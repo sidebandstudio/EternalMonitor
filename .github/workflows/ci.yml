@@ -156,6 +156,7 @@ jobs:
           sysctl -n hw.model hw.ncpu hw.memsize
       - name: Run simulator streaming matrix
         env:
+          EM_PROFILE_HOST: 1
           EM_SIM_NAME: cistream
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: scripts/e2e_matrix.sh --ci
