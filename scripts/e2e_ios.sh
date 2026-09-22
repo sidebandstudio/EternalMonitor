@@ -40,10 +40,13 @@ rm -f "$OUT/result.json"
 HOST_PID=""
 LOG_PID=""
 MONITOR_PID=""
+PROFILE_PID=""
 UDID=""
 INSTALL_DIR=""
 cleanup() {
     status=$?
+    [ -n "$PROFILE_PID" ] && kill "$PROFILE_PID" 2>/dev/null || true
+    [ -n "$PROFILE_PID" ] && wait "$PROFILE_PID" 2>/dev/null || true
     [ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
@@ -156,6 +159,13 @@ SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
     xcrun simctl launch "$UDID" com.eternal.monitor >/dev/null
+
+# Optional bounded stack sampling for throughput investigations. The sampler
+# targets only this row's host and records stacks, never process arguments.
+if [ "${EM_PROFILE_HOST:-0}" = 1 ] && [ -n "$HOST_PID" ]; then
+    sample "$HOST_PID" 5 10 -file "$OUT/host-stacks.txt" > "$OUT/profile.log" 2>&1 &
+    PROFILE_PID=$!
+fi
 
 echo "==> Waiting for $WANT_DECODED decoded frames (timeout ${TIMEOUT_SECS}s)"
 elapsed=0
