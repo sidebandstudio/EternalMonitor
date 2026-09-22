@@ -437,16 +437,36 @@ fn lossy_stream_recovers_and_adapts() {
         Duration::from_micros(16_667),
         Duration::from_millis(1),
     );
-    let mut decoder = H264TestDecoder::new();
-    let mut decoded = 0usize;
+    // Match the app's independent decode queue. Synchronous software decode
+    // here can stall socket reads through a repair deadline on a busy runner,
+    // even when the retransmit is already waiting in the kernel buffer.
+    let (decode_tx, decode_rx) = mpsc::sync_channel::<Vec<u8>>(3);
+    let decoding = std::thread::spawn(move || {
+        let mut decoder = H264TestDecoder::new();
+        let mut decoded = 0usize;
+        for frame in decode_rx {
+            decoded += decoder.decode(&frame).len();
+        }
+        decoded
+    });
+    let mut decode_queue_drops = 0;
     let mut requests = 0u32;
     let mut abr_down = false;
     let started = Instant::now();
+    let mut media_trace = Vec::new();
+    let mut nack_trace = Vec::new();
+    let mut recovery_sequences = Vec::new();
     let mut bytes = [0; 2048];
     while started.elapsed() < Duration::from_secs(15) {
         if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
             if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
                 if header.session_id == receiver.session_id {
+                    media_trace.push((
+                        started.elapsed().as_micros(),
+                        header.frame_seq,
+                        header.frag_index,
+                        header.is_retransmit,
+                    ));
                     assembler.add_media(header, payload, Instant::now());
                 }
             } else if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&bytes[..len]) {
@@ -455,10 +475,12 @@ fn lossy_stream_recovers_and_adapts() {
         }
         assembler.tick(Instant::now());
         for nack in assembler.take_nacks() {
+            nack_trace.push((started.elapsed().as_micros(), nack.clone()));
             receiver.send(&ControlMessage::Nack(nack));
         }
         if let Some((epoch, seq)) = assembler.take_keyframe_request() {
             requests += 1;
+            recovery_sequences.push(seq);
             eprintln!(
                 "NACK_E2E_RECOVERY elapsed_ms={} last_complete={seq} counters={:?}",
                 started.elapsed().as_millis(),
@@ -471,7 +493,9 @@ fn lossy_stream_recovers_and_adapts() {
             }));
         }
         for frame in assembler.take_ready() {
-            decoded += decoder.decode(&frame.payload).len();
+            if decode_tx.try_send(frame.payload).is_err() {
+                decode_queue_drops += 1;
+            }
         }
         if receiver.last_report.elapsed() >= Duration::from_millis(400) {
             receiver.last_report = Instant::now();
@@ -508,7 +532,26 @@ fn lossy_stream_recovers_and_adapts() {
     done_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("bounded shutdown");
-    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} retransmits={retransmits} counters={counters:?}");
+    drop(decode_tx);
+    let decoded = decoding.join().expect("decoder thread");
+    if requests > 1 {
+        for retired in recovery_sequences {
+            for event in &media_trace {
+                if (retired..=retired + 3).contains(&event.1) {
+                    eprintln!(
+                        "REPAIR_MEDIA us={} seq={} frag={} retransmit={}",
+                        event.0, event.1, event.2, event.3
+                    );
+                }
+            }
+            for (at, nack) in &nack_trace {
+                if (retired..=retired + 3).contains(&nack.frame_seq) {
+                    eprintln!("REPAIR_NACK us={at} {nack:?}");
+                }
+            }
+        }
+    }
+    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
     assert!(
         sent >= 600,
         "fifteen-second stream must make sustained progress"
