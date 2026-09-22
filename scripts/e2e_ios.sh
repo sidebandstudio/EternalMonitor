@@ -22,22 +22,43 @@ TIMEOUT_SECS="${EM_TIMEOUT:-120}"
 # (ETERNAL_HEVC=1 → libx265 via the variant table) and the app's VideoToolbox
 # session software-decodes it in the simulator.
 CODEC="${EM_CODEC:-h264}"
-SYNTH_W=640
-SYNTH_H=360
-# BSD mktemp only substitutes TRAILING Xs — no suffix after them.
-APP_LOG="$(mktemp /tmp/em_e2e_app.XXXXXX)"
-HOST_LOG="$(mktemp /tmp/em_e2e_host.XXXXXX)"
+SIZE="${EM_SIZE:-640x360}"
+SYNTH_W="${SIZE%x*}"
+SYNTH_H="${SIZE#*x}"
+SCENARIO="${EM_SCENARIO:-$CODEC-udp}"
+OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
+SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
+REMOTE_HOST="${EM_REMOTE_HOST:-}"
+MIN_FPS="${EM_MIN_FPS:-55}"
+MIN_SECONDS="${EM_DURATION:-0}"
+STARTED=$SECONDS
+mkdir -p "$OUT" "$(dirname "$SHOT")"
+APP_LOG="$OUT/app.log"
+HOST_LOG="$OUT/host.log"
+rm -f "$OUT/result.json"
 
 HOST_PID=""
 LOG_PID=""
 UDID=""
+INSTALL_DIR=""
 cleanup() {
+    status=$?
     [ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null || true
     [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
+    [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
+    if [ "$status" -ne 0 ]; then
+        python3 - "$OUT/result.json" "$SCENARIO" "$((SECONDS - STARTED))" <<'PY'
+import json,sys
+with open(sys.argv[1], 'w') as f:
+    json.dump(dict(scenario=sys.argv[2], status='FAIL', elapsed=int(sys.argv[3])), f)
+PY
+        echo "FAIL: evidence at $OUT" >&2
+    fi
 }
 trap cleanup EXIT
 
+if [ "${EM_SKIP_BUILD:-0}" != 1 ]; then
 echo "==> Generating Xcode project"
 (cd "$ROOT/ios" && xcodegen generate >/dev/null)
 
@@ -48,22 +69,27 @@ xcodebuild build \
     -destination "platform=iOS Simulator,name=$SIM_NAME" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
     CODE_SIGNING_ALLOWED=NO -quiet
+echo "==> Building host"
+(cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
+fi
 APP="$ROOT/ios/build/e2e/Build/Products/Debug-iphonesimulator/EternalMonitor.app"
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }
 
-echo "==> Building host"
-cargo build -q --release -p eternal-host
-
 HEVC_FLAG=0
 [ "$CODEC" = "hevc" ] && HEVC_FLAG=1
+if [ -z "$REMOTE_HOST" ]; then
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
+APPDATA="$OUT/state" \
 ETERNAL_HEADLESS=1 \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
 ETERNAL_HEVC="$HEVC_FLAG" \
+ETERNAL_FPS="${ETERNAL_FPS:-60}" \
     "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
+fi
+CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
 
 echo "==> Booting simulator: $SIM_NAME"
 UDID=$(xcrun simctl list -j devices available | /usr/bin/python3 -c '
@@ -79,7 +105,11 @@ sys.exit(1)
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
 echo "==> Installing app"
-xcrun simctl install "$UDID" "$APP"
+# Simulator's helper can stall copying directly from a protected Desktop
+# checkout. Stage only the built app in the temporary directory first.
+INSTALL_DIR="$(mktemp -d /tmp/em-e2e-install.XXXXXX)"
+ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
+xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 
 echo "==> Streaming app E2E log"
@@ -88,15 +118,15 @@ xcrun simctl spawn "$UDID" log stream --style compact \
 LOG_PID=$!
 sleep 2 # let the log stream attach before the milestones start
 
-echo "==> Launching app with EM_AUTOCONNECT=127.0.0.1:$PORT"
-SIMCTL_CHILD_EM_AUTOCONNECT="127.0.0.1:$PORT" \
+echo "==> Launching app with EM_AUTOCONNECT=$CONNECT_HOST:$PORT"
+SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
     xcrun simctl launch "$UDID" com.eternal.monitor >/dev/null
 
 echo "==> Waiting for $WANT_DECODED decoded frames (timeout ${TIMEOUT_SECS}s)"
 elapsed=0
 decoded=0
-until [ "$decoded" -ge "$WANT_DECODED" ]; do
+until [ "$decoded" -ge "$WANT_DECODED" ] && [ "$elapsed" -ge "$MIN_SECONDS" ]; do
     sleep 2
     elapsed=$((elapsed + 2))
     decoded=$(grep -o 'decoded=[0-9]*' "$APP_LOG" | tail -1 | cut -d= -f2 || true)
@@ -118,12 +148,26 @@ if ! grep -q "w=$SYNTH_W h=$SYNTH_H" <<<"$last_stats"; then
     exit 1
 fi
 
-if [ "$CODEC" = "hevc" ] && ! grep -q "libx265" "$HOST_LOG"; then
+if [ -z "$REMOTE_HOST" ] && [ "$CODEC" = "hevc" ] && ! grep -q "libx265" "$HOST_LOG"; then
     echo "FAIL: hevc requested but the host never opened an HEVC encoder session"
     echo "----- host log -----"; tail -30 "$HOST_LOG"
     exit 1
 fi
 
+fps=$(sed -E 's/.* fps=([0-9]+).*/\1/' <<<"$last_stats")
+if [ "$fps" -lt "$MIN_FPS" ]; then
+    echo "FAIL: decoded fps $fps is below $MIN_FPS"
+    exit 1
+fi
+"$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
+xcrun swift "$ROOT/scripts/px.swift" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
+python3 - "$OUT/result.json" "$SCENARIO" "$fps" "$decoded" "$SHOT" "$((SECONDS - STARTED))" <<'PY'
+import json,sys
+with open(sys.argv[1], 'w') as f:
+    json.dump(dict(scenario=sys.argv[2], status='PASS', fps=int(sys.argv[3]),
+                   decoded=int(sys.argv[4]), screenshot=sys.argv[5], elapsed=int(sys.argv[6])), f)
+PY
 echo "PASS: $last_stats"
 echo "      $first_frame"
 echo "      $decoder_kind"
+echo "      Evidence: $OUT"

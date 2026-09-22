@@ -107,6 +107,7 @@ struct DisplayView: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(hudAccessibilitySummary)
+        .accessibilityIdentifier("display.hud")
     }
 
     private var hudAccessibilitySummary: String {
@@ -214,6 +215,7 @@ struct DisplayView: View {
                 .background(Capsule().fill(Theme.amber.opacity(0.12)))
             }
             .accessibilityLabel("Disconnect")
+            .accessibilityIdentifier("display.disconnect")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)

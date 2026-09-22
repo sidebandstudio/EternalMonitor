@@ -24,3 +24,6 @@ ios/build/
 
 # Generated Xcode project — project.yml is the source of truth (run `xcodegen generate` in ios/)
 ios/EternalMonitor.xcodeproj/
+
+# Python bytecode from the Windows verification wrapper
+__pycache__/

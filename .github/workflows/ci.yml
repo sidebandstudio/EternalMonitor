@@ -106,12 +106,18 @@ jobs:
           echo "Using device type: $DEVICE_TYPE"
           UDID=$(xcrun simctl create citest "$DEVICE_TYPE")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Build and test on iOS Simulator
-        working-directory: ios
+      - name: Run iOS unit and UI tests
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          set -o pipefail
-          xcodebuild test \
-            -project EternalMonitor.xcodeproj \
-            -scheme EternalMonitor \
-            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
-            CODE_SIGNING_ALLOWED=NO | tail -80
+          scripts/test_ios.sh
+      - name: Retain iOS test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-evidence
+          path: |
+            build/ios-tests-*.log
+            build/ios-tests-*.xcresult
+            build/screenshots/ui-*
+          retention-days: 7

@@ -155,6 +155,7 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
+                        .accessibilityIdentifier("settings.done")
                         .font(.appMonoMedium(size: 15))
                         .foregroundColor(Theme.amber)
                 }
