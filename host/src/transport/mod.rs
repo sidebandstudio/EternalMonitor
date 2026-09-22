@@ -557,6 +557,14 @@ async fn execute_actions(
     }
 
     if let Some(target) = actions.new_target {
+        let preference = shared
+            .session
+            .lock()
+            .client_info()
+            .map_or(0, |info| u32::from(info.preferred_fps));
+        shared
+            .client_preferred_fps
+            .store(preference, Ordering::SeqCst);
         *shared.target_addr.lock() = target;
         {
             let mut stats = PIPELINE_STATS.lock();
@@ -584,6 +592,7 @@ async fn execute_actions(
     }
 
     if actions.client_lost {
+        shared.client_preferred_fps.store(0, Ordering::SeqCst);
         let unspecified = PeerId {
             link: LinkId::Udp,
             addr: None,

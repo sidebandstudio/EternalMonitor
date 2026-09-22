@@ -18,6 +18,8 @@ pub struct SharedControl {
     /// changes (hardware encoders ignore bitrate pokes on an open context).
     pub abr_current_bps: Arc<AtomicU32>,
     pub target_fps: Arc<AtomicU32>,
+    pub client_preferred_fps: Arc<AtomicU32>,
+    pub encoder_input: Arc<Mutex<crate::encoder::input::EncoderInput>>,
     pub max_dgram: Arc<AtomicU32>,
     pub target_addr: Arc<Mutex<PeerId>>,
     /// Set by transport on iPad re-handshake (same target). Encoder
@@ -76,6 +78,8 @@ pub enum VddStatus {
     /// Virtual display was requested but could not be enabled/attached — capture fell back to
     /// the primary display.
     Failed,
+    /// The installer-owned task itself failed to execute.
+    TaskFailed,
 }
 
 /// Selects which display output the capture loop duplicates.
@@ -121,6 +125,8 @@ impl SharedControl {
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
+            client_preferred_fps: Arc::new(AtomicU32::new(0)),
+            encoder_input: Arc::new(Mutex::new(Default::default())),
             max_dgram: Arc::new(AtomicU32::new(eternal_wire::v2::MAX_DGRAM_SIZE as u32)),
             target_addr: Arc::new(Mutex::new(PeerId::udp(SocketAddr::from((
                 [0, 0, 0, 0],
@@ -150,6 +156,13 @@ impl SharedControl {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    pub fn effective_fps(&self) -> u32 {
+        merge_fps(
+            self.target_fps.load(Ordering::SeqCst),
+            self.client_preferred_fps.load(Ordering::SeqCst),
+        )
+    }
+
     /// Is a client actually watching? Protocol v2 makes the session the only
     /// truth: media needs a session id, so a target address on its own (a
     /// persisted `target_ip`, a stale value from a previous client) must never
@@ -158,6 +171,14 @@ impl SharedControl {
     /// viewer.
     pub fn client_connected(&self) -> bool {
         self.session.lock().is_active()
+    }
+}
+
+pub fn merge_fps(host: u32, client: u32) -> u32 {
+    if client == 0 {
+        host.max(1)
+    } else {
+        host.max(1).min(client)
     }
 }
 
@@ -207,6 +228,23 @@ impl GuiControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_fps_caps_the_host_without_overwriting_its_preference() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        for (host, client, expected) in [
+            (120, 30, 30),
+            (30, 120, 30),
+            (90, 60, 60),
+            (120, 0, 120),
+            (0, 0, 1),
+        ] {
+            shared.target_fps.store(host, Ordering::SeqCst);
+            shared.client_preferred_fps.store(client, Ordering::SeqCst);
+            assert_eq!(shared.effective_fps(), expected);
+            assert_eq!(shared.target_fps.load(Ordering::SeqCst), host);
+        }
+    }
 
     #[test]
     fn client_connected_requires_a_session_not_just_an_address() {

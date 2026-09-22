@@ -39,7 +39,8 @@ fn run_task(task: &str) -> bool {
             warn!(
                 task,
                 code = ?out.status.code(),
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                stdout = %String::from_utf8_lossy(&out.stdout),
                 "VDD scheduled task did not run — is the installer's task registered?"
             );
             false

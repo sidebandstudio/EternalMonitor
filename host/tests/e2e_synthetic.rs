@@ -255,6 +255,7 @@ struct FakeReceiver {
     msg_seq: u32,
     last_report: Instant,
     host_caps: u16,
+    advertised_fps: u16,
 }
 
 impl FakeReceiver {
@@ -268,6 +269,15 @@ impl FakeReceiver {
     }
 
     fn connect_full(host_port: u16, decoder_caps: u16, feature_caps: u16) -> Self {
+        Self::connect_preferred(host_port, decoder_caps, feature_caps, 0)
+    }
+
+    fn connect_preferred(
+        host_port: u16,
+        decoder_caps: u16,
+        feature_caps: u16,
+        preferred_fps: u8,
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -290,7 +300,7 @@ impl FakeReceiver {
             refresh_hz: 120,
             device_name: "E2E fake iPad".to_string(),
             device_id: 0,
-            preferred_fps: 0,
+            preferred_fps,
             auth_token: [0; 16],
             pairing_code: 0,
         });
@@ -338,6 +348,7 @@ impl FakeReceiver {
             msg_seq: 1,
             last_report: Instant::now(),
             host_caps: ack.host_caps,
+            advertised_fps: ack.stream_config.fps,
         }
     }
 
@@ -1644,6 +1655,7 @@ fn pairing_flow_end_to_end() {
             msg_seq: 1,
             last_report: Instant::now(),
             host_caps: paired.host_caps,
+            advertised_fps: paired.stream_config.fps,
         };
         let mut assembler = Reassembler::new();
         let mut decoder = H264TestDecoder::new();
@@ -1701,6 +1713,100 @@ fn pairing_flow_end_to_end() {
     shared.stop();
     tx.send(SupervisorCommand::Shutdown).unwrap();
     supervisor.join().unwrap();
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn preferred_fps_caps_the_host() {
+    use std::sync::atomic::Ordering;
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", "640x360");
+    for name in [
+        "ETERNAL_DROP",
+        "ETERNAL_REORDER",
+        "ETERNAL_JITTER_MS",
+        "ETERNAL_FAULT_ENCODER_AFTER",
+        "ETERNAL_USB_DIRECT",
+    ] {
+        std::env::remove_var(name);
+    }
+    let port = free_udp_port();
+    let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    shared.target_fps.store(120, Ordering::SeqCst);
+    let (tx, rx) = mpsc::channel();
+    let host_shared = shared.clone();
+    let host_tx = tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(port, host_shared, GpuInfo::software_fallback(), host_tx, rx);
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 30);
+        assert_eq!(receiver.advertised_fps, 30);
+        let mut assembler = Reassembler::new();
+        let mut decoder = H264TestDecoder::new();
+        let mut frames = Vec::new();
+        let mut buffer = [0; 2048];
+        let mut heartbeat_seen = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while frames.len() < 45 || !heartbeat_seen {
+            assert!(Instant::now() < deadline, "capped stream must still decode");
+            receiver.maybe_report(0, frames.len() as u32);
+            let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if let Ok((_, ControlMessage::Heartbeat(heartbeat))) = parse_control(&buffer[..len]) {
+                assert_eq!(heartbeat.stream_config.fps, 30);
+                heartbeat_seen = true;
+            }
+            let Ok((header, payload)) = MediaHeader::decode(&buffer[..len]) else {
+                continue;
+            };
+            if let AddOutcome::Completed(bytes) = assembler.add_fragment(
+                header.frame_seq,
+                header.frag_index,
+                header.frag_count,
+                header.stream_epoch,
+                payload,
+                Instant::now(),
+            ) {
+                frames.extend(decoder.decode(&bytes));
+            }
+        }
+        assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
+        assert_eq!(shared.effective_fps(), 30);
+        assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.client_preferred_fps.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "disconnect must release the client cap"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(shared.effective_fps(), 120);
+        shared.target_fps.store(30, Ordering::SeqCst);
+        let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 120);
+        assert_eq!(receiver.advertised_fps, 30);
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    shared.stop();
+    tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bounded shutdown");
     if let Err(error) = outcome {
         std::panic::resume_unwind(error);
     }

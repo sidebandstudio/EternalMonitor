@@ -17,6 +17,10 @@ pub struct SettingsFile {
     pub target_ip: Option<String>,
     #[serde(default)]
     pub encoder_override: Option<String>,
+    #[serde(default)]
+    pub encoder_input: crate::encoder::input::EncoderInput,
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
     /// DXGI `DeviceName` of the capture display (e.g. `\\.\DISPLAY3`).
     /// `None` means auto (primary monitor).
     #[serde(default)]
@@ -54,6 +58,8 @@ impl Default for SettingsFile {
             max_dgram: default_max_dgram(),
             target_ip: None,
             encoder_override: None,
+            encoder_input: Default::default(),
+            check_for_updates: true,
             capture_display: None,
             hevc_enabled: false,
             stream_audio: true,

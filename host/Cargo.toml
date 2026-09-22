@@ -23,6 +23,8 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 plist = "1"
+semver = "1"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 
 # mDNS service advertisement
 mdns-sd = "0.12"
@@ -44,6 +46,7 @@ features = [
     "Win32_Security",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_System_Performance",

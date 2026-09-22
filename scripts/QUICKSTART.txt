@@ -31,11 +31,11 @@ Double-click  EternalMonitor-Setup.exe
 
 That's it for setup - no files to unzip, no drivers to install by hand.
 
-Step 2 - Allow the network prompt
----------------------------------
-The first time the host runs, Windows Firewall will ask to allow network
-access. CHECK both "Private networks" and "Public networks", then click
-"Allow". If you miss this, the iPad won't be able to connect.
+Step 2 - Check the connection
+------------------------------
+The installer configures Windows Firewall for the host. Keep the PC and
+iPad on the same local network. If a security product blocks the connection,
+see the firewall fallback below.
 
 Step 3 - Note the IP address
 ----------------------------
@@ -90,7 +90,7 @@ If the video is choppy or laggy
 If it doesn't work
 ------------------
 - Make sure both devices are on the SAME Wi-Fi (not a guest network).
-- Re-check the Firewall prompt from Step 2. You can re-allow it under
+- Check that EternalMonitor is allowed under
   Windows Settings -> Privacy & security -> Windows Security ->
   Firewall & network protection -> Allow an app through firewall.
 - Try manual IP entry instead of "Scan network".

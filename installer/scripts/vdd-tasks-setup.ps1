@@ -30,6 +30,15 @@ function Register-VddTask([string]$Name, [string]$ToggleAction) {
 Register-VddTask 'EternalMonitor VDD Enable'  'enable'
 Register-VddTask 'EternalMonitor VDD Disable' 'disable'
 
+# Let a normal host process read/run the fixed SYSTEM tasks. Users receive no
+# permission to change the task action or its protected Program Files script.
+$service = New-Object -ComObject Schedule.Service
+$service.Connect()
+$folder = $service.GetFolder('\')
+foreach ($name in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {
+    $folder.GetTask($name).SetSecurityDescriptor('D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)', 0)
+}
+
 # Verify the tasks actually registered — fail the install loudly if not, instead of silently
 # leaving the host unable to control the virtual display at runtime.
 foreach ($name in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {

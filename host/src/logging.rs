@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use once_cell::sync::Lazy;
@@ -25,16 +25,44 @@ static SESSION_LOG_FILE: Lazy<Option<Arc<Mutex<File>>>> = Lazy::new(|| {
         let _ = fs::create_dir_all(parent);
     }
 
+    let rotated = match rotate_session_logs(&path) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("Could not rotate session logs: {error}");
+            false
+        }
+    };
     match OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(rotated)
+        .append(!rotated)
         .open(&path)
     {
         Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(_) => None,
     }
 });
+
+fn rotate_session_logs(path: &Path) -> io::Result<()> {
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let suffix = |number: u8| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{number}"));
+        PathBuf::from(name)
+    };
+    let older = suffix(2);
+    if older.try_exists()? {
+        fs::remove_file(&older)?;
+    }
+    let previous = suffix(1);
+    if previous.try_exists()? {
+        fs::rename(&previous, &older)?;
+    }
+    fs::rename(path, previous)
+}
 
 #[derive(Clone)]
 pub struct MemoryLogWriter {
@@ -248,5 +276,45 @@ impl Visit for MessageVisitor {
         if field.name() == "message" && self.message.is_none() {
             self.message = Some(value.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_keeps_two_previous_sessions_and_preserves_them_without_a_current_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_LOG_FILE_NAME);
+        for session in 0..4 {
+            rotate_session_logs(&path).unwrap();
+            fs::write(&path, session.to_string()).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "3");
+        assert_eq!(
+            fs::read_to_string(dir.join(format!("{SESSION_LOG_FILE_NAME}.1"))).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(format!("{SESSION_LOG_FILE_NAME}.2"))).unwrap(),
+            "1"
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        fs::remove_file(&path).unwrap();
+        rotate_session_logs(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(format!("{SESSION_LOG_FILE_NAME}.1"))).unwrap(),
+            "2"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

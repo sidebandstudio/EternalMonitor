@@ -80,6 +80,11 @@ Name: "{group}\Uninstall EternalMonitor";  Filename: "{uninstallexe}"
 Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.exe"; Tasks: desktopicon
 
 [Run]
+; Replace only this product's named rules so upgrades remain idempotent.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=private,public enable=yes"; StatusMsg: "Allowing display traffic through Windows Firewall..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host TCP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=TCP profile=private,public enable=yes"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
 ; Install the virtual display driver during setup. We're already elevated, so this
 ; runs without a second UAC prompt. /VERYSILENT works when the bundled setup is
@@ -93,6 +98,8 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 Filename: "{app}\EternalMonitor-host.exe"; Description: "Launch EternalMonitor now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated; RunOnceId: "EternalMonitorFirewallUDP"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated; RunOnceId: "EternalMonitorFirewallTCP"
 #ifdef IncludeDriver
 ; Remove the scheduled tasks and re-enable the device before removing the driver.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-remove.ps1"""; Flags: runhidden; RunOnceId: "VddTasksRemove"

@@ -282,7 +282,7 @@ pub fn run_capture_loop(
         heartbeat(&shared.hb_capture_loop_ms);
 
         let frame_start = Instant::now();
-        let frame_budget = frame_budget_for(shared.target_fps.load(Ordering::SeqCst));
+        let frame_budget = frame_budget_for(shared.effective_fps());
         // Half the frame budget, clamped: at 60 fps this is the classic 8 ms;
         // high-rate modes (ETERNAL_FPS=120) must not block a whole 16 ms in
         // AcquireNextFrame, and below 4 ms the wakeups outrun the compositor.

@@ -17,6 +17,7 @@ pub mod settings;
 pub mod stats;
 pub mod supervisor;
 pub mod transport;
+pub mod updates;
 pub mod vdd;
 pub mod vdd_settings;
 

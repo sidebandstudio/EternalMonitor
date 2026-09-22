@@ -56,6 +56,7 @@ pub struct ClientInfo {
     pub device_id: u64,
     pub screen_px: (u16, u16),
     pub refresh_hz: u8,
+    pub preferred_fps: u8,
     pub decoder_caps: u16,
     pub feature_caps: u16,
     pub connected_at: Instant,
@@ -386,6 +387,7 @@ impl Session {
                 device_id: hello.device_id,
                 screen_px: (hello.screen_px_w, hello.screen_px_h),
                 refresh_hz: hello.refresh_hz,
+                preferred_fps: hello.preferred_fps,
                 decoder_caps: hello.decoder_caps,
                 feature_caps: hello.feature_caps,
                 connected_at: now,
@@ -549,7 +551,7 @@ impl Session {
             let msg_seq = self.next_msg_seq();
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
-                stream_config: config.stream_config(),
+                stream_config: self.negotiated_config(config),
             });
             actions.replies.push((
                 peer,
@@ -568,7 +570,7 @@ impl Session {
         let peer = session.peer;
         let session_id = session.session_id;
         let msg_seq = self.next_msg_seq();
-        let message = ControlMessage::StreamConfig(config.stream_config());
+        let message = ControlMessage::StreamConfig(self.negotiated_config(config));
         vec![(
             peer,
             eternal_wire::v2::control::encode_control(session_id, msg_seq, &message),
@@ -615,12 +617,22 @@ impl Session {
             heartbeat_interval_ms: HEARTBEAT_INTERVAL.as_millis() as u16,
             report_interval_ms: REPORT_INTERVAL_MS,
             liveness_timeout_ms: LIVENESS_TIMEOUT.as_millis() as u16,
-            stream_config: config.stream_config(),
+            stream_config: self.negotiated_config(config),
             host_name: config.host_name(),
             auth_token,
             host_caps: HOSTCAP_NACK | config.host_caps(),
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
+    }
+
+    fn negotiated_config(&self, source: &impl ConfigSource) -> StreamConfig {
+        let mut config = source.stream_config();
+        let preference = self
+            .active
+            .as_ref()
+            .map_or(0, |s| u32::from(s.info.preferred_fps));
+        config.fps = crate::control::merge_fps(u32::from(config.fps), preference) as u16;
+        config
     }
 }
 

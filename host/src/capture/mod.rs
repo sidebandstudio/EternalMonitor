@@ -268,7 +268,7 @@ pub(crate) fn reconcile_virtual_display(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
                 );
-                *shared.vdd_status.lock() = VddStatus::Failed;
+                *shared.vdd_status.lock() = VddStatus::TaskFailed;
                 return CaptureTarget::PrimaryAuto;
             }
             let deadline = Instant::now() + vdd_attach_timeout();

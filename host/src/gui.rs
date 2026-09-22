@@ -153,6 +153,10 @@ pub struct AnalyzerApp {
     current_tab: AppTab,
     settings_bitrate_mbps: f32,
     settings_fps_target: u32,
+    settings_encoder_input: crate::encoder::input::EncoderInput,
+    settings_check_updates: bool,
+    available_update: crate::updates::AvailableUpdate,
+    update_dismissed: bool,
     settings_packet_size: u32,
     /// Last settings error worth showing (currently only the autostart
     /// registry write).
@@ -196,7 +200,7 @@ impl AnalyzerApp {
             runtime_bitrate_mbps
         };
 
-        let fps_target = if persisted.target_fps == 30 || persisted.target_fps == 60 {
+        let fps_target = if [30, 60, 90, 120].contains(&persisted.target_fps) {
             persisted.target_fps
         } else {
             control
@@ -265,7 +269,16 @@ impl AnalyzerApp {
             }
         }
 
+        let available_update = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        if persisted.check_for_updates {
+            crate::updates::start(available_update.clone());
+        }
+        let encoder_input = *control.shared.encoder_input.lock();
         Self {
+            settings_encoder_input: encoder_input,
+            settings_check_updates: persisted.check_for_updates,
+            available_update,
+            update_dismissed: false,
             settings_packet_size: control
                 .shared
                 .max_dgram
@@ -307,6 +320,8 @@ impl AnalyzerApp {
             // older settings.json still parse.
             target_ip: None,
             encoder_override,
+            encoder_input: self.settings_encoder_input,
+            check_for_updates: self.settings_check_updates,
             capture_display: if self.settings_capture_display.is_empty() {
                 None
             } else {
@@ -381,6 +396,19 @@ impl eframe::App for AnalyzerApp {
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
+                if self.settings_check_updates && !self.update_dismissed {
+                    let update = self.available_update.lock().clone();
+                    if let Some(version) = update {
+                        card_frame().show(ui, |ui| {
+                            ui.label(egui::RichText::new(format!("EternalMonitor v{version} is available. The iPad app must match.")).color(ACCENT));
+                            ui.horizontal(|ui| {
+                                ui.hyperlink_to("View release", format!("https://github.com/whoisaldo/EternalMonitor/releases/tag/v{version}"));
+                                if ui.button("Dismiss").clicked() { self.update_dismissed = true; }
+                            });
+                        });
+                        ui.add_space(12.0);
+                    }
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| match self.current_tab {
                     AppTab::Stream => self.draw_stream_tab(ui, &snap),
                     AppTab::Performance => self.draw_performance_tab(ui, &snap),
@@ -464,8 +492,9 @@ impl AnalyzerApp {
         // If the user asked for the extended (virtual) display but it could not be brought up,
         // capture silently fell back to the primary monitor — say so instead of leaving the
         // Settings combo claiming "Extended display".
-        if *self.control.shared.vdd_status.lock() == VddStatus::Failed {
-            vdd_failed_banner(ui);
+        let vdd_status = *self.control.shared.vdd_status.lock();
+        if matches!(vdd_status, VddStatus::Failed | VddStatus::TaskFailed) {
+            vdd_failed_banner(ui, vdd_status == VddStatus::TaskFailed);
             ui.add_space(12.0);
         }
 
@@ -518,6 +547,8 @@ impl AnalyzerApp {
         usb_card(ui, snap);
         ui.add_space(12.0);
         audio_card(ui, &snap.audio);
+        ui.add_space(12.0);
+        self.draw_client_card(ui);
         ui.add_space(12.0);
 
         // ── Live readouts ────────────────────────────────────────────────────
@@ -726,17 +757,10 @@ impl AnalyzerApp {
                 ui.label(egui::RichText::new("FPS target").color(TEXT).size(13.0));
                 ui.add_space(8.0);
                 let prev = self.settings_fps_target;
-                if ui
-                    .selectable_label(self.settings_fps_target == 30, "30")
-                    .clicked()
-                {
-                    self.settings_fps_target = 30;
-                }
-                if ui
-                    .selectable_label(self.settings_fps_target == 60, "60")
-                    .clicked()
-                {
-                    self.settings_fps_target = 60;
+                for fps in [30, 60, 90, 120] {
+                    if ui.selectable_label(self.settings_fps_target == fps, fps.to_string()).clicked() {
+                        self.settings_fps_target = fps;
+                    }
                 }
                 if self.settings_fps_target != prev {
                     self.control
@@ -771,6 +795,20 @@ impl AnalyzerApp {
             // with nobody connected.
 
             // --- Encoder override dropdown ---------------------------------------
+            ui.horizontal(|ui| {
+                use crate::encoder::input::EncoderInput;
+                ui.label(egui::RichText::new("Encoder input").color(TEXT).size(13.0));
+                let before = self.settings_encoder_input;
+                for (mode, label) in [(EncoderInput::Auto, "Auto"), (EncoderInput::Bgra, "BGRA"), (EncoderInput::Yuv420, "YUV420")] {
+                    ui.radio_value(&mut self.settings_encoder_input, mode, label);
+                }
+                if before != self.settings_encoder_input {
+                    *self.control.shared.encoder_input.lock() = self.settings_encoder_input;
+                    self.persist_settings();
+                }
+            });
+            ui.label(egui::RichText::new("Encoder input changes apply after Restart stream.").color(MUTED2).size(11.0));
+            ui.add_space(12.0);
             let detected = PIPELINE_STATS.lock().codec_name.clone();
             ui.horizontal(|ui| {
                 ui.label(
@@ -969,6 +1007,11 @@ impl AnalyzerApp {
                     ui.label(egui::RichText::new(error).color(RED).size(11.0));
                 }
             }
+            ui.add_space(12.0);
+            if ui.checkbox(&mut self.settings_check_updates, "Check for updates daily").changed() {
+                if self.settings_check_updates { crate::updates::start(self.available_update.clone()); }
+                self.persist_settings();
+            }
         });
 
         ui.add_space(12.0);
@@ -1011,6 +1054,76 @@ impl AnalyzerApp {
 }
 
 impl AnalyzerApp {
+    fn draw_client_card(&self, ui: &mut egui::Ui) {
+        let (client, peer, report) = {
+            let session = self.control.shared.session.lock();
+            (session.client_info(), session.peer(), session.last_report())
+        };
+        card_frame().show(ui, |ui| {
+            section_header(ui, "Connected iPad");
+            let Some(client) = client else {
+                ui.label(egui::RichText::new("Waiting for an iPad").color(MUTED2));
+                return;
+            };
+            let link = if peer
+                .is_some_and(|p| matches!(p.link, crate::transport::link::LinkId::Usb { .. }))
+            {
+                "USB"
+            } else {
+                "WiFi"
+            };
+            ui.label(
+                egui::RichText::new(format!("{} · {link}", client.device_name))
+                    .color(TEXT)
+                    .strong(),
+            );
+            if let Some(r) = report {
+                let total = f64::from(r.frags_received)
+                    + f64::from(r.frags_repaired)
+                    + f64::from(r.frags_lost);
+                let loss = if total > 0.0 {
+                    100.0 * f64::from(r.frags_lost) / total
+                } else {
+                    0.0
+                };
+                let repaired = if total > 0.0 {
+                    100.0 * f64::from(r.frags_repaired) / total
+                } else {
+                    0.0
+                };
+                egui::Grid::new("client-health")
+                    .num_columns(2)
+                    .spacing([20.0, 6.0])
+                    .show(ui, |ui| {
+                        for (label, value) in [
+                            ("RTT", format!("{:.1} ms", f64::from(r.rtt_ms_x10) / 10.0)),
+                            ("Unrecovered loss", format!("{loss:.2}%")),
+                            ("Repaired fragments", format!("{repaired:.2}%")),
+                            (
+                                "End-to-end latency",
+                                if r.e2e_latency_ms_x10 == 0 {
+                                    "Measuring".into()
+                                } else {
+                                    format!("{:.1} ms", f64::from(r.e2e_latency_ms_x10) / 10.0)
+                                },
+                            ),
+                            (
+                                "Decode rate",
+                                format!("{:.1} fps", f64::from(r.decode_fps_x10) / 10.0),
+                            ),
+                            ("Audio buffer", format!("{} ms", r.audio_buffer_ms)),
+                        ] {
+                            ui.label(egui::RichText::new(label).color(MUTED2));
+                            ui.label(egui::RichText::new(value).color(TEXT).monospace());
+                            ui.end_row();
+                        }
+                    });
+            } else {
+                ui.label(egui::RichText::new("Waiting for client measurements").color(MUTED2));
+            }
+        });
+    }
+
     fn draw_pairing_card(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         card_frame().show(ui, |ui| {
@@ -1190,7 +1303,7 @@ fn software_fallback_banner(ui: &mut egui::Ui) {
 
 /// Amber warning banner shown when the user selected the extended (virtual) display but the
 /// managed VDD could not be enabled/attached, so capture fell back to the primary monitor.
-fn vdd_failed_banner(ui: &mut egui::Ui) {
+fn vdd_failed_banner(ui: &mut egui::Ui, task_failed: bool) {
     egui::Frame::new()
         .fill(WARN_FILL)
         .stroke(egui::Stroke::new(1.0_f32, WARN_BORDER))
@@ -1207,8 +1320,11 @@ fn vdd_failed_banner(ui: &mut egui::Ui) {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(
-                    "The virtual display driver didn't attach. Reinstall via EternalMonitor-Setup.exe \
-                     so its display task is registered, then Restart stream.",
+                    if task_failed {
+                        "The display task could not run. Reinstall EternalMonitor-Setup.exe to repair its permissions, then Restart stream. Copy logs for the Windows error."
+                    } else {
+                        "The display task ran, but no display appeared before the timeout. Check Windows display settings and the driver, then Restart stream."
+                    },
                 )
                 .color(TEXT)
                 .size(11.0),
