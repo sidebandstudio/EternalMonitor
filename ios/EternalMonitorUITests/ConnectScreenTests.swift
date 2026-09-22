@@ -7,7 +7,7 @@ final class ConnectScreenTests: XCTestCase {
 
     func testConnectControls() {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
         app.launch()
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
@@ -15,6 +15,8 @@ final class ConnectScreenTests: XCTestCase {
         for identifier in ["connect.button", "connect.scan", "connect.qr", "settings.button"] {
             XCTAssertTrue(app.buttons[identifier].exists, identifier)
         }
+        XCTAssertEqual(app.textFields["connect.host"].value as? String, "127.0.0.1")
+        XCTAssertTrue(app.buttons["connect.button"].isEnabled)
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "connect-screen"
         screenshot.lifetime = .keepAlways
@@ -23,7 +25,7 @@ final class ConnectScreenTests: XCTestCase {
 
     func testSettingsOpenAndDismiss() {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
         app.launch()
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
