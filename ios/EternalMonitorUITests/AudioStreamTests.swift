@@ -16,14 +16,6 @@ final class AudioStreamTests: XCTestCase {
         let toggle = app.switches["settings.playPCaudio"]
         XCTAssertTrue(toggle.exists)
         XCTAssertEqual(toggle.value as? String, "1")
-        app.swipeUp()
-        let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
-        XCTAssertTrue(audio.waitForExistence(timeout: 5))
-        let activeAudio = NSPredicate(format: "value CONTAINS %@", "Opus 128 kbps, buffer")
-        expectation(for: activeAudio, evaluatedWith: audio)
-        waitForExpectations(timeout: 5)
-        capture("audio-host-stream", app: app)
-        app.swipeDown()
         toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
         XCTAssertEqual(toggle.value as? String, "0")
         app.buttons["settings.done"].tap()
@@ -34,6 +26,13 @@ final class AudioStreamTests: XCTestCase {
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
         XCTAssertEqual(toggle.value as? String, "1")
+        app.swipeUp()
+        let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
+        XCTAssertTrue(audio.waitForExistence(timeout: 5))
+        let activeAudio = NSPredicate(format: "value CONTAINS %@", "Opus 128 kbps, buffer")
+        expectation(for: activeAudio, evaluatedWith: audio)
+        waitForExpectations(timeout: 5)
+        capture("audio-host-stream", app: app)
         app.buttons["settings.done"].tap()
         waitForLabel(hud, containing: "PC audio playing")
         capture("audio-playing-hud", app: app)
