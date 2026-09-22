@@ -38,6 +38,11 @@ final class KeyboardRelayTests: XCTestCase {
         waitForExpectations(timeout: 5)
         XCTAssertTrue(app.buttons["display.disconnect"].exists)
         capture("keyboard-dismissed", app: app)
+        // Prove the normal HUD timeout and the three-finger way back to it.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
+        waitForExpectations(timeout: 6)
+        app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         keyboard.tap()
         XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
         app.buttons["keyboard.done"].tap()

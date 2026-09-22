@@ -40,6 +40,7 @@ for name in ['keyboard-relay','keyboard-dismissed']:
         (out/(name+'-pixels.log')).write_text(result.stdout+result.stderr)
         if result.returncode: errors.append('Pixel assertion failed: '+name)
 log=(out/'host.log').read_text() if (out/'host.log').exists() else ''
+log=re.sub(r'\x1b\[[0-9;]*m','',log)
 commands=re.findall(r'Input injection command=(.+)',log)
 expected=['Unicode(72)','Unicode(105)','Unicode(33)',
     'KeyDown { scan: 28, extended: false }','KeyUp { scan: 28, extended: false }',
