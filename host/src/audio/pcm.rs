@@ -2,6 +2,25 @@
 
 use super::AudioResult;
 
+/// Account for the time actually waited when an idle WASAPI engine supplies
+/// no packets. A nominal 10 ms Windows wait can take 15.6 ms. Carry fractional
+/// sample time forward instead of emitting a fixed, too-short silence block.
+#[cfg(any(windows, test))]
+pub(super) fn silence_span(
+    rate: u32,
+    elapsed: std::time::Duration,
+) -> (usize, std::time::Duration) {
+    let nanos = elapsed
+        .min(std::time::Duration::from_millis(100))
+        .as_nanos();
+    let frames = nanos * u128::from(rate) / 1_000_000_000;
+    let consumed = frames * 1_000_000_000 / u128::from(rate);
+    (
+        frames as usize,
+        std::time::Duration::from_nanos(consumed as u64),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleEncoding {
     Float32,
@@ -52,6 +71,27 @@ impl SampleEncoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_silence_tracks_coarse_waits_without_clock_drift() {
+        use std::time::Duration;
+        for rate in [44_100, 48_000, 96_000] {
+            let mut represented = Duration::ZERO;
+            let mut frames = 0;
+            for tick in 1..=64 {
+                let wall = Duration::from_micros(31_250 * tick);
+                let (count, span) = silence_span(rate, wall - represented);
+                represented += span;
+                frames += count;
+            }
+            assert!((frames as i64 - i64::from(rate) * 2).abs() <= 1);
+            assert!(Duration::from_secs(2) - represented < Duration::from_micros(25));
+            assert_eq!(
+                silence_span(rate, Duration::from_secs(5)).0,
+                rate as usize / 10
+            );
+        }
+    }
 
     #[test]
     fn signed_pcm_and_float_cover_zero_full_scale_and_unaligned_reads() {
