@@ -89,6 +89,13 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
         run: cargo test --workspace --locked
+      - name: Retain GUI comparison images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-gui-snapshots
+          path: host/tests/snapshots/
+          retention-days: 7
 
   ios-build:
     name: iOS (simulator build)

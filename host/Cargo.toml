@@ -39,6 +39,9 @@ socket2 = "0.5"
 [build-dependencies]
 winresource = "0.1"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
