@@ -366,6 +366,23 @@ impl FramedLink {
     pub fn is_closed(&self) -> bool {
         *self.state.closed.borrow()
     }
+
+    pub fn closed_signal(&self) -> watch::Receiver<bool> {
+        self.state.closed.subscribe()
+    }
+
+    pub fn close_guard(&self) -> CloseGuard {
+        CloseGuard(self.state.closed.clone())
+    }
+}
+
+/// A device worker owns this guard after handing the link to the transport.
+/// Removing the device or stopping its supervisor closes both tunnel halves.
+pub struct CloseGuard(watch::Sender<bool>);
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 impl Link for FramedLink {

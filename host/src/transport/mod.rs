@@ -4,6 +4,7 @@ pub mod link;
 pub mod pacer;
 pub mod retransmit;
 pub mod session;
+pub mod usb;
 pub mod usbmuxd;
 
 use std::collections::VecDeque;
@@ -25,9 +26,11 @@ use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use fault::FaultInjector;
+use link::{LinkId, PeerId};
 use pacer::FramePacer;
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
+use usb::{LinkEvent, TransportLinks};
 
 /// Monotonic per-process counter stamped into each media header's `stream_epoch`. Every
 /// `start_sender` (i.e. every pipeline run) gets a fresh value so the iPad can detect a stream
@@ -63,6 +66,14 @@ impl ConfigSource for SharedConfigSource<'_> {
                 0
             },
             bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
+        }
+    }
+
+    fn host_caps(&self) -> u16 {
+        if PIPELINE_STATS.lock().usb_service_reachable {
+            eternal_wire::v2::control::HOSTCAP_USB
+        } else {
+            0
         }
     }
 
@@ -175,7 +186,7 @@ pub async fn start_sender(
     let mut input_relay = crate::input::InputRelay::default();
     let mut retransmit_ring = RetransmitRing::default();
 
-    let mut recv_buf = [0u8; 2048];
+    let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -192,28 +203,33 @@ pub async fn start_sender(
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
                 let destination = *shared.target_addr.lock();
                 for datagram in fault.drain_due(Instant::now()) {
-                    let _ = socket.send_to(&datagram, destination).await;
+                    let _ = links.send_to(&datagram, destination).await;
                 }
             }
             _ = heartbeat.tick() => {
                 let actions = shared.session.lock().tick(&config, true, Instant::now());
                 if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
-                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
+                execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
             _ = liveness_tick.tick() => {
+                links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
                     info!("Transport loop stopping on running=false");
                     break;
                 }
                 let actions = shared.session.lock().tick(&config, false, Instant::now());
                 if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
-                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
+                execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
 
-            result = receive_control(&socket, &mut recv_buf, &mut deferred_control) => {
+            result = receive_control(&mut links, &mut deferred_control) => {
                 match result {
-                    Ok((len, src)) => {
-                        let datagram = &recv_buf[..len];
+                    Ok(LinkEvent::Closed(id)) => {
+                        let actions = shared.session.lock().link_lost(id);
+                        execute_actions(actions, &links, &shared, &supervisor_tx).await;
+                    }
+                    Ok(LinkEvent::Datagram(src, datagram)) => {
+                        let datagram = datagram.as_slice();
                         match classify(datagram) {
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
@@ -236,7 +252,7 @@ pub async fn start_sender(
                                         if let (Some((epoch, seq, missing)), Some(frag_count)) =
                                             (actions.retransmit.take(), nack_frag_count)
                                         {
-                                            send_repairs(&socket, &mut retransmit_ring, &shared,
+                                            send_repairs(&links.udp.socket, &mut retransmit_ring, &shared,
                                                 epoch, seq, frag_count, &missing).await;
                                         }
                                         if let Some((session_id, event)) = actions.input.take() {
@@ -279,14 +295,13 @@ pub async fn start_sender(
                                                     .lock()
                                                     .stream_config_notify(&config);
                                                 for (destination, datagram) in notify {
-                                                    let _ = socket
-                                                        .send_to(&datagram, destination)
+                                                    let _ = links.send_to(&datagram, destination)
                                                         .await;
                                                 }
                                             }
                                         }
                                         execute_actions(
-                                            actions, &socket, &shared, &supervisor_tx,
+                                            actions, &links, &shared, &supervisor_tx,
                                         ).await;
                                     }
                                     Err(error) => {
@@ -298,7 +313,7 @@ pub async fn start_sender(
                                 shared.session.lock().note_legacy_hello(src)
                             }
                             Classified::Media { .. } | Classified::Unknown => {
-                                debug!(peer = %src, len, "Ignored unexpected datagram");
+                                debug!(peer = %src, len = datagram.len(), "Ignored unexpected datagram");
                             }
                         }
                     }
@@ -310,7 +325,7 @@ pub async fn start_sender(
                 let Some(nal) = nal_opt else { break; };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
                 let target_addr = *shared.target_addr.lock();
-                if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
+                if target_addr.link == LinkId::Udp && target_addr.addr.is_none_or(|a| a.ip().is_unspecified() || a.port() == 0) {
                     continue;
                 }
                 if last_session_id != Some(session_id) {
@@ -363,16 +378,16 @@ pub async fn start_sender(
                         stored.push(datagram.to_vec());
                     }
 
-                    if fault.enabled() {
+                    if target_addr.link == LinkId::Udp && fault.enabled() {
                         for due in fault.push(datagram, Instant::now()) {
-                            if let Err(e) = socket.send_to(&due, target_addr).await {
+                            if let Err(e) = links.send_to(&due, target_addr).await {
                                 if !send_failed {
                                     warn!(seq = nal.sequence, error = %e, "UDP send failed");
                                     send_failed = true;
                                 }
                             }
                         }
-                    } else if let Err(e) = socket.send_to(datagram, target_addr).await {
+                    } else if let Err(e) = links.send_to(datagram, target_addr).await {
                         if !send_failed {
                             warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
                             send_failed = true;
@@ -380,8 +395,8 @@ pub async fn start_sender(
                     }
 
                     let pause = frame_pacer.after_send(Instant::now());
-                    if pause > Duration::ZERO {
-                        repair_while_pacing(&socket, &mut retransmit_ring, &shared, &config,
+                    if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
+                        repair_while_pacing(&links.udp.socket, &mut retransmit_ring, &shared, &config,
                             nal.sequence as u32, pause, &mut deferred_control).await;
                     }
                 }
@@ -416,18 +431,16 @@ pub async fn start_sender(
     Ok(())
 }
 
-type DeferredControl = VecDeque<(usize, SocketAddr, [u8; 2048])>;
+type DeferredControl = VecDeque<LinkEvent>;
 
 async fn receive_control(
-    socket: &UdpSocket,
-    buffer: &mut [u8; 2048],
+    links: &mut TransportLinks,
     deferred: &mut DeferredControl,
-) -> std::io::Result<(usize, SocketAddr)> {
-    if let Some((len, peer, bytes)) = deferred.pop_front() {
-        buffer[..len].copy_from_slice(&bytes[..len]);
-        Ok((len, peer))
+) -> std::io::Result<LinkEvent> {
+    if let Some(event) = deferred.pop_front() {
+        Ok(event)
     } else {
-        socket.recv_from(buffer).await
+        links.receive().await
     }
 }
 
@@ -440,7 +453,10 @@ async fn send_repairs(
     frag_count: u16,
     missing: &[u16],
 ) {
-    let destination = *shared.target_addr.lock();
+    let target = *shared.target_addr.lock();
+    let Some(destination) = target.addr.filter(|_| target.link == LinkId::Udp) else {
+        return;
+    };
     let mut sent = 0;
     for datagram in ring.resend(epoch, seq, frag_count, missing, Instant::now()) {
         if socket.send_to(&datagram, destination).await.is_ok() {
@@ -486,7 +502,7 @@ async fn repair_while_pacing(
                     // datagram; defer those NACKs rather than losing them.
                     if nack.frame_seq != current_seq {
                         let count = nack.frag_count;
-                        let actions = shared.session.lock().handle_control(peer, header.session_id,
+                        let actions = shared.session.lock().handle_control(PeerId::udp(peer), header.session_id,
                             ControlMessage::Nack(nack), config, Instant::now());
                         if let Some((epoch, seq, missing)) = actions.retransmit {
                             send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
@@ -494,7 +510,7 @@ async fn repair_while_pacing(
                         continue;
                     }
                 }
-                if deferred.len() < 64 { deferred.push_back((len, peer, bytes)); }
+                if deferred.len() < 64 { deferred.push_back(LinkEvent::Datagram(PeerId::udp(peer), bytes[..len].to_vec())); }
             }
         }
     }
@@ -502,12 +518,12 @@ async fn repair_while_pacing(
 
 async fn execute_actions(
     actions: Actions,
-    socket: &UdpSocket,
+    links: &TransportLinks,
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
     for (destination, datagram) in &actions.replies {
-        if let Err(e) = socket.send_to(datagram, destination).await {
+        if let Err(e) = links.send_to(datagram, *destination).await {
             warn!(peer = %destination, error = %e, "Failed to send control reply");
         }
     }
@@ -540,7 +556,10 @@ async fn execute_actions(
     }
 
     if actions.client_lost {
-        let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+        let unspecified = PeerId {
+            link: LinkId::Udp,
+            addr: None,
+        };
         *shared.target_addr.lock() = unspecified;
         PIPELINE_STATS
             .lock()
@@ -599,10 +618,13 @@ mod tests {
             auth_token: [0; 16],
             pairing_code: 0,
         });
-        let actions = shared
-            .session
-            .lock()
-            .handle_control(peer, 0, hello, &config, Instant::now());
+        let actions = shared.session.lock().handle_control(
+            PeerId::udp(peer),
+            0,
+            hello,
+            &config,
+            Instant::now(),
+        );
         *shared.target_addr.lock() = actions.new_target.unwrap();
         let session_id = shared.session.lock().session_id().unwrap();
         let mut original = vec![0xAB; MEDIA_HEADER_SIZE + 1];
@@ -675,9 +697,12 @@ mod tests {
         }
         let deferred = pacing.await.unwrap();
         assert_eq!(deferred.len(), pending.len());
-        for ((len, source, bytes), expected) in deferred.into_iter().zip(pending) {
-            assert_eq!(source, peer);
-            assert_eq!(parse_control(&bytes[..len]).unwrap().1, expected);
+        for (event, expected) in deferred.into_iter().zip(pending) {
+            let LinkEvent::Datagram(source, bytes) = event else {
+                panic!("unexpected disconnect");
+            };
+            assert_eq!(source, PeerId::udp(peer));
+            assert_eq!(parse_control(&bytes).unwrap().1, expected);
         }
     }
 }

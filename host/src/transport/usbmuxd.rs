@@ -198,6 +198,7 @@ impl Client {
                 Endpoint::Tcp(address) => {
                     let socket = TcpStream::connect(address).await?;
                     socket.set_nodelay(true)?;
+                    let _ = socket2::SockRef::from(&socket).set_send_buffer_size(32 * 1024);
                     Box::new(socket)
                 }
                 #[cfg(unix)]

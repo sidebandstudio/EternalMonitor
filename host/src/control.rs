@@ -1,3 +1,4 @@
+use crate::transport::link::PeerId;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
@@ -18,7 +19,7 @@ pub struct SharedControl {
     pub abr_current_bps: Arc<AtomicU32>,
     pub target_fps: Arc<AtomicU32>,
     pub max_dgram: Arc<AtomicU32>,
-    pub target_addr: Arc<Mutex<SocketAddr>>,
+    pub target_addr: Arc<Mutex<PeerId>>,
     /// Set by transport on iPad re-handshake (same target). Encoder
     /// swaps it back to false on the next frame and forces an IDR. AMD only — NVENC
     /// ignores it because NVENC keyframe cadence is already correct.
@@ -110,7 +111,10 @@ impl SharedControl {
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
             max_dgram: Arc::new(AtomicU32::new(eternal_wire::v2::MAX_DGRAM_SIZE as u32)),
-            target_addr: Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], listen_port)))),
+            target_addr: Arc::new(Mutex::new(PeerId::udp(SocketAddr::from((
+                [0, 0, 0, 0],
+                listen_port,
+            ))))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
@@ -201,7 +205,7 @@ mod tests {
         // from a client that has since gone — must not read as "connected".
         // It used to, which held the virtual display up and kept the capture
         // loop at full rate with nobody watching.
-        *shared.target_addr.lock() = "192.168.1.50:9876".parse().unwrap();
+        *shared.target_addr.lock() = PeerId::udp("192.168.1.50:9876".parse().unwrap());
         assert!(!shared.client_connected());
     }
 }
