@@ -11,6 +11,7 @@ using System.Windows.Forms;
 public class EMTestPattern : Form {
     [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
     readonly Timer timer = new Timer();
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly int seconds;
@@ -26,6 +27,8 @@ public class EMTestPattern : Form {
         KeyPreview = true;
         KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
         timeBeginPeriod(1);
+        if (SetThreadExecutionState(0x80000003) == 0)
+            throw new InvalidOperationException("Could not keep the test display awake");
         timer.Interval = 4;
         timer.Tick += delegate {
             if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"D:\AgentWork\em-v030\pattern.stop")) { Close(); return; }
@@ -50,7 +53,9 @@ public class EMTestPattern : Form {
                 e.Graphics.FillRectangle(Brushes.White, 4+bit*20, 4, 16, 16);
     }
     protected override void OnFormClosed(FormClosedEventArgs e) {
-        timer.Stop(); timer.Dispose(); timeEndPeriod(1); base.OnFormClosed(e);
+        timer.Stop(); timer.Dispose(); timeEndPeriod(1);
+        SetThreadExecutionState(0x80000000);
+        base.OnFormClosed(e);
     }
 }
 '@
