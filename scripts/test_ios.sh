@@ -19,17 +19,28 @@ PAIR_HOST_LOG="$ROOT/build/ios-ui-pairing-host-$STAMP.log"
 USB_PROXY_PID=""
 cleanup() {
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
+    [ -n "$HOST_PID" ] && wait "$HOST_PID" 2>/dev/null || true
     [ -n "$PAIR_HOST_PID" ] && kill "$PAIR_HOST_PID" 2>/dev/null || true
     [ -n "$USB_HOST_PID" ] && kill "$USB_HOST_PID" 2>/dev/null || true
     [ -n "$USB_PROXY_PID" ] && kill "$USB_PROXY_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
-# Unit-only selections do not need a streaming host. The complete suite and
-# UI selections use a real stream so diagnostics are checked with live values.
-NEED_STREAM=1
+# Only the selected UI classes that connect need streaming fixtures.
+NEED_STREAM=0
+NEED_LIFECYCLE=0
+SELECTED=0
 for argument in "$@"; do
-    case "$argument" in -only-testing:EternalMonitorTests*) NEED_STREAM=0 ;; esac
+    case "$argument" in
+        -only-testing:EternalMonitorTests*|-only-testing:EternalMonitorUITests/ConnectScreenTests*) SELECTED=1 ;;
+        -only-testing:EternalMonitorUITests/StreamLifecycleTests*|-only-testing:EternalMonitorUITests) SELECTED=1; NEED_STREAM=1; NEED_LIFECYCLE=1 ;;
+        -only-testing:*) SELECTED=1; NEED_STREAM=1 ;;
+    esac
 done
+if [ "$SELECTED" = 0 ]; then NEED_STREAM=1; NEED_LIFECYCLE=1; fi
+if [ "$NEED_LIFECYCLE" = 1 ]; then
+    export EM_LIFECYCLE_DIR="${EM_LIFECYCLE_DIR:-$ROOT/build/ui-lifecycle-$STAMP}"
+    mkdir -p "$EM_LIFECYCLE_DIR"
+fi
 (cd "$ROOT/ios" && xcodegen generate)
 xcrun simctl bootstatus "$UDID" -b
 # Compiling while a software encoder and a newly booting simulator compete
@@ -50,10 +61,14 @@ for name in ['ui-state', 'ui-usb-state']:
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(dict(bitrate_mbps=15,target_fps=60,start_on_boot=False,require_pairing=False)))
 PYSETTINGS
+    HOST_COMMAND=("$ROOT/target/release/eternal-host" 19875)
+    if [ -n "${EM_LIFECYCLE_DIR:-}" ]; then
+        HOST_COMMAND=(python3 "$ROOT/scripts/lifecycle_host.py" "$EM_LIFECYCLE_DIR" "${HOST_COMMAND[@]}")
+    fi
     APPDATA="$ROOT/build/ui-state" ETERNAL_HEADLESS=1 ETERNAL_CAPTURE=synthetic \
         ETERNAL_SYNTH_SIZE=640x360 ETERNAL_ENCODER=libx264 ETERNAL_FPS=60 \
         ETERNAL_DROP=0.03 ETERNAL_REORDER=0.01 ETERNAL_INPUT_RECORDER_LOG=1 \
-        "$ROOT/target/release/eternal-host" 19875 > "$ROOT/build/ios-ui-host-$STAMP.log" 2>&1 &
+        "${HOST_COMMAND[@]}" > "$ROOT/build/ios-ui-host-$STAMP.log" 2>&1 &
     HOST_PID=$!
     python3 "$ROOT/scripts/usb_proxy.py" --control-port 19874 > "$ROOT/build/ios-usb-proxy-$STAMP.log" 2>&1 &
     USB_PROXY_PID=$!
@@ -82,8 +97,9 @@ products=pathlib.Path(sys.argv[1])
 runfile=max(products.glob('*.xctestrun'),key=lambda p:p.stat().st_mtime)
 data=plistlib.loads(runfile.read_bytes())
 env=data['EternalMonitorUITests'].setdefault('EnvironmentVariables',{})
-for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST','EM_INPUT_HOST_LOG','EM_INPUT_HOST']:
+for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST','EM_INPUT_HOST_LOG','EM_INPUT_HOST','EM_LIFECYCLE_DIR']:
     env.pop(key,None)
+if os.environ.get('EM_LIFECYCLE_DIR'): env['EM_LIFECYCLE_DIR']=os.environ['EM_LIFECYCLE_DIR']
 if sys.argv[3]=='1':
     env['EM_INPUT_HOST_LOG']=os.environ.get('EM_INPUT_HOST_LOG', sys.argv[4])
     env['EM_INPUT_HOST']=os.environ.get('EM_INPUT_HOST','127.0.0.1:19875')
