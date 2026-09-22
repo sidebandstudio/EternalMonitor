@@ -67,6 +67,22 @@ PY
 }
 trap cleanup EXIT
 
+# Resolve the exact simulator before building. A name-only Xcode destination
+# implicitly selects OS:latest, which may differ from the runtime under test.
+UDID="${EM_SIM_UDID:-}"
+if [ -z "$UDID" ]; then
+UDID=$(xcrun simctl list -j devices available | /usr/bin/python3 -c '
+import json, sys
+data = json.load(sys.stdin)["devices"]
+name = sys.argv[1]
+for devices in data.values():
+    for device in devices:
+        if device["name"] == name:
+            print(device["udid"]); sys.exit(0)
+sys.exit(1)
+' "$SIM_NAME")
+fi
+
 if [ "${EM_SKIP_BUILD:-0}" != 1 ]; then
 echo "==> Generating Xcode project"
 (cd "$ROOT/ios" && xcodegen generate >/dev/null)
@@ -75,7 +91,7 @@ echo "==> Building optimized app for simulator measurements"
 xcodebuild build \
     -project "$ROOT/ios/EternalMonitor.xcodeproj" \
     -scheme EternalMonitor -configuration Release \
-    -destination "platform=iOS Simulator,name=$SIM_NAME" \
+    -destination "platform=iOS Simulator,id=$UDID" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
     CODE_SIGNING_ALLOWED=NO -quiet
 echo "==> Building host"
@@ -96,16 +112,7 @@ MEASUREMENT_ARGS=(--link "$MEASURE_LINK")
 if [ "$TRANSPORT" = takeover ]; then MEASUREMENT_ARGS+=(--max-switch-ms 1000); fi
 
 echo "==> Booting simulator: $SIM_NAME"
-UDID=$(xcrun simctl list -j devices available | /usr/bin/python3 -c '
-import json, sys
-data = json.load(sys.stdin)["devices"]
-name = sys.argv[1]
-for devices in data.values():
-    for device in devices:
-        if device["name"] == name:
-            print(device["udid"]); sys.exit(0)
-sys.exit(1)
-' "$SIM_NAME")
+
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
 echo "==> Installing app"
