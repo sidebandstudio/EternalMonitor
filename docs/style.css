@@ -697,6 +697,7 @@ section {
 }
 
 .download-hero h1 {
+  font-size: clamp(1.5rem, 7vw, 4rem);
   margin-bottom: 12px;
 }
 
@@ -941,6 +942,32 @@ section {
   .reveal {
     opacity: 1;
     transform: none;
+  }
+}
+
+/* --- Responsive: Small phones --- */
+@media (max-width: 480px) {
+  .nav-inner {
+    padding-inline: 16px;
+    gap: 12px;
+  }
+
+  .nav-brand {
+    gap: 8px;
+    font-size: 0.9rem;
+  }
+
+  .nav-links {
+    gap: 12px;
+  }
+
+  .nav-links .btn-sm {
+    padding-inline: 12px;
+    font-size: 0.8rem;
+  }
+
+  .nav-link-label {
+    display: none;
   }
 }
 
