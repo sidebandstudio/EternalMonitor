@@ -44,10 +44,16 @@ HOST_PID=""
 MONITOR_PID=""
 PROXY_PID=""
 PROFILE_PID=""
+SOAK_PID=""
 UDID=""
 INSTALL_DIR=""
 cleanup() {
     status=$?
+    trap - EXIT
+    if [ -n "$SOAK_PID" ]; then
+        kill "$SOAK_PID" 2>/dev/null || true
+        wait "$SOAK_PID" || status=1
+    fi
     [ -n "$PROFILE_PID" ] && kill "$PROFILE_PID" 2>/dev/null || true
     [ -n "$PROFILE_PID" ] && wait "$PROFILE_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
@@ -66,6 +72,7 @@ p.write_text(json.dumps(r, indent=2)+'\n')
 PY
         echo "FAIL: evidence at $OUT" >&2
     fi
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -102,6 +109,7 @@ fi
 APP="$ROOT/ios/build/e2e/Build/Products/Release-iphonesimulator/EternalMonitor.app"
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }
 
+"$ROOT/scripts/pixels.sh" --prepare
 CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
 USB_DIRECT=""
 MEASURE_LINK=udp
@@ -158,6 +166,7 @@ ETERNAL_FPS="${ETERNAL_FPS:-60}" \
 HOST_PID=$!
 fi
 
+if [ "${EM_SOAK:-0}" != 1 ]; then
 python3 - "$OUT/resources.log" <<'PY' &
 import datetime, signal, subprocess, sys, time
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -170,12 +179,22 @@ with open(sys.argv[1], 'w') as out:
         time.sleep(2)
 PY
 MONITOR_PID=$!
+fi
 
 echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
-SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
+LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES -playPCaudio "$AUDIO" >/dev/null
+    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES -playPCaudio "$AUDIO")
+if [ "${EM_SOAK:-0}" = 1 ]; then
+    APP_PID="${LAUNCH_RESULT##*: }"
+    [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
+    SOURCE=(--host-pid "$HOST_PID")
+    if [ -n "$REMOTE_HOST" ]; then SOURCE=(--remote "$ROOT/scripts/win/remote.sh"); fi
+    python3 "$ROOT/scripts/soak_sample.py" "${SOURCE[@]}" --app-pid "$APP_PID" \
+        --log "$APP_LOG" --output "$OUT/resources.jsonl" > "$OUT/sampler.log" 2>&1 &
+    SOAK_PID=$!
+fi
 
 if [ "$TRANSPORT" = takeover ]; then
     echo "==> Waiting for WiFi frames before attaching the USB fixture"
@@ -216,6 +235,11 @@ done
 # consume CPU on the same machine as the simulator and synthetic host.
 MEASURED_LOG="$OUT/measured.log"
 cp "$APP_LOG" "$MEASURED_LOG"
+if [ -n "$SOAK_PID" ]; then
+    kill "$SOAK_PID"
+    wait "$SOAK_PID"
+    SOAK_PID=""
+fi
 
 first_frame=$(grep 'E2E_FIRST_FRAME' "$MEASURED_LOG" | grep -m1 "link=$MEASURE_LINK" || true)
 decoder_kind=$(grep -m1 'E2E_DECODER' "$MEASURED_LOG" || true)
@@ -251,7 +275,7 @@ PYBITRATE
 fi
 
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
-xcrun swift "$ROOT/scripts/px.swift" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
+"$ROOT/scripts/pixels.sh" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \

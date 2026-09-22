@@ -69,7 +69,10 @@ def main(args):
         if not 4 <= bitrate <= 50:
             raise ValueError("EM_BITRATE_MBPS must be between 4 and 50")
         settings_dir = ROOT + r"\state\EternalMonitor"
-        settings = json.dumps(dict(bitrate_mbps=bitrate, target_fps=60, start_on_boot=False))
+        # This isolated fixture profile is separate from the installed product.
+        settings = json.dumps(dict(bitrate_mbps=bitrate, target_fps=60, start_on_boot=False,
+                                   require_pairing=os.environ.get("EM_REQUIRE_PAIRING", "0") == "1",
+                                   stream_audio=os.environ.get("EM_AUDIO", "0") == "1"))
         command += "; New-Item -ItemType Directory -Force " + quote(settings_dir) + " | Out-Null"
         command += "; [System.IO.File]::WriteAllText(" + quote(settings_dir + r"\settings.json")
         command += "," + quote(settings) + ",(New-Object System.Text.UTF8Encoding($false)))"
@@ -80,6 +83,12 @@ def main(args):
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
         command += "; $p.WaitForExit(); if ($p.ExitCode -ne 0) { throw ('Host exited with ' + $p.ExitCode) }"
         session(command, detach=True, idle=True, timeout=7200)
+    elif action == "rss" and not args:
+        ps("$record=Get-Content " + quote(ROOT + r"\host.pid.json") + " -Raw | ConvertFrom-Json; "
+           "$p=Get-Process -Id $record.id; "
+           "if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { "
+           "throw 'The tracked host process identity changed' }; "
+           "@{pid=$p.Id;rss_kib=[math]::Ceiling($p.WorkingSet64/1024)} | ConvertTo-Json -Compress")
     elif action == "stop-host" and not args:
         ps("$file=" + quote(ROOT + r"\host.pid.json") + "; if (Test-Path $file) { "
            "$record=Get-Content $file -Raw | ConvertFrom-Json; "
