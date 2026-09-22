@@ -21,6 +21,8 @@ use crate::stats::PIPELINE_STATS;
 
 pub mod input;
 use input::{select_input, EncoderInput};
+#[cfg(target_os = "macos")]
+mod vimage;
 
 const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
@@ -314,8 +316,27 @@ fn run_encode_loop(
                 .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
         }
 
-        if let (Some(scaler), Some(bgra)) = (&mut encoder.scaler, &encoder.bgra_frame) {
-            scaler.run(bgra, &mut encoder.frame)?;
+        #[cfg(target_os = "macos")]
+        let converted = if let (Some(converter), Some(bgra)) =
+            (&encoder.native_converter, &encoder.bgra_frame)
+        {
+            match converter.convert(bgra, &mut encoder.frame) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, "Using swscale after native color conversion failed");
+                    encoder.native_converter = None;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "macos"))]
+        let converted = false;
+        if !converted {
+            if let (Some(scaler), Some(bgra)) = (&mut encoder.scaler, &encoder.bgra_frame) {
+                scaler.run(bgra, &mut encoder.frame)?;
+            }
         }
         let pts = if encoder.legacy_pts {
             raw_frame.frame_number as i64
@@ -453,6 +474,8 @@ fn run_encode_loop(
 }
 
 struct EncoderState {
+    #[cfg(target_os = "macos")]
+    native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     scaler: Option<ffmpeg_next::software::scaling::Context>,
     bgra_frame: Option<ffmpeg_next::frame::Video>,
@@ -554,6 +577,21 @@ impl EncoderState {
         }
 
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+                match vimage::Converter::new() {
+                    Ok(converter) => {
+                        info!("Accelerate BGRA->YUV420P converter ready");
+                        Some(converter)
+                    }
+                    Err(error) => {
+                        warn!(%error, "Using swscale color conversion");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
             encoder,
             scaler,
             bgra_frame: (pixel_format == ffmpeg_next::format::Pixel::YUV420P).then(|| {
