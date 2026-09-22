@@ -116,7 +116,7 @@ PY
 else
     skip=0
     for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd; do
-        codec=h264; size=640x360; drop=0; reorder=0; bitrate=15; idr=0; duration=0; repairs=0; backend=nw
+        codec=h264; size=640x360; drop=0; reorder=0; bitrate=15; idr=0; duration=5; repairs=0; backend=nw
         case "$scenario" in
             hevc-udp) codec=hevc ;;
             h264-udp-loss3) drop=0.03; reorder=0.01; duration=20; repairs=1 ;;
