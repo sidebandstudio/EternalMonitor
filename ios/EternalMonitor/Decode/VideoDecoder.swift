@@ -450,7 +450,7 @@ final class VideoDecoder {
         waitingForSyncSample = true
         onEvent?("VideoToolbox session ready (\(hardware ? "hardware" : "software") decoder)")
         if E2E.enabled {
-            E2E.logger.log("E2E_DECODER kind=\(hardware ? "hw" : "sw", privacy: .public)")
+            E2E.emit("E2E_DECODER kind=\(hardware ? "hw" : "sw")")
         }
     }
 
