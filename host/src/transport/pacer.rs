@@ -9,6 +9,42 @@
 
 use std::time::{Duration, Instant};
 
+/// Wake the async sender from a dedicated deadline thread. Tokio's millisecond
+/// timer wheel and OS timer coalescing can stretch a nominal 250 us pause past
+/// the entire frame budget. Socket/control processing stays on the runtime;
+/// only the short deadline wait runs here. One request can be queued.
+pub struct PacingClock {
+    tx: std::sync::mpsc::SyncSender<(Instant, tokio::sync::oneshot::Sender<()>)>,
+}
+
+impl PacingClock {
+    pub fn new() -> std::io::Result<Self> {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<(Instant, tokio::sync::oneshot::Sender<()>)>(1);
+        std::thread::Builder::new()
+            .name("packet-pacing".into())
+            .spawn(move || {
+                let mut timer = crate::capture::timing::FrameTimer::new();
+                while let Ok((deadline, done)) = rx.recv() {
+                    timer.wait_until(deadline);
+                    let _ = done.send(());
+                }
+            })?;
+        Ok(Self { tx })
+    }
+
+    pub async fn wait(&self, duration: Duration) {
+        let (done, ready) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .try_send((Instant::now() + duration.min(MAX_SPREAD), done))
+            .is_ok()
+        {
+            let _ = ready.await;
+        }
+    }
+}
+
 /// Frames at or below this many fragments go out unpaced.
 pub const PACE_THRESHOLD_FRAGS: usize = 16;
 /// Datagrams per burst between gaps.
@@ -58,6 +94,24 @@ impl FramePacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deadline_thread_wakes_the_runtime_and_releases_on_drop() {
+        let clock = PacingClock::new().unwrap();
+        let started = Instant::now();
+        for _ in 0..20 {
+            clock.wait(BATCH_GAP).await;
+        }
+        assert!(started.elapsed() >= BATCH_GAP * 20);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let (done, ready) = tokio::sync::oneshot::channel();
+        clock
+            .tx
+            .try_send((Instant::now() + BATCH_GAP, done))
+            .unwrap();
+        drop(clock);
+        ready.await.unwrap(); // dropping the clock never strands a pending wait
+    }
 
     #[test]
     fn small_frames_are_never_paced() {
