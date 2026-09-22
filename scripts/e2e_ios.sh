@@ -44,10 +44,13 @@ HOST_PID=""
 LOG_PID=""
 MONITOR_PID=""
 PROXY_PID=""
+PROFILE_PID=""
 UDID=""
 INSTALL_DIR=""
 cleanup() {
     status=$?
+    [ -n "$PROFILE_PID" ] && kill "$PROFILE_PID" 2>/dev/null || true
+    [ -n "$PROFILE_PID" ] && wait "$PROFILE_PID" 2>/dev/null || true
     [ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
@@ -184,6 +187,13 @@ if [ "$TRANSPORT" = takeover ]; then
     done
     python3 "$ROOT/scripts/usb_proxy.py" > "$OUT/usb-proxy.log" 2>&1 &
     PROXY_PID=$!
+fi
+
+# Optional bounded stack sampling for throughput investigations. The sampler
+# targets only this row's host and records stacks, never process arguments.
+if [ "${EM_PROFILE_HOST:-0}" = 1 ] && [ -n "$HOST_PID" ]; then
+    sample "$HOST_PID" 5 10 -file "$OUT/host-stacks.txt" > "$OUT/profile.log" 2>&1 &
+    PROFILE_PID=$!
 fi
 
 echo "==> Waiting for $WANT_DECODED decoded frames (timeout ${TIMEOUT_SECS}s)"
