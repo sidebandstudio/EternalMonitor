@@ -133,7 +133,6 @@ jobs:
 
   system-e2e:
     name: System E2E (simulator streaming)
-    # XCTest leaves diagnostic services consuming CPU after its simulators stop.
     # Measure the real encoder and client together on a fresh runner.
     runs-on: macos-15
     timeout-minutes: 30
@@ -141,6 +140,13 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare the disposable streaming runner
+        run: |
+          # Indexing the SDK and build output competes with both software codecs.
+          # This is a disposable CI VM, never a developer's machine.
+          sudo mdutil -a -i off
+          xcrun simctl list devices booted
+          xcrun simctl shutdown all
       - name: Install XcodeGen and streaming SDK
         run: |
           brew install xcodegen ffmpeg@7 pkgconf
@@ -156,10 +162,17 @@ jobs:
           sysctl -n hw.model hw.ncpu hw.memsize
       - name: Run simulator streaming matrix
         env:
-          EM_PROFILE_HOST: 1
           EM_SIM_NAME: cistream
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
-        run: scripts/e2e_matrix.sh --ci
+        run: |
+          mkdir -p build/e2e
+          vm_stat > build/e2e/vm-before.txt
+          sysctl vm.swapusage >> build/e2e/vm-before.txt
+          status=0
+          scripts/e2e_matrix.sh --ci || status=$?
+          vm_stat > build/e2e/vm-after.txt
+          sysctl vm.swapusage >> build/e2e/vm-after.txt
+          exit "$status"
       - name: Retain streaming evidence
         if: always()
         uses: actions/upload-artifact@v4
