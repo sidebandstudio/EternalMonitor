@@ -161,6 +161,13 @@ jobs:
           DEVICE_TYPE=com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB
           xcodebuild -version
           UDID=$(xcrun simctl create cistream "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
+          # Finish the cold boot before compilation gives background setup time to settle.
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          # This daemon forwards the simulator's live diagnostic stream and
+          # consumes a CPU on the three-core VM. Milestones are read directly
+          # from the app's file mirror; host logs and screenshots stay enabled.
+          xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.diagnosticd
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           sysctl -n hw.model hw.ncpu hw.memsize
       - name: Run simulator streaming matrix
