@@ -121,11 +121,11 @@ jobs:
           xcodebuild -version
           UDID=$(xcrun simctl create citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Run iOS unit and UI tests
+      - name: Run iOS unit tests and connection/settings UI tests
         env:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          scripts/test_ios.sh
+          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests
       - name: Retain iOS test evidence
         if: always()
         uses: actions/upload-artifact@v4

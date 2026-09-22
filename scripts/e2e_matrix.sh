@@ -20,8 +20,8 @@ write_report() {
 python3 - "$REPORT" "${rows[@]}" <<'PY'
 import datetime,json,pathlib,sys
 lines=['# EternalMonitor system tests', '', datetime.datetime.now(datetime.timezone.utc).isoformat(), '',
-       '| Scenario | Result | Average FPS | Decoded | Dropped | Repaired | NACKs | Stream seconds | Audio decoded | Audio lost | Tone dBFS | Screenshot |',
-       '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
+       '| Scenario | Result | Average FPS | Decoded | Dropped | Repaired | NACKs | Stream seconds | Audio decoded | Audio lost | Tone dBFS | Recovery seconds | Elapsed seconds | Screenshot |',
+       '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
 for filename in sys.argv[2:]:
     p=pathlib.Path(filename)
     r=json.loads(p.read_text()) if p.exists() else dict(scenario=p.parent.name,status='FAIL')
@@ -29,6 +29,7 @@ for filename in sys.argv[2:]:
     cells=[r['scenario'],r['status'],r.get('average_fps',r.get('fps','')),r.get('decoded',''),
            r.get('dropped',''),r.get('repaired',''),r.get('nacks',''),r.get('measured_seconds',''),
            r.get('audio_decoded',''),r.get('audio_lost',''),r.get('audio_tone1k_db',''),
+           r.get('recovery_seconds',''),r.get('elapsed',''),
            f'[PNG]({shot})' if shot else '']
     lines.append('| '+' | '.join(map(str,cells))+' |')
 pathlib.Path(sys.argv[1]).write_text('\n'.join(lines)+'\n')
@@ -116,12 +117,23 @@ PY
     done
 else
     skip=0
-    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio pairing keyboard; do
-        if [ "$scenario" = pairing ] || [ "$scenario" = keyboard ]; then
+    scenarios=(h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio pairing keyboard reconnect background-resume stream-ui)
+    if [ "$MODE" = --ci ]; then
+        # The full local gate also compares both socket paths and USB audio.
+        scenarios=(h264-udp hevc-udp h264-udp-loss3 h264-udp-burst usb-takeover h264-udp-audio pairing keyboard reconnect background-resume stream-ui)
+    fi
+    for scenario in "${scenarios[@]}"; do
+        runner=""
+        case "$scenario" in
+            pairing|keyboard) runner="e2e_$scenario.sh" ;;
+            reconnect|background-resume) runner=e2e_lifecycle.sh ;;
+            stream-ui) runner=e2e_stream_ui.sh ;;
+        esac
+        if [ -n "$runner" ]; then
             rows+=("$OUT/$scenario/result.json")
             echo "==> $scenario"
             if ! EM_SCENARIO="$scenario" EM_OUTPUT_DIR="$OUT/$scenario" \
-                "$ROOT/scripts/e2e_$scenario.sh" > "$OUT/$scenario-run.log" 2>&1; then failed=1; fi
+                "$ROOT/scripts/$runner" > "$OUT/$scenario-run.log" 2>&1; then failed=1; fi
             tail -5 "$OUT/$scenario-run.log"
             continue
         fi

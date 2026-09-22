@@ -42,7 +42,7 @@ for name in names:
                 shutil.copy2(shots/item['exportedFileName'],out/(name+'.png')); found=True
     if not found: errors.append('Missing screenshot: '+name)
     else:
-        result=subprocess.run(['xcrun','swift',str(root/'scripts/px.swift'),str(out/(name+'.png')),'--assert-pattern'],capture_output=True,text=True)
+        result=subprocess.run([str(root/'scripts/pixels.sh'),str(out/(name+'.png')),'--assert-pattern'],capture_output=True,text=True)
         (out/(name+'-pixels.log')).write_text(result.stdout+result.stderr)
         if result.returncode: errors.append('Pixel assertion failed: '+name)
 app=(out/'app.log').read_text(errors='replace') if (out/'app.log').exists() else ''
