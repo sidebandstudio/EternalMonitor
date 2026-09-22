@@ -343,13 +343,14 @@ impl AnalyzerApp {
 }
 
 impl eframe::App for AnalyzerApp {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if self.settings_dirty_at.take().is_some() {
             self.persist_settings();
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= std::time::Duration::from_millis(800) {
                 self.settings_dirty_at = None;
@@ -387,7 +388,7 @@ impl eframe::App for AnalyzerApp {
         ctx.set_visuals(visuals);
 
         let snap = StatsSnapshot::take();
-        self.draw_sidebar(ctx, &snap);
+        self.draw_sidebar(ui, &snap);
 
         egui::CentralPanel::default()
             .frame(
@@ -395,7 +396,7 @@ impl eframe::App for AnalyzerApp {
                     .fill(BG)
                     .inner_margin(egui::Margin::same(16)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 if self.settings_check_updates && !self.update_dismissed {
                     let update = self.available_update.lock().clone();
                     if let Some(version) = update {
@@ -417,15 +418,16 @@ impl eframe::App for AnalyzerApp {
             });
 
         if self.show_qr_modal {
-            self.draw_qr_modal(ctx, &snap);
+            self.draw_qr_modal(&ctx, &snap);
         }
     }
 }
 
 impl AnalyzerApp {
-    fn draw_sidebar(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
-        egui::SidePanel::left("sidebar")
-            .exact_width(200.0)
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui, snap: &StatsSnapshot) {
+        let ctx = ui.ctx().clone();
+        egui::Panel::left("sidebar")
+            .exact_size(200.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -433,7 +435,7 @@ impl AnalyzerApp {
                     .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::same(12)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 logo_widget(ui);
                 ui.add_space(24.0);
 
@@ -443,7 +445,7 @@ impl AnalyzerApp {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(4.0);
-                    status_pill(ui, ctx, snap.pipeline_running, &snap.target_addr);
+                    status_pill(ui, &ctx, snap.pipeline_running, &snap.target_addr);
                 });
             });
     }
@@ -1873,7 +1875,7 @@ mod tests {
                 audio.error = Some("Output was removed".into());
             }
             let context = egui::Context::default();
-            let output = context.run(
+            let output = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1889,6 +1891,8 @@ mod tests {
             for clipped in &output.shapes {
                 painted_text(&clipped.shape, &mut text);
             }
+            // These unit tests inspect text, without a GPU texture consumer.
+            output.drop_without_applying_deltas();
             assert!(
                 text.contains("PC AUDIO") && text.contains("USB Audio Device"),
                 "{text}"
@@ -1932,7 +1936,7 @@ mod tests {
             snapshot.usb_link_state = "Connected".into();
             snapshot.usb_frames_dropped = 17;
             let context = egui::Context::default();
-            let output = context.run(
+            let output = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1948,6 +1952,7 @@ mod tests {
             for clipped in &output.shapes {
                 painted_text(&clipped.shape, &mut text);
             }
+            output.drop_without_applying_deltas();
             assert!(text.contains("USB CONNECTION"), "{text}");
             if available {
                 assert!(

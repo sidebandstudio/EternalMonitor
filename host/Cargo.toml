@@ -14,7 +14,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # GUI
-eframe = "0.31"
+eframe = "0.36"
 
 # QR code rendering for the "QR Code" modal in the GUI
 qrcode = { version = "0.14", default-features = false }
