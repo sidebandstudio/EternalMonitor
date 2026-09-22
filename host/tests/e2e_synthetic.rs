@@ -253,6 +253,7 @@ struct FakeReceiver {
     session_id: u32,
     msg_seq: u32,
     last_report: Instant,
+    host_caps: u16,
 }
 
 impl FakeReceiver {
@@ -335,6 +336,7 @@ impl FakeReceiver {
             session_id: ack.session_id,
             msg_seq: 1,
             last_report: Instant::now(),
+            host_caps: ack.host_caps,
         }
     }
 
@@ -357,6 +359,176 @@ impl FakeReceiver {
                 ..Default::default()
             }));
         }
+    }
+}
+
+#[test]
+fn audio_stream_end_to_end() {
+    use eternal_wire::v2::audio::AudioHeader;
+    use eternal_wire::v2::control::{FEATURE_WANTS_AUDIO, HOSTCAP_AUDIO};
+    use std::sync::atomic::Ordering;
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_AUDIO", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in [
+        "ETERNAL_DROP",
+        "ETERNAL_REORDER",
+        "ETERNAL_JITTER_MS",
+        "ETERNAL_USB_DIRECT",
+    ] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".into());
+    shared.max_dgram.store(576, Ordering::SeqCst);
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buffer = [0; 2048];
+        let assert_video_without_audio = |receiver: &mut FakeReceiver, duration: Duration| {
+            let end = Instant::now() + duration;
+            let mut buffer = [0; 2048];
+            let mut video = 0;
+            while Instant::now() < end {
+                receiver.maybe_report(0, 0);
+                if let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) {
+                    match classify(&buffer[..len]) {
+                        Classified::Audio { .. } => {
+                            panic!("audio was sent without both peers opting in")
+                        }
+                        Classified::Media { .. } => video += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert!(video >= 30, "video stopped while audio was off");
+        };
+
+        let mut legacy = FakeReceiver::connect(listen_port);
+        assert_ne!(legacy.host_caps & HOSTCAP_AUDIO, 0);
+        assert_video_without_audio(&mut legacy, Duration::from_millis(600));
+        legacy.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        drop(legacy);
+        std::thread::sleep(Duration::from_millis(100));
+
+        shared.audio_enabled.store(false, Ordering::SeqCst);
+        let mut receiver =
+            FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_WANTS_AUDIO);
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
+        shared.audio_enabled.store(true, Ordering::SeqCst);
+        let codec = ffmpeg_next::decoder::find_by_name("opus").unwrap();
+        let mut context = ffmpeg_next::codec::Context::new_with_codec(codec);
+        unsafe {
+            ffmpeg_next::ffi::av_channel_layout_default(&mut (*context.as_mut_ptr()).ch_layout, 2);
+            (*context.as_mut_ptr()).sample_rate = 48_000;
+        }
+        let mut decoder = context.decoder().audio().unwrap();
+        let mut previous: Option<AudioHeader> = None;
+        let mut audio_packets = 0;
+        let mut quiet_packets = 0;
+        let mut pcm = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while audio_packets < 130 {
+            assert!(
+                Instant::now() < deadline,
+                "only {audio_packets} audio packets arrived"
+            );
+            receiver.maybe_report(0, 0);
+            let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if !matches!(classify(&buffer[..len]), Classified::Audio { .. }) {
+                continue;
+            }
+            assert!(len <= 576);
+            let (header, payload) = AudioHeader::decode(&buffer[..len]).unwrap();
+            assert_eq!(header.session_id, receiver.session_id);
+            if let Some(previous) = previous {
+                assert_eq!(header.audio_seq, previous.audio_seq.wrapping_add(1));
+                assert!(header.capture_ts_us > previous.capture_ts_us);
+                assert_eq!(header.stream_epoch, previous.stream_epoch);
+            } else {
+                assert!(
+                    header.discontinuity,
+                    "first audio packet lacks DISCONTINUITY"
+                );
+            }
+            if header.discontinuity {
+                decoder.flush();
+            }
+            decoder
+                .send_packet(&ffmpeg_next::Packet::copy(payload))
+                .unwrap();
+            let mut frame = ffmpeg_next::frame::Audio::empty();
+            decoder.receive_frame(&mut frame).unwrap();
+            assert_eq!(frame.samples(), 960);
+            pcm.extend_from_slice(frame.plane::<f32>(0));
+            previous = Some(header);
+            audio_packets += 1;
+            quiet_packets += usize::from(payload.len() < 10);
+        }
+        let window = &pcm[4800..9600];
+        let mut re = 0.0;
+        let mut im = 0.0;
+        for (i, &value) in window.iter().enumerate() {
+            let phase = std::f64::consts::TAU * 1000.0 * i as f64 / 48000.0;
+            re += f64::from(value) * phase.cos();
+            im += f64::from(value) * phase.sin();
+        }
+        let tone_db = 20.0 * (2.0 * re.hypot(im) / window.len() as f64).log10();
+        assert!(tone_db > -20.0, "1 kHz tone too quiet: {tone_db} dBFS");
+        assert!(
+            quiet_packets >= 5,
+            "100 ms silence did not produce small Opus packets"
+        );
+        eprintln!(
+            "Audio E2E decoded={audio_packets}, tone={tone_db:.2} dBFS, quiet={quiet_packets}"
+        );
+
+        shared.audio_enabled.store(false, Ordering::SeqCst);
+        let drain_until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < drain_until {
+            let _ = receiver.socket.recv_from(&mut buffer);
+        }
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
+
+        // Force an actual source-open error. It must disable audio for this
+        // session, without opening a Windows endpoint or restarting video.
+        let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        std::env::set_var("ETERNAL_AUDIO", "invalid-test-source");
+        shared.audio_enabled.store(true, Ordering::SeqCst);
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
+        assert!(eternal_host::stats::PIPELINE_STATS
+            .lock()
+            .audio
+            .error
+            .is_some());
+        assert_eq!(
+            eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    supervisor.join().unwrap();
+    std::env::remove_var("ETERNAL_AUDIO");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
 

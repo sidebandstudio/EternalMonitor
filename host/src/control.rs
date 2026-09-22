@@ -48,6 +48,9 @@ pub struct SharedControl {
     /// session only when this is on AND the connected client advertised HEVC
     /// decode in its HELLO2.
     pub hevc_enabled: Arc<AtomicBool>,
+    /// Host permission to capture and stream PC audio. The client must also
+    /// negotiate FEATURE_WANTS_AUDIO before the audio stage opens an endpoint.
+    pub audio_enabled: Arc<AtomicBool>,
     /// What the encoder is actually emitting right now (wire `CODEC_*` value),
     /// written on every encoder open and reported in HELLO_ACK/heartbeats.
     pub active_codec: Arc<AtomicU8>,
@@ -124,6 +127,7 @@ impl SharedControl {
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
             capture_geometry: Arc::new(Mutex::new(None)),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
+            audio_enabled: Arc::new(AtomicBool::new(true)),
             active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),
             session: Arc::new(Mutex::new(crate::transport::session::Session::new({
                 use std::hash::{BuildHasher, Hasher};

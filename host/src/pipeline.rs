@@ -39,6 +39,23 @@ pub async fn run_pipeline_supervised(
 
     let (frame_producer, frame_consumer) = capture::frame_slot();
     let (nal_tx, nal_rx) = tokio_mpsc::channel(encoder::NAL_CHANNEL_CAPACITY);
+    let (audio_tx, audio_rx) = tokio_mpsc::channel(crate::audio::QUEUE_CAPACITY);
+
+    let audio_shared = shared.clone();
+    let audio_reporter = reporter.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("audio-g{generation}"))
+        .spawn(move || {
+            crate::audio::run_audio_stage(audio_tx, audio_shared, generation, audio_reporter)
+        })
+    {
+        let reason = error.to_string();
+        let mut stats = stats::PIPELINE_STATS.lock();
+        stats.audio.stopped("Unavailable");
+        stats.audio.error = Some(reason.clone());
+        drop(stats);
+        reporter.stage_exited(Stage::Audio, StageOutcome::Failed(reason));
+    }
 
     let capture_reporter = reporter.clone();
     let capture_shared = shared.clone();
@@ -86,7 +103,9 @@ pub async fn run_pipeline_supervised(
     }
 
     let transport_outcome =
-        match transport::start_sender(nal_rx, listen_port, shared.clone(), supervisor_tx).await {
+        match transport::start_sender(nal_rx, audio_rx, listen_port, shared.clone(), supervisor_tx)
+            .await
+        {
             Ok(()) => StageOutcome::Completed,
             Err(e) => {
                 error!(error = %e, "Transport sender exited with error");

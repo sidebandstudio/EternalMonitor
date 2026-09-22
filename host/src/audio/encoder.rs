@@ -98,6 +98,14 @@ impl OpusEncoder {
         Ok(packet)
     }
 
+    pub fn reopen(&mut self) -> AudioResult<()> {
+        self.drain_tail();
+        self.encoder = open_encoder()?;
+        self.quiet = false;
+        self.discontinuity = true;
+        Ok(())
+    }
+
     fn drain_tail(&mut self) {
         // The low-delay lookahead leaves a partial frame at EOF. A live
         // restart replaces that tail with a marked discontinuity, rather
