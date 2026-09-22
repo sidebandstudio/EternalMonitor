@@ -22,6 +22,7 @@ use tracing::{info, warn};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 pub const REPORT_INTERVAL_MS: u16 = 500;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
+const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -66,6 +67,7 @@ struct ActiveSession {
     peer: PeerId,
     info: ClientInfo,
     liveness_deadline: Instant,
+    awaiting_takeover: bool,
     last_keyframe_grant: Option<Instant>,
     last_report: Option<ReceiverReport>,
     msg_seq_out: u32,
@@ -182,13 +184,14 @@ impl Session {
         // down the one that replaced it.
         if !matches!(message, ControlMessage::Hello2(_)) {
             match self.active.as_ref() {
-                Some(session) if session.session_id == header_session_id => {}
+                Some(session)
+                    if session.session_id == header_session_id && !session.awaiting_takeover => {}
                 _ => return Actions::default(),
             }
         }
         match message {
             ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
-            ControlMessage::Bye(reason) => self.handle_bye(source, reason),
+            ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
@@ -332,6 +335,7 @@ impl Session {
                 connected_at: now,
             },
             liveness_deadline: now + LIVENESS_TIMEOUT,
+            awaiting_takeover: false,
             last_keyframe_grant: None,
             last_report: None,
             msg_seq_out: 0,
@@ -344,15 +348,27 @@ impl Session {
         actions
     }
 
-    fn handle_bye(&mut self, source: PeerId, reason: ByeReason) -> Actions {
+    fn handle_bye(&mut self, source: PeerId, reason: ByeReason, now: Instant) -> Actions {
         let mut actions = Actions::default();
-        let Some(session) = self.active.as_ref() else {
+        let Some(session) = self.active.as_mut() else {
             return actions;
         };
         if !session_peer_matches(session, source) {
             return actions;
         }
         info!(peer = %source, ?reason, "Client said goodbye");
+        if reason == ByeReason::Superseded
+            && source.link == LinkId::Udp
+            && session.info.device_id != 0
+        {
+            // WiFi BYE and USB HELLO travel on different links and may arrive
+            // in either order. Retain the display until the same device takes
+            // over, with a short deadline if the new link never handshakes.
+            session.awaiting_takeover = true;
+            session.liveness_deadline = now + USB_TAKEOVER_TIMEOUT;
+            info!(peer = %source, "Awaiting USB takeover after WiFi goodbye");
+            return actions;
+        }
         self.active = None;
         actions.client_lost = true;
         actions
@@ -656,6 +672,79 @@ mod tests {
         let same_device =
             session.handle_control(new_ip, 0, identified_hello(3, 77), &TestConfig, now);
         assert_eq!(same_device.new_target, Some(new_ip));
+    }
+
+    #[test]
+    fn wifi_goodbye_preserves_the_display_until_usb_takes_over() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        let usb = PeerId::usb(17);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        let wifi_id = session.session_id().unwrap();
+        let bye = session.handle_control(
+            wifi,
+            wifi_id,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &TestConfig,
+            now,
+        );
+        assert!(!bye.client_lost);
+        assert_eq!(session.peer(), Some(wifi));
+        let later = now + USB_TAKEOVER_TIMEOUT / 2;
+        let foreign = session.handle_control(usb, 0, identified_hello(2, 88), &TestConfig, later);
+        assert_eq!(parse_ack(&foreign.replies[0].1).status, HelloStatus::Busy);
+        let takeover = session.handle_control(usb, 0, identified_hello(2, 77), &TestConfig, later);
+        assert_eq!(takeover.new_target, Some(usb));
+        assert!(takeover.force_idr);
+        assert!(!takeover.client_lost);
+        assert_ne!(session.session_id(), Some(wifi_id));
+        assert!(
+            !session
+                .tick(&TestConfig, false, now + USB_TAKEOVER_TIMEOUT)
+                .client_lost
+        );
+    }
+
+    #[test]
+    fn missing_usb_takeover_expires_and_late_wifi_traffic_cannot_extend_it() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.handle_control(
+            wifi,
+            id,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &TestConfig,
+            now,
+        );
+        let late = session.handle_control(
+            wifi,
+            id,
+            ControlMessage::ReceiverReport(ReceiverReport::default()),
+            &TestConfig,
+            now + USB_TAKEOVER_TIMEOUT / 2,
+        );
+        assert!(late.report.is_none());
+        let expired = session.tick(&TestConfig, false, now + USB_TAKEOVER_TIMEOUT);
+        assert!(expired.client_lost);
+        assert!(!session.is_active());
+        for (peer, device_id, reason) in [
+            (wifi, 0, ByeReason::Superseded),
+            (wifi, 77, ByeReason::UserDisconnect),
+            (PeerId::usb(17), 77, ByeReason::Superseded),
+        ] {
+            session.handle_control(peer, 0, identified_hello(2, device_id), &TestConfig, now);
+            let bye =
+                session.handle_control_authed(peer, ControlMessage::Bye(reason), &TestConfig, now);
+            assert!(
+                bye.client_lost,
+                "grace only applies to an identified WiFi takeover"
+            );
+            assert!(!session.is_active());
+        }
     }
 
     #[test]
