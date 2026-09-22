@@ -40,7 +40,6 @@ HOST_LOG="$OUT/host.log"
 rm -f "$OUT/result.json"
 
 HOST_PID=""
-LOG_PID=""
 MONITOR_PID=""
 PROXY_PID=""
 PROFILE_PID=""
@@ -50,7 +49,6 @@ cleanup() {
     status=$?
     [ -n "$PROFILE_PID" ] && kill "$PROFILE_PID" 2>/dev/null || true
     [ -n "$PROFILE_PID" ] && wait "$PROFILE_PID" 2>/dev/null || true
-    [ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
@@ -126,11 +124,13 @@ ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
 xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 
-echo "==> Streaming app E2E log"
-xcrun simctl spawn "$UDID" log stream --style compact \
-    --predicate 'subsystem == "com.eternal.monitor.e2e"' >"$APP_LOG" 2>&1 &
-LOG_PID=$!
-sleep 2 # let the log stream attach before the milestones start
+# Read the app's identical milestone mirror directly. Streaming the complete
+# simulator log through diagnosticd can consume a CPU on small hosted runners.
+APP_DATA=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
+SIM_LOG="$APP_DATA/tmp/eternal-e2e.log"
+rm -f "$SIM_LOG" "$APP_LOG"
+touch "$SIM_LOG"
+ln "$SIM_LOG" "$APP_LOG"
 
 HEVC_FLAG=0
 [ "$CODEC" = "hevc" ] && HEVC_FLAG=1
@@ -233,6 +233,18 @@ if [ -z "$REMOTE_HOST" ] && [ "$CODEC" = "hevc" ] && ! grep -q "libx265" "$HOST_
     echo "FAIL: hevc requested but the host never opened an HEVC encoder session"
     echo "----- host log -----"; tail -30 "$HOST_LOG"
     exit 1
+fi
+
+if [ -z "$REMOTE_HOST" ] && [ "${ETERNAL_ABR:-1}" = 0 ]; then
+    python3 - "$HOST_LOG" "${EM_BITRATE_MBPS:-15}" <<'PYBITRATE'
+import pathlib,re,sys
+text=re.sub(r'\x1b\[[0-9;]*m','',pathlib.Path(sys.argv[1]).read_text())
+opened=[line for line in text.splitlines() if 'Encoder opened' in line]
+rates=[int(m.group(1)) for line in opened if (m:=re.search(r'\bbitrate=(\d+)',line))]
+expected=round(float(sys.argv[2])*1_000_000)
+if not rates or any(rate!=expected for rate in rates):
+    sys.exit(f'Fixed bitrate mismatch: opened {rates}, expected {expected}')
+PYBITRATE
 fi
 
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
