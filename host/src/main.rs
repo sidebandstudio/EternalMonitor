@@ -122,6 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .hevc_enabled
         .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+    shared
+        .audio_enabled
+        .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
     {
         let mut stats = stats::PIPELINE_STATS.lock();

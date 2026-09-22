@@ -1,6 +1,7 @@
 //! EternalMonitor host library. The binary (`main.rs`) is a thin bootstrap
 //! over these modules; end-to-end tests drive the same pipeline headlessly.
 
+pub mod audio;
 pub mod autostart;
 pub mod capture;
 pub mod clock;

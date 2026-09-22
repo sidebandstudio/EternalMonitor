@@ -78,6 +78,10 @@ final class MediaDatagrams {
             )
         case .control:
             onControlDatagram?(data)
+        case .audio:
+            // Playback is enabled by the audio-client change. Until then the
+            // client does not advertise WANTS_AUDIO.
+            break
         case .legacyHello:
             // The host never sends this; ignore.
             break

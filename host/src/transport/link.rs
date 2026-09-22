@@ -8,7 +8,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
+use eternal_wire::v2::audio::{AudioHeader, AUDIO_FLAG_DISCONTINUITY};
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified, MAX_DGRAM_SIZE};
 use parking_lot::Mutex;
@@ -247,12 +249,49 @@ impl VideoQueue {
 #[derive(Default)]
 struct Outbound {
     controls: VecDeque<Vec<u8>>,
+    audio: AudioQueue,
     video: VideoQueue,
+}
+
+#[derive(Default)]
+struct AudioQueue {
+    packets: VecDeque<(Instant, Vec<u8>)>,
+    reset_pending: bool,
+}
+
+impl AudioQueue {
+    fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
+        AudioHeader::decode(bytes).map_err(|_| invalid("audio header"))?;
+        let dropped = u64::from(self.packets.len() == crate::audio::QUEUE_CAPACITY);
+        if dropped > 0 {
+            self.packets.pop_front();
+            self.reset_pending = true;
+        }
+        self.packets.push_back((now, bytes.to_vec()));
+        Ok(dropped)
+    }
+
+    fn pop(&mut self, now: Instant) -> (Option<Vec<u8>>, u64) {
+        let mut dropped = 0;
+        while let Some((at, mut bytes)) = self.packets.pop_front() {
+            if now.saturating_duration_since(at) > Duration::from_millis(100) {
+                dropped += 1;
+                self.reset_pending = true;
+                continue;
+            }
+            if std::mem::take(&mut self.reset_pending) {
+                bytes[4] |= AUDIO_FLAG_DISCONTINUITY;
+            }
+            return (Some(bytes), dropped);
+        }
+        (None, dropped)
+    }
 }
 
 #[derive(Default)]
 pub struct FramedStats {
     pub frames_dropped: AtomicU64,
+    pub audio_packets_dropped: AtomicU64,
 }
 
 struct WriterState {
@@ -264,6 +303,18 @@ struct WriterState {
 }
 
 impl WriterState {
+    fn take_priority(&self) -> Option<Vec<u8>> {
+        let mut queue = self.queue.lock();
+        if let Some(control) = queue.controls.pop_front() {
+            return Some(control);
+        }
+        let (audio, dropped) = queue.audio.pop(Instant::now());
+        self.stats
+            .audio_packets_dropped
+            .fetch_add(dropped, Ordering::Relaxed);
+        audio
+    }
+
     fn record_drops(&self, dropped: u64) {
         if dropped > 0 {
             self.stats
@@ -414,6 +465,13 @@ impl Link for FramedLink {
             let mut queue = self.state.queue.lock();
             if matches!(classify(datagram), Classified::Media { .. }) {
                 queue.video.push(datagram)?
+            } else if matches!(classify(datagram), Classified::Audio { .. }) {
+                let dropped = queue.audio.push(datagram, Instant::now())?;
+                self.state
+                    .stats
+                    .audio_packets_dropped
+                    .fetch_add(dropped, Ordering::Relaxed);
+                0
             } else {
                 if queue.controls.len() >= CONTROL_LIMIT {
                     return Err(io::Error::new(
@@ -446,12 +504,9 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
         if *closed.borrow() {
             return Ok(());
         }
-        let (control, frame) = {
-            let mut queue = state.queue.lock();
-            match queue.controls.pop_front() {
-                Some(packet) => (Some(packet), None),
-                None => (None, queue.video.pop()),
-            }
+        let (control, frame) = match state.take_priority() {
+            Some(packet) => (Some(packet), None),
+            None => (None, state.queue.lock().video.pop()),
         };
         if let Some(packet) = control {
             tokio::select! {
@@ -473,6 +528,15 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
                     state.record_drops(1);
                     break;
                 }
+                // Audio and control can pass between video datagrams, without
+                // ever interrupting a partly written TCP frame prefix/body.
+                while let Some(priority) = state.take_priority() {
+                    tokio::select! {
+                        biased;
+                        _ = closed.changed() => return Ok(()),
+                        sent = write_datagram(&mut writer, &priority) => sent?,
+                    }
+                }
             }
         } else {
             tokio::select! {
@@ -489,6 +553,44 @@ mod tests {
     use super::*;
     use eternal_wire::v2::control::{encode_control, ControlMessage, Ping};
     use eternal_wire::v2::media::MEDIA_HEADER_SIZE;
+
+    #[test]
+    fn audio_queue_drops_old_packets_and_marks_recovery_without_growing_latency() {
+        let mut queue = AudioQueue::default();
+        let now = Instant::now();
+        let packet = |seq| {
+            AudioHeader {
+                session_id: 1,
+                stream_epoch: 7,
+                audio_seq: seq,
+                capture_ts_us: 1000,
+                discontinuity: false,
+            }
+            .encode(&[0xF8, 0xFF, 0xFE])
+            .unwrap()
+        };
+        for seq in 0..4 {
+            assert_eq!(queue.push(&packet(seq), now).unwrap(), u64::from(seq == 3));
+        }
+        assert_eq!(queue.packets.len(), 3);
+        let (bytes, dropped) = queue.pop(now);
+        assert_eq!(dropped, 0);
+        let (header, _) = AudioHeader::decode(bytes.as_ref().unwrap()).unwrap();
+        assert_eq!(header.audio_seq, 1);
+        assert!(header.discontinuity);
+        let later = now + Duration::from_millis(101);
+        assert_eq!(queue.pop(later), (None, 2));
+        queue.push(&packet(4), later).unwrap();
+        let (bytes, dropped) = queue.pop(later);
+        assert_eq!(dropped, 0);
+        assert!(
+            AudioHeader::decode(bytes.as_ref().unwrap())
+                .unwrap()
+                .0
+                .discontinuity
+        );
+        assert!(queue.push(&[0; 12], now).is_err());
+    }
 
     fn packet(seq: u32, keyframe: bool, index: u16, count: u16, size: usize) -> Vec<u8> {
         let mut bytes = vec![0xAC; size];

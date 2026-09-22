@@ -56,6 +56,7 @@ enum AppTab {
 
 struct StatsSnapshot {
     listen_addr: String,
+    audio: crate::audio::AudioStats,
     capture_fps: f64,
     capture_frame_count: u64,
     capture_resolution: (u32, u32),
@@ -90,6 +91,7 @@ impl StatsSnapshot {
         let s = PIPELINE_STATS.lock();
         Self {
             listen_addr: s.listen_addr.clone(),
+            audio: s.audio.clone(),
             capture_fps: s.capture_fps,
             capture_frame_count: s.capture_frame_count,
             capture_resolution: s.capture_resolution,
@@ -243,6 +245,10 @@ impl AnalyzerApp {
             .shared
             .hevc_enabled
             .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+        control
+            .shared
+            .audio_enabled
+            .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
         let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
             // Persisted state disagrees with the registry — trust the registry as ground truth.
@@ -306,6 +312,11 @@ impl AnalyzerApp {
                 Some(self.settings_capture_display.clone())
             },
             hevc_enabled: self.settings_hevc_enabled,
+            stream_audio: self
+                .control
+                .shared
+                .audio_enabled
+                .load(std::sync::atomic::Ordering::SeqCst),
             vdd_match_resolution: self.settings_vdd_match,
             start_on_boot: self.settings_start_on_boot,
         };
@@ -500,6 +511,8 @@ impl AnalyzerApp {
         ui.add_space(12.0);
 
         usb_card(ui, snap);
+        ui.add_space(12.0);
+        audio_card(ui, &snap.audio);
         ui.add_space(12.0);
 
         // ── Live readouts ────────────────────────────────────────────────────
@@ -925,6 +938,13 @@ impl AnalyzerApp {
             ui.add_space(12.0);
 
             // --- Start on Windows startup (Windows-only concept) ------------------
+            let mut stream_audio = self.control.shared.audio_enabled.load(std::sync::atomic::Ordering::SeqCst);
+            if ui.checkbox(&mut stream_audio, egui::RichText::new("Stream PC audio").color(TEXT).size(13.0)).changed() {
+                self.control.shared.audio_enabled.store(stream_audio, std::sync::atomic::Ordering::SeqCst);
+                self.persist_settings();
+            }
+            ui.add_space(12.0);
+
             if cfg!(windows) {
                 let prev_boot = self.settings_start_on_boot;
                 ui.checkbox(
@@ -1653,9 +1673,70 @@ fn usb_card(ui: &mut egui::Ui, snap: &StatsSnapshot) {
     });
 }
 
+fn audio_card(ui: &mut egui::Ui, audio: &crate::audio::AudioStats) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_header(ui, "PC audio");
+        stat_row(ui, "Status", &audio.status);
+        if !audio.device.is_empty() { stat_row(ui, "Output", &audio.device); }
+        if audio.status == "Streaming" {
+            stat_row(ui, "Opus", &format!("{:.0} kbps · {:.0} packets/s", audio.kbps, audio.packets_per_sec));
+        }
+        if let Some(error) = &audio.error {
+            ui.label(egui::RichText::new(format!("Audio unavailable: {error}. Video continues. Turn Stream PC audio off and on to retry.")).color(WARN_AMBER).size(11.0));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_card_reports_rate_and_keeps_failure_separate_from_video() {
+        let mut audio = crate::audio::AudioStats::started("USB Audio Device");
+        audio.kbps = 128.0;
+        audio.packets_per_sec = 50.0;
+        for failed in [false, true] {
+            if failed {
+                audio.stopped("Unavailable");
+                audio.error = Some("Output was removed".into());
+            }
+            let context = egui::Context::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| audio_card(ui, &audio));
+                },
+            );
+            let mut text = String::new();
+            for clipped in &output.shapes {
+                painted_text(&clipped.shape, &mut text);
+            }
+            assert!(
+                text.contains("PC AUDIO") && text.contains("USB Audio Device"),
+                "{text}"
+            );
+            if failed {
+                assert!(
+                    text.contains("Output was removed") && text.contains("Video continues"),
+                    "{text}"
+                );
+                assert!(!text.contains("128 kbps"), "{text}");
+            } else {
+                assert!(
+                    text.contains("128 kbps") && text.contains("50 packets/s"),
+                    "{text}"
+                );
+            }
+        }
+    }
 
     fn painted_text(shape: &egui::epaint::Shape, output: &mut String) {
         match shape {

@@ -39,6 +39,7 @@ pub enum Stage {
     Capture,
     Encoder,
     Transport,
+    Audio,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +165,15 @@ impl Machine {
         };
         if generation != live_generation {
             return Effect::None; // poisoned: an old generation's ghost
+        }
+        if stage == Stage::Audio {
+            if let StageOutcome::Failed(reason) = outcome {
+                warn!(
+                    reason,
+                    "PC audio unavailable for this session; video continues"
+                );
+            }
+            return Effect::None;
         }
         match outcome {
             StageOutcome::Completed => Effect::None,
@@ -483,6 +493,36 @@ fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_failures_never_restart_or_exhaust_the_video_failure_budget() {
+        let mut machine = Machine::new(7);
+        for _ in 0..20 {
+            assert_eq!(
+                machine.on_stage_exit(
+                    7,
+                    Stage::Audio,
+                    &StageOutcome::Failed("endpoint removed".into()),
+                    Instant::now()
+                ),
+                Effect::None
+            );
+        }
+        assert_eq!(machine.state, SupervisorState::Running { generation: 7 });
+        assert_eq!(
+            machine.on_stage_exit(
+                7,
+                Stage::Encoder,
+                &StageOutcome::Failed("encoder failed".into()),
+                Instant::now()
+            ),
+            Effect::StopPipeline
+        );
+        assert!(matches!(
+            machine.state,
+            SupervisorState::BackingOff { attempt: 1, .. }
+        ));
+    }
 
     fn failed(reason: &str) -> StageOutcome {
         StageOutcome::Failed(reason.to_string())

@@ -1,4 +1,5 @@
 pub mod abr;
+mod audio;
 pub mod fault;
 pub mod link;
 pub mod pacer;
@@ -70,8 +71,13 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn host_caps(&self) -> u16 {
-        if PIPELINE_STATS.lock().usb_service_reachable {
+        let usb = if PIPELINE_STATS.lock().usb_service_reachable {
             eternal_wire::v2::control::HOSTCAP_USB
+        } else {
+            0
+        };
+        usb | if crate::audio::codec_available() {
+            eternal_wire::v2::control::HOSTCAP_AUDIO
         } else {
             0
         }
@@ -90,6 +96,7 @@ impl ConfigSource for SharedConfigSource<'_> {
 /// same socket.
 pub async fn start_sender(
     mut nal_rx: mpsc::Receiver<NALUnit>,
+    mut audio_rx: mpsc::Receiver<crate::audio::SessionPacket>,
     listen_port: u16,
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
@@ -185,6 +192,7 @@ pub async fn start_sender(
 
     let mut input_relay = crate::input::InputRelay::default();
     let mut retransmit_ring = RetransmitRing::default();
+    let mut audio_sender = audio::AudioSender::default();
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
     let mut deferred_control = VecDeque::new();
@@ -312,7 +320,7 @@ pub async fn start_sender(
                             Classified::LegacyHello => {
                                 shared.session.lock().note_legacy_hello(src)
                             }
-                            Classified::Media { .. } | Classified::Unknown => {
+                            Classified::Media { .. } | Classified::Audio { .. } | Classified::Unknown => {
                                 debug!(peer = %src, len = datagram.len(), "Ignored unexpected datagram");
                             }
                         }
@@ -321,6 +329,9 @@ pub async fn start_sender(
                 }
             }
 
+            Some(packet) = audio_rx.recv() => {
+                audio_sender.send(packet, &links, &shared, stream_epoch).await;
+            }
             nal_opt = nal_rx.recv() => {
                 let Some(nal) = nal_opt else { break; };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
@@ -396,8 +407,18 @@ pub async fn start_sender(
 
                     let pause = frame_pacer.after_send(Instant::now());
                     if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
-                        repair_while_pacing(&links.udp.socket, &mut retransmit_ring, &shared, &config,
-                            nal.sequence as u32, pause, &mut deferred_control).await;
+                        let repairs = repair_while_pacing(&links.udp.socket, &mut retransmit_ring, &shared, &config,
+                            nal.sequence as u32, pause, &mut deferred_control);
+                        tokio::pin!(repairs);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = &mut repairs => break,
+                                Some(packet) = audio_rx.recv() => {
+                                    audio_sender.send(packet, &links, &shared, stream_epoch).await;
+                                }
+                            }
+                        }
                     }
                 }
 

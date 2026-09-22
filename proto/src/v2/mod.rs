@@ -20,6 +20,7 @@
 //! control datagrams extend it to a 16-byte header ([`control::ControlHeader`])
 //! followed by one message ([`control::ControlMessage`]).
 
+pub mod audio;
 pub mod control;
 pub mod media;
 
@@ -43,6 +44,7 @@ pub enum PacketType {
     Media = 0x01,
     /// Reserved for forward-error-correction parity datagrams. Not sent in v2.0.
     MediaFec = 0x02,
+    Audio = 0x03,
     Hello2 = 0x10,
     HelloAck = 0x11,
     Heartbeat = 0x12,
@@ -63,6 +65,7 @@ impl PacketType {
         Some(match value {
             0x01 => Self::Media,
             0x02 => Self::MediaFec,
+            0x03 => Self::Audio,
             0x10 => Self::Hello2,
             0x11 => Self::HelloAck,
             0x12 => Self::Heartbeat,
@@ -163,6 +166,8 @@ impl CommonPrefix {
 pub enum Classified {
     /// A v2 media fragment — hand to the reassembler ([`media::MediaHeader::decode`]).
     Media { flags: u8 },
+    /// An Opus packet — hand to [`audio::AudioHeader::decode`].
+    Audio { flags: u8 },
     /// A v2 control datagram — hand to [`control::parse_control`].
     Control(PacketType),
     /// A v1 "ETERNALHELLO" registration from an old client.
@@ -181,6 +186,9 @@ pub fn classify(datagram: &[u8]) -> Classified {
     match CommonPrefix::decode(datagram) {
         Ok(prefix) => match prefix.packet_type {
             PacketType::Media | PacketType::MediaFec => Classified::Media {
+                flags: prefix.flags,
+            },
+            PacketType::Audio => Classified::Audio {
                 flags: prefix.flags,
             },
             other => Classified::Control(other),
