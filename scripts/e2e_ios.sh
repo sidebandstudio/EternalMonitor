@@ -102,6 +102,7 @@ fi
 APP="$ROOT/ios/build/e2e/Build/Products/Release-iphonesimulator/EternalMonitor.app"
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }
 
+"$ROOT/scripts/pixels.sh" --prepare
 CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
 USB_DIRECT=""
 MEASURE_LINK=udp
@@ -251,7 +252,7 @@ PYBITRATE
 fi
 
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
-xcrun swift "$ROOT/scripts/px.swift" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
+"$ROOT/scripts/pixels.sh" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
