@@ -12,7 +12,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tracing::info;
 
@@ -69,13 +69,9 @@ pub fn run_capture_loop(
         height,
     });
 
-    // Absolute-deadline pacing. `thread::sleep` is NOT trusted for the fine
-    // pacing here: macOS timer coalescing can stretch a 16 ms sleep past
-    // 100 ms (measured on a Mac mini), which silently turned this "60 fps"
-    // source into an 8 fps one. Sleeping is used only for coarse waits; the
-    // final stretch spins. This burns part of a core while pacing — fine for
-    // a test/dev source, never acceptable for the production capture loop
-    // (DXGI paces in the driver via AcquireNextFrame's timeout instead).
+    // Absolute deadlines preserve the requested source rate. The macOS timer
+    // avoids normal sleep coalescing without burning an entire CPU core.
+    let mut timer = super::timing::FrameTimer::new();
     let mut next_deadline = Instant::now();
 
     loop {
@@ -118,15 +114,7 @@ pub fn run_capture_loop(
             next_deadline = now;
             continue;
         }
-        while Instant::now() < next_deadline {
-            if next_deadline - Instant::now() > Duration::from_millis(150) {
-                // Only worth risking a real sleep when there is more slack than
-                // the worst observed coalescing stretch (very low fps targets).
-                std::thread::sleep(Duration::from_millis(5));
-            } else {
-                std::hint::spin_loop();
-            }
-        }
+        timer.wait_until(next_deadline);
     }
 
     Ok(())
