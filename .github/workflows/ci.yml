@@ -92,9 +92,7 @@ jobs:
 
   ios-build:
     name: iOS (simulator build)
-    # Encode, decode and render run together. Use the standard 4-core/14-GiB
-    # image for this job; the Rust macOS job retains ARM coverage.
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -121,28 +119,6 @@ jobs:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
           scripts/test_ios.sh
-      - name: Prepare simulator for streaming measurements
-        env:
-          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
-        run: |
-          # Xcode may leave test clones running. This runner belongs to this
-          # job; keep only the selected iPad active during performance rows.
-          xcrun simctl list devices booted
-          python3 - <<'PY'
-          import json, os, subprocess
-          devices = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','--json']))['devices']
-          for runtime in devices.values():
-              for device in runtime:
-                  if device['state'] == 'Booted' and device['udid'] != os.environ['EM_SIM_UDID']:
-                      subprocess.run(['xcrun','simctl','shutdown',device['udid']], check=True)
-          PY
-          xcrun simctl bootstatus "$EM_SIM_UDID" -b
-          sysctl -n hw.model hw.ncpu hw.memsize
-      - name: Run simulator streaming matrix
-        env:
-          EM_SIM_NAME: citest
-          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
-        run: scripts/e2e_matrix.sh --ci
       - name: Retain iOS test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -153,6 +129,42 @@ jobs:
             build/ios-tests-*.xcresult
             build/ios-ui-host-*.log
             build/screenshots/ui-*
+          retention-days: 7
+
+  system-e2e:
+    name: System E2E (simulator streaming)
+    # XCTest leaves diagnostic services consuming CPU after its simulators stop.
+    # Measure the real encoder and client together on a fresh runner.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen and streaming SDK
+        run: |
+          brew install xcodegen ffmpeg@7 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: Create iPad simulator
+        id: sim
+        run: |
+          DEVICE_TYPE=com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB
+          xcodebuild -version
+          UDID=$(xcrun simctl create cistream "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          sysctl -n hw.model hw.ncpu hw.memsize
+      - name: Run simulator streaming matrix
+        env:
+          EM_SIM_NAME: cistream
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
+        run: scripts/e2e_matrix.sh --ci
+      - name: Retain streaming evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-e2e-evidence
+          path: |
             build/e2e-report.md
             build/e2e/
             build/screenshots/e2e-*.png
