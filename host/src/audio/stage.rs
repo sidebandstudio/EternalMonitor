@@ -12,6 +12,11 @@ use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
 use crate::supervisor::{generation_is_current, HealthReporter, Stage, StageOutcome};
 
+// A synthetic capture block is one Opus frame, so discontinuity resets
+// never discard half a frame and shift the tone/silence boundaries.
+const SYNTHETIC_BLOCK_FRAMES: usize = super::FRAME_SAMPLES;
+const SYNTHETIC_BLOCK_US: u64 = SYNTHETIC_BLOCK_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64;
+
 enum Source {
     Synthetic {
         source: SyntheticSource,
@@ -64,21 +69,21 @@ impl Source {
                 timer,
                 first,
             } => {
-                *next += Duration::from_millis(10);
+                *next += Duration::from_micros(SYNTHETIC_BLOCK_US);
                 timer.wait_until(*next);
                 let late = next.elapsed() > Duration::from_millis(20);
                 if late {
                     *next = Instant::now();
                 }
                 let samples = source
-                    .read(SAMPLE_RATE as usize / 100)
+                    .read(SYNTHETIC_BLOCK_FRAMES)
                     .into_iter()
                     .flat_map(|(l, r)| [l, r])
                     .collect();
                 Ok(Some(PcmBlock {
                     format: PcmFormat::STEREO_48K,
                     samples,
-                    capture_ts_us: crate::clock::host_now_us().saturating_sub(10_000),
+                    capture_ts_us: crate::clock::host_now_us().saturating_sub(SYNTHETIC_BLOCK_US),
                     discontinuity: std::mem::take(first) || late,
                 }))
             }
@@ -260,4 +265,47 @@ pub fn run_audio_stage(
         PIPELINE_STATS.lock().audio.stopped("Stopped");
     }
     reporter.stage_exited(Stage::Audio, StageOutcome::Completed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_silence_keeps_opus_alignment_after_a_late_capture() {
+        ffmpeg_next::init().unwrap();
+        let mut source = SyntheticSource::default();
+        let mut resampler = Resampler::new(PcmFormat::STEREO_48K).unwrap();
+        let mut quiet = 0;
+        for index in 0..96_000 / SYNTHETIC_BLOCK_FRAMES {
+            // A late read recreates swresample. A half-Opus-frame remainder
+            // here used to shift the 100 ms quiet window by 10 ms forever.
+            if index == 3 {
+                resampler = Resampler::new(PcmFormat::STEREO_48K).unwrap();
+            }
+            let samples = source
+                .read(SYNTHETIC_BLOCK_FRAMES)
+                .into_iter()
+                .flat_map(|(l, r)| [l, r])
+                .collect();
+            for frame in resampler
+                .push(&PcmBlock {
+                    format: PcmFormat::STEREO_48K,
+                    samples,
+                    capture_ts_us: index as u64 * SYNTHETIC_BLOCK_FRAMES as u64 * 1_000_000
+                        / u64::from(SAMPLE_RATE),
+                    discontinuity: index == 3,
+                })
+                .unwrap()
+            {
+                if frame.samples.iter().all(|&(l, r)| l == 0.0 && r == 0.0) {
+                    quiet += 1;
+                }
+            }
+        }
+        assert_eq!(
+            quiet, 5,
+            "100 ms silence must retain five complete Opus frames"
+        );
+    }
 }
