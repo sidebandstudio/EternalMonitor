@@ -21,7 +21,7 @@ use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
 pub mod dxgi;
 pub mod synthetic;
-mod timing;
+pub(crate) mod timing;
 
 #[cfg(windows)]
 pub(crate) const ACQUIRE_TIMEOUT_MS: u32 = 16;

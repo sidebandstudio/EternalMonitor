@@ -22,7 +22,7 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut Timebase) -> i32;
 }
 
-pub(super) struct FrameTimer {
+pub(crate) struct FrameTimer {
     #[cfg(target_os = "macos")]
     queue: Option<OwnedFd>,
     #[cfg(target_os = "macos")]

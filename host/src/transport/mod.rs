@@ -23,7 +23,7 @@ use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use fault::FaultInjector;
-use pacer::FramePacer;
+use pacer::{FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 
@@ -172,6 +172,7 @@ pub async fn start_sender(
 
     let mut input_relay = crate::input::InputRelay::default();
     let mut retransmit_ring = RetransmitRing::default();
+    let pacing_clock = PacingClock::new()?;
 
     let mut recv_buf = [0u8; 2048];
     let mut deferred_control = VecDeque::new();
@@ -380,7 +381,7 @@ pub async fn start_sender(
                     let pause = frame_pacer.after_send(Instant::now());
                     if pause > Duration::ZERO {
                         repair_while_pacing(&socket, &mut retransmit_ring, &shared, &config,
-                            nal.sequence as u32, pause, &mut deferred_control).await;
+                            nal.sequence as u32, pacing_clock.wait(pause), &mut deferred_control).await;
                     }
                 }
 
@@ -466,11 +467,10 @@ async fn repair_while_pacing(
     shared: &SharedControl,
     config: &impl ConfigSource,
     current_seq: u32,
-    pause: Duration,
+    timer: impl std::future::Future<Output = ()>,
     deferred: &mut DeferredControl,
 ) {
     use eternal_wire::v2::control::{parse_control, ControlMessage};
-    let timer = tokio::time::sleep(pause);
     tokio::pin!(timer);
     loop {
         let mut bytes = [0; 2048];
@@ -626,7 +626,7 @@ mod tests {
                 &shared,
                 &config,
                 8,
-                Duration::from_secs(1),
+                tokio::time::sleep(Duration::from_secs(1)),
                 &mut deferred,
             )
             .await;
