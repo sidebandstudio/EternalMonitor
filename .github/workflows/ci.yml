@@ -137,6 +137,7 @@ jobs:
       - name: Run simulator streaming matrix
         env:
           EM_SIM_NAME: citest
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: scripts/e2e_matrix.sh --ci
       - name: Retain iOS test evidence
         if: always()
