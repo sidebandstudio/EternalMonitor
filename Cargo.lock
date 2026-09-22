@@ -1068,7 +1068,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "eternal-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "eternal-wire",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "eternal-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tracing",
 ]

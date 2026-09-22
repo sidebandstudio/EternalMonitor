@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Check release version parity
+        run: scripts/check-versions.sh
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check -p eternal-wire
@@ -62,6 +64,9 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: Test workspace
         run: cargo test --workspace --locked
 
@@ -74,6 +79,10 @@ jobs:
       - name: Install FFmpeg 7.1 SDK
         run: brew install ffmpeg@7 pkgconf
       - uses: Swatinem/rust-cache@v2
+      - name: Lint workspace
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace (includes synthetic end-to-end stream)
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
