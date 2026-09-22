@@ -308,6 +308,9 @@ fn run_encode_loop(
             bgra_plane[dst_offset..dst_offset + src_row_bytes]
                 .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
         }
+        // The encoder owns its copy now. Release capture's buffer before the
+        // codec or sender can block, so the next capture can recycle it.
+        drop(raw_frame.data);
 
         #[cfg(target_os = "macos")]
         let converted = match encoder
