@@ -4,6 +4,7 @@ pub mod pacer;
 pub mod retransmit;
 pub mod session;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -173,6 +174,7 @@ pub async fn start_sender(
     let mut retransmit_ring = RetransmitRing::default();
 
     let mut recv_buf = [0u8; 2048];
+    let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -206,7 +208,7 @@ pub async fn start_sender(
                 execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
 
-            result = socket.recv_from(&mut recv_buf) => {
+            result = receive_control(&socket, &mut recv_buf, &mut deferred_control) => {
                 match result {
                     Ok((len, src)) => {
                         let datagram = &recv_buf[..len];
@@ -232,18 +234,8 @@ pub async fn start_sender(
                                         if let (Some((epoch, seq, missing)), Some(frag_count)) =
                                             (actions.retransmit.take(), nack_frag_count)
                                         {
-                                            let destination = *shared.target_addr.lock();
-                                            let mut sent = 0;
-                                            for datagram in retransmit_ring.resend(epoch, seq, frag_count, &missing, Instant::now()) {
-                                                if socket.send_to(&datagram, destination).await.is_ok() {
-                                                    sent += 1;
-                                                }
-                                            }
-                                            if sent > 0 {
-                                                let mut stats = PIPELINE_STATS.lock();
-                                                stats.transport_retransmits += sent;
-                                                debug!(seq, retransmits = stats.transport_retransmits, "NACK fragments resent");
-                                            }
+                                            send_repairs(&socket, &mut retransmit_ring, &shared,
+                                                epoch, seq, frag_count, &missing).await;
                                         }
                                         if let Some((session_id, event)) = actions.input.take() {
                                             if let Some(geometry) = *shared.capture_geometry.lock()
@@ -387,7 +379,8 @@ pub async fn start_sender(
 
                     let pause = frame_pacer.after_send(Instant::now());
                     if pause > Duration::ZERO {
-                        tokio::time::sleep(pause).await;
+                        repair_while_pacing(&socket, &mut retransmit_ring, &shared, &config,
+                            nal.sequence as u32, pause, &mut deferred_control).await;
                     }
                 }
 
@@ -419,6 +412,90 @@ pub async fn start_sender(
 
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+type DeferredControl = VecDeque<(usize, SocketAddr, [u8; 2048])>;
+
+async fn receive_control(
+    socket: &UdpSocket,
+    buffer: &mut [u8; 2048],
+    deferred: &mut DeferredControl,
+) -> std::io::Result<(usize, SocketAddr)> {
+    if let Some((len, peer, bytes)) = deferred.pop_front() {
+        buffer[..len].copy_from_slice(&bytes[..len]);
+        Ok((len, peer))
+    } else {
+        socket.recv_from(buffer).await
+    }
+}
+
+async fn send_repairs(
+    socket: &UdpSocket,
+    ring: &mut RetransmitRing,
+    shared: &SharedControl,
+    epoch: u32,
+    seq: u32,
+    frag_count: u16,
+    missing: &[u16],
+) {
+    let destination = *shared.target_addr.lock();
+    let mut sent = 0;
+    for datagram in ring.resend(epoch, seq, frag_count, missing, Instant::now()) {
+        if socket.send_to(&datagram, destination).await.is_ok() {
+            sent += 1;
+        }
+    }
+    if sent > 0 {
+        let mut stats = PIPELINE_STATS.lock();
+        stats.transport_retransmits += sent;
+        debug!(
+            seq,
+            retransmits = stats.transport_retransmits,
+            "NACK fragments resent"
+        );
+    }
+}
+
+/// A coarse platform timer may stretch a pacing gap beyond the receiver's
+/// repair budget. Continue serving NACKs for already-sent frames throughout
+/// that wait. Other control messages retain their order until the current
+/// frame finishes; at most 64 packets (128 KiB) can wait here.
+async fn repair_while_pacing(
+    socket: &UdpSocket,
+    ring: &mut RetransmitRing,
+    shared: &SharedControl,
+    config: &impl ConfigSource,
+    current_seq: u32,
+    pause: Duration,
+    deferred: &mut DeferredControl,
+) {
+    use eternal_wire::v2::control::{parse_control, ControlMessage};
+    let timer = tokio::time::sleep(pause);
+    tokio::pin!(timer);
+    loop {
+        let mut bytes = [0; 2048];
+        tokio::select! {
+            biased;
+            _ = &mut timer => break,
+            received = socket.recv_from(&mut bytes) => {
+                let Ok((len, peer)) = received else { break; };
+                if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
+                    // The current frame enters the ring after its last original
+                    // datagram; defer those NACKs rather than losing them.
+                    if nack.frame_seq != current_seq {
+                        let count = nack.frag_count;
+                        let actions = shared.session.lock().handle_control(peer, header.session_id,
+                            ControlMessage::Nack(nack), config, Instant::now());
+                        if let Some((epoch, seq, missing)) = actions.retransmit {
+                            send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
+                        }
+                        continue;
+                    }
+                }
+                if deferred.len() < 64 { deferred.push_back((len, peer, bytes)); }
+            }
+        }
+    }
 }
 
 async fn execute_actions(
@@ -479,6 +556,122 @@ async fn execute_actions(
             if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
                 warn!(error = %error, "Failed to request pipeline restart after client loss");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eternal_wire::v2::control::{
+        encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,
+        FEATURE_SUPPORTS_NACK,
+    };
+
+    #[tokio::test]
+    async fn repairs_previous_frames_before_the_pacing_wait_ends() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let host = socket.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let shared = SharedControl::new(host.port(), 15_000_000);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+        };
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: peer.port(),
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_SUPPORTS_NACK,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "repair timing test".into(),
+        });
+        let actions = shared
+            .session
+            .lock()
+            .handle_control(peer, 0, hello, &config, Instant::now());
+        *shared.target_addr.lock() = actions.new_target.unwrap();
+        let session_id = shared.session.lock().session_id().unwrap();
+        let mut original = vec![0xAB; MEDIA_HEADER_SIZE + 1];
+        MediaHeader {
+            session_id,
+            stream_epoch: 1,
+            frame_seq: 7,
+            frag_index: 0,
+            frag_count: 1,
+            is_keyframe: false,
+            is_retransmit: false,
+            capture_ts_us: 1234,
+            payload_len: 1,
+        }
+        .encode_into(&mut original);
+        let mut ring = RetransmitRing::default();
+        ring.insert(1, 7, vec![original]);
+        let pacing = tokio::spawn(async move {
+            let config = SharedConfigSource {
+                shared: &shared,
+                stream_epoch: 1,
+            };
+            let mut deferred = DeferredControl::new();
+            repair_while_pacing(
+                &socket,
+                &mut ring,
+                &shared,
+                &config,
+                8,
+                Duration::from_secs(1),
+                &mut deferred,
+            )
+            .await;
+            deferred
+        });
+        let nack = |seq| {
+            ControlMessage::Nack(Nack {
+                stream_epoch: 1,
+                frame_seq: seq,
+                frag_count: 1,
+                missing: vec![0],
+            })
+        };
+        client
+            .send_to(&encode_control(session_id, 1, &nack(7)), host)
+            .await
+            .unwrap();
+        let mut buffer = [0; 2048];
+        let (len, source) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buffer))
+                .await
+                .expect("repair must bypass the pacing wait")
+                .unwrap();
+        assert_eq!(source, host);
+        let (header, payload) = MediaHeader::decode(&buffer[..len]).unwrap();
+        assert_eq!(header.frame_seq, 7);
+        assert!(header.is_retransmit);
+        assert_eq!(payload, &[0xAB]);
+        assert!(
+            !pacing.is_finished(),
+            "repair was delayed until after pacing"
+        );
+
+        let pending = [nack(8), ControlMessage::Ping(Ping { t1_us: 42 })];
+        for (index, message) in pending.iter().enumerate() {
+            client
+                .send_to(&encode_control(session_id, index as u32 + 2, message), host)
+                .await
+                .unwrap();
+        }
+        let deferred = pacing.await.unwrap();
+        assert_eq!(deferred.len(), pending.len());
+        for ((len, source, bytes), expected) in deferred.into_iter().zip(pending) {
+            assert_eq!(source, peer);
+            assert_eq!(parse_control(&bytes[..len]).unwrap().1, expected);
         }
     }
 }
