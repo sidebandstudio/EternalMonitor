@@ -131,6 +131,7 @@ struct Loopback {
     format: PcmFormat,
     encoding: SampleEncoding,
     first: bool,
+    idle: bool,
     last_packet: Instant,
 }
 
@@ -167,6 +168,7 @@ impl Loopback {
                 format,
                 encoding,
                 first: true,
+                idle: false,
                 last_packet: Instant::now(),
             })
         }
@@ -181,21 +183,26 @@ impl Loopback {
                     return Err(windows::core::Error::from_win32().into());
                 }
                 if self.capture.GetNextPacketSize()? == 0 {
-                    if self.last_packet.elapsed() < Duration::from_millis(20) {
+                    let elapsed = self.last_packet.elapsed();
+                    if elapsed < Duration::from_millis(20) {
                         return Ok(None);
                     }
                     // An idle render engine may publish no buffers at all.
                     // Keep the capture clock moving with digital silence.
-                    self.last_packet = Instant::now();
+                    let (frames, span) = super::pcm::silence_span(self.format.rate, elapsed);
+                    let stalled = elapsed > Duration::from_millis(100);
+                    self.last_packet = if stalled {
+                        Instant::now()
+                    } else {
+                        self.last_packet + span
+                    };
+                    self.idle = true;
                     return Ok(Some(PcmBlock {
                         format: self.format,
-                        samples: vec![
-                            0.0;
-                            self.format.rate as usize / 50
-                                * usize::from(self.format.channels)
-                        ],
-                        capture_ts_us: crate::clock::host_now_us().saturating_sub(20_000),
-                        discontinuity: std::mem::take(&mut self.first),
+                        samples: vec![0.0; frames * usize::from(self.format.channels)],
+                        capture_ts_us: crate::clock::host_now_us()
+                            .saturating_sub(span.as_micros() as u64),
+                        discontinuity: std::mem::take(&mut self.first) || stalled,
                     }));
                 }
             }
@@ -251,6 +258,7 @@ impl Loopback {
                     samples: pcm,
                     capture_ts_us: timestamp,
                     discontinuity: std::mem::take(&mut self.first)
+                        || std::mem::take(&mut self.idle)
                         || flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
                 })
             })();
