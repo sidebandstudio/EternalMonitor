@@ -459,6 +459,11 @@ fn lossy_stream_recovers_and_adapts() {
         }
         if let Some((epoch, seq)) = assembler.take_keyframe_request() {
             requests += 1;
+            eprintln!(
+                "NACK_E2E_RECOVERY elapsed_ms={} last_complete={seq} counters={:?}",
+                started.elapsed().as_millis(),
+                assembler.counters()
+            );
             receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
                 stream_epoch: epoch,
                 last_complete_seq: seq,

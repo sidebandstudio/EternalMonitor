@@ -181,6 +181,31 @@ pub async fn start_sender(
 
     loop {
         tokio::select! {
+            // Service timers and queued control before another paced frame.
+            // Random branch selection can delay a NACK by multiple frame
+            // bursts on platforms with coarse sleep granularity.
+            biased;
+            _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
+                let destination = *shared.target_addr.lock();
+                for datagram in fault.drain_due(Instant::now()) {
+                    let _ = socket.send_to(&datagram, destination).await;
+                }
+            }
+            _ = heartbeat.tick() => {
+                let actions = shared.session.lock().tick(&config, true, Instant::now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
+            }
+            _ = liveness_tick.tick() => {
+                if !shared.running.load(Ordering::SeqCst) {
+                    info!("Transport loop stopping on running=false");
+                    break;
+                }
+                let actions = shared.session.lock().tick(&config, false, Instant::now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
+            }
+
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((len, src)) => {
@@ -286,6 +311,7 @@ pub async fn start_sender(
                     Err(e) => warn!(error = %e, "recv_from error"),
                 }
             }
+
             nal_opt = nal_rx.recv() => {
                 let Some(nal) = nal_opt else { break; };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
@@ -387,26 +413,6 @@ pub async fn start_sender(
                     target = %target_addr,
                     "Frame sent"
                 );
-            }
-            _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
-                let destination = *shared.target_addr.lock();
-                for datagram in fault.drain_due(Instant::now()) {
-                    let _ = socket.send_to(&datagram, destination).await;
-                }
-            }
-            _ = heartbeat.tick() => {
-                let actions = shared.session.lock().tick(&config, true, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
-                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
-            }
-            _ = liveness_tick.tick() => {
-                if !shared.running.load(Ordering::SeqCst) {
-                    info!("Transport loop stopping on running=false");
-                    break;
-                }
-                let actions = shared.session.lock().tick(&config, false, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
-                execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
         }
     }
