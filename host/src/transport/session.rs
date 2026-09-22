@@ -63,7 +63,9 @@ pub struct ClientInfo {
 
 struct ActiveSession {
     session_id: u32,
-    client_nonce: u32,
+    accepted_hello: eternal_wire::v2::control::Hello2,
+    ack: Vec<u8>,
+    auth_token: [u8; 16],
     peer: PeerId,
     info: ClientInfo,
     liveness_deadline: Instant,
@@ -75,6 +77,10 @@ struct ActiveSession {
 
 /// Provides the current stream parameters for HELLO_ACK/heartbeats.
 pub trait ConfigSource {
+    fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+        None
+    }
+
     fn stream_config(&self) -> StreamConfig;
     fn host_name(&self) -> String;
     fn host_caps(&self) -> u16 {
@@ -283,6 +289,37 @@ impl Session {
             return actions;
         }
 
+        // Keep credentials locked through authorization, rotation and ACK creation:
+        // a simultaneous GUI token reset must not issue a new secret to an old token.
+        let mut pairing = config.pairing().map(|state| state.lock());
+        let token = pairing.as_ref().map_or([0; 16], |state| state.ack_token());
+        if let Some(session) = self.active.as_ref() {
+            if session.peer == source
+                && session.accepted_hello == hello
+                && session.auth_token == token
+            {
+                // Exact replay of an accepted handshake. In particular, losing the
+                // first code-based ACK must not require the now-rotated code.
+                actions.replies.push((source, session.ack.clone()));
+                return actions;
+            }
+        }
+        let grant = match pairing
+            .as_mut()
+            .map(|state| state.authorize(source, &hello, now))
+        {
+            Some(Ok(grant)) => grant,
+            Some(Err(status)) => {
+                let ack = self.make_ack(status, hello.client_nonce, 0, config);
+                actions.replies.push((source, ack));
+                return actions;
+            }
+            None => crate::pairing::Grant {
+                token: [0; 16],
+                used_code: false,
+            },
+        };
+
         // The media target: the client's advertised listen port at its source IP
         // (normally identical to the source port; 0 = malformed, use the source).
         let media_target = PeerId {
@@ -306,19 +343,25 @@ impl Session {
                     actions.replies.push((source, ack));
                     return actions;
                 }
-                if session.client_nonce == hello.client_nonce && session.peer.link == source.link {
-                    // Pure retransmit: re-send the identical ACK.
-                    let (session_id, nonce) = (session.session_id, session.client_nonce);
-                    let ack = self.make_ack(HelloStatus::Ok, nonce, session_id, config);
-                    actions.replies.push((source, ack));
-                    return actions;
-                }
                 // Same device, new connect attempt: supersede in place.
                 info!(peer = %source, "Client reconnected — superseding session in place");
             } else {
                 // A different device while one is streaming: reject.
                 info!(peer = %source, "Second client rejected while a session is active");
                 let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
+                actions.replies.push((source, ack));
+                return actions;
+            }
+        }
+
+        if grant.used_code {
+            if let Err(error) = pairing
+                .as_mut()
+                .expect("code grant has pairing state")
+                .rotate_code()
+            {
+                warn!(%error, "Pairing code rotation failed");
+                let ack = self.make_ack(HelloStatus::Error, hello.client_nonce, 0, config);
                 actions.replies.push((source, ack));
                 return actions;
             }
@@ -334,7 +377,9 @@ impl Session {
         );
         self.active = Some(ActiveSession {
             session_id,
-            client_nonce: hello.client_nonce,
+            accepted_hello: hello.clone(),
+            ack: Vec::new(),
+            auth_token: grant.token,
             peer: source,
             info: ClientInfo {
                 device_name: hello.device_name.clone(),
@@ -352,7 +397,14 @@ impl Session {
             msg_seq_out: 0,
         });
 
-        let ack = self.make_ack(HelloStatus::Ok, hello.client_nonce, session_id, config);
+        let ack = self.make_ack_with_token(
+            HelloStatus::Ok,
+            hello.client_nonce,
+            session_id,
+            config,
+            grant.token,
+        );
+        self.active.as_mut().unwrap().ack = ack.clone();
         actions.replies.push((source, ack));
         actions.new_target = Some(media_target);
         actions.force_idr = true;
@@ -469,6 +521,17 @@ impl Session {
             return actions;
         };
 
+        let revoked = config.pairing().is_some_and(|state| {
+            let state = state.lock();
+            state.required && session.auth_token != state.token()
+        });
+        if revoked {
+            info!(peer = %session.peer, "Pairing credentials changed — reconnect required");
+            self.active = None;
+            actions.client_lost = true;
+            return actions;
+        }
+
         if now >= session.liveness_deadline {
             warn!(
                 peer = %session.peer,
@@ -532,6 +595,17 @@ impl Session {
         session_id: u32,
         config: &impl ConfigSource,
     ) -> Vec<u8> {
+        self.make_ack_with_token(status, client_nonce, session_id, config, [0; 16])
+    }
+
+    fn make_ack_with_token(
+        &mut self,
+        status: HelloStatus,
+        client_nonce: u32,
+        session_id: u32,
+        config: &impl ConfigSource,
+        auth_token: [u8; 16],
+    ) -> Vec<u8> {
         let msg_seq = self.next_msg_seq();
         let ack = ControlMessage::HelloAck(HelloAck {
             status,
@@ -543,7 +617,7 @@ impl Session {
             liveness_timeout_ms: LIVENESS_TIMEOUT.as_millis() as u16,
             stream_config: config.stream_config(),
             host_name: config.host_name(),
-            auth_token: [0; 16],
+            auth_token,
             host_caps: HOSTCAP_NACK | config.host_caps(),
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
@@ -1184,5 +1258,176 @@ mod tests {
         assert_eq!(ticked.replies.len(), 1);
         let (_, message) = eternal_wire::v2::control::parse_control(&ticked.replies[0].1).unwrap();
         assert!(matches!(message, ControlMessage::Heartbeat(_)));
+    }
+
+    struct PairConfig(parking_lot::Mutex<crate::pairing::Pairing>);
+    impl ConfigSource for PairConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            Some(&self.0)
+        }
+    }
+    fn pair_config(required: bool) -> PairConfig {
+        PairConfig(parking_lot::Mutex::new(
+            crate::pairing::Pairing::new(required, [7; 16]).unwrap(),
+        ))
+    }
+    fn pair_hello(nonce: u32) -> Hello2 {
+        let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
+            unreachable!()
+        };
+        hello.device_id = 17;
+        hello
+    }
+    fn pair_ack(actions: &Actions) -> HelloAck {
+        let (_, ControlMessage::HelloAck(ack)) =
+            eternal_wire::v2::control::parse_control(&actions.replies[0].1).unwrap()
+        else {
+            panic!("expected ACK")
+        };
+        ack
+    }
+    fn pair_send(
+        session: &mut Session,
+        config: &PairConfig,
+        peer: PeerId,
+        hello: Hello2,
+        now: Instant,
+    ) -> Actions {
+        session.handle_control(peer, 0, ControlMessage::Hello2(hello), config, now)
+    }
+
+    #[test]
+    fn pairing_required_code_rotation_retry_token_and_regeneration() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let now = Instant::now();
+        let mut hello = pair_hello(1);
+        let rejected = pair_send(&mut session, &config, peer, hello.clone(), now);
+        assert_eq!(pair_ack(&rejected).status, HelloStatus::Unauthorized);
+        assert_eq!(pair_ack(&rejected).auth_token, [0; 16]);
+        assert!(rejected.new_target.is_none());
+        assert!(!session.is_active());
+        hello.pairing_code = config.0.lock().code();
+        let accepted = pair_send(&mut session, &config, peer, hello.clone(), now);
+        let ack = pair_ack(&accepted);
+        assert_eq!(ack.status, HelloStatus::Ok);
+        assert_eq!(ack.auth_token, [7; 16]);
+        assert_ne!(config.0.lock().code(), hello.pairing_code);
+        let duplicate = pair_send(&mut session, &config, peer, hello.clone(), now);
+        assert_eq!(duplicate.replies, accepted.replies);
+        assert!(duplicate.new_target.is_none());
+        let mut modified = hello.clone();
+        modified.listen_port += 1;
+        assert_eq!(
+            pair_ack(&pair_send(&mut session, &config, peer, modified, now)).status,
+            HelloStatus::Unauthorized
+        );
+        hello.client_nonce += 1;
+        assert_eq!(
+            pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now)).status,
+            HelloStatus::Unauthorized
+        );
+        hello.auth_token = ack.auth_token;
+        hello.pairing_code = 0;
+        let reconnected = pair_send(&mut session, &config, peer, hello.clone(), now);
+        assert_eq!(pair_ack(&reconnected).status, HelloStatus::Ok);
+        assert_ne!(pair_ack(&reconnected).session_id, ack.session_id);
+        config.0.lock().regenerate_token().unwrap();
+        let stale = pair_send(&mut session, &config, peer, hello, now);
+        assert_eq!(pair_ack(&stale).status, HelloStatus::Unauthorized);
+        assert_eq!(pair_ack(&stale).auth_token, [0; 16]);
+        assert!(session.tick(&config, false, now).client_lost);
+        assert!(!session.is_active());
+    }
+
+    #[test]
+    fn pairing_optional_usb_and_busy_do_not_consume_a_code() {
+        let peer = addr([192, 0, 2, 1], 50000);
+        let now = Instant::now();
+        let config = pair_config(false);
+        let mut session = Session::new(10);
+        let accepted = pair_send(&mut session, &config, peer, pair_hello(1), now);
+        assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&accepted).auth_token, [0; 16]);
+        config.0.lock().required = true;
+        // Requiring pairing now must invalidate the unpaired duplicate too.
+        assert_eq!(
+            pair_ack(&pair_send(&mut session, &config, peer, pair_hello(1), now)).status,
+            HelloStatus::Unauthorized
+        );
+        assert!(session.tick(&config, false, now).client_lost);
+        let usb = PeerId {
+            link: LinkId::Usb { device_id: 1 },
+            addr: None,
+        };
+        let code = config.0.lock().code();
+        let accepted = pair_send(&mut session, &config, usb, pair_hello(2), now);
+        assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&accepted).auth_token, [7; 16]);
+        assert_eq!(config.0.lock().code(), code);
+        let mut foreign = pair_hello(3);
+        foreign.device_id += 1;
+        foreign.pairing_code = code;
+        let busy = pair_send(&mut session, &config, peer, foreign, now);
+        assert_eq!(pair_ack(&busy).status, HelloStatus::Busy);
+        assert_eq!(pair_ack(&busy).auth_token, [0; 16]);
+        assert_eq!(config.0.lock().code(), code);
+    }
+
+    #[test]
+    fn pairing_rate_limit_blocks_code_guesses_but_preserves_paired_and_usb_access() {
+        let config = pair_config(true);
+        let now = Instant::now();
+        let peer = addr([192, 0, 2, 1], 50000);
+        let mut session = Session::new(10);
+        for nonce in 1..=5 {
+            let ack = pair_ack(&pair_send(
+                &mut session,
+                &config,
+                peer,
+                pair_hello(nonce),
+                now,
+            ));
+            assert_eq!(
+                ack.status,
+                if nonce == 5 {
+                    HelloStatus::RateLimited
+                } else {
+                    HelloStatus::Unauthorized
+                }
+            );
+            assert_eq!(ack.auth_token, [0; 16]);
+        }
+        let mut hello = pair_hello(6);
+        hello.pairing_code = config.0.lock().code();
+        assert_eq!(
+            pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now)).status,
+            HelloStatus::RateLimited
+        );
+        hello.auth_token = [7; 16];
+        assert_eq!(
+            pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now)).status,
+            HelloStatus::Ok
+        );
+        hello.auth_token = [0; 16];
+        hello.client_nonce += 1;
+        assert_eq!(
+            pair_ack(&pair_send(
+                &mut session,
+                &config,
+                peer,
+                hello,
+                now + Duration::from_secs(60)
+            ))
+            .status,
+            HelloStatus::Ok
+        );
     }
 }

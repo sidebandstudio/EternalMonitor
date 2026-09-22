@@ -124,6 +124,8 @@ pub enum HelloStatus {
     Busy = 1,
     VersionUnsupported = 2,
     Error = 3,
+    Unauthorized = 4,
+    RateLimited = 5,
 }
 
 impl HelloStatus {
@@ -133,6 +135,8 @@ impl HelloStatus {
             1 => Self::Busy,
             2 => Self::VersionUnsupported,
             3 => Self::Error,
+            4 => Self::Unauthorized,
+            5 => Self::RateLimited,
             _ => return None,
         })
     }

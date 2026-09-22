@@ -298,6 +298,7 @@ impl AnalyzerApp {
                     Some((*ffmpeg).to_string())
                 }
             });
+        let pairing = self.control.shared.pairing.lock();
         let file = SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
@@ -319,6 +320,8 @@ impl AnalyzerApp {
                 .load(std::sync::atomic::Ordering::SeqCst),
             vdd_match_resolution: self.settings_vdd_match,
             start_on_boot: self.settings_start_on_boot,
+            require_pairing: pairing.required,
+            auth_token_hex: crate::pairing::token_hex(&pairing.token()),
         };
         file.save();
     }
@@ -510,6 +513,8 @@ impl AnalyzerApp {
 
         ui.add_space(12.0);
 
+        self.draw_pairing_card(ui);
+        ui.add_space(12.0);
         usb_card(ui, snap);
         ui.add_space(12.0);
         audio_card(ui, &snap.audio);
@@ -1006,13 +1011,62 @@ impl AnalyzerApp {
 }
 
 impl AnalyzerApp {
+    fn draw_pairing_card(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_header(ui, "Pairing");
+            let mut pairing = self.control.shared.pairing.lock();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{:06}", pairing.code()))
+                        .monospace()
+                        .strong()
+                        .size(24.0)
+                        .color(ACCENT_BRIGHT),
+                );
+                if ghost_button(ui, "New code", true).clicked() {
+                    if let Err(error) = pairing.rotate_code() {
+                        self.settings_error =
+                            Some(format!("Could not create a pairing code: {error}"));
+                    }
+                }
+            });
+            changed |= ui
+                .checkbox(&mut pairing.required, "Require pairing")
+                .changed();
+            ui.label(
+                egui::RichText::new(
+                    "Enter this code on your iPad. USB connections pair automatically.",
+                )
+                .color(MUTED2)
+                .size(11.0),
+            );
+            if ghost_button(ui, "Regenerate token (forget all iPads)", true).clicked() {
+                match pairing.regenerate_token() {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        self.settings_error = Some(format!("Could not reset pairing: {error}"))
+                    }
+                }
+            }
+        });
+        if changed {
+            self.persist_settings();
+        }
+    }
+
     fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
         let listen_addr = if snap.listen_addr.is_empty() {
             self.control.shared.target_addr.lock().to_string()
         } else {
             snap.listen_addr.clone()
         };
-        let url = format!("eternaldisplay://{}", listen_addr);
+        let url = format!(
+            "eternaldisplay://{}?t={}",
+            listen_addr,
+            crate::pairing::token_hex(&self.control.shared.pairing.lock().token())
+        );
 
         // Cache the encoded QR matrix until the URL changes.
         if self
@@ -1024,7 +1078,7 @@ impl AnalyzerApp {
             match QrCode::new(url.as_bytes()) {
                 Ok(code) => self.qr_cache = Some((url.clone(), code)),
                 Err(error) => {
-                    warn!(error = %error, url = %url, "Failed to encode QR code");
+                    warn!(error = %error, "Failed to encode QR code");
                     self.qr_cache = None;
                 }
             }

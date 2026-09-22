@@ -94,7 +94,7 @@ xcodebuild build \
     -scheme EternalMonitor -configuration Release \
     -destination "platform=iOS Simulator,id=$UDID" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
-    CODE_SIGNING_ALLOWED=NO -quiet
+    CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- -quiet
 echo "==> Building host"
 (cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
 fi
@@ -138,7 +138,7 @@ python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" "$A
 import json,sys
 with open(sys.argv[1], 'w') as f:
     json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False,
-                   stream_audio=sys.argv[3]=='1'), f)
+                   stream_audio=sys.argv[3]=='1', require_pairing=False), f)
 PY
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
 APPDATA="$OUT/state" \

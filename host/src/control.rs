@@ -60,6 +60,7 @@ pub struct SharedControl {
     /// transport resumes streaming to the same session and the epoch bump
     /// resets the client's reassembly.
     pub session: Arc<Mutex<crate::transport::session::Session>>,
+    pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -109,6 +110,13 @@ impl CaptureTarget {
 impl SharedControl {
     pub fn new(listen_port: u16, initial_bitrate_bps: u32) -> Self {
         Self {
+            pairing: Arc::new(Mutex::new(
+                crate::pairing::Pairing::new(
+                    true,
+                    crate::pairing::new_token().expect("OS entropy for pairing token"),
+                )
+                .expect("OS entropy for pairing code"),
+            )),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),

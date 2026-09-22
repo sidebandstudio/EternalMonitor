@@ -278,6 +278,8 @@ enum HelloStatus: UInt8 {
     case busy = 1
     case versionUnsupported = 2
     case error = 3
+    case unauthorized = 4
+    case rateLimited = 5
 }
 
 struct HelloAck: Equatable {

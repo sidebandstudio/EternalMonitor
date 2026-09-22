@@ -27,6 +27,10 @@ pub struct SettingsFile {
     pub hevc_enabled: bool,
     #[serde(default = "default_true")]
     pub stream_audio: bool,
+    #[serde(default = "default_true")]
+    pub require_pairing: bool,
+    #[serde(default)]
+    pub auth_token_hex: String,
     /// Ask the virtual display driver to offer the connected iPad's native
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
@@ -53,6 +57,8 @@ impl Default for SettingsFile {
             capture_display: None,
             hevc_enabled: false,
             stream_audio: true,
+            require_pairing: true,
+            auth_token_hex: String::new(),
             vdd_match_resolution: true,
             start_on_boot: false,
         }
@@ -60,6 +66,18 @@ impl Default for SettingsFile {
 }
 
 impl SettingsFile {
+    /// Upgrade old settings once, before networking starts. An invalid or
+    /// missing secret is replaced; entropy failures never disable pairing.
+    pub fn ensure_auth_token(&mut self) -> Result<[u8; 16], getrandom::Error> {
+        if let Some(token) = crate::pairing::parse_token(&self.auth_token_hex) {
+            return Ok(token);
+        }
+        let token = crate::pairing::new_token()?;
+        self.auth_token_hex = crate::pairing::token_hex(&token);
+        self.save();
+        Ok(token)
+    }
+
     /// Load settings from `%APPDATA%/EternalMonitor/settings.json`. On any failure
     /// (missing file, parse error, permission denied) returns `SettingsFile::default()`.
     pub fn load() -> Self {
@@ -150,6 +168,9 @@ mod tests {
     #[test]
     fn old_settings_default_packet_size_and_new_settings_round_trip() {
         let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert!(parsed.require_pairing);
+        assert!(parsed.auth_token_hex.is_empty());
         assert!(
             serde_json::from_str::<SettingsFile>(old)
                 .unwrap()
@@ -162,9 +183,14 @@ mod tests {
         let settings = SettingsFile {
             max_dgram: 1200,
             stream_audio: false,
+            require_pairing: false,
+            auth_token_hex: "0123456789abcdef0123456789abcdef".into(),
             ..Default::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.require_pairing);
+        assert_eq!(parsed.auth_token_hex, settings.auth_token_hex);
         assert!(
             !serde_json::from_str::<SettingsFile>(&json)
                 .unwrap()

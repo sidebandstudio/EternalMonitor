@@ -5,6 +5,7 @@ struct ConnectView: View {
     @EnvironmentObject var settings: AppSettings
     @StateObject private var recentStore = RecentConnectionStore.shared
     @StateObject private var scanner = NetworkScanner()
+    @ObservedObject private var pairings = PairingStore.shared
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
@@ -128,6 +129,9 @@ struct ConnectView: View {
                     .accessibilityLabel("Settings")
                     .accessibilityIdentifier("settings.button")
                 }
+            }
+            .sheet(item: $connectionManager.pairingPrompt, onDismiss: connectionManager.pairingSheetDismissed) { model in
+                PairingSheet(model: model, submit: connectionManager.submitPairing, cancel: connectionManager.cancel)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -493,7 +497,7 @@ struct ConnectView: View {
         case .success(let target):
             hostIP = target.host
             port = String(target.port)
-            connectionManager.connect(host: target.host, port: target.port)
+            connectionManager.connect(host: target.host, port: target.port, token: target.token)
         case .failure(.wrongScheme):
             connectionManager.connectionError = "Scanned QR is not an EternalMonitor link."
         case .failure:
@@ -607,6 +611,13 @@ struct ConnectView: View {
                         }
 
                         Spacer()
+
+                        if conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port) {
+                            Image(systemName: "lock.fill")
+                                .foregroundStyle(Theme.text2)
+                                .accessibilityLabel("Paired host")
+                                .accessibilityIdentifier("recent.paired")
+                        }
 
                         Text(conn.isUSB ? "USB" : "WIFI")
                             .font(.appMonoMedium(size: 10))

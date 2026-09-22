@@ -153,6 +153,7 @@ jobs:
             build/ios-tests-*.xcresult
             build/ios-ui-host-*.log
             build/ios-ui-usb-host-*.log
+            build/ios-ui-pairing-host-*.log
             build/ios-usb-proxy-*.log
             build/screenshots/ui-*
             build/e2e-report.md

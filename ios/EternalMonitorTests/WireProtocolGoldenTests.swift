@@ -35,9 +35,21 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 20,
+            Self.vectors.count, 22,
             "golden vector count drifted — update both test suites together"
         )
+    }
+
+    func testPairingRejectionVectors() throws {
+        for (name, status): (String, HelloStatus) in [("hello_ack_unauthorized", .unauthorized), ("hello_ack_rate_limited", .rateLimited)] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+            XCTAssertEqual(ack.status, status)
+            XCTAssertEqual(ack.sessionId, 0)
+            XCTAssertEqual(ack.authToken, Data(repeating: 0, count: 16))
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
     }
 
     // MARK: Media

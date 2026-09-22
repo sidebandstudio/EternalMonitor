@@ -74,6 +74,7 @@ fn usb_framed_stream_end_to_end() {
     std::env::set_var("ETERNAL_USB_DIRECT", address.to_string());
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".into());
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
     let supervisor_shared = shared.clone();
@@ -383,6 +384,7 @@ fn audio_stream_end_to_end() {
     }
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".into());
     shared.max_dgram.store(576, Ordering::SeqCst);
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
@@ -544,6 +546,7 @@ fn synthetic_stream_end_to_end_v2() {
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".to_string());
     let gpu_info = GpuInfo::software_fallback();
 
@@ -739,6 +742,7 @@ fn lossy_stream_recovers_and_adapts() {
     std::env::set_var("ETERNAL_REORDER", "0.02");
     let port = free_udp_port();
     let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".into());
     let (tx, rx) = mpsc::channel();
     let pipeline_shared = shared.clone();
@@ -919,6 +923,7 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".to_string());
     let gpu_info = GpuInfo::software_fallback();
 
@@ -1069,6 +1074,7 @@ fn hevc_stream_negotiates_and_decodes() {
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".to_string());
     shared
         .hevc_enabled
@@ -1211,6 +1217,7 @@ fn input_relay_maps_touches_end_to_end() {
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".to_string());
     let gpu_info = GpuInfo::software_fallback();
 
@@ -1378,6 +1385,7 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some("libx264".to_string());
     let gpu_info = GpuInfo::software_fallback();
 
@@ -1491,4 +1499,166 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
     done_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("supervisor must shut down within 5s");
+}
+
+#[test]
+fn pairing_flow_end_to_end() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in [
+        "ETERNAL_DROP",
+        "ETERNAL_REORDER",
+        "ETERNAL_JITTER_MS",
+        "ETERNAL_FAULT_ENCODER_AFTER",
+        "ETERNAL_USB_DIRECT",
+    ] {
+        std::env::remove_var(name);
+    }
+    let port = free_udp_port();
+    let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    assert!(
+        shared.pairing.lock().required,
+        "production defaults must require pairing"
+    );
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (tx, rx) = mpsc::channel();
+    let host_shared = shared.clone();
+    let host_tx = tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(port, host_shared, GpuInfo::software_fallback(), host_tx, rx);
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let host = format!("127.0.0.1:{port}");
+        let mut hello = Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: socket.local_addr().unwrap().port(),
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 640,
+            screen_px_h: 360,
+            screen_pt_w: 640,
+            screen_pt_h: 360,
+            refresh_hz: 60,
+            device_name: "Pairing test iPad".into(),
+            device_id: 17,
+            preferred_fps: 60,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        };
+        let exchange = |hello: &Hello2| -> HelloAck {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last_send = Instant::now() - Duration::from_secs(1);
+            let mut buffer = [0; 2048];
+            loop {
+                assert!(Instant::now() < deadline, "pairing handshake timed out");
+                if last_send.elapsed() >= Duration::from_millis(250) {
+                    socket
+                        .send_to(
+                            &encode_control(0, 1, &ControlMessage::Hello2(hello.clone())),
+                            &host,
+                        )
+                        .unwrap();
+                    last_send = Instant::now();
+                }
+                let Ok((len, _)) = socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buffer[..len]) {
+                    if ack.client_nonce == hello.client_nonce {
+                        return ack;
+                    }
+                }
+            }
+        };
+        let denied = exchange(&hello);
+        assert_eq!(denied.status, HelloStatus::Unauthorized);
+        assert_eq!(denied.auth_token, [0; 16]);
+        assert!(!shared.client_connected());
+        hello.client_nonce += 1;
+        hello.pairing_code = shared.pairing.lock().code();
+        let paired = exchange(&hello);
+        assert_eq!(paired.status, HelloStatus::Ok);
+        assert_ne!(paired.auth_token, [0; 16]);
+        assert_ne!(hello.pairing_code, shared.pairing.lock().code());
+        assert_eq!(
+            exchange(&hello),
+            paired,
+            "lost ACK retry must succeed after code rotation"
+        );
+        let mut receiver = FakeReceiver {
+            socket: socket.try_clone().unwrap(),
+            host: format!("127.0.0.1:{port}"),
+            session_id: paired.session_id,
+            msg_seq: 1,
+            last_report: Instant::now(),
+            host_caps: paired.host_caps,
+        };
+        let mut assembler = Reassembler::new();
+        let mut decoder = H264TestDecoder::new();
+        let mut frames = Vec::new();
+        let mut buffer = [0; 2048];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while frames.len() < 20 {
+            assert!(Instant::now() < deadline, "paired stream did not decode");
+            receiver.maybe_report(0, frames.len() as u32);
+            let Ok((len, _)) = socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            let Ok((header, payload)) = MediaHeader::decode(&buffer[..len]) else {
+                continue;
+            };
+            assert_eq!(header.session_id, paired.session_id);
+            if let AddOutcome::Completed(bytes) = assembler.add_fragment(
+                header.frame_seq,
+                header.frag_index,
+                header.frag_count,
+                header.stream_epoch,
+                payload,
+                Instant::now(),
+            ) {
+                frames.extend(decoder.decode(&bytes));
+            }
+        }
+        assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.client_connected() {
+            assert!(Instant::now() < deadline, "BYE did not end pairing session");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        hello.client_nonce += 1;
+        hello.pairing_code = 0;
+        hello.auth_token = paired.auth_token;
+        let reconnected = exchange(&hello);
+        assert_eq!(reconnected.status, HelloStatus::Ok);
+        assert_ne!(reconnected.session_id, paired.session_id);
+        shared.pairing.lock().regenerate_token().unwrap();
+        hello.client_nonce += 1;
+        let revoked = exchange(&hello);
+        assert_eq!(revoked.status, HelloStatus::Unauthorized);
+        assert_eq!(revoked.auth_token, [0; 16]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.client_connected() {
+            assert!(
+                Instant::now() < deadline,
+                "token reset did not revoke session"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }));
+    shared.stop();
+    tx.send(SupervisorCommand::Shutdown).unwrap();
+    supervisor.join().unwrap();
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
 }
