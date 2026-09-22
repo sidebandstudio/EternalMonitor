@@ -7,6 +7,7 @@ struct DisplayView: View {
     @State private var showHUD = true
     @State private var hudDismissTask: Task<Void, Never>?
     @State private var showQualityPopover = false
+    @State private var showSettings = false
 
     var body: some View {
         ZStack {
@@ -72,6 +73,11 @@ struct DisplayView: View {
             // screen dimming (or not) right now.
             UIApplication.shared.isIdleTimerDisabled = keepAwake
         }
+        .sheet(isPresented: $showSettings) { SettingsView() }
+        .onChange(of: showSettings) { _, presented in
+            if presented { hudDismissTask?.cancel() }
+            else { scheduleHUDDismiss() }
+        }
     }
 
     // MARK: - HUD overlay
@@ -89,6 +95,10 @@ struct DisplayView: View {
                 divider
                 stat(connectionManager.transportMode, unit: "", color: Theme.text)
                 divider
+                Image(systemName: connectionManager.audioStats.playing && settings.playPCaudio
+                    ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(Theme.text2)
                 qualityBars
             }
             .padding(.horizontal, 14)
@@ -121,7 +131,8 @@ struct DisplayView: View {
         let latency = connectionManager.stats.e2eMs.map { String(format: "%.0f milliseconds", $0) }
             ?? "unknown latency"
         return "Stream statistics: \(Int(connectionManager.fps)) frames per second, "
-            + "\(latency), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars"
+            + "\(latency), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars, "
+            + (connectionManager.audioStats.playing && settings.playPCaudio ? "PC audio playing" : "PC audio muted or unavailable")
     }
 
     private var qualityBars: some View {
@@ -219,6 +230,14 @@ struct DisplayView: View {
             )
 
             Spacer()
+
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape")
+                    .foregroundColor(Theme.text2)
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Stream settings")
+            .accessibilityIdentifier("display.settings")
 
             Button {
                 connectionManager.cancel()

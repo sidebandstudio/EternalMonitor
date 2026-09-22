@@ -20,14 +20,15 @@ write_report() {
 python3 - "$REPORT" "${rows[@]}" <<'PY'
 import datetime,json,pathlib,sys
 lines=['# EternalMonitor system tests', '', datetime.datetime.now(datetime.timezone.utc).isoformat(), '',
-       '| Scenario | Result | Average FPS | Decoded | Dropped | Repaired | NACKs | Stream seconds | Screenshot |',
-       '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
+       '| Scenario | Result | Average FPS | Decoded | Dropped | Repaired | NACKs | Stream seconds | Audio decoded | Audio lost | Tone dBFS | Screenshot |',
+       '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
 for filename in sys.argv[2:]:
     p=pathlib.Path(filename)
     r=json.loads(p.read_text()) if p.exists() else dict(scenario=p.parent.name,status='FAIL')
     shot=r.get('screenshot','')
     cells=[r['scenario'],r['status'],r.get('average_fps',r.get('fps','')),r.get('decoded',''),
            r.get('dropped',''),r.get('repaired',''),r.get('nacks',''),r.get('measured_seconds',''),
+           r.get('audio_decoded',''),r.get('audio_lost',''),r.get('audio_tone1k_db',''),
            f'[PNG]({shot})' if shot else '']
     lines.append('| '+' | '.join(map(str,cells))+' |')
 pathlib.Path(sys.argv[1]).write_text('\n'.join(lines)+'\n')
@@ -115,14 +116,17 @@ PY
     done
 else
     skip=0
-    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover; do
+    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio; do
         codec=h264; size=640x360; drop=0; reorder=0; bitrate=15; idr=0; duration=5; repairs=0; backend=nw; transport=udp
+        audio=0
         case "$scenario" in
             hevc-udp) codec=hevc ;;
             h264-udp-loss3) drop=0.03; reorder=0.01; duration=20; repairs=1 ;;
             h264-udp-burst*) size=2560x1440; bitrate=40; idr=60; duration=20 ;;
             h264-usb) transport=usb ;;
             usb-takeover) transport=takeover ;;
+            h264-udp-audio) audio=1 ;;
+            h264-usb-audio) transport=usb; audio=1 ;;
         esac
         [ "$scenario" != h264-udp-burst-bsd ] || backend=bsd
         rows+=("$OUT/$scenario/result.json")
@@ -130,7 +134,7 @@ else
         if ! EM_CODEC="$codec" EM_SCENARIO="$scenario" EM_SKIP_BUILD="$skip" \
              EM_OUTPUT_DIR="$OUT/$scenario" EM_SIZE="$size" EM_BITRATE_MBPS="$bitrate" \
              EM_UDP_BACKEND="$backend" EM_DURATION="$duration" EM_REQUIRE_REPAIRS="$repairs" \
-             EM_TRANSPORT="$transport" \
+             EM_TRANSPORT="$transport" EM_AUDIO="$audio" \
              ETERNAL_DROP="$drop" ETERNAL_REORDER="$reorder" ETERNAL_FORCE_IDR_PERIOD="$idr" \
              "$ROOT/scripts/e2e_ios.sh" > "$OUT/$scenario-run.log" 2>&1; then
             failed=1

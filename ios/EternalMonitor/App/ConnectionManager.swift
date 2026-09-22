@@ -86,6 +86,8 @@ final class ConnectionManager: ObservableObject {
     /// Whether this session asked the host to relay input (the Settings
     /// toggle, latched at HELLO2 time — mid-session flips need a reconnect).
     @Published private(set) var sessionWantsInput = false
+    @Published private(set) var sessionWantsAudio = false
+    @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
     @Published private(set) var hostInfo: ControlChannel.SessionInfo?
     /// The host's live stream parameters — from the ACK, then refreshed by
@@ -101,6 +103,8 @@ final class ConnectionManager: ObservableObject {
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
     private var videoDecoder: VideoDecoder?
+    private var audioPlayer: AudioPlayer?
+    private var audioPreference: Bool?
     private var timeoutTask: Task<Void, Never>?
     private var statsFlushTask: Task<Void, Never>?
     /// Hot-path counters written on the link queue and drained at 4 Hz — the
@@ -229,12 +233,26 @@ final class ConnectionManager: ObservableObject {
         videoSize = .zero
         let wantsInput = UserDefaults.standard.object(forKey: "controlPC") as? Bool ?? true
         sessionWantsInput = wantsInput
+        let wantsAudio = audioPreference ?? (UserDefaults.standard.object(forKey: "playPCaudio") as? Bool ?? true)
+        sessionWantsAudio = wantsAudio
+        audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
         record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
 
         let decoder = VideoDecoder()
         let metrics = ReceiverMetrics()
         let assembler = FrameAssembler()
+        let audio = wantsAudio ? AudioPlayer() : nil
+        audio?.onError = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, "audio", message)
+            }
+        }
+        receiver.onAudioPacket = { [weak self, weak audio] header, opus in
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            audio?.receive(header: header, opus: opus)
+        }
 
         assembler.onDiagnostic = { [weak self] message in
             Task { @MainActor in
@@ -339,11 +357,15 @@ final class ConnectionManager: ObservableObject {
         assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
             channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: seq, reason: .gapLoss)
         }
-        channel.reportProvider = { [weak assembler, weak channel, weak decoder] in
-            metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
+        channel.reportProvider = { [weak assembler, weak channel, weak decoder, weak audio] in
+            var report = metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
                 decodeDepth: decoder?.decodeDepth ?? 0,
                 clock: channel?.clockSnapshot.withLock { $0 } ?? .init(),
                 now: ControlChannel.clientNowUs())
+            let stats = audio?.stats ?? AudioStats()
+            report.audioPacketsLost = UInt32(clamping: stats.lost)
+            report.audioBufferMs = UInt16(clamping: stats.bufferMs)
+            return report
         }
         channel.onHelloAttempt = { [weak self] attempt, total in
             Task { @MainActor in
@@ -437,7 +459,8 @@ final class ConnectionManager: ObservableObject {
             screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
             refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
             decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
-            featureCaps: (wantsInput ? Hello2.featureWantsInput : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
+            featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
+                | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
             deviceId: DeviceIdentity.load(),
             preferredFPS: UInt8(clamping: UserDefaults.standard.object(forKey: "targetFPS") as? Int ?? 60)
         )
@@ -485,6 +508,7 @@ final class ConnectionManager: ObservableObject {
         }
 
         self.videoDecoder = decoder
+        self.audioPlayer = audio
         self.frameAssembler = assembler
         self.controlChannel = channel
         self.mediaLink = receiver
@@ -554,6 +578,7 @@ final class ConnectionManager: ObservableObject {
     /// heartbeat liveness watchdog. MainActor, 4 Hz.
     private func refreshStatsAndWatchdog() {
         guard let channel = controlChannel else { return }
+        audioStats = audioPlayer?.stats ?? AudioStats()
 
         // --- Stats snapshot ---
         var next = StreamStats()
@@ -672,6 +697,21 @@ final class ConnectionManager: ObservableObject {
         disconnect()
     }
 
+    func refreshAudioPreference(_ enabled: Bool) {
+        audioPreference = enabled
+        if !enabled || sessionWantsAudio {
+            audioPlayer?.setEnabled(enabled)
+            audioStats.playing = false
+        } else if state != .disconnected {
+            // Audio is negotiated in HELLO2. Enabling it after an audio-free
+            // session needs a new handshake; USB's listener accepts the retry.
+            let isUSB = mediaLink?.isUSB == true
+            let target = lastTarget
+            disconnect()
+            if !isUSB, let target { connect(host: target.host, port: target.port) }
+        }
+    }
+
     /// The app is leaving the foreground: say goodbye so the host stops
     /// streaming promptly instead of waiting out its liveness window.
     func handleAppBackgrounded() {
@@ -713,6 +753,7 @@ final class ConnectionManager: ObservableObject {
         controlChannel?.stop()
         mediaLink?.stop()
         videoDecoder?.shutdown()
+        audioPlayer?.stop()
         frameAssembler?.reset()
         _ = streamCounters.drain()
 
@@ -722,6 +763,9 @@ final class ConnectionManager: ObservableObject {
         fpsCounter = FPSCounter()
         frameAssembler = nil
         videoDecoder = nil
+        audioPlayer = nil
+        sessionWantsAudio = false
+        audioStats = AudioStats()
 
         state = .disconnected
         fps = 0
@@ -882,6 +926,9 @@ struct FPSCounter {
 // MARK: - Settings
 
 final class AppSettings: ObservableObject {
+    @Published var playPCaudio: Bool {
+        didSet { UserDefaults.standard.set(playPCaudio, forKey: "playPCaudio") }
+    }
     @Published var allowUSB: Bool {
         didSet { UserDefaults.standard.set(allowUSB, forKey: "allowUSB") }
     }
@@ -919,6 +966,7 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        self.playPCaudio = defaults.object(forKey: "playPCaudio") as? Bool ?? true
         self.allowUSB = defaults.object(forKey: "allowUSB") as? Bool ?? true
         self.showHUD = defaults.object(forKey: "showHUD") as? Bool ?? true
         self.keepScreenAwake = defaults.object(forKey: "keepScreenAwake") as? Bool ?? true

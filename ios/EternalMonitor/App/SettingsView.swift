@@ -32,6 +32,11 @@ struct SettingsView: View {
                         Label("Show stats HUD", systemImage: "gauge.with.dots.needle.33percent")
                     }
 
+                    Toggle(isOn: $settings.playPCaudio) {
+                        Label("Play PC audio", systemImage: "speaker.wave.2")
+                    }
+                    .accessibilityIdentifier("settings.playPCaudio")
+
                     Toggle(isOn: $settings.autoReconnect) {
                         Label("Auto-reconnect", systemImage: "arrow.triangle.2.circlepath")
                     }
@@ -92,6 +97,11 @@ struct SettingsView: View {
                             String(format: "%.1f Mbps", Double(config.bitrateBps) / 1_000_000.0),
                             "slider.horizontal.3"
                         )
+                        infoRow("Audio", audioDescription, "speaker.wave.2")
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("Audio")
+                            .accessibilityValue(audioDescription)
+                            .accessibilityIdentifier("settings.hostAudio")
                     } else {
                         infoRow("Host", "Not connected", "desktopcomputer")
                     }
@@ -174,6 +184,13 @@ struct SettingsView: View {
             .font(.appMonoMedium(size: 11))
             .tracking(1.5)
             .foregroundColor(Theme.text3)
+    }
+
+    private var audioDescription: String {
+        if !settings.playPCaudio { return "Muted" }
+        if let error = connectionManager.audioStats.error { return error }
+        guard connectionManager.audioStats.playing else { return "Unavailable" }
+        return "Opus 128 kbps, buffer \(connectionManager.audioStats.targetMs) ms"
     }
 
     private func footnote(_ text: String) -> some View {

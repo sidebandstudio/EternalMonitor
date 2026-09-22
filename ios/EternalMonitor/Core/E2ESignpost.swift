@@ -39,4 +39,9 @@ enum E2E {
             "E2E_STATS decoded=\(decoded, privacy: .public) w=\(width, privacy: .public) h=\(height, privacy: .public) fps=\(Int(fps), privacy: .public) dropped=\(counters.framesDropped, privacy: .public) repaired=\(counters.fragsRepaired, privacy: .public) nacks=\(counters.nacksSent, privacy: .public) jitter_us=\(counters.jitterUs, privacy: .public) monotonic_ms=\(monotonicMs, privacy: .public) assembled=\(counters.framesComplete, privacy: .public) decode_depth=\(decodeDepth, privacy: .public)"
         )
     }
+
+    static func audio(_ stats: AudioStats) {
+        guard enabled else { return }
+        logger.log("E2E_AUDIO packets=\(stats.packets, privacy: .public) decoded=\(stats.decoded, privacy: .public) lost=\(stats.lost, privacy: .public) buffer_ms=\(stats.bufferMs, privacy: .public) rms=\(stats.rms, privacy: .public) tone1k_db=\(stats.tone1kDB, privacy: .public)")
+    }
 }
