@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 22,
+            Self.vectors.count, 25,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -48,6 +48,20 @@ final class WireProtocolGoldenTests: XCTestCase {
             XCTAssertEqual(ack.status, status)
             XCTAssertEqual(ack.sessionId, 0)
             XCTAssertEqual(ack.authToken, Data(repeating: 0, count: 16))
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    func testKeyboardTextAndHoverVectors() throws {
+        for (name, kind, phase, keycode): (String, UInt8, UInt8, UInt16) in [
+            ("input_key_down", 4, 0, 0x4f), ("input_text", 5, 0, 0xd83d), ("input_hover", 6, 1, 0)
+        ] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .inputEvent(let event) = message else { return XCTFail("wrong type") }
+            XCTAssertEqual(header.sessionId, 0x1234_5678)
+            XCTAssertEqual(event, WireInputEvent(kind: kind, phase: phase, buttons: 0, eventId: 42,
+                xNorm: 32768, yNorm: 16384, keycode: keycode, modifiers: 2, clientTimeUs: 123456789))
             XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
         }
     }

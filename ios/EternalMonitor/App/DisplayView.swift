@@ -8,6 +8,7 @@ struct DisplayView: View {
     @State private var hudDismissTask: Task<Void, Never>?
     @State private var showQualityPopover = false
     @State private var showSettings = false
+    @State private var showKeyboard = false
 
     var body: some View {
         ZStack {
@@ -19,7 +20,7 @@ struct DisplayView: View {
                 // PC; a three-finger tap (via the relay layer) drives the HUD.
                 MetalView()
                     .ignoresSafeArea()
-                TouchRelayView(onToggleHUD: { toggleHUD() })
+                TouchRelayView(keyboardVisible: $showKeyboard, active: !showSettings && !connectionManager.signalLost, onToggleHUD: { toggleHUD() })
                     .ignoresSafeArea()
             } else {
                 // One gesture, one meaning: tap toggles the HUD. (The old
@@ -74,8 +75,12 @@ struct DisplayView: View {
             UIApplication.shared.isIdleTimerDisabled = keepAwake
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
+        .onChange(of: showKeyboard) { _, presented in
+            if presented { hudDismissTask?.cancel(); showHUD = true }
+            else { scheduleHUDDismiss() }
+        }
         .onChange(of: showSettings) { _, presented in
-            if presented { hudDismissTask?.cancel() }
+            if presented { showKeyboard = false; hudDismissTask?.cancel() }
             else { scheduleHUDDismiss() }
         }
     }
@@ -231,6 +236,16 @@ struct DisplayView: View {
 
             Spacer()
 
+            if connectionManager.sessionHasKeyboard {
+                Button { showKeyboard.toggle() } label: {
+                    Label(showKeyboard ? "Hide keyboard" : "Keyboard", systemImage: "keyboard")
+                        .font(.appMonoMedium(size: 12))
+                        .foregroundColor(Theme.amber)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityIdentifier("display.keyboard")
+            }
+
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape")
                     .foregroundColor(Theme.text2)
@@ -282,6 +297,7 @@ struct DisplayView: View {
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
         withAnimation(.easeOut(duration: 0.25)) { showHUD = true }
+        guard !showKeyboard && !showSettings else { return }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {

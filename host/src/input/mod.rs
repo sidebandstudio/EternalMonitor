@@ -7,6 +7,8 @@
 //! end-to-end tests instead.
 
 use eternal_wire::v2::control::InputEvent;
+mod hid;
+pub use hid::hid_to_scancode;
 
 #[cfg(windows)]
 pub mod windows_inject;
@@ -37,6 +39,8 @@ pub const KIND_PENCIL: u8 = 1;
 pub const KIND_MOUSE_ABS: u8 = 2;
 pub const KIND_SCROLL: u8 = 3;
 pub const KIND_KEY: u8 = 4;
+pub const KIND_TEXT: u8 = 5;
+pub const KIND_HOVER: u8 = 6;
 
 /// Phases (`InputEvent.phase`).
 pub const PHASE_BEGAN: u8 = 0;
@@ -48,6 +52,15 @@ pub const PHASE_CANCELLED: u8 = 3;
 /// recorder off Windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Injection {
+    KeyDown {
+        scan: u16,
+        extended: bool,
+    },
+    KeyUp {
+        scan: u16,
+        extended: bool,
+    },
+    Unicode(u16),
     /// Absolute pointer move in virtual-screen normalized space (0..65535).
     MoveAbs {
         x: u16,
@@ -66,6 +79,14 @@ pub enum Injection {
         y: u16,
     },
     RightUp {
+        x: u16,
+        y: u16,
+    },
+    MiddleDown {
+        x: u16,
+        y: u16,
+    },
+    MiddleUp {
         x: u16,
         y: u16,
     },
@@ -149,15 +170,24 @@ pub fn resolve(
     output: CaptureGeometry,
     screen: VirtualScreen,
 ) -> Vec<Injection> {
+    if event.input_ver != 1 {
+        return Vec::new();
+    }
     let (px, py) = norm_to_output_pixel(event.x_norm, event.y_norm, output);
     let (ax, ay) = desktop_pixel_to_abs(px, py, screen);
 
     match event.kind {
         KIND_TOUCH | KIND_PENCIL | KIND_MOUSE_ABS => {
             let right_button = event.buttons & 0b10 != 0;
+            let middle_button = event.buttons & 0b100 != 0;
             match event.phase {
                 PHASE_BEGAN => {
-                    if right_button {
+                    if middle_button {
+                        vec![
+                            Injection::MoveAbs { x: ax, y: ay },
+                            Injection::MiddleDown { x: ax, y: ay },
+                        ]
+                    } else if right_button {
                         vec![
                             Injection::MoveAbs { x: ax, y: ay },
                             Injection::RightDown { x: ax, y: ay },
@@ -171,7 +201,12 @@ pub fn resolve(
                 }
                 PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
                 PHASE_ENDED | PHASE_CANCELLED => {
-                    if right_button {
+                    if middle_button {
+                        vec![
+                            Injection::MoveAbs { x: ax, y: ay },
+                            Injection::MiddleUp { x: ax, y: ay },
+                        ]
+                    } else if right_button {
                         vec![
                             Injection::MoveAbs { x: ax, y: ay },
                             Injection::RightUp { x: ax, y: ay },
@@ -186,6 +221,18 @@ pub fn resolve(
                 _ => Vec::new(),
             }
         }
+        KIND_HOVER if event.phase == PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
+        KIND_KEY => {
+            let Some((scan, extended)) = hid_to_scancode(event.keycode) else {
+                return Vec::new();
+            };
+            match event.phase {
+                PHASE_BEGAN => vec![Injection::KeyDown { scan, extended }],
+                PHASE_ENDED | PHASE_CANCELLED => vec![Injection::KeyUp { scan, extended }],
+                _ => Vec::new(),
+            }
+        }
+        KIND_TEXT if event.phase == PHASE_BEGAN => vec![Injection::Unicode(event.keycode)],
         KIND_SCROLL => {
             let mut injections = vec![Injection::MoveAbs { x: ax, y: ay }];
             if event.scroll_dy != 0 {
@@ -231,7 +278,18 @@ pub fn inject(injections: &[Injection]) {
     #[cfg(windows)]
     windows_inject::inject(injections);
     #[cfg(not(windows))]
-    recorder::record(injections);
+    {
+        recorder::record(injections);
+        log_injections(injections);
+    }
+}
+
+fn log_injections(injections: &[Injection]) {
+    if std::env::var("ETERNAL_INPUT_RECORDER_LOG").is_ok_and(|value| value == "1") {
+        for injection in injections {
+            tracing::info!(command = ?injection, "Input injection");
+        }
+    }
 }
 
 /// The transport's per-connection relay state: an edge deduper scoped to the
@@ -240,21 +298,88 @@ pub fn inject(injections: &[Injection]) {
 #[derive(Debug, Default)]
 pub struct InputRelay {
     session: Option<(u32, EventDeduper)>,
+    held: HeldInputs,
+}
+
+#[derive(Debug, Default)]
+struct HeldInputs {
+    keys: std::collections::BTreeSet<(u16, bool)>,
+    buttons: u8,
+    pointer: (u16, u16),
+}
+
+impl HeldInputs {
+    fn record(&mut self, injections: &[Injection]) {
+        for injection in injections {
+            match *injection {
+                Injection::KeyDown { scan, extended } => {
+                    self.keys.insert((scan, extended));
+                }
+                Injection::KeyUp { scan, extended } => {
+                    self.keys.remove(&(scan, extended));
+                }
+                Injection::MoveAbs { x, y } => self.pointer = (x, y),
+                Injection::LeftDown { .. } => self.buttons |= 1,
+                Injection::LeftUp { .. } => self.buttons &= !1,
+                Injection::RightDown { .. } => self.buttons |= 2,
+                Injection::RightUp { .. } => self.buttons &= !2,
+                Injection::MiddleDown { .. } => self.buttons |= 4,
+                Injection::MiddleUp { .. } => self.buttons &= !4,
+                _ => {}
+            }
+        }
+    }
+
+    fn release(&mut self) -> Vec<Injection> {
+        let mut releases: Vec<_> = std::mem::take(&mut self.keys)
+            .into_iter()
+            .map(|(scan, extended)| Injection::KeyUp { scan, extended })
+            .collect();
+        let (x, y) = self.pointer;
+        if self.buttons & 1 != 0 {
+            releases.push(Injection::LeftUp { x, y });
+        }
+        if self.buttons & 2 != 0 {
+            releases.push(Injection::RightUp { x, y });
+        }
+        if self.buttons & 4 != 0 {
+            releases.push(Injection::MiddleUp { x, y });
+        }
+        self.buttons = 0;
+        releases
+    }
 }
 
 impl InputRelay {
+    /// Release keys/buttons when a session ends, expires, or is superseded.
+    pub fn reset(&mut self) {
+        inject(&self.held.release());
+        self.session = None;
+    }
+
     /// Dedupe, map, and inject one session-validated event.
     pub fn relay(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
         match &self.session {
             Some((id, _)) if *id == session_id => {}
-            _ => self.session = Some((session_id, EventDeduper::default())),
+            _ => {
+                self.reset();
+                self.session = Some((session_id, EventDeduper::default()));
+            }
         }
         let deduper = &mut self.session.as_mut().expect("just ensured").1;
         if !deduper.accept(event) {
             return;
         }
         let screen = current_virtual_screen(output);
-        inject(&resolve(event, output, screen));
+        let injections = resolve(event, output, screen);
+        self.held.record(&injections);
+        inject(&injections);
+    }
+}
+
+impl Drop for InputRelay {
+    fn drop(&mut self) {
+        self.reset();
     }
 }
 
@@ -393,7 +518,15 @@ mod tests {
         relay.relay(7, &e, OUTPUT); // injected (MoveAbs + LeftDown)
         relay.relay(7, &e, OUTPUT); // duplicate edge: dropped
         relay.relay(8, &e, OUTPUT); // new session, same event_id: injected
-        assert_eq!(recorder::take().len(), 4);
+        let recorded = recorder::take();
+        assert_eq!(recorded.len(), 5);
+        assert!(matches!(recorded[2], Injection::LeftUp { .. }));
+        // Empty the release that Drop correctly injects for session 8 too.
+        drop(relay);
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::LeftUp { .. }]
+        ));
     }
 
     #[test]
@@ -432,5 +565,97 @@ mod tests {
         let mut ended = event(KIND_TOUCH, PHASE_ENDED, 2, 2);
         ended.event_id = 8;
         assert!(dedupe.accept(&ended));
+    }
+
+    #[test]
+    fn keyboard_text_hover_and_middle_resolve_without_extra_clicks() {
+        let mut e = event(KIND_KEY, PHASE_BEGAN, 0, 0);
+        e.keycode = 0x4f;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN),
+            vec![Injection::KeyDown {
+                scan: 0x4d,
+                extended: true
+            }]
+        );
+        e.phase = PHASE_CANCELLED;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN),
+            vec![Injection::KeyUp {
+                scan: 0x4d,
+                extended: true
+            }]
+        );
+        e.keycode = 0xffff;
+        assert!(resolve(&e, OUTPUT, SINGLE_SCREEN).is_empty());
+        e.kind = KIND_TEXT;
+        e.phase = PHASE_BEGAN;
+        e.keycode = 0xd83d;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN),
+            vec![Injection::Unicode(0xd83d)]
+        );
+        e.phase = PHASE_ENDED;
+        assert!(resolve(&e, OUTPUT, SINGLE_SCREEN).is_empty());
+        e.kind = KIND_HOVER;
+        e.phase = PHASE_MOVED;
+        e.buttons = 7;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN),
+            vec![Injection::MoveAbs { x: 0, y: 0 }]
+        );
+        e.kind = KIND_MOUSE_ABS;
+        e.buttons = 4;
+        e.phase = PHASE_BEGAN;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN)[1],
+            Injection::MiddleDown { x: 0, y: 0 }
+        );
+        e.phase = PHASE_ENDED;
+        assert_eq!(
+            resolve(&e, OUTPUT, SINGLE_SCREEN)[1],
+            Injection::MiddleUp { x: 0, y: 0 }
+        );
+        e.kind = KIND_KEY;
+        e.event_id = 99;
+        let mut deduper = EventDeduper::default();
+        assert!(deduper.accept(&e));
+        assert!(!deduper.accept(&e));
+    }
+
+    #[test]
+    fn held_inputs_release_once_after_disconnect() {
+        let mut held = HeldInputs::default();
+        held.record(&[
+            Injection::KeyDown {
+                scan: 0x1d,
+                extended: false,
+            },
+            Injection::KeyDown {
+                scan: 0x1d,
+                extended: false,
+            },
+            Injection::KeyDown {
+                scan: 0x2e,
+                extended: false,
+            },
+            Injection::KeyUp {
+                scan: 0x2e,
+                extended: false,
+            },
+            Injection::MoveAbs { x: 123, y: 456 },
+            Injection::MiddleDown { x: 123, y: 456 },
+        ]);
+        assert_eq!(
+            held.release(),
+            vec![
+                Injection::KeyUp {
+                    scan: 0x1d,
+                    extended: false
+                },
+                Injection::MiddleUp { x: 123, y: 456 }
+            ]
+        );
+        assert!(held.release().is_empty());
     }
 }

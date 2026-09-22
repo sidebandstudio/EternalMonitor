@@ -189,8 +189,16 @@ final class ConnectionManager: ObservableObject {
 
     /// Relay one input event to the host (hot path — the channel hops to its
     /// own queue; dropped silently when no session is up).
-    func sendInput(_ event: WireInputEvent) {
-        controlChannelBox.value?.sendInput(event)
+    private var inputSequence = InputEventSequencer()
+    var sessionHasKeyboard: Bool {
+        sessionWantsInput && (hostInfo?.hostCaps ?? 0) & HelloAck.hostCapKeyboard != 0
+    }
+
+    func sendInputs(_ events: [WireInputEvent]) {
+        guard sessionWantsInput else { return }
+        for event in inputSequence.packets(events, timeUs: ControlChannel.clientNowUs()) {
+            controlChannelBox.value?.sendInput(event)
+        }
     }
 
     // MARK: - Connect / Disconnect
@@ -1006,6 +1014,9 @@ final class AppSettings: ObservableObject {
     @Published var controlPC: Bool {
         didSet { UserDefaults.standard.set(controlPC, forKey: "controlPC") }
     }
+    @Published var commandAsControl: Bool {
+        didSet { UserDefaults.standard.set(commandAsControl, forKey: "commandAsControl") }
+    }
     @Published var autoReconnect: Bool {
         didSet { UserDefaults.standard.set(autoReconnect, forKey: "autoReconnect") }
     }
@@ -1032,6 +1043,7 @@ final class AppSettings: ObservableObject {
         self.autoResumeOnForeground =
             defaults.object(forKey: "autoResumeOnForeground") as? Bool ?? true
         self.controlPC = defaults.object(forKey: "controlPC") as? Bool ?? true
+        self.commandAsControl = defaults.object(forKey: "commandAsControl") as? Bool ?? true
         self.autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
         self.targetFPS = defaults.object(forKey: "targetFPS") as? Int ?? 60
         self.promotionEnabled = defaults.object(forKey: "promotionEnabled") as? Bool ?? true
