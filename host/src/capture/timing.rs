@@ -1,7 +1,7 @@
-//! Pacing for the synthetic source. macOS's ordinary sleep can coalesce
-//! timers by several milliseconds, but spinning for a whole frame consumes
-//! a core the software encoder and simulator need. A critical kqueue timer
-//! sleeps until the final 500 us, which is the only busy-wait interval.
+//! Pacing for synthetic capture and packet delivery. Sleep until the final
+//! 500 us so encoding and loss repair can use the CPU between deadlines.
+//! macOS needs a critical kqueue timer to avoid coalescing; Rust's Windows
+//! sleep uses a high-resolution waitable timer on supported Windows versions.
 
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,11 @@ impl FrameTimer {
 
     pub fn wait_until(&mut self, deadline: Instant) {
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            #[cfg(windows)]
+            if remaining > Duration::from_micros(500) {
+                std::thread::sleep(remaining - Duration::from_micros(500));
+                continue;
+            }
             #[cfg(target_os = "macos")]
             if let Some(queue) = &self.queue {
                 let margin = Duration::from_micros(500);
