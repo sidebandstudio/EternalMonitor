@@ -19,6 +19,9 @@ use crate::control::SharedControl;
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
+#[cfg(target_os = "macos")]
+mod vimage;
+
 const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
@@ -306,9 +309,27 @@ fn run_encode_loop(
                 .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
         }
 
-        encoder
-            .scaler
-            .run(&encoder.bgra_frame, &mut encoder.frame)?;
+        #[cfg(target_os = "macos")]
+        let converted = match encoder
+            .native_converter
+            .as_ref()
+            .map(|converter| converter.convert(&encoder.bgra_frame, &mut encoder.frame))
+        {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                warn!(%error, "Using swscale after native color conversion failed");
+                encoder.native_converter = None;
+                false
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let converted = false;
+        if !converted {
+            encoder
+                .scaler
+                .run(&encoder.bgra_frame, &mut encoder.frame)?;
+        }
         let pts = if encoder.legacy_pts {
             raw_frame.frame_number as i64
         } else {
@@ -445,6 +466,8 @@ fn run_encode_loop(
 }
 
 struct EncoderState {
+    #[cfg(target_os = "macos")]
+    native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     scaler: ffmpeg_next::software::scaling::Context,
     bgra_frame: ffmpeg_next::frame::Video,
@@ -525,6 +548,17 @@ impl EncoderState {
         info!("swscale BGRA->YUV420P context created");
 
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            native_converter: match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
+                }
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            },
             encoder,
             scaler,
             bgra_frame: ffmpeg_next::frame::Video::new(
