@@ -11,6 +11,8 @@ const APP_FOLDER: &str = "EternalMonitor";
 pub struct SettingsFile {
     pub bitrate_mbps: f32,
     pub target_fps: u32,
+    #[serde(default = "default_max_dgram")]
+    pub max_dgram: u16,
     #[serde(default)]
     pub target_ip: Option<String>,
     #[serde(default)]
@@ -34,11 +36,16 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_dgram() -> u16 {
+    eternal_wire::v2::MAX_DGRAM_SIZE as u16
+}
+
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             bitrate_mbps: 15.0,
             target_fps: 60,
+            max_dgram: default_max_dgram(),
             target_ip: None,
             encoder_override: None,
             capture_display: None,
@@ -131,4 +138,29 @@ pub fn app_data_dir() -> Option<PathBuf> {
 
 fn settings_path() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_default_packet_size_and_new_settings_round_trip() {
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        assert_eq!(
+            serde_json::from_str::<SettingsFile>(old).unwrap().max_dgram,
+            1400
+        );
+        let settings = SettingsFile {
+            max_dgram: 1200,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SettingsFile>(&json)
+                .unwrap()
+                .max_dgram,
+            1200
+        );
+    }
 }

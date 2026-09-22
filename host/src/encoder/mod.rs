@@ -107,6 +107,10 @@ fn run_encode_loop(
 
     let mut encoder_state: Option<EncoderState> = None;
     let mut frames_since_last_idr: u64 = 0;
+    let test_idr_period = std::env::var("ETERNAL_FORCE_IDR_PERIOD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&period| period > 0);
     // Bounded retries for the AMF startup case where a keyframe is emitted before any SPS/PPS are
     // available (empty extradata + no inline parameter sets). We nudge another IDR a few times so
     // a subsequent keyframe carrying inline parameter sets can recover, instead of leaving the
@@ -319,7 +323,8 @@ fn run_encode_loop(
             pts
         };
         encoder.frame.set_pts(Some(pts));
-        let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst);
+        let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst)
+            || test_idr_period.is_some_and(|period| raw_frame.frame_number.is_multiple_of(period));
         let _forced_intra = prepare_frame_for_encode(
             &mut encoder.frame,
             raw_frame.frame_number,

@@ -41,6 +41,7 @@ pub struct PipelineStats {
     pub transport_bytes_sent: u64,
     pub transport_packets_sent: u64,
     pub transport_fragments_sent: u64,
+    pub transport_retransmits: u64,
     pub target_addr: String,
     pub latency_ms: f64,
     transport_timestamps: VecDeque<Instant>,
@@ -92,6 +93,7 @@ impl PipelineStats {
             transport_bytes_sent: 0,
             transport_packets_sent: 0,
             transport_fragments_sent: 0,
+            transport_retransmits: 0,
             target_addr: String::new(),
             latency_ms: 0.0,
             transport_timestamps: VecDeque::with_capacity(128),
@@ -138,6 +140,7 @@ impl PipelineStats {
         self.transport_bytes_sent = 0;
         self.transport_packets_sent = 0;
         self.transport_fragments_sent = 0;
+        self.transport_retransmits = 0;
         self.transport_timestamps.clear();
         self.bandwidth_samples.clear();
         self.bandwidth_bps = 0.0;

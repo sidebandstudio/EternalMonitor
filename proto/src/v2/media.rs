@@ -23,12 +23,22 @@ use super::{Classified, CommonPrefix, PacketType, WireError, MAX_DGRAM_SIZE, PRE
 pub const MEDIA_HEADER_SIZE: usize = 32;
 /// Largest payload chunk that fits a media datagram.
 pub const MAX_MEDIA_PAYLOAD: usize = MAX_DGRAM_SIZE - MEDIA_HEADER_SIZE; // 1368
+pub const MIN_DGRAM_SIZE: usize = 576;
+
+pub fn media_payload_size(max_dgram: usize) -> Result<usize, WireError> {
+    if !(MIN_DGRAM_SIZE..=MAX_DGRAM_SIZE).contains(&max_dgram) {
+        return Err(WireError::InvalidField("max_dgram"));
+    }
+    Ok(max_dgram - MEDIA_HEADER_SIZE)
+}
 /// Hard cap on fragments per frame: 4 MiB of payload. Anything larger is a
 /// protocol violation (and a memory-exhaustion vector on the receiver).
 pub const MAX_FRAG_COUNT: u16 = (4 * 1024 * 1024 / MAX_MEDIA_PAYLOAD) as u16; // 3066
 
 /// flags bit0: the access unit this fragment belongs to is a random-access point.
 pub const MEDIA_FLAG_KEYFRAME: u8 = 0b0000_0001;
+/// flags bit1: a NACK-triggered retransmission, excluded from first-send stats.
+pub const MEDIA_FLAG_RETRANSMIT: u8 = 0b0000_0010;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaHeader {
@@ -38,6 +48,7 @@ pub struct MediaHeader {
     pub frag_index: u16,
     pub frag_count: u16,
     pub is_keyframe: bool,
+    pub is_retransmit: bool,
     pub capture_ts_us: u64,
     /// Length of the payload chunk following the header.
     pub payload_len: u16,
@@ -53,11 +64,15 @@ impl MediaHeader {
         assert!(buf.len() >= MEDIA_HEADER_SIZE);
         CommonPrefix {
             packet_type: PacketType::Media,
-            flags: if self.is_keyframe {
+            flags: (if self.is_keyframe {
                 MEDIA_FLAG_KEYFRAME
             } else {
                 0
-            },
+            }) | (if self.is_retransmit {
+                MEDIA_FLAG_RETRANSMIT
+            } else {
+                0
+            }),
             payload_len: self.payload_len,
         }
         .encode_into(buf);
@@ -117,6 +132,7 @@ impl MediaHeader {
             frag_index,
             frag_count,
             is_keyframe: prefix.flags & MEDIA_FLAG_KEYFRAME != 0,
+            is_retransmit: prefix.flags & MEDIA_FLAG_RETRANSMIT != 0,
             capture_ts_us: u64::from_le_bytes([
                 datagram[24],
                 datagram[25],
@@ -144,17 +160,28 @@ pub fn fragment_access_unit(
     header_template: MediaHeader,
     payload: &[u8],
     scratch: &mut [u8],
+    emit: impl FnMut(&[u8]),
+) -> Result<u16, WireError> {
+    fragment_access_unit_with_max_dgram(header_template, payload, MAX_DGRAM_SIZE, scratch, emit)
+}
+
+pub fn fragment_access_unit_with_max_dgram(
+    header_template: MediaHeader,
+    payload: &[u8],
+    max_dgram: usize,
+    scratch: &mut [u8],
     mut emit: impl FnMut(&[u8]),
 ) -> Result<u16, WireError> {
-    assert!(scratch.len() >= MAX_DGRAM_SIZE);
-    let frag_count = payload.len().div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+    let payload_size = media_payload_size(max_dgram)?;
+    assert!(scratch.len() >= max_dgram);
+    let frag_count = payload.len().div_ceil(payload_size).max(1);
     if frag_count > usize::from(MAX_FRAG_COUNT) {
         return Err(WireError::InvalidField("frag_count"));
     }
     let frag_count = frag_count as u16;
 
     for (index, chunk) in payload
-        .chunks(MAX_MEDIA_PAYLOAD)
+        .chunks(payload_size)
         .chain(std::iter::once(&payload[..0]).filter(|_| payload.is_empty()))
         .enumerate()
     {
@@ -182,6 +209,42 @@ const _: () = assert!(PREFIX_SIZE == 8);
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_packet_sizes_bound_every_fragment_and_reconstruct_payload() {
+        let payload: Vec<u8> = (0..10_000).map(|i| i as u8).collect();
+        for max_dgram in [576, 1200, 1400] {
+            let mut scratch = [0; MAX_DGRAM_SIZE];
+            let mut reconstructed = Vec::new();
+            let count = fragment_access_unit_with_max_dgram(
+                sample_header(),
+                &payload,
+                max_dgram,
+                &mut scratch,
+                |bytes| {
+                    assert!(bytes.len() <= max_dgram);
+                    let (header, chunk) = MediaHeader::decode(bytes).unwrap();
+                    assert_eq!(
+                        usize::from(header.frag_count),
+                        payload.len().div_ceil(max_dgram - MEDIA_HEADER_SIZE)
+                    );
+                    reconstructed.extend_from_slice(chunk);
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                usize::from(count),
+                payload.len().div_ceil(max_dgram - MEDIA_HEADER_SIZE)
+            );
+            assert_eq!(reconstructed, payload);
+        }
+        for invalid in [0, 32, 575, 1401, usize::MAX] {
+            assert_eq!(
+                media_payload_size(invalid),
+                Err(WireError::InvalidField("max_dgram"))
+            );
+        }
+    }
+
     fn sample_header() -> MediaHeader {
         MediaHeader {
             session_id: 0xA1B2_C3D4,
@@ -190,6 +253,7 @@ mod tests {
             frag_index: 2,
             frag_count: 9,
             is_keyframe: true,
+            is_retransmit: false,
             capture_ts_us: 0x0000_0123_4567_89AB,
             payload_len: 3,
         }

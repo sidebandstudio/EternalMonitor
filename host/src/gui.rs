@@ -143,6 +143,7 @@ pub struct AnalyzerApp {
     current_tab: AppTab,
     settings_bitrate_mbps: f32,
     settings_fps_target: u32,
+    settings_packet_size: u32,
     /// Last settings error worth showing (currently only the autostart
     /// registry write).
     settings_error: Option<String>,
@@ -251,6 +252,10 @@ impl AnalyzerApp {
         }
 
         Self {
+            settings_packet_size: control
+                .shared
+                .max_dgram
+                .load(std::sync::atomic::Ordering::SeqCst),
             control,
             current_tab: AppTab::Stream,
             settings_bitrate_mbps: bitrate_mbps,
@@ -282,6 +287,7 @@ impl AnalyzerApp {
         let file = SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
+            max_dgram: self.settings_packet_size as u16,
             // v2 has no manual target; the field stays in the file only so
             // older settings.json still parse.
             target_ip: None,
@@ -670,7 +676,7 @@ impl AnalyzerApp {
                 .color(TEXT)
                 .size(13.0));
             });
-            let slider = egui::Slider::new(&mut self.settings_bitrate_mbps, 1.0..=50.0)
+            let slider = egui::Slider::new(&mut self.settings_bitrate_mbps, 4.0..=50.0)
                 .show_value(false);
             if ui.add(slider).changed() {
                 let bitrate_bps = (self.settings_bitrate_mbps * 1_000_000.0).round() as u32;
@@ -716,6 +722,16 @@ impl AnalyzerApp {
                 }
             });
 
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Packet size").color(TEXT).size(13.0));
+                if ui.add(egui::DragValue::new(&mut self.settings_packet_size).range(576..=1400).suffix(" bytes")).changed() {
+                    self.control.shared.max_dgram.store(self.settings_packet_size, std::sync::atomic::Ordering::SeqCst);
+                    self.settings_dirty_at = Some(std::time::Instant::now());
+                }
+                ui.label(egui::RichText::new("Lower it for VPNs").color(MUTED2).size(12.0));
+            });
             ui.add_space(12.0);
 
             // Protocol v2 has no manual target: media carries the session id

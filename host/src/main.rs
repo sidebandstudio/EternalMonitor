@@ -100,6 +100,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared = SharedControl::new(listen_port, initial_bitrate);
+    let max_dgram = std::env::var("ETERNAL_MAX_DGRAM")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(persisted.max_dgram)
+        .clamp(576, 1400);
+    shared
+        .max_dgram
+        .store(u32::from(max_dgram), std::sync::atomic::Ordering::SeqCst);
+    info!(max_dgram, "Media packet size configured");
     if persisted.target_fps == 30 || persisted.target_fps == 60 {
         shared
             .target_fps

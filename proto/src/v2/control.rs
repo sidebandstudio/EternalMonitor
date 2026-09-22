@@ -36,6 +36,8 @@ pub const CAP_DECODE_HEVC_10BIT: u16 = 1 << 2;
 /// [`Hello2::feature_caps`] bits.
 pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
+pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
+pub const HOSTCAP_NACK: u16 = 1 << 0;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;
@@ -143,6 +145,8 @@ pub struct HelloAck {
     pub liveness_timeout_ms: u16,
     pub stream_config: StreamConfig,
     pub host_name: String,
+    pub auth_token: [u8; 16],
+    pub host_caps: u16,
 }
 
 /// Host → client, every heartbeat interval while a session is active.
@@ -204,6 +208,29 @@ pub struct KeyframeRequest {
     pub reason: KeyframeReason,
 }
 
+/// Requests missing fragments from one frame. Indices are unique and sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nack {
+    pub stream_epoch: u32,
+    pub frame_seq: u32,
+    pub frag_count: u16,
+    pub missing: Vec<u16>,
+}
+
+impl Nack {
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.missing.is_empty() || self.missing.len() > 64 {
+            return Err(WireError::InvalidField("missing_len"));
+        }
+        if self.missing.iter().any(|&index| index >= self.frag_count)
+            || self.missing.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(WireError::InvalidField("missing"));
+        }
+        Ok(())
+    }
+}
+
 /// Client → host stats, every report interval. Cumulative per epoch — the host
 /// diffs consecutive reports. Doubles as the client's liveness signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -222,6 +249,10 @@ pub struct ReceiverReport {
     /// 0 until clock sync has converged.
     pub e2e_latency_ms_x10: u16,
     pub rtt_ms_x10: u16,
+    pub frags_repaired: u32,
+    pub nacks_sent: u32,
+    pub audio_packets_lost: u32,
+    pub audio_buffer_ms: u16,
 }
 
 pub const RECEIVER_REPORT_SIZE: usize = 36;
@@ -271,6 +302,7 @@ pub enum ControlMessage {
     Heartbeat(Heartbeat),
     Bye(ByeReason),
     KeyframeRequest(KeyframeRequest),
+    Nack(Nack),
     ReceiverReport(ReceiverReport),
     Ping(Ping),
     Pong(Pong),
@@ -286,6 +318,7 @@ impl ControlMessage {
             Self::Heartbeat(_) => PacketType::Heartbeat,
             Self::Bye(_) => PacketType::Bye,
             Self::KeyframeRequest(_) => PacketType::KeyframeRequest,
+            Self::Nack(_) => PacketType::Nack,
             Self::ReceiverReport(_) => PacketType::ReceiverReport,
             Self::Ping(_) => PacketType::Ping,
             Self::Pong(_) => PacketType::Pong,
@@ -328,6 +361,10 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.extend_from_slice(&cfg);
             body.push(name.len() as u8);
             body.extend_from_slice(name.as_bytes());
+            if a.host_caps != 0 || a.auth_token != [0; 16] {
+                body.extend_from_slice(&a.auth_token);
+                body.extend_from_slice(&a.host_caps.to_le_bytes());
+            }
         }
         ControlMessage::Heartbeat(hb) => {
             body.extend_from_slice(&hb.host_time_us.to_le_bytes());
@@ -340,6 +377,16 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.extend_from_slice(&k.stream_epoch.to_le_bytes());
             body.extend_from_slice(&k.last_complete_seq.to_le_bytes());
             body.push(k.reason as u8);
+        }
+        ControlMessage::Nack(n) => {
+            n.validate().expect("invalid outgoing NACK");
+            body.extend_from_slice(&n.stream_epoch.to_le_bytes());
+            body.extend_from_slice(&n.frame_seq.to_le_bytes());
+            body.extend_from_slice(&n.frag_count.to_le_bytes());
+            body.push(n.missing.len() as u8);
+            for index in &n.missing {
+                body.extend_from_slice(&index.to_le_bytes());
+            }
         }
         ControlMessage::ReceiverReport(r) => {
             body.extend_from_slice(&r.stream_epoch.to_le_bytes());
@@ -354,6 +401,16 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.push(r.decode_depth);
             body.extend_from_slice(&r.e2e_latency_ms_x10.to_le_bytes());
             body.extend_from_slice(&r.rtt_ms_x10.to_le_bytes());
+            if r.frags_repaired != 0
+                || r.nacks_sent != 0
+                || r.audio_packets_lost != 0
+                || r.audio_buffer_ms != 0
+            {
+                body.extend_from_slice(&r.frags_repaired.to_le_bytes());
+                body.extend_from_slice(&r.nacks_sent.to_le_bytes());
+                body.extend_from_slice(&r.audio_packets_lost.to_le_bytes());
+                body.extend_from_slice(&r.audio_buffer_ms.to_le_bytes());
+            }
         }
         ControlMessage::Ping(p) => body.extend_from_slice(&p.t1_us.to_le_bytes()),
         ControlMessage::Pong(p) => {
@@ -460,6 +517,11 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             let liveness_timeout_ms = r.u16()?;
             let stream_config = StreamConfig::decode(r.take(STREAM_CONFIG_SIZE)?)?;
             let host_name = r.name()?;
+            let (auth_token, host_caps) = if r.remaining() >= 18 {
+                (r.take(16)?.try_into().unwrap(), r.u16()?)
+            } else {
+                ([0; 16], 0)
+            };
             if status == HelloStatus::Ok && session_id == 0 {
                 return Err(WireError::InvalidField("session_id"));
             }
@@ -473,6 +535,8 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 liveness_timeout_ms,
                 stream_config,
                 host_name,
+                auth_token,
+                host_caps,
             })
         }
         PacketType::Heartbeat => ControlMessage::Heartbeat(Heartbeat {
@@ -488,20 +552,51 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             reason: KeyframeReason::from_u8(r.u8()?)
                 .ok_or(WireError::InvalidField("keyframe_reason"))?,
         }),
-        PacketType::ReceiverReport => ControlMessage::ReceiverReport(ReceiverReport {
-            stream_epoch: r.u32()?,
-            highest_seq: r.u32()?,
-            frames_complete: r.u32()?,
-            frames_dropped: r.u32()?,
-            frags_received: r.u32()?,
-            frags_lost: r.u32()?,
-            jitter_us: r.u32()?,
-            decode_fps_x10: r.u16()?,
-            assembler_depth: r.u8()?,
-            decode_depth: r.u8()?,
-            e2e_latency_ms_x10: r.u16()?,
-            rtt_ms_x10: r.u16()?,
-        }),
+        PacketType::Nack => {
+            let stream_epoch = r.u32()?;
+            let frame_seq = r.u32()?;
+            let frag_count = r.u16()?;
+            let missing_len = usize::from(r.u8()?);
+            if !(1..=64).contains(&missing_len) {
+                return Err(WireError::InvalidField("missing_len"));
+            }
+            let mut missing = Vec::with_capacity(missing_len);
+            for _ in 0..missing_len {
+                missing.push(r.u16()?);
+            }
+            let nack = Nack {
+                stream_epoch,
+                frame_seq,
+                frag_count,
+                missing,
+            };
+            nack.validate()?;
+            ControlMessage::Nack(nack)
+        }
+        PacketType::ReceiverReport => {
+            let mut report = ReceiverReport {
+                stream_epoch: r.u32()?,
+                highest_seq: r.u32()?,
+                frames_complete: r.u32()?,
+                frames_dropped: r.u32()?,
+                frags_received: r.u32()?,
+                frags_lost: r.u32()?,
+                jitter_us: r.u32()?,
+                decode_fps_x10: r.u16()?,
+                assembler_depth: r.u8()?,
+                decode_depth: r.u8()?,
+                e2e_latency_ms_x10: r.u16()?,
+                rtt_ms_x10: r.u16()?,
+                ..Default::default()
+            };
+            if r.remaining() >= 14 {
+                report.frags_repaired = r.u32()?;
+                report.nacks_sent = r.u32()?;
+                report.audio_packets_lost = r.u32()?;
+                report.audio_buffer_ms = r.u16()?;
+            }
+            ControlMessage::ReceiverReport(report)
+        }
         PacketType::Ping => ControlMessage::Ping(Ping { t1_us: r.u64()? }),
         PacketType::Pong => ControlMessage::Pong(Pong {
             t1_us: r.u64()?,
@@ -562,6 +657,10 @@ impl<'a> Reader<'a> {
         Self { data, at: 0 }
     }
 
+    fn remaining(&self) -> usize {
+        self.data.len() - self.at
+    }
+
     fn take(&mut self, len: usize) -> Result<&'a [u8], WireError> {
         let slice = self
             .data
@@ -612,6 +711,97 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    fn nack_bytes() -> Vec<u8> {
+        encode_control(
+            7,
+            1,
+            &ControlMessage::Nack(Nack {
+                stream_epoch: 9,
+                frame_seq: 42,
+                frag_count: 8,
+                missing: vec![0, 2, 7],
+            }),
+        )
+    }
+
+    #[test]
+    fn nack_round_trip_and_sixty_four_index_limit() {
+        let bytes = nack_bytes();
+        let (header, message) = parse_control(&bytes).unwrap();
+        assert_eq!(header.packet_type, PacketType::Nack);
+        assert_eq!(
+            message,
+            ControlMessage::Nack(Nack {
+                stream_epoch: 9,
+                frame_seq: 42,
+                frag_count: 8,
+                missing: vec![0, 2, 7],
+            })
+        );
+        let maximum = ControlMessage::Nack(Nack {
+            stream_epoch: 1,
+            frame_seq: 2,
+            frag_count: 64,
+            missing: (0..64).collect(),
+        });
+        assert_eq!(
+            parse_control(&encode_control(7, 1, &maximum)).unwrap().1,
+            maximum
+        );
+    }
+
+    #[test]
+    fn nack_rejects_empty_oversized_unsorted_duplicate_and_out_of_range_indices() {
+        for length in [0, 65, 255] {
+            let mut bytes = nack_bytes();
+            bytes[CONTROL_HEADER_SIZE + 10] = length;
+            assert_eq!(
+                parse_control(&bytes),
+                Err(WireError::InvalidField("missing_len"))
+            );
+        }
+        for indices in [[2u16, 0, 7], [0, 0, 7], [0, 2, 8]] {
+            let mut bytes = nack_bytes();
+            for (i, value) in indices.into_iter().enumerate() {
+                bytes[27 + i * 2..29 + i * 2].copy_from_slice(&value.to_le_bytes());
+            }
+            assert_eq!(
+                parse_control(&bytes),
+                Err(WireError::InvalidField("missing"))
+            );
+        }
+    }
+
+    #[test]
+    fn nack_rejects_short_bodies_even_with_matching_prefix_length() {
+        let bytes = nack_bytes();
+        for length in CONTROL_HEADER_SIZE..bytes.len() {
+            let mut truncated = bytes[..length].to_vec();
+            truncated[6..8].copy_from_slice(&((length - CONTROL_HEADER_SIZE) as u16).to_le_bytes());
+            assert_eq!(parse_control(&truncated), Err(WireError::Truncated));
+        }
+    }
+
+    #[test]
+    fn old_control_bodies_default_new_tails() {
+        for message in all_messages() {
+            let (_, decoded) = parse_control(&encode_control(7, 1, &message)).unwrap();
+            match decoded {
+                ControlMessage::HelloAck(ack) => {
+                    assert_eq!(ack.auth_token, [0; 16]);
+                    assert_eq!(ack.host_caps, 0);
+                }
+                ControlMessage::ReceiverReport(report) => {
+                    assert_eq!(report.frags_repaired, 0);
+                    assert_eq!(report.nacks_sent, 0);
+                    assert_eq!(report.audio_packets_lost, 0);
+                    assert_eq!(report.audio_buffer_ms, 0);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn sample_config() -> StreamConfig {
         StreamConfig {
             stream_epoch: 3,
@@ -650,6 +840,8 @@ mod tests {
                 liveness_timeout_ms: 3000,
                 stream_config: sample_config(),
                 host_name: "ALI-PC".to_string(),
+                auth_token: [0; 16],
+                host_caps: 0,
             }),
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
@@ -674,6 +866,7 @@ mod tests {
                 decode_depth: 0,
                 e2e_latency_ms_x10: 321,
                 rtt_ms_x10: 28,
+                ..Default::default()
             }),
             ControlMessage::Ping(Ping { t1_us: 42 }),
             ControlMessage::Pong(Pong {
@@ -763,6 +956,8 @@ mod tests {
             liveness_timeout_ms: 3000,
             stream_config: sample_config(),
             host_name: String::new(),
+            auth_token: [0; 16],
+            host_caps: 0,
         });
         // encode_control would happily serialize it; the parser must reject.
         let datagram = encode_control(0, 1, &ack);

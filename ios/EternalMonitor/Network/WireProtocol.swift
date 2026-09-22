@@ -27,6 +27,7 @@ enum Wire {
         case ping = 0x16
         case pong = 0x17
         case streamConfig = 0x18
+        case nack = 0x19
         case inputEvent = 0x20
         case error = 0x7F
     }
@@ -70,6 +71,7 @@ struct MediaHeader: Equatable {
     /// 4 MiB frame cap — larger fragment counts are protocol violations.
     static let maxFragCount: UInt16 = UInt16((4 * 1024 * 1024) / maxPayload)  // 3066
     static let keyframeFlag: UInt8 = 0b0000_0001
+    static let retransmitFlag: UInt8 = 0b0000_0010
 
     var sessionId: UInt32
     var streamEpoch: UInt32
@@ -77,6 +79,7 @@ struct MediaHeader: Equatable {
     var fragIndex: UInt16
     var fragCount: UInt16
     var isKeyframe: Bool
+    var isRetransmit: Bool = false
     var captureTimestampUs: UInt64
     var payloadLen: UInt16
 
@@ -106,6 +109,7 @@ struct MediaHeader: Equatable {
                 fragIndex: fragIndex,
                 fragCount: fragCount,
                 isKeyframe: raw[4] & keyframeFlag != 0,
+                isRetransmit: raw[4] & retransmitFlag != 0,
                 captureTimestampUs: UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self)),
                 payloadLen: payloadLen
             )
@@ -121,7 +125,7 @@ struct MediaHeader: Equatable {
         out.appendLE(Wire.magic)
         out.append(Wire.version)
         out.append(Wire.PacketType.media.rawValue)
-        out.append(isKeyframe ? Self.keyframeFlag : 0)
+        out.append((isKeyframe ? Self.keyframeFlag : 0) | (isRetransmit ? Self.retransmitFlag : 0))
         out.append(0)
         out.appendLE(UInt16(payload.count))
         out.appendLE(sessionId)
@@ -191,6 +195,7 @@ struct Hello2: Equatable {
     static let capDecodeHEVC10Bit: UInt16 = 1 << 2
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
+    static let featureSupportsNack: UInt16 = 1 << 2
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -215,6 +220,7 @@ enum HelloStatus: UInt8 {
 }
 
 struct HelloAck: Equatable {
+    static let hostCapNack: UInt16 = 1 << 0
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -224,6 +230,8 @@ struct HelloAck: Equatable {
     var livenessTimeoutMs: UInt16
     var streamConfig: StreamConfig
     var hostName: String
+    var authToken = Data(repeating: 0, count: 16)
+    var hostCaps: UInt16 = 0
 }
 
 struct Heartbeat: Equatable {
@@ -252,6 +260,19 @@ struct KeyframeRequest: Equatable {
     var reason: KeyframeReason
 }
 
+struct Nack: Equatable {
+    var streamEpoch: UInt32
+    var frameSeq: UInt32
+    var fragCount: UInt16
+    var missing: [UInt16]
+
+    var isValid: Bool {
+        (1...64).contains(missing.count)
+            && missing.allSatisfy { $0 < fragCount }
+            && zip(missing, missing.dropFirst()).allSatisfy { $0 < $1 }
+    }
+}
+
 struct ReceiverReport: Equatable {
     var streamEpoch: UInt32 = 0
     var highestSeq: UInt32 = 0
@@ -265,6 +286,10 @@ struct ReceiverReport: Equatable {
     var decodeDepth: UInt8 = 0
     var e2eLatencyMsX10: UInt16 = 0
     var rttMsX10: UInt16 = 0
+    var fragsRepaired: UInt32 = 0
+    var nacksSent: UInt32 = 0
+    var audioPacketsLost: UInt32 = 0
+    var audioBufferMs: UInt16 = 0
 }
 
 struct WirePing: Equatable {
@@ -299,6 +324,7 @@ enum ControlMessage: Equatable {
     case heartbeat(Heartbeat)
     case bye(ByeReason)
     case keyframeRequest(KeyframeRequest)
+    case nack(Nack)
     case receiverReport(ReceiverReport)
     case ping(WirePing)
     case pong(WirePong)
@@ -312,6 +338,7 @@ enum ControlMessage: Equatable {
         case .heartbeat: return .heartbeat
         case .bye: return .bye
         case .keyframeRequest: return .keyframeRequest
+        case .nack: return .nack
         case .receiverReport: return .receiverReport
         case .ping: return .ping
         case .pong: return .pong
@@ -353,6 +380,11 @@ extension Wire {
             a.streamConfig.encode(into: &body)
             body.append(UInt8(name.count))
             body.append(name)
+            precondition(a.authToken.count == 16)
+            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) {
+                body.append(a.authToken)
+                body.appendLE(a.hostCaps)
+            }
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
             hb.streamConfig.encode(into: &body)
@@ -362,6 +394,13 @@ extension Wire {
             body.appendLE(k.streamEpoch)
             body.appendLE(k.lastCompleteSeq)
             body.append(k.reason.rawValue)
+        case .nack(let n):
+            precondition(n.isValid)
+            body.appendLE(n.streamEpoch)
+            body.appendLE(n.frameSeq)
+            body.appendLE(n.fragCount)
+            body.append(UInt8(n.missing.count))
+            for index in n.missing { body.appendLE(index) }
         case .receiverReport(let r):
             body.appendLE(r.streamEpoch)
             body.appendLE(r.highestSeq)
@@ -375,6 +414,13 @@ extension Wire {
             body.append(r.decodeDepth)
             body.appendLE(r.e2eLatencyMsX10)
             body.appendLE(r.rttMsX10)
+            if r.fragsRepaired != 0 || r.nacksSent != 0
+                || r.audioPacketsLost != 0 || r.audioBufferMs != 0 {
+                body.appendLE(r.fragsRepaired)
+                body.appendLE(r.nacksSent)
+                body.appendLE(r.audioPacketsLost)
+                body.appendLE(r.audioBufferMs)
+            }
         case .ping(let p):
             body.appendLE(p.t1Us)
         case .pong(let p):
@@ -455,6 +501,18 @@ extension Wire {
                 KeyframeRequest(streamEpoch: epoch, lastCompleteSeq: last, reason: reason))
         case .receiverReport:
             message = parseReceiverReport(&r)
+        case .nack:
+            guard let epoch = r.readU32(), let seq = r.readU32(),
+                  let count = r.readU16(), let length = r.readU8(), (1...64).contains(length)
+            else { return nil }
+            var missing: [UInt16] = []
+            for _ in 0..<length {
+                guard let index = r.readU16() else { return nil }
+                missing.append(index)
+            }
+            let nack = Nack(streamEpoch: epoch, frameSeq: seq, fragCount: count, missing: missing)
+            guard nack.isValid else { return nil }
+            message = .nack(nack)
         case .ping:
             guard let t1 = r.readU64() else { return nil }
             message = .ping(WirePing(t1Us: t1))
@@ -506,11 +564,17 @@ extension Wire {
               let hostName = r.readName()
         else { return nil }
         if status == .ok && sessionId == 0 { return nil }
-        return .helloAck(HelloAck(
+        var ack = HelloAck(
             status: status, acceptedVersion: acceptedVersion, clientNonce: clientNonce,
             sessionId: sessionId, heartbeatIntervalMs: heartbeatIntervalMs,
             reportIntervalMs: reportIntervalMs, livenessTimeoutMs: livenessTimeoutMs,
-            streamConfig: streamConfig, hostName: hostName))
+            streamConfig: streamConfig, hostName: hostName)
+        if r.remaining >= 18 {
+            guard let token = r.take(16), let caps = r.readU16() else { return nil }
+            ack.authToken = Data(token)
+            ack.hostCaps = caps
+        }
+        return .helloAck(ack)
     }
 
     private static func parseReceiverReport(_ r: inout WireReader) -> ControlMessage? {
@@ -527,12 +591,21 @@ extension Wire {
               let e2eLatencyMsX10: UInt16 = r.readU16(),
               let rttMsX10: UInt16 = r.readU16()
         else { return nil }
-        return .receiverReport(ReceiverReport(
+        var report = ReceiverReport(
             streamEpoch: streamEpoch, highestSeq: highestSeq,
             framesComplete: framesComplete, framesDropped: framesDropped,
             fragsReceived: fragsReceived, fragsLost: fragsLost, jitterUs: jitterUs,
             decodeFpsX10: decodeFpsX10, assemblerDepth: assemblerDepth,
-            decodeDepth: decodeDepth, e2eLatencyMsX10: e2eLatencyMsX10, rttMsX10: rttMsX10))
+            decodeDepth: decodeDepth, e2eLatencyMsX10: e2eLatencyMsX10, rttMsX10: rttMsX10)
+        if r.remaining >= 14 {
+            guard let repaired = r.readU32(), let nacks = r.readU32(),
+                  let audioLost = r.readU32(), let audioBuffer = r.readU16() else { return nil }
+            report.fragsRepaired = repaired
+            report.nacksSent = nacks
+            report.audioPacketsLost = audioLost
+            report.audioBufferMs = audioBuffer
+        }
+        return .receiverReport(report)
     }
 
     private static func parseInputEvent(_ r: inout WireReader) -> ControlMessage? {
@@ -565,6 +638,7 @@ extension Wire {
 private struct WireReader {
     let bytes: [UInt8]
     var at: Int
+    var remaining: Int { bytes.count - at }
 
     mutating func take(_ len: Int) -> ArraySlice<UInt8>? {
         guard at + len <= bytes.count else { return nil }

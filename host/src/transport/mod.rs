@@ -1,5 +1,7 @@
 pub mod abr;
+pub mod fault;
 pub mod pacer;
+pub mod retransmit;
 pub mod session;
 
 use std::net::SocketAddr;
@@ -7,7 +9,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
-use eternal_wire::v2::media::{MediaHeader, MAX_FRAG_COUNT, MAX_MEDIA_PAYLOAD, MEDIA_HEADER_SIZE};
+use eternal_wire::v2::media::{
+    media_payload_size, MediaHeader, MAX_FRAG_COUNT, MAX_MEDIA_PAYLOAD, MEDIA_HEADER_SIZE,
+};
 use eternal_wire::v2::{classify, Classified, MAX_DGRAM_SIZE};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -17,7 +21,9 @@ use crate::control::{CaptureTarget, SharedControl, SupervisorCommand, VddStatus}
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
+use fault::FaultInjector;
 use pacer::FramePacer;
+use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 
 /// Monotonic per-process counter stamped into each media header's `stream_epoch`. Every
@@ -80,6 +86,33 @@ pub async fn start_sender(
         // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
         // hard budget doesn't smooth (best effort — some platforms clamp it).
         let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
+        let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
+        let _ = raw.set_tos(0xB8);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows::Win32::Networking::WinSock::{
+                WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
+            };
+            let disabled = 0u32;
+            let mut returned = 0;
+            let result = unsafe {
+                WSAIoctl(
+                    SOCKET(raw.as_raw_socket() as usize),
+                    SIO_UDP_CONNRESET,
+                    Some((&disabled as *const u32).cast()),
+                    std::mem::size_of_val(&disabled) as u32,
+                    None,
+                    0,
+                    &mut returned,
+                    None,
+                    None,
+                )
+            };
+            if result != 0 {
+                warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
+            }
+        }
         raw.set_nonblocking(true)?;
         raw.bind(&bind_addr.into())?;
         UdpSocket::from_std(raw.into())?
@@ -109,22 +142,26 @@ pub async fn start_sender(
         .abr_current_bps
         .store(abr.current_bps(), Ordering::SeqCst);
 
-    // Test-harness fault injection: ETERNAL_DROP=0.05 silently drops ~5% of
-    // media datagrams (deterministic xorshift so runs are reproducible).
-    let drop_rate: f64 = std::env::var("ETERNAL_DROP")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|r| (0.0..1.0).contains(r))
-        .unwrap_or(0.0);
-    let mut drop_rng: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut next_drop = move || {
-        drop_rng ^= drop_rng << 13;
-        drop_rng ^= drop_rng >> 7;
-        drop_rng ^= drop_rng << 17;
-        (drop_rng >> 11) as f64 / (1u64 << 53) as f64
+    let probability = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|r| (0.0..=1.0).contains(r))
+            .unwrap_or(0.0)
     };
-    if drop_rate > 0.0 {
-        warn!(drop_rate, "ETERNAL_DROP fault injection active");
+    let drop_rate = probability("ETERNAL_DROP");
+    let reorder_rate = probability("ETERNAL_REORDER");
+    let jitter_ms = std::env::var("ETERNAL_JITTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(1000);
+    let mut fault = FaultInjector::new(drop_rate, reorder_rate, Duration::from_millis(jitter_ms));
+    if fault.enabled() {
+        warn!(
+            drop_rate,
+            reorder_rate, jitter_ms, "Media fault injection active"
+        );
     }
 
     // Frames already sitting in the encoder channel when a session starts are
@@ -133,6 +170,7 @@ pub async fn start_sender(
     let mut awaiting_keyframe = true;
 
     let mut input_relay = crate::input::InputRelay::default();
+    let mut retransmit_ring = RetransmitRing::default();
 
     let mut recv_buf = [0u8; 2048];
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
@@ -151,6 +189,10 @@ pub async fn start_sender(
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
                                     Ok((header, message)) => {
+                                        let nack_frag_count = match &message {
+                                            eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
+                                            _ => None,
+                                        };
                                         let mut actions = shared.session.lock().handle_control(
                                             src,
                                             header.session_id,
@@ -158,6 +200,26 @@ pub async fn start_sender(
                                             &config,
                                             Instant::now(),
                                         );
+                                        if actions.new_target.is_some() || actions.client_lost {
+                                            retransmit_ring.clear();
+                                            fault.clear();
+                                        }
+                                        if let (Some((epoch, seq, missing)), Some(frag_count)) =
+                                            (actions.retransmit.take(), nack_frag_count)
+                                        {
+                                            let destination = *shared.target_addr.lock();
+                                            let mut sent = 0;
+                                            for datagram in retransmit_ring.resend(epoch, seq, frag_count, &missing, Instant::now()) {
+                                                if socket.send_to(&datagram, destination).await.is_ok() {
+                                                    sent += 1;
+                                                }
+                                            }
+                                            if sent > 0 {
+                                                let mut stats = PIPELINE_STATS.lock();
+                                                stats.transport_retransmits += sent;
+                                                debug!(seq, retransmits = stats.transport_retransmits, "NACK fragments resent");
+                                            }
+                                        }
                                         if let Some((session_id, event)) = actions.input.take() {
                                             if let Some(geometry) = *shared.capture_geometry.lock()
                                             {
@@ -239,7 +301,8 @@ pub async fn start_sender(
 
                 let send_start = Instant::now();
                 let payload = &nal.data;
-                let frag_count_usize = payload.len().div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+                let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
+                let frag_count_usize = payload.len().div_ceil(payload_size).max(1);
                 if frag_count_usize > usize::from(MAX_FRAG_COUNT) {
                     warn!(
                         seq = nal.sequence,
@@ -252,8 +315,10 @@ pub async fn start_sender(
                 let capture_ts_us = crate::clock::instant_to_us(nal.timestamp);
 
                 let mut send_failed = false;
+                let keep_for_repair = shared.session.lock().client_supports_nack();
+                let mut stored = Vec::new();
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
-                for (index, chunk) in payload.chunks(MAX_MEDIA_PAYLOAD).enumerate() {
+                for (index, chunk) in payload.chunks(payload_size).enumerate() {
                     let header = MediaHeader {
                         session_id,
                         stream_epoch,
@@ -261,6 +326,7 @@ pub async fn start_sender(
                         frag_index: index as u16,
                         frag_count,
                         is_keyframe: nal.is_keyframe,
+                        is_retransmit: false,
                         capture_ts_us,
                         payload_len: chunk.len() as u16,
                     };
@@ -268,14 +334,23 @@ pub async fn start_sender(
                     dgram_scratch[MEDIA_HEADER_SIZE..MEDIA_HEADER_SIZE + chunk.len()]
                         .copy_from_slice(chunk);
                     let datagram = &dgram_scratch[..MEDIA_HEADER_SIZE + chunk.len()];
+                    if keep_for_repair {
+                        stored.push(datagram.to_vec());
+                    }
 
-                    let inject_drop = drop_rate > 0.0 && next_drop() < drop_rate;
-                    if !inject_drop {
-                        if let Err(e) = socket.send_to(datagram, target_addr).await {
-                            if !send_failed {
-                                warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
-                                send_failed = true;
+                    if fault.enabled() {
+                        for due in fault.push(datagram, Instant::now()) {
+                            if let Err(e) = socket.send_to(&due, target_addr).await {
+                                if !send_failed {
+                                    warn!(seq = nal.sequence, error = %e, "UDP send failed");
+                                    send_failed = true;
+                                }
                             }
+                        }
+                    } else if let Err(e) = socket.send_to(datagram, target_addr).await {
+                        if !send_failed {
+                            warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
+                            send_failed = true;
                         }
                     }
 
@@ -283,6 +358,10 @@ pub async fn start_sender(
                     if pause > Duration::ZERO {
                         tokio::time::sleep(pause).await;
                     }
+                }
+
+                if keep_for_repair {
+                    retransmit_ring.insert(stream_epoch, nal.sequence as u32, stored);
                 }
 
                 let total_bytes = payload.len();
@@ -304,8 +383,15 @@ pub async fn start_sender(
                     "Frame sent"
                 );
             }
+            _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
+                let destination = *shared.target_addr.lock();
+                for datagram in fault.drain_due(Instant::now()) {
+                    let _ = socket.send_to(&datagram, destination).await;
+                }
+            }
             _ = heartbeat.tick() => {
                 let actions = shared.session.lock().tick(&config, true, Instant::now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
                 execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
             _ = liveness_tick.tick() => {
@@ -314,6 +400,7 @@ pub async fn start_sender(
                     break;
                 }
                 let actions = shared.session.lock().tick(&config, false, Instant::now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
                 execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
         }

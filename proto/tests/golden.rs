@@ -48,6 +48,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         frag_index: 2,
         frag_count: 9,
         is_keyframe: true,
+        is_retransmit: false,
         capture_ts_us: 0x0000_0123_4567_89AB,
         payload_len: 4,
     }
@@ -63,12 +64,16 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         frag_index: 0,
         frag_count: 1,
         is_keyframe: false,
+        is_retransmit: false,
         capture_ts_us: 999_999,
         payload_len: 2,
     }
     .encode_into(&mut media_delta);
     media_delta[MEDIA_HEADER_SIZE..].copy_from_slice(&[0x41, 0x9A]);
     vectors.push(("media_delta", media_delta));
+    let mut retransmit = vectors[0].1.clone();
+    retransmit[4] |= eternal_wire::v2::media::MEDIA_FLAG_RETRANSMIT;
+    vectors.push(("media_retransmit", retransmit));
 
     let control: Vec<(&'static str, u32, u32, ControlMessage)> = vec![
         (
@@ -104,6 +109,8 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 liveness_timeout_ms: 3000,
                 stream_config: stream_config(),
                 host_name: "ALI-PC".to_string(),
+                auth_token: [0; 16],
+                host_caps: 0,
             }),
         ),
         (
@@ -120,6 +127,8 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 liveness_timeout_ms: 3000,
                 stream_config: StreamConfig::default(),
                 host_name: "ALI-PC".to_string(),
+                auth_token: [0; 16],
+                host_caps: 0,
             }),
         ),
         (
@@ -164,6 +173,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 decode_depth: 0,
                 e2e_latency_ms_x10: 321,
                 rtt_ms_x10: 28,
+                ..Default::default()
             }),
         ),
         (
@@ -215,6 +225,53 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     for (name, session_id, msg_seq, message) in control {
         vectors.push((name, encode_control(session_id, msg_seq, &message)));
     }
+    vectors.push((
+        "nack",
+        encode_control(
+            0x1234_5678,
+            49,
+            &ControlMessage::Nack(Nack {
+                stream_epoch: 3,
+                frame_seq: 5001,
+                frag_count: 300,
+                missing: vec![0, 17, 299],
+            }),
+        ),
+    ));
+    let (_, ControlMessage::ReceiverReport(mut report)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "receiver_report")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    report.frags_repaired = 1234;
+    report.nacks_sent = 567;
+    report.audio_packets_lost = 89;
+    report.audio_buffer_ms = 60;
+    vectors.push((
+        "receiver_report_v030",
+        encode_control(0x1234_5678, 50, &ControlMessage::ReceiverReport(report)),
+    ));
+    let (_, ControlMessage::HelloAck(mut ack)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "hello_ack_ok")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    ack.auth_token = std::array::from_fn(|index| index as u8 + 1);
+    ack.host_caps = HOSTCAP_NACK;
+    vectors.push((
+        "hello_ack_paired",
+        encode_control(0, 3, &ControlMessage::HelloAck(ack)),
+    ));
     vectors
 }
 
@@ -336,5 +393,6 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::Ping as u8, 0x16);
     assert_eq!(PacketType::Pong as u8, 0x17);
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
+    assert_eq!(PacketType::Nack as u8, 0x19);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
 }

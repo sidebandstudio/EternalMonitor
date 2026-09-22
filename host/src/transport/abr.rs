@@ -9,8 +9,9 @@ use tracing::info;
 
 /// Candidate bitrates, low to high. The active ladder is this intersected
 /// with the user's ceiling (the GUI "Max bitrate" slider).
-const LADDER_BPS: [u32; 7] = [
-    4_000_000, 6_000_000, 8_000_000, 10_000_000, 12_000_000, 15_000_000, 20_000_000,
+const LADDER_BPS: [u32; 11] = [
+    4_000_000, 6_000_000, 8_000_000, 10_000_000, 12_000_000, 15_000_000, 20_000_000, 25_000_000,
+    30_000_000, 40_000_000, 50_000_000,
 ];
 
 const DOWN_COOLDOWN: Duration = Duration::from_secs(3);
@@ -38,13 +39,20 @@ pub struct AbrController {
     last_change: Option<(Instant, bool)>, // (when, was_downgrade)
     clean_since: Option<Instant>,
     last_report_at: Option<Instant>,
-    prev_cumulative: Option<(u32, u32)>, // (frags_received, frags_lost)
+    prev_cumulative: Option<ReceiverReport>,
 }
 
 impl AbrController {
     /// Starts at min(ceiling, 15 Mbps) per the plan.
     pub fn new(ceiling_bps: u32, enabled: bool) -> Self {
-        let start = clamp_to_ladder(ceiling_bps.min(15_000_000), ceiling_bps);
+        let start = clamp_to_ladder(
+            if enabled {
+                ceiling_bps.min(15_000_000)
+            } else {
+                ceiling_bps
+            },
+            ceiling_bps,
+        );
         Self {
             enabled,
             ceiling_bps,
@@ -63,7 +71,14 @@ impl AbrController {
     /// The user moved the ceiling: re-clamp immediately.
     pub fn set_ceiling(&mut self, ceiling_bps: u32) -> AbrDecision {
         self.ceiling_bps = ceiling_bps;
-        let clamped = clamp_to_ladder(self.current_bps, ceiling_bps);
+        let clamped = clamp_to_ladder(
+            if self.enabled {
+                self.current_bps
+            } else {
+                ceiling_bps
+            },
+            ceiling_bps,
+        );
         let changed = clamped != self.current_bps;
         self.current_bps = clamped;
         AbrDecision {
@@ -83,14 +98,22 @@ impl AbrController {
         }
 
         // Interval deltas from cumulative counters.
-        let (delta_received, delta_lost) = match self.prev_cumulative {
-            Some((prev_received, prev_lost)) => (
-                report.frags_received.saturating_sub(prev_received),
-                report.frags_lost.saturating_sub(prev_lost),
+        let (delta_received, delta_lost, delta_repaired) = match self.prev_cumulative {
+            Some(prev) if prev.stream_epoch == report.stream_epoch => (
+                report.frags_received.saturating_sub(prev.frags_received),
+                report.frags_lost.saturating_sub(prev.frags_lost),
+                report.frags_repaired.saturating_sub(prev.frags_repaired),
             ),
-            None => (report.frags_received, report.frags_lost),
+            _ => {
+                self.clean_since = None;
+                (
+                    report.frags_received,
+                    report.frags_lost,
+                    report.frags_repaired,
+                )
+            }
         };
-        self.prev_cumulative = Some((report.frags_received, report.frags_lost));
+        self.prev_cumulative = Some(*report);
 
         // A stale gap between reports invalidates the clean streak.
         if let Some(last) = self.last_report_at {
@@ -100,18 +123,20 @@ impl AbrController {
         }
         self.last_report_at = Some(now);
 
-        let total = delta_received + delta_lost;
+        let total = u64::from(delta_received) + u64::from(delta_lost) + u64::from(delta_repaired);
         let loss = if total == 0 {
             0.0
         } else {
-            f64::from(delta_lost) / f64::from(total)
+            f64::from(delta_lost) / total as f64
         };
+        let repairs = f64::from(delta_repaired) / f64::from(delta_received.max(1));
         let congested_queue = report.assembler_depth >= 3;
+        let jitter_high = report.jitter_us > 15_000;
 
         // ---- Downgrade path ----
         let down_rungs = if loss > LOSS_DOWN_TWO {
             2
-        } else if loss > LOSS_DOWN_ONE || congested_queue {
+        } else if loss > LOSS_DOWN_ONE || repairs > 0.05 || congested_queue || jitter_high {
             1
         } else {
             0
@@ -129,6 +154,8 @@ impl AbrController {
                         from = self.current_bps,
                         to = target,
                         loss_pct = format!("{:.1}", loss * 100.0),
+                        repair_pct = format!("{:.1}", repairs * 100.0),
+                        jitter_us = report.jitter_us,
                         "ABR stepping bitrate down"
                     );
                     self.current_bps = target;
@@ -143,7 +170,12 @@ impl AbrController {
         }
 
         // ---- Upgrade path ----
-        if loss < LOSS_CLEAN && !congested_queue {
+        if total > 0
+            && loss < LOSS_CLEAN
+            && repairs < LOSS_CLEAN
+            && !congested_queue
+            && !jitter_high
+        {
             let clean_since = *self.clean_since.get_or_insert(now);
             let up_cooldown_over = match self.last_change {
                 Some((when, _)) => now.duration_since(when) >= UP_COOLDOWN,
@@ -324,5 +356,83 @@ mod tests {
             now += Duration::from_secs(4);
         }
         assert_eq!(abr.current_bps(), 4_000_000, "must bottom out at the floor");
+    }
+
+    #[test]
+    fn repairs_and_jitter_step_down_before_unrecovered_loss() {
+        let now = Instant::now();
+        let mut abr = AbrController::new(50_000_000, true);
+        let mut r = ReceiverReport {
+            frags_received: 1000,
+            frags_repaired: 51,
+            ..Default::default()
+        };
+        assert_eq!(abr.on_report(&r, now).target_bps, 12_000_000);
+        r.frags_received += 1000;
+        r.frags_repaired += 100;
+        assert!(!abr.on_report(&r, now + Duration::from_secs(1)).changed);
+        r.frags_received += 1000;
+        r.jitter_us = 15_001;
+        assert_eq!(
+            abr.on_report(&r, now + Duration::from_secs(3)).target_bps,
+            10_000_000
+        );
+        r.frags_received += 850;
+        r.frags_lost += 150;
+        assert_eq!(
+            abr.on_report(&r, now + Duration::from_secs(6)).target_bps,
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn extended_ladder_reaches_fifty_and_obeys_disabled_ceiling() {
+        let mut abr = AbrController::new(50_000_000, true);
+        let now = Instant::now();
+        let mut r = ReceiverReport::default();
+        let mut rungs = Vec::new();
+        for tick in 0..=150 {
+            r.frags_received += 1000;
+            let d = abr.on_report(&r, now + Duration::from_millis(tick * 500));
+            if d.changed {
+                rungs.push(d.target_bps);
+            }
+        }
+        assert_eq!(
+            rungs,
+            [20_000_000, 25_000_000, 30_000_000, 40_000_000, 50_000_000]
+        );
+        let mut fixed = AbrController::new(40_000_000, false);
+        assert_eq!(fixed.current_bps(), 40_000_000);
+        assert_eq!(fixed.set_ceiling(50_000_000).target_bps, 50_000_000);
+    }
+
+    #[test]
+    fn repairs_prevent_clean_upgrade_and_epoch_reset_uses_new_counters() {
+        let mut abr = AbrController::new(50_000_000, true);
+        let now = Instant::now();
+        let mut r = ReceiverReport {
+            stream_epoch: 1,
+            ..Default::default()
+        };
+        for tick in 0..=40 {
+            r.frags_received += 1000;
+            r.frags_repaired += 10;
+            assert!(
+                !abr.on_report(&r, now + Duration::from_millis(tick * 500))
+                    .changed
+            );
+        }
+        let restarted = ReceiverReport {
+            stream_epoch: 2,
+            frags_received: 800,
+            frags_lost: 200,
+            ..Default::default()
+        };
+        assert_eq!(
+            abr.on_report(&restarted, now + Duration::from_secs(21))
+                .target_bps,
+            10_000_000
+        );
     }
 }

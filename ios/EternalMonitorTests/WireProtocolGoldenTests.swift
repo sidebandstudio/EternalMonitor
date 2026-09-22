@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 13,
+            Self.vectors.count, 17,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -66,6 +66,57 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertFalse(header.isKeyframe)
         XCTAssertEqual(header.captureTimestampUs, 999_999)
         XCTAssertEqual(header.encode(payload: Data(data[payloadRange])), data)
+    }
+
+    func testMediaRetransmitVector() throws {
+        let data = try vector("media_retransmit")
+        XCTAssertEqual(Wire.classify(data), .media(flags: 3))
+        let (header, payloadRange) = try XCTUnwrap(MediaHeader.decode(data))
+        XCTAssertTrue(header.isKeyframe)
+        XCTAssertTrue(header.isRetransmit)
+        var original = data
+        original[4] &= ~MediaHeader.retransmitFlag
+        XCTAssertEqual(original, try vector("media_keyframe"))
+        XCTAssertEqual(header.encode(payload: Data(data[payloadRange])), data)
+    }
+
+    func testNackVector() throws {
+        let data = try vector("nack")
+        XCTAssertEqual(Wire.classify(data), .control(.nack))
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        XCTAssertEqual(message, .nack(Nack(streamEpoch: 3, frameSeq: 5001, fragCount: 300, missing: [0, 17, 299])))
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+    }
+
+    func testHelloAckPairedVectorAndLegacyDefaults() throws {
+        let data = try vector("hello_ack_paired")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(ack.authToken, Data(1...16))
+        XCTAssertEqual(ack.hostCaps, HelloAck.hostCapNack)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        let (_, old) = try XCTUnwrap(Wire.parseControl(try vector("hello_ack_ok")))
+        guard case .helloAck(let legacy) = old else { return XCTFail("wrong type") }
+        XCTAssertEqual(legacy.authToken, Data(repeating: 0, count: 16))
+        XCTAssertEqual(legacy.hostCaps, 0)
+    }
+
+    func testReceiverReportV030VectorAndLegacyDefaults() throws {
+        let data = try vector("receiver_report_v030")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .receiverReport(let report) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(report.fragsRepaired, 1234)
+        XCTAssertEqual(report.nacksSent, 567)
+        XCTAssertEqual(report.audioPacketsLost, 89)
+        XCTAssertEqual(report.audioBufferMs, 60)
+        XCTAssertEqual(report.rttMsX10, 28)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        let (_, old) = try XCTUnwrap(Wire.parseControl(try vector("receiver_report")))
+        guard case .receiverReport(let legacy) = old else { return XCTFail("wrong type") }
+        XCTAssertEqual(legacy.fragsRepaired, 0)
+        XCTAssertEqual(legacy.nacksSent, 0)
+        XCTAssertEqual(legacy.audioPacketsLost, 0)
+        XCTAssertEqual(legacy.audioBufferMs, 0)
     }
 
     // MARK: Control
@@ -201,6 +252,31 @@ final class WireProtocolGoldenTests: XCTestCase {
     }
 
     // MARK: Hardening
+
+    func testNackValidation() throws {
+        let valid = try vector("nack")
+        for count: UInt8 in [0, 65, 255] {
+            var bytes = valid
+            bytes[26] = count
+            XCTAssertNil(Wire.parseControl(bytes))
+        }
+        for indices: [UInt16] in [[17, 0, 299], [0, 0, 299], [0, 17, 300]] {
+            var bytes = valid
+            for (i, value) in indices.enumerated() {
+                bytes[27 + i * 2] = UInt8(value & 255)
+                bytes[28 + i * 2] = UInt8(value >> 8)
+            }
+            XCTAssertNil(Wire.parseControl(bytes))
+        }
+        for length in ControlHeader.size..<valid.count {
+            var bytes = Data(valid.prefix(length))
+            bytes[6] = UInt8(length - ControlHeader.size)
+            bytes[7] = 0
+            XCTAssertNil(Wire.parseControl(bytes))
+        }
+        let maximum = ControlMessage.nack(Nack(streamEpoch: 1, frameSeq: 2, fragCount: 64, missing: Array(0..<64)))
+        XCTAssertEqual(Wire.parseControl(Wire.encodeControl(sessionId: 1, msgSeq: 1, message: maximum))?.message, maximum)
+    }
 
     func testEveryVectorTruncationIsRejected() throws {
         for (name, data) in Self.vectors {
