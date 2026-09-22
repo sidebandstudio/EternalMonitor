@@ -25,7 +25,7 @@ enum E2E {
 
     static func emit(_ message: String) {
         guard enabled else { return }
-        logger.log("\(message)")
+        logger.log("\(message, privacy: .public)")
         #if targetEnvironment(simulator)
         fileLock.lock()
         defer { fileLock.unlock() }
