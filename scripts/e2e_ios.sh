@@ -64,39 +64,19 @@ if [ "${EM_SKIP_BUILD:-0}" != 1 ]; then
 echo "==> Generating Xcode project"
 (cd "$ROOT/ios" && xcodegen generate >/dev/null)
 
-echo "==> Building app for the simulator"
+echo "==> Building optimized app for simulator measurements"
 xcodebuild build \
     -project "$ROOT/ios/EternalMonitor.xcodeproj" \
-    -scheme EternalMonitor \
+    -scheme EternalMonitor -configuration Release \
     -destination "platform=iOS Simulator,name=$SIM_NAME" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
     CODE_SIGNING_ALLOWED=NO -quiet
 echo "==> Building host"
 (cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
 fi
-APP="$ROOT/ios/build/e2e/Build/Products/Debug-iphonesimulator/EternalMonitor.app"
+APP="$ROOT/ios/build/e2e/Build/Products/Release-iphonesimulator/EternalMonitor.app"
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }
 
-HEVC_FLAG=0
-[ "$CODEC" = "hevc" ] && HEVC_FLAG=1
-if [ -z "$REMOTE_HOST" ]; then
-mkdir -p "$OUT/state/EternalMonitor"
-python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" <<'PY'
-import json,sys
-with open(sys.argv[1], 'w') as f:
-    json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False), f)
-PY
-echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
-APPDATA="$OUT/state" \
-ETERNAL_HEADLESS=1 \
-ETERNAL_CAPTURE=synthetic \
-ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
-ETERNAL_ENCODER=libx264 \
-ETERNAL_HEVC="$HEVC_FLAG" \
-ETERNAL_FPS="${ETERNAL_FPS:-60}" \
-    "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
-HOST_PID=$!
-fi
 CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
 
 echo "==> Booting simulator: $SIM_NAME"
@@ -126,6 +106,27 @@ xcrun simctl spawn "$UDID" log stream --style compact \
 LOG_PID=$!
 sleep 2 # let the log stream attach before the milestones start
 
+HEVC_FLAG=0
+[ "$CODEC" = "hevc" ] && HEVC_FLAG=1
+if [ -z "$REMOTE_HOST" ]; then
+mkdir -p "$OUT/state/EternalMonitor"
+python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" <<'PY'
+import json,sys
+with open(sys.argv[1], 'w') as f:
+    json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False), f)
+PY
+echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
+APPDATA="$OUT/state" \
+ETERNAL_HEADLESS=1 \
+ETERNAL_CAPTURE=synthetic \
+ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
+ETERNAL_ENCODER=libx264 \
+ETERNAL_HEVC="$HEVC_FLAG" \
+ETERNAL_FPS="${ETERNAL_FPS:-60}" \
+    "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
+HOST_PID=$!
+fi
+
 echo "==> Launching app with EM_AUTOCONNECT=$CONNECT_HOST:$PORT"
 SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
@@ -148,9 +149,14 @@ until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --min-frames "$WANT_DECODE
     fi
 done
 
-first_frame=$(grep -m1 'E2E_FIRST_FRAME' "$APP_LOG" || true)
-decoder_kind=$(grep -m1 'E2E_DECODER' "$APP_LOG" || true)
-last_stats=$(grep 'E2E_STATS' "$APP_LOG" | tail -1)
+# Freeze the measured interval before screenshot and pixel-analysis work can
+# consume CPU on the same machine as the simulator and synthetic host.
+MEASURED_LOG="$OUT/measured.log"
+cp "$APP_LOG" "$MEASURED_LOG"
+
+first_frame=$(grep -m1 'E2E_FIRST_FRAME' "$MEASURED_LOG" || true)
+decoder_kind=$(grep -m1 'E2E_DECODER' "$MEASURED_LOG" || true)
+last_stats=$(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)
 
 if ! grep -q "w=$SYNTH_W h=$SYNTH_H" <<<"$last_stats"; then
     echo "FAIL: decoded resolution mismatch: $last_stats (expected ${SYNTH_W}x${SYNTH_H})"
@@ -163,18 +169,13 @@ if [ -z "$REMOTE_HOST" ] && [ "$CODEC" = "hevc" ] && ! grep -q "libx265" "$HOST_
     exit 1
 fi
 
-fps=$(sed -E 's/.* fps=([0-9]+).*/\1/' <<<"$last_stats")
-if [ "$fps" -lt "$MIN_FPS" ]; then
-    echo "FAIL: decoded fps $fps is below $MIN_FPS"
-    exit 1
-fi
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
 xcrun swift "$ROOT/scripts/px.swift" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
-python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --output "$OUT/result.json" \
+python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
-echo "PASS: $(grep 'E2E_STATS' "$APP_LOG" | tail -1)"
+echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
 echo "      $first_frame"
 echo "      $decoder_kind"
 echo "      Evidence: $OUT"

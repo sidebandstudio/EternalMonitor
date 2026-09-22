@@ -105,7 +105,7 @@ jobs:
       - name: Create iPad simulator
         id: sim
         run: |
-          DEVICE_TYPE=$(xcrun simctl list devicetypes | grep -oE 'com\.apple\.CoreSimulator\.SimDeviceType\.iPad[A-Za-z0-9-]*' | head -1)
+          DEVICE_TYPE=com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB
           echo "Using device type: $DEVICE_TYPE"
           UDID=$(xcrun simctl create citest "$DEVICE_TYPE")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
@@ -114,6 +114,23 @@ jobs:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
           scripts/test_ios.sh
+      - name: Prepare simulator for streaming measurements
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          # Xcode may leave test clones running. This runner belongs to this
+          # job; keep only the selected iPad active during performance rows.
+          xcrun simctl list devices booted
+          python3 - <<'PY'
+          import json, os, subprocess
+          devices = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','--json']))['devices']
+          for runtime in devices.values():
+              for device in runtime:
+                  if device['state'] == 'Booted' and device['udid'] != os.environ['EM_SIM_UDID']:
+                      subprocess.run(['xcrun','simctl','shutdown',device['udid']], check=True)
+          PY
+          xcrun simctl bootstatus "$EM_SIM_UDID" -b
+          sysctl -n hw.model hw.ncpu hw.memsize
       - name: Run simulator streaming matrix
         env:
           EM_SIM_NAME: citest
