@@ -92,14 +92,18 @@ jobs:
 
   ios-build:
     name: iOS (simulator build)
-    runs-on: macos-15
+    # Encode, decode and render run together. Use the standard 4-core/14-GiB
+    # image for this job; the Rust macOS job retains ARM coverage.
+    runs-on: macos-15-intel
     timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen and streaming SDK
-        run: brew install xcodegen ffmpeg@7 pkgconf
+        run: |
+          brew install xcodegen ffmpeg@7 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Generate Xcode project
         working-directory: ios
