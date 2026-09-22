@@ -16,7 +16,7 @@ use crate::stats::PIPELINE_STATS;
 const BG: egui::Color32 = egui::Color32::from_rgb(6, 7, 8); // void
 const SURFACE: egui::Color32 = egui::Color32::from_rgb(15, 16, 18); // panel
 const SURFACE2: egui::Color32 = egui::Color32::from_rgb(23, 25, 28); // panel raised
-const BORDER: egui::Color32 = egui::Color32::from_rgba_premultiplied(255, 255, 255, 18);
+const BORDER: egui::Color32 = egui::Color32::from_rgba_premultiplied(18, 18, 18, 18);
 
 // Transmit amber — brand + primary action.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 122, 26);
@@ -1062,6 +1062,7 @@ impl AnalyzerApp {
             (session.client_info(), session.peer(), session.last_report())
         };
         card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             section_header(ui, "Connected iPad");
             let Some(client) = client else {
                 ui.label(egui::RichText::new("Waiting for an iPad").color(MUTED2));
