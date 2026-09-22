@@ -22,7 +22,7 @@ jobs:
       - name: Check release version parity
         run: scripts/check-versions.sh
       - name: Test system measurement parser
-        run: python3 -m unittest discover -s scripts -p test_e2e_stats.py
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check -p eternal-wire
@@ -147,6 +147,8 @@ jobs:
             build/ios-tests-*.log
             build/ios-tests-*.xcresult
             build/ios-ui-host-*.log
+            build/ios-ui-usb-host-*.log
+            build/ios-usb-proxy-*.log
             build/screenshots/ui-*
             build/e2e-report.md
             build/e2e/

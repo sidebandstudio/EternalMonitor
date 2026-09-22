@@ -32,11 +32,26 @@ final class ConnectScreenTests: XCTestCase {
         settings.tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["settings.done"].exists)
+        let allowUSB = app.switches["settings.allowUSB"]
+        XCTAssertTrue(allowUSB.exists)
+        XCTAssertEqual(allowUSB.value as? String, "1")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "settings"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+        // SwiftUI exposes the whole form row as a switch. Tap its thumb.
+        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        XCTAssertEqual(allowUSB.value as? String, "0")
         app.buttons["settings.done"].tap()
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "USB: off")
+        settings.tap()
+        XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
+        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        XCTAssertEqual(allowUSB.value as? String, "1")
+        app.buttons["settings.done"].tap()
+        let listening = NSPredicate(format: "label == %@", "USB: waiting for a cable")
+        expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
+        waitForExpectations(timeout: 5)
     }
 }

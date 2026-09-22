@@ -36,6 +36,11 @@ struct SettingsView: View {
                         Label("Auto-reconnect", systemImage: "arrow.triangle.2.circlepath")
                     }
 
+                    Toggle(isOn: $settings.allowUSB) {
+                        Label("Allow USB connections", systemImage: "cable.connector")
+                    }
+                    .accessibilityIdentifier("settings.allowUSB")
+
                     Toggle(isOn: $settings.keepScreenAwake) {
                         Label("Keep screen awake", systemImage: "sun.max")
                     }

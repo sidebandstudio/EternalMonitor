@@ -20,9 +20,16 @@ enum E2E {
         return host.isEmpty ? nil : (host, port)
     }
 
-    static func firstFrame(width: Int, height: Int) {
+    static func firstFrame(width: Int, height: Int, link: String = "udp") {
         guard enabled else { return }
-        logger.log("E2E_FIRST_FRAME w=\(width, privacy: .public) h=\(height, privacy: .public)")
+        let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        logger.log("E2E_FIRST_FRAME w=\(width, privacy: .public) h=\(height, privacy: .public) link=\(link, privacy: .public) monotonic_ms=\(monotonicMs, privacy: .public)")
+    }
+
+    static func linkSwitch(from: String, to: String) {
+        guard enabled else { return }
+        let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        logger.log("E2E_LINK_SWITCH from=\(from, privacy: .public) to=\(to, privacy: .public) monotonic_ms=\(monotonicMs, privacy: .public)")
     }
 
     static func stats(decoded: Int, width: Int, height: Int, fps: Double, counters: FrameAssembler.Counters, decodeDepth: UInt8 = 0) {
