@@ -3,6 +3,7 @@ pub mod fault;
 pub mod pacer;
 pub mod retransmit;
 pub mod session;
+pub mod usbmuxd;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};

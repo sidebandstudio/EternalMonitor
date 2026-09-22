@@ -7,7 +7,7 @@ edition = "2021"
 eternal-wire = { path = "../proto" }
 ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling"] }
 libc = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
@@ -20,6 +20,7 @@ qrcode = { version = "0.14", default-features = false }
 # Settings persistence (%APPDATA%/EternalMonitor/settings.json)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+plist = "1"
 
 # mDNS service advertisement
 mdns-sd = "0.12"

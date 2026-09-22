@@ -133,6 +133,10 @@ impl FakeReceiver {
             screen_pt_h: 834,
             refresh_hz: 120,
             device_name: "E2E fake iPad".to_string(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         });
         let hello_bytes = encode_control(0, 1, &hello);
 

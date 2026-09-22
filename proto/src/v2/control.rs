@@ -38,6 +38,7 @@ pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
 pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
+pub const HOSTCAP_USB: u16 = 1 << 2;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;
@@ -109,6 +110,10 @@ pub struct Hello2 {
     pub screen_pt_h: u16,
     pub refresh_hz: u8,
     pub device_name: String,
+    pub device_id: u64,
+    pub preferred_fps: u8,
+    pub auth_token: [u8; 16],
+    pub pairing_code: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +351,16 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.push(h.refresh_hz);
             body.push(name.len() as u8);
             body.extend_from_slice(name.as_bytes());
+            if h.device_id != 0
+                || h.preferred_fps != 0
+                || h.auth_token != [0; 16]
+                || h.pairing_code != 0
+            {
+                body.extend_from_slice(&h.device_id.to_le_bytes());
+                body.push(h.preferred_fps);
+                body.extend_from_slice(&h.auth_token);
+                body.extend_from_slice(&h.pairing_code.to_le_bytes());
+            }
         }
         ControlMessage::HelloAck(a) => {
             let name = truncated_name(&a.host_name);
@@ -489,6 +504,11 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             let screen_pt_h = r.u16()?;
             let refresh_hz = r.u8()?;
             let device_name = r.name()?;
+            let (device_id, preferred_fps, auth_token, pairing_code) = if r.remaining() >= 29 {
+                (r.u64()?, r.u8()?, r.take(16)?.try_into().unwrap(), r.u32()?)
+            } else {
+                (0, 0, [0; 16], 0)
+            };
             if proto_min > proto_max {
                 return Err(WireError::InvalidField("proto_range"));
             }
@@ -505,6 +525,10 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 screen_pt_h,
                 refresh_hz,
                 device_name,
+                device_id,
+                preferred_fps,
+                auth_token,
+                pairing_code,
             })
         }
         PacketType::HelloAck => {
@@ -787,6 +811,12 @@ mod tests {
         for message in all_messages() {
             let (_, decoded) = parse_control(&encode_control(7, 1, &message)).unwrap();
             match decoded {
+                ControlMessage::Hello2(hello) => {
+                    assert_eq!(hello.device_id, 0);
+                    assert_eq!(hello.preferred_fps, 0);
+                    assert_eq!(hello.auth_token, [0; 16]);
+                    assert_eq!(hello.pairing_code, 0);
+                }
                 ControlMessage::HelloAck(ack) => {
                     assert_eq!(ack.auth_token, [0; 16]);
                     assert_eq!(ack.host_caps, 0);
@@ -829,6 +859,10 @@ mod tests {
                 screen_pt_h: 834,
                 refresh_hz: 120,
                 device_name: "Ali's iPad Pro".to_string(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
             }),
             ControlMessage::HelloAck(HelloAck {
                 status: HelloStatus::Ok,
@@ -983,6 +1017,10 @@ mod tests {
                 screen_pt_h: 100,
                 refresh_hz: 60,
                 device_name: "x".to_string(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
             }),
         );
         let name_len_at = CONTROL_HEADER_SIZE + 21;
@@ -1013,6 +1051,10 @@ mod tests {
                 screen_pt_h: 1,
                 refresh_hz: 60,
                 device_name: long_name,
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
             }),
         );
         let (_, parsed) = parse_control(&datagram).unwrap();

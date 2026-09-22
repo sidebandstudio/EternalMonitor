@@ -548,6 +548,10 @@ mod tests {
             screen_pt_h: 834,
             refresh_hz: 120,
             device_name: "Test iPad".to_string(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         })
     }
 
@@ -720,6 +724,10 @@ mod tests {
             screen_pt_h: 1,
             refresh_hz: 60,
             device_name: String::new(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         });
         let actions = session.handle_control_authed(peer, msg, &TestConfig, now);
         assert_eq!(

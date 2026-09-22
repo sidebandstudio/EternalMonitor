@@ -93,6 +93,10 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 screen_pt_h: 834,
                 refresh_hz: 120,
                 device_name: "Ali's iPad Pro".to_string(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
             }),
         ),
         (
@@ -271,6 +275,24 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     vectors.push((
         "hello_ack_paired",
         encode_control(0, 3, &ControlMessage::HelloAck(ack)),
+    ));
+    let (_, ControlMessage::Hello2(mut hello)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "hello2")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    hello.device_id = 0x0123_4567_89AB_CDEF;
+    hello.preferred_fps = 120;
+    hello.auth_token = std::array::from_fn(|index| index as u8 + 1);
+    hello.pairing_code = 123_456;
+    vectors.push((
+        "hello2_v030",
+        encode_control(0, 4, &ControlMessage::Hello2(hello)),
     ));
     vectors
 }

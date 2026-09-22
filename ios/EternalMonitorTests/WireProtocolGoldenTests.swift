@@ -35,12 +35,30 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 17,
+            Self.vectors.count, 18,
             "golden vector count drifted — update both test suites together"
         )
     }
 
     // MARK: Media
+
+    func testHello2V030VectorAndLegacyDefaults() throws {
+        let data = try vector("hello2_v030")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .hello2(let hello) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(hello.deviceId, 0x0123_4567_89AB_CDEF)
+        XCTAssertEqual(hello.preferredFPS, 120)
+        XCTAssertEqual(hello.authToken, Data(1...16))
+        XCTAssertEqual(hello.pairingCode, 123_456)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        guard case .hello2(let old) = try XCTUnwrap(Wire.parseControl(vector("hello2"))).message else {
+            return XCTFail("wrong legacy type")
+        }
+        XCTAssertEqual(old.deviceId, 0)
+        XCTAssertEqual(old.preferredFPS, 0)
+        XCTAssertEqual(old.authToken, Data(repeating: 0, count: 16))
+        XCTAssertEqual(old.pairingCode, 0)
+    }
 
     func testMediaKeyframeVector() throws {
         let data = try vector("media_keyframe")
