@@ -673,8 +673,10 @@ mod tests {
         session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
 
         let later = now + Duration::from_millis(2500);
-        let mut report = ReceiverReport::default();
-        report.frames_complete = 99;
+        let report = ReceiverReport {
+            frames_complete: 99,
+            ..ReceiverReport::default()
+        };
         session.handle_control_authed(
             peer,
             ControlMessage::ReceiverReport(report),
