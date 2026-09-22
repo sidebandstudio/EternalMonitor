@@ -43,10 +43,12 @@ def pull(remote, destination):
 
 def main(args):
     if not args:
-        raise ValueError("Usage: remote.sh sync|build|run-host|stop-host|shot|log|probe-log|pattern|probe|tone|firewall")
+        raise ValueError("Usage: remote.sh idle|sync|build|run-host|stop-host|shot|log|probe-log|pattern|probe|tone|firewall")
     action, *args = args
     print("Windows: " + action + " " + " ".join(args), file=sys.stderr, flush=True)
-    if action == "sync" and len(args) == 1:
+    if action == "idle" and not args:
+        session("Write-Output 'Console input-idle check passed'", idle=True, timeout=30)
+    elif action == "sync" and len(args) == 1:
         ps("New-Item -ItemType Directory -Force " + quote(ROOT + r"\scripts") + " | Out-Null")
         sources = sorted(pathlib.Path(__file__).parent.glob("*.ps1"))
         subprocess.run(["scp", *map(str, sources), "windows:D:/AgentWork/em-v030/scripts/"], check=True)
