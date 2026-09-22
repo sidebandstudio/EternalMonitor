@@ -28,7 +28,7 @@ use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::FramePacer;
+use pacer::{FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -193,6 +193,7 @@ pub async fn start_sender(
     let mut input_relay = crate::input::InputRelay::default();
     let mut retransmit_ring = RetransmitRing::default();
     let mut audio_sender = audio::AudioSender::default();
+    let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
     let mut deferred_control = VecDeque::new();
@@ -408,7 +409,7 @@ pub async fn start_sender(
                     let pause = frame_pacer.after_send(Instant::now());
                     if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
                         let repairs = repair_while_pacing(&links.udp.socket, &mut retransmit_ring, &shared, &config,
-                            nal.sequence as u32, pause, &mut deferred_control);
+                            nal.sequence as u32, pacing_clock.wait(pause), &mut deferred_control);
                         tokio::pin!(repairs);
                         loop {
                             tokio::select! {
@@ -505,11 +506,10 @@ async fn repair_while_pacing(
     shared: &SharedControl,
     config: &impl ConfigSource,
     current_seq: u32,
-    pause: Duration,
+    timer: impl std::future::Future<Output = ()>,
     deferred: &mut DeferredControl,
 ) {
     use eternal_wire::v2::control::{parse_control, ControlMessage};
-    let timer = tokio::time::sleep(pause);
     tokio::pin!(timer);
     loop {
         let mut bytes = [0; 2048];
@@ -675,7 +675,7 @@ mod tests {
                 &shared,
                 &config,
                 8,
-                Duration::from_secs(1),
+                tokio::time::sleep(Duration::from_secs(1)),
                 &mut deferred,
             )
             .await;
