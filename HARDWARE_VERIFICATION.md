@@ -1,153 +1,127 @@
-# v0.2.0 Hardware Verification Runbook
+# v0.3.0 hardware verification
 
-What CI cannot prove: real GPU encoders, the virtual display driver, real
-WiFi, and touch feel. Run this on the Windows PC plus a real iPad before
-tagging the release. Budget about 45 minutes, plus per-GPU repeats if you
-can borrow AMD or Intel machines. Check items off; anything that fails gets
-logs (see the last section) and a fix round before the tag.
+Status: candidate work is in draft phase branches. No v0.3.0 release candidate
+has been published or installed. The reference-PC desktop campaign is pending:
+a Windows Security prompt for another application prevents an unobstructed
+capture session. Native compilation and simulator results below do not replace
+that campaign.
 
-Conventions: "Expect" is the pass condition. "Host log" means the Copy logs
-button on the Stream tab, or
-`%APPDATA%\EternalMonitor\logs\eternal-host-session.log`.
+Use the host and iPad app from the same candidate. Keep the evidence with the
+candidate's commit, version, build number, encoder, capture resolution, transport,
+and date. A failed or unavailable row remains pending until it is rerun.
 
-## A. Install & first light (5 min)
+## Verified by the automated campaign on the reference PC
 
-- [ ] **A1 Installer.** Run `EternalMonitor-Setup.exe` (SmartScreen → "Run
-  anyway", one UAC prompt). Expect: install completes, host launches, no
-  second UAC. Upgrading over a previous version keeps settings.
-- [ ] **A2 Firewall.** On first run tick BOTH Private and Public. Expect:
-  the prompt appears exactly once.
-- [ ] **A3 Banner.** Host log shows `EternalMonitor v0.2.0`, the right GPU
-  name, and a hardware encoder (not x264), with no fallback banner in the
-  GUI.
+Reference hardware: Windows 11, Ryzen 7 7800X3D with Radeon integrated graphics,
+GeForce RTX 5080, 1920×1080 primary display. The following preliminary checks
+passed on 2026-09-22; the full desktop campaign has **not** passed.
 
-## B. Basic streaming (8 min)
+| Check | Result | Evidence in the handoff folder |
+| --- | --- | --- |
+| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed on the P7 code at `c5fbbe1`; 176 tests | `PROGRESS.md`, `/tmp/em_v030_p7_native_build2.log` |
+| WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
+| Installer compilation | Passed; runtime install/upgrade/uninstall pending | `PROGRESS.md`, `/tmp/em_v030_p6_installer_build.log` |
+| Desktop availability | Blocked by an unrelated firewall prompt; no action taken on it | `evidence/windows/p7-desktop-check.png` |
 
-- [ ] **B1 Manual IP connect.** Enter the host IP on the iPad. Expect: a
-  picture in under 2 s, iPad HUD around 60 fps, host Stream tab shows the
-  client.
-- [ ] **B2 Discovery.** The iPad Scan list finds the host. Leave the list
-  open 4+ minutes, which crosses two 60 s re-advertisements. Expect: the
-  host never blinks out of the list. Quit the host app. Expect: it leaves
-  the list within a few seconds (mDNS goodbye), not after minutes.
-- [ ] **B3 QR connect.** Scan the host's QR from the iPad. Expect: it
-  connects to the same address the GUI shows.
-- [ ] **B4 Truthful readouts.** The host Stream tab codec matches the iPad
-  Settings HOST module (name, resolution, fps, codec, bitrate), and the
-  HOST bitrate follows the adaptive rung, not just the slider.
-- [ ] **B5 Latency sanity.** Drag a window in circles. The iPad HUD's ms
-  readout should sit in the tens (typically 20 to 80 ms on good WiFi) and
-  the motion should feel attached. With a 240 fps camera, film both screens
-  and count frames; the HUD claim should land within about ±20 ms of
-  measured.
-- [ ] **B6 Decoder.** iPad Settings diagnostics say "hardware decoder". The
-  simulator's software path must not appear on a real device.
+The endpoint read is an API/clock check. It does not prove PC audio was encoded,
+transported and heard on the iPad. The native tests use synthetic capture; they
+do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior.
 
-## C. Input relay (7 min)
+Every row below is required before the release candidate. Save host stdout and
+stderr, app milestones, simulator and PC screenshots, pixel assertions, duration,
+and a machine-readable result under `evidence/real/<row>/`. Keep desktop images
+in the private handoff evidence directory, outside git and public PRs.
 
-- [ ] **C1 Click targets.** Tap small targets (window close buttons) in all
-  four screen corners. Expect: exact hits with no offset. This validates
-  the desktop-rect mapping; test at 100% AND at 150% display scaling.
-- [ ] **C2 Drag.** Drag a window smoothly; select text; starting a
-  two-finger scroll must not produce a stray click.
-- [ ] **C3 Scroll.** Two-finger scroll in a browser. Expect: content
-  follows the fingers (direct-manipulation direction), smooth, both axes.
-- [ ] **C4 Right-click.** Hold about half a second. Expect: a context menu
-  at the touch point. A tap elsewhere dismisses it with a single click, not
-  a double.
-- [ ] **C5 Pencil.** In Paint or a whiteboard, ink starts immediately on
-  contact (no tap-vs-drag delay) and pressure varies the stroke where the
-  app supports it.
-- [ ] **C6 Multi-monitor.** With a second physical monitor attached,
-  capture monitor 2. Touches must land on monitor 2, never the primary.
-- [ ] **C7 View-only.** Turn "Control PC with touch" off and reconnect.
-  Expect: touches do nothing on the PC, and a single tap toggles the HUD.
+| Row | Pass condition | Current result |
+| --- | --- | --- |
+| R-baseline | Installed/current host captures the primary screen through DXGI; H.264 reaches the simulator at ≥55 fps; quadrant pixels match | Pending |
+| R-nvenc-h264 | NVENC is actually selected; ≥55 fps for ≥20 measured seconds; no encoder error | Pending |
+| R-nvenc-hevc | NVENC HEVC opens; software VideoToolbox decodes the correct pattern at ≥55 fps | Pending |
+| R-amf-h264 | Radeon AMF opens; normalized packets decode and SDK FFmpeg validates the saved Annex B stream | Pending |
+| R-amf-hevc | Radeon HEVC opens and saved packets validate; record any explicit hardware/resource limitation | Pending |
+| R-nvenc-h264-loss3 | 3% first-transmission loss and 1% reorder; ≥55 fps, <2% unrecovered drops, nonzero repairs, no keyframe storm | Pending |
+| R-nvenc-burst | Fixed 40 Mbps, one IDR per second; ≥55 fps for ≥20 seconds; no overflow/freeze | Pending |
+| R-audio | Session-1 tone passes through WASAPI → Opus → simulator playback; ≥100 packets decoded, ≤2 lost, 1 kHz >−20 dBFS; silence uses small packets | Pending |
+| R-pairing | Wrong code rejected; real logged code accepted through the sheet; persisted token reconnects; pairing card captured | Pending |
+| R-input | Only the focused input probe receives center/corner clicks within ±3 px, drag, wheel, right-click and `Hi!` plus Enter | Pending |
+| R-vdd | Extended display attaches; advertised mode is first in VDD XML; heartbeat reports that resolution; disconnect and host exit remove the display | Pending |
+| R-reconnect | Kill only the tracked host; SIGNAL LOST appears; restart a new process; video resumes in <15 seconds | Pending |
+| R-gui | Stream/client/audio/USB/pairing cards, Settings and QR are driven and captured; labels reflect the actual session | Pending |
 
-## D. Reliability (8 min)
+Additional Windows gates:
 
-- [ ] **D1 Host death.** Kill the host from Task Manager mid-stream.
-  Expect: the iPad shows SIGNAL LOST within about 3 s. Relaunch the host.
-  Expect: the iPad reconnects by itself within about 10 s, no taps.
-- [ ] **D2 ABR under real loss.** Walk toward the edge of WiFi range (or
-  run the microwave). Expect: the picture softens as the host bitrate steps
-  down, with no multi-second freezes; walking back sharpens it within about
-  20 s.
-- [ ] **D3 Live bitrate change.** Move the Max-bitrate slider mid-stream.
-  Expect: at most a sub-second hiccup, no disconnect.
-- [ ] **D4 Backgrounding.** Swipe the app away to the switcher. Expect: the
-  host Stream tab returns to "waiting for client" within about 3 s (BYE),
-  and a virtual display tears down. Reopen the app. Expect: it resumes by
-  itself ("Resume after switching apps" defaults on).
-- [ ] **D5 Second device busy.** While one iPad streams, connect from a
-  second device. Expect: a clear "host is busy" message, and the first
-  stream is untouched.
-- [ ] **D6 Version mismatch UX** (if a v0.1.x build is still around). Old
-  app → new host and new app → old host each show an explicit "update the
-  other side" message, not garbage video.
+| Row | Pass condition | Current result |
+| --- | --- | --- |
+| R-usb-service | USB card truthfully reports the service/device state; native fake-server tests exercise TCP usbmuxd | Native tests passed; GUI and cable pending |
+| R-bgra-nvenc / R-bgra-amf | Each hardware encoder runs BGRA for ten minutes without errors; quadrant mean-channel difference versus its YUV run <12/255 | Pending; default stays YUV420P |
+| R-vdd-limited | A normal-user host can run the SYSTEM VDD tasks with the new read/execute ACLs | Pending |
+| R-fps120 | Requested/negotiated 120 fps is visible; report achieved decode rate and any stutter/errors | Pending |
+| R-headless-ctrlc | Ctrl+C reaches the tracked host and exits cleanly with VDD removed | Pending |
+| R-autostart | Toggle writes/removes the correct HKCU Run entry and preserves the prior value after the test | Pending |
+| R-update-banner | A test build at version 0.0.1 shows the available-release banner; dismissal works | Pending |
+| R-installer | Upgrade, limited-user extended-display stream, uninstall cleanup, reinstall; files, task ACLs, TCP/UDP rules and pinned VDD version verified | Pending |
+| Simulator and real NVENC soaks | 30 minutes each; both host/app RSS grow <20% from minute five; ≥55 fps in ≥95% of samples | Pending |
 
-## E. HEVC (5 min, repeat per GPU vendor available)
+Run simulator checks with `scripts/e2e_matrix.sh` and the long test with
+`scripts/soak.sh 1800`. The Windows entry points are
+`scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800`; consult
+`scripts/win/README.md` for the session runner and evidence collection. A script
+entry point is not a claim that every hardware row has passed. Until the full
+Windows runner is completed, use the table above to identify missing rows.
 
-- [ ] **E1 Switch on.** Mid-stream, tick "Prefer HEVC". Expect: the iPad
-  HOST module codec flips to HEVC within about 1 s, the picture stays
-  clean, no reconnect. Untick and it returns to H.264 the same way.
-- [ ] **E2 Quality and limits.** At the same bitrate HEVC should look no
-  worse than H.264. Watch 2+ minutes for artifacts, especially on AMF,
-  whose `header_insertion_mode` handling is the least-proven path. On any
-  breakage: note the GPU and driver version, collect logs, and leave the
-  toggle off.
-- [ ] **E3 Fallback.** On a GPU without an HEVC encoder, the toggle warns
-  once in the log and keeps streaming H.264 with no error loop.
+For each merged host phase, retain the `release.yml` workflow-dispatch installer
+artifact URL in `PROGRESS.md`. Before tagging, repeat both matrices and both
+soaks on main. Then install the exact prerelease installer, verify its published
+SHA-256, and repeat R-baseline. Those release artifacts remain pending.
 
-## F. Extended display & resolution match (8 min)
+Campaign prerequisites and cleanup:
 
-- [ ] **F1 Lifecycle.** Select "Extended display (iPad)" and Restart stream
-  with the iPad connected. Expect: a new display appears in Windows Display
-  settings, windows drag onto it, and the iPad shows it. Disconnect the
-  iPad. Expect: the virtual display disappears within about 5 s. Quit,
-  relaunch, or crash must never strand a phantom monitor.
-- [ ] **F2 Native resolution.** With "Match extended display to the iPad's
-  resolution" on (the default), the virtual display's mode equals the
-  iPad's native landscape resolution (for example 2420×1668) and the iPad
-  picture is edge-to-edge with no letterbox. Check that
-  `C:\VirtualDisplayDriver\vdd_settings.xml` exists and lists that mode
-  first. Toggle the match off and restart. Expect: the driver's default
-  mode (a letterboxed picture is fine here).
-- [ ] **F3 120 Hz mode** (ProMotion iPad). With the match on, Windows
-  offers the panel refresh, or falls back to the 60 Hz variant without
-  erroring.
+1. The Windows console must be logged in, unlocked and free of secure-desktop
+   prompts. Run capture and input through the interactive session runner, not
+   SSH session 0. Check actual input idle time is at least two minutes before
+   opening probes or changing topology; do not use an RDP session.
+2. Build, stage and retain artifacts on D:. Preserve the installed profile while
+   using the separate harness profile. Do not click or dismiss other programs'
+   dialogs. Do not run installers during capture.
+3. Keep input inside the focused probe. Do not send Windows shortcuts, Alt+F4,
+   or text to another application. Stop if the foreground window changes.
+4. Stop only tracked processes, close probes/patterns, verify VDD disabled,
+   restore the power settings observed before testing, and remove temporary
+   debug/release firewall rules. Keep the installed product's rules.
+5. End with the verified newest installer installed and a clean desktop
+   screenshot. The reference PC still has the old 0.1-series installation.
+   Rollback installer: `C:\Users\aliyo\Downloads\EternalMonitor-Setup.exe`.
 
-## G. Encoder deep checks (per vendor, about 5 min each)
+## Ali with the physical iPad
 
-- [ ] **G1 Idle VBV (real PTS).** Leave a static desktop for 60 s. Expect:
-  bandwidth on the Performance tab collapses to keepalives, and the first
-  motion afterwards is clean, not a smear. If pacing looks wrong on NVENC
-  or AMF, retry with `set ETERNAL_LEGACY_PTS=1` and report; that escape
-  hatch existing is why this item is here.
-- [ ] **G2 AMF specifics** (AMD box). Startup shows a keyframe (no black
-  screen), recovery after loss works, and 10 minutes of streaming shows no
-  periodic freeze. If broken: `set ETERNAL_AMF_DIAG=1`, reproduce, send
-  `%APPDATA%\EternalMonitor\diagnostics\`.
-- [ ] **G3 High refresh.** `set ETERNAL_FPS=120` with a ProMotion iPad.
-  Expect: HUD at 100+ fps on a strong network with no capture-side stutter.
-- [ ] **G4 Stop/Start.** GUI Stop, then Start. Expect: a clean halt and a
-  fresh stream that the iPad resumes automatically.
+These checks require an iPad, its accessories and the real LAN. Simulator
+software decode and loopback USB tests cannot prove them. Record the iPad model,
+iPadOS version, app version/build, host version, WiFi band/router, cable and
+Windows display scaling. Save the host session log and the app's diagnostics
+with each failure; include a short screen recording when timing or feel matters.
 
-## H. Long soak (run in the background of the above)
+| Check | Expected result | Collect if it fails |
+| --- | --- | --- |
+| TestFlight installation | Install from the external invite/public link. App and installed host show the same marketing version. Connect on the first attempt after pairing. | Invite/build number, install/review error, both versions; setup is in `FRIENDS_TESTING.md` |
+| H.264 hardware decoding | With HEVC off, diagnostics say hardware decoder; video is stable near the selected rate | App diagnostics, host encoder line, iPad model |
+| HEVC hardware decoding | Explicitly enable HEVC; diagnostics and host both report HEVC and hardware decoding | Both codec lines and the first session/decoder error |
+| LAN discovery | On the same 10.0.0.x LAN, Scan finds the PC and stays stable for four minutes; quitting the host removes it promptly | Both LAN addresses, firewall profile, scan recording and host mDNS log |
+| QR and pairing | Fresh app prompts for the code; two wrong codes stay rejected; correct code connects. QR carries the token and skips the sheet. Regenerating the token requires pairing again. Six wrong attempts within a minute show a 60-second wait. | Host pairing/session log and sheet screenshots; redact tokens and QR codes before sharing |
+| USB service and trust | Apple Devices or desktop iTunes exposes the local usbmuxd service with the iPad attached; accept Trust on the iPad. Host sees the device and the app shows USB while open. | USB card, Device Manager, whether TCP 27015 listens, cable/trust state |
+| USB takeover and fallback | Connect over WiFi, then plug in: USB takes over within three seconds. Unplug: WiFi returns within five seconds. Repeat without duplicate sessions. Manual Disconnect stays disconnected. | Host link/session log, app link badge recording and timestamps |
+| Audio | PC music reaches the iPad with <150 ms perceived offset; changing Windows output recovers; iPad mute works without stopping video | Endpoint name, packet loss/buffer diagnostics, recording of the clap test |
+| Touch, Pencil and view-only | Center/corners hit correctly at 100% and 150% scaling; dragging and two-finger scrolling feel direct; hold gives right-click. Pencil contact/hover behave as advertised. View-only sends no input. | Capture/display geometry, scaling, probe log or recording; note that this release does not promise pressure-sensitive Windows pen injection |
+| Hardware keyboard and pointer | Magic Keyboard text, Shift/Ctrl, arrows and copy/paste work with ⌘ as Ctrl; on-screen accessory keys work; trackpad secondary click/scroll and supported Pencil hover work | Exact key/gesture, mapping setting, host input log collected in a harmless test window |
+| Reserved iPadOS keys | Globe, ⌘H, ⌘Tab and ⌘Space keep their system behavior | Describe any unexpected interception |
+| ProMotion | On a supported iPad, host/virtual display/app request 120 Hz. A strong link sustains 100+ decoded fps; record the actual rate. Compare 60/90/120 host settings. | App/host requested and effective rates, VDD mode, power mode and network |
+| Background and reconnect | Home sends BYE; returning resumes. Host restart shows SIGNAL LOST and recovers without tapping. Extended display is removed when disconnected. | Host/app timestamps, recording, VDD device state |
+| WiFi loss and latency | Walking toward the edge of coverage reduces bitrate without multi-second freezes, then recovers. Use 240 fps video of both displays to compare latency with the HUD. | Network conditions, bitrate/loss/repair graph, camera recording |
 
-- [ ] **H1.** Keep one stream up 30+ minutes. Expect: no leak-shaped memory
-  growth on either end (Task Manager, Xcode gauge), no thermal shutdown of
-  the stream, and sane HUD stats throughout.
+If Apple Devices does not expose TCP 27015 after cable attachment and trust,
+record that result before trying desktop iTunes. The harness does not yet prove
+which package works with this PC and iPad combination.
 
-## When something fails
-
-1. Host: Copy logs (Stream tab) or grab
-   `%APPDATA%\EternalMonitor\logs\eternal-host-session.log`.
-2. iPad: the diagnostics list in Settings (most recent events), plus what
-   the screen showed.
-3. Note the GPU model and driver version, the WiFi band, and which runbook
-   item failed.
-4. AMD encode issues: also send `%APPDATA%\EternalMonitor\diagnostics\`
-   captured with `ETERNAL_AMF_DIAG=1`.
-
-Fixes land, the failing items get re-run, and only then does `v0.2.0` get
-tagged. The tag builds and publishes the installer automatically.
+Logs on the PC are at `%APPDATA%\EternalMonitor\logs\eternal-host-session.log`
+(with `.1` and `.2` for prior sessions), or use Copy logs. Preserve failures;
+do not mark them passed after only changing a setting. Complete the iPad pass
+and a fix/retest round before publishing the final `v0.3.0` tag.
