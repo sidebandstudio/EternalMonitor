@@ -757,6 +757,10 @@ section {
   margin-bottom: 20px;
 }
 
+.download-btn-wrap [hidden] {
+  display: none;
+}
+
 .download-meta {
   font-family: var(--font-mono);
   font-size: 0.8rem;

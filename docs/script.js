@@ -3,6 +3,17 @@
 (function () {
   'use strict';
 
+  // Set this after the external group and Beta App Review are ready.
+  const TESTFLIGHT_URL = '';
+  var testflightLink = document.getElementById('testflight-link');
+  var testflightStatus = document.getElementById('testflight-status');
+  if (testflightLink && TESTFLIGHT_URL) {
+    testflightLink.href = TESTFLIGHT_URL;
+    testflightLink.textContent = 'Join the TestFlight';
+    testflightLink.hidden = false;
+    if (testflightStatus) testflightStatus.hidden = true;
+  }
+
   /* --- macOS Notice --- */
   // iPadOS reports platform 'MacIntel' too, so require a non-touch device.
   var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
