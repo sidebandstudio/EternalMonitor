@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use eternal_wire::v2::audio::AudioHeader;
 use eternal_wire::v2::control::*;
 use eternal_wire::v2::media::{MediaHeader, MEDIA_HEADER_SIZE};
 use eternal_wire::v2::{classify, Classified, PacketType};
@@ -74,6 +75,20 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     let mut retransmit = vectors[0].1.clone();
     retransmit[4] |= eternal_wire::v2::media::MEDIA_FLAG_RETRANSMIT;
     vectors.push(("media_retransmit", retransmit));
+    for (name, discontinuity) in [("audio_packet", false), ("audio_discontinuity", true)] {
+        vectors.push((
+            name,
+            AudioHeader {
+                session_id: 0xA1B2_C3D4,
+                stream_epoch: 7,
+                audio_seq: 12_345,
+                capture_ts_us: 0x0000_0123_4567_89AB,
+                discontinuity,
+            }
+            .encode(&[0xF8, 0xFF, 0xFE])
+            .unwrap(),
+        ));
+    }
 
     let control: Vec<(&'static str, u32, u32, ControlMessage)> = vec![
         (
@@ -382,6 +397,15 @@ fn golden_vectors_parse_back_to_canonical_fields() {
                 let re = encode_control(header.session_id, header.msg_seq, &message);
                 assert_eq!(re, bytes, "{name} re-encode mismatch");
             }
+            Classified::Audio { .. } => {
+                let (header, payload) = AudioHeader::decode(&bytes).unwrap();
+                assert_eq!(header.session_id, 0xA1B2_C3D4);
+                assert_eq!(header.stream_epoch, 7);
+                assert_eq!(header.audio_seq, 12_345);
+                assert_eq!(header.capture_ts_us, 0x0000_0123_4567_89AB);
+                assert_eq!(header.discontinuity, name == "audio_discontinuity");
+                assert_eq!(header.encode(payload).unwrap(), bytes);
+            }
             other => panic!("{name} classified as {other:?}"),
         }
     }
@@ -394,6 +418,7 @@ fn every_golden_vector_truncation_is_rejected() {
             let slice = &bytes[..len];
             let ok = match classify(&bytes) {
                 Classified::Media { .. } => MediaHeader::decode(slice).is_ok(),
+                Classified::Audio { .. } => AudioHeader::decode(slice).is_ok(),
                 _ => parse_control(slice).is_ok(),
             };
             assert!(!ok, "{name} truncated to {len} bytes must not parse");
@@ -406,6 +431,7 @@ fn packet_type_registry_is_stable() {
     // These numbers are wire constants. If this test fails you are breaking
     // protocol compatibility — do that only with a version bump.
     assert_eq!(PacketType::Media as u8, 0x01);
+    assert_eq!(PacketType::Audio as u8, 0x03);
     assert_eq!(PacketType::Hello2 as u8, 0x10);
     assert_eq!(PacketType::HelloAck as u8, 0x11);
     assert_eq!(PacketType::Heartbeat as u8, 0x12);

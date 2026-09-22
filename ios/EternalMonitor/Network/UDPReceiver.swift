@@ -346,6 +346,10 @@ final class UDPReceiver {
             )
         case .control:
             onControlDatagram?(data)
+        case .audio:
+            // Playback is added in the audio-client phase. This client does
+            // not advertise WANTS_AUDIO yet, so no host should send it audio.
+            break
         case .legacyHello:
             // The host never sends this; ignore.
             break

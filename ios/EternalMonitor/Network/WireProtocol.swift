@@ -18,6 +18,7 @@ enum Wire {
     enum PacketType: UInt8 {
         case media = 0x01
         case mediaFec = 0x02
+        case audio = 0x03
         case hello2 = 0x10
         case helloAck = 0x11
         case heartbeat = 0x12
@@ -34,6 +35,7 @@ enum Wire {
 
     enum Classification: Equatable {
         case media(flags: UInt8)
+        case audio(flags: UInt8)
         case control(PacketType)
         case legacyHello
         case unknown
@@ -54,6 +56,8 @@ enum Wire {
             switch type {
             case .media, .mediaFec:
                 return .media(flags: raw[4])
+            case .audio:
+                return .audio(flags: raw[4])
             default:
                 return .control(type)
             }
@@ -133,6 +137,59 @@ struct MediaHeader: Equatable {
         out.appendLE(frameSeq)
         out.appendLE(fragIndex)
         out.appendLE(fragCount)
+        out.appendLE(captureTimestampUs)
+        out.append(payload)
+        return out
+    }
+}
+
+// MARK: - Audio
+
+/// One Opus packet. Audio sequence numbers are independent from video frames.
+struct AudioHeader: Equatable {
+    static let size = 28
+    static let discontinuityFlag: UInt8 = 1
+    var sessionId: UInt32
+    var streamEpoch: UInt32
+    var audioSeq: UInt32
+    var captureTimestampUs: UInt64
+    var discontinuity: Bool
+
+    static func decode(_ datagram: Data) -> (header: AudioHeader, payloadRange: Range<Data.Index>)? {
+        guard datagram.count > size, datagram.count <= Wire.maxDatagramSize else { return nil }
+        let header: AudioHeader? = datagram.withUnsafeBytes { raw in
+            guard UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: 0, as: UInt16.self)) == Wire.magic,
+                  raw[2] == Wire.version, raw[3] == Wire.PacketType.audio.rawValue,
+                  Int(UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: 6, as: UInt16.self))) == datagram.count - size
+            else { return nil }
+            let sessionId = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self))
+            let streamEpoch = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self))
+            guard sessionId != 0, streamEpoch != 0 else { return nil }
+            return AudioHeader(
+                sessionId: sessionId, streamEpoch: streamEpoch,
+                audioSeq: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 16, as: UInt32.self)),
+                captureTimestampUs: UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: 20, as: UInt64.self)),
+                discontinuity: raw[4] & discontinuityFlag != 0
+            )
+        }
+        guard let header else { return nil }
+        let start = datagram.index(datagram.startIndex, offsetBy: size)
+        return (header, start..<datagram.endIndex)
+    }
+
+    func encode(payload: Data) -> Data? {
+        guard sessionId != 0, streamEpoch != 0, !payload.isEmpty,
+              payload.count <= Wire.maxDatagramSize - Self.size else { return nil }
+        var out = Data(capacity: Self.size + payload.count)
+        out.appendLE(Wire.magic)
+        out.append(Wire.version)
+        out.append(Wire.PacketType.audio.rawValue)
+        out.append(discontinuity ? Self.discontinuityFlag : 0)
+        out.append(0)
+        out.appendLE(UInt16(payload.count))
+        out.appendLE(sessionId)
+        out.appendLE(streamEpoch)
+        out.appendLE(audioSeq)
         out.appendLE(captureTimestampUs)
         out.append(payload)
         return out
@@ -225,6 +282,7 @@ enum HelloStatus: UInt8 {
 
 struct HelloAck: Equatable {
     static let hostCapNack: UInt16 = 1 << 0
+    static let hostCapAudio: UInt16 = 1 << 1
     static let hostCapUSB: UInt16 = 1 << 2
     var status: HelloStatus
     var acceptedVersion: UInt8
@@ -536,7 +594,7 @@ extension Wire {
             message = .streamConfig(cfg)
         case .inputEvent:
             message = parseInputEvent(&r)
-        case .media, .mediaFec, .error:
+        case .media, .mediaFec, .audio, .error:
             return nil
         }
         guard let message else { return nil }

@@ -312,7 +312,7 @@ pub async fn start_sender(
                             Classified::LegacyHello => {
                                 shared.session.lock().note_legacy_hello(src)
                             }
-                            Classified::Media { .. } | Classified::Unknown => {
+                            Classified::Media { .. } | Classified::Audio { .. } | Classified::Unknown => {
                                 debug!(peer = %src, len = datagram.len(), "Ignored unexpected datagram");
                             }
                         }
