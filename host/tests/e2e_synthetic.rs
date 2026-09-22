@@ -106,6 +106,7 @@ impl FakeReceiver {
         Self::connect_full(host_port, CAP_DECODE_H264, 0)
     }
 
+    #[cfg(not(windows))]
     fn connect_with_caps(host_port: u16, feature_caps: u16) -> Self {
         Self::connect_full(host_port, CAP_DECODE_H264, feature_caps)
     }
