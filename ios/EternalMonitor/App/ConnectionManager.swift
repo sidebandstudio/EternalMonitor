@@ -199,7 +199,8 @@ final class ConnectionManager: ObservableObject {
                         width: frameWidth,
                         height: frameHeight,
                         fps: self.fps,
-                        counters: self.frameAssembler?.counters.withLock { $0 } ?? .init()
+                        counters: self.frameAssembler?.counters.withLock { $0 } ?? .init(),
+                        decodeDepth: self.videoDecoder?.decodeDepth ?? 0
                     )
                 }
                 self.signalLost = false

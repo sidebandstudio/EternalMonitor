@@ -39,11 +39,14 @@ rm -f "$OUT/result.json"
 
 HOST_PID=""
 LOG_PID=""
+MONITOR_PID=""
 UDID=""
 INSTALL_DIR=""
 cleanup() {
     status=$?
     [ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null || true
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
+    [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
     [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
@@ -118,6 +121,7 @@ PY
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
 APPDATA="$OUT/state" \
 ETERNAL_HEADLESS=1 \
+ETERNAL_E2E_LOG=1 \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
@@ -126,6 +130,19 @@ ETERNAL_FPS="${ETERNAL_FPS:-60}" \
     "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
 fi
+
+python3 - "$OUT/resources.log" <<'PY' &
+import datetime, signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+with open(sys.argv[1], 'w') as out:
+    while True:
+        out.write(datetime.datetime.now(datetime.timezone.utc).isoformat()+'\n')
+        out.flush()
+        # Names and resource use only; command arguments may contain secrets.
+        subprocess.run(['ps','-axo','pid,pcpu,pmem,comm'], stdout=out, check=True)
+        time.sleep(2)
+PY
+MONITOR_PID=$!
 
 echo "==> Launching app with EM_AUTOCONNECT=$CONNECT_HOST:$PORT"
 SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
