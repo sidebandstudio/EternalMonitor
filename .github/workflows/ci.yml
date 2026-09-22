@@ -21,6 +21,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check release version parity
         run: scripts/check-versions.sh
+      - name: Test system measurement parser
+        run: python3 -m unittest discover -s scripts -p test_e2e_stats.py
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check -p eternal-wire
@@ -94,8 +96,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen and streaming SDK
+        run: brew install xcodegen ffmpeg@7 pkgconf
+      - uses: Swatinem/rust-cache@v2
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate
@@ -111,6 +114,10 @@ jobs:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
           scripts/test_ios.sh
+      - name: Run simulator streaming matrix
+        env:
+          EM_SIM_NAME: citest
+        run: scripts/e2e_matrix.sh --ci
       - name: Retain iOS test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -119,5 +126,9 @@ jobs:
           path: |
             build/ios-tests-*.log
             build/ios-tests-*.xcresult
+            build/ios-ui-host-*.log
             build/screenshots/ui-*
+            build/e2e-report.md
+            build/e2e/
+            build/screenshots/e2e-*.png
           retention-days: 7

@@ -25,10 +25,11 @@ enum E2E {
         logger.log("E2E_FIRST_FRAME w=\(width, privacy: .public) h=\(height, privacy: .public)")
     }
 
-    static func stats(decoded: Int, width: Int, height: Int, fps: Double) {
+    static func stats(decoded: Int, width: Int, height: Int, fps: Double, counters: FrameAssembler.Counters) {
         guard enabled else { return }
+        let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
         logger.log(
-            "E2E_STATS decoded=\(decoded, privacy: .public) w=\(width, privacy: .public) h=\(height, privacy: .public) fps=\(Int(fps), privacy: .public)"
+            "E2E_STATS decoded=\(decoded, privacy: .public) w=\(width, privacy: .public) h=\(height, privacy: .public) fps=\(Int(fps), privacy: .public) dropped=\(counters.framesDropped, privacy: .public) repaired=\(counters.fragsRepaired, privacy: .public) nacks=\(counters.nacksSent, privacy: .public) jitter_us=\(counters.jitterUs, privacy: .public) monotonic_ms=\(monotonicMs, privacy: .public)"
         )
     }
 }

@@ -49,9 +49,11 @@ cleanup() {
     [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
     if [ "$status" -ne 0 ]; then
         python3 - "$OUT/result.json" "$SCENARIO" "$((SECONDS - STARTED))" <<'PY'
-import json,sys
-with open(sys.argv[1], 'w') as f:
-    json.dump(dict(scenario=sys.argv[2], status='FAIL', elapsed=int(sys.argv[3])), f)
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1])
+r=json.loads(p.read_text()) if p.exists() else {}
+r.update(scenario=sys.argv[2], status='FAIL', elapsed=int(sys.argv[3]))
+p.write_text(json.dumps(r, indent=2)+'\n')
 PY
         echo "FAIL: evidence at $OUT" >&2
     fi
@@ -78,6 +80,12 @@ APP="$ROOT/ios/build/e2e/Build/Products/Debug-iphonesimulator/EternalMonitor.app
 HEVC_FLAG=0
 [ "$CODEC" = "hevc" ] && HEVC_FLAG=1
 if [ -z "$REMOTE_HOST" ]; then
+mkdir -p "$OUT/state/EternalMonitor"
+python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" <<'PY'
+import json,sys
+with open(sys.argv[1], 'w') as f:
+    json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False), f)
+PY
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
 APPDATA="$OUT/state" \
 ETERNAL_HEADLESS=1 \
@@ -121,12 +129,13 @@ sleep 2 # let the log stream attach before the milestones start
 echo "==> Launching app with EM_AUTOCONNECT=$CONNECT_HOST:$PORT"
 SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
+SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
     xcrun simctl launch "$UDID" com.eternal.monitor >/dev/null
 
 echo "==> Waiting for $WANT_DECODED decoded frames (timeout ${TIMEOUT_SECS}s)"
 elapsed=0
 decoded=0
-until [ "$decoded" -ge "$WANT_DECODED" ] && [ "$elapsed" -ge "$MIN_SECONDS" ]; do
+until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS"; do
     sleep 2
     elapsed=$((elapsed + 2))
     decoded=$(grep -o 'decoded=[0-9]*' "$APP_LOG" | tail -1 | cut -d= -f2 || true)
@@ -161,13 +170,11 @@ if [ "$fps" -lt "$MIN_FPS" ]; then
 fi
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
 xcrun swift "$ROOT/scripts/px.swift" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
-python3 - "$OUT/result.json" "$SCENARIO" "$fps" "$decoded" "$SHOT" "$((SECONDS - STARTED))" <<'PY'
-import json,sys
-with open(sys.argv[1], 'w') as f:
-    json.dump(dict(scenario=sys.argv[2], status='PASS', fps=int(sys.argv[3]),
-                   decoded=int(sys.argv[4]), screenshot=sys.argv[5], elapsed=int(sys.argv[6])), f)
-PY
-echo "PASS: $last_stats"
+python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --output "$OUT/result.json" \
+    --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
+    --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
+    --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
+echo "PASS: $(grep 'E2E_STATS' "$APP_LOG" | tail -1)"
 echo "      $first_frame"
 echo "      $decoder_kind"
 echo "      Evidence: $OUT"

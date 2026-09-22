@@ -338,6 +338,7 @@ impl Session {
             return actions;
         }
         session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        info!(reason = ?request.reason, "Keyframe request received");
 
         let granted = !matches!(
             session.last_keyframe_grant,

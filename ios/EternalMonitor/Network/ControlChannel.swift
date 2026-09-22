@@ -16,6 +16,7 @@ final class ControlChannel {
         let reportIntervalMs: UInt16
         let livenessTimeoutMs: UInt16
         let streamConfig: StreamConfig
+        let hostCaps: UInt16
     }
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
@@ -35,6 +36,7 @@ final class ControlChannel {
     private let send: (Data) -> Void
 
     private var sessionId: UInt32 = 0
+    private var hostCaps: UInt16 = 0
     private var msgSeq: UInt32 = 0
     private var clientNonce: UInt32 = 0
     private var helloBytes = Data()
@@ -94,6 +96,7 @@ final class ControlChannel {
     func startHandshake(listenPort: UInt16, identity: ClientIdentity) {
         queue.async { [self] in
             sessionId = 0
+            hostCaps = 0
             msgSeq = 0
             helloAttempts = 0
             clientNonce = UInt32.random(in: 1...UInt32.max)
@@ -194,6 +197,7 @@ final class ControlChannel {
         guard sessionId == 0 else { return } // duplicate ack retransmit
 
         sessionId = ack.sessionId
+        hostCaps = ack.hostCaps
         onDiagnostic?("Session \(ack.sessionId) established with \(ack.hostName)")
         lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }
         startReportTimer(intervalMs: max(ack.reportIntervalMs, 100))
@@ -204,11 +208,19 @@ final class ControlChannel {
             heartbeatIntervalMs: ack.heartbeatIntervalMs,
             reportIntervalMs: ack.reportIntervalMs,
             livenessTimeoutMs: ack.livenessTimeoutMs,
-            streamConfig: ack.streamConfig
+            streamConfig: ack.streamConfig,
+            hostCaps: ack.hostCaps
         ))
     }
 
     // MARK: - Outbound
+
+    func sendNack(_ nack: Nack) {
+        queue.async { [self] in
+            guard sessionId != 0, hostCaps & HelloAck.hostCapNack != 0, nack.isValid else { return }
+            sendMessage(.nack(nack))
+        }
+    }
 
     private func startReportTimer(intervalMs: UInt16) {
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -297,6 +309,7 @@ final class ControlChannel {
             pingTimer?.cancel()
             pingTimer = nil
             sessionId = 0
+            hostCaps = 0
             estimator.reset()
             lastHeartbeatAtUs.withLock { $0 = 0 }
             clockSnapshot.withLock { $0 = ClockSnapshot() }

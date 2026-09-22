@@ -227,6 +227,11 @@ pub async fn start_sender(
                                             }
                                         }
                                         if let Some(report) = actions.report.take() {
+                                            info!(epoch = report.stream_epoch, complete = report.frames_complete,
+                                                dropped = report.frames_dropped, repaired = report.frags_repaired,
+                                                nacks = report.nacks_sent, jitter_us = report.jitter_us,
+                                                retransmits = PIPELINE_STATS.lock().transport_retransmits,
+                                                "Receiver report");
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
                                             // A lowered ceiling clamps the rung

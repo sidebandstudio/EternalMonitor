@@ -153,6 +153,7 @@ final class ConnectionManager: ObservableObject {
         record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
 
         let decoder = VideoDecoder()
+        let metrics = ReceiverMetrics()
         let assembler = FrameAssembler()
         let receiver = UDPReceiver(port: port)
 
@@ -168,6 +169,7 @@ final class ConnectionManager: ObservableObject {
             self.frameSlot.set(pixelBuffer)
             // Capture only the scalars we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
+            metrics.recordDecoded(at: ControlChannel.clientNowUs(), captureUs: ts)
             let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
             let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
             Task { @MainActor in
@@ -196,7 +198,8 @@ final class ConnectionManager: ObservableObject {
                         decoded: self.debugState.decodedFrames,
                         width: frameWidth,
                         height: frameHeight,
-                        fps: self.fps
+                        fps: self.fps,
+                        counters: self.frameAssembler?.counters.withLock { $0 } ?? .init()
                     )
                 }
                 self.signalLost = false
@@ -246,20 +249,16 @@ final class ConnectionManager: ObservableObject {
             receiver?.send(data)
         })
         controlChannelBox.value = channel
-        channel.reportProvider = { [weak assembler, weak channel] in
-            var report = ReceiverReport()
-            if let counters = assembler?.counters.withLock({ $0 }) {
-                report.framesComplete = UInt32(clamping: counters.framesComplete)
-                report.framesDropped = UInt32(clamping: counters.framesDropped)
-                report.fragsReceived = UInt32(clamping: counters.fragsReceived)
-                report.fragsLost = UInt32(clamping: counters.fragsLost)
-            }
-            if let snapshot = channel?.clockSnapshot.withLock({ $0 }) {
-                if let rtt = snapshot.rttUs {
-                    report.rttMsX10 = UInt16(clamping: rtt / 100)
-                }
-            }
-            return report
+        assembler.rttUs = { [weak channel] in channel?.clockSnapshot.withLock { $0.rttUs } ?? 10_000 }
+        assembler.onNack = { [weak channel] nack in channel?.sendNack(nack) }
+        assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
+            channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: seq, reason: .gapLoss)
+        }
+        channel.reportProvider = { [weak assembler, weak channel, weak decoder] in
+            metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
+                decodeDepth: decoder?.decodeDepth ?? 0,
+                clock: channel?.clockSnapshot.withLock { $0 } ?? .init(),
+                now: ControlChannel.clientNowUs())
         }
         channel.onHelloAttempt = { [weak self] attempt, total in
             Task { @MainActor in
@@ -272,7 +271,9 @@ final class ConnectionManager: ObservableObject {
                 self?.record(.info, "ctrl", message)
             }
         }
-        channel.onSessionEstablished = { [weak self, weak receiver] info in
+        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler] info in
+            assembler?.repairEnabled = info.hostCaps & HelloAck.hostCapNack != 0
+            assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             Task { @MainActor in
                 guard let self else { return }
@@ -322,12 +323,14 @@ final class ConnectionManager: ObservableObject {
                 self.disconnect()
             }
         }
-        channel.onHeartbeat = { [weak self] heartbeat in
+        channel.onHeartbeat = { [weak self, weak assembler] heartbeat in
+            assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, heartbeat.streamConfig.fps))
             Task { @MainActor in
                 self?.hostStreamConfig = heartbeat.streamConfig
             }
         }
-        channel.onStreamConfig = { [weak self] config in
+        channel.onStreamConfig = { [weak self, weak assembler] config in
+            assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, config.fps))
             Task { @MainActor in
                 self?.hostStreamConfig = config
             }
@@ -349,7 +352,7 @@ final class ConnectionManager: ObservableObject {
                     // VideoToolbox decodes HEVC on every supported iPad
                     // (hardware on device, software in the simulator).
                     decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
-                    featureCaps: wantsInput ? Hello2.featureWantsInput : 0
+                    featureCaps: (wantsInput ? Hello2.featureWantsInput : 0) | Hello2.featureSupportsNack
                 )
             )
             Task { @MainActor in
@@ -473,6 +476,8 @@ final class ConnectionManager: ObservableObject {
             let total = deltaReceived + deltaLost
             next.lossPercent = total == 0 ? 0 : Double(deltaLost) * 100.0 / Double(total)
             next.framesDropped = counters.framesDropped
+            next.fragsRepaired = counters.fragsRepaired
+            next.jitterMs = Double(counters.jitterUs) / 1000
         }
         next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
         stats = next

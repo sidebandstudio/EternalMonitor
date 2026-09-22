@@ -1,7 +1,6 @@
 //! Fragment reassembly that mirrors the iPad's `FrameAssembler.swift`
 //! semantics exactly — epoch precedence, duplicate/stale rejection, the
-//! seq-backward-jump restart heuristic, completion-time eviction of older
-//! partial frames, and 100 ms stale-frame cleanup.
+//! seq-backward-jump restart heuristic, negotiated ordered repair windows, and bounded partial-frame storage.
 //!
 //! The host never reassembles in production; this exists so the fake receiver
 //! in the end-to-end tests (and any future host-side receiver) exercises the
@@ -9,117 +8,162 @@
 //! on every platform. If behavior here diverges from the Swift assembler,
 //! the Swift side is the specification.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// A backward jump in sequence numbers larger than this means the sender
-/// restarted its pipeline and reset seq toward 0 (legacy hosts only — epoch
-/// makes this explicit on current hosts).
+use crate::v2::control::Nack;
+use crate::v2::media::{MediaHeader, MAX_FRAG_COUNT};
+
 pub const STREAM_RESTART_GAP: u32 = 256;
-
-/// Partial frames older than this are evicted during periodic cleanup.
 pub const STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// After this many CONSECUTIVE stale-epoch drops, the current epoch is treated
-/// as bogus and re-synced to whatever is actually arriving.
-///
-/// Without this, one corrupted or spoofed fragment carrying a high epoch
-/// latches an epoch the sender will never reach, and every real fragment is
-/// dropped forever — video freezes while the control channel stays healthy, so
-/// nothing notices. Genuine stragglers from a previous run can't trip it: the
-/// new run's fragments interleave and are accepted, which resets the streak.
 pub const EPOCH_RESYNC_THRESHOLD: u32 = 512;
-
-/// Cleanup runs every this-many fragments.
-const CLEANUP_INTERVAL: u32 = 100;
+pub const MAX_PENDING_FRAMES: usize = 8;
+pub const MAX_REPAIR_FRAMES: usize = 3;
+pub const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
-    /// Fragment carries an epoch lower than the current stream's.
     StaleEpoch,
-    /// Duplicate fragment of the frame that just completed.
     DuplicateCompleted,
-    /// Stale/late fragment of an already-superseded frame.
     StaleSeq,
-    /// fragment_count == 0.
     ZeroCount,
-    /// fragment_index >= fragment_count.
     IndexOutOfRange,
-    /// Fragment count disagrees with the live frame's; first-seen count wins.
     CountMismatch,
-    /// This index of this frame was already stored.
     DuplicateFragment,
+    CountExceedsCap,
+    Capacity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddOutcome {
-    /// Fragment stored; frame not yet complete.
     Stored,
-    /// This fragment completed the frame; here is the reassembled payload.
     Completed(Vec<u8>),
-    /// Fragment rejected.
     Dropped(DropReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledFrame {
+    pub seq: u32,
+    pub capture_ts_us: u64,
+    pub is_keyframe: bool,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct PendingFrame {
-    fragment_count: u16,
+    header: MediaHeader,
     fragments: HashMap<u16, Vec<u8>>,
+    bytes: usize,
     created_at: Instant,
+    contiguous: u16,
+    highest_index: u16,
+    repaired: u64,
+    deadline: Option<Instant>,
+    retry_at: Option<Instant>,
+    nack_count: u8,
+    keyframe_requested: bool,
 }
 
 impl PendingFrame {
-    /// Fragments that never arrived. THIS is what loss means: counting the
-    /// ones that did arrive (as this mirror used to) reported a frame missing
-    /// one fragment out of ten as nine lost, so the host ABR saw roughly nine
-    /// times the real loss and stepped down on a healthy link.
+    fn complete(&self) -> bool {
+        self.fragments.len() == usize::from(self.header.frag_count)
+    }
     fn missing_fragments(&self) -> u64 {
-        u64::from(self.fragment_count).saturating_sub(self.fragments.len() as u64)
+        u64::from(self.header.frag_count).saturating_sub(self.fragments.len() as u64)
     }
 }
 
-/// Cumulative counters for loss accounting (feeds receiver reports in v2).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReassemblyCounters {
     pub frames_complete: u64,
-    /// Partial frames discarded (superseded by a newer completion or evicted
-    /// as stale).
     pub frames_dropped: u64,
     pub frags_received: u64,
-    /// Fragments belonging to dropped partial frames.
     pub frags_lost: u64,
+    pub frags_repaired: u64,
+    pub nacks_sent: u64,
+    pub highest_seq: u32,
+    pub stream_epoch: u32,
+    pub assembler_depth: u8,
+    pub jitter_us: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Reassembler {
-    pending: HashMap<u32, PendingFrame>,
+    pending: BTreeMap<u32, PendingFrame>,
+    pending_bytes: usize,
     latest_completed_seq: u32,
-    cleanup_counter: u32,
+    retired_seq: u32,
     current_epoch: Option<u32>,
-    /// Consecutive stale-epoch drops; see [`EPOCH_RESYNC_THRESHOLD`].
     stale_epoch_streak: u32,
     counters: ReassemblyCounters,
+    repair_enabled: bool,
+    frame_period: Duration,
+    rtt: Duration,
+    ready: VecDeque<AssembledFrame>,
+    nacks: VecDeque<Nack>,
+    keyframe_needed: bool,
+    clock_origin: Option<Instant>,
+    previous_transit: Option<f64>,
+    jitter: f64,
+}
+
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            pending_bytes: 0,
+            latest_completed_seq: 0,
+            retired_seq: 0,
+            current_epoch: None,
+            stale_epoch_streak: 0,
+            counters: ReassemblyCounters::default(),
+            repair_enabled: false,
+            frame_period: Duration::from_micros(16_667),
+            rtt: Duration::from_millis(10),
+            ready: VecDeque::new(),
+            nacks: VecDeque::new(),
+            keyframe_needed: false,
+            clock_origin: None,
+            previous_transit: None,
+            jitter: 0.0,
+        }
+    }
 }
 
 impl Reassembler {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn counters(&self) -> ReassemblyCounters {
         self.counters
     }
-
-    /// Number of in-flight partial frames.
     pub fn pending_frames(&self) -> usize {
         self.pending.len()
     }
-
     pub fn latest_completed_seq(&self) -> u32 {
         self.latest_completed_seq
     }
 
-    /// Feed one fragment. `now` is injected so tests control time.
+    pub fn configure_repair(&mut self, enabled: bool, frame_period: Duration, rtt: Duration) {
+        self.repair_enabled = enabled;
+        self.frame_period = frame_period;
+        self.rtt = rtt.min(Duration::from_secs(1));
+    }
+
+    /// Repair-mode callers drain deliveries and requests after each add/tick,
+    /// like the synchronous callbacks in the Swift receiver.
+    pub fn take_ready(&mut self) -> Vec<AssembledFrame> {
+        self.ready.drain(..).collect()
+    }
+    pub fn take_nacks(&mut self) -> Vec<Nack> {
+        self.nacks.drain(..).collect()
+    }
+    pub fn take_keyframe_request(&mut self) -> Option<(u32, u32)> {
+        std::mem::take(&mut self.keyframe_needed)
+            .then_some((self.current_epoch.unwrap_or(0), self.latest_completed_seq))
+    }
+
+    /// Compatibility helper for receivers that have not negotiated repair.
     pub fn add_fragment(
         &mut self,
         seq: u32,
@@ -129,171 +173,429 @@ impl Reassembler {
         payload: &[u8],
         now: Instant,
     ) -> AddOutcome {
-        // Primary restart signal: a HIGHER epoch means a brand-new pipeline
-        // run — drop all old state instantly. A LOWER epoch is a stale
-        // fragment from the previous run; never roll the epoch backward.
-        // Legacy hosts send 0, which behaves like any constant epoch and
-        // leaves restart detection to the seq-gap fallback below.
+        self.add_media(
+            MediaHeader {
+                session_id: 1,
+                stream_epoch: epoch,
+                frame_seq: seq,
+                frag_index: index,
+                frag_count: count,
+                is_keyframe: false,
+                is_retransmit: false,
+                capture_ts_us: 0,
+                payload_len: payload.len() as u16,
+            },
+            payload,
+            now,
+        )
+    }
+
+    pub fn add_media(&mut self, header: MediaHeader, payload: &[u8], now: Instant) -> AddOutcome {
+        let (seq, index, count, epoch) = (
+            header.frame_seq,
+            header.frag_index,
+            header.frag_count,
+            header.stream_epoch,
+        );
         match self.current_epoch {
             Some(current) if epoch > current => {
                 self.reset_internal();
                 self.current_epoch = Some(epoch);
-                self.stale_epoch_streak = 0;
             }
             Some(current) if epoch < current => {
                 self.stale_epoch_streak += 1;
                 if self.stale_epoch_streak < EPOCH_RESYNC_THRESHOLD {
                     return AddOutcome::Dropped(DropReason::StaleEpoch);
                 }
-                // Nothing has been accepted for a long run of drops, so the
-                // epoch we are holding can't be the live one. Re-sync to the
-                // stream that is actually arriving.
                 self.reset_internal();
                 self.current_epoch = Some(epoch);
-                self.stale_epoch_streak = 0;
             }
             Some(_) => self.stale_epoch_streak = 0,
-            None => {
-                self.current_epoch = Some(epoch);
-                self.stale_epoch_streak = 0;
-            }
+            None => self.current_epoch = Some(epoch),
         }
-
-        if self.latest_completed_seq > 0 {
-            if seq == self.latest_completed_seq {
+        let retired = self.latest_completed_seq.max(self.retired_seq);
+        if retired > 0 {
+            if seq == retired {
                 return AddOutcome::Dropped(DropReason::DuplicateCompleted);
             }
-            if seq < self.latest_completed_seq {
-                if self.latest_completed_seq - seq > STREAM_RESTART_GAP {
-                    // Sender restarted (seq reset toward 0): accept this
-                    // fragment as the start of the new stream.
-                    let epoch = self.current_epoch;
+            if seq < retired {
+                if retired - seq > STREAM_RESTART_GAP {
                     self.reset_internal();
-                    self.current_epoch = epoch;
                 } else {
                     return AddOutcome::Dropped(DropReason::StaleSeq);
                 }
             }
         }
-
         if count == 0 {
             return AddOutcome::Dropped(DropReason::ZeroCount);
+        }
+        if count > MAX_FRAG_COUNT {
+            return AddOutcome::Dropped(DropReason::CountExceedsCap);
         }
         if index >= count {
             return AddOutcome::Dropped(DropReason::IndexOutOfRange);
         }
-
-        match self.pending.get(&seq) {
-            // Conflicting metadata for a live frame: the FIRST-seen count wins.
-            // Rebuilding the frame here (as this mirror used to) let one late
-            // duplicate or spoofed datagram throw away every fragment already
-            // buffered for it.
-            Some(frame) if frame.fragment_count != count => {
+        self.tick(now);
+        if self.repair_enabled && self.retired_seq > 0 && seq <= self.retired_seq {
+            return AddOutcome::Dropped(DropReason::StaleSeq);
+        }
+        if let Some(frame) = self.pending.get(&seq) {
+            if frame.header.frag_count != count {
                 return AddOutcome::Dropped(DropReason::CountMismatch);
             }
-            Some(_) => {}
-            None => {
-                self.pending.insert(
-                    seq,
-                    PendingFrame {
-                        fragment_count: count,
-                        fragments: HashMap::new(),
-                        created_at: now,
-                    },
-                );
+            if frame.fragments.contains_key(&index) {
+                return AddOutcome::Dropped(DropReason::DuplicateFragment);
             }
         }
-
-        let frame = self
-            .pending
-            .get_mut(&seq)
-            .expect("pending frame present or just inserted");
-        // First write wins, and only a first write counts as received: a
-        // replayed fragment must not overwrite good bytes or inflate the
-        // receive count the loss math is derived from.
-        if frame.fragments.contains_key(&index) {
-            return AddOutcome::Dropped(DropReason::DuplicateFragment);
+        if payload.len() > MAX_PENDING_BYTES {
+            return AddOutcome::Dropped(DropReason::Capacity);
         }
-        frame.fragments.insert(index, payload.to_vec());
-        self.counters.frags_received += 1;
-        let frame = self
-            .pending
-            .get_mut(&seq)
-            .expect("pending frame present or just inserted");
-
-        let mut outcome = AddOutcome::Stored;
-        if frame.fragments.len() == usize::from(frame.fragment_count) {
-            let mut assembled = Vec::with_capacity(frame.fragments.values().map(Vec::len).sum());
-            for i in 0..frame.fragment_count {
-                let fragment = frame
-                    .fragments
-                    .get(&i)
-                    .expect("complete frame has every index");
-                assembled.extend_from_slice(fragment);
-            }
-
-            self.latest_completed_seq = seq;
-            self.pending.remove(&seq);
-            self.counters.frames_complete += 1;
-
-            // Evict every older partial frame: delivering it after a newer
-            // frame would corrupt decode order.
-            let mut dropped_frames = 0u64;
-            let mut dropped_frags = 0u64;
-            self.pending.retain(|&pending_seq, frame| {
-                let keep = pending_seq > seq;
-                if !keep {
-                    dropped_frames += 1;
-                    dropped_frags += frame.missing_fragments();
+        let limit = if self.repair_enabled {
+            MAX_REPAIR_FRAMES
+        } else {
+            MAX_PENDING_FRAMES
+        };
+        while (!self.pending.contains_key(&seq) && self.pending.len() >= limit)
+            || self.pending_bytes + payload.len() > MAX_PENDING_BYTES
+        {
+            let Some((&oldest, _)) = self.pending.first_key_value() else {
+                break;
+            };
+            self.drop_pending(oldest);
+            if self.repair_enabled {
+                self.retired_seq = self.retired_seq.max(oldest);
+                self.drain_ready();
+                if seq <= self.retired_seq {
+                    return AddOutcome::Dropped(DropReason::StaleSeq);
                 }
-                keep
-            });
-            self.counters.frames_dropped += dropped_frames;
-            self.counters.frags_lost += dropped_frags;
-
-            outcome = AddOutcome::Completed(assembled);
+            }
         }
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter.is_multiple_of(CLEANUP_INTERVAL) {
-            self.evict_stale(now);
+        let frame = self.pending.entry(seq).or_insert_with(|| PendingFrame {
+            header,
+            fragments: HashMap::new(),
+            bytes: 0,
+            created_at: now,
+            contiguous: 0,
+            highest_index: 0,
+            repaired: 0,
+            deadline: None,
+            retry_at: None,
+            nack_count: 0,
+            keyframe_requested: false,
+        });
+        frame.fragments.insert(index, payload.to_vec());
+        frame.bytes += payload.len();
+        frame.highest_index = frame.highest_index.max(index);
+        while frame.contiguous < count && frame.fragments.contains_key(&frame.contiguous) {
+            frame.contiguous += 1;
         }
-
-        outcome
+        self.pending_bytes += payload.len();
+        if header.is_retransmit {
+            frame.repaired += 1;
+        } else {
+            self.counters.frags_received += 1;
+            let origin = *self.clock_origin.get_or_insert(now);
+            let transit = now.saturating_duration_since(origin).as_micros() as f64
+                - header.capture_ts_us as f64;
+            if let Some(previous) = self.previous_transit {
+                self.jitter += ((transit - previous).abs() - self.jitter) / 16.0;
+            }
+            self.previous_transit = Some(transit);
+        }
+        self.counters.highest_seq = self.counters.highest_seq.max(seq);
+        self.counters.stream_epoch = epoch;
+        self.counters.jitter_us = self.jitter as u32;
+        let complete = frame.complete();
+        if self.repair_enabled {
+            if !complete && frame.contiguous < frame.highest_index {
+                let through = frame.highest_index;
+                self.begin_gap(seq, through, now);
+            }
+            if complete {
+                let older: Vec<_> = self
+                    .pending
+                    .range(..seq)
+                    .filter(|(_, f)| !f.complete())
+                    .map(|(&s, f)| (s, f.header.frag_count - 1))
+                    .collect();
+                for (s, through) in older {
+                    self.begin_gap(s, through, now);
+                }
+            }
+            self.drain_ready();
+        } else if complete {
+            self.deliver(seq);
+            let stale: Vec<_> = self.pending.range(..=seq).map(|(&s, _)| s).collect();
+            for s in stale {
+                self.drop_pending(s);
+            }
+        }
+        self.update_depth();
+        if !self.repair_enabled {
+            if let Some(frame) = self.ready.pop_front() {
+                return AddOutcome::Completed(frame.payload);
+            }
+        }
+        AddOutcome::Stored
     }
 
-    /// Drops all reassembly state (new session / manual disconnect).
-    pub fn reset(&mut self) {
-        self.reset_internal();
-        self.current_epoch = None;
-        self.stale_epoch_streak = 0;
+    pub fn tick(&mut self, now: Instant) {
+        let keys: Vec<_> = self.pending.keys().copied().collect();
+        for seq in keys {
+            let Some(frame) = self.pending.get(&seq) else {
+                continue;
+            };
+            if frame.complete() {
+                continue;
+            }
+            if self.repair_enabled {
+                if frame.deadline.is_some_and(|deadline| now >= deadline) {
+                    if self.pending.first_key_value().map(|(&s, _)| s) == Some(seq) {
+                        self.drop_pending(seq);
+                        self.retired_seq = self.retired_seq.max(seq);
+                        self.drain_ready();
+                    }
+                } else if frame.deadline.is_none()
+                    && now.saturating_duration_since(frame.created_at) >= self.frame_period
+                {
+                    let through = frame.header.frag_count - 1;
+                    self.begin_gap(seq, through, now);
+                } else if frame.nack_count < 2 && frame.retry_at.is_some_and(|retry| now >= retry) {
+                    let through = frame.header.frag_count - 1;
+                    self.request_missing(seq, through);
+                }
+            } else if now.saturating_duration_since(frame.created_at) >= STALE_FRAME_TIMEOUT {
+                self.drop_pending(seq);
+            }
+        }
+        if self.repair_enabled {
+            self.drain_ready();
+        }
+        self.update_depth();
     }
 
-    fn reset_internal(&mut self) {
-        for (_, frame) in self.pending.drain() {
+    fn begin_gap(&mut self, seq: u32, through: u16, now: Instant) {
+        let Some(frame) = self.pending.get_mut(&seq) else {
+            return;
+        };
+        if frame.deadline.is_some() {
+            return;
+        }
+        let window_us =
+            (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2).clamp(8_000, 25_000);
+        frame.deadline = Some(now + Duration::from_micros(window_us as u64));
+        frame.retry_at = Some(now + self.rtt + Duration::from_millis(5));
+        self.request_missing(seq, through);
+    }
+
+    fn request_missing(&mut self, seq: u32, through: u16) {
+        let Some(frame) = self.pending.get_mut(&seq) else {
+            return;
+        };
+        if frame.nack_count >= 2 {
+            return;
+        }
+        let missing: Vec<_> = (0..=through)
+            .filter(|i| !frame.fragments.contains_key(i))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        if missing.len() > 64 {
+            frame.nack_count = 2;
+            self.request_keyframe(seq);
+            return;
+        }
+        frame.nack_count += 1;
+        self.counters.nacks_sent += 1;
+        self.nacks.push_back(Nack {
+            stream_epoch: self.current_epoch.unwrap_or(0),
+            frame_seq: seq,
+            frag_count: frame.header.frag_count,
+            missing,
+        });
+    }
+
+    fn request_keyframe(&mut self, seq: u32) {
+        if let Some(frame) = self.pending.get_mut(&seq) {
+            if !frame.keyframe_requested {
+                self.keyframe_needed = true;
+                frame.keyframe_requested = true;
+            }
+        }
+    }
+
+    fn drain_ready(&mut self) {
+        while let Some((&seq, frame)) = self.pending.first_key_value() {
+            if !frame.complete() {
+                break;
+            }
+            self.deliver(seq);
+        }
+    }
+
+    fn deliver(&mut self, seq: u32) {
+        let Some(frame) = self.pending.remove(&seq) else {
+            return;
+        };
+        self.pending_bytes -= frame.bytes;
+        let mut payload = Vec::with_capacity(frame.bytes);
+        for index in 0..frame.header.frag_count {
+            payload.extend_from_slice(&frame.fragments[&index]);
+        }
+        self.latest_completed_seq = seq;
+        self.retired_seq = self.retired_seq.max(seq);
+        self.counters.frames_complete += 1;
+        self.counters.frags_repaired += frame.repaired;
+        self.ready.push_back(AssembledFrame {
+            seq,
+            capture_ts_us: frame.header.capture_ts_us,
+            is_keyframe: frame.header.is_keyframe,
+            payload,
+        });
+    }
+
+    fn drop_pending(&mut self, seq: u32) {
+        self.request_keyframe(seq);
+        if let Some(frame) = self.pending.remove(&seq) {
+            self.pending_bytes -= frame.bytes;
             self.counters.frames_dropped += 1;
             self.counters.frags_lost += frame.missing_fragments();
         }
-        self.latest_completed_seq = 0;
-        self.cleanup_counter = 0;
     }
 
-    fn evict_stale(&mut self, now: Instant) {
-        let counters = &mut self.counters;
-        self.pending.retain(|_, frame| {
-            let fresh = now.duration_since(frame.created_at) < STALE_FRAME_TIMEOUT;
-            if !fresh {
-                counters.frames_dropped += 1;
-                counters.frags_lost += frame.missing_fragments();
-            }
-            fresh
-        });
+    fn update_depth(&mut self) {
+        self.counters.assembler_depth =
+            self.pending.values().filter(|f| !f.complete()).count() as u8;
+    }
+
+    pub fn reset(&mut self) {
+        self.reset_internal();
+        self.current_epoch = None;
+    }
+    fn reset_internal(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.latest_completed_seq = 0;
+        self.retired_seq = 0;
+        self.stale_epoch_streak = 0;
+        self.ready.clear();
+        self.nacks.clear();
+        self.keyframe_needed = false;
+        self.clock_origin = None;
+        self.previous_transit = None;
+        self.jitter = 0.0;
+        self.counters = ReassemblyCounters::default();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_traces_match_the_swift_specification() {
+        let base = Instant::now();
+        let mut r = Reassembler::new();
+        let mut delivered = Vec::new();
+        let mut requests = Vec::new();
+        let mut keyframes = 0;
+        for (line_number, line) in include_str!("../testdata/repair_vectors.txt")
+            .lines()
+            .enumerate()
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.is_empty() || fields[0].starts_with('#') {
+                continue;
+            }
+            let number = |i: usize| fields[i].parse::<u64>().unwrap();
+            match fields[0] {
+                "reset" => {
+                    r.reset();
+                    r.configure_repair(
+                        true,
+                        Duration::from_micros(number(1)),
+                        Duration::from_micros(number(2)),
+                    );
+                    delivered.clear();
+                    requests.clear();
+                    keyframes = 0;
+                }
+                "add" => {
+                    r.add_media(
+                        MediaHeader {
+                            session_id: 1,
+                            stream_epoch: number(2) as u32,
+                            frame_seq: number(3) as u32,
+                            frag_index: number(4) as u16,
+                            frag_count: number(5) as u16,
+                            is_retransmit: number(6) != 0,
+                            is_keyframe: false,
+                            capture_ts_us: 0,
+                            payload_len: 1,
+                        },
+                        &[number(7) as u8],
+                        base + Duration::from_micros(number(1)),
+                    );
+                }
+                "tick" => r.tick(base + Duration::from_micros(number(1))),
+                "expect" => {
+                    let c = r.counters();
+                    assert_eq!(
+                        [
+                            c.frames_complete,
+                            c.frames_dropped,
+                            c.frags_received,
+                            c.frags_lost,
+                            c.frags_repaired,
+                            c.nacks_sent,
+                            u64::from(c.assembler_depth)
+                        ],
+                        std::array::from_fn::<_, 7, _>(|i| number(i + 1)),
+                        "line {}",
+                        line_number + 1
+                    );
+                    assert_eq!(
+                        if delivered.is_empty() {
+                            "-".into()
+                        } else {
+                            delivered.join(",")
+                        },
+                        fields[8],
+                        "line {}",
+                        line_number + 1
+                    );
+                    assert_eq!(keyframes, number(9), "line {}", line_number + 1);
+                    assert_eq!(
+                        if requests.is_empty() {
+                            "-".into()
+                        } else {
+                            requests.join("|")
+                        },
+                        fields[10],
+                        "line {}",
+                        line_number + 1
+                    );
+                }
+                command => panic!("unknown trace command {command}"),
+            }
+            delivered.extend(r.take_ready().into_iter().map(|f| f.seq.to_string()));
+            requests.extend(r.take_nacks().into_iter().map(|n| {
+                format!(
+                    "{}:{}",
+                    n.frame_seq,
+                    n.missing
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }));
+            if r.take_keyframe_request().is_some() {
+                keyframes += 1;
+            }
+        }
+    }
 
     fn feed(
         r: &mut Reassembler,

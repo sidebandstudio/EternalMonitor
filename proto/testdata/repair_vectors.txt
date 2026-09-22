@@ -1,0 +1,68 @@
+# Shared Rust/Swift reassembly traces. Time is monotonic microseconds.
+# reset frame_period_us rtt_us
+# add time epoch seq index count retransmit byte
+# tick time
+# expect complete dropped received lost repaired nacks depth delivered_seqs keyframes nack_requests
+# nack_requests is seq:comma-separated-indices, with | between requests.
+reset 16667 10000
+add 0 1 1 0 2 0 1
+expect 0 0 1 0 0 0 1 - 0 -
+add 10000 1 2 0 1 0 3
+expect 0 0 2 0 0 1 1 - 0 1:1
+add 12000 1 1 1 2 1 2
+expect 2 0 2 0 1 1 0 1,2 0 1:1
+
+reset 16667 10000
+add 0 1 1 1 2 0 2
+add 1000 1 2 0 1 0 3
+tick 14999
+expect 0 0 2 0 0 1 1 - 0 1:0
+tick 15000
+expect 0 0 2 0 0 2 1 - 0 1:0|1:0
+tick 24999
+expect 0 0 2 0 0 2 1 - 0 1:0|1:0
+tick 25000
+expect 1 1 2 1 0 2 0 2 1 1:0|1:0
+add 26000 1 1 0 2 1 1
+expect 1 1 2 1 0 2 0 2 1 1:0|1:0
+
+reset 16667 10000
+add 0 1 1 0 2 0 1
+tick 16666
+expect 0 0 1 0 0 0 1 - 0 -
+tick 16667
+expect 0 0 1 0 0 1 1 - 0 1:1
+tick 41667
+expect 0 1 1 1 0 1 0 - 1 1:1
+
+reset 16667 10000
+add 0 1 1 0 2 0 1
+add 0 1 2 0 1 0 2
+add 0 1 3 0 1 0 3
+expect 0 0 3 0 0 1 1 - 0 1:1
+add 0 1 4 0 1 0 4
+expect 3 1 4 1 0 1 0 2,3,4 1 1:1
+
+reset 16667 10000
+add 0 1 1 65 66 0 1
+expect 0 0 1 0 0 0 1 - 1 -
+tick 25000
+expect 0 1 1 65 0 0 0 - 1 -
+
+reset 1000 100
+add 0 1 1 1 2 0 2
+tick 7999
+expect 0 0 1 0 0 2 1 - 0 1:0|1:0
+tick 8000
+expect 0 1 1 1 0 2 0 - 1 1:0|1:0
+
+reset 16667 10000
+add 0 1 3 1 2 0 5
+add 10000 1 1 0 2 0 1
+add 10000 1 2 0 1 0 3
+tick 25000
+expect 0 0 3 0 0 3 2 - 0 3:0|1:1|1:1
+add 26000 1 1 1 2 1 2
+expect 2 0 3 0 1 3 1 1,2 0 3:0|1:1|1:1
+tick 26000
+expect 2 1 3 1 1 3 0 1,2 1 3:0|1:1|1:1

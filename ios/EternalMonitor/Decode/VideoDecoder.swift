@@ -47,6 +47,9 @@ final class VideoDecoder {
     private var packetLogCounter: UInt64 = 0
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
+    private let queued = OSAllocatedUnfairLock<Int>(initialState: 0)
+    private let inFlight = OSAllocatedUnfairLock<Int>(initialState: 0)
+    var decodeDepth: UInt8 { UInt8(clamping: queued.withLock { $0 } + inFlight.withLock { $0 }) }
 
     deinit {
         // `shutdown()` is the proper teardown; this is the safety net if an owner
@@ -58,8 +61,11 @@ final class VideoDecoder {
     }
 
     func decode(packet: FramePacket) {
+        queued.withLock { $0 += 1 }
         decodeQueue.async { [weak self] in
-            self?.decodeOnQueue(packet: packet)
+            guard let self else { return }
+            self.queued.withLock { $0 -= 1 }
+            self.decodeOnQueue(packet: packet)
         }
     }
 
@@ -554,12 +560,23 @@ final class VideoDecoder {
         }
 
         var infoFlags = VTDecodeInfoFlags()
+        inFlight.withLock { $0 += 1 }
+        let finished = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let finish: () -> Void = { [weak self] in
+            let first = finished.withLock { value in
+                if value { return false }
+                value = true
+                return true
+            }
+            if first { self?.inFlight.withLock { $0 -= 1 } }
+        }
         let status = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
             flags: [._EnableAsynchronousDecompression],
             infoFlagsOut: &infoFlags
         ) { [weak self] status, _, imageBuffer, _, _ in
+            finish()
             guard let self else { return }
             if verboseDecodeLogging {
                 print("[VT] Output callback fired: status=\(status)")
@@ -571,6 +588,7 @@ final class VideoDecoder {
             self.onFrameDecoded?(pixelBuffer, timestampUs)
         }
 
+        if status != noErr || infoFlags.contains(.frameDropped) { finish() }
         if status == kVTInvalidSessionErr {
             // The session died underneath us (typical after app backgrounding).
             // Rebuild it and hold for the next keyframe.

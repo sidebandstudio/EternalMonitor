@@ -13,6 +13,8 @@ struct StreamStats: Equatable {
     /// Fragment loss over the last stats window.
     var lossPercent: Double = 0
     var framesDropped: UInt64 = 0
+    var fragsRepaired: UInt64 = 0
+    var jitterMs: Double = 0
     /// 1–4 signal bars for the HUD.
     var bars: Int = 4
 
