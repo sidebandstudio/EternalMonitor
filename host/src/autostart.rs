@@ -97,7 +97,7 @@ mod windows_impl {
         if enabled {
             let exe_path = std::env::current_exe().map_err(|error| error.to_string())?;
             let key = create_run_key()?;
-            let exe_path = utf16_bytes(exe_path.as_os_str());
+            let exe_path = startup_command_bytes(exe_path.as_os_str());
             let status =
                 unsafe { RegSetValueExW(key.0, RUN_VALUE_NAME, 0, REG_SZ, Some(&exe_path)) };
             if status == ERROR_SUCCESS {
@@ -152,11 +152,14 @@ mod windows_impl {
         }
     }
 
-    fn utf16_bytes(value: &OsStr) -> Vec<u8> {
-        let wide: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
-        let len = wide.len() * std::mem::size_of::<u16>();
-        let ptr = wide.as_ptr() as *const u8;
-        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    fn startup_command_bytes(value: &OsStr) -> Vec<u8> {
+        // Run values are command lines. Quote the executable so Program Files
+        // and other paths with spaces remain a single executable argument.
+        std::iter::once(u16::from(b'"'))
+            .chain(value.encode_wide())
+            .chain([u16::from(b'"'), 0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
     }
 
     struct OwnedRegKey(HKEY);
@@ -173,6 +176,32 @@ mod windows_impl {
     mod tests {
         use super::ipv4_from_inaddr;
         use std::net::Ipv4Addr;
+
+        #[test]
+        fn startup_command_round_trips_through_windows_argument_parsing() {
+            use std::ffi::OsStr;
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{LocalFree, HLOCAL};
+            use windows::Win32::UI::Shell::CommandLineToArgvW;
+            for path in [
+                r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe",
+                r"D:\AgentWork\Eternal-Monitor\eternal-host.exe",
+                r"D:\Apps\Moniteur éternel\eternal-host.exe",
+            ] {
+                let bytes = super::startup_command_bytes(OsStr::new(path));
+                let wide: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                let mut count = 0;
+                let args = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+                assert!(!args.is_null());
+                let executable = unsafe { (*args).to_string() };
+                unsafe { LocalFree(HLOCAL(args.cast())) };
+                assert_eq!(count, 1, "startup command must contain only the executable");
+                assert_eq!(executable.unwrap(), path);
+            }
+        }
 
         #[test]
         fn ipv4_from_inaddr_preserves_network_order_octets() {
