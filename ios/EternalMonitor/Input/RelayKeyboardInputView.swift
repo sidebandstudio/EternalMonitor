@@ -40,7 +40,7 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
         for (usage, button) in modifierButtons {
             button.isSelected = held.contains(usage)
             button.accessibilityValue = held.contains(usage) ? "On" : "Off"
-            button.configuration?.baseBackgroundColor = held.contains(usage) ? UIColor(Theme.amber) : .secondarySystemFill
+            button.configuration?.baseBackgroundColor = held.contains(usage) ? UIColor(Theme.accent) : .secondarySystemFill
             button.configuration?.baseForegroundColor = held.contains(usage) ? .black : .label
         }
     }
@@ -54,7 +54,7 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
         let done = UIButton(type: .system)
         var doneConfiguration = UIButton.Configuration.plain()
         doneConfiguration.title = "Done"
-        doneConfiguration.baseForegroundColor = UIColor(Theme.amber)
+        doneConfiguration.baseForegroundColor = UIColor(Theme.accent)
         doneConfiguration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8)
         done.configuration = doneConfiguration
         done.accessibilityIdentifier = "keyboard.done"

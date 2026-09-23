@@ -25,6 +25,7 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
     var onCancel: (() -> Void)?
 
     private let captureSession = AVCaptureSession()
+    private let overlay = ScannerOverlayView()
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var didFinish = false
 
@@ -51,16 +52,47 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
             showCameraDeniedAlert()
         }
 
-        let cancelButton = UIButton(type: .system)
-        cancelButton.setTitle("Cancel", for: .normal)
-        cancelButton.setTitleColor(.white, for: .normal)
-        cancelButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
+        view.addSubview(overlay)
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: view.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+
+        let hint = UILabel()
+        hint.text = "Point at the QR code in EternalMonitor on your PC"
+        hint.font = UIFont(name: "Geist-Medium", size: 17) ?? .systemFont(ofSize: 17, weight: .medium)
+        hint.textColor = .white
+        hint.textAlignment = .center
+        hint.numberOfLines = 0
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(hint)
+        NSLayoutConstraint.activate([
+            hint.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            hint.bottomAnchor.constraint(equalTo: overlay.windowLayoutGuide.topAnchor, constant: -28),
+            hint.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -64),
+        ])
+
+        var cancel = UIButton.Configuration.filled()
+        cancel.title = "Cancel"
+        cancel.baseBackgroundColor = UIColor.white.withAlphaComponent(0.16)
+        cancel.baseForegroundColor = .white
+        cancel.cornerStyle = .capsule
+        cancel.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 22, bottom: 10, trailing: 22)
+        cancel.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = UIFont(name: "Geist-SemiBold", size: 16) ?? .systemFont(ofSize: 16, weight: .semibold)
+            return attributes
+        }
+        let cancelButton = UIButton(configuration: cancel)
         cancelButton.addTarget(self, action: #selector(handleCancel), for: .touchUpInside)
         cancelButton.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(cancelButton)
         NSLayoutConstraint.activate([
-            cancelButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            cancelButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            cancelButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            cancelButton.topAnchor.constraint(equalTo: overlay.windowLayoutGuide.bottomAnchor, constant: 32),
         ])
     }
 
@@ -140,5 +172,76 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
         didFinish = true
         captureSession.stopRunning()
         onScan?(value)
+    }
+}
+
+/// Dims everything except a rounded window and marks its corners in the
+/// accent color. Purely visual; touches pass through.
+final class ScannerOverlayView: UIView {
+    /// The clear window, for laying out the hint and buttons around it.
+    let windowLayoutGuide = UILayoutGuide()
+    private let dim = CAShapeLayer()
+    private let corners = CAShapeLayer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        dim.fillRule = .evenOdd
+        dim.fillColor = UIColor.black.withAlphaComponent(0.55).cgColor
+        layer.addSublayer(dim)
+        corners.strokeColor = UIColor(red: 0.91, green: 1.0, blue: 0.28, alpha: 1).cgColor
+        corners.fillColor = UIColor.clear.cgColor
+        corners.lineWidth = 4
+        corners.lineCap = .round
+        corners.lineJoin = .round
+        layer.addSublayer(corners)
+        addLayoutGuide(windowLayoutGuide)
+        let side = windowLayoutGuide.widthAnchor.constraint(equalToConstant: 300)
+        side.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            windowLayoutGuide.centerXAnchor.constraint(equalTo: centerXAnchor),
+            windowLayoutGuide.centerYAnchor.constraint(equalTo: centerYAnchor),
+            windowLayoutGuide.heightAnchor.constraint(equalTo: windowLayoutGuide.widthAnchor),
+            windowLayoutGuide.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.7),
+            side,
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let window = windowLayoutGuide.layoutFrame
+        let radius: CGFloat = 28
+        let dimPath = UIBezierPath(rect: bounds)
+        dimPath.append(UIBezierPath(roundedRect: window, cornerRadius: radius))
+        dim.frame = bounds
+        dim.path = dimPath.cgPath
+
+        let arm: CGFloat = 44
+        let path = UIBezierPath()
+        let (l, r, t, b) = (window.minX, window.maxX, window.minY, window.maxY)
+        // top-left
+        path.move(to: CGPoint(x: l, y: t + arm))
+        path.addLine(to: CGPoint(x: l, y: t + radius))
+        path.addArc(withCenter: CGPoint(x: l + radius, y: t + radius), radius: radius, startAngle: .pi, endAngle: 1.5 * .pi, clockwise: true)
+        path.addLine(to: CGPoint(x: l + arm, y: t))
+        // top-right
+        path.move(to: CGPoint(x: r - arm, y: t))
+        path.addLine(to: CGPoint(x: r - radius, y: t))
+        path.addArc(withCenter: CGPoint(x: r - radius, y: t + radius), radius: radius, startAngle: 1.5 * .pi, endAngle: 0, clockwise: true)
+        path.addLine(to: CGPoint(x: r, y: t + arm))
+        // bottom-right
+        path.move(to: CGPoint(x: r, y: b - arm))
+        path.addLine(to: CGPoint(x: r, y: b - radius))
+        path.addArc(withCenter: CGPoint(x: r - radius, y: b - radius), radius: radius, startAngle: 0, endAngle: 0.5 * .pi, clockwise: true)
+        path.addLine(to: CGPoint(x: r - arm, y: b))
+        // bottom-left
+        path.move(to: CGPoint(x: l + arm, y: b))
+        path.addLine(to: CGPoint(x: l + radius, y: b))
+        path.addArc(withCenter: CGPoint(x: l + radius, y: b - radius), radius: radius, startAngle: 0.5 * .pi, endAngle: .pi, clockwise: true)
+        path.addLine(to: CGPoint(x: l, y: b - arm))
+        corners.frame = bounds
+        corners.path = path.cgPath
     }
 }

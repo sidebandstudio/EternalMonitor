@@ -14,9 +14,10 @@ struct ConnectView: View {
     // don't clobber user edits on every re-render.
     @State private var didPrefillFromLastHost = false
     @State private var showQRScanner = false
-    @State private var appeared = false
+    @State private var showDetails = false
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     private enum Field: Hashable {
         case host, port
@@ -44,87 +45,66 @@ struct ConnectView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                SignalBackground()
+                AppBackground()
 
-                ScrollView {
-                    VStack(spacing: 22) {
-                        Spacer().frame(height: 28)
+                GeometryReader { geometry in
+                    ScrollView {
+                        VStack(spacing: 20) {
+                            header
+                                .padding(.top, 24)
+                                .padding(.bottom, 8)
 
-                        logoSection
-                            .reveal(appeared, 0)
+                            if !didSeeOnboarding {
+                                onboardingCard
+                            }
 
-                        if !didSeeOnboarding {
-                            onboardingCard
-                                .reveal(appeared, 1)
-                        }
+                            if let error = connectionManager.connectionError {
+                                errorBanner(error)
+                            }
 
-                        if let error = connectionManager.connectionError {
-                            errorBanner(error)
-                        }
+                            if isConnecting {
+                                connectingCard
+                            } else {
+                                connectCard
+                            }
 
-                        inputSection
-                            .reveal(appeared, 2)
+                            usbCard
 
-                        if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
-                            diagnosticsSection
-                        }
+                            if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
+                                scanEmptyState
+                            }
 
-                        if isConnecting {
-                            connectingSection
-                        } else {
-                            connectButton
-                                .reveal(appeared, 3)
-                        }
+                            if !scanner.hosts.isEmpty {
+                                discoveredSection
+                            }
 
-                        HStack(spacing: 12) {
-                            scanButton
-                            qrScanButton
-                        }
-                        .reveal(appeared, 4)
+                            if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
+                                recentSection
+                            }
 
-                        HStack(spacing: 10) {
-                            Image(systemName: "cable.connector")
-                                .foregroundColor(Theme.amber)
-                            Text(connectionManager.usbStatus)
-                                .font(.appMonoRegular(size: 12))
-                                .foregroundColor(Theme.text2)
-                                .accessibilityIdentifier("connect.usbStatus")
-                            Spacer()
-                            if settings.allowUSB && connectionManager.usbStatus == "USB: disconnected" {
-                                Button("Connect USB") { connectionManager.resumeUSBConnections() }
-                                    .font(.appMonoMedium(size: 12))
-                                    .accessibilityIdentifier("connect.usb")
+                            if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
+                                diagnosticsSection
                             }
                         }
-
-                        if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
-                            scanEmptyState
-                        }
-
-                        if !scanner.hosts.isEmpty {
-                            discoveredSection
-                        }
-
-                        if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
-                            recentSection
-                                .reveal(appeared, 5)
-                        }
-
-                        Spacer().frame(height: 36)
+                        .frame(maxWidth: 560)
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 40)
+                        // Centre the column on tall screens; scroll when it grows.
+                        .frame(maxWidth: .infinity, minHeight: geometry.size.height * 0.92, alignment: .center)
                     }
-                    .padding(.horizontal, 28)
+                    .scrollDismissesKeyboard(.interactively)
                 }
-                .scrollDismissesKeyboard(.interactively)
             }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
                     } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .foregroundColor(Theme.amber)
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel("Settings")
                     .accessibilityIdentifier("settings.button")
@@ -146,6 +126,9 @@ struct ConnectView: View {
                 )
             }
             .onAppear {
+                #if DEBUG
+                if UIPreview.opensSettings { showSettings = true }
+                #endif
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
                     if settings.lastPort != 0 {
@@ -153,98 +136,66 @@ struct ConnectView: View {
                     }
                     didPrefillFromLastHost = true
                 }
-                if !appeared {
-                    withAnimation(.easeOut(duration: 0.5)) { appeared = true }
-                }
             }
+            .animation(.easeInOut(duration: 0.2), value: isConnecting)
+            .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
         }
-        .tint(Theme.amber)
+        .tint(Theme.accent)
     }
 
-    // MARK: - Logo lockup
+    // MARK: - Header
 
-    private var logoSection: some View {
+    private var header: some View {
         VStack(spacing: 14) {
-            ZStack {
-                if UIImage(named: "LogoImage") != nil {
-                    Image("LogoImage")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 76, height: 76)
-                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                } else {
-                    signalMark
-                        .frame(width: 76, height: 76)
-                        .background(
-                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .fill(Theme.amber.opacity(0.10))
-                        )
-                }
-            }
-            .overlay(
-                ViewfinderCorners(armLength: 12, inset: -6)
-                    .stroke(Theme.amber.opacity(0.5), lineWidth: 1)
-            )
-
-            VStack(spacing: 3) {
-                Text("ETERNALMONITOR")
-                    .font(.appDisplayBold(size: 26))
-                    .tracking(1)
-                    .foregroundColor(Theme.text)
-
-                Text("WINDOWS DISPLAY · SIGNAL LINK")
-                    .font(.appMonoRegular(size: 11))
-                    .tracking(2)
-                    .foregroundColor(Theme.text3)
+            LogoMark(size: 68)
+            VStack(spacing: 6) {
+                Text("EternalMonitor")
+                    .font(.app(30, .semibold, relativeTo: .largeTitle))
+                    .foregroundStyle(Theme.text)
+                Text("Use this iPad as a second screen for your Windows PC.")
+                    .font(.app(16, relativeTo: .body))
+                    .foregroundStyle(Theme.textMuted)
+                    .multilineTextAlignment(.center)
             }
         }
+        .frame(maxWidth: .infinity)
     }
 
-    // Three ascending amber bars — a transmit-level meter.
-    private var signalMark: some View {
-        HStack(alignment: .bottom, spacing: 5) {
-            ForEach(0..<3, id: \.self) { i in
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(Theme.amber)
-                    .frame(width: 7, height: CGFloat(14 + i * 11))
-            }
-        }
-    }
-
-    // MARK: - Onboarding hint
+    // MARK: - Onboarding
 
     private var onboardingCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
-                SectionLabel(title: "How it works")
-                Spacer()
+                SectionHeader(title: "How it works")
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) { didSeeOnboarding = true }
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(Theme.text3)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textFaint)
+                        .frame(width: 32, height: 32)
                 }
                 .accessibilityLabel("Dismiss tips")
             }
-            onboardingStep("1", "Run EternalMonitor on your Windows PC.")
-            onboardingStep("2", "Scan the QR it shows, or type the PC's IP below.")
-            onboardingStep("3", "Tap Connect — your screen appears here.")
+            onboardingStep(1, "Open EternalMonitor on your Windows PC.")
+            onboardingStep(2, "Choose the PC below, scan its QR code, or plug in a USB cable.")
+            onboardingStep(3, "The first time on Wi-Fi, enter the six-digit code the PC shows.")
         }
-        .moduleCard()
+        .card()
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
-    private func onboardingStep(_ n: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(n)
-                .font(.appMonoMedium(size: 11))
-                .foregroundColor(Theme.void)
-                .frame(width: 18, height: 18)
-                .background(Circle().fill(Theme.amber))
+    private func onboardingStep(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("\(n)")
+                .font(.appMono(12, medium: true))
+                .foregroundStyle(Theme.onAccent)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Theme.accent))
+                .accessibilityHidden(true)
             Text(text)
-                .font(.appMonoRegular(size: 13))
-                .foregroundColor(Theme.text2)
+                .font(.app(15, relativeTo: .body))
+                .foregroundStyle(Theme.text)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
@@ -253,14 +204,15 @@ struct ConnectView: View {
     // MARK: - Error banner
 
     private func errorBanner(_ message: String) -> some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(Theme.caution)
                 .font(.system(size: 16))
+                .foregroundStyle(Theme.warning)
+                .padding(.top, 1)
 
             Text(message)
-                .font(.appMonoRegular(size: 12))
-                .foregroundColor(Theme.text2)
+                .font(.app(14, relativeTo: .callout))
+                .foregroundStyle(Theme.text)
                 .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -270,174 +222,159 @@ struct ConnectView: View {
                 withAnimation { connectionManager.connectionError = nil }
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(Theme.text3)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(width: 28, height: 28)
             }
             .accessibilityLabel("Dismiss error")
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Theme.caution.opacity(0.10))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Theme.caution.opacity(0.30), lineWidth: 1)
-                )
-        )
+        .card(padding: 16, tint: Theme.warning)
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
-    // MARK: - Input fields
+    // MARK: - Connect
 
-    private var inputSection: some View {
-        VStack(spacing: 14) {
-            // .URL keyboard: hostnames and IPv6 need letters and colons, which
-            // the old .decimalPad made impossible to type.
-            field(label: "HOST IP", placeholder: "e.g. 10.0.0.45", text: $hostIP, field: .host, keyboard: .URL)
+    private var connectCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Connect to a PC")
+                    .font(.app(20, .semibold, relativeTo: .title3))
+                    .foregroundStyle(Theme.text)
+                Text("Enter the address shown in EternalMonitor on your PC.")
+                    .font(.app(14, relativeTo: .callout))
+                    .foregroundStyle(Theme.textMuted)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                // .URL keyboard: hostnames and IPv6 need letters and colons, which
+                // a decimal pad made impossible to type.
+                field(label: "PC address", placeholder: "192.168.1.20", text: $hostIP, field: .host, keyboard: .URL)
+                field(label: "Port", placeholder: "9876", text: $port, field: .port, keyboard: .numberPad)
+                    .frame(width: 104)
+            }
 
             if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
                 Button {
                     hostIP = settings.lastHost
                     if settings.lastPort != 0 { port = String(settings.lastPort) }
                 } label: {
-                    Text("Use last: \(settings.lastHost)")
-                        .font(.appMonoRegular(size: 11))
-                        .foregroundColor(Theme.amber.opacity(0.8))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Label("Use last PC: \(settings.lastHost)", systemImage: "clock.arrow.circlepath")
+                        .font(.app(13, .medium, relativeTo: .footnote))
+                        .foregroundStyle(Theme.accent)
                 }
+                .buttonStyle(.plain)
             }
-
-            field(label: "PORT", placeholder: "9876", text: $port, field: .port, keyboard: .numberPad)
 
             if !port.isEmpty && parsedPort == nil {
-                Text("Enter a valid UDP port between 1 and 65535.")
-                    .font(.appMonoRegular(size: 11))
-                    .foregroundColor(Theme.caution)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Enter a port between 1 and 65535.")
+                    .font(.app(13, relativeTo: .footnote))
+                    .foregroundStyle(Theme.warning)
+            }
+
+            Button {
+                focusedField = nil
+                guard let p = parsedPort else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    connectionManager.connect(host: normalizedHostIP, port: p)
+                }
+            } label: {
+                Text("Connect")
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(!canConnect)
+            .accessibilityLabel("Connect to PC")
+            .accessibilityIdentifier("connect.button")
+
+            let layout = sizeClass == .compact
+                ? AnyLayout(VStackLayout(spacing: 10))
+                : AnyLayout(HStackLayout(spacing: 10))
+            layout {
+                Button {
+                    focusedField = nil
+                    showQRScanner = true
+                } label: {
+                    Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .accessibilityIdentifier("connect.qr")
+
+                Button {
+                    focusedField = nil
+                    if scanner.isScanning { scanner.stopScan() } else { scanner.startScan() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if scanner.isScanning {
+                            ProgressView().tint(Theme.accent).controlSize(.small)
+                        } else {
+                            Image(systemName: "dot.radiowaves.left.and.right")
+                        }
+                        Text(scanner.isScanning ? "Searching…" : "Find PCs")
+                    }
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .accessibilityIdentifier("connect.scan")
             }
         }
-        .opacity(isConnecting ? 0.5 : 1)
+        .card()
     }
 
     private func field(label: String, placeholder: String, text: Binding<String>, field: Field, keyboard: UIKeyboardType) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label)
-                .font(.appMonoMedium(size: 11))
-                .tracking(1)
-                .foregroundColor(Theme.text3)
+                .font(.app(12.5, .medium, relativeTo: .caption))
+                .foregroundStyle(Theme.textMuted)
 
-            TextField(placeholder, text: text)
-                .font(.appMonoRegular(size: 17))
-                .foregroundColor(Theme.text)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 15)
+            TextField(placeholder, text: text, prompt: Text(placeholder).foregroundStyle(Theme.textFaint))
+                .font(.appMono(17, relativeTo: .body))
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 50)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.04))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(
-                                    focusedField == field ? Theme.amber : Theme.hairline,
-                                    lineWidth: 1
-                                )
-                        )
+                        .fill(Theme.canvas)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(focusedField == field ? Theme.accent : Theme.borderStrong, lineWidth: focusedField == field ? 1.5 : 1)
                 )
                 .keyboardType(keyboard)
                 .textContentType(.none)
+                .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .submitLabel(field == .host ? .next : .go)
+                .onSubmit {
+                    if field == .host {
+                        focusedField = .port
+                    } else if canConnect, let p = parsedPort {
+                        focusedField = nil
+                        connectionManager.connect(host: normalizedHostIP, port: p)
+                    }
+                }
                 .focused($focusedField, equals: field)
-                .disabled(isConnecting)
-                .accessibilityLabel(label)
+                .accessibilityLabel(field == .host ? "PC address" : "Port")
                 .accessibilityIdentifier(field == .host ? "connect.host" : "connect.port")
         }
     }
 
-    // MARK: - Connect button
+    // MARK: - Connecting
 
-    private var connectButton: some View {
-        Button {
-            focusedField = nil
-            guard let p = parsedPort else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                connectionManager.connect(host: normalizedHostIP, port: p)
-            }
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "dot.radiowaves.up.forward")
-                Text("Connect")
-                    .font(.appDisplayBold(size: 17))
-            }
-        }
-        .buttonStyle(AmberButtonStyle())
-        .disabled(!canConnect)
-        .opacity(canConnect ? 1 : 0.45)
-        .accessibilityLabel("Connect to host")
-        .accessibilityIdentifier("connect.button")
-    }
-
-    // MARK: - Diagnostics
-
-    private var diagnosticsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "Diagnostics")
-
-            let entries = Array(connectionManager.diagnostics.suffix(8).reversed())
-            ForEach(entries) { entry in
-                HStack(alignment: .top, spacing: 10) {
-                    Text(entry.level.rawValue)
-                        .font(.appMonoMedium(size: 10))
-                        .foregroundColor(color(for: entry.level))
-                        .frame(width: 42, alignment: .leading)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(entry.category.uppercased())
-                            .font(.appMonoMedium(size: 10))
-                            .foregroundColor(Theme.text3)
-
-                        Text(entry.message)
-                            .font(.appMonoRegular(size: 11))
-                            .foregroundColor(Theme.text2)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Spacer(minLength: 0)
+    private var connectingCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 14) {
+                ProgressView()
+                    .tint(Theme.accent)
+                    .controlSize(.regular)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Connecting…")
+                        .font(.app(18, .semibold, relativeTo: .headline))
+                        .foregroundStyle(Theme.text)
+                    Text(normalizedHostIP.isEmpty ? "Waiting for your PC" : "Reaching \(normalizedHostIP)")
+                        .font(.app(14, relativeTo: .callout))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(1)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.035))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(Theme.hairline, lineWidth: 1)
-                        )
-                )
-            }
-        }
-    }
-
-    // MARK: - Connecting state
-
-    private var connectingSection: some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 12) {
-                SignalDot(color: Theme.amber)
-                Text("Acquiring signal from \(normalizedHostIP)…")
-                    .font(.appMonoRegular(size: 14))
-                    .foregroundColor(Theme.text2)
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-            .background(
-                RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .fill(Theme.amber.opacity(0.08))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            .strokeBorder(Theme.amber.opacity(0.25), lineWidth: 1)
-                    )
-            )
 
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -445,50 +382,45 @@ struct ConnectView: View {
                 }
             } label: {
                 Text("Cancel")
-                    .font(.appDisplayBold(size: 16))
             }
-            .buttonStyle(GhostButtonStyle(accent: Theme.amber))
+            .buttonStyle(SecondaryButtonStyle())
         }
+        .card()
     }
 
-    // MARK: - Scan buttons
+    // MARK: - USB
 
-    private var scanButton: some View {
-        Button {
-            focusedField = nil
-            if scanner.isScanning { scanner.stopScan() } else { scanner.startScan() }
-        } label: {
-            HStack(spacing: 8) {
-                if scanner.isScanning {
-                    ProgressView().tint(Theme.amber).scaleEffect(0.8)
-                } else {
-                    Image(systemName: "antenna.radiowaves.left.and.right")
-                }
-                Text(scanner.isScanning ? "Scanning" : "Scan")
-                    .font(.appMonoMedium(size: 13))
+    private var usbCard: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "cable.connector")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(settings.allowUSB ? Theme.accent : Theme.textFaint)
+                .frame(width: 40, height: 40)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(Theme.surfaceRaised)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text("USB cable")
+                    .font(.app(15, .medium, relativeTo: .subheadline))
+                    .foregroundStyle(Theme.text)
+                Text(connectionManager.usbStatus)
+                    .font(.app(13.5, relativeTo: .footnote))
+                    .foregroundStyle(Theme.textMuted)
+                    .accessibilityIdentifier("connect.usbStatus")
+            }
+            Spacer(minLength: 8)
+            if settings.allowUSB && connectionManager.usbStatus == "USB: disconnected" {
+                Button("Connect USB") { connectionManager.resumeUSBConnections() }
+                    .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                    .accessibilityIdentifier("connect.usb")
+            } else if !settings.allowUSB {
+                Button("Turn on") { settings.allowUSB = true }
+                    .buttonStyle(PillButtonStyle())
+                    .accessibilityLabel("Turn on USB connections")
             }
         }
-        .buttonStyle(GhostButtonStyle(accent: scanner.isScanning ? Theme.amber : Theme.text2))
-        .accessibilityIdentifier("connect.scan")
-        .disabled(isConnecting)
-        .opacity(isConnecting ? 0.5 : 1)
-    }
-
-    private var qrScanButton: some View {
-        Button {
-            focusedField = nil
-            showQRScanner = true
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "qrcode.viewfinder")
-                Text("Scan QR")
-                    .font(.appMonoMedium(size: 13))
-            }
-        }
-        .buttonStyle(GhostButtonStyle(accent: Theme.text2))
-        .accessibilityIdentifier("connect.qr")
-        .disabled(isConnecting)
-        .opacity(isConnecting ? 0.5 : 1)
+        .card(padding: 14)
     }
 
     // parse "eternaldisplay://host:port" and immediately connect.
@@ -499,165 +431,197 @@ struct ConnectView: View {
             port = String(target.port)
             connectionManager.connect(host: target.host, port: target.port, token: target.token)
         case .failure(.wrongScheme):
-            connectionManager.connectionError = "Scanned QR is not an EternalMonitor link."
+            connectionManager.connectionError = "That QR code isn't from EternalMonitor. Scan the code shown on the PC’s Stream page."
         case .failure:
-            connectionManager.connectionError = "Scanned QR is malformed."
+            connectionManager.connectionError = "That QR code couldn't be read. Try again, or type the address instead."
         }
     }
 
-    // MARK: - Scan empty state
+    // MARK: - Scan results
 
     private var scanEmptyState: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: "wifi.exclamationmark")
-                .foregroundColor(Theme.text3)
-                .font(.system(size: 15))
-            Text("No hosts found. Enter the IP shown on the PC, and check both devices are on the same Wi-Fi (not a guest network).")
-                .font(.appMonoRegular(size: 12))
-                .foregroundColor(Theme.text2)
+                .foregroundStyle(Theme.textMuted)
+                .font(.system(size: 16))
+            Text("No PCs found. Check that both devices are on the same Wi-Fi (not a guest network), or type the address shown on the PC.")
+                .font(.app(14, relativeTo: .callout))
+                .foregroundStyle(Theme.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.03))
-        )
+        .card(padding: 16)
         .transition(.opacity)
     }
 
-    // MARK: - Discovered hosts
-
     private var discoveredSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                SectionLabel(title: "Found on network")
-                Spacer()
-                if !scanner.statusMessage.isEmpty {
-                    Text(scanner.statusMessage)
-                        .font(.appMonoRegular(size: 10))
-                        .foregroundColor(Theme.phosphor.opacity(0.85))
-                }
-            }
+            SectionHeader(title: "Found on this network", trailing: scanner.statusMessage.isEmpty ? nil : scanner.statusMessage)
+                .padding(.horizontal, 4)
 
-            ForEach(scanner.hosts) { host in
-                Button {
-                    hostIP = host.address
-                    port = "\(host.port)"
-                } label: {
-                    HStack(spacing: 12) {
-                        SignalDot(color: Theme.phosphor, size: 8)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(host.address)
-                                .font(.appMonoRegular(size: 15))
-                                .foregroundColor(Theme.text)
-                            if host.name != host.address {
-                                Text(host.name)
-                                    .font(.appMonoRegular(size: 11))
-                                    .foregroundColor(Theme.text3)
-                            }
-                        }
-
-                        Spacer()
-
-                        Text(":\(String(host.port))")
-                            .font(.appMonoRegular(size: 12))
-                            .foregroundColor(Theme.text3)
-
-                        Image(systemName: "arrow.right.circle.fill")
-                            .foregroundColor(Theme.amber.opacity(0.7))
-                            .font(.system(size: 18))
+            VStack(spacing: 0) {
+                ForEach(Array(scanner.hosts.enumerated()), id: \.element.id) { index, host in
+                    if index > 0 { rowDivider }
+                    Button {
+                        hostIP = host.address
+                        port = "\(host.port)"
+                    } label: {
+                        hostRow(
+                            icon: "desktopcomputer",
+                            title: host.name != host.address ? host.name : host.address,
+                            subtitle: host.name != host.address ? "\(host.address) · port \(host.port)" : "Port \(host.port)",
+                            badge: nil,
+                            paired: false
+                        )
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 13)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Theme.phosphor.opacity(0.06))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .strokeBorder(Theme.phosphor.opacity(0.18), lineWidth: 1)
-                            )
-                    )
+                    .buttonStyle(.plain)
                 }
             }
+            .card(padding: 0)
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
-    // MARK: - Recent connections
-
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "Recent")
+            SectionHeader(title: "Recent")
+                .padding(.horizontal, 4)
 
-            ForEach(recentStore.connections) { conn in
-                Button {
-                    if conn.isUSB {
-                        connectionManager.resumeUSBConnections()
-                    } else {
-                        hostIP = conn.host
-                        port = "\(conn.port)"
-                    }
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(conn.host)
-                                .font(.appMonoRegular(size: 15))
-                                .foregroundColor(Theme.text)
-                            Text(conn.isUSB ? "Connect with a USB cable" : ":\(String(conn.port))")
-                                .font(.appMonoRegular(size: 12))
-                                .foregroundColor(Theme.text3)
+            VStack(spacing: 0) {
+                ForEach(Array(recentStore.connections.enumerated()), id: \.element.id) { index, conn in
+                    if index > 0 { rowDivider }
+                    Button {
+                        if conn.isUSB {
+                            connectionManager.resumeUSBConnections()
+                        } else {
+                            hostIP = conn.host
+                            port = "\(conn.port)"
                         }
-
-                        Spacer()
-
-                        if conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port) {
-                            Image(systemName: "lock.fill")
-                                .foregroundStyle(Theme.text2)
-                                .accessibilityLabel("Paired host")
-                                .accessibilityIdentifier("recent.paired")
-                        }
-
-                        Text(conn.isUSB ? "USB" : "WIFI")
-                            .font(.appMonoMedium(size: 10))
-                            .tracking(1)
-                            .foregroundColor(conn.isUSB ? Theme.amber : Theme.phosphor)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule().fill((conn.isUSB ? Theme.amber : Theme.phosphor).opacity(0.15))
-                            )
+                    } label: {
+                        hostRow(
+                            icon: conn.isUSB ? "cable.connector" : "desktopcomputer",
+                            title: conn.host,
+                            subtitle: conn.isUSB ? "Connect with a USB cable" : "Port \(conn.port)",
+                            badge: conn.isUSB ? "USB" : "Wi-Fi",
+                            paired: conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port)
+                        )
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 13)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.white.opacity(0.03))
-                    )
+                    .buttonStyle(.plain)
                 }
             }
+            .card(padding: 0)
         }
         .opacity(isConnecting ? 0.5 : 1)
     }
 
+    private var rowDivider: some View {
+        Rectangle()
+            .fill(Theme.border)
+            .frame(height: 1)
+            .padding(.leading, 70)
+    }
+
+    private func hostRow(icon: String, title: String, subtitle: String, badge: String?, paired: Bool) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
+                .frame(width: 40, height: 40)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(Theme.surfaceRaised)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.app(15.5, .medium, relativeTo: .body))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.app(13, relativeTo: .footnote))
+                    .foregroundStyle(Theme.textMuted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if paired {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textMuted)
+                    .accessibilityLabel("Paired PC")
+                    .accessibilityIdentifier("recent.paired")
+            }
+            if let badge {
+                Text(badge)
+                    .font(.app(11.5, .medium, relativeTo: .caption))
+                    .foregroundStyle(badge == "USB" ? Theme.accent : Theme.textMuted)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Theme.surfaceRaised))
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.textFaint)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+    }
+
+    // MARK: - Diagnostics
+
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showDetails.toggle() }
+            } label: {
+                HStack {
+                    Text("Connection details")
+                        .font(.app(14, .medium, relativeTo: .subheadline))
+                        .foregroundStyle(Theme.textMuted)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textFaint)
+                        .rotationEffect(.degrees(showDetails ? 180 : 0))
+                }
+                .padding(16)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showDetails {
+                let entries = Array(connectionManager.diagnostics.suffix(8).reversed())
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(entries) { entry in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Circle()
+                                .fill(color(for: entry.level))
+                                .frame(width: 7, height: 7)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.category.capitalized)
+                                    .font(.app(12, .medium, relativeTo: .caption))
+                                    .foregroundStyle(Theme.textMuted)
+                                Text(entry.message)
+                                    .font(.appMono(12, relativeTo: .caption))
+                                    .foregroundStyle(Theme.text)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+            }
+        }
+        .card(padding: 0)
+    }
+
     private func color(for level: DiagnosticLevel) -> Color {
         switch level {
-        case .info: return Theme.phosphor
-        case .warning: return Theme.caution
-        case .error: return Theme.fault
+        case .info: return Theme.accent
+        case .warning: return Theme.warning
+        case .error: return Theme.danger
         }
-    }
-}
-
-// MARK: - Staggered reveal
-
-private extension View {
-    /// Fade + rise on first appear, ordered by `index`.
-    func reveal(_ appeared: Bool, _ index: Int) -> some View {
-        self
-            .opacity(appeared ? 1 : 0)
-            .offset(y: appeared ? 0 : 14)
-            .animation(.easeOut(duration: 0.45).delay(Double(index) * 0.07), value: appeared)
     }
 }

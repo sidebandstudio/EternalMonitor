@@ -38,7 +38,7 @@ OutputDir={#StagingDir}\..\out
 OutputBaseFilename=EternalMonitor-Setup
 Compression=lzma2/max
 SolidCompression=yes
-; --- Branding (SIGNAL look) ---------------------------------------------------
+; --- Branding (see DESIGN.md) -------------------------------------------------
 WizardStyle=modern
 SetupIconFile=..\host\assets\icon.ico
 WizardImageFile=assets\wizard-large.bmp
@@ -53,7 +53,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
-; Autostart is handled inside the app (Settings -> "Start on Windows startup",
+; Autostart is handled inside the app (Settings -> "Start with Windows",
 ; which writes HKCU\Run for the signed-in user) — no installer task needed.
 
 [Files]

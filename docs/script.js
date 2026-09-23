@@ -17,20 +17,23 @@
   /* --- macOS Notice --- */
   // iPadOS reports platform 'MacIntel' too, so require a non-touch device.
   var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
-  if (isMac && sessionStorage.getItem('mac-notice-dismissed') !== '1') {
-    var notice = document.createElement('div');
+  var nav = document.querySelector('.nav');
+  if (isMac && nav && sessionStorage.getItem('mac-notice-dismissed') !== '1') {
+    var notice = document.createElement('aside');
     notice.className = 'mac-notice';
+    notice.setAttribute('aria-label', 'Notice for Mac visitors');
     notice.innerHTML =
-      '<p><strong>Looks like you\'re on a Mac.</strong>' +
-      'EternalMonitor is Windows-only for now. The good news: macOS already does this ' +
-      'for free with <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>, ' +
-      'which turns your iPad into a second display natively and works well.</p>' +
-      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button>';
+      '<div class="container mac-notice-inner">' +
+      '<p><strong>On a Mac?</strong>EternalMonitor streams from Windows PCs. ' +
+      'macOS already does this with <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>, ' +
+      'which turns an iPad into a second display for free.</p>' +
+      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button>' +
+      '</div>';
     notice.querySelector('.mac-notice-close').addEventListener('click', function () {
       sessionStorage.setItem('mac-notice-dismissed', '1');
       notice.remove();
     });
-    document.body.appendChild(notice);
+    nav.insertAdjacentElement('afterend', notice);
   }
 
   /* --- Scroll Reveal (IntersectionObserver) --- */
@@ -104,7 +107,7 @@
     .catch(function () {
       downloadBtn.href = 'https://github.com/whoisaldo/EternalMonitor/releases';
       downloadBtn.textContent = 'View Releases on GitHub';
-      if (metaEl) metaEl.textContent = 'Visit GitHub for the latest release';
+      if (metaEl) metaEl.textContent = 'Find the latest release on GitHub.';
     });
 
   /* --- Preview build ---
