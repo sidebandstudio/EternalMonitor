@@ -23,9 +23,9 @@ passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passe
 | --- | --- | --- |
 | Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed at `5092767`; 184 tests with synthetic tests isolated from the attached iPad | `evidence/windows/em-normal-priority-native-build.log` |
 | WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
-| Installer compilation | `EternalMonitor-USB-cac987c-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-usb-installer-cac987c.log` |
+| Installer compilation | `EternalMonitor-USB-5092767-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-installer-5092767.log` |
 | Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
-| Physical USB extended display | Startup and sustained delivery confirmed at 2732×2048 with NVENC H.264; native build/test load caused two interruptions, followed by automatic recovery. Inherited background priorities were corrected; load and visual confirmation remain pending | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Physical USB extended display | Startup and sustained delivery confirmed at 2732×2048 with NVENC H.264; native build/test load caused two interruptions, followed by automatic recovery. Inherited background priorities were corrected, but capture stalls persisted, including during installer compilation; thread diagnostics and visual confirmation remain pending | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
 | Interactive task scheduling | New Limited and Highest tasks use Normal CPU, memory priority 5 and I/O priority 2. The old live host and its launcher were corrected in place at 06:07 UTC | `evidence/windows/new-task-priorities.log`, `installed-priority-repair.jsonl` |
 | Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
 
@@ -36,8 +36,9 @@ USB run exercised DXGI, NVENC and VDD startup. Receiver reports prove completed
 frames; visual confirmation on the physical iPad is still required. The two
 build-time interruptions remain part of the result. Changing CPU priority alone
 did not solve them, because the original scheduled task also lowered memory and
-I/O priorities. Both effective priorities are now normal; do not label that
-change a load-test pass until it has been measured.
+I/O priorities. Both effective priorities are now normal, but further capture stalls occurred
+while the installer compiled. The priority correction did not close this
+stability issue. Bounded thread diagnostics are in progress.
 
 The 30-minute simulator soak evidence is in
 `evidence/soak-b28687e/simulator/`. It used immutable source and binary copies.
