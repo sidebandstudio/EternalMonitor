@@ -17,7 +17,8 @@ def quote(value):
 
 
 def ps(command):
-    encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + command).encode("utf-16-le")).decode()
+    encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+                               "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " + command).encode("utf-16-le")).decode()
     subprocess.run(["ssh", "-o", "BatchMode=yes", "windows",
                     "powershell -NoProfile -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + encoded], check=True)
 
@@ -125,9 +126,9 @@ def main(args):
         session(script("Take-Screenshot", "-Path " + quote(remote)))
         pull(remote, EVIDENCE / "windows" / (args[0] + ".png"))
     elif action == "log" and (not args or (len(args) == 2 and args[0] == "-n" and args[1].isdigit())):
-        ps("Get-Content " + quote(ROOT + r"\host.log") + (" -Tail " + args[1] if args else ""))
+        ps("Get-Content " + quote(ROOT + r"\host.log") + " -Encoding UTF8" + (" -Tail " + args[1] if args else ""))
     elif action == "stderr" and not args:
-        ps("Get-Content " + quote(ROOT + r"\host.stderr.log"))
+        ps("Get-Content " + quote(ROOT + r"\host.stderr.log") + " -Encoding UTF8")
     elif action == "gui" and len(args) in (2, 3) and args[0] in ("Stream", "Settings", "QR"):
         if len(args) == 3 and args[2] != '--connected':
             raise ValueError('The optional GUI flag is --connected')

@@ -316,7 +316,7 @@ def main():
             if host_started:
                 try:
                     (row / ('host-final.log' if scenario == 'R-reconnect' else 'host.log')).write_text(remote('log'))
-                except (OSError, subprocess.SubprocessError) as error:
+                except (OSError, UnicodeError, subprocess.SubprocessError) as error:
                     print('Could not collect final host log: ' + str(error), flush=True)
                 try:
                     remote('stop-host', output=row / 'host-stop.log')

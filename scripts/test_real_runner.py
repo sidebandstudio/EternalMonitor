@@ -58,6 +58,19 @@ class RealRunnerCleanupTests(unittest.TestCase):
         self.assertEqual(calls[-1],('pattern','stop'))
         self.assertTrue(any('Host cleanup' in error for error in result['errors']))
 
+    def test_invalid_log_encoding_does_not_skip_cleanup(self):
+        calls = []
+        def remote(*args, **kwargs):
+            calls.append(args)
+            if args == ('host-info',): return 'null'
+            if args[0] == 'run-host': raise OSError('test host launch failed')
+            if args == ('log',):
+                raise UnicodeDecodeError('utf-8', b'\x83', 0, 1, 'invalid byte')
+            return ''
+        self.run_failure(remote)
+        self.assertIn(('stop-host',), calls)
+        self.assertEqual(calls[-1], ('pattern', 'stop'))
+
     def run_input_geometry(self, size, probe_size):
         calls = []
         def remote(*args, **kwargs):
