@@ -29,7 +29,11 @@ probe, and host runs require two minutes idle because host startup can
 change the virtual display. Screenshots can run while the console is active.
 For a window the owner has explicitly made available, set `EM_PC_AVAILABLE=1`
 to bypass that idle check. It does not bypass the console-session check.
-Detached tasks expire after their timeout and unregister on exit. Job output
+Detached tasks expire after their timeout and unregister on exit. Limited
+tasks receive DELETE permission for the current user on their own temporary
+registration. This leaves the task definition and other permissions protected.
+Run `Test-InteractiveCleanup.ps1` on the reference PC to verify that a completed
+Limited task removes itself. Job output
 and exit status are in `D:\AgentWork\em-v030\jobs`. Host settings are isolated
 in `D:\AgentWork\em-v030\state`, preserving the installed app's preferences.
 
