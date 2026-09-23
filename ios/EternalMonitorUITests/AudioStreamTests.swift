@@ -17,7 +17,7 @@ final class AudioStreamTests: XCTestCase {
         XCTAssertTrue(toggle.exists)
         XCTAssertEqual(toggle.value as? String, "1")
         toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(toggle.value as? String, "0")
+        waitForValue(toggle, value: "0")
         app.buttons["settings.done"].tap()
         waitForLabel(hud, containing: "PC audio muted or unavailable")
         XCTAssertTrue(app.buttons["display.disconnect"].exists)
@@ -25,7 +25,7 @@ final class AudioStreamTests: XCTestCase {
         app.buttons["display.settings"].tap()
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(toggle.value as? String, "1")
+        waitForValue(toggle, value: "1")
         app.swipeUp()
         let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
         XCTAssertTrue(audio.waitForExistence(timeout: 5))
@@ -44,6 +44,11 @@ final class AudioStreamTests: XCTestCase {
     private func waitForLabel(_ element: XCUIElement, containing text: String) {
         expectation(for: NSPredicate(format: "label CONTAINS %@", text), evaluatedWith: element)
         waitForExpectations(timeout: 10)
+    }
+
+    private func waitForValue(_ element: XCUIElement, value: String) {
+        expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: element)
+        waitForExpectations(timeout: 5)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

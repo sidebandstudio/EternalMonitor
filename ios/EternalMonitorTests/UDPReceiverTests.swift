@@ -3,6 +3,44 @@ import XCTest
 @testable import EternalMonitor
 
 final class UDPReceiverTests: XCTestCase {
+    func testNetworkFrameworkSendsGoodbyeBeforeImmediateStop() throws {
+        let server = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(server, 0)
+        defer { Darwin.close(server) }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bindSize = size
+        let port = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                XCTAssertEqual(Darwin.bind(server, $0, bindSize), 0)
+                XCTAssertEqual(getsockname(server, $0, &size), 0)
+            }
+            return UInt16(bigEndian: pointer.pointee.sin_port)
+        }
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        XCTAssertEqual(setsockopt(server, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+            socklen_t(MemoryLayout<timeval>.size)), 0)
+        for sequence: UInt32 in 1...8 {
+            let receiver = UDPReceiver(port: port, backend: .networkFramework)
+            let ready = expectation(description: "Goodbye queued before stop")
+            let goodbye = Wire.encodeControl(sessionId: 7, msgSeq: sequence, message: .bye(.appBackground))
+            receiver.onListenerReady = { [weak receiver] _ in
+                receiver?.send(goodbye)
+                receiver?.stop()
+                ready.fulfill()
+            }
+            XCTAssertTrue(receiver.start(host: "127.0.0.1"))
+            wait(for: [ready], timeout: 3)
+            var buffer = [UInt8](repeating: 0, count: 2048)
+            let count = recv(server, &buffer, buffer.count, 0)
+            XCTAssertEqual(count, goodbye.count, "Stopping must not cancel the queued BYE")
+            guard count == goodbye.count else { return }
+            XCTAssertEqual(Data(buffer.prefix(count)), goodbye)
+        }
+    }
+
     func testBSDLoopbackDrainsBurstAndReportsKernelBuffer() throws {
         try exerciseLoopback(family: AF_INET, host: "127.0.0.1")
     }
