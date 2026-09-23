@@ -32,6 +32,7 @@ OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
 SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
 REMOTE_HOST="${EM_REMOTE_HOST:-}"
 MIN_FPS="${EM_MIN_FPS:-55}"
+FPS_GATE="${EM_FPS_GATE:-enforce}"
 MIN_SECONDS="${EM_DURATION:-0}"
 STARTED=$SECONDS
 mkdir -p "$OUT" "$(dirname "$SHOT")"
@@ -43,8 +44,42 @@ HOST_PID=""
 MONITOR_PID=""
 PROXY_PID=""
 PROFILE_PID=""
+APP_PID=""
 UDID=""
 INSTALL_DIR=""
+# CoreSimulator can stall `simctl terminate` and app-container lookups
+# indefinitely, holding the next row behind a finished measurement.
+bounded() {
+    local limit=$1 ticks=0 pid
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$ticks" -ge $((limit * 4)) ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            echo "Timed out after ${limit}s: $*" >&2
+            return 124
+        fi
+        sleep 0.25
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
+# Stop the exact app process this run launched, never another simulator's.
+stop_app() {
+    if [ -n "$APP_PID" ] && ps -ww -o command= -p "$APP_PID" 2>/dev/null \
+        | grep -q "/Devices/$UDID/.*/EternalMonitor.app/EternalMonitor"; then
+        kill -TERM "$APP_PID" 2>/dev/null || true
+        for _ in $(seq 20); do
+            kill -0 "$APP_PID" 2>/dev/null || return 0
+            sleep 0.25
+        done
+        kill -KILL "$APP_PID" 2>/dev/null || true
+        return 0
+    fi
+    bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+}
 cleanup() {
     status=$?
     [ -n "$PROFILE_PID" ] && kill "$PROFILE_PID" 2>/dev/null || true
@@ -52,7 +87,7 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
-    [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+    [ -n "$UDID" ] && stop_app
     # The live log is a hard link into the app container. Detach the retained
     # copy before another test launch truncates the simulator's log in place.
     if [ -f "$APP_LOG" ]; then
@@ -122,7 +157,7 @@ echo "==> Booting simulator: $SIM_NAME"
 
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
-INSTALLED_APP=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor app 2>/dev/null || true)
+INSTALLED_APP=$(bounded 30 xcrun simctl get_app_container "$UDID" com.eternal.monitor app 2>/dev/null || true)
 if [ -n "$INSTALLED_APP" ] && diff -qr "$APP" "$INSTALLED_APP" >/dev/null 2>&1; then
     echo "==> Reusing identical installed app"
 else
@@ -135,11 +170,11 @@ else
     ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
     xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
 fi
-xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 
 # Read the app's identical milestone mirror directly. Streaming the complete
 # simulator log through diagnosticd can consume a CPU on small hosted runners.
-APP_DATA=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
+APP_DATA=$(bounded 30 xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
 SIM_LOG="$APP_DATA/tmp/eternal-e2e.log"
 rm -f "$SIM_LOG" "$APP_LOG"
 touch "$SIM_LOG"
@@ -182,10 +217,12 @@ PY
 MONITOR_PID=$!
 
 echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
-SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
+LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES >/dev/null
+    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES)
+APP_PID="${LAUNCH_RESULT##*: }"
+[[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
 
 if [ "$TRANSPORT" = takeover ]; then
     echo "==> Waiting for WiFi frames before attaching the USB fixture"
@@ -265,6 +302,7 @@ fi
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
+    --fps-gate "$FPS_GATE" \
     "${MEASUREMENT_ARGS[@]}" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
 echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
