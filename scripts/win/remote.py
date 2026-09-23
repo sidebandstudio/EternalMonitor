@@ -33,7 +33,9 @@ def session(command, detach=False, idle=False, timeout=600, run_level="Highest")
     options += " -RunLevel " + run_level
     if detach:
         options += " -Detach"
-    if idle:
+    # Set only for a test window the user explicitly says is free. Keep the
+    # idle guard for unattended runs and never persist this on the PC.
+    if idle and os.environ.get("EM_PC_AVAILABLE") != "1":
         options += " -RequireIdle"
     ps(script("Invoke-InSession", options))
 
@@ -83,7 +85,7 @@ def main(args):
         command += "; $env:PATH=" + quote(r"D:\AgentWork\sdk\ffmpeg-7.1.1-full_build-shared\bin;") + "+$env:PATH"
         executable = REPO + r"\target\release\eternal-host.exe"
         if os.environ.get("EM_INSTALLED_HOST") == "1":
-            executable = ROOT + r"\installed\EternalMonitor-host.exe"
+            executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
         command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(executable)
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
