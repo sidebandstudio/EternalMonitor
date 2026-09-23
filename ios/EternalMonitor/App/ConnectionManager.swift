@@ -70,7 +70,6 @@ private struct ConnectionDebugState {
 final class ConnectionManager: ObservableObject {
     @Published var state: ConnectionState = .disconnected
     @Published var fps: Double = 0
-    @Published var lagMs: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
@@ -121,6 +120,8 @@ final class ConnectionManager: ObservableObject {
     /// retaining self (rebuilt each connect).
     private let controlChannelBox = ControlChannelBox()
     private var fpsCounter = FPSCounter()
+    // Frame measurements are published with the other HUD stats at 4 Hz.
+    private var lagMs: Double = 0
     private var lastTarget: (host: String, port: UInt16)?
     private var livenessTimeoutUs: UInt64 = 3_000_000
     private var degradedSinceUs: UInt64?
@@ -292,18 +293,17 @@ final class ConnectionManager: ObservableObject {
                     }
                 }
                 self.fpsCounter.tick()
-                self.fps = self.fpsCounter.currentFPS
                 if E2E.enabled && self.debugState.decodedFrames % 60 == 0 {
                     E2E.stats(
                         decoded: self.debugState.decodedFrames,
                         width: frameWidth,
                         height: frameHeight,
-                        fps: self.fps,
+                        fps: self.fpsCounter.currentFPS,
                         counters: self.frameAssembler?.counters.withLock { $0 } ?? .init(),
                         decodeDepth: self.videoDecoder?.decodeDepth ?? 0
                     )
                 }
-                self.signalLost = false
+                if self.signalLost { self.signalLost = false }
                 self.degradedSinceUs = nil
                 if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
                     self.videoSize = CGSize(width: frameWidth, height: frameHeight)
@@ -579,6 +579,7 @@ final class ConnectionManager: ObservableObject {
     private func refreshStatsAndWatchdog() {
         guard let channel = controlChannel else { return }
         audioStats = audioPlayer?.stats ?? AudioStats()
+        fps = fpsCounter.currentFPS
 
         // --- Stats snapshot ---
         var next = StreamStats()
