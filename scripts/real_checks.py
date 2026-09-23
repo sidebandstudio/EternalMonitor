@@ -96,3 +96,20 @@ def check_probe(events, expected):
     if errors:
         raise ValueError('; '.join(errors))
     return dict(input_mapping_error_px=mapping_error, wheel_delta=sum(wheel), probe_events=len(events))
+
+
+def check_vdd_mode(state, milestones):
+    """Windows must expose the connected client's actual advertised mode first."""
+    import xml.etree.ElementTree as ET
+    advertised = re.search(r'E2E_HELLO w=(\d+) h=(\d+) refresh_hz=(\d+)', milestones)
+    if not advertised:
+        raise ValueError('Client display advertisement is missing')
+    width, height, hz = map(int, advertised.groups())
+    expected = (max(width, height), min(width, height), hz)
+    if expected[:2] != (2420, 1668) or expected[2] not in (30, 60, 120):
+        raise ValueError(f'Unexpected simulator display advertisement: {expected}')
+    first = ET.fromstring(state['settings_xml']).find('./resolutions/resolution')
+    actual = None if first is None else tuple(int(first.findtext(k)) for k in ('width', 'height', 'refresh_rate'))
+    if state['disabled'] or actual != expected:
+        raise ValueError(f'Connected VDD first mode {actual} did not match advertised {expected}')
+    return expected

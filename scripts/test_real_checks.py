@@ -77,5 +77,22 @@ class ProbeChecksTests(unittest.TestCase):
                 with self.assertRaises(ValueError): check_probe(events,expected)
 
 
+class AdvertisedDisplayTests(unittest.TestCase):
+    def state(self, hz):
+        return {'disabled': False, 'settings_xml': f'<vdd_settings><resolutions><resolution><width>2420</width><height>1668</height><refresh_rate>{hz}</refresh_rate></resolution></resolutions></vdd_settings>'}
+
+    def test_sixty_and_120_hz_modes_follow_advertisement(self):
+        from real_checks import check_vdd_mode
+        for hz in (60, 120):
+            for width, height in ((2420, 1668), (1668, 2420)):
+                self.assertEqual(check_vdd_mode(self.state(hz), f'E2E_HELLO w={width} h={height} refresh_hz={hz}'), (2420, 1668, hz))
+
+    def test_lower_mode_and_missing_advertisement_are_rejected(self):
+        from real_checks import check_vdd_mode
+        for milestone in ('', 'E2E_HELLO w=2420 h=1668 refresh_hz=120'):
+            with self.assertRaises(ValueError):
+                check_vdd_mode(self.state(60), milestone)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -9,6 +9,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 public class EMTestPattern : Form {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
@@ -73,6 +75,11 @@ public class EMTestPattern : Form {
 '@
 Add-Type -TypeDefinition $source -ReferencedAssemblies System.Windows.Forms,System.Drawing
 Remove-Item 'D:\AgentWork\em-v030\pattern.stop' -ErrorAction SilentlyContinue
+# Match capture dimensions in physical pixels, including secondary screens
+# with a different scale from the primary monitor. PowerShell is system-aware.
+if ([EMTestPattern]::SetThreadDpiAwarenessContext([IntPtr](-4)) -eq [IntPtr]::Zero) {
+    throw "Could not enable per-monitor DPI awareness for the test pattern"
+}
 [Windows.Forms.Application]::EnableVisualStyles()
 $window = New-Object EMTestPattern $Seconds,([bool]$VirtualDisplay)
 try { [Windows.Forms.Application]::Run($window) } finally { $window.Dispose() }

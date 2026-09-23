@@ -15,4 +15,4 @@ if ($Disable) {
 $device = Get-PnpDevice -InstanceId $instance
 $code = (Get-PnpDeviceProperty -InstanceId $instance -KeyName 'DEVPKEY_Device_ProblemCode').Data
 $xml = if (Test-Path 'C:\VirtualDisplayDriver\vdd_settings.xml') { Get-Content 'C:\VirtualDisplayDriver\vdd_settings.xml' -Raw } else { '' }
-@{instance=$instance; status=$device.Status; problem_code=$code; disabled=($code -eq 22); settings_xml=$xml} | ConvertTo-Json -Compress
+@{instance=$instance; status=$device.Status; problem_code=$code; disabled=($code -eq 22); settings_xml="$xml"} | ConvertTo-Json -Compress

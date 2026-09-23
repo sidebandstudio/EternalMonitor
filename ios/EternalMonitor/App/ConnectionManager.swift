@@ -532,6 +532,7 @@ final class ConnectionManager: ObservableObject {
             preferredFPS: UInt8(UserDefaults.standard.frameRatePreference()),
             authToken: pairingToken
         )
+        E2E.emit("E2E_HELLO w=\(identity.screenPxW) h=\(identity.screenPxH) refresh_hz=\(identity.refreshHz)")
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
             channel?.startHandshake(listenPort: actualPort, identity: identity)
             Task { @MainActor in

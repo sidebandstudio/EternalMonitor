@@ -8,9 +8,8 @@ import re
 import subprocess
 import shutil
 import time
-import xml.etree.ElementTree as ET
 
-from real_checks import check_stream, clean
+from real_checks import check_stream, check_vdd_mode, clean
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / 'scripts/win/remote.sh'
@@ -223,9 +222,7 @@ def main():
                             if scenario == 'R-vdd' and not vdd_checked and 'w=2420 h=1668' in milestones:
                                 state = json.loads(remote('vdd-state'))
                                 save(row / 'vdd-connected.json', state)
-                                first = ET.fromstring(state['settings_xml']).find('./resolutions/resolution')
-                                if state['disabled'] or first is None or tuple(first.findtext(k) for k in ('width','height','refresh_rate')) != ('2420','1668','120'):
-                                    raise ValueError('Connected VDD did not expose 2420x1668@120 as its first mode')
+                                check_vdd_mode(state, milestones)
                                 remote('shot', scenario + '-connected', output=row / 'vdd-connected-shot.log')
                                 vdd_checked = True
                             if scenario == 'R-audio' and tone is None and 'E2E_FIRST_FRAME' in milestones:
