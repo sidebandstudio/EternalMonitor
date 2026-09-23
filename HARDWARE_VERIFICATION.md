@@ -25,7 +25,7 @@ passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passe
 | WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
 | Installer compilation | `EternalMonitor-USB-bd88cc4-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-installer-bd88cc4.log` |
 | Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
-| Physical USB extended display | Startup and sustained delivery confirmed at 2732×2048 with NVENC H.264; native build/test load caused two interruptions, followed by automatic recovery. Inherited background priorities were corrected, but capture stalls persisted, including during installer compilation; thread diagnostics and visual confirmation remain pending | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Physical USB extended display | Startup and delivery confirmed at 2732×2048 with NVENC H.264. A direct iPad screenshot at about 08:04 UTC shows the extended desktop correctly. Repeated capture interruptions persisted after the priority correction; intermittent stability remains open | `evidence/windows/usb-extend-installed-cac987c.log`, `ipad-physical-display-20260923-0805.png` |
 | Interactive task scheduling | New Limited and Highest tasks use Normal CPU, memory priority 5 and I/O priority 2. The old live host and its launcher were corrected in place at 06:07 UTC | `evidence/windows/new-task-priorities.log`, `installed-priority-repair.jsonl` |
 | Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
 
@@ -33,20 +33,48 @@ The endpoint read is an API/clock check. It does not prove PC audio was encoded,
 transported and heard on the iPad. The native tests use synthetic capture; they
 do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior. The separate physical
 USB run exercised DXGI, NVENC and VDD startup. Receiver reports prove completed
-frames; visual confirmation on the physical iPad is still required. The two
-build-time interruptions remain part of the result. Changing CPU priority alone
-did not solve them, because the original scheduled task also lowered memory and
-I/O priorities. Both effective priorities are now normal, but further capture stalls occurred
+frames; the direct iPad screenshot confirms a rendered picture at that moment.
+The build-time interruptions remain part of the result. The original scheduled
+task also lowered memory and I/O priorities. All three effective priorities are
+now normal, but further capture stalls occurred
 while the installer compiled. The priority correction did not close this
-stability issue. Bounded thread diagnostics are in progress.
+stability issue.
 
 The later native test run reproduced an interruption at 06:52:27–06:53:27 UTC.
 Log-triggered dumps captured recovery because the observer's log read also
-paused. Native process monitoring is being used to avoid that dependency.
+paused. The 08:33 native monitor captured another recovery dump at 08:41:05 UTC.
+Its CPU samples also paused for 48 seconds, so this dump does not establish
+the original blocking call. All monitors have ended.
 Candidate `bd88cc4` removes full session-log reads during GUI repaint, releases
 the statistics lock before logging, and records peer decode FPS/queue depth.
 It has passed native tests but is not installed; these corrections have not
 closed the physical USB stability gate.
+
+The refreshed log contains sixteen capture watchdog restarts from 08:02 to
+08:41 UTC, including intervals without builds or input tests. Windows recorded
+SATA resets and retried I/O on Disk 0, the D: Hitachi HDD that stores this test
+host's redirected stdout. Four reset timestamps fall 25.8–26.8 seconds after
+the three-second capture watchdog, consistent with a storage timeout. Windows
+still reports the disk as Healthy; the hardware cause is not established.
+Evidence is `evidence/windows/usb-stalls/disk-capture-correlation-20260923.json`.
+
+P6 `7f135a3` sends stdout and session-file output through separate bounded
+background workers and keeps recent logs in memory. An unread stdout pipe
+stopped the previous host after 420 decoded frames. With the correction,
+the same test decoded 960 frames at 60.00 FPS with zero drops. Strict clippy
+and all 185 phase Rust tests pass. Evidence is
+`evidence/async-logging-7f135a3/`. This change is not installed on the PC;
+physical stability and the Windows campaign remain open.
+
+The physical iPad runs app version 0.3.0 build 6 on iPadOS 26.2. Its existing
+developer services allowed a read-only screen capture and app-scoped logs over
+USB, without a restart, new pairing or developer-image mount. The 30-second
+graphics sample had median compositor FPS 58.5 and no graphics recovery events;
+one sample fell to 10 FPS and the following sample was 47. These samples and
+the static picture do not replace motion, load or soak verification. Evidence
+is `evidence/windows/ipad-graphics-20260923-0809.jsonl` and the screenshot above.
+The newer decoder recovery fix has passed simulator tests but is not in the
+installed iPad build.
 
 The 30-minute simulator soak evidence is in
 `evidence/soak-b28687e/simulator/`. It used immutable source and binary copies.
