@@ -525,8 +525,7 @@ impl EncoderState {
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
-        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-        let opts = encoder_options(encoder_name, cpus);
+        let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts)?;
         log_encoder_configuration(encoder_name, &encoder);
@@ -647,7 +646,7 @@ fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
         .set_codec_name(codec_display_name_for(encoder_name));
 }
 
-fn encoder_options(encoder_name: &str, cpus: usize) -> ffmpeg_next::Dictionary<'_> {
+fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
     let mut opts = ffmpeg_next::Dictionary::new();
     match encoder_name {
         "h264_nvenc" => {
@@ -691,11 +690,6 @@ fn encoder_options(encoder_name: &str, cpus: usize) -> ffmpeg_next::Dictionary<'
             opts.set("preset", "ultrafast");
             opts.set("tune", "zerolatency");
             opts.set("profile", "baseline");
-            // On small CPUs, slice workers compete with capture and transport
-            // and spend more time waiting for one another than encoding.
-            if cpus <= 4 {
-                opts.set("threads", "1");
-            }
         }
         // HEVC siblings. Every keyframe must be decodable by a mid-stream
         // joiner, so ask each encoder to repeat VPS/SPS/PPS in-band; the
@@ -724,14 +718,7 @@ fn encoder_options(encoder_name: &str, cpus: usize) -> ffmpeg_next::Dictionary<'
         "libx265" => {
             opts.set("preset", "ultrafast");
             opts.set("tune", "zerolatency");
-            opts.set(
-                "x265-params",
-                if cpus <= 4 {
-                    "repeat-headers=1:log-level=error:pools=none:frame-threads=1"
-                } else {
-                    "repeat-headers=1:log-level=error"
-                },
-            );
+            opts.set("x265-params", "repeat-headers=1:log-level=error");
         }
         _ => {
             opts.set("profile", "baseline");
@@ -1107,52 +1094,6 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn small_cpu_software_options_open_both_codecs() {
-        ffmpeg_next::init().unwrap();
-        for name in ["libx264", "libx265"] {
-            let codec = ffmpeg_next::encoder::find_by_name(name).unwrap();
-            let mut encoder = ffmpeg_next::codec::Context::new_with_codec(codec)
-                .encoder()
-                .video()
-                .unwrap();
-            encoder.set_width(64);
-            encoder.set_height(64);
-            encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
-            encoder.set_time_base(ffmpeg_next::Rational(1, 60));
-            encoder.set_frame_rate(Some(ffmpeg_next::Rational(60, 1)));
-            encoder.set_max_b_frames(0);
-            let mut encoder = encoder.open_with(encoder_options(name, 3)).unwrap();
-            let mut frame =
-                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, 64, 64);
-            frame.set_pts(Some(0));
-            for plane in 0..frame.planes() {
-                frame.data_mut(plane).fill(128);
-            }
-            encoder.send_frame(&frame).unwrap();
-            let mut packet = ffmpeg_next::Packet::empty();
-            encoder.receive_packet(&mut packet).unwrap();
-            assert!(packet.size() > 0, "{name} must emit immediately");
-        }
-        for name in [
-            "h264_nvenc",
-            "hevc_nvenc",
-            "h264_amf",
-            "hevc_amf",
-            "h264_qsv",
-        ] {
-            let small: Vec<_> = encoder_options(name, 3)
-                .iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
-            let large: Vec<_> = encoder_options(name, 16)
-                .iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
-            assert_eq!(small, large, "{name} must retain its existing options");
-        }
-    }
 
     #[test]
     fn hevc_variants_cover_every_supported_encoder() {
