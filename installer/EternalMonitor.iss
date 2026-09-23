@@ -70,6 +70,7 @@ Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion 
 ; toggle script the tasks invoke (it resolves the VDD device at trigger time).
 Source: "scripts\vdd-tasks-setup.ps1";  DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-tasks-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\vdd-driver-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-toggle.ps1";       DestDir: "{app}\scripts"; Flags: ignoreversion
 #endif
 
@@ -102,9 +103,10 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 #ifdef IncludeDriver
 ; Remove the scheduled tasks and disable the device before removing an owned driver.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-remove.ps1"""; Flags: runhidden; RunOnceId: "VddTasksRemove"
-; Use the actual vendor uninstaller only for a driver this application installed.
-; Keep the RunOnceId so upgrades replace the earlier unsafe setup /uninstall entry.
-Filename: "{code:VddUninstaller}"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; Flags: waituntilterminated skipifdoesntexist; Check: OwnsVdd; RunOnceId: "VddUninstall"
+; Always record this entry to supersede older VddUninstall commands on upgrade.
+; A Check that returns false at install time leaves the old command in place.
+; The helper checks ownership when the uninstaller actually runs.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-driver-remove.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "VddUninstall"
 #endif
 
 #ifdef IncludeDriver
@@ -150,23 +152,4 @@ begin
     RaiseException('Could not record Virtual Display Driver installation ownership.');
 end;
 
-function OwnsVdd: Boolean;
-var
-  Directory, Version: String;
-  Recorded: AnsiString;
-begin
-  Result := False;
-  if not ReadVddRegistration(Directory, Version) then exit;
-  if not LoadStringFromFile(ExpandConstant('{app}\driver\installed-by-eternalmonitor.txt'), Recorded) then exit;
-  Result := String(Recorded) = AddBackslash(Directory) + 'unins000.exe' + #13#10 + Version;
-  if not Result then Log('Preserving driver installed or changed outside EternalMonitor.');
-end;
-
-function VddUninstaller(Param: String): String;
-var
-  Directory, Version: String;
-begin
-  ReadVddRegistration(Directory, Version);
-  Result := AddBackslash(Directory) + 'unins000.exe';
-end;
 #endif
