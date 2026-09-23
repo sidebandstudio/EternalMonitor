@@ -11,7 +11,5 @@ foreach ($task in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {
     Unregister-ScheduledTask -TaskName $task -Confirm:$false
 }
 
-$dev = Get-PnpDevice -Class Display |
-    Where-Object { $_.FriendlyName -like '*Virtual Display*' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
-    Select-Object -First 1 -ExpandProperty InstanceId
-if ($dev) { & pnputil.exe /disable-device "$dev" | Out-Null }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'vdd-toggle.ps1') -Action disable
+if ($LASTEXITCODE -ne 0) { throw 'The virtual display could not be disabled before uninstall.' }

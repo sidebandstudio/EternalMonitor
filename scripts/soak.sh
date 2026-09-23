@@ -9,7 +9,13 @@ if [ "$#" -gt 1 ] || [[ ! "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -lt 330 ];
     echo "Usage: $0 [--real] [seconds >= 330, default 1800]" >&2
     exit 2
 fi
-OUT="$ROOT/build/soak/$MODE"
+if [ "$MODE" = real ]; then
+    # Desktop screenshots and logs belong with private hardware evidence.
+    DEFAULT_OUT="${EM_EVIDENCE_DIR:-/Users/aldo/Desktop/EternalMonitor-Handoff/evidence}/soak-real"
+else
+    DEFAULT_OUT="$ROOT/build/soak/$MODE"
+fi
+OUT="${EM_OUTPUT_DIR:-$DEFAULT_OUT}"
 REPORT="$ROOT/build/soak-report.md"
 HOST_STARTED=0
 PATTERN_STARTED=0
@@ -31,7 +37,8 @@ if [ "$MODE" = real ]; then
     "$ROOT/scripts/win/remote.sh" pattern start
     PATTERN_STARTED=1
     "$ROOT/scripts/win/remote.sh" run-host ETERNAL_HEADLESS=1 ETERNAL_ENCODER=h264_nvenc \
-        ETERNAL_HEVC=0 ETERNAL_FPS=60 ETERNAL_MAX_DGRAM=1200 ETERNAL_E2E_LOG=1
+        ETERNAL_HEVC=0 ETERNAL_FPS=60 ETERNAL_MAX_DGRAM=1200 ETERNAL_E2E_LOG=1 \
+        ETERNAL_USB_DIRECT=127.0.0.1:0
     HOST_STARTED=1
     export EM_REMOTE_HOST=100.81.59.48 EM_PORT=19876 EM_SIZE=1920x1080
 fi
