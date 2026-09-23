@@ -16,7 +16,7 @@ final class AudioStreamTests: XCTestCase {
         let toggle = app.switches["settings.playPCaudio"]
         XCTAssertTrue(toggle.exists)
         XCTAssertEqual(toggle.value as? String, "1")
-        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        pressSwitch(toggle)
         waitForValue(toggle, value: "0")
         app.buttons["settings.done"].tap()
         waitForLabel(hud, containing: "PC audio muted or unavailable")
@@ -24,7 +24,7 @@ final class AudioStreamTests: XCTestCase {
         capture("audio-muted-hud", app: app)
         app.buttons["display.settings"].tap()
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        pressSwitch(toggle)
         waitForValue(toggle, value: "1")
         app.swipeUp()
         let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
@@ -49,6 +49,15 @@ final class AudioStreamTests: XCTestCase {
     private func waitForValue(_ element: XCUIElement, value: String) {
         expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: element)
         waitForExpectations(timeout: 5)
+    }
+
+    private func pressSwitch(_ element: XCUIElement) {
+        expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: element)
+        waitForExpectations(timeout: 5)
+        // The accessible switch covers the whole Form row. Hit the actual
+        // control and keep contact across more than one busy simulator frame.
+        element.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5))
+            .press(forDuration: 0.15)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

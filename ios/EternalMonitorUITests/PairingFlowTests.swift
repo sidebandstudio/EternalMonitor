@@ -15,7 +15,8 @@ final class PairingFlowTests: XCTestCase {
         let input = app.textFields["pairing.code"]
         XCTAssertTrue(input.waitForExistence(timeout: 10))
         input.tap()
-        input.typeText("000000")
+        let wrongCode = code == "000000" ? "000001" : "000000"
+        input.typeText(wrongCode)
         app.buttons["pairing.submit"].tap()
         let error = app.staticTexts["pairing.error"]
         XCTAssertTrue(error.waitForExistence(timeout: 5))
