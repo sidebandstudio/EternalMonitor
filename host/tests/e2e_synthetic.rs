@@ -178,6 +178,45 @@ fn usb_framed_stream_end_to_end() {
         assert!(dropped > 0, "a 500 ms read stall must overflow the video queue");
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
         eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
+
+        // A virtual-display startup restarts capture once. That closes USB,
+        // causing another HELLO on the replacement tunnel while the monitor
+        // is still attaching. It must not trigger a second pipeline restart.
+        use eternal_host::control::{CaptureTarget, VddStatus};
+        use eternal_host::supervisor::CURRENT_GENERATION;
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        let original_generation = CURRENT_GENERATION.load(Ordering::SeqCst);
+        let ControlMessage::Hello2(mut next_hello) = hello else { unreachable!() };
+        next_hello.client_nonce += 1;
+        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_datagram(&mut stream).await.is_ok() {}
+        }).await.expect("virtual-display start must close the previous tunnel");
+        drop(stream);
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+        read_preamble(&mut stream).await.unwrap();
+        next_hello.client_nonce += 1;
+        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello))).await.unwrap();
+        let mut received_ack = false;
+        let mut frames = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames < 30 || !received_ack {
+            assert!(Instant::now() < deadline, "USB reconnect must resume media during display startup");
+            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+            if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) {
+                assert_eq!(ack.status, HelloStatus::Ok);
+                received_ack = true;
+            } else if let Ok((header, _)) = MediaHeader::decode(&bytes) {
+                if header.frag_index == 0 { frames += 1; }
+            }
+        }
+        assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), original_generation + 1,
+            "USB HELLO during attach must not restart capture again");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        *shared.vdd_status.lock() = VddStatus::Inactive;
+        eprintln!("USB_VDD_RECONNECT frames={frames} restarts=1");
         drop(stream);
         let disconnected = Instant::now();
         while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
