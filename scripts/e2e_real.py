@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / 'scripts/win/remote.sh'
 SCENARIOS = ('R-baseline', 'R-nvenc-h264', 'R-nvenc-hevc', 'R-amf-h264', 'R-amf-hevc',
              'R-nvenc-h264-loss3', 'R-nvenc-burst', 'R-audio', 'R-pairing', 'R-vdd', 'R-reconnect', 'R-gui', 'R-input')
-PERFORMANCE_SCENARIOS = ('R-yuv-nvenc', 'R-yuv-amf', 'R-bgra-nvenc', 'R-bgra-amf', 'R-fps120')
+PERFORMANCE_SCENARIOS = ('R-yuv-nvenc', 'R-yuv-amf', 'R-bgra-nvenc', 'R-bgra-amf', 'R-fps120', 'R-autostart')
 # Input runs last: its SendInput events reset Windows' two-minute idle gate.
 
 
@@ -157,7 +157,7 @@ def main():
             host_args += ['ETERNAL_AMF_DIAG=1']
         if scenario == 'R-audio':
             env.update(EM_AUDIO='1', EM_DURATION='40')
-        if scenario in ('R-audio', 'R-pairing', 'R-gui'):
+        if scenario in ('R-audio', 'R-pairing', 'R-gui', 'R-autostart'):
             host_args[0] = 'ETERNAL_HEADLESS=0'
         if scenario == 'R-gui':
             env['EM_DURATION'] = '40'
@@ -244,6 +244,11 @@ def main():
                             if scenario == 'R-audio' and tone is None and 'E2E_FIRST_FRAME' in milestones:
                                 tone_log = (row / 'tone.log').open('w')
                                 tone = subprocess.Popen([str(REMOTE), 'tone', '30'], stdout=tone_log, stderr=subprocess.STDOUT)
+                            if scenario == 'R-autostart' and not gui_checked and milestones.count('E2E_STATS') >= 4:
+                                remote('autostart', scenario, output=row / 'autostart-controls.json')
+                                run([str(ROOT / 'scripts/pixels.sh'), str(evidence / 'windows' / (scenario + '.png')),
+                                     '--assert-ui'], output=row / 'autostart-pixels.json')
+                                gui_checked = True
                             if scenario in ('R-audio', 'R-gui') and not gui_checked and milestones.count('E2E_STATS') >= 4:
                                 for view in (('Stream', 'Settings', 'QR') if scenario == 'R-gui' else ('Stream',)):
                                     name = scenario + '-' + view.lower()
@@ -265,7 +270,7 @@ def main():
                         raise ValueError('The Windows tone was not started')
                     if tone.wait(timeout=60):
                         raise ValueError('The Windows tone failed; see tone.log')
-                if scenario in ('R-audio', 'R-gui') and not gui_checked:
+                if scenario in ('R-audio', 'R-gui', 'R-autostart') and not gui_checked:
                     raise ValueError('Connected host GUI evidence was not collected')
                 if scenario == 'R-vdd':
                     if not vdd_checked:

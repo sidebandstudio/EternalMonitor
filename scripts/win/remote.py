@@ -139,6 +139,12 @@ def main(args):
         session(script("Inspect-Host", "-View " + quote(args[0]) + " -Path " + quote(remote_path) +
                        (" -Connected" if len(args) == 3 else "")), idle=True)
         pull(remote_path, EVIDENCE / "windows" / (args[1] + ".png"))
+    elif action == "autostart" and len(args) == 1:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", args[0]):
+            raise ValueError('Autostart evidence name is invalid')
+        remote_path = ROOT + "\\shots\\" + args[0] + ".png"
+        session(script('Inspect-Host', '-View Settings -TestAutostart -Path ' + quote(remote_path)), idle=True)
+        pull(remote_path, EVIDENCE / 'windows' / (args[0] + '.png'))
     elif action == "diagnostic" and len(args) == 2 and args[0] in ("h264", "hevc"):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args[1]):
             raise ValueError("Diagnostic row name is invalid")

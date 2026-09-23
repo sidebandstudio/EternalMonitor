@@ -1,7 +1,8 @@
 param(
     [ValidateSet('Stream','Settings','QR')][string]$View = 'Stream',
     [Parameter(Mandatory=$true)][string]$Path,
-    [switch]$Connected
+    [switch]$Connected,
+    [switch]$TestAutostart
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
@@ -65,6 +66,48 @@ if ($View -eq 'Stream') {
 }
 if ($View -eq 'Settings' -and !($names -contains 'Encoder input')) { throw 'Settings content did not appear' }
 if ($View -eq 'QR' -and !($names -contains 'QR Code')) { throw 'QR modal did not appear' }
+$autostart = $null
+if ($TestAutostart) {
+    if ($View -ne 'Settings') { throw 'Autostart must be tested from Settings' }
+    $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Start on Windows startup')
+    $checkbox = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+    $toggle = $null
+    if (!$checkbox -or !$checkbox.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$toggle)) {
+        throw 'Startup checkbox has no UI Automation toggle'
+    }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run',$true)
+    if (!$key) { throw 'Windows Run registry key is absent' }
+    $originalPresent = $key.GetValueNames() -contains 'EternalMonitor'
+    $originalValue = $key.GetValue('EternalMonitor',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $originalKind = if ($originalPresent) { $key.GetValueKind('EternalMonitor') } else { $null }
+    function Set-StartupFlag([bool]$Enabled) {
+        $current = $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On
+        if ($current -ne $Enabled) { $toggle.Toggle() }
+        $deadline = (Get-Date).AddSeconds(5)
+        while (($key.GetValueNames() -contains 'EternalMonitor') -ne $Enabled -or
+               (($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) -ne $Enabled)) {
+            if ((Get-Date) -gt $deadline) { throw 'Startup checkbox did not update the registry' }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    try {
+        Set-StartupFlag $false
+        Set-StartupFlag $true
+        if ($key.GetValue('EternalMonitor') -ne ('"' + $p.Path + '"')) {
+            throw 'Startup command must contain the quoted, current host executable'
+        }
+        Set-StartupFlag $false
+        $autostart = @{ enabled_path_verified=$true; disabled_value_absent=$true }
+    } finally {
+        try { Set-StartupFlag $originalPresent } finally {
+            try {
+                if ($originalPresent) { $key.SetValue('EternalMonitor',$originalValue,$originalKind) }
+                else { $key.DeleteValue('EternalMonitor',$false) }
+            } finally { $key.Dispose() }
+        }
+    }
+    $autostart.restored = $true
+}
 $rect = $window.Current.BoundingRectangle
 if ($rect.Width -lt 100 -or $rect.Height -lt 100) { throw 'Invalid host window bounds' }
 New-Item -ItemType Directory -Force (Split-Path $Path -Parent) | Out-Null
@@ -74,4 +117,4 @@ try {
     $graphics.CopyFromScreen([int]$rect.X,[int]$rect.Y,0,0,$bitmap.Size)
     $bitmap.Save($Path,[Drawing.Imaging.ImageFormat]::Png)
 } finally { $graphics.Dispose(); $bitmap.Dispose() }
-@{pid=$p.Id; view=$View; labels=$names; screenshot=$Path} | ConvertTo-Json -Depth 4
+@{pid=$p.Id; view=$View; labels=$names; screenshot=$Path; autostart=$autostart} | ConvertTo-Json -Depth 4
