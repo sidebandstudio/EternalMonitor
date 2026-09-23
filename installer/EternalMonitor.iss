@@ -102,9 +102,10 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 #ifdef IncludeDriver
 ; Remove the scheduled tasks and disable the device before removing an owned driver.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-remove.ps1"""; Flags: runhidden; RunOnceId: "VddTasksRemove"
-; Use the actual vendor uninstaller only for a driver this application installed.
-; Keep the RunOnceId so upgrades replace the earlier unsafe setup /uninstall entry.
-Filename: "{code:VddUninstaller}"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; Flags: waituntilterminated skipifdoesntexist; Check: OwnsVdd; RunOnceId: "VddUninstall"
+; Always record this entry to supersede older VddUninstall commands on upgrade.
+; A Check that returns false at install time leaves the old command in place.
+; The callback checks ownership at uninstall time; the command itself does nothing.
+Filename: "{sys}\cmd.exe"; Parameters: "/c exit 0"; Flags: runhidden waituntilterminated; BeforeInstall: RemoveOwnedVdd; RunOnceId: "VddUninstall"
 #endif
 
 #ifdef IncludeDriver
@@ -162,11 +163,21 @@ begin
   if not Result then Log('Preserving driver installed or changed outside EternalMonitor.');
 end;
 
-function VddUninstaller(Param: String): String;
+procedure RemoveOwnedVdd;
 var
   Directory, Version: String;
+  ResultCode: Integer;
 begin
+  if not OwnsVdd then begin
+    Log('Preserving preexisting Virtual Display Driver during uninstall.');
+    exit;
+  end;
   ReadVddRegistration(Directory, Version);
-  Result := AddBackslash(Directory) + 'unins000.exe';
+  if not Exec(AddBackslash(Directory) + 'unins000.exe',
+      '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Could not start the owned Virtual Display Driver uninstaller.');
+  if (ResultCode <> 0) and (ResultCode <> 3010) then
+    RaiseException('Virtual Display Driver uninstall failed with exit ' + IntToStr(ResultCode));
 end;
 #endif
