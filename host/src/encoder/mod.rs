@@ -48,6 +48,8 @@ pub fn run_encode_stage(
     gpu: GpuInfo,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    crate::capture::timing::set_stream_qos();
     let result = run_encode_loop(frames, tx, shared, gpu, generation);
     if let Err(ref e) = result {
         error!(error = %e, "Encode loop exited with error");
@@ -421,6 +423,12 @@ fn run_encode_loop(
                             is_keyframe,
                         );
                     }
+                    if let Some(capture) = encoder.hevc_capture.as_mut() {
+                        if let Err(error) = capture.observe(&nal_data, is_keyframe) {
+                            warn!(%error, "Stopping opt-in HEVC diagnostic capture");
+                            encoder.hevc_capture = None;
+                        }
+                    }
 
                     // AMF startup safety net: a keyframe went out but we still have no cached
                     // SPS/PPS (empty extradata and none inline), so the iPad can't build a format
@@ -486,6 +494,7 @@ struct EncoderState {
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
     amf_diagnostics: Option<AmfBitstreamDiagnostics>,
+    hevc_capture: Option<HevcBitstreamCapture>,
     /// The FFmpeg encoder this session was opened with; a negotiated codec
     /// change (H.264 ↔ HEVC) requests a reopen.
     opened_encoder: String,
@@ -604,6 +613,7 @@ impl EncoderState {
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
+            hevc_capture: HevcBitstreamCapture::for_encoder(encoder_name),
             opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
             opened_fps: target_fps,
@@ -812,6 +822,84 @@ fn prepare_frame_for_encode(
 /// Check if an ffmpeg error is EAGAIN (no output available yet).
 fn is_eagain(e: &ffmpeg_next::Error) -> bool {
     matches!(e, ffmpeg_next::Error::Other { errno } if *errno == libc::EAGAIN)
+}
+
+// The existing H.264 diagnostics remain unchanged. HEVC uses its own bounded,
+// opt-in file so the hardware campaign can validate the actual AMF bitstream.
+struct HevcBitstreamCapture {
+    file: Option<File>,
+    packets: u64,
+}
+
+impl HevcBitstreamCapture {
+    fn for_encoder(name: &str) -> Option<Self> {
+        if !is_amf_encoder(name)
+            || !is_hevc_encoder(name)
+            || !std::env::var("ETERNAL_AMF_DIAG").is_ok_and(|v| v.trim() == "1")
+        {
+            return None;
+        }
+        let path = diagnostic_dir().join("amf-first-120-packets.hevc");
+        let opened = fs::create_dir_all(path.parent().unwrap()).and_then(|()| File::create(&path));
+        match opened {
+            Ok(file) => {
+                info!(path = %path.display(), "Capturing AMF HEVC packets for diagnostics");
+                Some(Self {
+                    file: Some(file),
+                    packets: 0,
+                })
+            }
+            Err(error) => {
+                warn!(%error, "Could not create opt-in HEVC diagnostic capture");
+                None
+            }
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], keyframe: bool) -> std::io::Result<()> {
+        if self.packets == 0 && !keyframe {
+            return Ok(());
+        }
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(bytes)?;
+            self.packets += 1;
+            if self.packets == AMF_CAPTURE_PACKET_LIMIT {
+                file.flush()?;
+                self.file = None;
+                info!(
+                    packets = self.packets,
+                    "AMF HEVC diagnostic capture complete"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hevc_capture_tests {
+    use super::*;
+
+    #[test]
+    fn capture_starts_at_a_keyframe_and_closes_at_the_packet_limit() {
+        let path = std::env::temp_dir().join(format!("em-hevc-capture-{}.bin", std::process::id()));
+        let mut capture = HevcBitstreamCapture {
+            file: Some(File::create(&path).unwrap()),
+            packets: 0,
+        };
+        capture.observe(&[99], false).unwrap();
+        capture.observe(&[1], true).unwrap();
+        for _ in 1..AMF_CAPTURE_PACKET_LIMIT {
+            capture.observe(&[2], false).unwrap();
+        }
+        capture.observe(&[3], true).unwrap();
+        assert!(capture.file.is_none());
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(bytes.len(), AMF_CAPTURE_PACKET_LIMIT as usize);
+        assert_eq!(bytes[0], 1);
+        assert!(bytes[1..].iter().all(|&byte| byte == 2));
+    }
 }
 
 struct AmfBitstreamDiagnostics {

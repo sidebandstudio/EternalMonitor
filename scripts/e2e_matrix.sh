@@ -14,8 +14,6 @@ fi
 mkdir -p "$OUT" "$ROOT/build"
 failed=0
 rows=()
-pattern_started=0
-host_started=0
 write_report() {
 python3 - "$REPORT" "${rows[@]}" <<'PY'
 import datetime,json,pathlib,sys
@@ -39,82 +37,16 @@ PY
 finish() {
     status=$?
     trap - EXIT
-    if [ "$host_started" = 1 ]; then
-        "$ROOT/scripts/win/remote.sh" stop-host || status=1
-    fi
-    if [ "$pattern_started" = 1 ]; then
-        "$ROOT/scripts/win/remote.sh" pattern stop || status=1
-    fi
-    if [ "$MODE" = --real ] && [ "$status" != 0 ]; then
-        python3 - "$OUT/$scenario/result.json" <<'PYRESULT'
-import json,pathlib,sys
-p=pathlib.Path(sys.argv[1])
-r=json.loads(p.read_text()) if p.exists() else {'scenario':p.parent.name}
-r['status']='FAIL'
-p.parent.mkdir(parents=True,exist_ok=True)
-p.write_text(json.dumps(r)+'\n')
-PYRESULT
-    fi
     write_report || status=1
     exit "$status"
 }
 trap finish EXIT
 if [ "$MODE" = --real ]; then
-    skip=0
-    for scenario in R-baseline R-nvenc-h264 R-nvenc-h264-loss3 R-nvenc-burst; do
-    rows+=("$OUT/$scenario/result.json")
-    # A failed prerequisite must not leave a previous run looking successful.
-    mkdir -p "$OUT/$scenario"
-    rm -f "$OUT/$scenario/result.json"
-    if [ "$pattern_started" = 0 ]; then
-        "$ROOT/scripts/win/remote.sh" pattern start
-        pattern_started=1
-    fi
-    drop=0; reorder=0; bitrate=15; idr=0; repairs=0; duration=20
-    case "$scenario" in
-        R-baseline) duration=0 ;;
-        R-nvenc-h264-loss3) drop=0.03; reorder=0.01; repairs=1 ;;
-        R-nvenc-burst) bitrate=40; idr=60 ;;
-    esac
-    EM_BITRATE_MBPS="$bitrate" "$ROOT/scripts/win/remote.sh" run-host \
-        ETERNAL_HEADLESS=1 ETERNAL_ENCODER=h264_nvenc ETERNAL_HEVC=0 ETERNAL_FPS=60 \
-        ETERNAL_MAX_DGRAM=1200 ETERNAL_DROP="$drop" ETERNAL_REORDER="$reorder" ETERNAL_FORCE_IDR_PERIOD="$idr"
-    host_started=1
-    if EM_SCENARIO="$scenario" EM_OUTPUT_DIR="$OUT/$scenario" \
-       EM_SCREENSHOT="$OUT/$scenario/simulator.png" EM_REMOTE_HOST=100.81.59.48 \
-       EM_PORT=19876 EM_SIZE=1920x1080 EM_SKIP_BUILD="$skip" EM_DURATION="$duration" \
-       EM_REQUIRE_REPAIRS="$repairs" "$ROOT/scripts/e2e_ios.sh" > "$OUT/$scenario-run.log" 2>&1; then
-        skip=1
-        "$ROOT/scripts/win/remote.sh" log > "$OUT/$scenario/host.log"
-        if ! python3 - "$OUT/$scenario" "$repairs" <<'PY'
-import json,pathlib,re,sys
-p=pathlib.Path(sys.argv[1]); r=json.loads((p/'result.json').read_text())
-log=(p/'host.log').read_text(); errors=[]
-if 'Desktop duplication active' not in log or 'h264_nvenc' not in log:
-    errors.append('hardware capture/NVENC evidence missing')
-requests=log.count('Keyframe request received')
-retransmits=max([int(x) for x in re.findall(r'retransmits=(\d+)',log)],default=0)
-if requests > max(1,int(r.get('measured_seconds',0)/10)):
-    errors.append(f'keyframe request storm: {requests}')
-if sys.argv[2]=='1' and retransmits==0:
-    errors.append('host retransmission evidence missing')
-r.update(keyframe_requests=requests,host_retransmits=retransmits)
-if errors: r.update(status='FAIL',errors=errors)
-(p/'result.json').write_text(json.dumps(r,indent=2)+'\n')
-if errors: sys.exit('; '.join(errors))
-PY
-        then
-            failed=1
-        fi
-        "$ROOT/scripts/win/remote.sh" shot "$scenario"
-    else
-        cat "$OUT/$scenario-run.log"
-        "$ROOT/scripts/win/remote.sh" log > "$OUT/$scenario/host.log"
-        failed=1
-    fi
-    "$ROOT/scripts/win/remote.sh" stop-host
-    host_started=0
-    done
+    while IFS= read -r scenario; do
+        rows+=("$OUT/$scenario/result.json")
+    done < <(python3 "$ROOT/scripts/e2e_real.py" --list)
+    python3 "$ROOT/scripts/e2e_real.py" || failed=1
+
 else
     skip=0
     scenarios=(h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio pairing keyboard reconnect background-resume stream-ui)

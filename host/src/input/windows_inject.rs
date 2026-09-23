@@ -1,6 +1,8 @@
 //! Windows `SendInput` backend for the input relay.
 
-use tracing::debug;
+use tracing::{debug, warn};
+use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -9,7 +11,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
+    GetWindowThreadProcessId, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 use super::{Injection, VirtualScreen};
@@ -65,6 +69,10 @@ fn mouse_input(
 
 /// Execute a resolved injection batch.
 pub fn inject(injections: &[Injection]) {
+    if !probe_guard_allows(injections) {
+        warn!("Input probe guard rejected an injection batch");
+        return;
+    }
     let mut inputs: Vec<INPUT> = Vec::with_capacity(injections.len() * 2);
     for injection in injections {
         let input = match *injection {
@@ -141,5 +149,46 @@ pub fn inject(injections: &[Injection]) {
             requested = inputs.len(),
             "SendInput injected fewer events than requested"
         );
+    }
+}
+
+fn probe_guard_allows(injections: &[Injection]) -> bool {
+    // An absent variable leaves the normal product input path unchanged. A
+    // malformed value fails closed, as does focus moving away from the probe.
+    let Ok(value) = std::env::var("ETERNAL_INPUT_WINDOW_PID") else {
+        return true;
+    };
+    let expected_pid = value.parse::<u32>().unwrap_or(0);
+    unsafe {
+        let window = GetForegroundWindow();
+        let mut foreground_pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut foreground_pid));
+        let mut title = [0u16; 128];
+        let length = GetWindowTextW(window, &mut title).max(0) as usize;
+        if String::from_utf16_lossy(&title[..length]) != "EternalMonitor input probe" {
+            return false;
+        }
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        let mut cursor = POINT::default();
+        if GetClientRect(window, &mut rect).is_err()
+            || !ClientToScreen(window, &mut origin).as_bool()
+            || GetCursorPos(&mut cursor).is_err()
+        {
+            return false;
+        }
+        super::probe_guard::permits(
+            expected_pid,
+            foreground_pid,
+            super::CaptureGeometry {
+                left: origin.x,
+                top: origin.y,
+                width: (rect.right - rect.left).max(0) as u32,
+                height: (rect.bottom - rect.top).max(0) as u32,
+            },
+            virtual_screen(),
+            (cursor.x, cursor.y),
+            injections,
+        )
     }
 }

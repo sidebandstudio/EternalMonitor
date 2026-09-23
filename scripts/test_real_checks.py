@@ -1,0 +1,81 @@
+import unittest
+from real_checks import check_probe, check_stream
+
+
+class RealChecksTests(unittest.TestCase):
+    def result(self):
+        return dict(status='PASS', measured_seconds=20)
+
+    def log(self, encoder='h264_nvenc', bitrate=40000000):
+        return f'Desktop duplication active\nEncoder opened bitrate={bitrate} encoder="{encoder}"\n'
+
+    def test_encoder_override_is_not_proof_that_hardware_opened(self):
+        result = check_stream(self.result(), 'Encoder override honoured encoder=h264_nvenc\n' +
+                              self.log('libx264'), 'h264_nvenc')
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertIn('libx264', result['errors'][0])
+
+    def test_hevc_may_open_h264_before_negotiation_but_must_finish_in_hevc(self):
+        log = self.log() + self.log('hevc_nvenc')
+        self.assertEqual(check_stream(self.result(), log, 'hevc_nvenc')['status'], 'PASS')
+        self.assertEqual(check_stream(self.result(), log + self.log(), 'hevc_nvenc')['status'], 'FAIL')
+
+    def test_burst_rejects_abr_reopen_below_forty_mbps(self):
+        result = check_stream(self.result(), self.log() + self.log(bitrate=15000000),
+                              'h264_nvenc', bitrate=40000000)
+        self.assertEqual(result['status'], 'FAIL')
+
+    def test_repairs_and_keyframe_storm_remain_separate_requirements(self):
+        log = self.log() + 'E2E_HOST_STATS retransmits=123\n'
+        self.assertEqual(check_stream(self.result(), log, 'h264_nvenc', repairs=True)['status'], 'PASS')
+        self.assertEqual(check_stream(self.result(), self.log(), 'h264_nvenc', repairs=True)['status'], 'FAIL')
+        self.assertEqual(check_stream(self.result(), log + 'Keyframe request received\n' * 3,
+                                      'h264_nvenc', repairs=True)['status'], 'FAIL')
+
+    def test_audio_requires_wasapi_and_a_growing_quiet_packet_count(self):
+        log = self.log() + 'WASAPI default endpoint\nAudio stream stats quiet_packets=3\n'
+        self.assertEqual(check_stream(self.result(), log, 'h264_nvenc', audio=True)['status'], 'FAIL')
+        log += 'Audio stream stats quiet_packets=16\n'
+        self.assertEqual(check_stream(self.result(), log, 'h264_nvenc', audio=True)['status'], 'PASS')
+
+
+class ProbeChecksTests(unittest.TestCase):
+    def fixture(self):
+        expected = dict(width=1920, height=1080, clicks=[[960,540],[20,20],[1899,20],[20,1059],[1899,1059]],
+                        drag_start=[384,432], drag_end=[1536,648], right_click=[1152,432])
+        events = [dict(event='Ready',x=0,y=0,width=1920,height=1080)]
+        for x,y in expected['clicks']:
+            events += [dict(event=kind,x=x,y=y,button='Left') for kind in ['MouseDown','MouseUp']]
+        events += [dict(event='MouseDown',x=384,y=432,button='Left')]
+        events += [dict(event='MouseMove',x=384+i*100,y=432+i*20,button='Left') for i in range(1,7)]
+        events += [dict(event='MouseUp',x=1536,y=648,button='Left')]
+        events += [dict(event=kind,x=1152,y=432,button='Right') for kind in ['MouseDown','MouseUp']]
+        events += [dict(event='MouseWheel',delta=-90) for _ in range(2)]
+        events += [dict(event='KeyPress',char=char) for char in 'Hi!\r']
+        events += [dict(event=kind,keycode=13,scan=28) for kind in ['KeyDown','KeyUp']]
+        return events,expected
+
+    def test_observed_full_gesture_sequence_passes(self):
+        self.assertEqual(check_probe(*self.fixture())['input_mapping_error_px'],0)
+
+    def test_four_pixel_mapping_error_fails(self):
+        events,expected = self.fixture()
+        events[1]['x'] += 4
+        with self.assertRaisesRegex(ValueError,'4.0px'):
+            check_probe(events,expected)
+
+    def test_reversed_scroll_focus_loss_and_missing_text_fail(self):
+        for defect in ['scroll','focus','text','drag']:
+            with self.subTest(defect=defect):
+                events,expected = self.fixture()
+                if defect == 'scroll':
+                    for event in events:
+                        if event['event'] == 'MouseWheel': event['delta'] *= -1
+                elif defect == 'focus': events += [dict(event='Deactivated')]
+                elif defect == 'text': events = [e for e in events if e.get('char') != '!']
+                else: events = [e for e in events if e['event'] != 'MouseMove']
+                with self.assertRaises(ValueError): check_probe(events,expected)
+
+
+if __name__ == '__main__':
+    unittest.main()

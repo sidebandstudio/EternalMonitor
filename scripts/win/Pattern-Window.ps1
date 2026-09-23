@@ -1,4 +1,4 @@
-param([int]$Seconds = 600)
+param([int]$Seconds = 600, [switch]$VirtualDisplay)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $source = @'
@@ -15,9 +15,11 @@ public class EMTestPattern : Form {
     readonly Timer timer = new Timer();
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly int seconds;
+    readonly bool virtualDisplay;
     long frame = -1;
-    public EMTestPattern(int seconds) {
+    public EMTestPattern(int seconds, bool virtualDisplay) {
         this.seconds = seconds;
+        this.virtualDisplay = virtualDisplay;
         Text = "EternalMonitor test pattern";
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -32,6 +34,16 @@ public class EMTestPattern : Form {
         timer.Interval = 4;
         timer.Tick += delegate {
             if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"D:\AgentWork\em-v030\pattern.stop")) { Close(); return; }
+            if (this.virtualDisplay) {
+                Rectangle target = Screen.PrimaryScreen.Bounds;
+                foreach (var screen in Screen.AllScreens) {
+                    if (!screen.Primary && screen.Bounds.Width == 2420 && screen.Bounds.Height == 1668) {
+                        target = screen.Bounds;
+                        break;
+                    }
+                }
+                if (Bounds != target) Bounds = target;
+            }
             long next = (long)(clock.Elapsed.TotalSeconds * 60);
             if (next != frame) { frame = next; Invalidate(); }
         };
@@ -62,5 +74,5 @@ public class EMTestPattern : Form {
 Add-Type -TypeDefinition $source -ReferencedAssemblies System.Windows.Forms,System.Drawing
 Remove-Item 'D:\AgentWork\em-v030\pattern.stop' -ErrorAction SilentlyContinue
 [Windows.Forms.Application]::EnableVisualStyles()
-$window = New-Object EMTestPattern $Seconds
+$window = New-Object EMTestPattern $Seconds,([bool]$VirtualDisplay)
 try { [Windows.Forms.Application]::Run($window) } finally { $window.Dispose() }

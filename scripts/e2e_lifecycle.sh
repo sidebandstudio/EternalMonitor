@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 SCENARIO="${EM_SCENARIO:-reconnect}"
 case "$SCENARIO" in
-    reconnect) TEST=testHostRestart ;;
+    reconnect|R-reconnect) TEST=testHostRestart ;;
     background-resume) TEST=testBackgroundResume ;;
     *) echo "Unknown lifecycle scenario: $SCENARIO" >&2; exit 2 ;;
 esac
@@ -17,10 +17,12 @@ rm -f "$OUT/result.json"
 status=0
 EM_TEST_STAMP="$STAMP" "$ROOT/scripts/test_ios.sh" \
     "-only-testing:EternalMonitorUITests/StreamLifecycleTests/$TEST" > "$OUT/ui-run.log" 2>&1 || status=$?
-RESULT="$ROOT/build/ios-tests-$STAMP.xcresult"
-SHOTS="$ROOT/build/screenshots/ui-$STAMP"
-[ ! -f "$ROOT/build/ios-tests-$STAMP.log" ] || cp "$ROOT/build/ios-tests-$STAMP.log" "$OUT/app.log"
-[ ! -f "$ROOT/build/ios-ui-host-$STAMP.log" ] || cp "$ROOT/build/ios-ui-host-$STAMP.log" "$OUT/host.log"
+TEST_ROOT="${EM_UI_EVIDENCE_DIR:-$ROOT/build}"
+RESULT="$TEST_ROOT/ios-tests-$STAMP.xcresult"
+SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
+[ ! -f "$TEST_ROOT/ios-tests-$STAMP.log" ] || cp "$TEST_ROOT/ios-tests-$STAMP.log" "$OUT/app.log"
+HOST_LOG="${EM_INPUT_HOST_LOG:-$ROOT/build/ios-ui-host-$STAMP.log}"
+[ ! -f "$HOST_LOG" ] || cp "$HOST_LOG" "$OUT/host.log"
 if [ -d "$RESULT" ]; then
     xcrun xcresulttool get test-results summary --path "$RESULT" --format json > "$OUT/tests.json" || status=1
 fi
@@ -33,7 +35,8 @@ summary=json.loads((out/'tests.json').read_text()) if (out/'tests.json').exists(
 if summary.get('passedTests',0)!=1 or summary.get('failedTests',0)!=0:
     errors.append('Expected exactly one passing lifecycle test')
 manifest=json.loads((shots/'manifest.json').read_text()) if (shots/'manifest.json').exists() else []
-names=['signal-lost','stream-resumed'] if scenario=='reconnect' else ['background-resumed']
+reconnect=scenario in ('reconnect','R-reconnect')
+names=['signal-lost','stream-resumed'] if reconnect else ['background-resumed']
 for name in names:
     found=False
     for test in manifest:
@@ -48,11 +51,11 @@ for name in names:
 app=(out/'app.log').read_text(errors='replace') if (out/'app.log').exists() else ''
 host=(out/'host.log').read_text(errors='replace') if (out/'host.log').exists() else ''
 host=re.sub(r'\x1b\[[0-9;]*m','',host)
-marker='E2E_LIFECYCLE_RESUMED' if scenario=='reconnect' else 'E2E_LIFECYCLE_FOREGROUND'
+marker='E2E_LIFECYCLE_RESUMED' if reconnect else 'E2E_LIFECYCLE_FOREGROUND'
 match=re.search(marker+r' elapsed=([0-9.]+)',app)
 recovery=float(match[1]) if match else None
 if recovery is None or recovery>=15: errors.append('Recovery was not measured below fifteen seconds')
-if scenario=='reconnect':
+if reconnect:
     events=[json.loads(line.split('E2E_LIFECYCLE ',1)[1]) for line in host.splitlines() if line.startswith('E2E_LIFECYCLE ')]
     if [e['event'] for e in events]!=['started','stopped','restarted']:
         errors.append('The host kill/restart sequence is missing')

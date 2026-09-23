@@ -8,10 +8,11 @@ UDID="${EM_SIM_UDID:-06416ADB-C33D-4EE4-82DB-44FCD663362F}"
 # remote Mac. Keep test products in the temporary directory, outside Desktop.
 DERIVED="${EM_DERIVED_DATA:-/tmp/eternalmonitor-ios-tests}"
 STAMP="${EM_TEST_STAMP:-$(date +%Y%m%d-%H%M%S)}"
-RESULT="$ROOT/build/ios-tests-$STAMP.xcresult"
-SHOTS="$ROOT/build/screenshots/ui-$STAMP"
-LOG="$ROOT/build/ios-tests-$STAMP.log"
-mkdir -p "$ROOT/build" "$SHOTS"
+TEST_ROOT="${EM_UI_EVIDENCE_DIR:-$ROOT/build}"
+RESULT="$TEST_ROOT/ios-tests-$STAMP.xcresult"
+SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
+LOG="$TEST_ROOT/ios-tests-$STAMP.log"
+mkdir -p "$ROOT/build" "$TEST_ROOT" "$SHOTS"
 HOST_PID=""
 USB_HOST_PID=""
 PAIR_HOST_PID=""
@@ -67,7 +68,7 @@ for name in ['ui-state', 'ui-usb-state']:
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(dict(bitrate_mbps=15,target_fps=60,start_on_boot=False,require_pairing=False)))
 PYSETTINGS
-    if [ "$NEED_STREAM" = 1 ]; then
+    if [ "$NEED_STREAM" = 1 ] && [ -z "${EM_INPUT_HOST:-}" ]; then
     HOST_COMMAND=("$ROOT/target/release/eternal-host" 19875)
     if [ -n "${EM_LIFECYCLE_DIR:-}" ]; then
         HOST_COMMAND=(python3 "$ROOT/scripts/lifecycle_host.py" "$EM_LIFECYCLE_DIR" "${HOST_COMMAND[@]}")
@@ -107,8 +108,10 @@ products=pathlib.Path(sys.argv[1])
 runfile=max(products.glob('*.xctestrun'),key=lambda p:p.stat().st_mtime)
 data=plistlib.loads(runfile.read_bytes())
 env=data['EternalMonitorUITests'].setdefault('EnvironmentVariables',{})
-for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST','EM_INPUT_HOST_LOG','EM_INPUT_HOST','EM_LIFECYCLE_DIR']:
+for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST','EM_INPUT_HOST_LOG','EM_INPUT_HOST','EM_LIFECYCLE_DIR','EM_INPUT_WIDTH','EM_INPUT_HEIGHT']:
     env.pop(key,None)
+for key in ['EM_INPUT_WIDTH','EM_INPUT_HEIGHT']:
+    if os.environ.get(key): env[key]=os.environ[key]
 if os.environ.get('EM_LIFECYCLE_DIR'): env['EM_LIFECYCLE_DIR']=os.environ['EM_LIFECYCLE_DIR']
 if sys.argv[3]=='1':
     env['EM_INPUT_HOST_LOG']=os.environ.get('EM_INPUT_HOST_LOG', sys.argv[4])

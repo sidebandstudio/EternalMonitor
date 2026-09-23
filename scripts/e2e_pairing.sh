@@ -12,9 +12,10 @@ rm -f "$OUT/result.json"
 status=0
 EM_TEST_STAMP="$STAMP" "$ROOT/scripts/test_ios.sh" \
     -only-testing:EternalMonitorUITests/PairingFlowTests/testPairingFlow > "$OUT/ui-run.log" 2>&1 || status=$?
-RESULT="$ROOT/build/ios-tests-$STAMP.xcresult"
-SHOTS="$ROOT/build/screenshots/ui-$STAMP"
-[ ! -f "$ROOT/build/ios-tests-$STAMP.log" ] || cp "$ROOT/build/ios-tests-$STAMP.log" "$OUT/tests.log"
+TEST_ROOT="${EM_UI_EVIDENCE_DIR:-$ROOT/build}"
+RESULT="$TEST_ROOT/ios-tests-$STAMP.xcresult"
+SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
+[ ! -f "$TEST_ROOT/ios-tests-$STAMP.log" ] || cp "$TEST_ROOT/ios-tests-$STAMP.log" "$OUT/tests.log"
 [ ! -f "$ROOT/build/ios-ui-pairing-host-$STAMP.log" ] || cp "$ROOT/build/ios-ui-pairing-host-$STAMP.log" "$OUT/host.log"
 if [ -d "$RESULT" ]; then
     xcrun xcresulttool get test-results summary --path "$RESULT" --format json > "$OUT/tests.json" || status=1
