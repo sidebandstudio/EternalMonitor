@@ -283,6 +283,8 @@ pub async fn start_sender(
                                             info!(epoch = report.stream_epoch, complete = report.frames_complete,
                                                 dropped = report.frames_dropped, repaired = report.frags_repaired,
                                                 nacks = report.nacks_sent, jitter_us = report.jitter_us,
+                                                decode_fps_x10 = report.decode_fps_x10,
+                                                decode_depth = report.decode_depth,
                                                 retransmits,
                                                 "Receiver report");
                                             let ceiling =
