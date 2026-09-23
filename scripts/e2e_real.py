@@ -123,6 +123,7 @@ def main():
         controller_log = None
         gui_checked = False
         vdd_owned = vdd_checked = False
+        measurement_host_log = None
         env = dict(os.environ, EM_SCENARIO=scenario, EM_OUTPUT_DIR=str(row),
                    EM_EVIDENCE_DIR=str(evidence), EM_UI_EVIDENCE_DIR=str(row / 'ui'),
                    DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer',
@@ -278,6 +279,10 @@ def main():
                 if scenario == 'R-vdd':
                     if not vdd_checked:
                         raise ValueError('VDD connection/mode evidence was not collected')
+                    # The next phase starts a separate client to test host exit.
+                    # Its traffic is outside the completed FPS measurement.
+                    measurement_host_log = remote('log')
+                    (row / 'host-measurement.log').write_text(measurement_host_log)
                     deadline = time.monotonic() + 20
                     while True:
                         state = json.loads(remote('vdd-state'))
@@ -293,7 +298,7 @@ def main():
             (row / 'host.stderr.log').write_text(remote('stderr'))
             result = json.loads(result_path.read_text())
             if scenario not in ('R-pairing', 'R-reconnect', 'R-input'):
-                check_stream(result, host_log, encoder,
+                check_stream(result, measurement_host_log if measurement_host_log is not None else host_log, encoder,
                              repairs=scenario.endswith('loss3'),
                              bitrate=40000000 if scenario.endswith('burst') else None,
                              audio=scenario == 'R-audio')
@@ -317,8 +322,13 @@ def main():
                     save(result_path, result)
             if family == 'amf':
                 remote('diagnostic', env['EM_CODEC'], scenario, output=row / 'bitstream-validation.log')
-            remote('shot', scenario, output=row / 'desktop-shot.log')
-            screenshot = evidence / 'windows' / (scenario + '.png')
+            if scenario == 'R-vdd':
+                # Assert the virtual display while it exists. After the teardown
+                # check, the pattern has returned to a different physical output.
+                screenshot = evidence / 'windows' / (scenario + '-connected.png')
+            else:
+                remote('shot', scenario, output=row / 'desktop-shot.log')
+                screenshot = evidence / 'windows' / (scenario + '.png')
             run([str(ROOT / 'scripts/pixels.sh'), str(screenshot), '--assert-pattern'], output=row / 'desktop-pixels.json')
             if result['status'] != 'PASS':
                 failed = True
