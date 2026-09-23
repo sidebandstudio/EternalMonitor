@@ -70,6 +70,7 @@ Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion 
 ; toggle script the tasks invoke (it resolves the VDD device at trigger time).
 Source: "scripts\vdd-tasks-setup.ps1";  DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-tasks-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\vdd-driver-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-toggle.ps1";       DestDir: "{app}\scripts"; Flags: ignoreversion
 #endif
 
@@ -104,8 +105,8 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-remove.ps1"""; Flags: runhidden; RunOnceId: "VddTasksRemove"
 ; Always record this entry to supersede older VddUninstall commands on upgrade.
 ; A Check that returns false at install time leaves the old command in place.
-; The callback checks ownership at uninstall time; the command itself does nothing.
-Filename: "{sys}\cmd.exe"; Parameters: "/c exit 0"; Flags: runhidden waituntilterminated; BeforeInstall: RemoveOwnedVdd; RunOnceId: "VddUninstall"
+; The helper checks ownership when the uninstaller actually runs.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-driver-remove.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "VddUninstall"
 #endif
 
 #ifdef IncludeDriver
@@ -151,33 +152,4 @@ begin
     RaiseException('Could not record Virtual Display Driver installation ownership.');
 end;
 
-function OwnsVdd: Boolean;
-var
-  Directory, Version: String;
-  Recorded: AnsiString;
-begin
-  Result := False;
-  if not ReadVddRegistration(Directory, Version) then exit;
-  if not LoadStringFromFile(ExpandConstant('{app}\driver\installed-by-eternalmonitor.txt'), Recorded) then exit;
-  Result := String(Recorded) = AddBackslash(Directory) + 'unins000.exe' + #13#10 + Version;
-  if not Result then Log('Preserving driver installed or changed outside EternalMonitor.');
-end;
-
-procedure RemoveOwnedVdd;
-var
-  Directory, Version: String;
-  ResultCode: Integer;
-begin
-  if not OwnsVdd then begin
-    Log('Preserving preexisting Virtual Display Driver during uninstall.');
-    exit;
-  end;
-  ReadVddRegistration(Directory, Version);
-  if not Exec(AddBackslash(Directory) + 'unins000.exe',
-      '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE,
-      ewWaitUntilTerminated, ResultCode) then
-    RaiseException('Could not start the owned Virtual Display Driver uninstaller.');
-  if (ResultCode <> 0) and (ResultCode <> 3010) then
-    RaiseException('Virtual Display Driver uninstall failed with exit ' + IntToStr(ResultCode));
-end;
 #endif
