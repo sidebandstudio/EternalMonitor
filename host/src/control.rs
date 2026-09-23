@@ -15,7 +15,7 @@ pub struct SharedControl {
     pub bitrate_bps: Arc<AtomicU32>,
     /// What the encoder should currently produce: the ABR controller's pick,
     /// always <= `bitrate_bps`. The encoder reopens its session when this
-    /// changes (hardware encoders ignore bitrate pokes on an open context).
+    /// changes for hardware encoders. libx264 reconfigures the open context.
     pub abr_current_bps: Arc<AtomicU32>,
     pub target_fps: Arc<AtomicU32>,
     pub client_preferred_fps: Arc<AtomicU32>,

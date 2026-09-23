@@ -71,24 +71,34 @@ impl Converter {
         }
     }
 
-    pub(super) fn convert(&self, source: &Video, output: &mut Video) -> Result<(), String> {
-        let (width, height) = (source.width() as usize, source.height() as usize);
-        if source.format() != Pixel::BGRA
-            || output.format() != Pixel::YUV420P
-            || source.width() != output.width()
-            || source.height() != output.height()
+    pub(super) fn convert(
+        &self,
+        source: &[u8],
+        width: u32,
+        height: u32,
+        row_bytes: usize,
+        output: &mut Video,
+    ) -> Result<(), String> {
+        let (width, height) = (width as usize, height as usize);
+        if output.format() != Pixel::YUV420P
+            || width != output.width() as usize
+            || height != output.height() as usize
             || width < 2
             || height < 2
             || width % 2 != 0
             || height % 2 != 0
+            || row_bytes < width * 4
+            || row_bytes
+                .checked_mul(height)
+                .is_none_or(|size| source.len() < size)
         {
             return Err("vImage requires equal, even BGRA/YUV420P dimensions".into());
         }
         let src = Buffer {
-            data: source.data(0).as_ptr() as *mut c_void,
+            data: source.as_ptr() as *mut c_void,
             width,
             height,
-            row_bytes: source.stride(0),
+            row_bytes,
         };
         let planes = std::array::from_fn::<_, 3, _>(|plane| {
             let row_bytes = output.stride(plane);
@@ -154,7 +164,9 @@ mod tests {
             )
             .unwrap();
             scaler.run(&src, &mut reference).unwrap();
-            converter.convert(&src, &mut output).unwrap();
+            converter
+                .convert(src.data(0), width, height, stride, &mut output)
+                .unwrap();
             for plane in 0..3 {
                 let shift = u32::from(plane != 0);
                 for y in 0..(height >> shift) as usize {
@@ -171,6 +183,57 @@ mod tests {
         }
         let src = Video::new(Pixel::BGRA, 3, 3);
         let mut output = Video::new(Pixel::YUV420P, 3, 3);
-        assert!(converter.convert(&src, &mut output).is_err());
+        assert!(converter
+            .convert(src.data(0), 3, 3, src.stride(0), &mut output)
+            .is_err());
+    }
+
+    #[test]
+    fn packed_capture_pixels_match_padded_input_and_remain_unchanged() {
+        let converter = Converter::new().unwrap();
+        let (width, height) = (642, 362);
+        let mut source = vec![0; width as usize * height as usize * 4];
+        crate::capture::synthetic::render_synthetic_frame(&mut source, width, height, 123);
+        let before = source.clone();
+        let mut packed = Video::new(Pixel::YUV420P, width, height);
+        let mut reference = Video::new(Pixel::YUV420P, width, height);
+        let mut padded = Video::new(Pixel::BGRA, width, height);
+        let row_bytes = width as usize * 4;
+        let stride = padded.stride(0);
+        for y in 0..height as usize {
+            padded.data_mut(0)[y * stride..y * stride + row_bytes]
+                .copy_from_slice(&source[y * row_bytes..(y + 1) * row_bytes]);
+        }
+        converter
+            .convert(&source, width, height, row_bytes, &mut packed)
+            .unwrap();
+        converter
+            .convert(padded.data(0), width, height, stride, &mut reference)
+            .unwrap();
+        assert_eq!(source, before);
+        for plane in 0..3 {
+            let shift = usize::from(plane != 0);
+            for y in 0..height as usize >> shift {
+                let count = width as usize >> shift;
+                let got = &packed.data(plane)[y * packed.stride(plane)..][..count];
+                let want = &reference.data(plane)[y * reference.stride(plane)..][..count];
+                assert_eq!(got, want);
+            }
+        }
+        assert!(converter
+            .convert(
+                &source[..source.len() - 1],
+                width,
+                height,
+                row_bytes,
+                &mut packed
+            )
+            .is_err());
+        assert!(converter
+            .convert(&source, width, height, row_bytes - 1, &mut packed)
+            .is_err());
+        assert!(converter
+            .convert(&source, width, height, usize::MAX, &mut packed)
+            .is_err());
     }
 }

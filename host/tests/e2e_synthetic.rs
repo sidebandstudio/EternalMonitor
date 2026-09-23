@@ -37,6 +37,16 @@ fn init_test_tracing() {
     // Never let a synthetic test claim a physically connected iPad. The USB
     // test replaces this unreachable endpoint with its own loopback listener.
     std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, priority: i32) -> i32;
+        }
+        // Match UDPReceiver's userInteractive queue. Capture and encode already
+        // use this class; a default-priority fake receiver can miss a repair
+        // deadline while those producer threads keep filling its socket.
+        assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
+    }
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

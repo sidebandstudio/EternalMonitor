@@ -198,9 +198,9 @@ LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
     xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES -playPCaudio "$AUDIO")
+APP_PID="${LAUNCH_RESULT##*: }"
+[[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
 if [ "${EM_SOAK:-0}" = 1 ]; then
-    APP_PID="${LAUNCH_RESULT##*: }"
-    [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
     SOURCE=(--host-pid "$HOST_PID")
     if [ -n "$REMOTE_HOST" ]; then SOURCE=(--remote "$ROOT/scripts/win/remote.sh"); fi
     python3 "$ROOT/scripts/soak_sample.py" "${SOURCE[@]}" --app-pid "$APP_PID" \
@@ -239,6 +239,11 @@ until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --m
         echo "FAIL: only $decoded decoded frames after ${TIMEOUT_SECS}s"
         echo "----- app milestones -----"; tail -20 "$APP_LOG"
         echo "----- host log -----"; tail -30 "$HOST_LOG"
+        # Collect only after failure so sampling cannot affect the measured row.
+        # The launch result identifies this simulator app, never another test's app.
+        sample "$APP_PID" 3 10 -file "$OUT/app-stall-stacks.txt" > "$OUT/app-stall-sample.log" 2>&1 || true
+        xcrun simctl spawn "$UDID" log show --style compact --info --last 3m \
+            --predicate 'subsystem == "com.eternal.monitor"' > "$OUT/app-diagnostics.log" 2>&1 || true
         exit 1
     fi
 done

@@ -12,6 +12,12 @@ scripts/win/remote.sh firewall 'D:\AgentWork\Eternal-Monitor\target\release\eter
 scripts/e2e_matrix.sh --real
 ```
 
+Set `EM_SIZE` to the current primary display size for both the real matrix and
+`scripts/soak.sh --real 1800`. It defaults to `1920x1080`; the reference PC's
+current primary display requires `EM_SIZE=3440x1440`. The VDD row uses the
+simulator's advertised size instead. The input row verifies the probe bounds
+against `EM_SIZE` before it starts a host that can inject input.
+
 The session runner refuses an RDP or missing console session. Pattern,
 probe, and host runs require two minutes idle because host startup can
 change the virtual display. Screenshots can run while the console is active.

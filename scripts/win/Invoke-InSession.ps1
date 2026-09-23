@@ -74,6 +74,9 @@ $script | Set-Content -Encoding UTF8 (Join-Path $job 'run.ps1')
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$job\run.ps1`""
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel $RunLevel
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSec) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# Task Scheduler defaults to background priority 7. Interactive capture and
+# input must run at the same Normal priority as an app launched from Explorer.
+$settings.Priority = 4
 Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $task
 Write-Output "EM_JOB=$id"
