@@ -210,6 +210,10 @@ struct Hello2: Equatable {
     var screenPtH: UInt16
     var refreshHz: UInt8
     var deviceName: String
+    var deviceId: UInt64 = 0
+    var preferredFPS: UInt8 = 0
+    var authToken = Data(repeating: 0, count: 16)
+    var pairingCode: UInt32 = 0
 }
 
 enum HelloStatus: UInt8 {
@@ -221,6 +225,7 @@ enum HelloStatus: UInt8 {
 
 struct HelloAck: Equatable {
     static let hostCapNack: UInt16 = 1 << 0
+    static let hostCapUSB: UInt16 = 1 << 2
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -368,6 +373,13 @@ extension Wire {
             body.append(h.refreshHz)
             body.append(UInt8(name.count))
             body.append(name)
+            precondition(h.authToken.count == 16)
+            if h.deviceId != 0 || h.preferredFPS != 0 || h.authToken.contains(where: { $0 != 0 }) || h.pairingCode != 0 {
+                body.appendLE(h.deviceId)
+                body.append(h.preferredFPS)
+                body.append(h.authToken)
+                body.appendLE(h.pairingCode)
+            }
         case .helloAck(let a):
             let name = Data(a.hostName.utf8).prefixOnCharBoundary(a.hostName, max: Hello2.maxNameLength)
             body.append(a.status.rawValue)
@@ -544,12 +556,21 @@ extension Wire {
               let refreshHz = r.readU8(),
               let deviceName = r.readName()
         else { return nil }
-        return .hello2(Hello2(
+        var hello = Hello2(
             protoMin: protoMin, protoMax: protoMax, clientNonce: clientNonce,
             listenPort: listenPort, decoderCaps: decoderCaps, featureCaps: featureCaps,
             screenPxW: screenPxW, screenPxH: screenPxH,
             screenPtW: screenPtW, screenPtH: screenPtH,
-            refreshHz: refreshHz, deviceName: deviceName))
+            refreshHz: refreshHz, deviceName: deviceName)
+        if r.remaining >= 29 {
+            guard let deviceId = r.readU64(), let fps = r.readU8(),
+                  let token = r.take(16), let code = r.readU32() else { return nil }
+            hello.deviceId = deviceId
+            hello.preferredFPS = fps
+            hello.authToken = Data(token)
+            hello.pairingCode = code
+        }
+        return .hello2(hello)
     }
 
     private static func parseHelloAck(_ r: inout WireReader) -> ControlMessage? {

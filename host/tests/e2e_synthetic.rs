@@ -58,6 +58,160 @@ const SYNTH_H: u32 = 360;
 const WANT_DECODED_FRAMES: usize = 30;
 const DEADLINE: Duration = Duration::from_secs(30);
 
+#[test]
+fn usb_framed_stream_end_to_end() {
+    use eternal_host::stats::PIPELINE_STATS;
+    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_wire::v2::control::HOSTCAP_USB;
+    use std::sync::atomic::Ordering;
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Leave the port closed initially to exercise the direct-link retry path.
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    std::env::set_var("ETERNAL_USB_DIRECT", address.to_string());
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+        stream.set_nodelay(true).unwrap();
+        socket2::SockRef::from(&stream).set_recv_buffer_size(32 * 1024).unwrap();
+        read_preamble(&mut stream).await.unwrap();
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2, proto_max: 2, client_nonce: 1, listen_port: 0,
+            decoder_caps: CAP_DECODE_H264, feature_caps: 0,
+            screen_px_w: SYNTH_W as u16, screen_px_h: SYNTH_H as u16,
+            screen_pt_w: SYNTH_W as u16, screen_pt_h: SYNTH_H as u16,
+            refresh_hz: 60, device_name: "USB E2E iPad".into(),
+            device_id: 77, preferred_fps: 60, auth_token: [0; 16], pairing_code: 0,
+        });
+        write_datagram(&mut stream, &encode_control(0, 1, &hello)).await.unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+        let (_, ControlMessage::HelloAck(ack)) = parse_control(&ack).unwrap() else { panic!("expected USB HELLO_ACK"); };
+        assert_eq!(ack.status, HelloStatus::Ok);
+        assert_ne!(ack.session_id, 0);
+        assert_ne!(ack.host_caps & HOSTCAP_USB, 0);
+        assert!(!shared.session.lock().client_supports_nack());
+
+        let mut reassembler = Reassembler::new();
+        let mut decoder = H264TestDecoder::new();
+        let started = Instant::now();
+        let mut last_report = Instant::now();
+        let mut msg_seq = 1;
+        let mut decoded = 0;
+        let mut after_recovery = 0;
+        let mut heartbeats = 0;
+        let mut resumed = None;
+        let mut recovered = false;
+        let mut recovery_ms = 0;
+        let mut highest_seq = 0;
+        let mut epoch = ack.stream_config.stream_epoch;
+        while after_recovery < 30 || heartbeats == 0 {
+            assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
+            if decoded >= 30 && resumed.is_none() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                resumed = Some(Instant::now());
+            }
+            if last_report.elapsed() >= Duration::from_millis(300) {
+                last_report = Instant::now();
+                msg_seq += 1;
+                let report = ControlMessage::ReceiverReport(ReceiverReport {
+                    stream_epoch: epoch, highest_seq, frames_complete: decoded,
+                    decode_fps_x10: 600, ..ReceiverReport::default()
+                });
+                write_datagram(&mut stream, &encode_control(ack.session_id, msg_seq, &report)).await.unwrap();
+            }
+            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+            match classify(&bytes) {
+                Classified::Control(_) => if matches!(parse_control(&bytes), Ok((_, ControlMessage::Heartbeat(_)))) { heartbeats += 1; },
+                Classified::Media { .. } => {
+                    let (header, payload) = MediaHeader::decode(&bytes).unwrap();
+                    assert_eq!(header.session_id, ack.session_id);
+                    assert!(!header.is_retransmit);
+                    highest_seq = header.frame_seq;
+                    epoch = header.stream_epoch;
+                    if let AddOutcome::Completed(frame) = reassembler.add_fragment(header.frame_seq,
+                        header.frag_index, header.frag_count, header.stream_epoch, payload, Instant::now()) {
+                        let age_us = eternal_host::clock::host_now_us().saturating_sub(header.capture_ts_us);
+                        if let Some(resumed) = resumed {
+                            if !recovered && header.is_keyframe && age_us <= 100_000 {
+                                recovered = true;
+                                recovery_ms = resumed.elapsed().as_millis();
+                                assert!(recovery_ms <= 100, "USB recovery took {recovery_ms} ms");
+                            }
+                        }
+                        let frames = decoder.decode(&frame);
+                        for counter in &frames {
+                            assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
+                        }
+                        decoded += frames.len() as u32;
+                        if recovered && !frames.is_empty() {
+                            assert!(age_us <= 100_000, "USB retained stale video after recovery: {age_us} us");
+                            after_recovery += frames.len();
+                        }
+                    }
+                }
+                _ => panic!("unexpected USB packet"),
+            }
+        }
+        let dropped = PIPELINE_STATS.lock().usb_frames_dropped;
+        assert!(dropped > 0, "a 500 ms read stall must overflow the video queue");
+        assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
+        eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
+        drop(stream);
+        let disconnected = Instant::now();
+        while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!shared.client_connected(), "tunnel EOF must release the session");
+        assert!(shared.running.load(Ordering::SeqCst));
+    })
+    }));
+    shared.stop();
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("USB host shutdown");
+    std::env::remove_var("ETERNAL_USB_DIRECT");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn free_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
@@ -143,6 +297,10 @@ impl FakeReceiver {
             screen_pt_h: 834,
             refresh_hz: 120,
             device_name: "E2E fake iPad".to_string(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         });
         let hello_bytes = encode_control(0, 1, &hello);
 

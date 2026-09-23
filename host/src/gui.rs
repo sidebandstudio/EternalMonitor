@@ -72,6 +72,10 @@ struct StatsSnapshot {
     transport_bytes_sent: u64,
     transport_packets_sent: u64,
     transport_fragments_sent: u64,
+    usb_service_reachable: bool,
+    usb_devices: usize,
+    usb_link_state: String,
+    usb_frames_dropped: u64,
     target_addr: String,
     latency_ms: f64,
     bandwidth_mbps: f64,
@@ -102,6 +106,10 @@ impl StatsSnapshot {
             transport_bytes_sent: s.transport_bytes_sent,
             transport_packets_sent: s.transport_packets_sent,
             transport_fragments_sent: s.transport_fragments_sent,
+            usb_service_reachable: s.usb_service_reachable,
+            usb_devices: s.usb_devices,
+            usb_link_state: s.usb_link_state.clone(),
+            usb_frames_dropped: s.usb_frames_dropped,
             target_addr: s.target_addr.clone(),
             latency_ms: s.latency_ms,
             bandwidth_mbps: s.bandwidth_mbps,
@@ -489,6 +497,9 @@ impl AnalyzerApp {
             );
         });
 
+        ui.add_space(12.0);
+
+        usb_card(ui, snap);
         ui.add_space(12.0);
 
         // ── Live readouts ────────────────────────────────────────────────────
@@ -1611,4 +1622,99 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     )
+}
+
+fn usb_card(ui: &mut egui::Ui, snap: &StatsSnapshot) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_header(ui, "USB connection");
+        stat_row(
+            ui,
+            "Apple device service",
+            if snap.usb_service_reachable {
+                "Available"
+            } else {
+                "Unavailable"
+            },
+        );
+        if snap.usb_service_reachable {
+            stat_row(ui, "Connected devices", &snap.usb_devices.to_string());
+            stat_row(ui, "Connection", &snap.usb_link_state);
+            stat_row(ui, "Frames dropped", &snap.usb_frames_dropped.to_string());
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Install the Apple Devices app from the Microsoft Store (or iTunes) to use USB",
+                )
+                .color(MUTED2)
+                .size(11.0),
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn painted_text(shape: &egui::epaint::Shape, output: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                output.push_str(&text.galley.job.text);
+                output.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    painted_text(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn usb_card_shows_install_hint_only_when_the_service_is_unavailable() {
+        let mut snapshot = StatsSnapshot::take();
+        for available in [false, true] {
+            snapshot.usb_service_reachable = available;
+            snapshot.usb_devices = 2;
+            snapshot.usb_link_state = "Connected".into();
+            snapshot.usb_frames_dropped = 17;
+            let context = egui::Context::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| usb_card(ui, &snapshot));
+                },
+            );
+            let mut text = String::new();
+            for clipped in &output.shapes {
+                painted_text(&clipped.shape, &mut text);
+            }
+            assert!(text.contains("USB CONNECTION"), "{text}");
+            if available {
+                assert!(
+                    text.contains("Available")
+                        && text.contains("Connected devices")
+                        && text.contains("Connected"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("Frames dropped") && text.contains("17"),
+                    "{text}"
+                );
+                assert!(!text.contains("Install the Apple Devices"));
+            } else {
+                assert!(text.contains("Unavailable"), "{text}");
+                assert!(text.contains("Install the Apple Devices app from the Microsoft Store (or iTunes) to use USB"), "{text}");
+                assert!(!text.contains("Connected devices"));
+            }
+        }
+    }
 }

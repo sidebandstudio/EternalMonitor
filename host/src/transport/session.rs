@@ -8,6 +8,8 @@
 //! sockets.
 
 use std::net::SocketAddr;
+
+use super::link::{LinkId, PeerId};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
@@ -20,6 +22,7 @@ use tracing::{info, warn};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 pub const REPORT_INTERVAL_MS: u16 = 500;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
+const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -27,10 +30,10 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(Debug, Default)]
 pub struct Actions {
     /// Serialized control datagrams to send, with their destination.
-    pub replies: Vec<(SocketAddr, Vec<u8>)>,
+    pub replies: Vec<(PeerId, Vec<u8>)>,
     /// The media target changed (new session or takeover): update
     /// `SharedControl::target_addr` and reset connection stats.
-    pub new_target: Option<SocketAddr>,
+    pub new_target: Option<PeerId>,
     /// Ask the encoder for an IDR (new/superseded session, keyframe request).
     pub force_idr: bool,
     /// The client is gone (BYE or liveness expiry): stop sending media and, if
@@ -50,6 +53,7 @@ pub struct Actions {
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
     pub device_name: String,
+    pub device_id: u64,
     pub screen_px: (u16, u16),
     pub refresh_hz: u8,
     pub decoder_caps: u16,
@@ -60,9 +64,10 @@ pub struct ClientInfo {
 struct ActiveSession {
     session_id: u32,
     client_nonce: u32,
-    peer: SocketAddr,
+    peer: PeerId,
     info: ClientInfo,
     liveness_deadline: Instant,
+    awaiting_takeover: bool,
     last_keyframe_grant: Option<Instant>,
     last_report: Option<ReceiverReport>,
     msg_seq_out: u32,
@@ -72,6 +77,9 @@ struct ActiveSession {
 pub trait ConfigSource {
     fn stream_config(&self) -> StreamConfig;
     fn host_name(&self) -> String;
+    fn host_caps(&self) -> u16 {
+        0
+    }
 }
 
 pub struct Session {
@@ -99,7 +107,21 @@ impl Session {
         self.active.as_ref().map(|s| s.session_id)
     }
 
-    pub fn peer(&self) -> Option<SocketAddr> {
+    pub fn link_lost(&mut self, link: LinkId) -> Actions {
+        let lost = self
+            .active
+            .as_ref()
+            .is_some_and(|session| session.peer.link == link);
+        if lost {
+            self.active = None;
+        }
+        Actions {
+            client_lost: lost,
+            ..Actions::default()
+        }
+    }
+
+    pub fn peer(&self) -> Option<PeerId> {
         self.active.as_ref().map(|s| s.peer)
     }
 
@@ -116,9 +138,9 @@ impl Session {
     }
 
     pub fn client_supports_nack(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|s| s.info.feature_caps & FEATURE_SUPPORTS_NACK != 0)
+        self.active.as_ref().is_some_and(|s| {
+            s.peer.link == LinkId::Udp && s.info.feature_caps & FEATURE_SUPPORTS_NACK != 0
+        })
     }
 
     pub fn last_report(&self) -> Option<ReceiverReport> {
@@ -146,7 +168,7 @@ impl Session {
     /// session's. `now` is injected for testability.
     pub fn handle_control(
         &mut self,
-        source: SocketAddr,
+        source: PeerId,
         header_session_id: u32,
         message: ControlMessage,
         config: &impl ConfigSource,
@@ -162,13 +184,14 @@ impl Session {
         // down the one that replaced it.
         if !matches!(message, ControlMessage::Hello2(_)) {
             match self.active.as_ref() {
-                Some(session) if session.session_id == header_session_id => {}
+                Some(session)
+                    if session.session_id == header_session_id && !session.awaiting_takeover => {}
                 _ => return Actions::default(),
             }
         }
         match message {
             ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
-            ControlMessage::Bye(reason) => self.handle_bye(source, reason),
+            ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
@@ -183,7 +206,7 @@ impl Session {
     #[cfg(test)]
     fn handle_control_authed(
         &mut self,
-        source: SocketAddr,
+        source: PeerId,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
@@ -192,7 +215,7 @@ impl Session {
         self.handle_control(source, id, message, config, now)
     }
 
-    fn handle_input(&mut self, source: SocketAddr, event: InputEvent, now: Instant) -> Actions {
+    fn handle_input(&mut self, source: PeerId, event: InputEvent, now: Instant) -> Actions {
         let mut actions = Actions::default();
         let Some(session) = self.active.as_mut() else {
             return actions;
@@ -211,12 +234,13 @@ impl Session {
         actions
     }
 
-    fn handle_nack(&mut self, source: SocketAddr, nack: Nack, now: Instant) -> Actions {
+    fn handle_nack(&mut self, source: PeerId, nack: Nack, now: Instant) -> Actions {
         let mut actions = Actions::default();
         let Some(session) = self.active.as_mut() else {
             return actions;
         };
         if !session_peer_matches(session, source)
+            || session.peer.link != LinkId::Udp
             || session.info.feature_caps & FEATURE_SUPPORTS_NACK == 0
             || nack.validate().is_err()
         {
@@ -229,7 +253,7 @@ impl Session {
 
     fn handle_hello(
         &mut self,
-        source: SocketAddr,
+        source: PeerId,
         hello: eternal_wire::v2::control::Hello2,
         config: &impl ConfigSource,
         now: Instant,
@@ -250,16 +274,28 @@ impl Session {
 
         // The media target: the client's advertised listen port at its source IP
         // (normally identical to the source port; 0 = malformed, use the source).
-        let media_port = if hello.listen_port != 0 {
-            hello.listen_port
-        } else {
-            source.port()
+        let media_target = PeerId {
+            link: source.link,
+            addr: source.addr.map(|addr| {
+                SocketAddr::new(
+                    addr.ip(),
+                    if hello.listen_port != 0 {
+                        hello.listen_port
+                    } else {
+                        addr.port()
+                    },
+                )
+            }),
         };
-        let media_target = SocketAddr::new(source.ip(), media_port);
 
         if let Some(session) = self.active.as_ref() {
-            if session.info_matches_peer(source) {
-                if session.client_nonce == hello.client_nonce {
+            if session.same_device(source, hello.device_id) {
+                if matches!(session.peer.link, LinkId::Usb { .. }) && source.link == LinkId::Udp {
+                    let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
+                    actions.replies.push((source, ack));
+                    return actions;
+                }
+                if session.client_nonce == hello.client_nonce && session.peer.link == source.link {
                     // Pure retransmit: re-send the identical ACK.
                     let (session_id, nonce) = (session.session_id, session.client_nonce);
                     let ack = self.make_ack(HelloStatus::Ok, nonce, session_id, config);
@@ -291,6 +327,7 @@ impl Session {
             peer: source,
             info: ClientInfo {
                 device_name: hello.device_name.clone(),
+                device_id: hello.device_id,
                 screen_px: (hello.screen_px_w, hello.screen_px_h),
                 refresh_hz: hello.refresh_hz,
                 decoder_caps: hello.decoder_caps,
@@ -298,6 +335,7 @@ impl Session {
                 connected_at: now,
             },
             liveness_deadline: now + LIVENESS_TIMEOUT,
+            awaiting_takeover: false,
             last_keyframe_grant: None,
             last_report: None,
             msg_seq_out: 0,
@@ -310,15 +348,27 @@ impl Session {
         actions
     }
 
-    fn handle_bye(&mut self, source: SocketAddr, reason: ByeReason) -> Actions {
+    fn handle_bye(&mut self, source: PeerId, reason: ByeReason, now: Instant) -> Actions {
         let mut actions = Actions::default();
-        let Some(session) = self.active.as_ref() else {
+        let Some(session) = self.active.as_mut() else {
             return actions;
         };
-        if !session.info_matches_peer(source) {
+        if !session_peer_matches(session, source) {
             return actions;
         }
         info!(peer = %source, ?reason, "Client said goodbye");
+        if reason == ByeReason::Superseded
+            && source.link == LinkId::Udp
+            && session.info.device_id != 0
+        {
+            // WiFi BYE and USB HELLO travel on different links and may arrive
+            // in either order. Retain the display until the same device takes
+            // over, with a short deadline if the new link never handshakes.
+            session.awaiting_takeover = true;
+            session.liveness_deadline = now + USB_TAKEOVER_TIMEOUT;
+            info!(peer = %source, "Awaiting USB takeover after WiFi goodbye");
+            return actions;
+        }
         self.active = None;
         actions.client_lost = true;
         actions
@@ -326,7 +376,7 @@ impl Session {
 
     fn handle_keyframe(
         &mut self,
-        source: SocketAddr,
+        source: PeerId,
         request: KeyframeRequest,
         now: Instant,
     ) -> Actions {
@@ -352,12 +402,7 @@ impl Session {
         actions
     }
 
-    fn handle_report(
-        &mut self,
-        source: SocketAddr,
-        report: ReceiverReport,
-        now: Instant,
-    ) -> Actions {
+    fn handle_report(&mut self, source: PeerId, report: ReceiverReport, now: Instant) -> Actions {
         let mut actions = Actions::default();
         if let Some(session) = self.active.as_mut() {
             if session_peer_matches(session, source) {
@@ -371,7 +416,7 @@ impl Session {
 
     fn handle_ping(
         &mut self,
-        source: SocketAddr,
+        source: PeerId,
         ping: eternal_wire::v2::control::Ping,
         now: Instant,
     ) -> Actions {
@@ -442,10 +487,7 @@ impl Session {
 
     /// One STREAM_CONFIG notify for the active client (bitrate/fps/resolution
     /// changed). The heartbeat's embedded config self-heals if this is lost.
-    pub fn stream_config_notify(
-        &mut self,
-        config: &impl ConfigSource,
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn stream_config_notify(&mut self, config: &impl ConfigSource) -> Vec<(PeerId, Vec<u8>)> {
         let Some(session) = self.active.as_ref() else {
             return Vec::new();
         };
@@ -461,7 +503,7 @@ impl Session {
 
     /// A legacy (v0.1.x) ETERNALHELLO arrived: no wire reply — the old app
     /// can't parse anything we'd send — but tell the user what happened.
-    pub fn note_legacy_hello(&mut self, source: SocketAddr) {
+    pub fn note_legacy_hello(&mut self, source: PeerId) {
         if !self.legacy_client_warned {
             self.legacy_client_warned = true;
             warn!(
@@ -491,22 +533,25 @@ impl Session {
             stream_config: config.stream_config(),
             host_name: config.host_name(),
             auth_token: [0; 16],
-            host_caps: HOSTCAP_NACK,
+            host_caps: HOSTCAP_NACK | config.host_caps(),
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
     }
 }
 
 impl ActiveSession {
-    fn info_matches_peer(&self, source: SocketAddr) -> bool {
-        // Same device = same IP. The source PORT may change across app
-        // relaunches (ephemeral binds), which must supersede, not reject.
-        self.peer.ip() == source.ip()
+    fn same_device(&self, source: PeerId, device_id: u64) -> bool {
+        if self.info.device_id != 0 && device_id != 0 {
+            self.info.device_id == device_id
+        } else {
+            session_peer_matches(self, source)
+        }
     }
 }
 
-fn session_peer_matches(session: &ActiveSession, source: SocketAddr) -> bool {
-    session.peer.ip() == source.ip()
+fn session_peer_matches(session: &ActiveSession, source: PeerId) -> bool {
+    session.peer.link == source.link
+        && session.peer.addr.map(|a| a.ip()) == source.addr.map(|a| a.ip())
 }
 
 #[cfg(test)]
@@ -548,11 +593,187 @@ mod tests {
             screen_pt_h: 834,
             refresh_hz: 120,
             device_name: "Test iPad".to_string(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         })
     }
 
-    fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
-        SocketAddr::from((ip, port))
+    fn addr(ip: [u8; 4], port: u16) -> PeerId {
+        PeerId::udp(SocketAddr::from((ip, port)))
+    }
+
+    fn identified_hello(nonce: u32, device_id: u64) -> ControlMessage {
+        let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
+            unreachable!()
+        };
+        hello.device_id = device_id;
+        hello.feature_caps = FEATURE_SUPPORTS_NACK;
+        ControlMessage::Hello2(hello)
+    }
+
+    #[test]
+    fn same_device_takes_over_usb_and_ignores_late_wifi_messages() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        let usb = PeerId::usb(17);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        let wifi_id = session.session_id().unwrap();
+        assert!(session.client_supports_nack());
+        let takeover = session.handle_control(usb, 0, identified_hello(1, 77), &TestConfig, now);
+        assert_eq!(takeover.new_target, Some(usb));
+        assert!(takeover.force_idr);
+        let usb_id = session.session_id().unwrap();
+        assert_ne!(
+            usb_id, wifi_id,
+            "the same nonce on a new link creates a new session"
+        );
+        assert!(!session.client_supports_nack());
+        for id in [wifi_id, usb_id] {
+            let late = session.handle_control(
+                wifi,
+                id,
+                ControlMessage::Bye(ByeReason::UserDisconnect),
+                &TestConfig,
+                now,
+            );
+            assert!(!late.client_lost);
+            assert_eq!(session.peer(), Some(usb));
+        }
+        let duplicate = session.handle_control(usb, 0, identified_hello(1, 77), &TestConfig, now);
+        assert!(duplicate.new_target.is_none());
+        assert_eq!(parse_ack(&duplicate.replies[0].1).session_id, usb_id);
+        let wifi_retry = session.handle_control(wifi, 0, identified_hello(2, 77), &TestConfig, now);
+        assert_eq!(
+            parse_ack(&wifi_retry.replies[0].1).status,
+            HelloStatus::Busy
+        );
+        assert!(!session.link_lost(LinkId::Udp).client_lost);
+        assert!(session.link_lost(usb.link).client_lost);
+        let fallback = session.handle_control(wifi, 0, identified_hello(3, 77), &TestConfig, now);
+        assert_eq!(fallback.new_target, Some(wifi));
+    }
+
+    #[test]
+    fn identified_foreign_device_is_busy_even_on_the_same_ip() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        for source in [wifi, PeerId::usb(17)] {
+            let foreign =
+                session.handle_control(source, 0, identified_hello(2, 88), &TestConfig, now);
+            assert_eq!(parse_ack(&foreign.replies[0].1).status, HelloStatus::Busy);
+            assert!(foreign.new_target.is_none());
+        }
+        let new_ip = addr([10, 0, 0, 6], 50000);
+        let same_device =
+            session.handle_control(new_ip, 0, identified_hello(3, 77), &TestConfig, now);
+        assert_eq!(same_device.new_target, Some(new_ip));
+    }
+
+    #[test]
+    fn wifi_goodbye_preserves_the_display_until_usb_takes_over() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        let usb = PeerId::usb(17);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        let wifi_id = session.session_id().unwrap();
+        let bye = session.handle_control(
+            wifi,
+            wifi_id,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &TestConfig,
+            now,
+        );
+        assert!(!bye.client_lost);
+        assert_eq!(session.peer(), Some(wifi));
+        let later = now + USB_TAKEOVER_TIMEOUT / 2;
+        let foreign = session.handle_control(usb, 0, identified_hello(2, 88), &TestConfig, later);
+        assert_eq!(parse_ack(&foreign.replies[0].1).status, HelloStatus::Busy);
+        let takeover = session.handle_control(usb, 0, identified_hello(2, 77), &TestConfig, later);
+        assert_eq!(takeover.new_target, Some(usb));
+        assert!(takeover.force_idr);
+        assert!(!takeover.client_lost);
+        assert_ne!(session.session_id(), Some(wifi_id));
+        assert!(
+            !session
+                .tick(&TestConfig, false, now + USB_TAKEOVER_TIMEOUT)
+                .client_lost
+        );
+    }
+
+    #[test]
+    fn missing_usb_takeover_expires_and_late_wifi_traffic_cannot_extend_it() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.handle_control(
+            wifi,
+            id,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &TestConfig,
+            now,
+        );
+        let late = session.handle_control(
+            wifi,
+            id,
+            ControlMessage::ReceiverReport(ReceiverReport::default()),
+            &TestConfig,
+            now + USB_TAKEOVER_TIMEOUT / 2,
+        );
+        assert!(late.report.is_none());
+        let expired = session.tick(&TestConfig, false, now + USB_TAKEOVER_TIMEOUT);
+        assert!(expired.client_lost);
+        assert!(!session.is_active());
+        for (peer, device_id, reason) in [
+            (wifi, 0, ByeReason::Superseded),
+            (wifi, 77, ByeReason::UserDisconnect),
+            (PeerId::usb(17), 77, ByeReason::Superseded),
+        ] {
+            session.handle_control(peer, 0, identified_hello(2, device_id), &TestConfig, now);
+            let bye =
+                session.handle_control_authed(peer, ControlMessage::Bye(reason), &TestConfig, now);
+            assert!(
+                bye.client_lost,
+                "grace only applies to an identified WiFi takeover"
+            );
+            assert!(!session.is_active());
+        }
+    }
+
+    #[test]
+    fn legacy_identity_stays_on_its_link_and_usb_never_requests_retransmits() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        session.handle_control(
+            addr([10, 0, 0, 5], 50000),
+            0,
+            hello(1, 50000),
+            &TestConfig,
+            now,
+        );
+        let usb = PeerId::usb(17);
+        let unknown = session.handle_control(usb, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&unknown.replies[0].1).status, HelloStatus::Busy);
+        session.link_lost(LinkId::Udp);
+        session.handle_control(usb, 0, identified_hello(3, 77), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        let nack = ControlMessage::Nack(Nack {
+            stream_epoch: 7,
+            frame_seq: 42,
+            frag_count: 1,
+            missing: vec![0],
+        });
+        assert!(session
+            .handle_control(usb, id, nack, &TestConfig, now)
+            .retransmit
+            .is_none());
     }
 
     fn parse_ack(bytes: &[u8]) -> HelloAck {
@@ -720,6 +941,10 @@ mod tests {
             screen_pt_h: 1,
             refresh_hz: 60,
             device_name: String::new(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
         });
         let actions = session.handle_control_authed(peer, msg, &TestConfig, now);
         assert_eq!(
