@@ -10,19 +10,18 @@ final class AudioStreamTests: XCTestCase {
         app.launch()
         let hud = app.buttons["display.hud"]
         XCTAssertTrue(hud.waitForExistence(timeout: 10))
-        waitForLabel(hud, containing: "PC audio playing")
-        app.buttons["display.settings"].tap()
-        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
+        waitForHUD(app, containing: "PC audio playing")
+        openSettings(app)
         let toggle = app.switches["settings.playPCaudio"]
         XCTAssertTrue(toggle.exists)
         XCTAssertEqual(toggle.value as? String, "1")
         pressSwitch(toggle)
         waitForValue(toggle, value: "0")
         app.buttons["settings.done"].tap()
-        waitForLabel(hud, containing: "PC audio muted or unavailable")
-        XCTAssertTrue(app.buttons["display.disconnect"].exists)
+        waitForHUD(app, containing: "PC audio muted or unavailable")
+        XCTAssertTrue(control("display.disconnect", in: app).exists)
         capture("audio-muted-hud", app: app)
-        app.buttons["display.settings"].tap()
+        openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         pressSwitch(toggle)
         waitForValue(toggle, value: "1")
@@ -34,16 +33,51 @@ final class AudioStreamTests: XCTestCase {
         waitForExpectations(timeout: 5)
         capture("audio-host-stream", app: app)
         app.buttons["settings.done"].tap()
-        waitForLabel(hud, containing: "PC audio playing")
+        waitForHUD(app, containing: "PC audio playing")
         capture("audio-playing-hud", app: app)
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        let host = app.textFields["connect.host"]
+        for _ in 0..<2 where !host.exists {
+            control("display.disconnect", in: app).tap()
+            _ = host.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(host.exists)
         app.terminate()
     }
 
-    private func waitForLabel(_ element: XCUIElement, containing text: String) {
-        expectation(for: NSPredicate(format: "label CONTAINS %@", text), evaluatedWith: element)
-        waitForExpectations(timeout: 10)
+    // Display controls fade five seconds after they appear, sooner than a
+    // busy runner may finish waiting for audio. Bring them back with the
+    // user's three-finger gesture instead of racing the fade.
+    private func revealControls(_ app: XCUIApplication, showing element: XCUIElement) {
+        if !(element.exists && element.isHittable) {
+            app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        }
+    }
+
+    private func control(_ identifier: String, in app: XCUIApplication) -> XCUIElement {
+        let control = app.buttons[identifier]
+        revealControls(app, showing: control)
+        XCTAssertTrue(control.waitForExistence(timeout: 5))
+        return control
+    }
+
+    private func waitForHUD(_ app: XCUIApplication, containing text: String) {
+        let hud = app.buttons["display.hud"]
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            revealControls(app, showing: hud)
+            if hud.waitForExistence(timeout: 2), hud.label.contains(text) { return }
+        }
+        XCTFail("HUD never showed \"\(text)\": \(hud.exists ? hud.label : "hidden")")
+    }
+
+    // A tap can still land just after the controls fade on a slow runner.
+    private func openSettings(_ app: XCUIApplication) {
+        let settings = app.navigationBars["Settings"]
+        for _ in 0..<2 where !settings.exists {
+            control("display.settings", in: app).tap()
+            _ = settings.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(settings.exists)
     }
 
     private func waitForValue(_ element: XCUIElement, value: String) {
