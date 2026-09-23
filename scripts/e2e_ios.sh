@@ -45,8 +45,42 @@ MONITOR_PID=""
 PROXY_PID=""
 PROFILE_PID=""
 SOAK_PID=""
+APP_PID=""
 UDID=""
 INSTALL_DIR=""
+# CoreSimulator can stall `simctl terminate` indefinitely while other
+# simulators are busy, holding the next row behind a finished measurement.
+bounded() {
+    local limit=$1 ticks=0 pid
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$ticks" -ge $((limit * 4)) ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            echo "Timed out after ${limit}s: $*" >&2
+            return 124
+        fi
+        sleep 0.25
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
+# Stop the exact app process this run launched, never another simulator's.
+stop_app() {
+    if [ -n "$APP_PID" ] && ps -ww -o command= -p "$APP_PID" 2>/dev/null \
+        | grep -q "/Devices/$UDID/.*/EternalMonitor.app/EternalMonitor"; then
+        kill -TERM "$APP_PID" 2>/dev/null || true
+        for _ in $(seq 20); do
+            kill -0 "$APP_PID" 2>/dev/null || return 0
+            sleep 0.25
+        done
+        kill -KILL "$APP_PID" 2>/dev/null || true
+        return 0
+    fi
+    bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+}
 cleanup() {
     status=$?
     trap - EXIT
@@ -59,7 +93,7 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
-    [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+    [ -n "$UDID" ] && stop_app
     # The live log is a hard link into the app container. Detach the retained
     # copy before another test launch truncates the simulator's log in place.
     if [ -f "$APP_LOG" ]; then
@@ -143,7 +177,7 @@ else
     ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
     xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
 fi
-xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 
 # Read the app's identical milestone mirror directly. Streaming the complete
 # simulator log through diagnosticd can consume a CPU on small hosted runners.
