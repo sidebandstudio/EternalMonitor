@@ -28,6 +28,10 @@ fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
     audio.error = None;
     let (text, _) = audio_summary(&audio, false);
     assert!(text.starts_with("Off."), "{text}");
+
+    let (text, color) = audio_summary(&crate::audio::AudioStats::default(), true);
+    assert_eq!(text, "Starts when an iPad connects.");
+    assert_eq!(color, TEXT_MUTED);
 }
 
 #[test]

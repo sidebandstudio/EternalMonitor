@@ -719,6 +719,10 @@ pub(super) fn audio_summary(
             ACCENT,
         );
     }
+    // The audio stage's idle status names the protocol, not the device.
+    if audio.status == "Waiting for client" {
+        return ("Starts when an iPad connects.".into(), TEXT_MUTED);
+    }
     if audio.device.is_empty() {
         (value_or_unknown(&audio.status).to_string(), TEXT_MUTED)
     } else {
