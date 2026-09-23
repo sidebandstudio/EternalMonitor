@@ -6,6 +6,8 @@ Use your iPad as a second display for Windows, with WiFi or USB and input relay.
 [![Release](https://img.shields.io/github/v/release/whoisaldo/EternalMonitor?labelColor=111&color=e8ff47)](https://github.com/whoisaldo/EternalMonitor/releases/latest)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
 
+![The EternalMonitor Windows app streaming to an iPad Pro](docs/assets/og.png)
+
 A Rust host on the PC captures the desktop with DXGI, encodes on the GPU
 (NVENC/AMF/QSV, H.264 or opt-in HEVC), and streams over UDP on the local
 network or a framed USB tunnel through Apple's device service. A native Swift
@@ -199,9 +201,9 @@ docs/       eternalmonitor.dev website (GitHub Pages)
   networks. The host window shows the address and a QR code.
 - Choppy video: compare capture/encode/decode FPS, loss, repairs and jitter.
   Try 5 GHz or a wired PC, then check encoder fallback and CPU/GPU load.
-- "H.264 (x264)" on the Stream tab means the hardware encoder failed to
-  open and the host fell back to CPU encoding. Update GPU drivers and
-  restart the stream.
+- A "Hardware encoder unavailable" banner on the Stream page means the
+  hardware encoder failed to open and the host fell back to CPU encoding.
+  Update GPU drivers and restart the stream.
 - Version mismatch: protocol v2 is a clean break. A v0.1.x app or host
   shows a clear "update the other side" message instead of streaming.
 

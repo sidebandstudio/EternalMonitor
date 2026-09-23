@@ -132,8 +132,8 @@ older builds is not a supported beta-test configuration.
 ## Extended display vs mirror
 
 By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop:
-**connect the iPad first**, then open Settings → Capture display, choose **"Extended display
-(iPad)"**, and click Restart stream. Dragging a window past the edge of the main screen should
+**connect the iPad first**, then on the host's Stream page set **Display** to **"Extended display
+(iPad)"** (also under Settings → Display to stream) and click **Restart now**. Dragging a window past the edge of the main screen should
 land it on the iPad. The virtual monitor is created **on demand and only while the iPad is
 connected** — there is intentionally no second display when idle, so don't expect to see it in
 Windows Display settings before connecting. If the extended display can't start, the host shows an
@@ -196,7 +196,7 @@ video is not proof that the requested hardware encoder worked.
 
 1. GPU, active codec/input format, capture display/resolution, both versions,
    iPad model/iPadOS, WiFi/USB and requested/effective FPS.
-2. Copy logs from the host Stream tab, or collect
+2. Copy logs from the host's Performance page, or collect
    `%APPDATA%\EternalMonitor\logs\eternal-host-session.log` and `.1`/`.2`.
 3. App diagnostics and a recording or screenshot of the visible failure.
 4. For an AMF H.264 investigation, explicitly enable `ETERNAL_AMF_DIAG=1` before

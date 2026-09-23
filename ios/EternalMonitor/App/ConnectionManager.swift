@@ -462,11 +462,11 @@ final class ConnectionManager: ObservableObject {
                 }
                 switch status {
                 case .busy:
-                    self.connectionError = "The host is busy with another device."
+                    self.connectionError = "Your PC is already streaming to another device."
                 case .versionUnsupported:
-                    self.connectionError = "Protocol mismatch — update the Windows host and this app."
+                    self.connectionError = "This app and EternalMonitor on your PC are different versions. Update both, then try again."
                 default:
-                    self.connectionError = "The host refused the connection."
+                    self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? "rejected")
                 self.disconnect()
@@ -492,7 +492,7 @@ final class ConnectionManager: ObservableObject {
         channel.onBye = { [weak self] reason in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.connectionError = "The host ended the session."
+                self.connectionError = "Your PC ended the session."
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
                 self.disconnect()
             }
@@ -583,7 +583,7 @@ final class ConnectionManager: ObservableObject {
         self.mediaLink = receiver
 
         guard receiver.start(host: normalizedHost) else {
-            connectionError = "Failed to start the receiver."
+            connectionError = "Couldn't start streaming on this iPad. Try again."
             record(.error, "connection", "Receiver failed to start")
             disconnect()
             return
@@ -735,7 +735,7 @@ final class ConnectionManager: ObservableObject {
             }
             guard let self, !Task.isCancelled else { return }
             self.reconnectAttempt = 0
-            self.connectionError = "Could not reach the host after 6 attempts."
+            self.connectionError = "Couldn't reach your PC after 6 tries. Check that EternalMonitor is running on it."
         }
     }
 
@@ -748,7 +748,7 @@ final class ConnectionManager: ObservableObject {
             if !Task.isCancelled && self.state == .connecting {
                 let summary = self.debugState.timeoutSummary
                 self.record(.error, "timeout", summary)
-                self.connectionError = "Timed out waiting for frames. \(summary)"
+                self.connectionError = "No picture arrived from your PC. \(summary)"
                 self.disconnect()
             }
         }

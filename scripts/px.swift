@@ -6,6 +6,8 @@ import Foundation
 // PNG [x y width height [scale]] measures a rect in points, at the given scale.
 // PNG --video WxH measures the centered aspect-fit video rect in a screenshot.
 // --assert-pattern fails for black video or a missing amber test-pattern stripe.
+// --assert-ui fails for a blank UI or one without its accent: the lime of the
+// logo (current apps) or amber (builds before the redesign).
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
     exit(1)
@@ -49,7 +51,7 @@ pixels.withUnsafeMutableBytes { bytes in
                                     | CGBitmapInfo.byteOrder32Big.rawValue) else { fail("Cannot read PNG") }
     context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
 }
-var luminance = 0.0, black = 0, amber = 0, count = 0
+var luminance = 0.0, black = 0, amber = 0, lime = 0, count = 0
 for y in Int(rect.minY)..<Int(rect.maxY) {
     for x in Int(rect.minX)..<Int(rect.maxX) {
         let i = (y * width + x) * 4
@@ -57,14 +59,17 @@ for y in Int(rect.minY)..<Int(rect.maxY) {
         luminance += 0.2126 * r + 0.7152 * g + 0.0722 * b
         if max(r, max(g, b)) < 16 { black += 1 }
         if r > 200 && g > 80 && g < 170 && b < 90 { amber += 1 }
+        if r > 190 && g > 220 && b < 140 { lime += 1 }
         count += 1
     }
 }
 guard count > 0 else { fail("Empty rectangle") }
 let mean = luminance / Double(count)
 let blackFraction = Double(black) / Double(count), amberFraction = Double(amber) / Double(count)
+let limeFraction = Double(lime) / Double(count), accentFraction = amberFraction + limeFraction
 var metrics: [String: Any] = ["width": width, "height": height, "pixels": count,
-    "mean_luminance": mean, "near_black_fraction": blackFraction, "amber_fraction": amberFraction]
+    "mean_luminance": mean, "near_black_fraction": blackFraction, "amber_fraction": amberFraction,
+    "lime_fraction": limeFraction, "accent_fraction": accentFraction]
 if quadrants {
     // A small interior patch avoids UI, borders and the encoded counter. The
     // channel median rejects the moving stripe when it crosses a sample.
@@ -95,6 +100,6 @@ print(String(decoding: data, as: UTF8.self))
 if assertPattern && (mean < 20 || blackFraction > 0.8 || amberFraction < 0.001) {
     fail("FAIL: video is black or the amber test pattern is missing")
 }
-if assertUI && (mean < 2 || blackFraction > 0.98 || amberFraction < 0.0001) {
-    fail("FAIL: UI is blank or the amber accent is missing")
+if assertUI && (mean < 2 || blackFraction > 0.98 || accentFraction < 0.0001) {
+    fail("FAIL: UI is blank or its accent color is missing")
 }
