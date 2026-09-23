@@ -155,6 +155,18 @@ def main(args):
         ps("$line=Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1; "
            "$info=$line | ConvertFrom-Json; if ($info.event -ne 'Ready') { throw 'Probe is not ready' }; "
            "Get-Process -Id $info.pid -ErrorAction Stop | Out-Null; Write-Output $line")
+    elif action == "probe-arm" and not args:
+        # The host's startup console and VDD task can take focus. Arm only
+        # after capture opens; no test input runs until the probe confirms focus.
+        log = quote(ROOT + r"\input-probe.log")
+        ps("$deadline=(Get-Date).AddSeconds(30); while (!(Select-String -Path " +
+           quote(ROOT + r"\host.log") + " -Pattern 'Desktop duplication active' -Quiet)) { "
+           "if ((Get-Date) -gt $deadline) { throw 'Capture did not open before input arming' }; Start-Sleep -Milliseconds 100 }; "
+           "New-Item -ItemType File -Force " + quote(ROOT + r"\probe.arm") + " | Out-Null; "
+           "$deadline=(Get-Date).AddSeconds(10); while (!(Select-String -Path " + log +
+           " -Pattern '\"event\":\"Armed\"' -Quiet)) { "
+           "if ((Get-Date) -gt $deadline) { throw 'Input probe could not acquire foreground focus' }; Start-Sleep -Milliseconds 100 }; "
+           "Write-Output 'Input probe armed with foreground focus'")
     elif action in ("pattern", "probe") and args in (["start"], ["stop"], ["start", "virtual"], ["start", "fullscreen"]):
         if len(args) == 2 and (action, args[1]) not in (("pattern", "virtual"), ("probe", "fullscreen")):
             raise ValueError("Only pattern supports virtual; only probe supports fullscreen")

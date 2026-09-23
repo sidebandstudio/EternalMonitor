@@ -48,6 +48,23 @@ def check_probe(events, expected):
     ready = next((e for e in events if e['event'] == 'Ready'), None)
     if not ready or (ready['width'], ready['height']) != (expected['width'], expected['height']):
         raise ValueError('Input probe does not cover the captured desktop')
+    armed = [i for i, e in enumerate(events) if e['event'] == 'Armed']
+    if len(armed) != 1:
+        raise ValueError('Input probe must confirm foreground focus exactly once before input')
+    startup = events[:armed[0]]
+    focus_clicks = [e for e in startup if e['event'] == 'FocusClick']
+    startup_buttons = [e for e in startup if e['event'] in ('MouseDown', 'MouseUp')]
+    if focus_clicks:
+        center = (ready['x'] + ready['width'] // 2, ready['y'] + ready['height'] // 2)
+        if len(focus_clicks) != 1 or (focus_clicks[0]['x'], focus_clicks[0]['y']) != center or \
+                [e['event'] for e in startup_buttons] != ['MouseDown', 'MouseUp'] or \
+                any(e['button'] != 'Left' or (e['x'], e['y']) != center for e in startup_buttons):
+            raise ValueError('Probe activation must be one bounded center click')
+    elif startup_buttons:
+        raise ValueError('Input reached the probe before it was armed')
+    if any(e['event'] not in ('Ready', 'Deactivated', 'MouseMove', 'Arming', 'FocusClick', 'MouseDown', 'MouseUp') for e in startup):
+        raise ValueError('Input reached the probe before it was armed')
+    events = events[armed[0]:]
     if any(e['event'] == 'Deactivated' for e in events):
         raise ValueError('Input probe lost foreground focus during the test')
     errors = []

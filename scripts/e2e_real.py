@@ -182,6 +182,8 @@ def main():
                 remote('pattern', 'start', *(['virtual'] if scenario == 'R-vdd' else []), output=row / 'pattern-start.log')
             host_started = True
             remote('run-host', *host_args, env=env, output=row / 'host-start.log')
+            if scenario == 'R-input':
+                remote('probe-arm', output=row / 'probe-arm.log')
             if scenario in ('R-reconnect', 'R-input'):
                 lifecycle = row / 'lifecycle'
                 lifecycle.mkdir(exist_ok=True)

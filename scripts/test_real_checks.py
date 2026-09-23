@@ -43,7 +43,7 @@ class ProbeChecksTests(unittest.TestCase):
     def fixture(self):
         expected = dict(width=1920, height=1080, clicks=[[960,540],[20,20],[1899,20],[20,1059],[1899,1059]],
                         drag_start=[384,432], drag_end=[1536,648], right_click=[1152,432])
-        events = [dict(event='Ready',x=0,y=0,width=1920,height=1080)]
+        events = [dict(event='Ready',x=0,y=0,width=1920,height=1080), dict(event='Armed')]
         for x,y in expected['clicks']:
             events += [dict(event=kind,x=x,y=y,button='Left') for kind in ['MouseDown','MouseUp']]
         events += [dict(event='MouseDown',x=384,y=432,button='Left')]
@@ -60,7 +60,7 @@ class ProbeChecksTests(unittest.TestCase):
 
     def test_four_pixel_mapping_error_fails(self):
         events,expected = self.fixture()
-        events[1]['x'] += 4
+        next(e for e in events if e['event'] == 'MouseDown')['x'] += 4
         with self.assertRaisesRegex(ValueError,'4.0px'):
             check_probe(events,expected)
 
@@ -75,6 +75,31 @@ class ProbeChecksTests(unittest.TestCase):
                 elif defect == 'text': events = [e for e in events if e.get('char') != '!']
                 else: events = [e for e in events if e['event'] != 'MouseMove']
                 with self.assertRaises(ValueError): check_probe(events,expected)
+
+    def test_startup_focus_change_is_allowed_only_before_arming(self):
+        events, expected = self.fixture()
+        events.insert(1, dict(event='Deactivated'))
+        self.assertEqual(check_probe(events, expected)['input_mapping_error_px'], 0)
+        events.append(dict(event='Deactivated'))
+        with self.assertRaisesRegex(ValueError, 'lost foreground'):
+            check_probe(events, expected)
+
+    def test_missing_arm_or_input_before_arming_fails(self):
+        events, expected = self.fixture()
+        with self.assertRaisesRegex(ValueError, 'exactly once'):
+            check_probe([e for e in events if e['event'] != 'Armed'], expected)
+        events.insert(1, dict(event='KeyPress', char='H'))
+        with self.assertRaisesRegex(ValueError, 'before it was armed'):
+            check_probe(events, expected)
+
+    def test_only_one_explicit_center_click_can_activate_the_probe(self):
+        events, expected = self.fixture()
+        setup = [dict(event='FocusClick', x=960, y=540)] + [dict(event=kind, button='Left', x=960, y=540) for kind in ('MouseDown', 'MouseUp')]
+        events[1:1] = setup
+        self.assertEqual(check_probe(events, expected)['input_mapping_error_px'], 0)
+        setup[1]['x'] += 1
+        with self.assertRaisesRegex(ValueError, 'bounded center click'):
+            check_probe(events, expected)
 
 
 class AdvertisedDisplayTests(unittest.TestCase):
