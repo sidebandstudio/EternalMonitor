@@ -48,6 +48,9 @@ def main():
     parser.add_argument("--screenshot")
     parser.add_argument("--elapsed", type=int)
     parser.add_argument("--min-fps", type=float, default=55)
+    # `record` keeps the measured FPS in the result without failing on it,
+    # for runners too small to encode and decode in software at 55 FPS.
+    parser.add_argument("--fps-gate", choices=["enforce", "record"], default="enforce")
     parser.add_argument("--max-drop-ratio", type=float, default=0.02)
     parser.add_argument("--require-repairs", type=int, default=0)
     parser.add_argument("--link", choices=["udp", "usb"])
@@ -58,8 +61,10 @@ def main():
         return 1
     if args.output:
         errors = []
+        notes = []
         if result["average_fps"] < args.min_fps:
-            errors.append(f"average FPS {result['average_fps']} is below {args.min_fps}")
+            message = f"average FPS {result['average_fps']} is below {args.min_fps}"
+            (errors if args.fps_gate == "enforce" else notes).append(message)
         if result["dropped"] / result["decoded"] >= args.max_drop_ratio:
             errors.append(f"dropped {result['dropped']} of {result['decoded']} decoded frames")
         if args.require_repairs and result["repaired"] == 0:
@@ -68,7 +73,8 @@ def main():
             delay = result["switch_ms"]
             if delay is None or not 0 <= delay <= args.max_switch_ms:
                 errors.append(f"USB takeover took {delay} ms; expected at most {args.max_switch_ms} ms")
-        result.update(status="FAIL" if errors else "PASS", errors=errors,
+        result.update(status="FAIL" if errors else "PASS", errors=errors, notes=notes,
+                      fps_gate=args.fps_gate,
                       scenario=args.scenario, screenshot=args.screenshot, elapsed=args.elapsed)
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         if errors:
