@@ -229,6 +229,17 @@ Auto and BGRA remain opt-in because the required native BGRA gate did not
 pass on both GPUs. Private campaign evidence is in
 `EternalMonitor-Handoff/evidence/windows-colors-a0823cc/`.
 
+### Gate streaming FPS on reference hardware, not hosted VMs
+
+GitHub's free three-vCPU macOS VM cannot run the software x264/x265 encoder and
+the simulator's software decoder at 55 FPS together. In retained runs the host
+itself encoded 33-52 FPS there while the app decoded every frame it received,
+and only about one hosted streaming job in six passed. Hosted CI therefore
+records simulator FPS but still fails on missing frames, drops, repairs, pixels,
+resolution, link and audio checks. The 55 FPS gate is enforced by the full local
+matrix and the 30-minute soak on the Apple silicon development Mac, and each
+phase PR records those results.
+
 ### Archive without credentials, upload only with signing configured
 
 The TestFlight job always compiles an unsigned Release archive for PRs and missing
