@@ -99,4 +99,46 @@ final class VideoDecoderTests: XCTestCase {
             wait(for: [done], timeout: 5)
         }
     }
+
+    func testBadAccessUnitRequestsOneKeyframeAndRecoversInTheSameSession() throws {
+        let data = try fixtureData()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let first = expectation(description: "initial frame")
+        let request = expectation(description: "decode error requests a keyframe")
+        let recovered = expectation(description: "recovery frame")
+        let sessionEvents = OSAllocatedUnfairLock(initialState: 0)
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        decoder.onEvent = { message in
+            if message.hasPrefix("VideoToolbox session ready") {
+                sessionEvents.withLock { $0 += 1 }
+            }
+        }
+        decoder.onFrameDecoded = { _, timestamp in
+            if timestamp == 16_667 { first.fulfill() }
+            if timestamp == 20 * 16_667 { recovered.fulfill() }
+        }
+        decoder.onNeedsKeyframe = {
+            requests.withLock { $0 += 1 }
+            request.fulfill()
+        }
+        decoder.decode(packet: packet(seq: 1, data: data, keyframe: true))
+        wait(for: [first], timeout: 10)
+
+        // A truncated P-slice reaches the real VideoToolbox callback. A
+        // complete wire frame can still contain undecodable codec data.
+        let corrupt = Data([0, 0, 0, 1, 0x41, 0x80])
+        decoder.decode(packet: packet(seq: 2, data: corrupt, keyframe: false))
+        guard XCTWaiter.wait(for: [request], timeout: 3) == .completed else {
+            XCTFail("VideoToolbox rejected a frame without requesting recovery")
+            return
+        }
+        for seq in 3...10 {
+            decoder.decode(packet: packet(seq: UInt32(seq), data: corrupt, keyframe: false))
+        }
+        decoder.decode(packet: packet(seq: 20, data: data, keyframe: true))
+        wait(for: [recovered], timeout: 10)
+        XCTAssertEqual(requests.withLock { $0 }, 1, "wait for a sync sample without a request storm")
+        XCTAssertEqual(sessionEvents.withLock { $0 }, 1, "bad data must not rebuild a healthy session")
+    }
 }

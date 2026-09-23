@@ -21,7 +21,7 @@ final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
     var onEvent: ((String) -> Void)?
     /// The decoder cannot make progress until the next keyframe (session died, decode error).
-    /// Protocol v2 turns this into a keyframe request to the host; today it is diagnostic.
+    /// Protocol v2 turns this into a keyframe request to the host.
     var onNeedsKeyframe: (() -> Void)?
 
     /// Which bitstream the host is sending. Sniffed from the NAL units
@@ -43,6 +43,8 @@ final class VideoDecoder {
     private var hasLoggedFirstNALPrefix = false
     private var hasLoggedFirstPacketHex = false
     private var waitingForSyncSample = true
+    /// Callbacks from before the latest sync sample or session cannot undo recovery.
+    private var recoveryGeneration: UInt64 = 0
     private var isShutdown = false
     private var packetLogCounter: UInt64 = 0
 
@@ -447,6 +449,7 @@ final class VideoDecoder {
         )
         let hardware = (usingHardware as? Bool) == true
         decompressionSession = session
+        recoveryGeneration &+= 1
         waitingForSyncSample = true
         onEvent?("VideoToolbox session ready (\(hardware ? "hardware" : "software") decoder)")
         if E2E.enabled {
@@ -467,14 +470,13 @@ final class VideoDecoder {
 
         let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
         if waitingForSyncSample && !isSyncSample {
-            onEvent?(
-                "Dropped inter access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) while waiting for sync sample"
-            )
             return
         }
         if isSyncSample {
+            recoveryGeneration &+= 1
             waitingForSyncSample = false
         }
+        let generation = recoveryGeneration
 
         // VideoToolbox expects a full access unit as consecutive AVCC length-prefixed NALs.
         var avccData = Data()
@@ -581,24 +583,35 @@ final class VideoDecoder {
             if verboseDecodeLogging {
                 print("[VT] Output callback fired: status=\(status)")
             }
-            guard status == noErr, let pixelBuffer = imageBuffer else {
-                self.onEvent?("Decoder callback status=\(status) imageBufferMissing=\(imageBuffer == nil)")
+            guard status == noErr else {
+                self.decodeQueue.async {
+                    self.recoverFromDecodeFailure(status, generation: generation, source: "Decoder callback")
+                }
                 return
             }
+            guard let pixelBuffer = imageBuffer else { return }
             self.onFrameDecoded?(pixelBuffer, timestampUs)
         }
 
         if status != noErr || infoFlags.contains(.frameDropped) { finish() }
+        if status != noErr {
+            recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame")
+        }
+    }
+
+    /// Both submission and asynchronous output errors arrive here on decodeQueue.
+    /// Hold dependent frames until a replacement sync sample, and coalesce errors
+    /// already in flight so one damaged frame cannot cause a request storm.
+    private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String) {
+        guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
+        waitingForSyncSample = true
+        onEvent?("\(source) status=\(status); waiting for a keyframe")
         if status == kVTInvalidSessionErr {
             // The session died underneath us (typical after app backgrounding).
-            // Rebuild it and hold for the next keyframe.
-            onEvent?("VideoToolbox session invalidated — recreating and waiting for a keyframe")
+            // Bad bitstream data alone does not rebuild a healthy session.
             createDecompressionSession()
-            waitingForSyncSample = true
-            onNeedsKeyframe?()
-        } else if status != noErr {
-            onEvent?("VTDecodeFrame failed status=\(status) nalCount=\(nalUnits.count) bytes=\(totalLen)")
         }
+        onNeedsKeyframe?()
     }
 
     private func isRandomAccessAccessUnit(_ nalUnits: [Data]) -> Bool {
