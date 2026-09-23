@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-/// Reassembles fragmented UDP datagrams into complete FlatBuffer payloads.
+/// Reassembles fragmented UDP datagrams into complete Annex B access units.
 /// Called exclusively from the UDP receiver's serial queue — no locking needed.
 ///
 /// Hardened against malformed/hostile input: fragment counts, in-flight frame
@@ -13,6 +13,18 @@ final class FrameAssembler {
     /// fragment carried (protocol v2 repeats it per datagram).
     var onFrameAssembled: ((Data, _ seq: UInt32, _ captureTimestampUs: UInt64, _ isKeyframe: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
+    var onNack: ((Nack) -> Void)?
+    var onNeedsKeyframe: ((_ epoch: UInt32, _ lastCompleteSeq: UInt32) -> Void)?
+    var repairEnabled = false
+    var framePeriodUs: UInt64 = 16_667
+    var rttUs: () -> UInt64 = { 10_000 }
+    private let nowUs: () -> UInt64
+
+    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs) {
+        self.nowUs = nowUs
+    }
+
+    static let maxRepairFrames = 3
 
     /// A frame may span at most this many fragments. This MUST match the
     /// protocol cap the host fragments against and the wire parser enforces:
@@ -34,6 +46,12 @@ final class FrameAssembler {
         var framesDropped: UInt64 = 0
         var fragsReceived: UInt64 = 0
         var fragsLost: UInt64 = 0
+        var fragsRepaired: UInt64 = 0
+        var nacksSent: UInt64 = 0
+        var highestSeq: UInt32 = 0
+        var streamEpoch: UInt32 = 0
+        var assemblerDepth: UInt8 = 0
+        var jitterUs: UInt32 = 0
     }
 
     let counters = OSAllocatedUnfairLock<Counters>(initialState: Counters())
@@ -41,7 +59,9 @@ final class FrameAssembler {
     private var pending: [UInt32: PendingFrame] = [:]
     private var pendingBytes = 0
     private var latestCompletedSeq: UInt32 = 0
-    private var cleanupCounter: UInt32 = 0
+    private var retiredSeq: UInt32 = 0
+    private var previousTransit: Double?
+    private var jitter = 0.0
     /// The host stamps a per-pipeline-run `stream_epoch` into each fragment header. When it
     /// changes we know the host restarted (seq reset toward 1) and drop the old stream's state
     /// immediately — more reliable than inferring a restart from a sequence gap. `nil` until the
@@ -72,7 +92,15 @@ final class FrameAssembler {
         let captureTimestampUs: UInt64
         var fragments: [UInt16: Data]
         var byteCount: Int
-        let createdAt: UInt64  // mach_absolute_time
+        let createdAt: UInt64  // monotonic microseconds
+        var contiguous: UInt16 = 0
+        var highestIndex: UInt16 = 0
+        var repaired: UInt64 = 0
+        var gapAt: UInt64?
+        var deadline: UInt64?
+        var retryAt: UInt64?
+        var nackCount = 0
+        var keyframeRequested = false
 
         var isComplete: Bool {
             fragments.count == Int(fragmentCount)
@@ -86,7 +114,8 @@ final class FrameAssembler {
         epoch: UInt32,
         isKeyframe: Bool,
         captureTimestampUs: UInt64,
-        payload: Data
+        payload: Data,
+        isRetransmit: Bool = false
     ) {
         // Primary restart signal: the host's stream epoch increases monotonically per pipeline
         // run. A HIGHER epoch means a brand-new run — drop all old state instantly so a fast
@@ -118,13 +147,14 @@ final class FrameAssembler {
             currentEpoch = epoch
         }
 
-        if latestCompletedSeq > 0 {
-            if seq == latestCompletedSeq {
+        let latestRetired = max(latestCompletedSeq, retiredSeq)
+        if latestRetired > 0 {
+            if seq == latestRetired {
                 // Duplicate fragment for the frame we just completed — ignore.
                 return
             }
-            if seq < latestCompletedSeq {
-                if latestCompletedSeq - seq > Self.streamRestartGap {
+            if seq < latestRetired {
+                if latestRetired - seq > Self.streamRestartGap {
                     // Host restarted its stream (seq reset toward 0). Drop the old stream's
                     // state and accept this fragment as the start of the new stream.
                     onDiagnostic?("Stream restart detected (seq \(latestCompletedSeq) -> \(seq)) — resetting reassembly")
@@ -151,119 +181,183 @@ final class FrameAssembler {
             return
         }
 
-        // Get or create pending frame
-        if let existing = pending[seq] {
-            if existing.fragmentCount != count {
-                // Conflicting metadata for a live frame. The first-seen count wins —
-                // a late duplicate must not wipe accumulated progress.
-                onDiagnostic?("Ignored fragment for seq=\(seq) with mismatched count \(count) (frame has \(existing.fragmentCount))")
-                return
-            }
-        } else {
-            enforceCapacityForNewFrame(incoming: seq)
-            pending[seq] = PendingFrame(
-                fragmentCount: count,
-                isKeyframe: isKeyframe,
-                captureTimestampUs: captureTimestampUs,
-                fragments: [:],
-                byteCount: 0,
-                createdAt: mach_absolute_time()
-            )
-        }
-
-        if pending[seq]?.fragments[index] == nil {
-            pending[seq]?.fragments[index] = payload
-            pending[seq]?.byteCount += payload.count
-            pendingBytes += payload.count
-            counters.withLock { $0.fragsReceived += 1 }
-        }
-
-        // Check if frame is complete
-        if let frame = pending[seq], frame.isComplete {
-            // Reassemble in fragment index order
-            var assembled = Data(capacity: frame.byteCount)
-            for i in 0..<frame.fragmentCount {
-                if let fragment = frame.fragments[i] {
-                    assembled.append(fragment)
-                } else {
-                    onDiagnostic?("Reassembly gap for seq=\(seq) at fragment \(i)")
-                    removePending(seq)
-                    return
-                }
-            }
-
-            latestCompletedSeq = seq
-            removePending(seq)
-            counters.withLock { $0.framesComplete += 1 }
-
-            // Evict any frames older than the completed one — delivering them
-            // after a newer frame would corrupt decode order.
-            for staleSeq in pending.keys where staleSeq <= seq {
-                dropPending(staleSeq)
-            }
-
-            onFrameAssembled?(assembled, seq, frame.captureTimestampUs, frame.isKeyframe)
-            evictStale()
+        let now = nowUs()
+        tick(at: now)
+        if repairEnabled && retiredSeq > 0 && seq <= retiredSeq { return }
+        if let existing = pending[seq], existing.fragmentCount != count {
+            onDiagnostic?("Ignored fragment for seq=\(seq) with mismatched count \(count) (frame has \(existing.fragmentCount))")
             return
         }
-
-        // Periodic cleanup of stale entries
-        cleanupCounter += 1
-        if cleanupCounter % 32 == 0 {
-            evictStale()
+        if pending[seq]?.fragments[index] != nil { return }
+        guard payload.count <= Self.maxPendingBytes else { return }
+        let limit = repairEnabled ? Self.maxRepairFrames : Self.maxPendingFrames
+        while (pending[seq] == nil && pending.count >= limit)
+            || pendingBytes + payload.count > Self.maxPendingBytes {
+            guard let oldest = pending.keys.min() else { break }
+            onDiagnostic?("Dropped partial frame seq=\(oldest) to admit seq=\(seq) (capacity)")
+            dropPending(oldest)
+            if repairEnabled {
+                retiredSeq = max(retiredSeq, oldest)
+                drainReady()
+                if seq <= retiredSeq { return }
+            }
         }
+        var frame = pending.removeValue(forKey: seq) ?? PendingFrame(
+            fragmentCount: count, isKeyframe: isKeyframe, captureTimestampUs: captureTimestampUs,
+            fragments: [:], byteCount: 0, createdAt: now
+        )
+        frame.fragments[index] = payload
+        frame.byteCount += payload.count
+        frame.highestIndex = max(frame.highestIndex, index)
+        while frame.contiguous < count && frame.fragments[frame.contiguous] != nil {
+            frame.contiguous += 1
+        }
+        pendingBytes += payload.count
+        if isRetransmit {
+            frame.repaired += 1
+        } else {
+            // RFC 3550 A.8, using microseconds in both clock domains. A fixed
+            // clock offset cancels when successive transit times are diffed.
+            let transit = Double(now) - Double(captureTimestampUs)
+            if let previousTransit { jitter += (abs(transit - previousTransit) - jitter) / 16 }
+            previousTransit = transit
+        }
+        pending[seq] = frame
+        counters.withLock {
+            if !isRetransmit { $0.fragsReceived += 1 }
+            $0.highestSeq = max($0.highestSeq, seq)
+            $0.streamEpoch = epoch
+            $0.jitterUs = UInt32(clamping: UInt64(jitter))
+        }
+
+        if repairEnabled {
+            if !frame.isComplete && frame.contiguous < frame.highestIndex {
+                beginGap(seq, through: frame.highestIndex, now: now)
+            }
+            if frame.isComplete {
+                // Completion of a newer frame also proves older trailing
+                // fragments are absent, even if no later index exposed them.
+                for older in pending.keys.sorted() where older < seq {
+                    if let partial = pending[older], !partial.isComplete {
+                        beginGap(older, through: partial.fragmentCount - 1, now: now)
+                    }
+                }
+            }
+            drainReady()
+        } else if frame.isComplete {
+            deliver(seq)
+            for stale in pending.keys where stale <= seq { dropPending(stale) }
+        }
+        updateDepth()
     }
 
     func reset() {
         pending.removeAll()
         pendingBytes = 0
         latestCompletedSeq = 0
-        cleanupCounter = 0
+        retiredSeq = 0
+        previousTransit = nil
+        jitter = 0
         currentEpoch = nil
         staleEpochStreak = 0
         counters.withLock { $0 = Counters() }
     }
 
-    private func removePending(_ seq: UInt32) {
-        if let removed = pending.removeValue(forKey: seq) {
-            pendingBytes -= removed.byteCount
-        }
-    }
-
-    /// Remove a partial frame that will never complete, counting its loss.
-    private func dropPending(_ seq: UInt32) {
-        if let removed = pending.removeValue(forKey: seq) {
-            pendingBytes -= removed.byteCount
-            counters.withLock {
-                $0.framesDropped += 1
-                $0.fragsLost += UInt64(max(Int(removed.fragmentCount) - removed.fragments.count, 0))
-            }
-        }
-    }
-
-    /// Make room before inserting a new partial frame: never exceed the frame
-    /// or byte caps. Drops the OLDEST pending frames first (they are the least
-    /// likely to ever complete).
-    private func enforceCapacityForNewFrame(incoming: UInt32) {
-        while pending.count >= Self.maxPendingFrames || pendingBytes >= Self.maxPendingBytes {
-            guard let oldest = pending.keys.min() else { break }
-            onDiagnostic?("Dropped partial frame seq=\(oldest) to admit seq=\(incoming) (capacity)")
-            dropPending(oldest)
-        }
-    }
-
-    private func evictStale() {
-        let now = mach_absolute_time()
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
-        let numer = UInt64(info.numer)
-        let denom = UInt64(info.denom)
-
-        for (seq, frame) in pending {
-            let elapsedNs = ((now - frame.createdAt) * numer) / denom
-            if elapsedNs >= 100_000_000 {  // 100ms timeout
+    /// Called by the receiver's timer even when the last fragment was lost.
+    func tick(at instant: UInt64? = nil) {
+        let now = instant ?? nowUs()
+        for seq in pending.keys.sorted() {
+            guard let frame = pending[seq], !frame.isComplete else { continue }
+            if repairEnabled {
+                if let deadline = frame.deadline, now >= deadline {
+                    // Retire in sequence order. Expiring a later partial
+                    // first must not make an older repair look stale.
+                    if pending.keys.min() == seq {
+                        dropPending(seq)
+                        retiredSeq = max(retiredSeq, seq)
+                        drainReady()
+                    }
+                } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
+                    beginGap(seq, through: frame.fragmentCount - 1, now: now)
+                } else if let retry = frame.retryAt, now >= retry, frame.nackCount < 2 {
+                    requestMissing(seq, through: frame.fragmentCount - 1)
+                }
+            } else if now >= frame.createdAt + 100_000 {
                 dropPending(seq)
             }
         }
+        if repairEnabled { drainReady() }
+        updateDepth()
+    }
+
+    private func beginGap(_ seq: UInt32, through index: UInt16, now: UInt64) {
+        guard let frame = pending[seq], frame.gapAt == nil else { return }
+        let rtt = min(rttUs(), 1_000_000)
+        let window = max(8_000, min(25_000, 2 * rtt + framePeriodUs * 3 / 2))
+        pending[seq]?.gapAt = now
+        pending[seq]?.deadline = now + window
+        pending[seq]?.retryAt = now + rtt + 5_000
+        requestMissing(seq, through: index)
+    }
+
+    private func requestMissing(_ seq: UInt32, through index: UInt16) {
+        guard let frame = pending[seq], frame.nackCount < 2 else { return }
+        let missing = (0...index).filter { frame.fragments[$0] == nil }
+        guard !missing.isEmpty else { return }
+        if missing.count > 64 {
+            pending[seq]?.nackCount = 2
+            requestKeyframe(seq)
+            return
+        }
+        pending[seq]?.nackCount += 1
+        counters.withLock { $0.nacksSent += 1 }
+        onNack?(Nack(streamEpoch: currentEpoch ?? 0, frameSeq: seq,
+                     fragCount: frame.fragmentCount, missing: missing))
+    }
+
+    private func requestKeyframe(_ seq: UInt32) {
+        guard pending[seq]?.keyframeRequested == false else { return }
+        // A complete queued keyframe restores references after this loss.
+        // Keep the repair deadline, but do not request another replacement.
+        guard !pending.contains(where: { $0.key > seq && $0.value.isKeyframe && $0.value.isComplete }) else { return }
+        pending[seq]?.keyframeRequested = true
+        onNeedsKeyframe?(currentEpoch ?? 0, latestCompletedSeq)
+    }
+
+    private func drainReady() {
+        while let seq = pending.keys.min(), pending[seq]?.isComplete == true { deliver(seq) }
+    }
+
+    private func deliver(_ seq: UInt32) {
+        guard let frame = pending.removeValue(forKey: seq) else { return }
+        pendingBytes -= frame.byteCount
+        var assembled = Data(capacity: frame.byteCount)
+        for index in 0..<frame.fragmentCount {
+            guard let bytes = frame.fragments[index] else { return }
+            assembled.append(bytes)
+        }
+        latestCompletedSeq = seq
+        retiredSeq = max(retiredSeq, seq)
+        counters.withLock {
+            $0.framesComplete += 1
+            $0.fragsRepaired += frame.repaired
+        }
+        onFrameAssembled?(assembled, seq, frame.captureTimestampUs, frame.isKeyframe)
+    }
+
+    private func dropPending(_ seq: UInt32) {
+        requestKeyframe(seq)
+        if let frame = pending.removeValue(forKey: seq) {
+            pendingBytes -= frame.byteCount
+            counters.withLock {
+                $0.framesDropped += 1
+                $0.fragsLost += UInt64(max(Int(frame.fragmentCount) - frame.fragments.count, 0))
+            }
+        }
+    }
+
+    private func updateDepth() {
+        let depth = UInt8(clamping: pending.values.filter { !$0.isComplete }.count)
+        counters.withLock { $0.assemblerDepth = depth }
     }
 }

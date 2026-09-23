@@ -100,6 +100,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared = SharedControl::new(listen_port, initial_bitrate);
+    let max_dgram = std::env::var("ETERNAL_MAX_DGRAM")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(persisted.max_dgram)
+        .clamp(576, 1400);
+    shared
+        .max_dgram
+        .store(u32::from(max_dgram), std::sync::atomic::Ordering::SeqCst);
+    info!(max_dgram, "Media packet size configured");
     if persisted.target_fps == 30 || persisted.target_fps == 60 {
         shared
             .target_fps
@@ -191,8 +200,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
             libc::signal(libc::SIGINT, handler as libc::sighandler_t);
         }
+        let log_e2e = std::env::var("ETERNAL_E2E_LOG").is_ok_and(|v| v == "1");
+        let mut last_sample = std::time::Instant::now();
         while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(250));
+            if log_e2e && last_sample.elapsed() >= std::time::Duration::from_secs(1) {
+                last_sample = std::time::Instant::now();
+                let sample = stats::PIPELINE_STATS.lock();
+                info!(
+                    captured = sample.capture_frame_count,
+                    encoded = sample.encode_frame_count,
+                    sent = sample.transport_packets_sent,
+                    capture_fps = sample.capture_fps,
+                    encode_fps = sample.encode_fps,
+                    send_fps = sample.transport_fps,
+                    encode_us = sample.encode_time_us,
+                    retransmits = sample.transport_retransmits,
+                    "E2E_HOST_STATS"
+                );
+            }
         }
         info!("Termination signal received — shutting down cleanly");
     } else if let Err(e) = gui::run_gui(gui_control.clone()) {

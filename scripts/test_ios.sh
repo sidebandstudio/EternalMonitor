@@ -12,12 +12,41 @@ RESULT="$ROOT/build/ios-tests-$STAMP.xcresult"
 SHOTS="$ROOT/build/screenshots/ui-$STAMP"
 LOG="$ROOT/build/ios-tests-$STAMP.log"
 mkdir -p "$ROOT/build" "$SHOTS"
+HOST_PID=""
+cleanup() {
+    [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+# Unit-only selections do not need a streaming host. The complete suite and
+# UI selections use a real stream so diagnostics are checked with live values.
+NEED_STREAM=1
+for argument in "$@"; do
+    case "$argument" in -only-testing:EternalMonitorTests*) NEED_STREAM=0 ;; esac
+done
 (cd "$ROOT/ios" && xcodegen generate)
+xcrun simctl bootstatus "$UDID" -b
+# Compiling while a software encoder and a newly booting simulator compete
+# for the runner's three CPUs can starve both the host and UI automation.
+if ! xcodebuild build-for-testing -project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonitor \
+    -destination "platform=iOS Simulator,id=$UDID" -parallel-testing-enabled NO \
+    -derivedDataPath "$DERIVED" CODE_SIGNING_ALLOWED=NO "$@" > "$LOG" 2>&1; then
+    tail -60 "$LOG"
+    exit 1
+fi
+if [ "$NEED_STREAM" = 1 ]; then
+    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig}"
+    (cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
+    APPDATA="$ROOT/build/ui-state" ETERNAL_HEADLESS=1 ETERNAL_CAPTURE=synthetic \
+        ETERNAL_SYNTH_SIZE=640x360 ETERNAL_ENCODER=libx264 ETERNAL_FPS=60 \
+        ETERNAL_DROP=0.03 ETERNAL_REORDER=0.01 \
+        "$ROOT/target/release/eternal-host" 19875 > "$ROOT/build/ios-ui-host-$STAMP.log" 2>&1 &
+    HOST_PID=$!
+fi
 status=0
-xcodebuild test -project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonitor \
+xcodebuild test-without-building -project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonitor \
     -destination "platform=iOS Simulator,id=$UDID" -parallel-testing-enabled NO \
     -derivedDataPath "$DERIVED" -resultBundlePath "$RESULT" CODE_SIGNING_ALLOWED=NO \
-    "$@" > "$LOG" 2>&1 || status=$?
+    "$@" >> "$LOG" 2>&1 || status=$?
 tail -60 "$LOG"
 if [ -d "$RESULT" ]; then
     xcrun xcresulttool export attachments --path "$RESULT" --output-path "$SHOTS" || status=1

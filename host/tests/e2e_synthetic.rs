@@ -34,6 +34,16 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Surface the host's tracing in test output (best effort, once per process).
 fn init_test_tracing() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, priority: i32) -> i32;
+        }
+        // Match UDPReceiver's userInteractive queue. Capture and encode already
+        // use this class; a default-priority fake receiver can miss a repair
+        // deadline while those producer threads keep filling its socket.
+        assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
+    }
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -116,6 +126,7 @@ impl FakeReceiver {
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
             .expect("read timeout");
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024);
         let listen_port = socket.local_addr().unwrap().port();
         let host = format!("127.0.0.1:{host_port}");
 
@@ -396,11 +407,266 @@ fn synthetic_stream_end_to_end_v2() {
         .expect("supervisor must shut down within 5s");
 }
 
+/// Repair is negotiated and exercised through the real encoder and transport.
+#[test]
+fn lossy_stream_recovers_and_adapts() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_DROP", "0.05");
+    std::env::set_var("ETERNAL_REORDER", "0.02");
+    let port = free_udp_port();
+    let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (tx, rx) = mpsc::channel();
+    let pipeline_shared = shared.clone();
+    let pipeline_tx = tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            port,
+            pipeline_shared,
+            GpuInfo::software_fallback(),
+            pipeline_tx,
+            rx,
+        );
+    });
+    let mut receiver = FakeReceiver::connect_full(
+        port,
+        CAP_DECODE_H264,
+        eternal_wire::v2::control::FEATURE_SUPPORTS_NACK,
+    );
+    #[cfg(not(target_os = "macos"))]
+    receiver
+        .socket
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    #[cfg(target_os = "macos")]
+    let repair_poll = {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SO_RCVTIMEO can coalesce a 2 ms wait beyond the frame's repair
+        // deadline. Match the app's 1 ms repair timer while also waking as
+        // soon as a packet arrives. No spin loop or relaxed deadline.
+        receiver.socket.set_nonblocking(true).unwrap();
+        let fd = unsafe { libc::kqueue() };
+        assert!(
+            fd >= 0,
+            "repair kqueue: {}",
+            std::io::Error::last_os_error()
+        );
+        let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+        let changes = [
+            libc::kevent {
+                ident: receiver.socket.as_raw_fd() as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            },
+            libc::kevent {
+                ident: 1,
+                filter: libc::EVFILT_TIMER,
+                flags: libc::EV_ADD,
+                fflags: libc::NOTE_USECONDS | libc::NOTE_CRITICAL,
+                data: 1_000,
+                udata: std::ptr::null_mut(),
+            },
+        ];
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                changes.as_ptr(),
+                changes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "repair poll: {}",
+            std::io::Error::last_os_error()
+        );
+        queue
+    };
+    let mut assembler = Reassembler::new();
+    assembler.configure_repair(
+        true,
+        Duration::from_micros(16_667),
+        Duration::from_millis(1),
+    );
+    // Match the app's independent decode queue. Synchronous software decode
+    // here can stall socket reads through a repair deadline on a busy runner,
+    // even when the retransmit is already waiting in the kernel buffer.
+    let (decode_tx, decode_rx) = mpsc::sync_channel::<Vec<u8>>(3);
+    let decoding = std::thread::spawn(move || {
+        let mut decoder = H264TestDecoder::new();
+        let mut decoded = 0usize;
+        for frame in decode_rx {
+            decoded += decoder.decode(&frame).len();
+        }
+        decoded
+    });
+    let mut decode_queue_drops = 0;
+    let mut requests = 0u32;
+    let mut abr_down = false;
+    let started = Instant::now();
+    let mut media_trace = Vec::new();
+    let mut nack_trace = Vec::new();
+    let mut recovery_sequences = Vec::new();
+    let mut bytes = [0; 2048];
+    while started.elapsed() < Duration::from_secs(15) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+            let result = unsafe {
+                libc::kevent(
+                    repair_poll.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    std::ptr::null(),
+                )
+            };
+            if result == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert_eq!(
+                result,
+                1,
+                "repair wait: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(unsafe { event.assume_init() }.flags & libc::EV_ERROR, 0);
+        }
+        if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
+            if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
+                if header.session_id == receiver.session_id {
+                    media_trace.push((
+                        started.elapsed().as_micros(),
+                        header.frame_seq,
+                        header.frag_index,
+                        header.is_retransmit,
+                    ));
+                    assembler.add_media(header, payload, Instant::now());
+                }
+            } else if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&bytes[..len]) {
+                abr_down |= hb.stream_config.bitrate_bps < 15_000_000;
+            }
+        }
+        assembler.tick(Instant::now());
+        for nack in assembler.take_nacks() {
+            nack_trace.push((started.elapsed().as_micros(), nack.clone()));
+            receiver.send(&ControlMessage::Nack(nack));
+        }
+        if let Some((epoch, seq)) = assembler.take_keyframe_request() {
+            requests += 1;
+            recovery_sequences.push(seq);
+            eprintln!(
+                "NACK_E2E_RECOVERY elapsed_ms={} last_complete={seq} counters={:?}",
+                started.elapsed().as_millis(),
+                assembler.counters()
+            );
+            receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: epoch,
+                last_complete_seq: seq,
+                reason: KeyframeReason::GapLoss,
+            }));
+        }
+        for frame in assembler.take_ready() {
+            if decode_tx.try_send(frame.payload).is_err() {
+                decode_queue_drops += 1;
+            }
+        }
+        if receiver.last_report.elapsed() >= Duration::from_millis(400) {
+            receiver.last_report = Instant::now();
+            let c = assembler.counters();
+            receiver.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: c.stream_epoch,
+                highest_seq: c.highest_seq,
+                frames_complete: c.frames_complete as u32,
+                frames_dropped: c.frames_dropped as u32,
+                frags_received: c.frags_received as u32,
+                frags_lost: c.frags_lost as u32,
+                frags_repaired: c.frags_repaired as u32,
+                nacks_sent: c.nacks_sent as u32,
+                assembler_depth: c.assembler_depth,
+                jitter_us: c.jitter_us,
+                ..Default::default()
+            }));
+        }
+    }
+    let counters = assembler.counters();
+    let (sent, retransmits) = {
+        let stats = eternal_host::stats::PIPELINE_STATS.lock();
+        (stats.transport_packets_sent, stats.transport_retransmits)
+    };
+    std::env::remove_var("ETERNAL_DROP");
+    std::env::remove_var("ETERNAL_REORDER");
+    shared.stop();
+    tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bounded shutdown");
+    drop(decode_tx);
+    let decoded = decoding.join().expect("decoder thread");
+    if requests > 1 {
+        for retired in recovery_sequences {
+            for event in &media_trace {
+                if (retired..=retired + 3).contains(&event.1) {
+                    eprintln!(
+                        "REPAIR_MEDIA us={} seq={} frag={} retransmit={}",
+                        event.0, event.1, event.2, event.3
+                    );
+                }
+            }
+            for (at, nack) in &nack_trace {
+                if (retired..=retired + 3).contains(&nack.frame_seq) {
+                    eprintln!("REPAIR_NACK us={at} {nack:?}");
+                }
+            }
+        }
+    }
+    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
+    assert!(
+        sent >= 600,
+        "fifteen-second stream must make sustained progress"
+    );
+    assert!(
+        decoded as f64 / sent as f64 >= 0.97,
+        "at least 97% of sent frames must decode"
+    );
+    assert!(
+        requests <= 1,
+        "no keyframe storm during the fifteen-second window"
+    );
+    assert!(
+        counters.frags_repaired > 0 && retransmits > 0,
+        "negotiated repair must actually run"
+    );
+    assert!(
+        abr_down,
+        "repairs above five percent must reduce the bitrate"
+    );
+}
+
 /// Under injected fragment loss the system must keep delivering decodable
 /// video (keyframe requests beat the GOP) and the ABR must step the bitrate
 /// down from its 15 Mbps start.
 #[test]
-fn lossy_stream_recovers_and_adapts() {
+fn lossy_legacy_stream_uses_keyframe_recovery() {
     let _guard = ENV_LOCK.lock().unwrap();
     init_test_tracing();
     let _ = ffmpeg_next::init();

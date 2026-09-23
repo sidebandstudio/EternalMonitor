@@ -17,6 +17,7 @@ pub struct SharedControl {
     /// changes (hardware encoders ignore bitrate pokes on an open context).
     pub abr_current_bps: Arc<AtomicU32>,
     pub target_fps: Arc<AtomicU32>,
+    pub max_dgram: Arc<AtomicU32>,
     pub target_addr: Arc<Mutex<SocketAddr>>,
     /// Set by transport on iPad re-handshake (same target). Encoder
     /// swaps it back to false on the next frame and forces an IDR. AMD only — NVENC
@@ -108,6 +109,7 @@ impl SharedControl {
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
+            max_dgram: Arc::new(AtomicU32::new(eternal_wire::v2::MAX_DGRAM_SIZE as u32)),
             target_addr: Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], listen_port)))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),

@@ -19,6 +19,9 @@ use crate::control::SharedControl;
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
+#[cfg(target_os = "macos")]
+mod vimage;
+
 const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
@@ -43,6 +46,8 @@ pub fn run_encode_stage(
     gpu: GpuInfo,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    crate::capture::timing::set_stream_qos();
     let result = run_encode_loop(frames, tx, shared, gpu, generation);
     if let Err(ref e) = result {
         error!(error = %e, "Encode loop exited with error");
@@ -107,6 +112,10 @@ fn run_encode_loop(
 
     let mut encoder_state: Option<EncoderState> = None;
     let mut frames_since_last_idr: u64 = 0;
+    let test_idr_period = std::env::var("ETERNAL_FORCE_IDR_PERIOD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&period| period > 0);
     // Bounded retries for the AMF startup case where a keyframe is emitted before any SPS/PPS are
     // available (empty extradata + no inline parameter sets). We nudge another IDR a few times so
     // a subsequent keyframe carrying inline parameter sets can recover, instead of leaving the
@@ -292,19 +301,43 @@ fn run_encode_loop(
         let current_bitrate = encoder.opened_bitrate;
         let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
 
-        let stride = encoder.bgra_frame.stride(0);
         let src_row_bytes = (raw_frame.width * 4) as usize;
-        let bgra_plane = encoder.bgra_frame.data_mut(0);
-        for y in 0..raw_frame.height as usize {
-            let src_offset = y * src_row_bytes;
-            let dst_offset = y * stride;
-            bgra_plane[dst_offset..dst_offset + src_row_bytes]
-                .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
+        #[cfg(target_os = "macos")]
+        let converted = match encoder.native_converter.as_ref().map(|converter| {
+            converter.convert(
+                &raw_frame.data,
+                raw_frame.width,
+                raw_frame.height,
+                src_row_bytes,
+                &mut encoder.frame,
+            )
+        }) {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                warn!(%error, "Using swscale after native color conversion failed");
+                encoder.native_converter = None;
+                false
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let converted = false;
+        if !converted {
+            let stride = encoder.bgra_frame.stride(0);
+            let bgra_plane = encoder.bgra_frame.data_mut(0);
+            for y in 0..raw_frame.height as usize {
+                let src_offset = y * src_row_bytes;
+                let dst_offset = y * stride;
+                bgra_plane[dst_offset..dst_offset + src_row_bytes]
+                    .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
+            }
+            encoder
+                .scaler
+                .run(&encoder.bgra_frame, &mut encoder.frame)?;
         }
-
-        encoder
-            .scaler
-            .run(&encoder.bgra_frame, &mut encoder.frame)?;
+        // Conversion finished synchronously. Recycle capture's buffer before
+        // the codec or sender can block, including on the direct macOS path.
+        drop(raw_frame.data);
         let pts = if encoder.legacy_pts {
             raw_frame.frame_number as i64
         } else {
@@ -319,7 +352,8 @@ fn run_encode_loop(
             pts
         };
         encoder.frame.set_pts(Some(pts));
-        let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst);
+        let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst)
+            || test_idr_period.is_some_and(|period| raw_frame.frame_number.is_multiple_of(period));
         let _forced_intra = prepare_frame_for_encode(
             &mut encoder.frame,
             raw_frame.frame_number,
@@ -440,6 +474,8 @@ fn run_encode_loop(
 }
 
 struct EncoderState {
+    #[cfg(target_os = "macos")]
+    native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     scaler: ffmpeg_next::software::scaling::Context,
     bgra_frame: ffmpeg_next::frame::Video,
@@ -520,6 +556,17 @@ impl EncoderState {
         info!("swscale BGRA->YUV420P context created");
 
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            native_converter: match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
+                }
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            },
             encoder,
             scaler,
             bgra_frame: ffmpeg_next::frame::Video::new(

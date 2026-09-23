@@ -5,6 +5,9 @@ final class FrameAssemblerTests: XCTestCase {
     private var assembler = FrameAssembler()
     private var completed: [Data] = []
     private var diagnostics: [String] = []
+    private var now: UInt64 = 0
+    private var nacks: [Nack] = []
+    private var keyframes = 0
 
     override func setUp() {
         super.setUp()
@@ -15,11 +18,177 @@ final class FrameAssemblerTests: XCTestCase {
         assembler.onDiagnostic = { [weak self] message in self?.diagnostics.append(message) }
     }
 
-    private func add(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32 = 1, byte: UInt8) {
+    private func add(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32 = 1, byte: UInt8, retransmit: Bool = false, keyframe: Bool = false) {
         assembler.addFragment(
             seq: seq, index: index, count: count, epoch: epoch,
-            isKeyframe: false, captureTimestampUs: 0, payload: Data([byte])
+            isKeyframe: keyframe, captureTimestampUs: 0, payload: Data([byte]), isRetransmit: retransmit
         )
+    }
+
+    private func enableRepair() {
+        now = 0
+        nacks = []
+        keyframes = 0
+        assembler = FrameAssembler(nowUs: { [weak self] in self?.now ?? 0 })
+        assembler.repairEnabled = true
+        assembler.onFrameAssembled = { [weak self] data, _, _, _ in self?.completed.append(data) }
+        assembler.onNack = { [weak self] nack in self?.nacks.append(nack) }
+        assembler.onNeedsKeyframe = { [weak self] _, _ in self?.keyframes += 1 }
+    }
+
+    func testSharedRustSwiftRepairTraces() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "repair_vectors", withExtension: "txt", subdirectory: "testdata"))
+        let text = try String(contentsOf: url, encoding: .utf8)
+        var delivered: [UInt32] = []
+        for (line, row) in text.components(separatedBy: .newlines).enumerated() {
+            let fields = row.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard let command = fields.first, !command.hasPrefix("#") else { continue }
+            func number(_ index: Int) -> UInt64 { UInt64(fields[index])! }
+            switch command {
+            case "reset":
+                enableRepair()
+                assembler.framePeriodUs = number(1)
+                let rtt = number(2)
+                assembler.rttUs = { rtt }
+                delivered = []
+                assembler.onFrameAssembled = { _, seq, _, _ in delivered.append(seq) }
+            case "add":
+                now = number(1)
+                add(seq: UInt32(number(3)), index: UInt16(number(4)), count: UInt16(number(5)),
+                    epoch: UInt32(number(2)), byte: UInt8(number(7)), retransmit: number(6) != 0,
+                    keyframe: fields.count > 8 && number(8) != 0)
+            case "tick":
+                assembler.tick(at: number(1))
+            case "expect":
+                let c = assembler.counters.withLock { $0 }
+                XCTAssertEqual([c.framesComplete, c.framesDropped, c.fragsReceived, c.fragsLost,
+                    c.fragsRepaired, c.nacksSent, UInt64(c.assemblerDepth)], (1...7).map(number), "line \(line + 1)")
+                XCTAssertEqual(delivered.isEmpty ? "-" : delivered.map(String.init).joined(separator: ","), fields[8], "line \(line + 1)")
+                XCTAssertEqual(UInt64(keyframes), number(9), "line \(line + 1)")
+                let requests = nacks.map { "\($0.frameSeq):" + $0.missing.map(String.init).joined(separator: ",") }
+                XCTAssertEqual(requests.isEmpty ? "-" : requests.joined(separator: "|"), fields[10], "line \(line + 1)")
+            default: XCTFail("Unknown trace command \(command)")
+            }
+        }
+    }
+
+    func testFirstGapRequestsOnlyProvenMissingIndices() {
+        enableRepair()
+        add(seq: 1, index: 2, count: 100, byte: 3)
+        XCTAssertEqual(nacks, [Nack(streamEpoch: 1, frameSeq: 1, fragCount: 100, missing: [0, 1])])
+        add(seq: 1, index: 2, count: 100, byte: 3)
+        XCTAssertEqual(nacks.count, 1)
+        XCTAssertEqual(assembler.counters.withLock { $0.fragsReceived }, 1)
+    }
+
+    func testRetransmitCompletesHeldFramesInOrder() {
+        enableRepair()
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        now = 10_000
+        add(seq: 2, index: 0, count: 1, byte: 3)
+        XCTAssertTrue(completed.isEmpty)
+        XCTAssertEqual(nacks.first?.missing, [1])
+        now = 12_000
+        add(seq: 1, index: 1, count: 2, byte: 2, retransmit: true)
+        XCTAssertEqual(completed, [Data([1, 2]), Data([3])])
+        let counts = assembler.counters.withLock { $0 }
+        XCTAssertEqual(counts.framesComplete, 2)
+        XCTAssertEqual(counts.framesDropped, 0)
+        XCTAssertEqual(counts.fragsRepaired, 1)
+        XCTAssertEqual(counts.fragsReceived, 2)
+        XCTAssertEqual(counts.assemblerDepth, 0)
+    }
+
+    func testDeadlineDropsMissingFrameAndReleasesQueue() {
+        enableRepair()
+        add(seq: 1, index: 1, count: 2, byte: 2)
+        now = 1_000
+        add(seq: 2, index: 0, count: 1, byte: 3)
+        assembler.tick(at: 24_999)
+        XCTAssertTrue(completed.isEmpty)
+        assembler.tick(at: 25_000)
+        XCTAssertEqual(completed, [Data([3])])
+        XCTAssertEqual(keyframes, 1)
+        now = 26_000
+        add(seq: 1, index: 0, count: 2, byte: 1, retransmit: true)
+        XCTAssertEqual(completed.count, 1)
+        let counts = assembler.counters.withLock { $0 }
+        XCTAssertEqual(counts.framesDropped, 1)
+        XCTAssertEqual(counts.fragsLost, 1)
+        XCTAssertEqual(counts.fragsRepaired, 0)
+    }
+
+    func testNackRetriesOnceAfterRTTPlusFiveMilliseconds() {
+        enableRepair()
+        add(seq: 1, index: 1, count: 2, byte: 2)
+        assembler.tick(at: 14_999)
+        XCTAssertEqual(nacks.count, 1)
+        assembler.tick(at: 15_000)
+        XCTAssertEqual(nacks.count, 2)
+        XCTAssertEqual(nacks[1].missing, [0])
+        assembler.tick(at: 20_000)
+        XCTAssertEqual(nacks.count, 2)
+        assembler.tick(at: 25_000)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    func testMissingTailIsDetectedWithoutAnotherDatagram() {
+        enableRepair()
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        assembler.tick(at: 16_666)
+        XCTAssertTrue(nacks.isEmpty)
+        assembler.tick(at: 16_667)
+        XCTAssertEqual(nacks.first?.missing, [1])
+        assembler.tick(at: 41_667)
+        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+    }
+
+    func testRepairHoldsAtMostThreeFrames() {
+        enableRepair()
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        add(seq: 2, index: 0, count: 1, byte: 2)
+        add(seq: 3, index: 0, count: 1, byte: 3)
+        XCTAssertTrue(completed.isEmpty)
+        add(seq: 4, index: 0, count: 1, byte: 4)
+        XCTAssertEqual(completed, [Data([2]), Data([3]), Data([4])])
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    func testMoreThanSixtyFourMissingFragmentsRequestsOneKeyframe() {
+        enableRepair()
+        add(seq: 1, index: 65, count: 66, byte: 1)
+        XCTAssertTrue(nacks.isEmpty)
+        XCTAssertEqual(keyframes, 1)
+        assembler.tick(at: 25_000)
+        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(assembler.counters.withLock { $0.fragsLost }, 65)
+    }
+
+    func testRepairDeadlineUsesRTTAndFramePeriodWithEightMillisecondFloor() {
+        enableRepair()
+        assembler.framePeriodUs = 1_000
+        assembler.rttUs = { 100 }
+        add(seq: 1, index: 1, count: 2, byte: 2)
+        assembler.tick(at: 7_999)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 8_000)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    func testJitterExcludesRetransmitsAndReportsActualDepth() {
+        enableRepair()
+        now = 100_000
+        add(seq: 1, index: 0, count: 3, byte: 1)
+        now = 101_000
+        add(seq: 1, index: 1, count: 3, byte: 2)
+        XCTAssertEqual(assembler.counters.withLock { $0.jitterUs }, 62)
+        XCTAssertEqual(assembler.counters.withLock { $0.assemblerDepth }, 1)
+        now = 102_000
+        add(seq: 1, index: 2, count: 3, byte: 3, retransmit: true)
+        XCTAssertEqual(assembler.counters.withLock { $0.jitterUs }, 62)
+        XCTAssertEqual(assembler.counters.withLock { $0.assemblerDepth }, 0)
     }
 
     func testAssemblesInOrderAndOutOfOrder() {

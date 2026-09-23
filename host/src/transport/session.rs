@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, ReceiverReport,
-    StreamConfig, FEATURE_WANTS_INPUT,
+    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, Nack,
+    ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
 };
 use tracing::{info, warn};
 
@@ -42,6 +42,9 @@ pub struct Actions {
     /// produced when that client's HELLO2 asked for input relay). The
     /// transport dedupes per session and injects.
     pub input: Option<(u32, InputEvent)>,
+    /// Negotiated and session-gated request; the transport checks frag_count
+    /// against its stored datagrams before sending anything.
+    pub retransmit: Option<(u32, u32, Vec<u16>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,12 @@ impl Session {
             .is_some_and(|s| s.info.decoder_caps & eternal_wire::v2::control::CAP_DECODE_HEVC != 0)
     }
 
+    pub fn client_supports_nack(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|s| s.info.feature_caps & FEATURE_SUPPORTS_NACK != 0)
+    }
+
     pub fn last_report(&self) -> Option<ReceiverReport> {
         self.active.as_ref().and_then(|s| s.last_report)
     }
@@ -164,6 +173,7 @@ impl Session {
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
             ControlMessage::InputEvent(event) => self.handle_input(source, event, now),
+            ControlMessage::Nack(nack) => self.handle_nack(source, nack, now),
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
         }
@@ -198,6 +208,22 @@ impl Session {
         // A stream of touches is proof of life as good as any report.
         session.liveness_deadline = now + LIVENESS_TIMEOUT;
         actions.input = Some((session.session_id, event));
+        actions
+    }
+
+    fn handle_nack(&mut self, source: SocketAddr, nack: Nack, now: Instant) -> Actions {
+        let mut actions = Actions::default();
+        let Some(session) = self.active.as_mut() else {
+            return actions;
+        };
+        if !session_peer_matches(session, source)
+            || session.info.feature_caps & FEATURE_SUPPORTS_NACK == 0
+            || nack.validate().is_err()
+        {
+            return actions;
+        }
+        session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        actions.retransmit = Some((nack.stream_epoch, nack.frame_seq, nack.missing));
         actions
     }
 
@@ -312,6 +338,7 @@ impl Session {
             return actions;
         }
         session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        info!(reason = ?request.reason, "Keyframe request received");
 
         let granted = !matches!(
             session.last_keyframe_grant,
@@ -463,6 +490,8 @@ impl Session {
             liveness_timeout_ms: LIVENESS_TIMEOUT.as_millis() as u16,
             stream_config: config.stream_config(),
             host_name: config.host_name(),
+            auth_token: [0; 16],
+            host_caps: HOSTCAP_NACK,
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
     }
@@ -532,6 +561,64 @@ mod tests {
             ControlMessage::HelloAck(ack) => ack,
             other => panic!("expected ack, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nack_requires_capability_peer_and_session_and_extends_liveness() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let nack = ControlMessage::Nack(Nack {
+            stream_epoch: 7,
+            frame_seq: 42,
+            frag_count: 9,
+            missing: vec![0, 8],
+        });
+        session.handle_control(peer, 0, hello(1, 50000), &TestConfig, now);
+        assert!(!session.client_supports_nack());
+        assert!(session
+            .handle_control_authed(peer, nack.clone(), &TestConfig, now)
+            .retransmit
+            .is_none());
+
+        let ControlMessage::Hello2(mut wants) = hello(2, 50000) else {
+            unreachable!()
+        };
+        wants.feature_caps = FEATURE_SUPPORTS_NACK;
+        let actions =
+            session.handle_control(peer, 0, ControlMessage::Hello2(wants), &TestConfig, now);
+        assert_eq!(
+            parse_ack(&actions.replies[0].1).host_caps & HOSTCAP_NACK,
+            HOSTCAP_NACK
+        );
+        let id = session.session_id().unwrap();
+        assert!(session.client_supports_nack());
+        assert!(session
+            .handle_control(peer, id + 1, nack.clone(), &TestConfig, now)
+            .retransmit
+            .is_none());
+        assert!(session
+            .handle_control(
+                addr([10, 0, 0, 9], 50000),
+                id,
+                nack.clone(),
+                &TestConfig,
+                now
+            )
+            .retransmit
+            .is_none());
+        let later = now + Duration::from_secs(2);
+        assert_eq!(
+            session
+                .handle_control(peer, id, nack, &TestConfig, later)
+                .retransmit,
+            Some((7, 42, vec![0, 8]))
+        );
+        assert!(
+            !session
+                .tick(&TestConfig, false, now + Duration::from_secs(4))
+                .client_lost
+        );
     }
 
     #[test]

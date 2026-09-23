@@ -1,5 +1,6 @@
 """Drive the reference PC using SSH and the console-session PowerShell runner."""
 import base64
+import json
 import os
 import pathlib
 import re
@@ -71,6 +72,14 @@ def main(args):
         pidfile = ROOT + r"\host.pid.json"
         ps("if (Test-Path " + quote(pidfile) + ") { throw 'A host run is already tracked; stop it before starting another' }")
         command = "; ".join("$env:" + k + "=" + quote(v) for k, v in environment.items())
+        bitrate = float(os.environ.get("EM_BITRATE_MBPS", "15"))
+        if not 4 <= bitrate <= 50:
+            raise ValueError("EM_BITRATE_MBPS must be between 4 and 50")
+        settings_dir = ROOT + r"\state\EternalMonitor"
+        settings = json.dumps(dict(bitrate_mbps=bitrate, target_fps=60, start_on_boot=False))
+        command += "; New-Item -ItemType Directory -Force " + quote(settings_dir) + " | Out-Null"
+        command += "; [System.IO.File]::WriteAllText(" + quote(settings_dir + r"\settings.json")
+        command += "," + quote(settings) + ",(New-Object System.Text.UTF8Encoding($false)))"
         command += "; $env:PATH=" + quote(r"D:\AgentWork\sdk\ffmpeg-7.1.1-full_build-shared\bin;") + "+$env:PATH"
         command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(REPO + r"\target\release\eternal-host.exe")
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")

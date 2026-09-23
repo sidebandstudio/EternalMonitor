@@ -63,6 +63,10 @@ struct DisplayView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear { scheduleHUDDismiss() }
         .onDisappear { hudDismissTask?.cancel() }
+        .onChange(of: showQualityPopover) { _, presented in
+            if presented { hudDismissTask?.cancel() }
+            else { scheduleHUDDismiss() }
+        }
         .onChange(of: settings.keepScreenAwake) { _, keepAwake in
             // Apply mid-session — the whole point of flipping it is the
             // screen dimming (or not) right now.
@@ -73,40 +77,43 @@ struct DisplayView: View {
     // MARK: - HUD overlay
 
     private var hudOverlay: some View {
-        HStack(spacing: 14) {
-            stat("\(Int(connectionManager.fps))", unit: "fps", color: Theme.amber)
-            divider
-            stat(
-                connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "—",
-                unit: "ms",
-                color: Theme.phosphor
-            )
-            divider
-            stat(connectionManager.transportMode, unit: "", color: Theme.text)
-            divider
-            qualityBars
-                .onTapGesture { showQualityPopover.toggle() }
-                .popover(isPresented: $showQualityPopover) {
-                    qualityPopover
-                        .padding(14)
-                        .background(Theme.panel)
-                        .presentationCompactAdaptation(.popover)
-                }
-                .accessibilityLabel("Connection quality details")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .strokeBorder(Theme.hairline, lineWidth: 1)
+        Button { showQualityPopover.toggle() } label: {
+            HStack(spacing: 14) {
+                stat("\(Int(connectionManager.fps))", unit: "fps", color: Theme.amber)
+                divider
+                stat(
+                    connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "—",
+                    unit: "ms",
+                    color: Theme.phosphor
                 )
-        )
+                divider
+                stat(connectionManager.transportMode, unit: "", color: Theme.text)
+                divider
+                qualityBars
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(Theme.hairline, lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showQualityPopover) {
+            qualityPopover
+                .padding(14)
+                .background(Theme.panel)
+                .presentationCompactAdaptation(.popover)
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(hudAccessibilitySummary)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Show connection quality details")
         .accessibilityIdentifier("display.hud")
     }
 
@@ -145,6 +152,18 @@ struct DisplayView: View {
                     label: "rtt", color: Theme.text
                 )
                 Readout(value: "\(q.framesDropped)", unit: "", label: "dropped", color: Theme.text)
+            }
+            HStack(spacing: 18) {
+                Readout(value: "\(q.fragsRepaired)", unit: "", label: "repaired", color: Theme.text)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Repaired fragments")
+                    .accessibilityValue("\(q.fragsRepaired)")
+                    .accessibilityIdentifier("quality.repaired")
+                Readout(value: String(format: "%.1f", q.jitterMs), unit: "ms", label: "jitter", color: Theme.text)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Jitter")
+                    .accessibilityValue(String(format: "%.1f milliseconds", q.jitterMs))
+                    .accessibilityIdentifier("quality.jitter")
             }
         }
     }
