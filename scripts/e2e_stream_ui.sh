@@ -7,16 +7,17 @@ OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/stream-ui}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 STARTED=$SECONDS
 mkdir -p "$OUT"
-rm -f "$OUT/result.json"
+rm -f "$OUT/result.json" "$OUT/tests.json"
 status=0
 EM_TEST_STAMP="$STAMP" "$ROOT/scripts/test_ios.sh" \
     -only-testing:EternalMonitorUITests/AudioStreamTests \
     -only-testing:EternalMonitorUITests/StreamDiagnosticsTests \
     -only-testing:EternalMonitorUITests/USBStreamTests > "$OUT/ui-run.log" 2>&1 || status=$?
-RESULT="$ROOT/build/ios-tests-$STAMP.xcresult"
-SHOTS="$ROOT/build/screenshots/ui-$STAMP"
-for source in "$ROOT/build/ios-tests-$STAMP.log" "$ROOT/build/ios-ui-host-$STAMP.log" \
-    "$ROOT/build/ios-ui-usb-host-$STAMP.log" "$ROOT/build/ios-usb-proxy-$STAMP.log"; do
+TEST_ROOT="${EM_UI_EVIDENCE_DIR:-$ROOT/build}"
+RESULT="$TEST_ROOT/ios-tests-$STAMP.xcresult"
+SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
+for source in "$TEST_ROOT/ios-tests-$STAMP.log" "$TEST_ROOT/ios-ui-host-$STAMP.log" \
+    "$TEST_ROOT/ios-ui-usb-host-$STAMP.log" "$TEST_ROOT/ios-usb-proxy-$STAMP.log"; do
     [ ! -f "$source" ] || cp "$source" "$OUT/"
 done
 if [ -d "$RESULT" ]; then
@@ -29,8 +30,9 @@ if sys.argv[3]!='0': errors.append('Streaming UI tests failed; see ui-run.log')
 summary=json.loads((out/'tests.json').read_text()) if (out/'tests.json').exists() else {}
 if summary.get('passedTests',0)!=4 or summary.get('failedTests',0)!=0:
     errors.append('Expected four passing streaming UI tests')
-if shots.exists(): shutil.copytree(shots,out/'screenshots',dirs_exist_ok=True)
-images=list((out/'screenshots').glob('*.png'))
+retained=out/'screenshots'/shots.name
+if shots.exists(): shutil.copytree(shots,retained)
+images=sorted(retained.glob('*.png'))
 if not images: errors.append('UI screenshots are missing')
 report=dict(scenario='stream-ui',status='FAIL' if errors else 'PASS',elapsed=int(sys.argv[4]),
     tests_passed=summary.get('passedTests',0),screenshot=str(images[0]) if images else '',errors=errors)
