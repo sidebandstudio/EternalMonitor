@@ -437,10 +437,61 @@ fn lossy_stream_recovers_and_adapts() {
         CAP_DECODE_H264,
         eternal_wire::v2::control::FEATURE_SUPPORTS_NACK,
     );
+    #[cfg(not(target_os = "macos"))]
     receiver
         .socket
         .set_read_timeout(Some(Duration::from_millis(2)))
         .unwrap();
+    #[cfg(target_os = "macos")]
+    let repair_poll = {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SO_RCVTIMEO can coalesce a 2 ms wait beyond the frame's repair
+        // deadline. Match the app's 1 ms repair timer while also waking as
+        // soon as a packet arrives. No spin loop or relaxed deadline.
+        receiver.socket.set_nonblocking(true).unwrap();
+        let fd = unsafe { libc::kqueue() };
+        assert!(
+            fd >= 0,
+            "repair kqueue: {}",
+            std::io::Error::last_os_error()
+        );
+        let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+        let changes = [
+            libc::kevent {
+                ident: receiver.socket.as_raw_fd() as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            },
+            libc::kevent {
+                ident: 1,
+                filter: libc::EVFILT_TIMER,
+                flags: libc::EV_ADD,
+                fflags: libc::NOTE_USECONDS | libc::NOTE_CRITICAL,
+                data: 1_000,
+                udata: std::ptr::null_mut(),
+            },
+        ];
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                changes.as_ptr(),
+                changes.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "repair poll: {}",
+            std::io::Error::last_os_error()
+        );
+        queue
+    };
     let mut assembler = Reassembler::new();
     assembler.configure_repair(
         true,
@@ -468,6 +519,33 @@ fn lossy_stream_recovers_and_adapts() {
     let mut recovery_sequences = Vec::new();
     let mut bytes = [0; 2048];
     while started.elapsed() < Duration::from_secs(15) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+            let result = unsafe {
+                libc::kevent(
+                    repair_poll.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    std::ptr::null(),
+                )
+            };
+            if result == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert_eq!(
+                result,
+                1,
+                "repair wait: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(unsafe { event.assume_init() }.flags & libc::EV_ERROR, 0);
+        }
         if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
             if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
                 if header.session_id == receiver.session_id {
