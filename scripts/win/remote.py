@@ -87,7 +87,8 @@ def main(args):
         executable = REPO + r"\target\release\eternal-host.exe"
         if os.environ.get("EM_INSTALLED_HOST") == "1":
             executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
-        command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(executable)
+        window_option = "-WindowStyle Hidden" if environment["ETERNAL_HEADLESS"] == "1" else "-NoNewWindow"
+        command += "; $p=Start-Process -PassThru " + window_option + " -FilePath " + quote(executable)
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
@@ -162,10 +163,11 @@ def main(args):
             ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
         else:
             if action == "probe":
-                ps("Remove-Item " + quote(ROOT + r"\input-probe.log") + " -ErrorAction SilentlyContinue")
+                ps("if (Test-Path " + quote(ROOT + r"\input-probe.log") + ") { Remove-Item " + quote(ROOT + r"\input-probe.log") + " }")
             session(script("Pattern-Window" if action == "pattern" else "Input-Probe",
                            "-Seconds 7200" + ((" -VirtualDisplay" if action == "pattern" else " -FullScreen") if len(args) == 2 else "")),
-                    detach=True, idle=True, timeout=7260)
+                    detach=True, idle=True, timeout=7260,
+                    run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
             if action == "probe":
                 ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not start' }; Start-Sleep -Milliseconds 100 }; "

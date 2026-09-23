@@ -42,5 +42,12 @@ class InstalledHostTests(unittest.TestCase):
         self.assertIn(remote.REPO + r'\target\release\eternal-host.exe', launch.call_args.args[0])
         self.assertNotIn('wrong.exe', launch.call_args.args[0])
 
+class ProbeTokenTests(unittest.TestCase):
+    def test_probe_uses_the_same_limited_token_as_the_host(self):
+        with patch.dict(os.environ, {'EM_RUN_LEVEL': 'Limited'}, clear=True), \
+                patch.object(remote, 'ps'), patch.object(remote, 'session') as launch:
+            remote.main(['probe', 'start', 'fullscreen'])
+        self.assertEqual(launch.call_args.kwargs['run_level'], 'Limited')
+
 if __name__ == '__main__':
     unittest.main()
