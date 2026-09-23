@@ -12,6 +12,96 @@ import e2e_real
 
 
 class RealRunnerCleanupTests(unittest.TestCase):
+    def test_vdd_checks_measured_stream_before_separate_host_exit_session(self):
+        after_measurement = False
+        states = iter((True, False, True))
+        pixel_paths = []
+        with tempfile.TemporaryDirectory() as directory:
+            def remote(*args, **kwargs):
+                if args == ('host-info',): return 'null'
+                if args == ('vdd-state',):
+                    return json.dumps(dict(disabled=next(states, True), settings_xml=
+                        '<vdd_settings><resolutions><resolution><width>2420</width><height>1668</height>'
+                        '<refresh_rate>60</refresh_rate></resolution></resolutions></vdd_settings>'))
+                if args == ('log',):
+                    return ('Desktop duplication active\nEncoder opened encoder="h264_nvenc"\n' +
+                            'Keyframe request received\n' * (3 if after_measurement else 2))
+                return ''
+
+            def run(command, **kwargs):
+                if Path(command[0]).name == 'pixels.sh': pixel_paths.append(Path(command[1]).name)
+                return ''
+
+            def host_exit(*args):
+                nonlocal after_measurement
+                after_measurement = True
+
+            class Stream:
+                returncode = 0
+                def __init__(self, command, *, env, **kwargs):
+                    self.polls = 0
+                    row = Path(env['EM_OUTPUT_DIR'])
+                    (row / 'app.log').write_text('E2E_HELLO w=1668 h=2420 refresh_hz=60\nw=2420 h=1668')
+                    (row / 'result.json').write_text(json.dumps(dict(status='PASS', measured_seconds=20)))
+                def poll(self):
+                    self.polls += 1
+                    return None if self.polls == 1 else 0
+
+            with patch.dict(os.environ, {'EM_EVIDENCE_DIR': directory}), \
+                    patch('sys.argv', ['e2e_real.py', '--rows', 'R-vdd']), \
+                    patch.object(e2e_real, 'remote', side_effect=remote), \
+                    patch.object(e2e_real, 'run', side_effect=run), \
+                    patch.object(e2e_real, 'verify_vdd_host_exit', side_effect=host_exit), \
+                    patch.object(e2e_real.time, 'sleep'), \
+                    patch.object(e2e_real.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
+                    patch.object(e2e_real.subprocess, 'Popen', Stream), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(e2e_real.main(), 0)
+            row = Path(directory) / 'real/R-vdd'
+            self.assertEqual(json.loads((row / 'result.json').read_text())['keyframe_requests'], 2)
+            self.assertEqual((row / 'host.log').read_text().count('Keyframe request received'), 3)
+            self.assertEqual((row / 'host-measurement.log').read_text().count('Keyframe request received'), 2)
+        self.assertEqual(pixel_paths, ['R-vdd-connected.png'])
+
+    def test_pairing_build_does_not_skip_first_release_stream_build(self):
+        builds = []
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory) / 'container'
+            (container / 'tmp').mkdir(parents=True)
+            (container / 'tmp/eternal-e2e.log').write_text('pairing evidence')
+
+            def complete(env):
+                (Path(env['EM_OUTPUT_DIR']) / 'result.json').write_text(
+                    json.dumps(dict(scenario=env['EM_SCENARIO'], status='PASS', errors=[])))
+
+            def run(command, *, env=None, **kwargs):
+                if Path(command[0]).name == 'e2e_pairing.sh':
+                    complete(env)
+                return str(container)
+
+            def remote(*args, **kwargs):
+                if args == ('host-info',): return 'null'
+                if args == ('log',): return 'pairing_code=123456'
+                return ''
+
+            class Stream:
+                returncode = 0
+                def __init__(self, command, *, env, **kwargs):
+                    builds.append(env['EM_SKIP_BUILD'])
+                    complete(env)
+                def poll(self): return 0
+
+            with patch.dict(os.environ, {'EM_EVIDENCE_DIR': directory}), \
+                    patch('sys.argv', ['e2e_real.py', '--rows', 'R-pairing', 'R-baseline', 'R-nvenc-h264']), \
+                    patch.object(e2e_real, 'remote', side_effect=remote), \
+                    patch.object(e2e_real, 'run', side_effect=run), \
+                    patch.object(e2e_real, 'check_stream'), \
+                    patch.object(e2e_real.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
+                    patch.object(e2e_real.subprocess, 'Popen', Stream), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(e2e_real.main(), 0)
+        self.assertEqual(builds, ['0', '1'])
+
     def run_failure(self, remote):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {'EM_EVIDENCE_DIR':directory}), \
@@ -57,6 +147,19 @@ class RealRunnerCleanupTests(unittest.TestCase):
         self.assertIn(('stop-host','--kill'),calls)
         self.assertEqual(calls[-1],('pattern','stop'))
         self.assertTrue(any('Host cleanup' in error for error in result['errors']))
+
+    def test_invalid_log_encoding_does_not_skip_cleanup(self):
+        calls = []
+        def remote(*args, **kwargs):
+            calls.append(args)
+            if args == ('host-info',): return 'null'
+            if args[0] == 'run-host': raise OSError('test host launch failed')
+            if args == ('log',):
+                raise UnicodeDecodeError('utf-8', b'\x83', 0, 1, 'invalid byte')
+            return ''
+        self.run_failure(remote)
+        self.assertIn(('stop-host',), calls)
+        self.assertEqual(calls[-1], ('pattern', 'stop'))
 
     def run_input_geometry(self, size, probe_size):
         calls = []

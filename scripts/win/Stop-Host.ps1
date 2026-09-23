@@ -9,10 +9,13 @@ if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString()
     throw 'The tracked host process identity changed; refusing to stop it'
 }
 $graceful = $false
+Write-Output ('Stopping verified host PID {0}, window={1}, title={2}' -f $p.Id,$p.MainWindowHandle,$p.MainWindowTitle)
 if (!$Force) {
     if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
+        Write-Output 'Requesting window close'
         $graceful = $p.CloseMainWindow()
     } else {
+        Write-Output 'Preparing console-control delivery'
         Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -31,8 +34,10 @@ public static class EMHostConsole {
     }
 }
 '@
+        Write-Output 'Sending Ctrl+C'
         $graceful = [EMHostConsole]::Stop([uint32]$p.Id)
     }
+    Write-Output ('Shutdown signal sent: ' + $graceful)
     if ($graceful) { [void]$p.WaitForExit(10000) }
 }
 $p.Refresh()

@@ -417,6 +417,19 @@ pub(crate) fn wedge_reason_at(
     None
 }
 
+fn stream_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    #[cfg(target_os = "macos")]
+    {
+        // Repair deadlines apply to transport and the I/O driver as well as
+        // capture and encoding. Rust threads do not inherit the parent's QoS.
+        crate::capture::timing::set_stream_qos();
+        builder.on_thread_start(crate::capture::timing::set_stream_qos);
+    }
+    builder.build()
+}
+
 fn spawn_generation(
     generation: u64,
     listen_port: u16,
@@ -450,7 +463,7 @@ fn spawn_generation(
         generation,
     };
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
+        let rt = match stream_runtime() {
             Ok(rt) => rt,
             Err(error) => {
                 reporter.stage_exited(
@@ -529,6 +542,45 @@ mod tests {
             machine.state,
             SupervisorState::BackingOff { attempt: 1, .. }
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_runtime_prioritizes_the_transport_and_io_workers() {
+        fn qos() -> u32 {
+            unsafe extern "C" {
+                fn pthread_get_qos_class_np(
+                    thread: libc::pthread_t,
+                    class: *mut u32,
+                    priority: *mut i32,
+                ) -> i32;
+            }
+            let mut class = 0;
+            let mut priority = 0;
+            assert_eq!(
+                unsafe {
+                    pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+                },
+                0
+            );
+            class
+        }
+
+        // Keep the test runner's own QoS unchanged. New Rust threads start at
+        // default QoS on macOS, even with an interactive-priority parent.
+        std::thread::spawn(|| {
+            let runtime = stream_runtime().unwrap();
+            let transport_qos = qos();
+            let worker_qos =
+                runtime.block_on(async { tokio::spawn(async { qos() }).await.unwrap() });
+            assert_eq!(
+                transport_qos, 0x21,
+                "transport must match capture and encode"
+            );
+            assert_eq!(worker_qos, 0x21, "I/O workers must promptly wake transport");
+        })
+        .join()
+        .unwrap();
     }
 
     fn failed(reason: &str) -> StageOutcome {
