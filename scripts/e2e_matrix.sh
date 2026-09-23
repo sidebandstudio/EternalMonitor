@@ -18,13 +18,13 @@ write_report() {
 python3 - "$REPORT" "${rows[@]}" <<'PY'
 import datetime,json,pathlib,sys
 lines=['# EternalMonitor system tests', '', datetime.datetime.now(datetime.timezone.utc).isoformat(), '',
-       '| Scenario | Result | Average FPS | Decoded | Dropped | Repaired | NACKs | Stream seconds | Audio decoded | Audio lost | Tone dBFS | Recovery seconds | Elapsed seconds | Screenshot |',
-       '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
+       '| Scenario | Result | Average FPS | FPS gate | Decoded | Dropped | Repaired | NACKs | Stream seconds | Audio decoded | Audio lost | Tone dBFS | Recovery seconds | Elapsed seconds | Screenshot |',
+       '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
 for filename in sys.argv[2:]:
     p=pathlib.Path(filename)
     r=json.loads(p.read_text()) if p.exists() else dict(scenario=p.parent.name,status='FAIL')
     shot=r.get('screenshot','')
-    cells=[r['scenario'],r['status'],r.get('average_fps',r.get('fps','')),r.get('decoded',''),
+    cells=[r['scenario'],r['status'],r.get('average_fps',r.get('fps','')),r.get('fps_gate',''),r.get('decoded',''),
            r.get('dropped',''),r.get('repaired',''),r.get('nacks',''),r.get('measured_seconds',''),
            r.get('audio_decoded',''),r.get('audio_lost',''),r.get('audio_tone1k_db',''),
            r.get('recovery_seconds',''),r.get('elapsed',''),
