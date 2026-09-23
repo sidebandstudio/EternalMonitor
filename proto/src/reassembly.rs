@@ -417,6 +417,15 @@ impl Reassembler {
     }
 
     fn request_keyframe(&mut self, seq: u32) {
+        // A complete queued keyframe restores references after this loss.
+        // Keep the repair deadline, but do not request another replacement.
+        if self
+            .pending
+            .iter()
+            .any(|(&later, frame)| later > seq && frame.header.is_keyframe && frame.complete())
+        {
+            return;
+        }
         if let Some(frame) = self.pending.get_mut(&seq) {
             if !frame.keyframe_requested {
                 self.keyframe_needed = true;
@@ -530,7 +539,7 @@ mod tests {
                             frag_index: number(4) as u16,
                             frag_count: number(5) as u16,
                             is_retransmit: number(6) != 0,
-                            is_keyframe: false,
+                            is_keyframe: fields.get(8).is_some_and(|value| *value == "1"),
                             capture_ts_us: 0,
                             payload_len: 1,
                         },

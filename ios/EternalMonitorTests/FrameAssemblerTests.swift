@@ -18,10 +18,10 @@ final class FrameAssemblerTests: XCTestCase {
         assembler.onDiagnostic = { [weak self] message in self?.diagnostics.append(message) }
     }
 
-    private func add(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32 = 1, byte: UInt8, retransmit: Bool = false) {
+    private func add(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32 = 1, byte: UInt8, retransmit: Bool = false, keyframe: Bool = false) {
         assembler.addFragment(
             seq: seq, index: index, count: count, epoch: epoch,
-            isKeyframe: false, captureTimestampUs: 0, payload: Data([byte]), isRetransmit: retransmit
+            isKeyframe: keyframe, captureTimestampUs: 0, payload: Data([byte]), isRetransmit: retransmit
         )
     }
 
@@ -55,7 +55,8 @@ final class FrameAssemblerTests: XCTestCase {
             case "add":
                 now = number(1)
                 add(seq: UInt32(number(3)), index: UInt16(number(4)), count: UInt16(number(5)),
-                    epoch: UInt32(number(2)), byte: UInt8(number(7)), retransmit: number(6) != 0)
+                    epoch: UInt32(number(2)), byte: UInt8(number(7)), retransmit: number(6) != 0,
+                    keyframe: fields.count > 8 && number(8) != 0)
             case "tick":
                 assembler.tick(at: number(1))
             case "expect":
