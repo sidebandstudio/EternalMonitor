@@ -45,14 +45,18 @@ fn utf16_to_string(buf: &[u16]) -> String {
 /// reusable by both the GUI picker and the capture loop. Never panics — on any DXGI error
 /// it returns whatever was discovered so far (possibly empty).
 pub fn enumerate_outputs() -> Vec<OutputInfo> {
-    let mut outputs = Vec::new();
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,
         Err(error) => {
             warn!(error = %error, "CreateDXGIFactory1 failed during output enumeration");
-            return outputs;
+            return Vec::new();
         }
     };
+    enumerate_factory_outputs(&factory)
+}
+
+fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
+    let mut outputs = Vec::new();
 
     let mut adapter_index = 0u32;
     loop {
@@ -102,9 +106,6 @@ pub fn run_capture_loop(
     adapter_index: u32,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // --- Create DXGI factory and select the output to capture ---
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-
     // The capture adapter FOLLOWS the chosen output (which may differ from the
     // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
     // and independent. `adapter_index` is only the last-resort fallback below.
@@ -112,8 +113,13 @@ pub fn run_capture_loop(
     // Turn the virtual display on/off to match the request before enumerating, so the
     // managed virtual output only exists while we're capturing it (and only while an iPad
     // is connected).
-    let target = reconcile_virtual_display(&requested_target, &shared);
-    let outputs = super::enumerate_outputs();
+    let Some(target) = reconcile_virtual_display(&requested_target, &shared, generation) else {
+        return Ok(());
+    };
+    // DXGI factories snapshot adapters at creation. Enable the driver first,
+    // then enumerate and open the chosen output from the same fresh factory.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let outputs = enumerate_factory_outputs(&factory);
     for o in &outputs {
         info!(
             device = %o.device_name,
