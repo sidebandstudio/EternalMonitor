@@ -10,16 +10,18 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Metadata, Subscriber};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
 const LOG_BUFFER_LIMIT: usize = 200;
+const OUTPUT_BUFFER_LIMIT: usize = 256;
 const SESSION_LOG_FILE_NAME: &str = "eternal-host-session.log";
 
 static LOG_BUFFER: Lazy<Arc<Mutex<VecDeque<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LIMIT))));
 static SESSION_LOG_PATH: Lazy<PathBuf> = Lazy::new(resolve_session_log_path);
-static SESSION_LOG_FILE: Lazy<Option<Arc<Mutex<File>>>> = Lazy::new(|| {
+fn open_session_log() -> Option<File> {
     let path = SESSION_LOG_PATH.clone();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -32,17 +34,23 @@ static SESSION_LOG_FILE: Lazy<Option<Arc<Mutex<File>>>> = Lazy::new(|| {
             false
         }
     };
-    match OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(rotated)
         .append(!rotated)
         .open(&path)
-    {
-        Ok(file) => Some(Arc::new(Mutex::new(file))),
-        Err(_) => None,
-    }
-});
+        .ok()
+}
+
+/// A stalled console or disk must not hold a capture, transport or GUI thread.
+/// Keep the guard in main so normal shutdown drains the bounded output queue.
+pub fn non_blocking_output(writer: impl Write + Send + 'static) -> (NonBlocking, WorkerGuard) {
+    NonBlockingBuilder::default()
+        .buffered_lines_limit(OUTPUT_BUFFER_LIMIT)
+        .lossy(true)
+        .finish(writer)
+}
 
 fn rotate_session_logs(path: &Path) -> io::Result<()> {
     if !path.try_exists()? {
@@ -67,23 +75,27 @@ fn rotate_session_logs(path: &Path) -> io::Result<()> {
 #[derive(Clone)]
 pub struct MemoryLogWriter {
     shared: Arc<Mutex<VecDeque<String>>>,
-    session_file: Option<Arc<Mutex<File>>>,
+    session_file: Option<NonBlocking>,
     current_line: Vec<u8>,
 }
 
-impl Default for MemoryLogWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MemoryLogWriter {
-    pub fn new() -> Self {
-        Self {
-            shared: LOG_BUFFER.clone(),
-            session_file: SESSION_LOG_FILE.clone(),
-            current_line: Vec::new(),
-        }
+    pub fn start() -> (Self, Option<WorkerGuard>) {
+        let (session_file, guard) = match open_session_log() {
+            Some(file) => {
+                let (writer, guard) = non_blocking_output(file);
+                (Some(writer), Some(guard))
+            }
+            None => (None, None),
+        };
+        (
+            Self {
+                shared: LOG_BUFFER.clone(),
+                session_file,
+                current_line: Vec::new(),
+            },
+            guard,
+        )
     }
 
     fn push_line(&mut self) {
@@ -100,16 +112,18 @@ impl MemoryLogWriter {
             return;
         }
 
-        let mut shared = self.shared.lock();
-        if shared.len() >= LOG_BUFFER_LIMIT {
-            shared.pop_front();
+        {
+            let mut shared = self.shared.lock();
+            if shared.len() >= LOG_BUFFER_LIMIT {
+                shared.pop_front();
+            }
+            shared.push_back(line.clone());
         }
-        shared.push_back(line);
 
-        if let Some(file) = &self.session_file {
-            let mut file = file.lock();
-            let _ = writeln!(file, "{}", shared.back().expect("log line just inserted"));
-            let _ = file.flush();
+        if let Some(file) = &mut self.session_file {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            let _ = file.write_all(&bytes);
         }
     }
 }
@@ -282,6 +296,89 @@ impl Visit for MessageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct BlockedOutput {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_output_drops_overflow_without_blocking_recent_logs() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (output, guard) = non_blocking_output(BlockedOutput {
+            entered: Some(entered_tx),
+            release: release_rx,
+        });
+        let errors = output.error_counter();
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: Some(output),
+            current_line: Vec::new(),
+        };
+        writer.write_all(b"first\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            for line in 0..OUTPUT_BUFFER_LIMIT * 2 {
+                writeln!(writer, "line {line}").unwrap();
+            }
+            done_tx.send(()).unwrap();
+        });
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        // Always release the simulated disk before asserting, even on failure.
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        drop(guard);
+        assert!(completed.is_ok(), "log output blocked the producer");
+        assert!(
+            errors.dropped_lines() > 0,
+            "the bounded queue did not overflow"
+        );
+        let recent = shared.lock();
+        assert_eq!(recent.len(), LOG_BUFFER_LIMIT);
+        assert_eq!(
+            recent.back().unwrap(),
+            &format!("line {}", OUTPUT_BUFFER_LIMIT * 2 - 1)
+        );
+    }
+
+    #[test]
+    fn output_guard_flushes_complete_lines_on_shutdown() {
+        #[derive(Clone)]
+        struct RecordedOutput(Arc<Mutex<Vec<u8>>>);
+        impl Write for RecordedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let recorded = RecordedOutput(Arc::new(Mutex::new(Vec::new())));
+        let (mut writer, guard) = non_blocking_output(recorded.clone());
+        writer.write_all(b"first\nlast\n").unwrap();
+        drop(guard);
+        assert_eq!(&*recorded.0.lock(), b"first\nlast\n");
+    }
 
     #[test]
     fn rotation_keeps_two_previous_sessions_and_preserves_them_without_a_current_log() {

@@ -11,6 +11,7 @@ getrandom = { version = "0.3.4", features = ["std"] }
 subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # GUI
