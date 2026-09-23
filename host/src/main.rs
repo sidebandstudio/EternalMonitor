@@ -14,14 +14,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
+    let (stdout_writer, _stdout_guard) = logging::non_blocking_output(std::io::stdout());
+    let (memory_writer, _session_guard) = logging::MemoryLogWriter::start();
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO))
+        .with_writer(stdout_writer.with_max_level(tracing::Level::INFO))
         .with_filter(logging::MdnsDedupFilter::new());
     let memory_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(logging::MemoryLogWriter::new)
+        .with_writer(move || memory_writer.clone())
         .with_filter(logging::MdnsDedupFilter::new());
 
     tracing_subscriber::registry()
