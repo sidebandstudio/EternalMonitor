@@ -2,9 +2,11 @@
 
 Status as of 2026-09-23: no release candidate has been published. The reference
 PC has installer `0975ad8`, including the USB capture/logging fixes and verified
-VDD binding checks. Extended desktop and charging work together through the
-rear USB-C port and a USB-C-to-USB-C data cable. The full campaign still has
-failing UDP reliability rows, and final validation on `main` remains pending.
+VDD binding checks. Extended desktop and charging passed together through the
+rear USB-C port and a USB-C-to-USB-C data cable. Later, Windows crashed during
+virtual-display activation; GPU, display and installer tests are suspended.
+The full campaign also has failing UDP reliability rows, and final validation
+on `main` remains pending.
 
 The results below belong to the stated phase revisions. They do not establish
 that a later candidate passed. Before release, run both complete matrices and
@@ -35,6 +37,17 @@ output workers keep capture and transport moving. The original failure,
 disk-reset correlation and before/after unread-pipe reproduction remain in
 `evidence/windows/usb-stalls/` and `evidence/async-logging-7f135a3/`.
 The evidence does not establish a hardware cause for the disk resets.
+
+At 19:42:10 UTC, Windows crashed with `SYSTEM_SERVICE_EXCEPTION (0x3B)` and an
+access violation in NVIDIA `nvlddmkm.sys` (driver 591.86), in `WUDFHost.exe`.
+WER identifies `CHwContext::uninitialize`. The installed host's USB connection
+arrived at 19:42:08.514 and triggered virtual-display activation; no completed
+enable operation appears before the crash. This is strong timing evidence that
+the display activation triggered the crash. The exact driver defect and a
+permanent fix remain unverified. Earlier restarts at 18:02–18:04 UTC were
+planned Windows Update operations. The new `4f0c706` installer had not been
+applied. Evidence: `evidence/windows/restarts/summary.json` and
+`evidence/windows/restarts/windbg-analysis.log`. Keep raw dumps and logs private.
 
 A fresh driver installation initially returned success while Windows had left
 the device unbound. Installer `0975ad8` now verifies the present device's bound
@@ -82,7 +95,7 @@ Additional gates:
 | R-autostart | Passed quoted HKCU value write/remove; prior absent value restored | `windows-campaign-755741b/real/R-autostart/` |
 | R-update-banner | Passed the 0.0.1 native test build, available-release banner and dismissal check | `windows/update-banner-native-inspection.log`, `windows/R-update-banner.png` |
 | R-installer | Upgrade and fresh/owned lifecycle checks passed. Latest installed R-vdd still fails its UDP keyframe limit, as recorded above | `windows/installer-0975ad8/`, `windows/owned-driver-*-0975ad8.log` |
-| Simulator soak | Older `b28687e` passed 30 minutes: host RSS +1.90%, app +0.16%, 60/60 intervals at least 55 FPS. The newer `116d6f5` soak is in progress; host memory growth needs review | `soak-b28687e/simulator/report.json`, `soak-simulator-116d6f5/` |
+| Simulator soak | `4f0c706` passes 30 minutes after the mdns-sd timer-heap correction: host RSS +1.61%, app -0.007%, 60/60 intervals at least 55 FPS, 59.99 average FPS and zero drops. Post-measurement simulator termination required a recorded manual cleanup. Earlier `116d6f5` failed host RSS at +55.57%; keep that failure | `soak-discovery-4f0c706/report.json`, `soak-discovery-4f0c706/cleanup-intervention.json`, `soak-simulator-116d6f5/` |
 | Real NVENC soak and final main soaks | Pending: 30 minutes each, host/app RSS growth below 20% from minute five and at least 95% of intervals at 55 FPS | Required before an rc tag |
 
 The independent Tailscale timing probe recorded 13 of 240 round trips above
@@ -95,8 +108,9 @@ Run `scripts/e2e_matrix.sh` and `scripts/soak.sh 1800` for simulator checks.
 Use `scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800` for Windows.
 Set `EM_PC_AVAILABLE=1` only with the user's availability authorization and
 `EM_RUN_LEVEL=Limited` for normal-user behavior. The user authorized the current
-campaign, including testing beyond the initial three hours. Verify current
-monitor geometry before each campaign; input tests reject mismatched bounds.
+campaign, including testing beyond the initial three hours. The kernel crash
+currently suspends Windows GPU/display tests despite that availability.
+Verify current monitor geometry before each campaign; input tests reject mismatched bounds.
 See `scripts/win/README.md` for the interactive runner and evidence collection.
 
 Keep each merged host phase's `release.yml` dry-run artifact URL in
@@ -115,10 +129,11 @@ Campaign cleanup and installed state:
    Completed Limited test tasks now remove their registrations. One hundred
    earlier completed registrations were removed after verifying their action,
    job identity and exit record; backups remain under the campaign directory.
-4. Before campaign completion, restore the recorded AC timeouts, 240 minutes
-   standby and 10 minutes display, and remove temporary binary firewall rules.
-   Keep installed product rules. Verify VDD removal after the final test. The
-   user's currently connected USB desktop remains active during ongoing work.
+4. At 20:00 UTC the original AC timeouts, 240 minutes standby and 10 minutes
+   display, were restored. Four temporary development firewall rules and the
+   stopped host launcher were removed after identity checks. Installed product
+   rules remain. No host is running, autostart is off and VDD problem 22 proves
+   it is disabled. Evidence: `evidence/windows/restarts/pause-cleanup.json`.
 5. Installer `0975ad8` is at
    `D:\AgentWork\em-v030\installer-0975ad8\EternalMonitor-Setup.exe`.
    Its SHA-256 is
