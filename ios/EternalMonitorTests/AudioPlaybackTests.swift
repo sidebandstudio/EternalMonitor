@@ -2,6 +2,98 @@ import AVFoundation
 import XCTest
 @testable import EternalMonitor
 
+final class AudioPlayerTests: XCTestCase {
+    private final class BlockingOutput: AudioOutputDevice {
+        let entered: XCTestExpectation
+        let release = DispatchSemaphore(value: 0)
+        let stopped = DispatchSemaphore(value: 0)
+        let error: Error?
+        init(entered: XCTestExpectation, error: Error? = nil) {
+            self.entered = entered; self.error = error
+        }
+        func start(pcm: AudioPCMBuffer) throws {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 20)
+            if let error { throw error }
+        }
+        func stop(deactivate: Bool) { stopped.signal() }
+    }
+
+    func testSlowOutputStartupDoesNotBlockPacketDecoding() throws {
+        let output = BlockingOutput(entered: expectation(description: "output startup entered"))
+        let player = AudioPlayer(output: output)
+        defer { output.release.signal(); player.stop() }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "tone_1khz_20ms",
+            withExtension: "opus", subdirectory: "Fixtures"))
+        let opus = try Data(contentsOf: url)
+        func send(_ seq: UInt32) {
+            player.receive(header: AudioHeader(sessionId: 7, streamEpoch: 1, audioSeq: seq,
+                captureTimestampUs: UInt64(seq) * 20_000, discontinuity: seq == 1), opus: opus)
+        }
+        send(1)
+        wait(for: [output.entered], timeout: 2)
+        for seq in 2...12 {
+            send(UInt32(seq))
+            let deadline = Date().addingTimeInterval(1)
+            while player.stats.decoded < UInt64(seq), Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            guard player.stats.decoded == UInt64(seq) else {
+                XCTFail("Packet \(seq) waited for output startup: \(player.stats)")
+                return
+            }
+        }
+        XCTAssertEqual(player.stats.lost, 0)
+        XCTAssertLessThanOrEqual(player.stats.bufferMs, 80, "waiting for output must not build latency")
+        XCTAssertFalse(player.stats.playing)
+    }
+
+    func testMuteIgnoresFailureFromAnOlderOutputStart() throws {
+        let output = BlockingOutput(entered: expectation(description: "output startup entered"),
+            error: NSError(domain: "AudioOutputTests", code: 1))
+        let player = AudioPlayer(output: output)
+        defer { output.release.signal(); player.stop() }
+        let failed = expectation(description: "retired output must not report an error")
+        failed.isInverted = true
+        player.onError = { _ in failed.fulfill() }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "tone_1khz_20ms",
+            withExtension: "opus", subdirectory: "Fixtures"))
+        player.receive(header: AudioHeader(sessionId: 7, streamEpoch: 1, audioSeq: 1,
+            captureTimestampUs: 20_000, discontinuity: true), opus: try Data(contentsOf: url))
+        wait(for: [output.entered], timeout: 2)
+        let decoded = Date().addingTimeInterval(1)
+        while player.stats.decoded == 0, Date() < decoded { Thread.sleep(forTimeInterval: 0.005) }
+        XCTAssertEqual(player.stats.bufferMs, 20)
+        player.setEnabled(false)
+        let muted = Date().addingTimeInterval(1)
+        while player.stats.bufferMs != 0, Date() < muted { Thread.sleep(forTimeInterval: 0.005) }
+        XCTAssertEqual(player.stats.bufferMs, 0)
+        output.release.signal()
+        XCTAssertEqual(output.stopped.wait(timeout: .now() + 2), .success)
+        wait(for: [failed], timeout: 0.1)
+        XCTAssertNil(player.stats.error)
+        XCTAssertFalse(player.stats.playing)
+    }
+
+    func testStopWaitsForPendingOutputToCloseBeforeReturning() throws {
+        let output = BlockingOutput(entered: expectation(description: "output startup entered"))
+        let player = AudioPlayer(output: output)
+        defer { output.release.signal(); player.stop() }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "tone_1khz_20ms",
+            withExtension: "opus", subdirectory: "Fixtures"))
+        player.receive(header: AudioHeader(sessionId: 7, streamEpoch: 1, audioSeq: 1,
+            captureTimestampUs: 20_000, discontinuity: true), opus: try Data(contentsOf: url))
+        wait(for: [output.entered], timeout: 2)
+        let stopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { player.stop(); stopped.signal() }
+        XCTAssertEqual(stopped.wait(timeout: .now() + 0.05), .timedOut)
+        output.release.signal()
+        XCTAssertEqual(stopped.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(output.stopped.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(player.stats, AudioStats())
+    }
+}
+
 final class AudioPCMBufferTests: XCTestCase {
     private func block(_ value: Float) -> [Float] { [Float](repeating: value, count: 1920) }
     private func render(_ ring: AudioPCMBuffer, frames: Int, at now: UInt64) -> [Float] {
