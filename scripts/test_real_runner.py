@@ -52,6 +52,8 @@ class RealRunnerCleanupTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1,args)
             return ''
         result = self.run_failure(remote)
+        launched = next(call for call in calls if call[0] == 'run-host')
+        self.assertIn('ETERNAL_USB_DIRECT=127.0.0.1:0', launched)
         self.assertIn(('stop-host','--kill'),calls)
         self.assertEqual(calls[-1],('pattern','stop'))
         self.assertTrue(any('Host cleanup' in error for error in result['errors']))
