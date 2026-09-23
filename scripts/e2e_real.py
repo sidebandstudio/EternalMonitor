@@ -89,6 +89,10 @@ def main():
     if args.list:
         print('\n'.join(args.rows))
         return 0
+    size = os.environ.get('EM_SIZE', '1920x1080')
+    if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*', size):
+        parser.error('EM_SIZE must be the primary display width and height, for example 3440x1440')
+    width, height = map(int, size.split('x'))
     evidence = Path(os.environ.get('EM_EVIDENCE_DIR', '/Users/aldo/Desktop/EternalMonitor-Handoff/evidence')).resolve()
     out = evidence / 'real'
     out.mkdir(parents=True, exist_ok=True)
@@ -123,7 +127,7 @@ def main():
                    EM_EVIDENCE_DIR=str(evidence), EM_UI_EVIDENCE_DIR=str(row / 'ui'),
                    DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer',
                    EM_SCREENSHOT=str(row / 'simulator.png'), EM_REMOTE_HOST='100.81.59.48',
-                   EM_PORT='19876', EM_SIZE='1920x1080', EM_DURATION='20', EM_TIMEOUT='180',
+                   EM_PORT='19876', EM_SIZE=size, EM_DURATION='20', EM_TIMEOUT='180',
                    EM_SKIP_BUILD=skip_build, EM_REQUIRE_PAIRING='0', EM_AUDIO='0', EM_BITRATE_MBPS='15',
                    EM_REQUIRE_REPAIRS='0')
         hevc = scenario.endswith('hevc')
@@ -170,10 +174,10 @@ def main():
                 remote('probe', 'start', 'fullscreen', output=row / 'probe-start.log')
                 probe = json.loads(remote('probe-info'))
                 save(row / 'probe-ready.json', probe)
-                if (probe['x'], probe['y'], probe['width'], probe['height']) != (0, 0, 1920, 1080):
-                    raise ValueError('The foreground input probe must cover the 1920x1080 primary screen')
+                if (probe['x'], probe['y'], probe['width'], probe['height']) != (0, 0, width, height):
+                    raise ValueError(f'The foreground input probe must cover the {size} primary screen')
                 host_args += ['ETERNAL_INPUT_WINDOW_PID=' + str(probe['pid']), 'ETERNAL_INPUT_RECORDER_LOG=1']
-                env.update(EM_INPUT_WIDTH='1920', EM_INPUT_HEIGHT='1080')
+                env.update(EM_INPUT_WIDTH=str(width), EM_INPUT_HEIGHT=str(height))
             else:
                 pattern_started = True
                 remote('pattern', 'start', *(['virtual'] if scenario == 'R-vdd' else []), output=row / 'pattern-start.log')
