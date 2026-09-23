@@ -21,18 +21,27 @@ passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passe
 
 | Check | Result | Evidence in the handoff folder |
 | --- | --- | --- |
-| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed at `cac987c`; 183 tests with the physical iPad attached and synthetic tests isolated from it | `evidence/windows/em-vdd-driver-native-build.log` |
+| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed at `5092767`; 184 tests with synthetic tests isolated from the attached iPad | `evidence/windows/em-normal-priority-native-build.log` |
 | WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
 | Installer compilation | `EternalMonitor-USB-cac987c-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-usb-installer-cac987c.log` |
 | Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
-| Physical USB extended display | Two successful starts at 2732×2048 with NVENC H.264; the installed host exceeded 144,000 completed frames with zero reported video drops over 41 minutes | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Physical USB extended display | Startup and sustained delivery confirmed at 2732×2048 with NVENC H.264; native build/test load caused two interruptions, followed by automatic recovery. Inherited background priorities were corrected; load and visual confirmation remain pending | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Interactive task scheduling | New Limited and Highest tasks use Normal CPU, memory priority 5 and I/O priority 2. The old live host and its launcher were corrected in place at 06:07 UTC | `evidence/windows/new-task-priorities.log`, `installed-priority-repair.jsonl` |
 | Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
 
 The endpoint read is an API/clock check. It does not prove PC audio was encoded,
 transported and heard on the iPad. The native tests use synthetic capture; they
 do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior. The separate physical
 USB run exercised DXGI, NVENC and VDD startup. Receiver reports prove completed
-frames; visual confirmation on the physical iPad is still required.
+frames; visual confirmation on the physical iPad is still required. The two
+build-time interruptions remain part of the result. Changing CPU priority alone
+did not solve them, because the original scheduled task also lowered memory and
+I/O priorities. Both effective priorities are now normal; do not label that
+change a load-test pass until it has been measured.
+
+The 30-minute simulator soak evidence is in
+`evidence/soak-b28687e/simulator/`. It used immutable source and binary copies.
+The earlier failing soak reports remain retained alongside it.
 
 Every row below is required before the release candidate. Save host stdout and
 stderr, app milestones, simulator and PC screenshots, pixel assertions, duration,
@@ -67,11 +76,13 @@ Additional Windows gates:
 | R-autostart | Toggle writes/removes the correct HKCU Run entry and preserves the prior value after the test | Pending |
 | R-update-banner | A test build at version 0.0.1 shows the available-release banner; dismissal works | Pending |
 | R-installer | Upgrade, limited-user extended-display stream, uninstall cleanup, reinstall; files, task ACLs, TCP/UDP rules and pinned VDD version verified | Pending |
-| Simulator and real NVENC soaks | 30 minutes each; both host/app RSS grow <20% from minute five; ≥55 fps in ≥95% of samples | Pending |
+| Simulator and real NVENC soaks | 30 minutes each; both host/app RSS grow <20% from minute five; ≥55 fps in ≥95% of samples | Simulator passed at `b28687e`: host +1.90%, app +0.16%, 60/60 FPS samples. Real NVENC and final main runs pending |
 
 Run simulator checks with `scripts/e2e_matrix.sh` and the long test with
 `scripts/soak.sh 1800`. The Windows entry points are
-`scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800`; consult
+`scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800`. Set
+`EM_SIZE=3440x1440` for the current primary monitor; verify it again before
+starting. Input tests reject mismatched probe bounds. Consult
 `scripts/win/README.md` for the session runner and evidence collection. A script
 entry point is not a claim that every hardware row has passed. The thirteen-row
 Windows runner is implemented, including cleanup and failure checks. Use the
