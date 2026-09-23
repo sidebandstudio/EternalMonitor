@@ -274,6 +274,11 @@ pub(crate) fn reconcile_virtual_display(
     if !capture_is_current(shared, generation) {
         return None;
     }
+    let progress = || {
+        if capture_is_current(shared, generation) {
+            startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
+        }
+    };
     match target {
         CaptureTarget::VirtualExtended => {
             // Defer enabling the VDD until an iPad actually connects. The transport restarts the
@@ -294,7 +299,7 @@ pub(crate) fn reconcile_virtual_display(
                     "Extended display selected but no iPad has connected yet — leaving the \
                      virtual display off and mirroring the primary display until a client registers"
                 );
-                crate::vdd::disable();
+                crate::vdd::set_enabled(false, progress);
                 *shared.vdd_output.lock() = None;
                 return capture_is_current(shared, generation)
                     .then_some(CaptureTarget::PrimaryAuto);
@@ -345,7 +350,7 @@ pub(crate) fn reconcile_virtual_display(
                 return None;
             }
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
-            if !crate::vdd::enable() {
+            if !crate::vdd::set_enabled(true, progress) {
                 warn!(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
@@ -387,13 +392,13 @@ pub(crate) fn reconcile_virtual_display(
             warn!("Virtual display did not attach in time — capturing the primary display instead");
             // enable() succeeded but nothing attached: turn it back off so we don't strand a
             // half-enabled device as a phantom monitor.
-            crate::vdd::disable();
+            crate::vdd::set_enabled(false, progress);
             *shared.vdd_status.lock() = VddStatus::Failed;
             Some(CaptureTarget::PrimaryAuto)
         }
         other => {
             // Any non-virtual target: ensure the virtual display is off.
-            crate::vdd::disable();
+            crate::vdd::set_enabled(false, progress);
             *shared.vdd_output.lock() = None;
             *shared.vdd_status.lock() = VddStatus::Inactive;
             Some(other.clone())
