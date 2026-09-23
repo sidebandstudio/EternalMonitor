@@ -165,12 +165,19 @@ jobs:
           # consumes a CPU on the three-core VM. Milestones are read directly
           # from the app's file mirror; host logs and screenshots stay enabled.
           xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.diagnosticd
+          # This app does not use push notifications. Hosted process samples
+          # show apsd and its launchd traffic consuming another CPU fraction.
+          xcrun simctl spawn "$UDID" launchctl print system/com.apple.apsd
+          xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.apsd
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           sysctl -n hw.model hw.ncpu hw.memsize
+      - name: Measure standalone software codec capacity
+        run: bash scripts/ci_codec_probe.sh
       - name: Run simulator streaming matrix
         env:
           EM_SIM_NAME: cistream
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
+          EM_PROFILE_HOST: "1"
         run: |
           mkdir -p build/e2e
           vm_stat > build/e2e/vm-before.txt
