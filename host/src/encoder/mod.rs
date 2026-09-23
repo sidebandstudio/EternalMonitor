@@ -197,6 +197,13 @@ fn run_encode_loop(
             encoder_name.clone()
         };
 
+        if let Some(state) = encoder_state.as_mut() {
+            if state.update_bitrate_without_reopening(&desired_encoder, desired_bitrate, target_fps)
+            {
+                failed_reopen = None;
+            }
+        }
+
         if encoder_state.is_none() {
             match EncoderState::new(
                 &desired_encoder,
@@ -498,7 +505,7 @@ struct EncoderState {
     /// The FFmpeg encoder this session was opened with; a negotiated codec
     /// change (H.264 ↔ HEVC) requests a reopen.
     opened_encoder: String,
-    /// The bitrate this session was opened with; a change requests a reopen.
+    /// Last applied bitrate. Hardware encoders reopen when this changes.
     opened_bitrate: u32,
     opened_fps: u32,
     /// First frame's capture instant — the PTS epoch for this session.
@@ -511,6 +518,40 @@ struct EncoderState {
 }
 
 impl EncoderState {
+    fn update_bitrate_without_reopening(
+        &mut self,
+        desired_encoder: &str,
+        bitrate_bps: u32,
+        target_fps: u32,
+    ) -> bool {
+        if self.opened_encoder != "libx264"
+            || desired_encoder != self.opened_encoder
+            || target_fps != self.opened_fps
+            || bitrate_bps == self.opened_bitrate
+        {
+            return false;
+        }
+        // FFmpeg 7.1's libx264 wrapper applies bitrate and VBV changes through
+        // x264_encoder_reconfig before the next frame. Preserve its reference
+        // frames, PTS epoch and buffers instead of allocating a second encoder
+        // for every ABR step. Other encoders retain the existing reopen path.
+        self.encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
+        self.encoder
+            .set_max_bit_rate(bitrate_bps.max(500_000) as usize);
+        // A half-second VBV is enabled at open, as required for x264's live
+        // bitrate reconfiguration. The context belongs to this encode thread.
+        unsafe {
+            (*self.encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
+        };
+        info!(
+            from = self.opened_bitrate,
+            to = bitrate_bps,
+            "Updated software encoder bitrate"
+        );
+        self.opened_bitrate = bitrate_bps;
+        true
+    }
+
     fn new(
         encoder_name: &str,
         width: u32,
@@ -551,6 +592,14 @@ impl EncoderState {
         }
         encoder.set_max_b_frames(0);
         encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
+        if encoder_name == "libx264" {
+            // x264 can only reconfigure bitrate when VBV was enabled at open.
+            // Limit bursts to half a second at the current target bitrate.
+            encoder.set_max_bit_rate(bitrate_bps.max(500_000) as usize);
+            unsafe {
+                (*encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
+            };
+        }
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
@@ -1208,6 +1257,81 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_bitrate_changes_preserve_decoding_and_reduce_packet_size() {
+        ffmpeg_next::init().unwrap();
+        let mut state =
+            EncoderState::new("libx264", 640, 360, 8_000_000, 60, EncoderInput::Yuv420).unwrap();
+        let context = unsafe { state.encoder.as_ptr() };
+        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+        let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut decoded_frames = 0;
+        let mut sizes = [0usize; 3];
+        let mut random = 1u32;
+        for number in 0..360 {
+            if number == 120 || number == 240 {
+                let bitrate = if number == 120 { 1_000_000 } else { 8_000_000 };
+                assert!(state.update_bitrate_without_reopening("libx264", bitrate, 60));
+            }
+            // Changing noise forces rate control to work at both targets.
+            for value in state.frame.data_mut(0) {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = (random >> 24) as u8;
+            }
+            state.frame.data_mut(1).fill(128);
+            state.frame.data_mut(2).fill(128);
+            state.frame.set_pts(Some(number as i64 * 1_000_000 / 60));
+            state.encoder.send_frame(&state.frame).unwrap();
+            loop {
+                match state.encoder.receive_packet(&mut state.packet) {
+                    Ok(()) => {
+                        if number % 120 >= 60 {
+                            sizes[number / 120] += state.packet.size();
+                        }
+                        decoder.send_packet(&state.packet).unwrap();
+                        loop {
+                            match decoder.receive_frame(&mut decoded) {
+                                Ok(()) => {
+                                    assert_eq!(
+                                        decoded.pts(),
+                                        Some(decoded_frames * 1_000_000 / 60)
+                                    );
+                                    assert_eq!((decoded.width(), decoded.height()), (640, 360));
+                                    decoded_frames += 1;
+                                }
+                                Err(error) if is_eagain(&error) => break,
+                                Err(error) => panic!("decode failed: {error}"),
+                            }
+                        }
+                    }
+                    Err(error) if is_eagain(&error) => break,
+                    Err(error) => panic!("encode failed: {error}"),
+                }
+            }
+        }
+        assert_eq!(decoded_frames, 360);
+        assert_eq!(unsafe { state.encoder.as_ptr() }, context);
+        assert!(
+            sizes[1] * 2 < sizes[0],
+            "lower bitrate was not applied: {sizes:?}"
+        );
+        assert!(
+            sizes[2] > sizes[1] * 2,
+            "higher bitrate was not applied: {sizes:?}"
+        );
+        // FPS and codec changes must still use the existing reopen path.
+        assert!(!state.update_bitrate_without_reopening("libx264", 4_000_000, 120));
+        assert!(!state.update_bitrate_without_reopening("libx265", 4_000_000, 60));
+        for name in ["h264_nvenc", "h264_amf", "h264_qsv", "libx265"] {
+            state.opened_encoder = name.to_string();
+            assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
+        }
+    }
 
     #[test]
     fn hevc_variants_cover_every_supported_encoder() {
