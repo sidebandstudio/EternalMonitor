@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum EncoderInput {
     Auto,
     Bgra,
-    // Remains the default until both hardware color/soak gates pass.
+    // AMD BGRA is unsupported in the pinned SDK; see DECISIONS.md.
     #[default]
     Yuv420,
 }
