@@ -23,6 +23,9 @@ struct EternalMonitorApp: App {
                     if let target = E2E.autoconnectTarget {
                         connectionManager.connect(host: target.host, port: target.port)
                     }
+                    #if DEBUG
+                    UIPreview.apply(to: connectionManager)
+                    #endif
                 }
                 .onChange(of: settings.allowUSB) { _, _ in
                     connectionManager.refreshUSBAvailability()
