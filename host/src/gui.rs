@@ -5,7 +5,7 @@ use tracing::{info, warn};
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl, VddStatus};
-use crate::logging::{session_log_path, session_log_text};
+use crate::logging::{recent_log_text, session_log_path, session_log_text};
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
 
@@ -622,7 +622,8 @@ impl AnalyzerApp {
             if amber_button(ui, "Restart stream").clicked() {
                 self.control.request_restart();
             }
-            let has_logs = session_log_text().is_some();
+            // Read the full session file only when the user copies it.
+            let has_logs = recent_log_text(1).is_some();
             let copy_logs_button = ghost_button(ui, "Copy logs", has_logs);
             if copy_logs_button.clicked() {
                 if let Some(log_text) = session_log_text() {

@@ -278,10 +278,12 @@ pub async fn start_sender(
                                             }
                                         }
                                         if let Some(report) = actions.report.take() {
+                                            // A slow log sink must not hold the capture/encode stats lock.
+                                            let retransmits = PIPELINE_STATS.lock().transport_retransmits;
                                             info!(epoch = report.stream_epoch, complete = report.frames_complete,
                                                 dropped = report.frames_dropped, repaired = report.frags_repaired,
                                                 nacks = report.nacks_sent, jitter_us = report.jitter_us,
-                                                retransmits = PIPELINE_STATS.lock().transport_retransmits,
+                                                retransmits,
                                                 "Receiver report");
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
