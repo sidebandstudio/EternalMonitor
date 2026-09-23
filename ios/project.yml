@@ -61,12 +61,26 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/EternalMonitor.app/EternalMonitor"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
+  EternalMonitorUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: EternalMonitorUITests
+    dependencies:
+      - target: EternalMonitor
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.eternal.monitor.uitests
+        TEST_TARGET_NAME: EternalMonitor
+
 schemes:
   EternalMonitor:
     build:
       targets:
         EternalMonitor: all
         EternalMonitorTests: [test]
+        EternalMonitorUITests: [test]
     run:
       config: Debug
     test:
@@ -74,6 +88,7 @@ schemes:
       gatherCoverageData: true
       targets:
         - EternalMonitorTests
+        - EternalMonitorUITests
     profile:
       config: Release
     archive:

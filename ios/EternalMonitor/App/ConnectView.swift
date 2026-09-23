@@ -111,6 +111,7 @@ struct ConnectView: View {
                             .foregroundColor(Theme.amber)
                     }
                     .accessibilityLabel("Settings")
+                    .accessibilityIdentifier("settings.button")
                 }
             }
             .sheet(isPresented: $showSettings) {
@@ -327,6 +328,8 @@ struct ConnectView: View {
                 .autocorrectionDisabled()
                 .focused($focusedField, equals: field)
                 .disabled(isConnecting)
+                .accessibilityLabel(label)
+                .accessibilityIdentifier(field == .host ? "connect.host" : "connect.port")
         }
     }
 
@@ -350,6 +353,7 @@ struct ConnectView: View {
         .disabled(!canConnect)
         .opacity(canConnect ? 1 : 0.45)
         .accessibilityLabel("Connect to host")
+        .accessibilityIdentifier("connect.button")
     }
 
     // MARK: - Diagnostics
@@ -446,6 +450,7 @@ struct ConnectView: View {
             }
         }
         .buttonStyle(GhostButtonStyle(accent: scanner.isScanning ? Theme.amber : Theme.text2))
+        .accessibilityIdentifier("connect.scan")
         .disabled(isConnecting)
         .opacity(isConnecting ? 0.5 : 1)
     }
@@ -462,6 +467,7 @@ struct ConnectView: View {
             }
         }
         .buttonStyle(GhostButtonStyle(accent: Theme.text2))
+        .accessibilityIdentifier("connect.qr")
         .disabled(isConnecting)
         .opacity(isConnecting ? 0.5 : 1)
     }
