@@ -15,7 +15,9 @@ use super::{
 impl AnalyzerApp {
     pub(super) fn performance_page(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
         let mut copy_logs = false;
-        let has_logs = crate::logging::session_log_text().is_some();
+        // Ask the bounded in-memory buffer; the session file grows all
+        // session and is read only when the user copies it.
+        let has_logs = crate::logging::recent_log_text(1).is_some();
         let copied = self.recently_copied(Copied::Logs);
         page_header(
             ui,
