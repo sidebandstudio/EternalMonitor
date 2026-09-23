@@ -1303,6 +1303,60 @@ mod tests {
     }
 
     #[test]
+    fn retransmitted_rejected_handshake_is_one_pairing_attempt() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let now = Instant::now();
+        let mut hello = pair_hello(1);
+        for retry in 0..8 {
+            let ack = pair_ack(&pair_send(
+                &mut session,
+                &config,
+                peer,
+                hello.clone(),
+                now + Duration::from_millis(retry * 300),
+            ));
+            assert_eq!(ack.status, HelloStatus::Unauthorized);
+            assert_eq!(ack.auth_token, [0; 16]);
+        }
+        hello.client_nonce = 2;
+        hello.pairing_code = config.0.lock().code();
+        assert_eq!(
+            pair_ack(&pair_send(
+                &mut session,
+                &config,
+                peer,
+                hello,
+                now + Duration::from_secs(3)
+            ))
+            .status,
+            HelloStatus::Ok
+        );
+    }
+
+    #[test]
+    fn changing_credentials_with_the_same_nonce_still_counts_as_guesses() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let now = Instant::now();
+        let mut hello = pair_hello(1);
+        for guess in 1..=5 {
+            hello.pairing_code = 1_000_000 + guess;
+            let ack = pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now));
+            assert_eq!(
+                ack.status,
+                if guess == 5 {
+                    HelloStatus::RateLimited
+                } else {
+                    HelloStatus::Unauthorized
+                }
+            );
+        }
+    }
+
+    #[test]
     fn pairing_required_code_rotation_retry_token_and_regeneration() {
         let config = pair_config(true);
         let mut session = Session::new(10);
