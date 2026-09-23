@@ -168,8 +168,22 @@ jobs:
           # consumes a CPU on the three-core VM. Milestones are read directly
           # from the app's file mirror; host logs and screenshots stay enabled.
           xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.diagnosticd
+          # This app does not use push notifications. Hosted process samples
+          # show apsd and its launchd traffic consuming another CPU fraction.
+          xcrun simctl spawn "$UDID" launchctl print system/com.apple.apsd
+          xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.apsd
+          # The three-core VM also starts Health and speech data maintenance
+          # during app launch. Resource traces show these unrelated services
+          # competing with both software codecs. Only this disposable streaming
+          # simulator is trimmed; the iOS unit/UI job keeps its normal services.
+          for service in com.apple.healthappd com.apple.healthd com.apple.triald com.apple.sirittsd; do
+            xcrun simctl spawn "$UDID" launchctl print "user/$(id -u)/$service"
+            xcrun simctl spawn "$UDID" launchctl bootout "user/$(id -u)/$service"
+          done
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           sysctl -n hw.model hw.ncpu hw.memsize
+      - name: Measure standalone software codec capacity
+        run: bash scripts/ci_codec_probe.sh
       - name: Run simulator streaming matrix
         env:
           EM_SIM_NAME: cistream

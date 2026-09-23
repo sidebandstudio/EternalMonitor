@@ -24,10 +24,13 @@ final class AudioPlayer {
     private let measurements = OSAllocatedUnfairLock(initialState: AudioStats())
     private let queue = DispatchQueue(label: "eternal.audio", qos: .userInteractive)
     private let queueKey = DispatchSpecificKey<Bool>()
+    private let outputQueue = DispatchQueue(label: "eternal.audio.output", qos: .userInteractive)
     private let pcm = AudioPCMBuffer(meterEnabled: E2E.enabled)
     private var timeline: AudioTimeline?
-    private var engine: AVAudioEngine?
-    private var sessionActive = false
+    private let output: AudioOutputDevice
+    private var outputRunning = false
+    private var outputRequested = false
+    private var outputGeneration: UInt64 = 0
     private var timer: DispatchSourceTimer?
     private var observers: [NSObjectProtocol] = []
     private var failed = false
@@ -39,7 +42,8 @@ final class AudioPlayer {
     private var previousLost: UInt64 = 0
     var onError: ((String) -> Void)?
 
-    init() {
+    init(output: AudioOutputDevice = AudioOutput()) {
+        self.output = output
         queue.setSpecific(key: queueKey, value: true)
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(1))
@@ -71,7 +75,7 @@ final class AudioPlayer {
     deinit {
         timer?.cancel()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        closeOutput(deactivate: true)
+        outputQueue.sync { output.stop(deactivate: true) }
     }
 
     var stats: AudioStats { measurements.withLock { $0 } }
@@ -109,6 +113,9 @@ final class AudioPlayer {
         // Finish old-session output before a USB takeover activates its player.
         if DispatchQueue.getSpecific(key: queueKey) == true { cleanup() }
         else { queue.sync(execute: cleanup) }
+        // A pending start must close before a replacement player's session is
+        // activated. The output worker never waits for the packet queue.
+        outputQueue.sync {}
     }
 
     private func process() {
@@ -128,13 +135,13 @@ final class AudioPlayer {
             }
             guard let timeline else { return }
             try timeline.drain(nowUs: now)
-            if !packets.isEmpty, engine == nil { try openOutput() }
+            if !packets.isEmpty, !outputRequested { openOutput() }
             let buffer = pcm.snapshot
             let stats = AudioStats(packets: previousPackets + timeline.packets,
                 decoded: previousDecoded + timeline.decoded,
                 lost: previousLost + timeline.lost, bufferMs: buffer.bufferMs + timeline.pendingCount * 20,
                 targetMs: buffer.targetMs,
-                playing: engine?.isRunning == true && now >= lastPacketUs && now - lastPacketUs < 500_000,
+                playing: outputRunning && now >= lastPacketUs && now - lastPacketUs < 500_000,
                 rms: buffer.rms, tone1kDB: buffer.tone1kDB)
             measurements.withLock { $0 = stats }
             if E2E.enabled, now - lastLogUs >= 1_000_000 {
@@ -142,35 +149,32 @@ final class AudioPlayer {
                 E2E.audio(stats)
             }
         } catch {
-            failed = true
-            closeOutput(deactivate: true)
-            let message = "PC audio stopped: \(error.localizedDescription)"
-            measurements.withLock { $0.playing = false; $0.error = "Audio unavailable. Reconnect to retry." }
-            onError?(message)
+            fail(error)
         }
     }
 
-    private func openOutput() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default)
-        try session.setPreferredSampleRate(48_000)
-        try session.setPreferredIOBufferDuration(0.01)
-        try session.setActive(true)
-        sessionActive = true
-        let output = AVAudioEngine()
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
-        let pcm = self.pcm
-        let source = AVAudioSourceNode(format: format) { silence, _, frameCount, list in
-            let buffers = UnsafeMutableAudioBufferListPointer(list)
-            pcm.render(frames: Int(frameCount), buffers: buffers, nowUs: ControlChannel.clientNowUs())
-            silence.pointee = false
-            return noErr
+    private func openOutput() {
+        outputRequested = true
+        let generation = outputGeneration
+        let queue = self.queue
+        outputQueue.async { [weak self, output, pcm] in
+            let result = Result { try output.start(pcm: pcm) }
+            queue.async { [weak self] in
+                guard let self, self.outputGeneration == generation else { return }
+                switch result {
+                case .success: self.outputRunning = true
+                case .failure(let error): self.fail(error)
+                }
+            }
         }
-        output.attach(source)
-        output.connect(source, to: output.mainMixerNode, format: format)
-        output.prepare()
-        try output.start()
-        engine = output
+    }
+
+    private func fail(_ error: Error) {
+        failed = true
+        closeOutput(deactivate: true)
+        let message = "PC audio stopped: \(error.localizedDescription)"
+        measurements.withLock { $0.playing = false; $0.error = "Audio unavailable. Reconnect to retry." }
+        onError?(message)
     }
 
     private func retireTimeline() {
@@ -183,12 +187,10 @@ final class AudioPlayer {
     }
 
     private func closeOutput(deactivate: Bool) {
-        engine?.stop()
-        engine = nil
+        outputGeneration &+= 1
+        outputRequested = false
+        outputRunning = false
         pcm.reset()
-        if deactivate, sessionActive {
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            sessionActive = false
-        }
+        outputQueue.async { [output] in output.stop(deactivate: deactivate) }
     }
 }

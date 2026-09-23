@@ -55,10 +55,10 @@ pub fn run_capture_loop(
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
     let frame_bytes = row_bytes * height as usize;
-    // Buffer recycling: after publishing, keep our Arc; once the encoder drops
-    // its clone, try_unwrap succeeds and the allocation is reused. Steady state
-    // is zero full-frame allocations.
-    let mut spare: Option<Arc<Vec<u8>>> = None;
+    // The encoder and latest-frame slot can each retain one buffer. Keep three
+    // allocations so a delayed consumer never discards a busy spare and causes
+    // a fresh full-frame allocation on the next tick.
+    let mut buffers = std::array::from_fn(|_| Arc::new(vec![0u8; frame_bytes]));
     let mut frame_number: u64 = 0;
 
     info!(width, height, "Synthetic capture source active");
@@ -88,24 +88,18 @@ pub fn run_capture_loop(
         heartbeat(&shared.hb_capture_loop_ms);
 
         frame_number += 1;
-        let mut pixel_buf = match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
-            Some(buf) if buf.len() == frame_bytes => buf,
-            _ => vec![0u8; frame_bytes],
-        };
-        render_synthetic_frame(&mut pixel_buf, width, height, frame_number);
+        let data = render_next_frame(&mut buffers, width, height, frame_number);
 
         PIPELINE_STATS.lock().record_capture(width, height);
         heartbeat(&shared.hb_capture_frame_ms);
 
-        let data = Arc::new(pixel_buf);
         slot.publish(RawFrame {
             frame_number,
             timestamp: frame_start,
-            data: Arc::clone(&data),
+            data,
             width,
             height,
         });
-        spare = Some(data);
 
         next_deadline += frame_budget;
         let now = Instant::now();
@@ -118,6 +112,20 @@ pub fn run_capture_loop(
     }
 
     Ok(())
+}
+
+fn render_next_frame(
+    buffers: &mut [Arc<Vec<u8>>; 3],
+    width: u32,
+    height: u32,
+    frame_number: u64,
+) -> Arc<Vec<u8>> {
+    let buffer = buffers
+        .iter_mut()
+        .find(|buffer| Arc::strong_count(buffer) == 1)
+        .expect("encoder and latest-frame slot retain at most two buffers");
+    render_synthetic_frame(Arc::get_mut(buffer).unwrap(), width, height, frame_number);
+    Arc::clone(buffer)
 }
 
 /// Draw the full test pattern for `frame_number` into a BGRA buffer.
@@ -241,6 +249,27 @@ pub fn decode_frame_counter_from_bgra(buf: &[u8], width: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_consumer_reuses_buffers_without_overwriting_held_frames() {
+        let (width, height) = (640, 360);
+        let mut buffers = std::array::from_fn(|_| Arc::new(vec![0; (width * height * 4) as usize]));
+        let addresses: Vec<_> = buffers.iter().map(|b| b.as_ptr()).collect();
+        let mut held = render_next_frame(&mut buffers, width, height, 1);
+        let mut held_number = 1;
+        let mut pending = render_next_frame(&mut buffers, width, height, 2);
+        for number in 3..150 {
+            let next = render_next_frame(&mut buffers, width, height, number);
+            assert!(addresses.contains(&next.as_ptr()));
+            assert_eq!(decode_frame_counter_from_bgra(&held, width), held_number);
+            assert_eq!(decode_frame_counter_from_bgra(&pending, width), number - 1);
+            if number % 7 == 0 {
+                held = pending;
+                held_number = number - 1;
+            }
+            pending = next;
+        }
+    }
 
     #[test]
     fn frame_counter_round_trips_through_bgra() {
