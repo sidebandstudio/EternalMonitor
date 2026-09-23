@@ -131,7 +131,9 @@ def main():
         encoder = ('hevc_' if hevc else 'h264_') + family
         host_args = ['ETERNAL_HEADLESS=1', 'ETERNAL_ENCODER=h264_' + family,
                      f'ETERNAL_HEVC={int(hevc)}', 'ETERNAL_FPS=60', 'ETERNAL_MAX_DGRAM=1200',
-                     'ETERNAL_E2E_LOG=1']
+                     'ETERNAL_E2E_LOG=1', 'ETERNAL_USB_DIRECT=127.0.0.1:0']
+        # These rows target the simulator over UDP. A physically attached
+        # iPad must not claim their session through the USB supervisor.
         env['EM_CODEC'] = 'hevc' if hevc else 'h264'
         if scenario == 'R-nvenc-h264-loss3':
             env['EM_REQUIRE_REPAIRS'] = '1'
