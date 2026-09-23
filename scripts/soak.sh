@@ -9,7 +9,13 @@ if [ "$#" -gt 1 ] || [[ ! "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -lt 330 ];
     echo "Usage: $0 [--real] [seconds >= 330, default 1800]" >&2
     exit 2
 fi
-OUT="$ROOT/build/soak/$MODE"
+if [ "$MODE" = real ]; then
+    # Desktop screenshots and logs belong with private hardware evidence.
+    DEFAULT_OUT="${EM_EVIDENCE_DIR:-/Users/aldo/Desktop/EternalMonitor-Handoff/evidence}/soak-real"
+else
+    DEFAULT_OUT="$ROOT/build/soak/$MODE"
+fi
+OUT="${EM_OUTPUT_DIR:-$DEFAULT_OUT}"
 REPORT="$ROOT/build/soak-report.md"
 HOST_STARTED=0
 PATTERN_STARTED=0
