@@ -26,8 +26,11 @@ def script(name, arguments=""):
     return "& " + quote(ROOT + "\\scripts\\" + name + ".ps1") + " " + arguments
 
 
-def session(command, detach=False, idle=False, timeout=600):
+def session(command, detach=False, idle=False, timeout=600, run_level="Highest"):
+    if run_level not in ("Highest", "Limited"):
+        raise ValueError("Run level must be Highest or Limited")
     options = "-Command " + quote(command) + " -TimeoutSec " + str(timeout)
+    options += " -RunLevel " + run_level
     if detach:
         options += " -Detach"
     if idle:
@@ -70,34 +73,49 @@ def main(args):
             raise ValueError("EM_BITRATE_MBPS must be between 4 and 50")
         settings_dir = ROOT + r"\state\EternalMonitor"
         # This isolated fixture profile is separate from the installed product.
-        settings = json.dumps(dict(bitrate_mbps=bitrate, target_fps=60, start_on_boot=False,
+        settings = json.dumps(dict(bitrate_mbps=bitrate, target_fps=int(environment["ETERNAL_FPS"]), start_on_boot=False,
                                    require_pairing=os.environ.get("EM_REQUIRE_PAIRING", "0") == "1",
-                                   stream_audio=os.environ.get("EM_AUDIO", "0") == "1"))
+                                   stream_audio=os.environ.get("EM_AUDIO", "0") == "1",
+                                   capture_display=os.environ.get("EM_CAPTURE_DISPLAY") or None))
         command += "; New-Item -ItemType Directory -Force " + quote(settings_dir) + " | Out-Null"
         command += "; [System.IO.File]::WriteAllText(" + quote(settings_dir + r"\settings.json")
         command += "," + quote(settings) + ",(New-Object System.Text.UTF8Encoding($false)))"
         command += "; $env:PATH=" + quote(r"D:\AgentWork\sdk\ffmpeg-7.1.1-full_build-shared\bin;") + "+$env:PATH"
-        command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(REPO + r"\target\release\eternal-host.exe")
+        executable = REPO + r"\target\release\eternal-host.exe"
+        if os.environ.get("EM_INSTALLED_HOST") == "1":
+            executable = ROOT + r"\installed\EternalMonitor-host.exe"
+        command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(executable)
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
         command += "; $p.WaitForExit(); if ($p.ExitCode -ne 0) { throw ('Host exited with ' + $p.ExitCode) }"
-        session(command, detach=True, idle=True, timeout=7200)
+        session(command, detach=True, idle=True, timeout=7200,
+                run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
+        ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(pidfile) + ")) { "
+           "if ((Get-Date) -gt $deadline) { throw 'Host did not start; inspect the interactive job' }; Start-Sleep -Milliseconds 100 }; "
+           "$record=Get-Content " + quote(pidfile) + " -Raw | ConvertFrom-Json; "
+           "$p=Get-Process -Id $record.id; if ($p.Path -ne $record.path -or "
+           "$p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { throw 'Host identity changed at startup' }")
+    elif action == "host-info" and not args:
+        path = quote(ROOT + r"\host.pid.json")
+        ps("if (Test-Path " + path + ") { Get-Content " + path + " -Raw } else { Write-Output 'null' }")
+    elif action == "vdd-state" and not args:
+        ps(script("Vdd-State"))
+    elif action == "vdd-disable" and not args:
+        ps(script("Vdd-State", "-Disable"))
     elif action == "rss" and not args:
         ps("$record=Get-Content " + quote(ROOT + r"\host.pid.json") + " -Raw | ConvertFrom-Json; "
            "$p=Get-Process -Id $record.id; "
            "if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { "
            "throw 'The tracked host process identity changed' }; "
            "@{pid=$p.Id;rss_kib=[math]::Ceiling($p.WorkingSet64/1024)} | ConvertTo-Json -Compress")
-    elif action == "stop-host" and not args:
-        ps("$file=" + quote(ROOT + r"\host.pid.json") + "; if (Test-Path $file) { "
-           "$record=Get-Content $file -Raw | ConvertFrom-Json; "
-           "$p=Get-Process -Id $record.id -ErrorAction SilentlyContinue; "
-           "if ($p -and $p.Path -eq $record.path -and $p.StartTime.ToUniversalTime().Ticks.ToString() -eq $record.start) { "
-           "taskkill /PID $p.Id /T /F | Out-Host; if ($LASTEXITCODE -ne 0) { throw 'Host stop failed' } }; "
-           "Remove-Item $file }; "
-           "Get-Process eternal-host -ErrorAction SilentlyContinue | Select-Object Id,SessionId,Path; "
-           "Write-Host 'Tracked host stopped'")
+    elif action == "stop-host" and args in ([], ["--kill"]):
+        if args:
+            ps(script("Stop-Host", "-Force"))
+        else:
+            # Console-control delivery must originate in the host's desktop
+            # session. Session 0 is reserved for the explicit kill path.
+            session(script("Stop-Host"), timeout=30)
     elif action == "shot" and len(args) == 1:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args[0]):
             raise ValueError("Screenshot names use letters, digits, underscores and dashes")
@@ -106,15 +124,50 @@ def main(args):
         pull(remote, EVIDENCE / "windows" / (args[0] + ".png"))
     elif action == "log" and (not args or (len(args) == 2 and args[0] == "-n" and args[1].isdigit())):
         ps("Get-Content " + quote(ROOT + r"\host.log") + (" -Tail " + args[1] if args else ""))
+    elif action == "stderr" and not args:
+        ps("Get-Content " + quote(ROOT + r"\host.stderr.log"))
+    elif action == "gui" and len(args) in (2, 3) and args[0] in ("Stream", "Settings", "QR"):
+        if len(args) == 3 and args[2] != '--connected':
+            raise ValueError('The optional GUI flag is --connected')
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", args[1]):
+            raise ValueError("Screenshot names use letters, digits, underscores and dashes")
+        remote_path = ROOT + "\\shots\\" + args[1] + ".png"
+        session(script("Inspect-Host", "-View " + quote(args[0]) + " -Path " + quote(remote_path) +
+                       (" -Connected" if len(args) == 3 else "")), idle=True)
+        pull(remote_path, EVIDENCE / "windows" / (args[1] + ".png"))
+    elif action == "diagnostic" and len(args) == 2 and args[0] in ("h264", "hevc"):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", args[1]):
+            raise ValueError("Diagnostic row name is invalid")
+        remote_path = ROOT + r"\state\EternalMonitor\diagnostics\amf-first-120-packets." + args[0]
+        ps("& " + quote(r"D:\AgentWork\sdk\ffmpeg-7.1.1-full_build-shared\bin\ffmpeg.exe") +
+           " -hide_banner -v error -xerror -f " + args[0] + " -i " + quote(remote_path) +
+           " -f null NUL; if ($LASTEXITCODE -ne 0) { throw 'AMF diagnostic decode failed' }; "
+           "if ((Get-Item " + quote(remote_path) + ").Length -eq 0) { throw 'AMF capture is empty' }; "
+           "Write-Output 'Captured AMF packets decoded without errors'")
+        pull(remote_path, EVIDENCE / "real" / args[1] / ("amf-first-120-packets." + args[0]))
     elif action == "probe-log" and not args:
         pull(ROOT + r"\input-probe.log", EVIDENCE / "windows" / "input-probe.log")
-    elif action in ("pattern", "probe") and args in (["start"], ["stop"]):
+    elif action == "probe-info" and not args:
+        ps("$line=Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1; "
+           "$info=$line | ConvertFrom-Json; if ($info.event -ne 'Ready') { throw 'Probe is not ready' }; "
+           "Get-Process -Id $info.pid -ErrorAction Stop | Out-Null; Write-Output $line")
+    elif action in ("pattern", "probe") and args in (["start"], ["stop"], ["start", "virtual"], ["start", "fullscreen"]):
+        if len(args) == 2 and (action, args[1]) not in (("pattern", "virtual"), ("probe", "fullscreen")):
+            raise ValueError("Only pattern supports virtual; only probe supports fullscreen")
         flag = ROOT + "\\" + action + ".stop"
         if args == ["stop"]:
             ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
         else:
-            session(script("Pattern-Window" if action == "pattern" else "Input-Probe", "-Seconds 7200"),
+            if action == "probe":
+                ps("Remove-Item " + quote(ROOT + r"\input-probe.log") + " -ErrorAction SilentlyContinue")
+            session(script("Pattern-Window" if action == "pattern" else "Input-Probe",
+                           "-Seconds 7200" + ((" -VirtualDisplay" if action == "pattern" else " -FullScreen") if len(args) == 2 else "")),
                     detach=True, idle=True, timeout=7260)
+            if action == "probe":
+                ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
+                   "if ((Get-Date) -gt $deadline) { throw 'Probe did not start' }; Start-Sleep -Milliseconds 100 }; "
+                   "while (!(Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1)) { "
+                   "if ((Get-Date) -gt $deadline) { throw 'Probe did not become ready' }; Start-Sleep -Milliseconds 100 }")
     elif action == "tone" and len(args) == 1 and args[0].isdigit():
         session(script("Play-Tone", "-Seconds " + args[0]), timeout=int(args[0]) + 30)
     elif action == "firewall" and len(args) in (1, 2):
