@@ -173,8 +173,11 @@ measurements. Keyframe recovery remains available when repair expires.
 Apple's installed device service handles the cable/trust relationship. EMLINK
 wraps existing v2 datagrams, so the session, pairing, media and input machinery
 stay shared with UDP. The iPad listener is loopback-only. Host frame queues are
-bounded and drop whole access units with an IDR request. Actual Windows service
-and cable behavior remain a physical-iPad gate.
+bounded and drop whole access units with an IDR request. On 2026-09-23, the
+reference PC streamed a moving 2732×2048 extended desktop to the physical iPad
+for 642.9 seconds at 57.2 decoded FPS with zero drops. Rear USB-C with a C-to-C
+data cable also charged the battery during that run. Timed cable takeover,
+fallback and first-install trust still require their own device checks.
 
 ### Use libopus on simulator and device
 
@@ -205,7 +208,10 @@ simulator results do not settle device behavior.
 The installer owns privileged driver setup. A normal host launch needs read and
 execute access to the SYSTEM enable/disable tasks, not a UAC prompt for every
 connection. Their ACL grants that access to BUILTIN\Users; the host reports the
-actual scheduler error. The normal-user desktop campaign must verify this fix.
+actual scheduler error. The 2026-09-23 campaign verified these tasks from a
+Limited user token, including attach, disconnect and host-exit cleanup. The
+installed host also attaches the physical iPad's extended display without
+elevating the host. The final campaign on main remains required.
 
 ### Keep YUV420P after the native input-format comparison
 
