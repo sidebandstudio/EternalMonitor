@@ -98,13 +98,13 @@ shell. Neither path switches the developer account used by this workspace.
 
 1. TestFlight tab, wait for the build to finish processing (usually a few
    minutes; you get an email).
-2. Export compliance is already answered in the app
-   (`ITSAppUsesNonExemptEncryption` is false), so it will not ask per build.
+2. Check the build's export-compliance status. The app declares
+   `ITSAppUsesNonExemptEncryption` as false for the current unencrypted stream.
 3. Create an external testing group, add the build, and fill in "What to
    Test" from `ios/TESTFLIGHT_NOTES.md`. Regenerate that file with
    `python3 scripts/testflight_notes.py` after changing the current release notes.
 4. Submit for Beta App Review. The first build for external testers is
-   reviewed by Apple, usually inside a day.
+   reviewed by Apple; wait for its result before sharing the external invite.
 5. Once approved, enable the group's public link and send that to your
    tester. Anyone with the link can install; you can cap the number of
    testers on the same screen. Paste the resulting `https://testflight.apple.com/join/...`
@@ -125,9 +125,9 @@ Two links, and they must match:
   marked as a test build.
 - The TestFlight public link for the matching iPad build.
 
-Protocol v2 is a clean break, so a preview host with a release app (or the
-reverse) will not stream. Both sides say so plainly rather than showing
-broken video, but it still wastes a tester's evening.
+Use the matching candidate pair. v0.1 and v2 builds cannot stream together.
+v0.3 keeps the v2 prefix and negotiates new features, but mixing candidate and
+older builds is not a supported beta-test configuration.
 
 ## Extended display vs mirror
 
@@ -140,76 +140,82 @@ Windows Display settings before connecting. If the extended display can't start,
 amber "Extended display unavailable" banner and mirrors the primary screen — re-run the installer
 so its display task is registered.
 
-## Build parity matters
+## Build parity and candidate status
 
-The host and iPad app must be from the **same release**. v0.2.0's protocol v2
-is a deliberate clean break: a v0.1.x app meeting a v0.2.0 host (or the
-reverse) won't stream. Each side shows an explicit "update the other half"
-message instead of corrupted video, so at least the failure is obvious. Hand
-out the matching TestFlight build and installer together.
+Hand out the Windows installer and iPad app from the same candidate, and record
+both versions and the TestFlight build number. The v0.3 features are implemented
+in draft branches. Local simulator and native build evidence is recorded, but
+the reference-PC desktop campaign, long-run memory gate and physical iPad pass
+are still pending. Do not present an unsigned archive or older release as the
+finished v0.3 product.
 
-## New in v0.2.0, worth testing on purpose
+## What to test in v0.3
 
-- Input relay: tap, drag, two-finger scroll, hold for right-click, and the
-  Pencil should feel like a trackpad. Check multi-monitor setups (clicks
-  must land on the captured screen) and the "Control PC with touch" toggle
-  off (the host must ignore touches).
-- HEVC: flip "Prefer HEVC" in host Settings mid-stream. The codec in the
-  iPad's Settings HOST module should flip to HEVC within a second, and
-  back. If video breaks only in HEVC on some GPU, that encoder's HEVC path
-  is the bug; collect logs and turn the toggle off.
-- Recovery: kill the host mid-stream (Task Manager) and relaunch. The iPad
-  should show SIGNAL LOST and reconnect by itself. Walk to the edge of WiFi
-  range; the picture should coarsen (bitrate stepping down) rather than
-  freeze, and recover afterwards.
-- Extended display resolution: with "Match extended display to the iPad's
-  resolution" on (the default), the virtual display should come up at the
-  iPad's native aspect, with no letterboxing on the iPad.
+Use `HARDWARE_VERIFICATION.md` for the complete checklist and expected results.
 
-## Cover all three GPU vendors
+- Pair with a wrong code, then the correct code; reconnect from Keychain, scan
+  the token QR, regenerate the token, and exercise the failed-code cooldown.
+- Verify H.264 and opt-in HEVC hardware decode on the iPad. Check the host's
+  actual encoder and software-fallback banner.
+- Connect by WiFi, attach USB and accept Trust, then unplug/replug. Record the
+  USB card and link badge throughout. The cable and Apple device-service path
+  has not been proven by the loopback tunnel tests.
+- Play PC audio, change the default Windows output, mute on the iPad, and
+  compare audio/video timing. Report endpoint, buffer and loss statistics.
+- Type through both keyboards; test Ctrl shortcuts, sticky modifiers, arrows,
+  pointer buttons/scroll, Pencil position/hover and touch in every corner.
+  Windows pressure-sensitive pen injection is not implemented.
+- Background/resume, kill/restart the host, and move toward poor WiFi coverage.
+  Watch repaired fragments separately from unrecovered drops and latency.
+- Try the extended display at 120 Hz on a ProMotion iPad; record the achieved
+  decode rate rather than assuming the requested rate was reached.
 
-The encoder path differs per vendor and the AMD path is the newest, so try to get at least
-one tester on each:
+## USB tester setup
 
-- **NVIDIA** — NVENC. Best-tested path.
-- **AMD** — AMF. Has bespoke handling (redundant SPS/PPS on every IDR, a forced IDR every
-  30 frames, closed-GOP flags). If an AMD tester sees periodic freezes or a black screen on
-  connect, that's the path to scrutinize.
-- **Intel** — QSV. Lightly tested.
+Install Apple Devices or desktop iTunes when the host asks for Apple's service.
+Use a data cable, unlock the iPad and accept Trust This Computer. Keep the app
+open. On Windows, the service must listen at 127.0.0.1:27015 and expose the device;
+the app listens on iPad loopback port 9877. Do not open that iPad port to the LAN.
+If Apple Devices does not expose the service, record the observation and try the
+desktop iTunes package. The reference-PC package/cable combination is still an
+open device gate.
 
-If a tester's hardware encoder fails to open, the host falls back to **CPU (libx264)** and
-now shows an **amber warning banner** on the Stream tab. CPU encoding is hot and high-latency
-— tell them to update GPU drivers and click "Restart stream".
+## GPU coverage
 
-## What to collect from a tester when something breaks
+Test NVIDIA NVENC, AMD AMF and Intel QSV separately. The reference PC has NVENC
+and AMF; QSV needs another tester. Keep H.264 and YUV420P as defaults. The BGRA
+option needs both color comparison and ten-minute NVENC/AMF runs before its
+baseline can change. AMF normalization, startup-IDR retries and forced-intra
+handling remain in place.
 
-1. **GPU + codec** — shown on the host Stream tab (e.g. "NVIDIA … / H.264 (NVENC)"). If the
-   codec reads "H.264 (x264)", they're on the CPU fallback.
-2. **Host logs** — "Copy logs" button on the Stream tab, or the full file at
-   `%APPDATA%\EternalMonitor\logs\eternal-host-session.log` (paste `%APPDATA%` into Explorer's
-   address bar — it expands to `C:\Users\<name>\AppData\Roaming`).
-3. **AMD only** — if streaming is broken on an AMD machine, ask for
-   `%APPDATA%\EternalMonitor\diagnostics\amf-first-120-packets.h264` (the host captures the first
-   120 NAL packets there for offline inspection).
-4. **What the iPad showed** — black screen / frozen / corrupted / "connecting" forever.
+An amber software-fallback banner means a hardware encoder failed to open.
+Capture that error before changing drivers or settings. A fallback that produces
+video is not proof that the requested hardware encoder worked.
 
-## The usual non-bug culprits
+## Evidence to collect
 
-- **Firewall** — both "Private" and "Public" boxes must be checked on first run. The single
-  most common "it won't connect" cause.
-- **Wi-Fi quality** — freezes/stutter are almost always the network (there is intentionally no
-  packet-loss recovery yet). Push testers to 5 GHz / proximity / wired host before assuming a
-  bug.
-- **Different subnets / guest networks** — mDNS discovery won't cross them; manual IP entry is
-  the known-good path.
-- **Unsigned binary** — SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
+1. GPU, active codec/input format, capture display/resolution, both versions,
+   iPad model/iPadOS, WiFi/USB and requested/effective FPS.
+2. Copy logs from the host Stream tab, or collect
+   `%APPDATA%\EternalMonitor\logs\eternal-host-session.log` and `.1`/`.2`.
+3. App diagnostics and a recording or screenshot of the visible failure.
+4. For an AMF H.264 investigation, explicitly enable `ETERNAL_AMF_DIAG=1` before
+   launch and retain `%APPDATA%\EternalMonitor\diagnostics\amf-first-120-packets.h264`
+   plus its validation log. Capture is opt-in; ordinary runs do not create it.
 
-## Known limitations (so you don't chase ghosts)
+Pairing tokens and token-bearing QR codes grant access. Redact them before
+posting evidence publicly. Keep screenshots of a tester's desktop private.
 
-No audio, no USB transport, and no retransmit of lost packets. Loss shows
-as a brief artifact or frame skip, then the stream self-heals with a
-requested keyframe and steps the bitrate down if loss persists. Sustained
-stutter on a clean network IS reportable now; on hotel or guest WiFi it's
-still the network. HEVC is experimental and off by default, so if a stream
-misbehaves, confirm the codec on the Stream tab before filing it as a
-general bug.
+## Troubleshooting and known limits
+
+The v0.3 installer creates TCP and UDP firewall rules. For an older install or
+another security product, check the host's allowed-app rule and network profile.
+Guest networks and subnet boundaries can block discovery; try a reachable manual
+LAN address. Use the packet/repair, encoder and decoder diagnostics to distinguish
+network trouble from resource pressure or a codec problem.
+
+Video NACK repair, USB framing and audio are implemented. They do not replace the
+pending hardware campaign. FEC and encryption remain deferred; pairing is access
+control on a trusted network, not confidentiality. HEVC and BGRA remain opt-in.
+Neither the simulator's software decoder nor its refresh rate proves hardware
+decoding or 120 Hz on a physical iPad.

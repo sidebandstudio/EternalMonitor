@@ -1,7 +1,8 @@
 ## EternalMonitor v0.3.0
 
 Release candidate work is in progress. Use the matching Windows installer and
-iPad build when an RC is published. Physical iPad verification is still pending.
+iPad build when an RC is published. The Windows desktop campaign, long-run
+memory gate and physical iPad verification are still pending. No RC is published yet.
 
 ### What changed
 

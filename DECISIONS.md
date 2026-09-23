@@ -151,10 +151,82 @@ multi-monitor and virtual-display layouts land clicks on the right screen.
   upstream starts signing.) The installer's SHA-256 is published in the
   release body, where the website reads it.
 
+## v0.3.0 decisions
+
+### Keep v2 and negotiate additions
+
+The existing prefix, session-id gate, nonce replay and codec behavior stay intact.
+NACK, audio, keyboard and pairing additions use capability bits and append-only
+control tails. Old parsers can ignore optional tails; matching release builds are
+still the supported combination. v0.1 used a different protocol and cannot stream
+with v2.
+
+### Repair missing fragments before requesting an IDR
+
+A bounded NACK history repairs the specific lost fragments within a short delay.
+This avoids multiplying WiFi fragment loss into keyframe storms. FEC remains
+reserved: it would spend bandwidth on clean links and needs separate device
+measurements. Keyframe recovery remains available when repair expires.
+
+### Use Apple's usbmuxd tunnel for USB
+
+Apple's installed device service handles the cable/trust relationship. EMLINK
+wraps existing v2 datagrams, so the session, pairing, media and input machinery
+stay shared with UDP. The iPad listener is loopback-only. Host frame queues are
+bounded and drop whole access units with an IDR request. Actual Windows service
+and cable behavior remain a physical-iPad gate.
+
+### Use libopus on simulator and device
+
+The AudioToolbox experiment created a converter but produced 840 frames for the
+first 960-frame packet and no useful concealment from a missing packet. The
+source-built, pinned libopus package gives one tested 960-frame/PLC path. The
+FFmpeg low-delay encoder uses CELT, which has no SILK in-band FEC; unavailable DTX
+options are not reported as active. Compact reset silence packets cover quiet
+periods. See `docs/audio-codec.md` for the probes, pins and license notices.
+
+### Pairing controls access; encryption is deferred
+
+A CSPRNG host token, rotating six-digit code, IP cooldown and Keychain persistence
+prevent an unauthenticated LAN peer from casually taking control. USB trusts
+physical access. This model does not hide the code, token or stream from a network
+observer. Adding encryption requires a separate authenticated key-exchange design;
+the current app is for trusted local networks.
+
+### Keep Network.framework as the default UDP backend
+
+The bounded BSD receive path remains selectable for device comparisons. Local
+1440p/40 Mbps burst runs reached about 60 fps with zero drops on both paths, so
+there was no measured gain to justify changing the existing default. Software
+simulator results do not settle device behavior.
+
+### Give ordinary users permission to run the VDD tasks
+
+The installer owns privileged driver setup. A normal host launch needs read and
+execute access to the SYSTEM enable/disable tasks, not a UAC prompt for every
+connection. Their ACL grants that access to BUILTIN\Users; the host reports the
+actual scheduler error. The normal-user desktop campaign must verify this fix.
+
+### Keep YUV420P until both hardware input-format gates pass
+
+Auto/BGRA is opt-in and checks the selected encoder's advertised formats. BGRA
+could remove a conversion copy, but it must match quadrant colors and run ten
+minutes on NVENC and AMF before becoming the default. Those runtime checks remain
+pending. Accelerate speeds up macOS synthetic testing without changing Windows
+hardware encoder configuration or the AMF normalization guards.
+
+### Archive without credentials, upload only with signing configured
+
+The TestFlight job always compiles an unsigned Release archive for PRs and missing
+secrets. Signed runs use a team API key and an optional temporary distribution
+keychain. Build numbers increase with workflow runs; tags must match the marketing
+version. External-group setup, Beta App Review and the public link remain manual
+App Store Connect steps. A dry archive is not an installable TestFlight build.
+
 ## Deferred
 
-- Audio (a WASAPI → Opus → AVAudioEngine sketch exists; wire types are
-  reserved)
-- USB transport
-- First-party signed display driver
-- FEC (types and flags reserved), zero-copy GPU capture, dirty-rect encode
+- Physical iPad and full reference-PC campaign results: tracked in the hardware runbook.
+- FEC, encryption, zero-copy GPU capture and dirty-rectangle encoding.
+- Native macOS screen capture via ScreenCaptureKit; macOS currently supplies synthetic capture.
+- Windows pressure-sensitive pen injection and a first-party signed display driver.
+- Public App Store distribution; testers use TestFlight or source builds.

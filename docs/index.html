@@ -46,13 +46,13 @@
     <div class="hero-content">
       <p class="hero-eyebrow">Open source &middot; Free forever</p>
       <h1>Your iPad.<br>A second monitor.</h1>
-      <p class="hero-subtitle">Low-latency wireless display for Windows.<br>No subscription, no dongle.</p>
+      <p class="hero-subtitle">A second display for Windows.<br>WiFi, with USB and audio in the v0.3 candidate.</p>
       <div class="hero-actions">
         <a href="download.html" class="btn-primary btn-lg">Download for Windows</a>
         <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener" class="btn-ghost">View on GitHub</a>
       </div>
       <div class="hero-trust">
-        <span class="trust-signal">60fps</span>
+        <span class="trust-signal">H.264 by default</span>
         <span class="trust-signal">Hardware H.264 / HEVC</span>
         <span class="trust-signal">Touch &amp; Pencil control</span>
       </div>
@@ -67,8 +67,8 @@
         <span class="stat-label">video out, input back</span>
       </div>
       <div class="stat">
-        <span class="stat-value">60fps</span>
-        <span class="stat-label">stream</span>
+        <span class="stat-value">30–120</span>
+        <span class="stat-label">requested fps in v0.3</span>
       </div>
       <div class="stat">
         <span class="stat-value">$0</span>
@@ -97,12 +97,12 @@
         <div class="step">
           <div class="step-number">2</div>
           <h3>Connect your iPad</h3>
-          <p>Open the iPad app and enter your PC's IP address. Both devices must be on the same WiFi network.</p>
+          <p>Open the matching iPad build, find the PC or enter its IP, then enter the six-digit host code. In v0.3, a trusted USB cable can take over the WiFi session.</p>
         </div>
         <div class="step">
           <div class="step-number">3</div>
           <h3>Start streaming</h3>
-          <p>Your iPad is now a second display you can touch: tap to click, drag, scroll, use the Pencil. The stream adapts its bitrate to your WiFi, recovers from loss, and shows its real measured latency in the HUD.</p>
+          <p>Mirror or extend the desktop, then tap, drag and scroll. The v0.3 candidate adds PC audio, keyboard and pointer relay, and repair of missing video fragments. The HUD shows decode rate, repairs and measured latency.</p>
         </div>
       </div>
     </div>
@@ -122,8 +122,8 @@
           </h3>
           <ul class="req-list">
             <li>Windows 10/11 64-bit</li>
-            <li>NVIDIA, AMD, or Intel GPU (NVIDIA recommended for lowest latency)</li>
-            <li>Same WiFi network as iPad</li>
+            <li>NVIDIA, AMD, or Intel GPU with a supported encoder</li>
+            <li>Trusted local network; Apple Devices or desktop iTunes for USB</li>
           </ul>
         </div>
         <div class="req-card card">
@@ -132,9 +132,9 @@
             iPad
           </h3>
           <ul class="req-list">
-            <li>iPadOS 16 or later</li>
+            <li>iPadOS 17 or later for v0.3</li>
             <li>iPad Pro / Air / mini</li>
-            <li>120Hz ProMotion supported</li>
+            <li>Matching TestFlight or source build; ProMotion testing pending</li>
           </ul>
         </div>
       </div>
@@ -145,8 +145,8 @@
   <section class="limitations reveal">
     <div class="container">
       <div class="limitations-card">
-        <span class="limitations-badge">v0.2.0</span>
-        <p>v0.2.0 rebuilds the streaming core: a real session protocol, adaptive bitrate and loss recovery, touch/Pencil control of the PC, opt-in HEVC, and an extended display that matches the iPad's native resolution. Audio, USB transport, and a first-party display driver are on the roadmap.</p>
+        <span class="limitations-badge">v0.3.0 candidate</span>
+        <p>USB, audio, pairing and keyboard relay are implemented in the candidate branches. The full local simulator matrix has passed; the Windows desktop campaign, memory soak and physical iPad checks are still pending. No v0.3 RC is published yet. Use a trusted local network: pairing does not encrypt the stream.</p>
       </div>
     </div>
   </section>
@@ -155,7 +155,7 @@
   <section class="roadmap">
     <div class="container">
       <div class="section-header reveal">
-        <h2>Roadmap</h2>
+        <h2>Release progress</h2>
       </div>
       <div class="roadmap-track reveal">
         <div class="milestone milestone--done">
@@ -175,9 +175,9 @@
         <div class="milestone">
           <div class="milestone-info">
             <span class="milestone-version">v0.3.0</span>
-            <span class="milestone-name">Audio + USB</span>
+            <span class="milestone-name">Audio, USB + Pairing</span>
           </div>
-          <span class="badge badge-muted">Upcoming</span>
+          <span class="badge badge-muted">In testing</span>
         </div>
         <div class="milestone">
           <div class="milestone-info">
