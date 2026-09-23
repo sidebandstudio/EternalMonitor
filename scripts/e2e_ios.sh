@@ -44,8 +44,8 @@ PROFILE_PID=""
 APP_PID=""
 UDID=""
 INSTALL_DIR=""
-# CoreSimulator can stall `simctl terminate` indefinitely while other
-# simulators are busy, holding the next row behind a finished measurement.
+# CoreSimulator can stall `simctl terminate` and app-container lookups
+# indefinitely, holding the next row behind a finished measurement.
 bounded() {
     local limit=$1 ticks=0 pid
     shift
@@ -144,7 +144,7 @@ echo "==> Booting simulator: $SIM_NAME"
 
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
-INSTALLED_APP=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor app 2>/dev/null || true)
+INSTALLED_APP=$(bounded 30 xcrun simctl get_app_container "$UDID" com.eternal.monitor app 2>/dev/null || true)
 if [ -n "$INSTALLED_APP" ] && diff -qr "$APP" "$INSTALLED_APP" >/dev/null 2>&1; then
     echo "==> Reusing identical installed app"
 else
@@ -161,7 +161,7 @@ bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || tru
 
 # Read the app's identical milestone mirror directly. Streaming the complete
 # simulator log through diagnosticd can consume a CPU on small hosted runners.
-APP_DATA=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
+APP_DATA=$(bounded 30 xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
 SIM_LOG="$APP_DATA/tmp/eternal-e2e.log"
 rm -f "$SIM_LOG" "$APP_LOG"
 touch "$SIM_LOG"
