@@ -1,10 +1,11 @@
 # v0.3.0 hardware verification
 
 Status: candidate work is in draft phase branches. No v0.3.0 release candidate
-has been published or installed. The reference-PC desktop campaign is pending:
-a Windows Security prompt for another application prevents an unobstructed
-capture session. Native compilation and simulator results below do not replace
-that campaign.
+has been published. The installed host and VDD scripts were updated to `cac987c`
+on 2026-09-23 to repair physical USB extended-display startup. The full desktop
+campaign and installer upgrade/uninstall/reinstall checks remain pending.
+The user is keeping the iPad connected for USB testing; preserve that live
+session until the next test requires an interruption.
 
 Use the host and iPad app from the same candidate. Keep the evidence with the
 candidate's commit, version, build number, encoder, capture resolution, transport,
@@ -14,18 +15,22 @@ and date. A failed or unavailable row remains pending until it is rerun.
 
 Reference hardware: Windows 11, Ryzen 7 7800X3D with Radeon integrated graphics,
 GeForce RTX 5080, 1920×1080 primary display. The following preliminary checks
-passed on 2026-09-22; the full desktop campaign has **not** passed.
+passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passed.
 
 | Check | Result | Evidence in the handoff folder |
 | --- | --- | --- |
-| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed on the P7 code at `c5fbbe1`; 176 tests | `PROGRESS.md`, `/tmp/em_v030_p7_native_build2.log` |
+| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed at `cac987c`; 183 tests with the physical iPad attached and synthetic tests isolated from it | `evidence/windows/em-vdd-driver-native-build.log` |
 | WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
-| Installer compilation | Passed; runtime install/upgrade/uninstall pending | `PROGRESS.md`, `/tmp/em_v030_p6_installer_build.log` |
-| Desktop availability | Blocked by an unrelated firewall prompt; no action taken on it | `evidence/windows/p7-desktop-check.png` |
+| Installer compilation | `EternalMonitor-USB-cac987c-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-usb-installer-cac987c.log` |
+| Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
+| Physical USB extended display | Two successful starts at 2732×2048 with NVENC H.264; the installed host exceeded 72,000 completed frames with zero reported video drops | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
 
 The endpoint read is an API/clock check. It does not prove PC audio was encoded,
 transported and heard on the iPad. The native tests use synthetic capture; they
-do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior.
+do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior. The separate physical
+USB run exercised DXGI, NVENC and VDD startup. Receiver reports prove completed
+frames; visual confirmation on the physical iPad is still required.
 
 Every row below is required before the release candidate. Save host stdout and
 stderr, app milestones, simulator and PC screenshots, pixel assertions, duration,
@@ -44,7 +49,7 @@ in the private handoff evidence directory, outside git and public PRs.
 | R-audio | Session-1 tone passes through WASAPI → Opus → simulator playback; ≥100 packets decoded, ≤2 lost, 1 kHz >−20 dBFS; silence uses small packets | Pending |
 | R-pairing | Wrong code rejected; real logged code accepted through the sheet; persisted token reconnects; pairing card captured | Pending |
 | R-input | Only the focused input probe receives center/corner clicks within ±3 px, drag, wheel, right-click and `Hi!` plus Enter | Pending |
-| R-vdd | Extended display attaches; advertised mode is first in VDD XML; heartbeat reports that resolution; disconnect and host exit remove the display | Pending |
+| R-vdd | Extended display attaches; advertised mode is first in VDD XML; heartbeat reports that resolution; disconnect and host exit remove the display | Physical iPad startup passed; full simulator row and teardown assertions pending |
 | R-reconnect | Kill only the tracked host; SIGNAL LOST appears; restart a new process; video resumes in <15 seconds | Pending |
 | R-gui | Stream/client/audio/USB/pairing cards, Settings and QR are driven and captured; labels reflect the actual session | Pending |
 
@@ -52,9 +57,9 @@ Additional Windows gates:
 
 | Row | Pass condition | Current result |
 | --- | --- | --- |
-| R-usb-service | USB card truthfully reports the service/device state; native fake-server tests exercise TCP usbmuxd | Native tests passed; GUI and cable pending |
+| R-usb-service | USB card truthfully reports the service/device state; native fake-server tests exercise TCP usbmuxd | Native tests and physical cable streaming passed; GUI assertion pending |
 | R-bgra-nvenc / R-bgra-amf | Each hardware encoder runs BGRA for ten minutes without errors; quadrant mean-channel difference versus its YUV run <12/255 | Pending; default stays YUV420P |
-| R-vdd-limited | A normal-user host can run the SYSTEM VDD tasks with the new read/execute ACLs | Pending |
+| R-vdd-limited | A normal-user host can run the SYSTEM VDD tasks with the new read/execute ACLs | Passed on 2026-09-23; repeat after the full installer upgrade |
 | R-fps120 | Requested/negotiated 120 fps is visible; report achieved decode rate and any stutter/errors | Pending |
 | R-headless-ctrlc | Ctrl+C reaches the tracked host and exits cleanly with VDD removed | Pending |
 | R-autostart | Toggle writes/removes the correct HKCU Run entry and preserves the prior value after the test | Pending |
@@ -66,8 +71,9 @@ Run simulator checks with `scripts/e2e_matrix.sh` and the long test with
 `scripts/soak.sh 1800`. The Windows entry points are
 `scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800`; consult
 `scripts/win/README.md` for the session runner and evidence collection. A script
-entry point is not a claim that every hardware row has passed. Until the full
-Windows runner is completed, use the table above to identify missing rows.
+entry point is not a claim that every hardware row has passed. The thirteen-row
+Windows runner is implemented, including cleanup and failure checks. Use the
+tables above to identify unfinished hardware execution.
 
 For each merged host phase, retain the `release.yml` workflow-dispatch installer
 artifact URL in `PROGRESS.md`. Before tagging, repeat both matrices and both
@@ -89,7 +95,10 @@ Campaign prerequisites and cleanup:
    restore the power settings observed before testing, and remove temporary
    debug/release firewall rules. Keep the installed product's rules.
 5. End with the verified newest installer installed and a clean desktop
-   screenshot. The reference PC still has the old 0.1-series installation.
+   screenshot. The reference PC currently has the `cac987c` host and task
+   scripts copied into the existing installation. The previous files are
+   backed up under `D:\AgentWork\em-v030\installed-before-cac987c`.
+   The driver is still 23.40.36.27; the pinned 25.5.2 upgrade remains pending.
    Rollback installer: `C:\Users\aliyo\Downloads\EternalMonitor-Setup.exe`.
 
 ## Ali with the physical iPad
@@ -118,8 +127,10 @@ with each failure; include a short screen recording when timing or feel matters.
 | WiFi loss and latency | Walking toward the edge of coverage reduces bitrate without multi-second freezes, then recovers. Use 240 fps video of both displays to compare latency with the HUD. | Network conditions, bitrate/loss/repair graph, camera recording |
 
 If Apple Devices does not expose TCP 27015 after cable attachment and trust,
-record that result before trying desktop iTunes. The harness does not yet prove
-which package works with this PC and iPad combination.
+record that result before trying desktop iTunes. Physical USB streaming now
+works on the reference PC with its existing Apple device support. Cable
+takeover, unplug/replug timing and the trust-prompt installation path still
+need their own checks.
 
 Logs on the PC are at `%APPDATA%\EternalMonitor\logs\eternal-host-session.log`
 (with `.1` and `.2` for prior sessions), or use Copy logs. Preserve failures;
