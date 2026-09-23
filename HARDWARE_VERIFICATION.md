@@ -42,11 +42,29 @@ stability issue.
 
 The later native test run reproduced an interruption at 06:52:27–06:53:27 UTC.
 Log-triggered dumps captured recovery because the observer's log read also
-paused. Bounded native process monitors ended without capturing another stall.
+paused. The 08:33 native monitor captured another recovery dump at 08:41:05 UTC.
+Its CPU samples also paused for 48 seconds, so this dump does not establish
+the original blocking call. All monitors have ended.
 Candidate `bd88cc4` removes full session-log reads during GUI repaint, releases
 the statistics lock before logging, and records peer decode FPS/queue depth.
 It has passed native tests but is not installed; these corrections have not
 closed the physical USB stability gate.
+
+The refreshed log contains sixteen capture watchdog restarts from 08:02 to
+08:41 UTC, including intervals without builds or input tests. Windows recorded
+SATA resets and retried I/O on Disk 0, the D: Hitachi HDD that stores this test
+host's redirected stdout. Four reset timestamps fall 25.8–26.8 seconds after
+the three-second capture watchdog, consistent with a storage timeout. Windows
+still reports the disk as Healthy; the hardware cause is not established.
+Evidence is `evidence/windows/usb-stalls/disk-capture-correlation-20260923.json`.
+
+P6 `7f135a3` sends stdout and session-file output through separate bounded
+background workers and keeps recent logs in memory. An unread stdout pipe
+stopped the previous host after 420 decoded frames. With the correction,
+the same test decoded 960 frames at 60.00 FPS with zero drops. Strict clippy
+and all 185 phase Rust tests pass. Evidence is
+`evidence/async-logging-7f135a3/`. This change is not installed on the PC;
+physical stability and the Windows campaign remain open.
 
 The physical iPad runs app version 0.3.0 build 6 on iPadOS 26.2. Its existing
 developer services allowed a read-only screen capture and app-scoped logs over
