@@ -38,6 +38,40 @@ class RealChecksTests(unittest.TestCase):
         log += 'Audio stream stats quiet_packets=16\n'
         self.assertEqual(check_stream(self.result(), log, 'h264_nvenc', audio=True)['status'], 'PASS')
 
+    def test_high_refresh_requires_actual_120_fps_encoder(self):
+        from real_checks import check_high_refresh
+        with self.assertRaises(ValueError):
+            check_high_refresh(self.result(), self.log() + 'Encoder opened fps=60\n')
+        result = check_high_refresh(self.result(), self.log() + 'Encoder opened fps=120\n')
+        self.assertEqual(result['target_fps'], 120)
+
+
+class BgraChecksTests(unittest.TestCase):
+    def fixture(self):
+        return (dict(status='PASS', measured_seconds=601),
+                'Encoder opened encoder="h264_nvenc" input=BGRA\n',
+                dict(width=2420, height=1668, quadrants_rgb=[[210,40,50],[35,180,80],[40,70,210],[180,180,180]]))
+
+    def test_matching_color_and_ten_minutes_pass(self):
+        from real_checks import check_bgra
+        result, log, colors = self.fixture()
+        self.assertEqual(check_bgra(result, log, colors, colors)['color_mean_channel_errors'], [0,0,0,0])
+
+    def test_channel_swap_short_run_and_yuv_fallback_fail(self):
+        from real_checks import check_bgra
+        import copy
+        for defect in ('swap', 'duration', 'fallback', 'error', 'missing', 'geometry'):
+            with self.subTest(defect=defect):
+                result, log, colors = self.fixture()
+                reference = copy.deepcopy(colors)
+                if defect == 'swap': colors['quadrants_rgb'][0].reverse()
+                elif defect == 'duration': result['measured_seconds'] = 599
+                elif defect == 'fallback': log += 'Encoder opened input=YUV420P\n'
+                elif defect == 'error': log += 'ERROR Encoder failed\n'
+                elif defect == 'missing': colors['quadrants_rgb'] = []
+                else: colors['width'] += 1
+                with self.assertRaises(ValueError): check_bgra(result, log, colors, reference)
+
 
 class ProbeChecksTests(unittest.TestCase):
     def fixture(self):

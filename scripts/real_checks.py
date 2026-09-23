@@ -6,6 +6,43 @@ def clean(text):
     return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 
+def check_bgra(result, log, colors, reference):
+    """Direct input must remain active for ten minutes and preserve color."""
+    log = clean(log)
+    formats = re.findall(r'Encoder opened[^\n]*\binput="?([A-Z0-9]+)', log)
+    if not formats or any(value not in ('BGRA', 'BGRZ', 'BGR0') for value in formats):
+        raise ValueError(f'Direct BGRA input was not used throughout: {formats}')
+    if result.get('measured_seconds', 0) < 600:
+        raise ValueError('BGRA stability measurement was shorter than ten minutes')
+    if re.search(r'\bERROR\b|encoder[^\n]*failed|capture watchdog|pipeline restart storm', log, re.I):
+        raise ValueError('Encoder/capture error during BGRA stability run')
+    if (colors.get('width'), colors.get('height')) != (reference.get('width'), reference.get('height')):
+        raise ValueError('BGRA and YUV screenshots have different dimensions')
+    samples = [entry.get('quadrants_rgb') for entry in (colors, reference)]
+    if any(not isinstance(s, list) or len(s) != 4 or any(
+            not isinstance(rgb, list) or len(rgb) != 3 or any(
+                not isinstance(v, (int, float)) or not 0 <= v <= 255 for v in rgb) for rgb in s)
+           for s in samples):
+        raise ValueError('Expected four RGB color patches in both screenshots')
+    errors = [sum(abs(a - b) for a, b in zip(actual, expected)) / 3
+              for actual, expected in zip(*samples)]
+    result.update(encoder_input=formats[-1], color_mean_channel_errors=errors)
+    if max(errors) >= 12:
+        raise ValueError(f'BGRA color error must be below 12/255 in every quadrant: {errors}')
+    return result
+
+
+def check_high_refresh(result, log):
+    log = clean(log)
+    rates = [int(v) for v in re.findall(r'Encoder opened[^\n]*\bfps=(\d+)', log)]
+    if not rates or rates[-1] != 120:
+        raise ValueError(f'Host did not negotiate a 120 FPS encoder: {rates}')
+    if re.search(r'\bERROR\b|encoder[^\n]*failed|capture watchdog|pipeline restart storm', log, re.I):
+        raise ValueError('Encoder/capture error during high-refresh run')
+    result['target_fps'] = 120
+    return result
+
+
 def check_stream(result, log, encoder, repairs=False, bitrate=None, audio=False):
     log = clean(log)
     errors = []

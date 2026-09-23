@@ -13,7 +13,8 @@ func fail(_ message: String) -> Never {
 var args = Array(CommandLine.arguments.dropFirst())
 let assertPattern = args.contains("--assert-pattern")
 let assertUI = args.contains("--assert-ui")
-args.removeAll { $0 == "--assert-pattern" || $0 == "--assert-ui" }
+let quadrants = args.contains("--quadrants")
+args.removeAll { $0 == "--assert-pattern" || $0 == "--assert-ui" || $0 == "--quadrants" }
 guard let path = args.first,
       let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
       let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
@@ -62,8 +63,33 @@ for y in Int(rect.minY)..<Int(rect.maxY) {
 guard count > 0 else { fail("Empty rectangle") }
 let mean = luminance / Double(count)
 let blackFraction = Double(black) / Double(count), amberFraction = Double(amber) / Double(count)
-let metrics: [String: Any] = ["width": width, "height": height, "pixels": count,
+var metrics: [String: Any] = ["width": width, "height": height, "pixels": count,
     "mean_luminance": mean, "near_black_fraction": blackFraction, "amber_fraction": amberFraction]
+if quadrants {
+    // A small interior patch avoids UI, borders and the encoded counter. The
+    // channel median rejects the moving stripe when it crosses a sample.
+    var colors = [[Int]]()
+    for yFraction in [0.25, 0.75] {
+        for xFraction in [0.25, 0.75] {
+            let cx = rect.minX + rect.width * xFraction
+            let cy = rect.minY + rect.height * yFraction
+            let rx = max(1, Int(rect.width * 0.05))
+            let ry = max(1, Int(rect.height * 0.05))
+            var channels = [[UInt8]](repeating: [], count: 3)
+            for y in max(0, Int(cy) - ry)..<min(height, Int(cy) + ry) {
+                for x in max(0, Int(cx) - rx)..<min(width, Int(cx) + rx) {
+                    let index = (y * width + x) * 4
+                    for channel in 0..<3 { channels[channel].append(pixels[index + channel]) }
+                }
+            }
+            colors.append(channels.map { values in
+                let sorted = values.sorted()
+                return Int(sorted[sorted.count / 2])
+            })
+        }
+    }
+    metrics["quadrants_rgb"] = colors
+}
 let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
 print(String(decoding: data, as: UTF8.self))
 if assertPattern && (mean < 20 || blackFraction > 0.8 || amberFraction < 0.001) {

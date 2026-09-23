@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / 'scripts/win/remote.sh'
 SCENARIOS = ('R-baseline', 'R-nvenc-h264', 'R-nvenc-hevc', 'R-amf-h264', 'R-amf-hevc',
              'R-nvenc-h264-loss3', 'R-nvenc-burst', 'R-audio', 'R-pairing', 'R-vdd', 'R-reconnect', 'R-gui', 'R-input')
+PERFORMANCE_SCENARIOS = ('R-yuv-nvenc', 'R-yuv-amf', 'R-bgra-nvenc', 'R-bgra-amf', 'R-fps120')
 # Input runs last: its SendInput events reset Windows' two-minute idle gate.
 
 
@@ -83,7 +84,7 @@ def verify_vdd_host_exit(row, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--list', action='store_true')
-    parser.add_argument('--rows', nargs='+', choices=SCENARIOS, default=list(SCENARIOS))
+    parser.add_argument('--rows', nargs='+', choices=SCENARIOS + PERFORMANCE_SCENARIOS, default=list(SCENARIOS))
     args = parser.parse_args()
     if args.list:
         print('\n'.join(args.rows))
@@ -130,14 +131,22 @@ def main():
                    EM_SKIP_BUILD=skip_build, EM_REQUIRE_PAIRING='0', EM_AUDIO='0', EM_BITRATE_MBPS='15',
                    EM_REQUIRE_REPAIRS='0')
         hevc = scenario.endswith('hevc')
-        family = 'amf' if scenario.startswith('R-amf') else 'nvenc'
+        family = 'amf' if scenario.startswith('R-amf') or scenario.endswith('-amf') else 'nvenc'
         encoder = ('hevc_' if hevc else 'h264_') + family
+        host_fps = 120 if scenario == 'R-fps120' else 60
         host_args = ['ETERNAL_HEADLESS=1', 'ETERNAL_ENCODER=h264_' + family,
-                     f'ETERNAL_HEVC={int(hevc)}', 'ETERNAL_FPS=60', 'ETERNAL_MAX_DGRAM=1200',
+                     f'ETERNAL_HEVC={int(hevc)}', f'ETERNAL_FPS={host_fps}', 'ETERNAL_MAX_DGRAM=1200',
                      'ETERNAL_E2E_LOG=1', 'ETERNAL_USB_DIRECT=127.0.0.1:0']
         # These rows target the simulator over UDP. A physically attached
         # iPad must not claim their session through the USB supervisor.
         env['EM_CODEC'] = 'hevc' if hevc else 'h264'
+        if scenario.startswith(('R-yuv-', 'R-bgra-')):
+            direct = scenario.startswith('R-bgra-')
+            host_args += ['ETERNAL_INPUT=' + ('bgra' if direct else 'yuv420')]
+            if direct:
+                env.update(EM_DURATION='600', EM_TIMEOUT='720')
+        if scenario == 'R-fps120':
+            env.update(EM_TARGET_FPS='120', EM_DURATION='60', EM_MIN_FPS='0')
         if scenario == 'R-nvenc-h264-loss3':
             env['EM_REQUIRE_REPAIRS'] = '1'
             host_args += ['ETERNAL_DROP=0.03', 'ETERNAL_REORDER=0.01']
@@ -221,7 +230,7 @@ def main():
                 with (row / 'run.log').open('w') as log:
                     client = subprocess.Popen([str(ROOT / 'scripts/e2e_ios.sh')], env=env,
                                               stdout=log, stderr=subprocess.STDOUT)
-                    deadline = time.monotonic() + 600
+                    deadline = time.monotonic() + int(env['EM_TIMEOUT']) + 120
                     try:
                         while client.poll() is None:
                             app_log = row / 'app.log'
@@ -243,7 +252,7 @@ def main():
                                          '--assert-ui'], output=row / (view.lower() + '-pixels.json'))
                                 gui_checked = True
                             if time.monotonic() >= deadline:
-                                raise TimeoutError('Simulator row exceeded ten minutes')
+                                raise TimeoutError('Simulator row exceeded its startup and measurement deadline')
                             time.sleep(.2)
                         if client.returncode:
                             raise subprocess.CalledProcessError(client.returncode, client.args)
@@ -282,6 +291,23 @@ def main():
                              bitrate=40000000 if scenario.endswith('burst') else None,
                              audio=scenario == 'R-audio')
             save(result_path, result)
+            if scenario == 'R-fps120':
+                from real_checks import check_high_refresh
+                check_high_refresh(result, host_log)
+                save(result_path, result)
+            if scenario.startswith(('R-yuv-', 'R-bgra-')):
+                colors = json.loads(run([str(ROOT / 'scripts/pixels.sh'), str(row / 'simulator.png'),
+                                        '--video', size, '--quadrants', '--assert-pattern']))
+                save(row / 'colors.json', colors)
+                if scenario.startswith('R-bgra-'):
+                    baseline = out / ('R-yuv-' + family) / 'colors.json'
+                    if not baseline.exists():
+                        raise ValueError('Run R-yuv-' + family + ' before its BGRA comparison')
+                    if json.loads((baseline.parent / 'result.json').read_text())['status'] != 'PASS':
+                        raise ValueError('YUV color reference did not pass its stream checks')
+                    from real_checks import check_bgra
+                    check_bgra(result, host_log, colors, json.loads(baseline.read_text()))
+                    save(result_path, result)
             if family == 'amf':
                 remote('diagnostic', env['EM_CODEC'], scenario, output=row / 'bitstream-validation.log')
             remote('shot', scenario, output=row / 'desktop-shot.log')
