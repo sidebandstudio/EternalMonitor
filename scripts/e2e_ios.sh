@@ -49,6 +49,11 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+    # The live log is a hard link into the app container. Detach the retained
+    # copy before another test launch truncates the simulator's log in place.
+    if [ -f "$APP_LOG" ]; then
+        cp "$APP_LOG" "$APP_LOG.snapshot" && mv "$APP_LOG.snapshot" "$APP_LOG" || status=1
+    fi
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
     [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
     if [ "$status" -ne 0 ]; then
@@ -90,7 +95,7 @@ xcodebuild build \
     -scheme EternalMonitor -configuration Release \
     -destination "platform=iOS Simulator,id=$UDID" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
-    CODE_SIGNING_ALLOWED=NO -quiet
+    CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- -quiet
 echo "==> Building host"
 (cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
 fi
@@ -104,12 +109,19 @@ echo "==> Booting simulator: $SIM_NAME"
 
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
-echo "==> Installing app"
-# Simulator's helper can stall copying directly from a protected Desktop
-# checkout. Stage only the built app in the temporary directory first.
-INSTALL_DIR="$(mktemp -d /tmp/em-e2e-install.XXXXXX)"
-ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
-xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
+INSTALLED_APP=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor app 2>/dev/null || true)
+if [ -n "$INSTALLED_APP" ] && diff -qr "$APP" "$INSTALLED_APP" >/dev/null 2>&1; then
+    echo "==> Reusing identical installed app"
+else
+    echo "==> Installing app"
+    # Installing the same bundle for every row repeatedly triggers simulator
+    # installation work during the next stream. Compare the whole bundle so
+    # changed code, resources or signatures always cause a fresh install.
+    # Stage outside a protected Desktop checkout for Simulator's helper.
+    INSTALL_DIR="$(mktemp -d /tmp/em-e2e-install.XXXXXX)"
+    ditto "$APP" "$INSTALL_DIR/EternalMonitor.app"
+    xcrun simctl install "$UDID" "$INSTALL_DIR/EternalMonitor.app"
+fi
 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 
 # Read the app's identical milestone mirror directly. Streaming the complete

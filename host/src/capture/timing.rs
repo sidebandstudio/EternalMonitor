@@ -22,6 +22,13 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut Timebase) -> i32;
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn set_stream_qos() {
+    // Encoding and capture serve the same live frame deadline. In particular,
+    // codec workers created by the encoder should inherit this QoS as well.
+    unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+}
+
 pub(crate) struct FrameTimer {
     #[cfg(target_os = "macos")]
     queue: Option<OwnedFd>,
@@ -35,9 +42,7 @@ impl FrameTimer {
         {
             // The synthetic capture thread produces frames for a live viewer.
             // This is a QoS hint, not a real-time scheduling reservation.
-            unsafe {
-                pthread_set_qos_class_self_np(0x21, 0);
-            }
+            set_stream_qos();
             let mut timebase = Timebase { numer: 0, denom: 0 };
             let fd = unsafe { libc::kqueue() };
             let queue = if fd >= 0 {

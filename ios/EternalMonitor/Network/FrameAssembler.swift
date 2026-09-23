@@ -317,6 +317,9 @@ final class FrameAssembler {
 
     private func requestKeyframe(_ seq: UInt32) {
         guard pending[seq]?.keyframeRequested == false else { return }
+        // A complete queued keyframe restores references after this loss.
+        // Keep the repair deadline, but do not request another replacement.
+        guard !pending.contains(where: { $0.key > seq && $0.value.isKeyframe && $0.value.isComplete }) else { return }
         pending[seq]?.keyframeRequested = true
         onNeedsKeyframe?(currentEpoch ?? 0, latestCompletedSeq)
     }
