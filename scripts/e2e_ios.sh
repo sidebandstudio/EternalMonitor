@@ -30,6 +30,7 @@ OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
 SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
 REMOTE_HOST="${EM_REMOTE_HOST:-}"
 MIN_FPS="${EM_MIN_FPS:-55}"
+FPS_GATE="${EM_FPS_GATE:-enforce}"
 MIN_SECONDS="${EM_DURATION:-0}"
 STARTED=$SECONDS
 mkdir -p "$OUT" "$(dirname "$SHOT")"
@@ -269,6 +270,7 @@ fi
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
+    --fps-gate "$FPS_GATE" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
 echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
 echo "      $first_frame"
