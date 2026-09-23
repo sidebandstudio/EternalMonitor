@@ -81,7 +81,7 @@ if [ "$MODE" = --real ]; then
     host_started=1
     if EM_SCENARIO="$scenario" EM_OUTPUT_DIR="$OUT/$scenario" \
        EM_SCREENSHOT="$OUT/$scenario/simulator.png" EM_REMOTE_HOST=100.81.59.48 \
-       EM_PORT=19876 EM_SIZE=1920x1080 EM_SKIP_BUILD="$skip" EM_DURATION="$duration" \
+       EM_PORT=19876 EM_SIZE="${EM_SIZE:-1920x1080}" EM_SKIP_BUILD="$skip" EM_DURATION="$duration" \
        EM_REQUIRE_REPAIRS="$repairs" "$ROOT/scripts/e2e_ios.sh" > "$OUT/$scenario-run.log" 2>&1; then
         skip=1
         "$ROOT/scripts/win/remote.sh" log > "$OUT/$scenario/host.log"
