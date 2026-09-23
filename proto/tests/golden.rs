@@ -90,6 +90,32 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         ));
     }
 
+    for (name, status) in [
+        ("hello_ack_unauthorized", HelloStatus::Unauthorized),
+        ("hello_ack_rate_limited", HelloStatus::RateLimited),
+    ] {
+        vectors.push((
+            name,
+            encode_control(
+                0,
+                2,
+                &ControlMessage::HelloAck(HelloAck {
+                    status,
+                    accepted_version: 2,
+                    client_nonce: 0xDEAD_BEEF,
+                    session_id: 0,
+                    heartbeat_interval_ms: 1000,
+                    report_interval_ms: 500,
+                    liveness_timeout_ms: 3000,
+                    stream_config: StreamConfig::default(),
+                    host_name: "ALI-PC".into(),
+                    auth_token: [0; 16],
+                    host_caps: 0,
+                }),
+            ),
+        ));
+    }
+
     let control: Vec<(&'static str, u32, u32, ControlMessage)> = vec![
         (
             "hello2",

@@ -92,7 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (Previously only the GUI applied them, seconds later — and headless
     // runs never did.) The GUI re-applies the same values at startup, which
     // is idempotent.
-    let persisted = eternal_host::settings::SettingsFile::load();
+    let mut persisted = eternal_host::settings::SettingsFile::load();
+    let auth_token = persisted.ensure_auth_token()?;
     let initial_bitrate = if persisted.bitrate_mbps > 0.0 {
         (persisted.bitrate_mbps * 1_000_000.0).round() as u32
     } else {
@@ -100,6 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared = SharedControl::new(listen_port, initial_bitrate);
+    {
+        let mut pairing = shared.pairing.lock();
+        pairing.configure(persisted.require_pairing, auth_token);
+        pairing.log_code();
+    }
     let max_dgram = std::env::var("ETERNAL_MAX_DGRAM")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())

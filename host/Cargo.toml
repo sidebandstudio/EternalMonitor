@@ -7,6 +7,8 @@ edition = "2021"
 eternal-wire = { path = "../proto" }
 ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
 libc = "0.2"
+getrandom = { version = "0.3.4", features = ["std"] }
+subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

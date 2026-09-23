@@ -91,6 +91,7 @@ mod tests {
 
     fn session(caps: u16) -> (SharedControl, u32) {
         let shared = SharedControl::new(9876, 15_000_000);
+        shared.pairing.lock().required = false;
         let config = super::super::SharedConfigSource {
             shared: &shared,
             stream_epoch: 7,

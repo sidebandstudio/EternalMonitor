@@ -72,6 +72,10 @@ final class ConnectionManager: ObservableObject {
     @Published var fps: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
+    @Published var pairingPrompt: PairingSheetModel?
+    private var awaitingPairing = false
+    private var explicitPairingToken: Data?
+    private let pairingStore = PairingStore.shared
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
     /// Live stream health for the HUD, recomputed at the 4 Hz flush.
     @Published private(set) var stats = StreamStats()
@@ -192,8 +196,28 @@ final class ConnectionManager: ObservableObject {
 
     // MARK: - Connect / Disconnect
 
-    func connect(host: String, port: UInt16) {
+    func connect(host: String, port: UInt16, token: Data? = nil) {
+        guard state == .disconnected else { return }
+        explicitPairingToken = token
+        if let token {
+            do { try pairingStore.save(token: token, hostName: "", address: PairingStore.address(host: host, port: port)) }
+            catch { record(.warning, "pairing", "Could not save the scanned pairing on this iPad.") }
+        }
         connect(target: .udp(host: host, port: port))
+    }
+
+    func submitPairing() {
+        guard awaitingPairing, let code = pairingPrompt?.submit() else { return }
+        controlChannel?.retryPairing(code: code)
+    }
+
+    func pairingSheetDismissed() {
+        if awaitingPairing { cancel() }
+    }
+
+    func forgetPairedHosts() {
+        do { try pairingStore.forgetAll() }
+        catch { connectionError = "Could not remove saved pairings from this iPad." }
     }
 
     func connect(target: ConnectionTarget) {
@@ -218,6 +242,9 @@ final class ConnectionManager: ObservableObject {
             }
         }
         let isUSB = receiver.isUSB
+        let pairingAddress = isUSB ? "USB" : PairingStore.address(host: normalizedHost, port: port)
+        let pairingToken = explicitPairingToken ?? ((try? pairingStore.token(address: pairingAddress)) ?? Data(repeating: 0, count: 16))
+        explicitPairingToken = nil
         let connectionID = UUID()
         currentAttempt.withLock { $0 = connectionID }
         transportMode = isUSB ? "USB" : "WiFi"
@@ -389,6 +416,15 @@ final class ConnectionManager: ObservableObject {
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.reconnectAttempt = 0
                 self.hostInfo = info
+                if self.awaitingPairing {
+                    self.awaitingPairing = false
+                    self.pairingPrompt = nil
+                    self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                }
+                if PairingStore.valid(info.authToken) {
+                    do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
+                    catch { self.record(.warning, "pairing", "Pairing was not saved on this iPad. Pair again next time.") }
+                }
                 if isUSB { self.usbStatus = "USB: connected to \(info.hostName)" }
                 self.hostStreamConfig = info.streamConfig
                 self.record(
@@ -400,6 +436,22 @@ final class ConnectionManager: ObservableObject {
         channel.onRejected = { [weak self] status in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                if status == .unauthorized || status == .rateLimited {
+                    self.timeoutTask?.cancel()
+                    self.reconnectTask?.cancel()
+                    self.reconnectAttempt = 0
+                    self.didExtendTimeout = true
+                    if status == .unauthorized {
+                        do { try self.pairingStore.remove(address: pairingAddress) }
+                        catch { self.record(.warning, "pairing", "Could not clear an expired pairing on this iPad.") }
+                    }
+                    self.awaitingPairing = true
+                    let prompt = self.pairingPrompt ?? PairingSheetModel()
+                    prompt.reject(status)
+                    self.pairingPrompt = prompt
+                    self.record(.info, "pairing", status == .rateLimited ? "Pairing rate limited for 60 seconds" : "Pairing code required")
+                    return
+                }
                 switch status {
                 case .busy:
                     self.connectionError = "The host is busy with another device."
@@ -415,6 +467,10 @@ final class ConnectionManager: ObservableObject {
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                if self.awaitingPairing {
+                    self.pairingPrompt?.timedOut()
+                    return
+                }
                 if let receiver, receiver.legacyLookingDatagrams > 0 {
                     self.connectionError =
                         "The host is running v0.1.x — update EternalMonitor on the PC."
@@ -462,7 +518,8 @@ final class ConnectionManager: ObservableObject {
             featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
                 | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
             deviceId: DeviceIdentity.load(),
-            preferredFPS: UInt8(clamping: UserDefaults.standard.object(forKey: "targetFPS") as? Int ?? 60)
+            preferredFPS: UInt8(clamping: UserDefaults.standard.object(forKey: "targetFPS") as? Int ?? 60),
+            authToken: pairingToken
         )
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
             channel?.startHandshake(listenPort: actualPort, identity: identity)
@@ -741,6 +798,8 @@ final class ConnectionManager: ObservableObject {
     }
 
     func disconnect(reason: ByeReason = .userDisconnect) {
+        awaitingPairing = false
+        pairingPrompt = nil
         currentAttempt.withLock { $0 = nil }
         timeoutTask?.cancel()
         timeoutTask = nil

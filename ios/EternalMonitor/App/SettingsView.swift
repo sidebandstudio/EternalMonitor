@@ -114,6 +114,17 @@ struct SettingsView: View {
                     )
                 }
 
+                Section {
+                    Button("Forget paired hosts", role: .destructive) {
+                        connectionManager.forgetPairedHosts()
+                    }
+                    .accessibilityIdentifier("settings.forgetPairings")
+                } header: {
+                    sectionHeader("Pairing")
+                } footer: {
+                    footnote("Saved hosts will ask for a code on your next connection.")
+                }
+
                 // About
                 Section {
                     HStack {

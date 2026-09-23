@@ -17,6 +17,7 @@ final class ControlChannel {
         let livenessTimeoutMs: UInt16
         let streamConfig: StreamConfig
         let hostCaps: UInt16
+        let authToken: Data
     }
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
@@ -40,6 +41,7 @@ final class ControlChannel {
     private var msgSeq: UInt32 = 0
     private var clientNonce: UInt32 = 0
     private var helloBytes = Data()
+    private var helloTemplate: Hello2?
     private var helloAttempts = 0
     private var helloTimer: DispatchSourceTimer?
     private var reportTimer: DispatchSourceTimer?
@@ -91,6 +93,8 @@ final class ControlChannel {
         var featureCaps: UInt16 = 0
         var deviceId: UInt64 = 0
         var preferredFPS: UInt8 = 0
+        var authToken = Data(repeating: 0, count: 16)
+        var pairingCode: UInt32 = 0
     }
 
     /// Begin the HELLO2 retry loop. `listenPort` is the ephemeral local port
@@ -114,20 +118,40 @@ final class ControlChannel {
                 refreshHz: identity.refreshHz,
                 deviceName: identity.deviceName,
                 deviceId: identity.deviceId,
-                preferredFPS: identity.preferredFPS
+                preferredFPS: identity.preferredFPS,
+                authToken: identity.authToken,
+                pairingCode: identity.pairingCode
             )
+            helloTemplate = hello
             helloBytes = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(hello))
 
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(
-                deadline: .now(),
-                repeating: .milliseconds(Self.helloRetryMs)
-            )
-            timer.setEventHandler { [weak self] in self?.helloTick() }
-            helloTimer?.cancel()
-            helloTimer = timer
-            timer.resume()
+            startHelloTimer()
         }
+    }
+
+    /// Retry on the same socket with a fresh nonce. A rejected attempt's
+    /// delayed ACK cannot dismiss or accept the next code submission.
+    func retryPairing(code: UInt32) {
+        queue.async { [self] in
+            guard sessionId == 0, var hello = helloTemplate else { return }
+            clientNonce = UInt32.random(in: 1...UInt32.max)
+            hello.clientNonce = clientNonce
+            hello.authToken = Data(repeating: 0, count: 16)
+            hello.pairingCode = code
+            helloTemplate = hello
+            helloAttempts = 0
+            helloBytes = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(hello))
+            startHelloTimer()
+        }
+    }
+
+    private func startHelloTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(Self.helloRetryMs))
+        timer.setEventHandler { [weak self] in self?.helloTick() }
+        helloTimer?.cancel()
+        helloTimer = timer
+        timer.resume()
     }
 
     private func helloTick() {
@@ -187,7 +211,7 @@ final class ControlChannel {
     }
 
     private func handleAck(_ ack: HelloAck) {
-        guard ack.clientNonce == clientNonce else {
+        guard clientNonce != 0, ack.clientNonce == clientNonce else {
             onDiagnostic?("Ignored HELLO_ACK for a stale nonce")
             return
         }
@@ -195,6 +219,7 @@ final class ControlChannel {
         helloTimer = nil
 
         guard ack.status == .ok else {
+            clientNonce = 0
             onRejected?(ack.status)
             return
         }
@@ -213,7 +238,8 @@ final class ControlChannel {
             reportIntervalMs: ack.reportIntervalMs,
             livenessTimeoutMs: ack.livenessTimeoutMs,
             streamConfig: ack.streamConfig,
-            hostCaps: ack.hostCaps
+            hostCaps: ack.hostCaps,
+            authToken: ack.authToken
         ))
     }
 
@@ -312,6 +338,9 @@ final class ControlChannel {
             reportTimer = nil
             pingTimer?.cancel()
             pingTimer = nil
+            helloTemplate = nil
+            helloBytes = Data()
+            clientNonce = 0
             sessionId = 0
             hostCaps = 0
             estimator.reset()

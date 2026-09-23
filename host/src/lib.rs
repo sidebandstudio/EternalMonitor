@@ -11,6 +11,7 @@ pub mod encoder;
 pub mod gui;
 pub mod input;
 pub mod logging;
+pub mod pairing;
 pub mod pipeline;
 pub mod settings;
 pub mod stats;

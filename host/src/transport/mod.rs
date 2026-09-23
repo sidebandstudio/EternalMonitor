@@ -45,6 +45,10 @@ struct SharedConfigSource<'a> {
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
+    fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+        Some(&self.shared.pairing)
+    }
+
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
         let (width, height, software) = {
             let stats = PIPELINE_STATS.lock();
@@ -614,6 +618,7 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = client.local_addr().unwrap();
         let shared = SharedControl::new(host.port(), 15_000_000);
+        shared.pairing.lock().required = false;
         let config = SharedConfigSource {
             shared: &shared,
             stream_epoch: 1,
