@@ -51,5 +51,6 @@ foreach ($name in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {
 # Off by default — the host turns it on only while streaming to it (and only once an iPad
 # connects). Resolve + disable via the same toggle script so the logic stays in one place.
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$toggle" -Action disable | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'The virtual display could not be disabled after task registration.' }
 
 Write-Output "Registered EternalMonitor VDD tasks (device resolved at trigger time; left disabled)."

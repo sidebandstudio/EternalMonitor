@@ -72,6 +72,10 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+      - name: Test virtual display task scripts
+        shell: powershell
+        run: ./scripts/win/Test-VddToggle.ps1
+
   rust-macos:
     name: Rust (macOS, full workspace + E2E)
     runs-on: macos-15
