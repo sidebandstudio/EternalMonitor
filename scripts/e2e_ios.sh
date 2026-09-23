@@ -23,6 +23,7 @@ TIMEOUT_SECS="${EM_TIMEOUT:-120}"
 # session software-decodes it in the simulator.
 CODEC="${EM_CODEC:-h264}"
 TRANSPORT="${EM_TRANSPORT:-udp}"
+AUDIO="${EM_AUDIO:-0}"
 case "$TRANSPORT" in udp|usb|takeover) ;; *) echo "Invalid EM_TRANSPORT: $TRANSPORT" >&2; exit 2;; esac
 SIZE="${EM_SIZE:-640x360}"
 SYNTH_W="${SIZE%x*}"
@@ -184,10 +185,11 @@ HEVC_FLAG=0
 [ "$CODEC" = "hevc" ] && HEVC_FLAG=1
 if [ -z "$REMOTE_HOST" ]; then
 mkdir -p "$OUT/state/EternalMonitor"
-python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" <<'PY'
+python3 - "$OUT/state/EternalMonitor/settings.json" "${EM_BITRATE_MBPS:-15}" "$AUDIO" <<'PY'
 import json,sys
 with open(sys.argv[1], 'w') as f:
-    json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False), f)
+    json.dump(dict(bitrate_mbps=float(sys.argv[2]), target_fps=60, start_on_boot=False,
+                   stream_audio=sys.argv[3]=='1'), f)
 PY
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
 APPDATA="$OUT/state" \
@@ -195,6 +197,7 @@ ETERNAL_HEADLESS=1 \
 ETERNAL_E2E_LOG=1 \
 ETERNAL_USB_DIRECT="$USB_DIRECT" \
 ETERNAL_CAPTURE=synthetic \
+ETERNAL_AUDIO=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
 ETERNAL_HEVC="$HEVC_FLAG" \
@@ -220,7 +223,7 @@ echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
 LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES)
+    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES -playPCaudio "$AUDIO")
 APP_PID="${LAUNCH_RESULT##*: }"
 [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
 
@@ -305,6 +308,9 @@ python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json"
     --fps-gate "$FPS_GATE" \
     "${MEASUREMENT_ARGS[@]}" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
+if [ "$AUDIO" = 1 ]; then
+    python3 "$ROOT/scripts/e2e_audio_stats.py" "$MEASURED_LOG" --output "$OUT/result.json"
+fi
 echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
 echo "      $first_frame"
 echo "      $decoder_kind"

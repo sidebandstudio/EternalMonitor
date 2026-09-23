@@ -63,4 +63,9 @@ enum E2E {
             "E2E_STATS decoded=\(decoded) w=\(width) h=\(height) fps=\(Int(fps)) dropped=\(counters.framesDropped) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) monotonic_ms=\(monotonicMs) assembled=\(counters.framesComplete) decode_depth=\(decodeDepth)"
         )
     }
+
+    static func audio(_ stats: AudioStats) {
+        guard enabled else { return }
+        emit("E2E_AUDIO packets=\(stats.packets) decoded=\(stats.decoded) lost=\(stats.lost) buffer_ms=\(stats.bufferMs) rms=\(stats.rms) tone1k_db=\(stats.tone1kDB)")
+    }
 }

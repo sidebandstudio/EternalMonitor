@@ -11,12 +11,20 @@ settings:
     SWIFT_VERSION: "5.9"
     SWIFT_STRICT_CONCURRENCY: targeted
 
+packages:
+  Opus:
+    url: https://github.com/alta/swift-opus.git
+    revision: 6f3cb6bd3ffed1fe5f06d00a962d5c191a50daf8
+
 targets:
   EternalMonitor:
     type: application
     platform: iOS
     sources:
       - path: EternalMonitor
+    dependencies:
+      - package: Opus
+        product: Copus
     settings:
       base:
         INFOPLIST_FILE: EternalMonitor/Info.plist

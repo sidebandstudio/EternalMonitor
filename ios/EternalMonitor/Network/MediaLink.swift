@@ -34,6 +34,10 @@ extension MediaLink {
         get { datagrams.onDatagramIgnored }
         set { datagrams.onDatagramIgnored = newValue }
     }
+    var onAudioPacket: ((AudioHeader, Data) -> Void)? {
+        get { datagrams.onAudioPacket }
+        set { datagrams.onAudioPacket = newValue }
+    }
     func setAcceptedSessionId(_ id: UInt32) { datagrams.setAcceptedSessionId(id) }
     var legacyLookingDatagrams: Int { datagrams.legacyLookingDatagrams }
 }
@@ -43,6 +47,7 @@ final class MediaDatagrams {
     var onControlDatagram: ((Data) -> Void)?
     var onDatagramReceived: ((Int) -> Void)?
     var onDatagramIgnored: ((String) -> Void)?
+    var onAudioPacket: ((AudioHeader, Data) -> Void)?
     private let acceptedSessionId = OSAllocatedUnfairLock<UInt32>(initialState: 0)
     private let unknownDatagramCount = OSAllocatedUnfairLock<Int>(initialState: 0)
 
@@ -79,9 +84,10 @@ final class MediaDatagrams {
         case .control:
             onControlDatagram?(data)
         case .audio:
-            // Playback arrives in the audio-client phase. This client does
-            // not advertise WANTS_AUDIO yet.
-            break
+            guard let (header, payloadRange) = AudioHeader.decode(data) else { return }
+            let expected = acceptedSessionId.withLock { $0 }
+            guard expected != 0, header.sessionId == expected else { return }
+            onAudioPacket?(header, data.subdata(in: payloadRange))
         case .legacyHello:
             // The host never sends this; ignore.
             break

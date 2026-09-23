@@ -27,6 +27,9 @@ struct EternalMonitorApp: App {
                 .onChange(of: settings.allowUSB) { _, _ in
                     connectionManager.refreshUSBAvailability()
                 }
+                .onChange(of: settings.playPCaudio) { _, enabled in
+                    connectionManager.refreshAudioPreference(enabled)
+                }
         }
         .onChange(of: scenePhase) { _, phase in
             // A backgrounded app cannot keep receiving UDP; tell the host
