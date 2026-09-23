@@ -172,7 +172,10 @@ def main(args):
             raise ValueError("Only pattern supports virtual; only probe supports fullscreen")
         flag = ROOT + "\\" + action + ".stop"
         if args == ["stop"]:
-            ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
+            if action == "probe":
+                ps(script("Stop-Probe"))
+            else:
+                ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
         else:
             if action == "probe":
                 ps("if (Test-Path " + quote(ROOT + r"\input-probe.log") + ") { Remove-Item " + quote(ROOT + r"\input-probe.log") + " }")

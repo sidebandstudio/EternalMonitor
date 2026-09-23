@@ -19,18 +19,20 @@ if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString()
     throw 'The tracked host identity changed'
 }
 $deadline = (Get-Date).AddSeconds(15)
+$pidCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$p.Id)
 do {
-    $p.Refresh()
-    if ($p.MainWindowHandle -ne [IntPtr]::Zero) { break }
-    if ((Get-Date) -gt $deadline) { throw 'The tracked host has no GUI window' }
+    $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$pidCondition)
+    $window = @($windows | Where-Object { $_.Current.Name -eq 'EternalMonitor // SIGNAL' }) | Select-Object -First 1
+    if ($window) { break }
+    if ((Get-Date) -gt $deadline) { throw 'The tracked host has no EternalMonitor GUI window' }
     Start-Sleep -Milliseconds 100
 } while ($true)
-$window = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
-if ($window.Current.ProcessId -ne $p.Id) { throw 'Unexpected GUI process' }
-# Raise only our tracked window over our test pattern. No synthetic keyboard or
-# pointer input is used, and the session runner checks actual input idle first.
-if (![EMHostWindow]::SetWindowPos($p.MainWindowHandle,[IntPtr](-1),30,10,1100,1000,0x40)) { throw 'Could not raise the tracked host' }
-[void][EMHostWindow]::SetForegroundWindow($p.MainWindowHandle)
+$handle = [IntPtr]$window.Current.NativeWindowHandle
+if ($window.Current.ProcessId -ne $p.Id -or $handle -eq [IntPtr]::Zero) { throw 'Unexpected GUI process' }
+# The Rust process can own a console as well as its actual GUI window.
+# Raise only the named GUI belonging to the verified tracked process.
+if (![EMHostWindow]::SetWindowPos($handle,[IntPtr](-1),30,10,1100,1000,0x40)) { throw 'Could not raise the tracked host' }
+[void][EMHostWindow]::SetForegroundWindow($handle)
 function Invoke-HostControl([string]$Name) {
     $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
     $deadline = (Get-Date).AddSeconds(5)
@@ -45,8 +47,8 @@ function Invoke-HostControl([string]$Name) {
     elseif ($control.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$pattern)) { $pattern.Select() }
     else { throw "Host control cannot be invoked through UI Automation: $Name" }
 }
-Invoke-HostControl $(if ($View -eq 'Settings') { 'Settings' } else { 'Stream' })
-if ($View -eq 'QR') { Invoke-HostControl 'QR code' }
+Invoke-HostControl $(if ($View -eq 'Settings') { 'SETTINGS' } else { 'STREAM' })
+if ($View -eq 'QR') { Invoke-HostControl 'QR CODE' }
 Start-Sleep -Milliseconds 300
 $nodes = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
 $names = @($nodes | ForEach-Object { $_.Current.Name } | Where-Object { $_ })

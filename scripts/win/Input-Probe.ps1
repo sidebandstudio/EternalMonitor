@@ -29,6 +29,7 @@ public class EMInputProbe : Form {
     long frame = -1;
     bool armAttempted;
     bool focusClickSent, focusClickComplete;
+    bool logClosed;
     public EMInputProbe(int seconds, bool fullScreen) {
         Text = "EternalMonitor input probe";
         StartPosition = FormStartPosition.Manual;
@@ -51,7 +52,8 @@ public class EMInputProbe : Form {
         Shown += delegate {
             Activate(); Focus();
             Rectangle r = RectangleToScreen(ClientRectangle);
-            Write("Ready", new Dictionary<string,object> { {"pid",Process.GetCurrentProcess().Id}, {"x",r.X}, {"y",r.Y}, {"width",r.Width}, {"height",r.Height} });
+            Process process = Process.GetCurrentProcess();
+            Write("Ready", new Dictionary<string,object> { {"pid",process.Id}, {"path",process.MainModule.FileName}, {"start",process.StartTime.ToUniversalTime().Ticks.ToString()}, {"x",r.X}, {"y",r.Y}, {"width",r.Width}, {"height",r.Height} });
         };
         Deactivate += delegate {
             uint pid;
@@ -98,6 +100,7 @@ public class EMInputProbe : Form {
         timer.Start();
     }
     void Write(string kind, Dictionary<string,object> fields) {
+        if (logClosed) return;
         fields["event"] = kind;
         fields["elapsed_ms"] = clock.ElapsedMilliseconds;
         log.WriteLine(json.Serialize(fields));
@@ -134,7 +137,7 @@ public class EMInputProbe : Form {
     protected override void OnFormClosed(FormClosedEventArgs e) {
         timer.Stop(); timer.Dispose(); timeEndPeriod(1); SetThreadExecutionState(0x80000000);
         Write("Closed", new Dictionary<string,object>());
-        log.Dispose(); base.OnFormClosed(e);
+        logClosed = true; log.Dispose(); base.OnFormClosed(e);
     }
 }
 '@
