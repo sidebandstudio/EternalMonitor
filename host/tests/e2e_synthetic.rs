@@ -34,6 +34,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Surface the host's tracing in test output (best effort, once per process).
 fn init_test_tracing() {
+    // Never let a synthetic test claim a physically connected iPad. The USB
+    // test replaces this unreachable endpoint with its own loopback listener.
+    std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -424,12 +427,7 @@ fn audio_stream_end_to_end() {
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
     std::env::set_var("ETERNAL_AUDIO", "synthetic");
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
-    for name in [
-        "ETERNAL_DROP",
-        "ETERNAL_REORDER",
-        "ETERNAL_JITTER_MS",
-        "ETERNAL_USB_DIRECT",
-    ] {
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
         std::env::remove_var(name);
     }
     let listen_port = free_udp_port();
@@ -1606,7 +1604,6 @@ fn pairing_flow_end_to_end() {
         "ETERNAL_REORDER",
         "ETERNAL_JITTER_MS",
         "ETERNAL_FAULT_ENCODER_AFTER",
-        "ETERNAL_USB_DIRECT",
     ] {
         std::env::remove_var(name);
     }
@@ -1770,7 +1767,6 @@ fn preferred_fps_caps_the_host() {
         "ETERNAL_REORDER",
         "ETERNAL_JITTER_MS",
         "ETERNAL_FAULT_ENCODER_AFTER",
-        "ETERNAL_USB_DIRECT",
     ] {
         std::env::remove_var(name);
     }
