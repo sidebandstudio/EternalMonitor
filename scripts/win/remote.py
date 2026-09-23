@@ -10,6 +10,8 @@ import sys
 ROOT = r"D:\AgentWork\em-v030"
 REPO = r"D:\AgentWork\Eternal-Monitor"
 EVIDENCE = pathlib.Path(os.environ.get("EM_EVIDENCE_DIR", "/Users/aldo/Desktop/EternalMonitor-Handoff/evidence"))
+SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
 
 
 def quote(value):
@@ -19,7 +21,7 @@ def quote(value):
 def ps(command):
     encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
                                "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " + command).encode("utf-16-le")).decode()
-    subprocess.run(["ssh", "-o", "BatchMode=yes", "windows",
+    subprocess.run(["ssh", *SSH_OPTIONS, "windows",
                     "powershell -NoProfile -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + encoded], check=True)
 
 
@@ -43,7 +45,7 @@ def session(command, detach=False, idle=False, timeout=600, run_level="Highest")
 
 def pull(remote, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["scp", "windows:" + remote.replace("\\", "/"), str(destination)], check=True)
+    subprocess.run(["scp", *SSH_OPTIONS, "windows:" + remote.replace("\\", "/"), str(destination)], check=True)
     print(destination.resolve(), file=sys.stderr)
 
 
@@ -57,7 +59,7 @@ def main(args):
     elif action == "sync" and len(args) == 1:
         ps("New-Item -ItemType Directory -Force " + quote(ROOT + r"\scripts") + " | Out-Null")
         sources = sorted(pathlib.Path(__file__).parent.glob("*.ps1"))
-        subprocess.run(["scp", *map(str, sources), "windows:D:/AgentWork/em-v030/scripts/"], check=True)
+        subprocess.run(["scp", *SSH_OPTIONS, *map(str, sources), "windows:D:/AgentWork/em-v030/scripts/"], check=True)
         ps(script("Sync-Repo", "-Branch " + quote(args[0])))
     elif action == "build" and all(a == "--release" for a in args):
         ps(script("Build-Host", "-Test -Lint" + (" -Release" if args else "")))

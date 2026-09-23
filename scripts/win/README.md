@@ -5,6 +5,11 @@ files, and logs stay under `D:\AgentWork`. `remote.sh sync <branch>` copies
 the scripts and updates the clean PC checkout. It refuses to overwrite
 uncommitted work.
 
+SSH and file copies allow ten seconds to connect and detect an unresponsive
+connection with three ten-second keepalive intervals. A lost SSH connection
+does not prove that its remote command stopped. Check the tracked process and
+job status after reconnecting before starting another test.
+
 ```sh
 scripts/win/remote.sh sync v030/p7-verification
 scripts/win/remote.sh build --release
