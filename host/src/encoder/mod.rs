@@ -301,25 +301,17 @@ fn run_encode_loop(
         let current_bitrate = encoder.opened_bitrate;
         let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
 
-        let stride = encoder.bgra_frame.stride(0);
         let src_row_bytes = (raw_frame.width * 4) as usize;
-        let bgra_plane = encoder.bgra_frame.data_mut(0);
-        for y in 0..raw_frame.height as usize {
-            let src_offset = y * src_row_bytes;
-            let dst_offset = y * stride;
-            bgra_plane[dst_offset..dst_offset + src_row_bytes]
-                .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
-        }
-        // The encoder owns its copy now. Release capture's buffer before the
-        // codec or sender can block, so the next capture can recycle it.
-        drop(raw_frame.data);
-
         #[cfg(target_os = "macos")]
-        let converted = match encoder
-            .native_converter
-            .as_ref()
-            .map(|converter| converter.convert(&encoder.bgra_frame, &mut encoder.frame))
-        {
+        let converted = match encoder.native_converter.as_ref().map(|converter| {
+            converter.convert(
+                &raw_frame.data,
+                raw_frame.width,
+                raw_frame.height,
+                src_row_bytes,
+                &mut encoder.frame,
+            )
+        }) {
             Some(Ok(())) => true,
             Some(Err(error)) => {
                 warn!(%error, "Using swscale after native color conversion failed");
@@ -331,10 +323,21 @@ fn run_encode_loop(
         #[cfg(not(target_os = "macos"))]
         let converted = false;
         if !converted {
+            let stride = encoder.bgra_frame.stride(0);
+            let bgra_plane = encoder.bgra_frame.data_mut(0);
+            for y in 0..raw_frame.height as usize {
+                let src_offset = y * src_row_bytes;
+                let dst_offset = y * stride;
+                bgra_plane[dst_offset..dst_offset + src_row_bytes]
+                    .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
+            }
             encoder
                 .scaler
                 .run(&encoder.bgra_frame, &mut encoder.frame)?;
         }
+        // Conversion finished synchronously. Recycle capture's buffer before
+        // the codec or sender can block, including on the direct macOS path.
+        drop(raw_frame.data);
         let pts = if encoder.legacy_pts {
             raw_frame.frame_number as i64
         } else {
