@@ -13,8 +13,12 @@ SHOTS="$ROOT/build/screenshots/ui-$STAMP"
 LOG="$ROOT/build/ios-tests-$STAMP.log"
 mkdir -p "$ROOT/build" "$SHOTS"
 HOST_PID=""
+USB_HOST_PID=""
+USB_PROXY_PID=""
 cleanup() {
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
+    [ -n "$USB_HOST_PID" ] && kill "$USB_HOST_PID" 2>/dev/null || true
+    [ -n "$USB_PROXY_PID" ] && kill "$USB_PROXY_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 # Unit-only selections do not need a streaming host. The complete suite and
@@ -41,6 +45,13 @@ if [ "$NEED_STREAM" = 1 ]; then
         ETERNAL_DROP=0.03 ETERNAL_REORDER=0.01 \
         "$ROOT/target/release/eternal-host" 19875 > "$ROOT/build/ios-ui-host-$STAMP.log" 2>&1 &
     HOST_PID=$!
+    python3 "$ROOT/scripts/usb_proxy.py" --control-port 19874 > "$ROOT/build/ios-usb-proxy-$STAMP.log" 2>&1 &
+    USB_PROXY_PID=$!
+    APPDATA="$ROOT/build/ui-usb-state" ETERNAL_HEADLESS=1 ETERNAL_CAPTURE=synthetic \
+        ETERNAL_SYNTH_SIZE=640x360 ETERNAL_ENCODER=libx264 ETERNAL_FPS=60 \
+        ETERNAL_USB_DIRECT=127.0.0.1:19873 \
+        "$ROOT/target/release/eternal-host" 19877 > "$ROOT/build/ios-ui-usb-host-$STAMP.log" 2>&1 &
+    USB_HOST_PID=$!
 fi
 status=0
 xcodebuild test-without-building -project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonitor \

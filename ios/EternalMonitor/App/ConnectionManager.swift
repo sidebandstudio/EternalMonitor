@@ -5,6 +5,11 @@ import Combine
 import os
 import UIKit
 
+enum ConnectionTarget {
+    case udp(host: String, port: UInt16)
+    case usb(FramedLink)
+}
+
 enum ConnectionState: Equatable {
     case disconnected
     case connecting
@@ -40,16 +45,16 @@ private struct ConnectionDebugState {
 
     var timeoutSummary: String {
         if listenerReadyPort == nil {
-            return "UDP listener never became ready."
+            return "Receiver never became ready."
         }
         if helloAttempts == 0 {
             return "Listener came up, but HELLO registration never sent."
         }
         if datagramsReceived == 0 {
-            return "HELLO sent \(helloAttempts)x to \(host):\(port), but no UDP datagrams came back."
+            return "HELLO sent \(helloAttempts)x to \(host):\(port), but no datagrams came back."
         }
         if assembledFrames == 0 {
-            return "Received \(datagramsReceived) UDP datagrams (\(datagramBytesReceived) bytes), but no complete frame was reassembled."
+            return "Received \(datagramsReceived) datagrams (\(datagramBytesReceived) bytes), but no complete frame was reassembled."
         }
         if decodePackets == 0 {
             return "Reassembled \(assembledFrames) frame payloads, but none could be parsed as FramePacket."
@@ -86,13 +91,18 @@ final class ConnectionManager: ObservableObject {
     /// every heartbeat (so ABR bitrate changes and codec switches show up).
     @Published private(set) var hostStreamConfig: StreamConfig?
 
-    private var udpReceiver: UDPReceiver?
+    @Published private(set) var usbStatus = "USB: waiting for a cable"
+    private var mediaLink: (any MediaLink)?
+    private var usbListener: USBListener?
+    private var isForeground = true
+    private var usbPaused = false
+    private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
     private var videoDecoder: VideoDecoder?
     private var timeoutTask: Task<Void, Never>?
     private var statsFlushTask: Task<Void, Never>?
-    /// Hot-path counters written on the UDP queue and drained at 4 Hz — the
+    /// Hot-path counters written on the link queue and drained at 4 Hz — the
     /// old per-datagram MainActor Task (~2 per datagram, ~2,800 hops/s at
     /// 1080p60) throttled the whole receive path.
     private let streamCounters = StreamCounters()
@@ -118,6 +128,50 @@ final class ConnectionManager: ObservableObject {
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
+    func refreshUSBAvailability() {
+        let allowed = UserDefaults.standard.object(forKey: "allowUSB") as? Bool ?? true
+        guard allowed, isForeground, !usbPaused else {
+            usbListener?.stop()
+            usbListener = nil
+            usbStatus = allowed ? "USB: disconnected" : "USB: off"
+            if !allowed, mediaLink?.isUSB == true { beginReconnect(reason: "USB connections turned off") }
+            return
+        }
+        guard usbListener == nil else { return }
+        let listener = USBListener()
+        usbListener = listener
+        listener.onState = { [weak self, weak listener] state in
+            Task { @MainActor in
+                guard let self, let listener, self.usbListener === listener else { return }
+                if self.mediaLink?.isUSB == true { return }
+                switch state {
+                case .listening: self.usbStatus = "USB: waiting for a cable"
+                case .failed(let message): self.usbStatus = "USB: unavailable"; self.record(.warning, "usb", message)
+                case .stopped: self.usbStatus = "USB: disconnected"
+                }
+            }
+        }
+        listener.onAccepted = { [weak self, weak listener] link in
+            Task { @MainActor in
+                guard let self, let listener, self.usbListener === listener,
+                      self.isForeground, !self.usbPaused, self.mediaLink?.isUSB != true else { link.stop(); return }
+                self.reconnectTask?.cancel()
+                self.reconnectAttempt = 0
+                if self.state != .disconnected {
+                    E2E.linkSwitch(from: "udp", to: "usb")
+                    self.disconnect(reason: .superseded)
+                }
+                self.connect(target: .usb(link))
+            }
+        }
+        listener.start()
+    }
+
+    func resumeUSBConnections() {
+        usbPaused = false
+        refreshUSBAvailability()
+    }
+
     // MARK: - Frame slot (thread-safe single-slot)
 
     var latestFrame: CVPixelBuffer? {
@@ -135,13 +189,39 @@ final class ConnectionManager: ObservableObject {
     // MARK: - Connect / Disconnect
 
     func connect(host: String, port: UInt16) {
+        connect(target: .udp(host: host, port: port))
+    }
+
+    func connect(target: ConnectionTarget) {
         guard state == .disconnected else { return }
-        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedHost.isEmpty else { return }
+        let normalizedHost: String
+        let port: UInt16
+        let receiver: any MediaLink
+        switch target {
+        case .udp(let host, let targetPort):
+            normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedHost.isEmpty, targetPort != 0 else { return }
+            port = targetPort
+            receiver = UDPReceiver(port: port)
+            lastTarget = (normalizedHost, port)
+        case .usb(let link):
+            normalizedHost = "USB"
+            port = 9877
+            receiver = link
+            if lastTarget == nil, let host = UserDefaults.standard.string(forKey: "lastHost"), !host.isEmpty {
+                let savedPort = UserDefaults.standard.integer(forKey: "lastPort")
+                lastTarget = (host, UInt16(exactly: savedPort).flatMap { $0 == 0 ? nil : $0 } ?? 9876)
+            }
+        }
+        let isUSB = receiver.isUSB
+        let connectionID = UUID()
+        currentAttempt.withLock { $0 = connectionID }
+        transportMode = isUSB ? "USB" : "WiFi"
+        if isUSB { usbStatus = "USB: connecting" }
+        fpsCounter = FPSCounter()
 
         state = .connecting
         connectionError = nil
-        lastTarget = (normalizedHost, port)
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -156,16 +236,16 @@ final class ConnectionManager: ObservableObject {
         let decoder = VideoDecoder()
         let metrics = ReceiverMetrics()
         let assembler = FrameAssembler()
-        let receiver = UDPReceiver(port: port)
 
         assembler.onDiagnostic = { [weak self] message in
             Task { @MainActor in
-                self?.record(.warning, "assembly", message)
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, "assembly", message)
             }
         }
 
         decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
-            guard let self else { return }
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             // Store frame in lock-protected slot (no Sendable boundary crossed)
             self.frameSlot.set(pixelBuffer)
             // Capture only the scalars we need — avoids sending CVPixelBuffer across boundary
@@ -174,23 +254,25 @@ final class ConnectionManager: ObservableObject {
             let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
             let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
             Task { @MainActor in
+                guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
                     self.record(.info, "decode", "First frame decoded successfully")
                     self.timeoutTask?.cancel()
                     self.state = .connected
-                    self.transportMode = "WiFi"
+                    self.transportMode = isUSB ? "USB" : "WiFi"
                     // Streaming is a passive activity — keep the iPad from
                     // dimming mid-session unless the user opted out.
                     UIApplication.shared.isIdleTimerDisabled =
                         UserDefaults.standard.object(forKey: "keepScreenAwake") as? Bool ?? true
-                    E2E.firstFrame(width: frameWidth, height: frameHeight)
-                    RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
-                    // remember the last successfully-connected target so we
-                    // can pre-fill the IP field on next launch.
-                    UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
-                    UserDefaults.standard.set(Int(port), forKey: "lastPort")
+                    E2E.firstFrame(width: frameWidth, height: frameHeight, link: isUSB ? "usb" : "udp")
+                    RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
+                        port: port, isUSB: isUSB)
+                    if !isUSB {
+                        UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
+                        UserDefaults.standard.set(Int(port), forKey: "lastPort")
+                    }
                 }
                 self.fpsCounter.tick()
                 if E2E.enabled && self.debugState.decodedFrames % 60 == 0 {
@@ -218,7 +300,8 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        decoder.onNeedsKeyframe = { [weak controlChannelBox] in
+        decoder.onNeedsKeyframe = { [weak self, weak controlChannelBox] in
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             controlChannelBox?.value?.sendKeyframeRequest(
                 streamEpoch: 0, lastCompleteSeq: 0, reason: .decodeError
             )
@@ -226,12 +309,13 @@ final class ConnectionManager: ObservableObject {
 
         decoder.onEvent = { [weak self] message in
             Task { @MainActor in
-                self?.record(.info, "decode", message)
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.info, "decode", message)
             }
         }
 
         assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
-            guard let self else { return }
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(
@@ -263,24 +347,27 @@ final class ConnectionManager: ObservableObject {
         }
         channel.onHelloAttempt = { [weak self] attempt, total in
             Task { @MainActor in
-                self?.debugState.helloAttempts = attempt
-                self?.record(.info, "ctrl", "HELLO2 attempt \(attempt)/\(total) to \(normalizedHost):\(port)")
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.debugState.helloAttempts = attempt
+                self.record(.info, "ctrl", "HELLO2 attempt \(attempt)/\(total) to \(normalizedHost):\(port)")
             }
         }
         channel.onDiagnostic = { [weak self] message in
             Task { @MainActor in
-                self?.record(.info, "ctrl", message)
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.info, "ctrl", message)
             }
         }
         channel.onSessionEstablished = { [weak self, weak receiver, weak assembler] info in
-            assembler?.repairEnabled = info.hostCaps & HelloAck.hostCapNack != 0
+            assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.reconnectAttempt = 0
                 self.hostInfo = info
+                if isUSB { self.usbStatus = "USB: connected to \(info.hostName)" }
                 self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
@@ -290,7 +377,7 @@ final class ConnectionManager: ObservableObject {
         }
         channel.onRejected = { [weak self] status in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 switch status {
                 case .busy:
                     self.connectionError = "The host is busy with another device."
@@ -305,7 +392,7 @@ final class ConnectionManager: ObservableObject {
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 if let receiver, receiver.legacyLookingDatagrams > 0 {
                     self.connectionError =
                         "The host is running v0.1.x — update EternalMonitor on the PC."
@@ -318,7 +405,7 @@ final class ConnectionManager: ObservableObject {
         }
         channel.onBye = { [weak self] reason in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.connectionError = "The host ended the session."
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
                 self.disconnect()
@@ -327,68 +414,80 @@ final class ConnectionManager: ObservableObject {
         channel.onHeartbeat = { [weak self, weak assembler] heartbeat in
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, heartbeat.streamConfig.fps))
             Task { @MainActor in
-                self?.hostStreamConfig = heartbeat.streamConfig
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.hostStreamConfig = heartbeat.streamConfig
             }
         }
         channel.onStreamConfig = { [weak self, weak assembler] config in
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, config.fps))
             Task { @MainActor in
-                self?.hostStreamConfig = config
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.hostStreamConfig = config
             }
         }
 
         receiver.onControlDatagram = { [weak channel] data in
             channel?.handleControl(data)
         }
+        let identity = ControlChannel.ClientIdentity(
+            deviceName: UIDevice.current.name,
+            screenPxW: UInt16(clamping: Int(UIScreen.main.nativeBounds.width)),
+            screenPxH: UInt16(clamping: Int(UIScreen.main.nativeBounds.height)),
+            screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
+            screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
+            refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
+            decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
+            featureCaps: (wantsInput ? Hello2.featureWantsInput : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
+            deviceId: DeviceIdentity.load(),
+            preferredFPS: UInt8(clamping: UserDefaults.standard.object(forKey: "targetFPS") as? Int ?? 60)
+        )
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
-            channel?.startHandshake(
-                listenPort: actualPort,
-                identity: ControlChannel.ClientIdentity(
-                    deviceName: UIDevice.current.name,
-                    screenPxW: UInt16(clamping: Int(UIScreen.main.nativeBounds.width)),
-                    screenPxH: UInt16(clamping: Int(UIScreen.main.nativeBounds.height)),
-                    screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
-                    screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
-                    refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
-                    // VideoToolbox decodes HEVC on every supported iPad
-                    // (hardware on device, software in the simulator).
-                    decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
-                    featureCaps: (wantsInput ? Hello2.featureWantsInput : 0) | Hello2.featureSupportsNack
-                )
-            )
+            channel?.startHandshake(listenPort: actualPort, identity: identity)
             Task { @MainActor in
-                self?.debugState.listenerReadyPort = actualPort
-                self?.record(.info, "udp", "Socket ready on ephemeral port \(actualPort)")
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.debugState.listenerReadyPort = actualPort
+                self.record(.info, isUSB ? "usb" : "udp", isUSB ? "USB tunnel ready" : "Socket ready on ephemeral port \(actualPort)")
             }
         }
         receiver.onDatagramReceived = { [streamCounters] byteCount in
-            // UDP-queue side: just count. The 4 Hz flush loop below moves the
+            // Link-queue side: just count. The 4 Hz flush loop below moves the
             // totals onto the MainActor.
             streamCounters.recordDatagram(bytes: byteCount)
         }
         receiver.onDatagramIgnored = { [weak self] message in
             Task { @MainActor in
-                self?.record(.warning, "udp", message)
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, isUSB ? "usb" : "udp", message)
             }
         }
         receiver.onConnectionEstablished = { [weak self] in
             Task { @MainActor in
-                self?.record(.info, "udp", "Accepted UDP stream from selected host")
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.info, isUSB ? "usb" : "udp", "Accepted stream from selected host")
             }
         }
         receiver.onError = { [weak self] message in
             Task { @MainActor in
-                guard let self, self.state == .connecting else { return }
-                self.record(.error, "udp", message)
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                guard self.state == .connecting else { return }
+                self.record(.error, isUSB ? "usb" : "udp", message)
                 self.connectionError = message
-                self.disconnect()
+                if !isUSB { self.disconnect() }
+            }
+        }
+
+        receiver.onClosed = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                if isUSB { self.usbStatus = "USB: waiting for a cable" }
+                self.beginReconnect(reason: "USB disconnected")
             }
         }
 
         self.videoDecoder = decoder
         self.frameAssembler = assembler
         self.controlChannel = channel
-        self.udpReceiver = receiver
+        self.mediaLink = receiver
 
         guard receiver.start(host: normalizedHost) else {
             connectionError = "Failed to start the receiver."
@@ -425,9 +524,10 @@ final class ConnectionManager: ObservableObject {
                     self.debugState.decodePackets += snapshot.parsed
 
                     if firstDatagrams {
+                        let linkName = self.mediaLink?.isUSB == true ? "USB" : "UDP"
                         self.record(
-                            .info, "udp",
-                            "UDP data flowing (\(snapshot.datagrams) datagrams, \(snapshot.datagramBytes) bytes in first batch)"
+                            .info, linkName.lowercased(),
+                            "\(linkName) data flowing (\(snapshot.datagrams) datagrams, \(snapshot.datagramBytes) bytes in first batch)"
                         )
                         // Data is flowing — grant a fresh full window (once) so a slow/jittery
                         // network gets time to finish reassembly + decode instead of being cut
@@ -561,6 +661,12 @@ final class ConnectionManager: ObservableObject {
     }
 
     func cancel() {
+        if mediaLink?.isUSB == true {
+            usbPaused = true
+            usbListener?.stop()
+            usbListener = nil
+            usbStatus = "USB: disconnected"
+        }
         timeoutTask?.cancel()
         reconnectTask?.cancel()
         reconnectAttempt = 0
@@ -570,15 +676,20 @@ final class ConnectionManager: ObservableObject {
     /// The app is leaving the foreground: say goodbye so the host stops
     /// streaming promptly instead of waiting out its liveness window.
     func handleAppBackgrounded() {
+        isForeground = false
+        usbListener?.stop()
+        usbListener = nil
         guard state != .disconnected else { return }
         resumeOnForeground = true
-        controlChannel?.sendBye(.appBackground)
         record(.info, "ctrl", "App backgrounded — sent BYE and disconnected")
-        disconnect()
+        disconnect(reason: .appBackground)
     }
 
     /// Resume the session that backgrounding interrupted (opt-out toggle).
     func handleAppForegrounded() {
+        isForeground = true
+        usbPaused = false
+        refreshUSBAvailability()
         guard resumeOnForeground else { return }
         resumeOnForeground = false
         guard UserDefaults.standard.object(forKey: "autoResumeOnForeground") as? Bool ?? true,
@@ -589,25 +700,27 @@ final class ConnectionManager: ObservableObject {
         connect(host: target.host, port: target.port)
     }
 
-    func disconnect() {
+    func disconnect(reason: ByeReason = .userDisconnect) {
+        currentAttempt.withLock { $0 = nil }
         timeoutTask?.cancel()
         timeoutTask = nil
         statsFlushTask?.cancel()
         statsFlushTask = nil
-        _ = streamCounters.drain()
         didExtendTimeout = false
 
         // Say goodbye first (fire-and-forget), then stop the socket, then shut
         // the decoder down on its own queue (provably after any in-flight decode).
-        controlChannel?.sendBye(.userDisconnect)
+        controlChannel?.sendBye(reason)
         controlChannel?.stop()
-        udpReceiver?.stop()
+        mediaLink?.stop()
         videoDecoder?.shutdown()
         frameAssembler?.reset()
+        _ = streamCounters.drain()
 
         controlChannel = nil
         controlChannelBox.value = nil
-        udpReceiver = nil
+        mediaLink = nil
+        fpsCounter = FPSCounter()
         frameAssembler = nil
         videoDecoder = nil
 
@@ -659,7 +772,7 @@ final class ControlChannelBox: @unchecked Sendable {
 
 // MARK: - Hot-path stream counters
 
-/// Written from the UDP queue on every datagram/frame; drained by the
+/// Written from the link queue on every datagram/frame; drained by the
 /// MainActor flush loop. The unfair lock costs nanoseconds where a per-event
 /// `Task { @MainActor }` cost a scheduler hop.
 final class StreamCounters: @unchecked Sendable {
@@ -770,6 +883,9 @@ struct FPSCounter {
 // MARK: - Settings
 
 final class AppSettings: ObservableObject {
+    @Published var allowUSB: Bool {
+        didSet { UserDefaults.standard.set(allowUSB, forKey: "allowUSB") }
+    }
     @Published var showHUD: Bool {
         didSet { UserDefaults.standard.set(showHUD, forKey: "showHUD") }
     }
@@ -804,6 +920,7 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        self.allowUSB = defaults.object(forKey: "allowUSB") as? Bool ?? true
         self.showHUD = defaults.object(forKey: "showHUD") as? Bool ?? true
         self.keepScreenAwake = defaults.object(forKey: "keepScreenAwake") as? Bool ?? true
         self.autoResumeOnForeground =
@@ -821,7 +938,7 @@ final class AppSettings: ObservableObject {
 // MARK: - Recent connections persistence
 
 struct RecentConnection: Codable, Identifiable {
-    var id: String { "\(host):\(port)" }
+    var id: String { "\(isUSB ? "usb" : "udp")|\(host):\(port)" }
     let host: String
     let port: UInt16
     let lastUsed: Date
@@ -840,7 +957,7 @@ final class RecentConnectionStore: ObservableObject {
     }
 
     func add(host: String, port: UInt16, isUSB: Bool) {
-        connections.removeAll { $0.host == host && $0.port == port }
+        connections.removeAll { $0.host == host && $0.port == port && $0.isUSB == isUSB }
         connections.insert(
             RecentConnection(host: host, port: port, lastUsed: Date(), isUSB: isUSB),
             at: 0

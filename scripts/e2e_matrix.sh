@@ -80,7 +80,7 @@ if [ "$MODE" = --real ]; then
     host_started=1
     if EM_SCENARIO="$scenario" EM_OUTPUT_DIR="$OUT/$scenario" \
        EM_SCREENSHOT="$OUT/$scenario/simulator.png" EM_REMOTE_HOST=100.81.59.48 \
-       EM_PORT=19876 EM_SIZE=1920x1080 EM_SKIP_BUILD="$skip" EM_DURATION="$duration" \
+       EM_PORT=19876 EM_SIZE="${EM_SIZE:-1920x1080}" EM_SKIP_BUILD="$skip" EM_DURATION="$duration" \
        EM_REQUIRE_REPAIRS="$repairs" "$ROOT/scripts/e2e_ios.sh" > "$OUT/$scenario-run.log" 2>&1; then
         skip=1
         "$ROOT/scripts/win/remote.sh" log > "$OUT/$scenario/host.log"
@@ -115,12 +115,14 @@ PY
     done
 else
     skip=0
-    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd; do
-        codec=h264; size=640x360; drop=0; reorder=0; bitrate=15; idr=0; duration=5; repairs=0; backend=nw; abr=1
+    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover; do
+        codec=h264; size=640x360; drop=0; reorder=0; bitrate=15; idr=0; duration=5; repairs=0; backend=nw; transport=udp; abr=1
         case "$scenario" in
             hevc-udp) codec=hevc ;;
             h264-udp-loss3) drop=0.03; reorder=0.01; duration=20; repairs=1 ;;
             h264-udp-burst*) size=2560x1440; bitrate=40; idr=60; duration=20; abr=0 ;;
+            h264-usb) transport=usb ;;
+            usb-takeover) transport=takeover ;;
         esac
         [ "$scenario" != h264-udp-burst-bsd ] || backend=bsd
         rows+=("$OUT/$scenario/result.json")
@@ -128,6 +130,7 @@ else
         if ! EM_CODEC="$codec" EM_SCENARIO="$scenario" EM_SKIP_BUILD="$skip" \
              EM_OUTPUT_DIR="$OUT/$scenario" EM_SIZE="$size" EM_BITRATE_MBPS="$bitrate" \
              EM_UDP_BACKEND="$backend" EM_DURATION="$duration" EM_REQUIRE_REPAIRS="$repairs" \
+             EM_TRANSPORT="$transport" \
              ETERNAL_ABR="$abr" ETERNAL_DROP="$drop" ETERNAL_REORDER="$reorder" ETERNAL_FORCE_IDR_PERIOD="$idr" \
              "$ROOT/scripts/e2e_ios.sh" > "$OUT/$scenario-run.log" 2>&1; then
             failed=1

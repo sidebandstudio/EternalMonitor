@@ -7,7 +7,7 @@ import os
 /// ways. Binds an EPHEMERAL local port (advertised to the host in HELLO2);
 /// demuxes inbound traffic by the v2 wire prefix — media goes to the
 /// `FrameAssembler`, control to the `ControlChannel`.
-final class UDPReceiver {
+final class UDPReceiver: MediaLink {
     enum Backend: String {
         case bsd
         case networkFramework = "nw"
@@ -25,20 +25,11 @@ final class UDPReceiver {
 
     /// The host's control/media port we connect to.
     let port: UInt16
-    var assembler: FrameAssembler?
-    var onControlDatagram: ((Data) -> Void)?
+    let datagrams = MediaDatagrams()
+    var onClosed: (() -> Void)?
     var onConnectionEstablished: (() -> Void)?
     var onError: ((String) -> Void)?
     var onListenerReady: ((UInt16) -> Void)?
-    var onDatagramReceived: ((Int) -> Void)?
-    var onDatagramIgnored: ((String) -> Void)?
-
-    /// Media datagrams must carry this session id (set after HELLO_ACK);
-    /// 0 = no session yet, drop all media.
-    private let acceptedSessionId = OSAllocatedUnfairLock<UInt32>(initialState: 0)
-    /// Count of v1-shaped datagrams (legacy host detection): 16+ bytes that
-    /// classify as neither v2 nor the legacy hello.
-    private let unknownDatagramCount = OSAllocatedUnfairLock<Int>(initialState: 0)
 
     private var connection: NWConnection?
     private var socketFD: Int32 = -1
@@ -72,15 +63,6 @@ final class UDPReceiver {
             guard socketFD >= 0, getsockopt(socketFD, SOL_SOCKET, SO_RCVBUF, &size, &length) == 0 else { return 0 }
             return Int(size)
         }
-    }
-
-    func setAcceptedSessionId(_ id: UInt32) {
-        acceptedSessionId.withLock { $0 = id }
-    }
-
-    /// v1-shaped datagrams observed (used to tell "old host" apart from "no host").
-    var legacyLookingDatagrams: Int {
-        unknownDatagramCount.withLock { $0 }
     }
 
     /// Start the socket toward `host`. HELLO2 is the ControlChannel's job once
@@ -256,8 +238,7 @@ final class UDPReceiver {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
-        acceptedSessionId.withLock { $0 = 0 }
-        unknownDatagramCount.withLock { $0 = 0 }
+        datagrams.reset()
     }
 
     // MARK: - Receive loop
@@ -278,7 +259,7 @@ final class UDPReceiver {
                 onDatagramIgnored?("Dropped oversized datagram")
                 continue
             }
-            handleDatagram(Data(receiveBuffer.prefix(count)))
+            datagrams.handle(Data(receiveBuffer.prefix(count)))
         }
     }
 
@@ -313,7 +294,7 @@ final class UDPReceiver {
             }
 
             if let data = content {
-                self.handleDatagram(data)
+                self.datagrams.handle(data)
             }
 
             // Continue receiving
@@ -321,45 +302,4 @@ final class UDPReceiver {
         }
     }
 
-    private func handleDatagram(_ data: Data) {
-        switch Wire.classify(data) {
-        case .media:
-            onDatagramReceived?(data.count)
-            guard let (header, payloadRange) = MediaHeader.decode(data) else {
-                onDatagramIgnored?("Dropped malformed media datagram (\(data.count) bytes)")
-                return
-            }
-            let expected = acceptedSessionId.withLock { $0 }
-            guard header.sessionId == expected, expected != 0 else {
-                onDatagramIgnored?("Dropped media for foreign session \(header.sessionId)")
-                return
-            }
-            assembler?.addFragment(
-                seq: header.frameSeq,
-                index: header.fragIndex,
-                count: header.fragCount,
-                epoch: header.streamEpoch,
-                isKeyframe: header.isKeyframe,
-                captureTimestampUs: header.captureTimestampUs,
-                payload: data.subdata(in: payloadRange),
-                isRetransmit: header.isRetransmit
-            )
-        case .control:
-            onControlDatagram?(data)
-        case .audio:
-            // Playback is added in the audio-client phase. This client does
-            // not advertise WANTS_AUDIO yet, so no host should send it audio.
-            break
-        case .legacyHello:
-            // The host never sends this; ignore.
-            break
-        case .unknown:
-            if data.count >= 16 {
-                // Looks like v1 media from an old host — count it so the app
-                // can say "update the Windows host" instead of "no host found".
-                unknownDatagramCount.withLock { $0 += 1 }
-            }
-            onDatagramIgnored?("Ignored unrecognized datagram (\(data.count) bytes)")
-        }
-    }
 }
