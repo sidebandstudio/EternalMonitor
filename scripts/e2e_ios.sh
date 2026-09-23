@@ -49,6 +49,11 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$UDID" ] && xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
+    # The live log is a hard link into the app container. Detach the retained
+    # copy before another test launch truncates the simulator's log in place.
+    if [ -f "$APP_LOG" ]; then
+        cp "$APP_LOG" "$APP_LOG.snapshot" && mv "$APP_LOG.snapshot" "$APP_LOG" || status=1
+    fi
     [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
     [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
     if [ "$status" -ne 0 ]; then
