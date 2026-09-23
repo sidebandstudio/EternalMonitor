@@ -207,13 +207,21 @@ execute access to the SYSTEM enable/disable tasks, not a UAC prompt for every
 connection. Their ACL grants that access to BUILTIN\Users; the host reports the
 actual scheduler error. The normal-user desktop campaign must verify this fix.
 
-### Keep YUV420P until both hardware input-format gates pass
+### Keep YUV420P after the native input-format comparison
 
-Auto/BGRA is opt-in and checks the selected encoder's advertised formats. BGRA
-could remove a conversion copy, but it must match quadrant colors and run ten
-minutes on NVENC and AMF before becoming the default. Those runtime checks remain
-pending. Accelerate speeds up macOS synthetic testing without changing Windows
-hardware encoder configuration or the AMF normalization guards.
+Keep YUV420P as the default. On the reference Windows PC on 2026-09-23,
+NVIDIA H.264 accepted BGRA for 601.347 seconds at 58.27 decoded fps.
+The four quadrant mean channel errors against YUV420P were 0, 0, 0.33,
+and 1 out of 255, below the 12/255 limit.
+
+The pinned FFmpeg SDK's AMD H.264 encoder did not advertise BGRA or BGR0
+input. The explicit BGRA run therefore fell back to libx264 and failed the
+AMD hardware assertion. Its ten minutes of software streaming do not count
+as an AMD BGRA pass. AMD YUV420P passed at 58.50 decoded fps with no dropped
+frames, and the SDK decoded the captured 120-packet stream without errors.
+Auto and BGRA remain opt-in because the required native BGRA gate did not
+pass on both GPUs. Private campaign evidence is in
+`EternalMonitor-Handoff/evidence/windows-colors-a0823cc/`.
 
 ### Archive without credentials, upload only with signing configured
 

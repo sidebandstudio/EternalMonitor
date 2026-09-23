@@ -62,8 +62,10 @@ __COMMAND__
     $_ | Out-String | Add-Content "$job\out.txt"
     $code = 1
 } finally {
-    Stop-Transcript | Out-Null
+    # Record the completed command before flushing the diagnostic transcript.
+    # A slow transcript writer must not hide a successful host shutdown.
     $code | Set-Content "$job\exit.txt"
+    Stop-Transcript | Out-Null
     Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
 }
 exit $code
@@ -77,8 +79,26 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seco
 # Task Scheduler defaults to background priority 7. Interactive capture and
 # input must run at the same Normal priority as an app launched from Explorer.
 $settings.Priority = 4
-Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName $task
+try {
+    Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    if ($RunLevel -eq 'Limited') {
+        # Registration uses the elevated SSH token. Give only DELETE to the
+        # same user so its Limited worker can remove this temporary task.
+        # Retain every existing ACE; do not grant permission to edit the task.
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $registered = $service.GetFolder('\').GetTask($task)
+        $acl = [System.Security.AccessControl.RawSecurityDescriptor]::new($registered.GetSecurityDescriptor(4))
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $deleteAce = [System.Security.AccessControl.CommonAce]::new('None','AccessAllowed',0x10000,$sid,$false,$null)
+        $acl.DiscretionaryAcl.InsertAce($acl.DiscretionaryAcl.Count,$deleteAce)
+        $registered.SetSecurityDescriptor($acl.GetSddlForm('Access'),0x10)
+    }
+    Start-ScheduledTask -TaskName $task
+} catch {
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    throw
+}
 Write-Output "EM_JOB=$id"
 Write-Output "EM_PATH=$job"
 $startupDeadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSec,30))

@@ -74,7 +74,15 @@ jobs:
 
       - name: Test virtual display task scripts
         shell: powershell
-        run: ./scripts/win/Test-VddToggle.ps1
+        run: |
+          ./scripts/win/Test-VddToggle.ps1
+          ./scripts/win/Test-VddState.ps1
+      - name: Verify virtual display driver ownership on uninstall
+        shell: powershell
+        run: ./installer/tests/Test-VddDriverRemoval.ps1
+      - name: Verify virtual display driver binding checks
+        shell: powershell
+        run: ./installer/tests/Test-VddDriverVerification.ps1
 
   rust-macos:
     name: Rust (macOS, full workspace + E2E)

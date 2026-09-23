@@ -152,7 +152,10 @@ impl Pairing {
             });
         }
         if let Some(addr) = peer.addr {
-            if self.limiter.fail(addr.ip(), now) {
+            if self
+                .limiter
+                .fail(addr.ip(), FailedRequest::from(hello), now)
+            {
                 warn!(ip = %addr.ip(), "Pairing rate limited for 60 seconds");
                 return Err(HelloStatus::RateLimited);
             }
@@ -171,8 +174,25 @@ struct RateLimiter {
 
 struct Attempts {
     since: Instant,
-    failures: u8,
+    failures: Vec<FailedRequest>,
     blocked_until: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FailedRequest {
+    nonce: u32,
+    code: u32,
+    token: [u8; 16],
+}
+
+impl From<&Hello2> for FailedRequest {
+    fn from(hello: &Hello2) -> Self {
+        Self {
+            nonce: hello.client_nonce,
+            code: hello.pairing_code,
+            token: hello.auth_token,
+        }
+    }
 }
 
 impl Attempts {
@@ -204,11 +224,11 @@ impl RateLimiter {
             .is_some_and(|entry| entry.blocked(now))
     }
     /// True only when this failure starts a ban (one warning per ban).
-    fn fail(&mut self, ip: IpAddr, now: Instant) -> bool {
+    fn fail(&mut self, ip: IpAddr, request: FailedRequest, now: Instant) -> bool {
         self.prune(now);
         let fresh = || Attempts {
             since: now,
-            failures: 0,
+            failures: Vec::with_capacity(5),
             blocked_until: None,
         };
         let entry = if self.entries.contains_key(&ip) || self.entries.len() < MAX_IPS {
@@ -216,11 +236,14 @@ impl RateLimiter {
         } else {
             self.overflow.get_or_insert_with(fresh)
         };
-        if entry.blocked(now) {
+        if entry.blocked(now) || entry.failures.contains(&request) {
             return false;
         }
-        entry.failures += 1;
-        if entry.failures == 5 {
+        // HELLO retransmissions retain their nonce and credentials. Count
+        // each guess once, even when its rejection ACK was lost or delayed.
+        // Changing credentials with the same nonce remains a new guess.
+        entry.failures.push(request);
+        if entry.failures.len() == 5 {
             entry.blocked_until = Some(now + WINDOW);
             true
         } else {
@@ -232,6 +255,14 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guess(nonce: u32) -> FailedRequest {
+        FailedRequest {
+            nonce,
+            code: 0,
+            token: [0; 16],
+        }
+    }
 
     #[test]
     fn token_parser_and_generated_credentials() {
@@ -262,18 +293,22 @@ mod tests {
         let other = "192.0.2.2".parse().unwrap();
         let start = Instant::now();
         for second in 0..4 {
-            assert!(!limiter.fail(ip, start + Duration::from_secs(second)));
+            assert!(!limiter.fail(
+                ip,
+                guess(second as u32),
+                start + Duration::from_secs(second)
+            ));
         }
         assert!(!limiter.blocked(ip, start + Duration::from_secs(4)));
-        assert!(limiter.fail(ip, start + Duration::from_secs(4)));
+        assert!(limiter.fail(ip, guess(4), start + Duration::from_secs(4)));
         assert!(!limiter.blocked(other, start + Duration::from_secs(5)));
         assert!(limiter.blocked(ip, start + Duration::from_secs(63)));
-        assert!(!limiter.fail(ip, start + Duration::from_secs(63)));
+        assert!(!limiter.fail(ip, guess(5), start + Duration::from_secs(63)));
         assert!(!limiter.blocked(ip, start + Duration::from_secs(64)));
-        for _ in 0..4 {
-            assert!(!limiter.fail(ip, start + Duration::from_secs(64)));
+        for n in 0..4 {
+            assert!(!limiter.fail(ip, guess(n), start + Duration::from_secs(64)));
         }
-        assert!(limiter.fail(ip, start + Duration::from_secs(64)));
+        assert!(limiter.fail(ip, guess(4), start + Duration::from_secs(64)));
     }
 
     #[test]
@@ -281,11 +316,15 @@ mod tests {
         let mut limiter = RateLimiter::default();
         let start = Instant::now();
         let ip = "192.0.2.1".parse().unwrap();
-        for _ in 0..5 {
-            limiter.fail(ip, start);
+        for n in 0..5 {
+            limiter.fail(ip, guess(n), start);
         }
         for n in 0..1024 {
-            limiter.fail(IpAddr::V6(std::net::Ipv6Addr::from(n)), start);
+            limiter.fail(
+                IpAddr::V6(std::net::Ipv6Addr::from(n)),
+                guess(n as u32),
+                start,
+            );
         }
         assert_eq!(limiter.entries.len(), MAX_IPS);
         assert!(limiter.blocked(ip, start));
@@ -293,9 +332,9 @@ mod tests {
         let later = start + WINDOW;
         assert!(!limiter.blocked(ip, later));
         assert_eq!(limiter.entries.len(), 0);
-        for _ in 0..4 {
-            assert!(!limiter.fail(ip, later));
+        for n in 0..4 {
+            assert!(!limiter.fail(ip, guess(n), later));
         }
-        assert!(!limiter.fail(ip, later + WINDOW));
+        assert!(!limiter.fail(ip, guess(4), later + WINDOW));
     }
 }

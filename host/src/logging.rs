@@ -223,14 +223,32 @@ where
     }
 
     fn event_enabled(&self, event: &Event<'_>, _ctx: &Context<'_, S>) -> bool {
-        if event.metadata().target() != "mdns_sd" {
+        let target = event.metadata().target();
+        if target != "log" && target != "mdns_sd" && !target.starts_with("mdns_sd::") {
             return true;
         }
         let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
+        // mdns-sd uses the log facade. Its tracing events carry the original
+        // module in log.target rather than in the event's static metadata.
+        let target = visitor.log_target.as_deref().unwrap_or(target);
+        if target != "mdns_sd" && !target.starts_with("mdns_sd::") {
+            return true;
+        }
         let Some(message) = visitor.message else {
             return true;
         };
+        // mdns-sd 0.12.0's register_service emits this ERROR after a successful
+        // announcement, immediately before setting ServiceStatus::Announced.
+        // Our discovery module already logs registration. Keep actual errors.
+        if *event.metadata().level() == tracing::Level::ERROR
+            && message.starts_with("Announce service ")
+            && message
+                .rsplit_once(" on ")
+                .is_some_and(|(_, address)| address.parse::<std::net::IpAddr>().is_ok())
+        {
+            return false;
+        }
         // mdns-sd's send failure messages look like:
         //   "Failed to send to ... interface ..."
         // or in raw socket form contain a zone id like "%5". Bucket on either.
@@ -271,11 +289,15 @@ fn interface_bucket(message: &str) -> String {
 
 struct MessageVisitor {
     message: Option<String>,
+    log_target: Option<String>,
 }
 
 impl MessageVisitor {
     fn new() -> Self {
-        Self { message: None }
+        Self {
+            message: None,
+            log_target: None,
+        }
     }
 }
 
@@ -289,6 +311,8 @@ impl Visit for MessageVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" && self.message.is_none() {
             self.message = Some(value.to_string());
+        } else if field.name() == "log.target" {
+            self.log_target = Some(value.to_string());
         }
     }
 }
@@ -298,6 +322,46 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn mdns_success_announcements_do_not_hide_real_errors() {
+        use tracing_subscriber::prelude::*;
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+        };
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(MdnsDedupFilter::new()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            // The log-to-tracing bridge stores the original module in log.target.
+            tracing::error!(target: "log", { log.target = "mdns_sd::service_daemon" },
+                "Announce service Monitor._eternaldisplay._udp.local. on 10.0.0.1");
+            tracing::error!(target: "mdns_sd", "Announce service Monitor._eternaldisplay._udp.local. on ::1");
+            tracing::error!(target: "log", { log.target = "mdns_sd::service_daemon" }, "discovery socket failed");
+            tracing::error!(target: "mdns_sd", "Announce service failed on invalid interface");
+            tracing::error!(target: "another_crate", "Announce service Other._udp.local. on 10.0.0.2");
+            tracing::info!(target: "mdns_sd", "Announce service Info._udp.local. on 10.0.0.3");
+        });
+        let lines = shared.lock();
+        assert_eq!(lines.len(), 4, "unexpected filtered logs: {lines:?}");
+        for expected in [
+            "discovery socket failed",
+            "invalid interface",
+            "Other._udp.local.",
+            "Info._udp.local.",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "lost {expected}"
+            );
+        }
+    }
 
     struct BlockedOutput {
         entered: Option<mpsc::Sender<()>>,
