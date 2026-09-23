@@ -23,7 +23,7 @@ serde_json = "1"
 plist = "1"
 
 # mDNS service advertisement
-mdns-sd = "0.12"
+mdns-sd = "0.13.11"
 
 # Shared state
 parking_lot = "0.12"
