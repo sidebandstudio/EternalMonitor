@@ -190,8 +190,10 @@ mod windows_impl {
             ] {
                 let bytes = super::startup_command_bytes(OsStr::new(path));
                 let wide: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes(*b))
                     .collect();
                 let mut count = 0;
                 let args = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
