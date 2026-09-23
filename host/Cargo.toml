@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 eternal-wire = { path = "../proto" }
-ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tracing = "0.1"
@@ -40,6 +40,13 @@ version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",

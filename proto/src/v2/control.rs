@@ -38,6 +38,7 @@ pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
 pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
+pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
 
 /// [`StreamConfig::flags`] bits.
@@ -649,7 +650,7 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             },
             client_time_us: r.u64()?,
         }),
-        PacketType::Media | PacketType::MediaFec | PacketType::Error => {
+        PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
             return Err(WireError::InvalidField("packet_type"));
         }
     };

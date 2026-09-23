@@ -78,6 +78,10 @@ final class MediaDatagrams {
             )
         case .control:
             onControlDatagram?(data)
+        case .audio:
+            // Playback arrives in the audio-client phase. This client does
+            // not advertise WANTS_AUDIO yet.
+            break
         case .legacyHello:
             // The host never sends this; ignore.
             break

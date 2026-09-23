@@ -13,6 +13,7 @@ const HISTORY_LEN: usize = 300;
 
 pub struct PipelineStats {
     pub listen_addr: String,
+    pub audio: crate::audio::AudioStats,
 
     // Capture
     pub capture_fps: f64,
@@ -76,6 +77,7 @@ impl PipelineStats {
     pub fn new() -> Self {
         Self {
             listen_addr: String::new(),
+            audio: crate::audio::AudioStats::default(),
 
             capture_fps: 0.0,
             capture_resolution: (0, 0),

@@ -143,6 +143,17 @@ impl Session {
         })
     }
 
+    pub fn audio_session_id(&self) -> Option<u32> {
+        self.active
+            .as_ref()
+            .filter(|session| {
+                !session.awaiting_takeover
+                    && session.info.feature_caps & eternal_wire::v2::control::FEATURE_WANTS_AUDIO
+                        != 0
+            })
+            .map(|session| session.session_id)
+    }
+
     pub fn last_report(&self) -> Option<ReceiverReport> {
         self.active.as_ref().and_then(|s| s.last_report)
     }

@@ -35,12 +35,49 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 18,
+            Self.vectors.count, 20,
             "golden vector count drifted — update both test suites together"
         )
     }
 
     // MARK: Media
+
+    func testAudioPacketVector() throws { try assertAudioVector("audio_packet", discontinuity: false) }
+    func testAudioDiscontinuityVector() throws { try assertAudioVector("audio_discontinuity", discontinuity: true) }
+
+    private func assertAudioVector(_ name: String, discontinuity: Bool) throws {
+        let data = try vector(name)
+        XCTAssertEqual(Wire.PacketType.audio.rawValue, 0x03)
+        XCTAssertEqual(Wire.classify(data), .audio(flags: discontinuity ? 1 : 0))
+        let (header, payload) = try XCTUnwrap(AudioHeader.decode(data))
+        XCTAssertEqual(header, AudioHeader(sessionId: 0xA1B2_C3D4, streamEpoch: 7,
+            audioSeq: 12_345, captureTimestampUs: 0x0000_0123_4567_89AB, discontinuity: discontinuity))
+        XCTAssertEqual(Data(data[payload]), Data([0xF8, 0xFF, 0xFE]))
+        XCTAssertEqual(header.encode(payload: Data(data[payload])), data)
+        // Data slices need not start at index zero.
+        var offset = Data([0xAA]); offset.append(data)
+        XCTAssertEqual(AudioHeader.decode(offset.dropFirst())?.header, header)
+    }
+
+    func testAudioRejectsInvalidFieldsAndPayloadSizes() throws {
+        let good = try vector("audio_packet")
+        for start in [8, 12] {
+            var invalid = good
+            invalid.replaceSubrange(start..<start + 4, with: [0, 0, 0, 0])
+            XCTAssertNil(AudioHeader.decode(invalid))
+        }
+        var empty = Data(good.prefix(AudioHeader.size))
+        empty[6] = 0; empty[7] = 0
+        XCTAssertNil(AudioHeader.decode(empty))
+        let header = try XCTUnwrap(AudioHeader.decode(good)).header
+        XCTAssertNil(header.encode(payload: Data()))
+        XCTAssertNil(header.encode(payload: Data(repeating: 1, count: Wire.maxDatagramSize - AudioHeader.size + 1)))
+        let maximum = try XCTUnwrap(header.encode(payload: Data(repeating: 1, count: Wire.maxDatagramSize - AudioHeader.size)))
+        XCTAssertEqual(maximum.count, Wire.maxDatagramSize)
+        XCTAssertNotNil(AudioHeader.decode(maximum))
+        var wrongType = good; wrongType[3] = Wire.PacketType.media.rawValue
+        XCTAssertNil(AudioHeader.decode(wrongType))
+    }
 
     func testHello2V030VectorAndLegacyDefaults() throws {
         let data = try vector("hello2_v030")
@@ -306,6 +343,8 @@ final class WireProtocolGoldenTests: XCTestCase {
                         MediaHeader.decode(slice),
                         "\(name) truncated to \(length) bytes must not parse"
                     )
+                } else if name.hasPrefix("audio") {
+                    XCTAssertNil(AudioHeader.decode(slice), "\(name) truncated to \(length) bytes must not parse")
                 } else {
                     XCTAssertNil(
                         Wire.parseControl(slice),
@@ -342,6 +381,7 @@ final class WireProtocolGoldenTests: XCTestCase {
             _ = Wire.classify(data)
             _ = Wire.parseControl(data)
             _ = MediaHeader.decode(data)
+            _ = AudioHeader.decode(data)
         }
     }
 

@@ -25,6 +25,8 @@ pub struct SettingsFile {
     /// Off by default until verified on real encoder hardware.
     #[serde(default)]
     pub hevc_enabled: bool,
+    #[serde(default = "default_true")]
+    pub stream_audio: bool,
     /// Ask the virtual display driver to offer the connected iPad's native
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
@@ -50,6 +52,7 @@ impl Default for SettingsFile {
             encoder_override: None,
             capture_display: None,
             hevc_enabled: false,
+            stream_audio: true,
             vdd_match_resolution: true,
             start_on_boot: false,
         }
@@ -147,15 +150,26 @@ mod tests {
     #[test]
     fn old_settings_default_packet_size_and_new_settings_round_trip() {
         let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        assert!(
+            serde_json::from_str::<SettingsFile>(old)
+                .unwrap()
+                .stream_audio
+        );
         assert_eq!(
             serde_json::from_str::<SettingsFile>(old).unwrap().max_dgram,
             1400
         );
         let settings = SettingsFile {
             max_dgram: 1200,
+            stream_audio: false,
             ..Default::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !serde_json::from_str::<SettingsFile>(&json)
+                .unwrap()
+                .stream_audio
+        );
         assert_eq!(
             serde_json::from_str::<SettingsFile>(&json)
                 .unwrap()
