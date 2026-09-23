@@ -49,5 +49,20 @@ class ProbeTokenTests(unittest.TestCase):
             remote.main(['probe', 'start', 'fullscreen'])
         self.assertEqual(launch.call_args.kwargs['run_level'], 'Limited')
 
+class PatternDisplayTests(unittest.TestCase):
+    def test_pattern_follows_the_selected_capture_output(self):
+        name = r'\\.\DISPLAY2'
+        with patch.dict(os.environ, {'EM_CAPTURE_DISPLAY': name}, clear=True), \
+                patch.object(remote, 'session') as launch:
+            remote.main(['pattern', 'start'])
+        self.assertIn('-DisplayName ' + remote.quote(name), launch.call_args.args[0])
+
+    def test_virtual_capture_uses_the_dynamic_virtual_pattern_target(self):
+        with patch.dict(os.environ, {'EM_CAPTURE_DISPLAY': 'virtual'}, clear=True), \
+                patch.object(remote, 'session') as launch:
+            remote.main(['pattern', 'start'])
+        self.assertIn('-VirtualDisplay', launch.call_args.args[0])
+        self.assertNotIn('-DisplayName', launch.call_args.args[0])
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,4 @@
-param([int]$Seconds = 600, [switch]$VirtualDisplay)
+param([int]$Seconds = 600, [switch]$VirtualDisplay, [string]$DisplayName = '')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $source = @'
@@ -19,13 +19,24 @@ public class EMTestPattern : Form {
     readonly int seconds;
     readonly bool virtualDisplay;
     long frame = -1;
-    public EMTestPattern(int seconds, bool virtualDisplay) {
+    public EMTestPattern(int seconds, bool virtualDisplay, string displayName) {
         this.seconds = seconds;
         this.virtualDisplay = virtualDisplay;
         Text = "EternalMonitor test pattern";
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         Bounds = Screen.PrimaryScreen.Bounds;
+        if (!String.IsNullOrEmpty(displayName)) {
+            bool found = false;
+            foreach (var screen in Screen.AllScreens) {
+                if (String.Equals(screen.DeviceName, displayName, StringComparison.OrdinalIgnoreCase)) {
+                    Bounds = screen.Bounds;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) throw new InvalidOperationException("Test display is absent: " + displayName);
+        }
         TopMost = true;
         DoubleBuffered = true;
         KeyPreview = true;
@@ -81,5 +92,5 @@ if ([EMTestPattern]::SetThreadDpiAwarenessContext([IntPtr](-4)) -eq [IntPtr]::Ze
     throw "Could not enable per-monitor DPI awareness for the test pattern"
 }
 [Windows.Forms.Application]::EnableVisualStyles()
-$window = New-Object EMTestPattern $Seconds,([bool]$VirtualDisplay)
+$window = New-Object EMTestPattern $Seconds,([bool]$VirtualDisplay),$DisplayName
 try { [Windows.Forms.Application]::Run($window) } finally { $window.Dispose() }

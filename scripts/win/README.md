@@ -18,6 +18,12 @@ current primary display requires `EM_SIZE=3440x1440`. The VDD row uses the
 simulator's advertised size instead. The input row verifies the probe bounds
 against `EM_SIZE` before it starts a host that can inject input.
 
+For a stream check on another physical display, set `EM_CAPTURE_DISPLAY` to
+its exact DXGI name, such as `\\.\DISPLAY2`, and set `EM_SIZE` to that display's
+pixel size. The test pattern follows the same output. This lets the 1080p
+loss/burst checks run on the secondary screen without changing the primary.
+Keep the input row on the primary screen where its probe is placed.
+
 The session runner refuses an RDP or missing console session. Pattern,
 probe, and host runs require two minutes idle because host startup can
 change the virtual display. Screenshots can run while the console is active.

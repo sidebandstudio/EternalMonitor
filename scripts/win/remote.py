@@ -185,8 +185,14 @@ def main(args):
         else:
             if action == "probe":
                 ps("if (Test-Path " + quote(ROOT + r"\input-probe.log") + ") { Remove-Item " + quote(ROOT + r"\input-probe.log") + " }")
-            session(script("Pattern-Window" if action == "pattern" else "Input-Probe",
-                           "-Seconds 7200" + ((" -VirtualDisplay" if action == "pattern" else " -FullScreen") if len(args) == 2 else "")),
+            options = "-Seconds 7200"
+            if len(args) == 2:
+                options += " -VirtualDisplay" if action == "pattern" else " -FullScreen"
+            elif action == "pattern" and os.environ.get("EM_CAPTURE_DISPLAY") == "virtual":
+                options += " -VirtualDisplay"
+            elif action == "pattern" and os.environ.get("EM_CAPTURE_DISPLAY"):
+                options += " -DisplayName " + quote(os.environ["EM_CAPTURE_DISPLAY"])
+            session(script("Pattern-Window" if action == "pattern" else "Input-Probe", options),
                     detach=True, idle=True, timeout=7260,
                     run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
             if action == "probe":
