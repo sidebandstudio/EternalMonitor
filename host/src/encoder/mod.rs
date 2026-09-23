@@ -46,6 +46,8 @@ pub fn run_encode_stage(
     gpu: GpuInfo,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    crate::capture::timing::set_stream_qos();
     let result = run_encode_loop(frames, tx, shared, gpu, generation);
     if let Err(ref e) = result {
         error!(error = %e, "Encode loop exited with error");
