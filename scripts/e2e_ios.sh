@@ -33,6 +33,7 @@ OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
 SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
 REMOTE_HOST="${EM_REMOTE_HOST:-}"
 MIN_FPS="${EM_MIN_FPS:-55}"
+FPS_GATE="${EM_FPS_GATE:-enforce}"
 MIN_SECONDS="${EM_DURATION:-0}"
 STARTED=$SECONDS
 mkdir -p "$OUT" "$(dirname "$SHOT")"
@@ -231,7 +232,7 @@ echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
 LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES \
+    bounded 60 xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES \
         -playPCaudio "$AUDIO" -targetFPS "${EM_TARGET_FPS:-60}")
 APP_PID="${LAUNCH_RESULT##*: }"
 [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
@@ -268,7 +269,8 @@ decoded=0
 until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS"; do
     sleep 2
     elapsed=$((elapsed + 2))
-    decoded=$(grep -o 'decoded=[0-9]*' "$APP_LOG" | tail -1 | cut -d= -f2 || true)
+    # Audio milestones carry their own decoded= count; report video frames.
+    decoded=$(grep 'E2E_STATS' "$APP_LOG" | grep -o 'decoded=[0-9]*' | tail -1 | cut -d= -f2 || true)
     decoded=${decoded:-0}
     if [ "$elapsed" -ge "$TIMEOUT_SECS" ]; then
         echo "FAIL: only $decoded decoded frames after ${TIMEOUT_SECS}s"
@@ -276,8 +278,10 @@ until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --m
         echo "----- host log -----"; tail -30 "$HOST_LOG"
         # Collect only after failure so sampling cannot affect the measured row.
         # The launch result identifies this simulator app, never another test's app.
-        sample "$APP_PID" 3 10 -file "$OUT/app-stall-stacks.txt" > "$OUT/app-stall-sample.log" 2>&1 || true
-        xcrun simctl spawn "$UDID" log show --style compact --info --last 3m \
+        # With developer mode off, attaching waits on an authorization prompt
+        # that nobody can answer on a headless Mac.
+        bounded 30 sample "$APP_PID" 3 10 -file "$OUT/app-stall-stacks.txt" > "$OUT/app-stall-sample.log" 2>&1 || true
+        bounded 60 xcrun simctl spawn "$UDID" log show --style compact --info --last 3m \
             --predicate 'subsystem == "com.eternal.monitor"' > "$OUT/app-diagnostics.log" 2>&1 || true
         exit 1
     fi
@@ -331,6 +335,7 @@ fi
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
+    --fps-gate "$FPS_GATE" \
     "${MEASUREMENT_ARGS[@]}" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
 if [ "$AUDIO" = 1 ]; then
