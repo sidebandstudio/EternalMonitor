@@ -133,8 +133,10 @@ jobs:
 
   system-e2e:
     name: System E2E (simulator streaming)
-    # Measure the real encoder and client together on a fresh runner.
-    runs-on: macos-15
+    # The complete simulator plus both software codecs need the standard
+    # 14 GB macOS 15 runner. The 7 GB ARM image compresses gigabytes during
+    # this workload; ARM builds and unit/UI tests remain in the other jobs.
+    runs-on: macos-15-intel
     timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -162,7 +164,7 @@ jobs:
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           # This daemon forwards the simulator's live diagnostic stream and
-          # consumes a CPU on the three-core VM. Milestones are read directly
+          # competes with software encoding. Milestones are read directly
           # from the app's file mirror; host logs and screenshots stay enabled.
           xcrun simctl spawn "$UDID" launchctl bootout system/com.apple.diagnosticd
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
