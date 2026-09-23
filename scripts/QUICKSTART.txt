@@ -31,7 +31,7 @@ Keep the PC and iPad on the same local network, outside a guest network.
 In the iPad app, Scan for the PC or enter the address shown by the host
 (default port 9876). Enter the six-digit pairing code shown on the PC.
 Scanning the host QR instead carries its pairing token and skips code entry.
-The app remembers the host. Regenerate token on the PC to forget paired iPads.
+The app remembers the host. On the PC, Settings > Forget all iPads resets pairing.
 Pairing does not encrypt video, audio or input; use a network you trust.
 
 3. Connect by USB
@@ -47,9 +47,9 @@ this candidate; include the card's exact message in a failure report.
 
 4. Choose mirror or extended display
 -----------------------------------
-Connect first. On the PC, open Settings > Capture display and choose
-Extended display (iPad), then Restart stream. Drag windows into the new
-Windows display. To mirror again, choose Auto (primary) and restart.
+Connect first. On the PC's Stream page, set Display to Extended display
+(iPad), then click Restart now. Drag windows into the new Windows display.
+To mirror again, choose Main display (mirror) and restart.
 The virtual display should disappear on disconnect and host exit. If it
 cannot start, collect the host log and rerun the matching installer.
 
@@ -96,7 +96,7 @@ What to report
 --------------
 Record both versions, iPad model/iPadOS, Windows GPU and active codec,
 WiFi/USB, capture target, and what failed. Use Copy logs on the host's
-Stream tab. Session logs also live at:
+Performance page. Session logs also live at:
 %APPDATA%\EternalMonitor\logs\eternal-host-session.log
 Previous sessions are .1 and .2. Redact pairing tokens and QR codes before
 posting logs publicly. HARDWARE_VERIFICATION.md lists the remaining iPad
