@@ -121,7 +121,7 @@ struct DisplayView: View {
         let latency = connectionManager.stats.e2eMs.map { String(format: "%.0f milliseconds", $0) }
             ?? "unknown latency"
         return "Stream statistics: \(Int(connectionManager.fps)) frames per second, "
-            + "\(latency), \(connectionManager.stats.bars) of 4 signal bars"
+            + "\(latency), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars"
     }
 
     private var qualityBars: some View {
@@ -221,7 +221,7 @@ struct DisplayView: View {
             Spacer()
 
             Button {
-                connectionManager.disconnect()
+                connectionManager.cancel()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "stop.fill").font(.system(size: 10))

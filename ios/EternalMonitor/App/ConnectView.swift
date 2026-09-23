@@ -81,6 +81,21 @@ struct ConnectView: View {
                         }
                         .reveal(appeared, 4)
 
+                        HStack(spacing: 10) {
+                            Image(systemName: "cable.connector")
+                                .foregroundColor(Theme.amber)
+                            Text(connectionManager.usbStatus)
+                                .font(.appMonoRegular(size: 12))
+                                .foregroundColor(Theme.text2)
+                                .accessibilityIdentifier("connect.usbStatus")
+                            Spacer()
+                            if settings.allowUSB && connectionManager.usbStatus == "USB: disconnected" {
+                                Button("Connect USB") { connectionManager.resumeUSBConnections() }
+                                    .font(.appMonoMedium(size: 12))
+                                    .accessibilityIdentifier("connect.usb")
+                            }
+                        }
+
                         if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
                             scanEmptyState
                         }
@@ -574,15 +589,19 @@ struct ConnectView: View {
 
             ForEach(recentStore.connections) { conn in
                 Button {
-                    hostIP = conn.host
-                    port = "\(conn.port)"
+                    if conn.isUSB {
+                        connectionManager.resumeUSBConnections()
+                    } else {
+                        hostIP = conn.host
+                        port = "\(conn.port)"
+                    }
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(conn.host)
                                 .font(.appMonoRegular(size: 15))
                                 .foregroundColor(Theme.text)
-                            Text(":\(String(conn.port))")
+                            Text(conn.isUSB ? "Connect with a USB cable" : ":\(String(conn.port))")
                                 .font(.appMonoRegular(size: 12))
                                 .foregroundColor(Theme.text3)
                         }

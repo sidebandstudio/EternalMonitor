@@ -44,9 +44,16 @@ enum E2E {
         return host.isEmpty ? nil : (host, port)
     }
 
-    static func firstFrame(width: Int, height: Int) {
+    static func firstFrame(width: Int, height: Int, link: String = "udp") {
         guard enabled else { return }
-        emit("E2E_FIRST_FRAME w=\(width) h=\(height)")
+        let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        emit("E2E_FIRST_FRAME w=\(width) h=\(height) link=\(link) monotonic_ms=\(monotonicMs)")
+    }
+
+    static func linkSwitch(from: String, to: String) {
+        guard enabled else { return }
+        let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        emit("E2E_LINK_SWITCH from=\(from) to=\(to) monotonic_ms=\(monotonicMs)")
     }
 
     static func stats(decoded: Int, width: Int, height: Int, fps: Double, counters: FrameAssembler.Counters, decodeDepth: UInt8 = 0) {

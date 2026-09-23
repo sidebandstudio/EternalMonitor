@@ -17,11 +17,15 @@ struct EternalMonitorApp: App {
                 .environmentObject(settings)
                 .preferredColorScheme(.dark)
                 .onAppear {
+                    connectionManager.refreshUSBAvailability()
                     // Automated end-to-end harness: EM_AUTOCONNECT=host:port
                     // connects immediately, bypassing the connect screen.
                     if let target = E2E.autoconnectTarget {
                         connectionManager.connect(host: target.host, port: target.port)
                     }
+                }
+                .onChange(of: settings.allowUSB) { _, _ in
+                    connectionManager.refreshUSBAvailability()
                 }
         }
         .onChange(of: scenePhase) { _, phase in

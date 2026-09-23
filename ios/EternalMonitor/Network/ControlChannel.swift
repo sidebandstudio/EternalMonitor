@@ -89,6 +89,8 @@ final class ControlChannel {
         var refreshHz: UInt8
         var decoderCaps: UInt16 = Hello2.capDecodeH264
         var featureCaps: UInt16 = 0
+        var deviceId: UInt64 = 0
+        var preferredFPS: UInt8 = 0
     }
 
     /// Begin the HELLO2 retry loop. `listenPort` is the ephemeral local port
@@ -110,7 +112,9 @@ final class ControlChannel {
                 screenPtW: identity.screenPtW,
                 screenPtH: identity.screenPtH,
                 refreshHz: identity.refreshHz,
-                deviceName: identity.deviceName
+                deviceName: identity.deviceName,
+                deviceId: identity.deviceId,
+                preferredFPS: identity.preferredFPS
             )
             helloBytes = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(hello))
 

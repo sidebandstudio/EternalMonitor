@@ -22,10 +22,12 @@ TIMEOUT_SECS="${EM_TIMEOUT:-120}"
 # (ETERNAL_HEVC=1 → libx265 via the variant table) and the app's VideoToolbox
 # session software-decodes it in the simulator.
 CODEC="${EM_CODEC:-h264}"
+TRANSPORT="${EM_TRANSPORT:-udp}"
+case "$TRANSPORT" in udp|usb|takeover) ;; *) echo "Invalid EM_TRANSPORT: $TRANSPORT" >&2; exit 2;; esac
 SIZE="${EM_SIZE:-640x360}"
 SYNTH_W="${SIZE%x*}"
 SYNTH_H="${SIZE#*x}"
-SCENARIO="${EM_SCENARIO:-$CODEC-udp}"
+SCENARIO="${EM_SCENARIO:-$CODEC-$TRANSPORT}"
 OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
 SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
 REMOTE_HOST="${EM_REMOTE_HOST:-}"
@@ -40,6 +42,7 @@ rm -f "$OUT/result.json"
 
 HOST_PID=""
 MONITOR_PID=""
+PROXY_PID=""
 PROFILE_PID=""
 APP_PID=""
 UDID=""
@@ -83,6 +86,7 @@ cleanup() {
     [ -n "$PROFILE_PID" ] && wait "$PROFILE_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
+    [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
     [ -n "$UDID" ] && stop_app
     # The live log is a hard link into the app container. Detach the retained
     # copy before another test launch truncates the simulator's log in place.
@@ -139,6 +143,15 @@ APP="$ROOT/ios/build/e2e/Build/Products/Release-iphonesimulator/EternalMonitor.a
 
 "$ROOT/scripts/pixels.sh" --prepare
 CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
+USB_DIRECT=""
+MEASURE_LINK=udp
+AUTOCONNECT="$CONNECT_HOST:$PORT"
+case "$TRANSPORT" in
+    usb) USB_DIRECT=127.0.0.1:9877; MEASURE_LINK=usb; AUTOCONNECT="" ;;
+    takeover) USB_DIRECT=127.0.0.1:19873; MEASURE_LINK=usb ;;
+esac
+MEASUREMENT_ARGS=(--link "$MEASURE_LINK")
+if [ "$TRANSPORT" = takeover ]; then MEASUREMENT_ARGS+=(--max-switch-ms 1000); fi
 
 echo "==> Booting simulator: $SIM_NAME"
 
@@ -180,6 +193,7 @@ echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, cod
 APPDATA="$OUT/state" \
 ETERNAL_HEADLESS=1 \
 ETERNAL_E2E_LOG=1 \
+ETERNAL_USB_DIRECT="$USB_DIRECT" \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
@@ -202,13 +216,25 @@ with open(sys.argv[1], 'w') as out:
 PY
 MONITOR_PID=$!
 
-echo "==> Launching app with EM_AUTOCONNECT=$CONNECT_HOST:$PORT"
-LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$CONNECT_HOST:$PORT" \
+echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
+LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor)
+    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES)
 APP_PID="${LAUNCH_RESULT##*: }"
 [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
+
+if [ "$TRANSPORT" = takeover ]; then
+    echo "==> Waiting for WiFi frames before attaching the USB fixture"
+    elapsed=0
+    until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link udp --min-frames 120; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        [ "$elapsed" -lt "$TIMEOUT_SECS" ] || { echo "FAIL: initial WiFi stream missing"; exit 1; }
+    done
+    python3 "$ROOT/scripts/usb_proxy.py" > "$OUT/usb-proxy.log" 2>&1 &
+    PROXY_PID=$!
+fi
 
 # Optional bounded stack sampling for throughput investigations. The sampler
 # targets only this row's host and records stacks, never process arguments.
@@ -220,7 +246,7 @@ fi
 echo "==> Waiting for $WANT_DECODED decoded frames (timeout ${TIMEOUT_SECS}s)"
 elapsed=0
 decoded=0
-until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS"; do
+until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS"; do
     sleep 2
     elapsed=$((elapsed + 2))
     decoded=$(grep -o 'decoded=[0-9]*' "$APP_LOG" | tail -1 | cut -d= -f2 || true)
@@ -238,9 +264,15 @@ done
 MEASURED_LOG="$OUT/measured.log"
 cp "$APP_LOG" "$MEASURED_LOG"
 
-first_frame=$(grep -m1 'E2E_FIRST_FRAME' "$MEASURED_LOG" || true)
+first_frame=$(grep 'E2E_FIRST_FRAME' "$MEASURED_LOG" | grep -m1 "link=$MEASURE_LINK" || true)
 decoder_kind=$(grep -m1 'E2E_DECODER' "$MEASURED_LOG" || true)
 last_stats=$(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)
+if [ -z "$first_frame" ]; then
+    echo "FAIL: no first frame on $MEASURE_LINK"; exit 1
+fi
+if [ "$TRANSPORT" = takeover ] && ! grep -q 'superseding session in place' "$HOST_LOG"; then
+    echo "FAIL: host did not preserve the session during USB takeover"; exit 1
+fi
 
 if ! grep -q "w=$SYNTH_W h=$SYNTH_H" <<<"$last_stats"; then
     echo "FAIL: decoded resolution mismatch: $last_stats (expected ${SYNTH_W}x${SYNTH_H})"
@@ -271,6 +303,7 @@ python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json"
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \
     --fps-gate "$FPS_GATE" \
+    "${MEASUREMENT_ARGS[@]}" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
 echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
 echo "      $first_frame"
