@@ -125,13 +125,26 @@ final class FramedLink: MediaLink {
         }
     }
 
-    func stop() { onQueue { stopOnQueue() } }
+    func stop() { onQueue { stopOnQueue(flush: true) } }
 
-    private func stopOnQueue() {
+    private func stopOnQueue(flush: Bool = false) {
         preambleDeadline?.cancel()
         preambleDeadline = nil
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
+        if let closing = connection {
+            closing.stateUpdateHandler = nil
+            if flush {
+                // The active send is already queued in Network.framework.
+                // Append our bounded control queue and BYE before write-close.
+                for packet in pendingSends {
+                    closing.send(content: packet, completion: .contentProcessed { _ in })
+                }
+                closing.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                    completion: .contentProcessed { _ in closing.cancel() })
+                queue.asyncAfter(deadline: .now() + .milliseconds(250)) { closing.cancel() }
+            } else {
+                closing.cancel()
+            }
+        }
         connection = nil
         bufferedPackets.removeAll()
         pendingSends.removeAll()
