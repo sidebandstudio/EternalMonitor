@@ -151,6 +151,22 @@ multi-monitor and virtual-display layouts land clicks on the right screen.
   upstream starts signing.) The installer's SHA-256 is published in the
   release body, where the website reads it.
 
+## Encoder input default for v0.3.0
+
+Keep YUV420P as the default. On the reference Windows PC on 2026-09-23,
+NVIDIA H.264 accepted BGRA for 601.347 seconds at 58.27 decoded fps.
+The four quadrant mean channel errors against YUV420P were 0, 0, 0.33,
+and 1 out of 255, below the 12/255 limit.
+
+The pinned FFmpeg SDK's AMD H.264 encoder did not advertise BGRA or BGR0
+input. The explicit BGRA run therefore fell back to libx264 and failed the
+AMD hardware assertion. Its ten minutes of software streaming do not count
+as an AMD BGRA pass. AMD YUV420P passed at 58.50 decoded fps with no dropped
+frames, and the SDK decoded the captured 120-packet stream without errors.
+Auto and BGRA remain opt-in because the required native BGRA gate did not
+pass on both GPUs. Private campaign evidence is in
+`EternalMonitor-Handoff/evidence/windows-colors-a0823cc/`.
+
 ## Deferred
 
 - Audio (a WASAPI → Opus → AVAudioEngine sketch exists; wire types are

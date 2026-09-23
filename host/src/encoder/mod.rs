@@ -884,13 +884,17 @@ struct HevcBitstreamCapture {
 
 impl HevcBitstreamCapture {
     fn for_encoder(name: &str) -> Option<Self> {
-        if !is_amf_encoder(name)
-            || !is_hevc_encoder(name)
-            || !std::env::var("ETERNAL_AMF_DIAG").is_ok_and(|v| v.trim() == "1")
-        {
+        Self::open_for_encoder(
+            name,
+            std::env::var("ETERNAL_AMF_DIAG").is_ok_and(|v| v.trim() == "1"),
+            diagnostic_dir().join("amf-first-120-packets.hevc"),
+        )
+    }
+
+    fn open_for_encoder(name: &str, enabled: bool, path: PathBuf) -> Option<Self> {
+        if name != "hevc_amf" || !enabled {
             return None;
         }
-        let path = diagnostic_dir().join("amf-first-120-packets.hevc");
         let opened = fs::create_dir_all(path.parent().unwrap()).and_then(|()| File::create(&path));
         match opened {
             Ok(file) => {
@@ -930,6 +934,25 @@ impl HevcBitstreamCapture {
 #[cfg(test)]
 mod hevc_capture_tests {
     use super::*;
+
+    #[test]
+    fn opted_in_hevc_amf_creates_capture_and_other_encoders_do_not() {
+        let path = std::env::temp_dir().join(format!("em-hevc-select-{}.bin", std::process::id()));
+        for (name, enabled) in [
+            ("hevc_amf", false),
+            ("h264_amf", true),
+            ("hevc_nvenc", true),
+        ] {
+            assert!(HevcBitstreamCapture::open_for_encoder(name, enabled, path.clone()).is_none());
+            assert!(!path.exists());
+        }
+        let mut capture = HevcBitstreamCapture::open_for_encoder("hevc_amf", true, path.clone())
+            .expect("opted-in AMD HEVC must create its diagnostic capture");
+        capture.observe(&[1, 2, 3], true).unwrap();
+        drop(capture);
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3]);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn capture_starts_at_a_keyframe_and_closes_at_the_packet_limit() {

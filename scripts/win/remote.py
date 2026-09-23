@@ -17,7 +17,8 @@ def quote(value):
 
 
 def ps(command):
-    encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + command).encode("utf-16-le")).decode()
+    encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+                               "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " + command).encode("utf-16-le")).decode()
     subprocess.run(["ssh", "-o", "BatchMode=yes", "windows",
                     "powershell -NoProfile -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + encoded], check=True)
 
@@ -33,7 +34,9 @@ def session(command, detach=False, idle=False, timeout=600, run_level="Highest")
     options += " -RunLevel " + run_level
     if detach:
         options += " -Detach"
-    if idle:
+    # Set only for a test window the user explicitly says is free. Keep the
+    # idle guard for unattended runs and never persist this on the PC.
+    if idle and os.environ.get("EM_PC_AVAILABLE") != "1":
         options += " -RequireIdle"
     ps(script("Invoke-InSession", options))
 
@@ -83,8 +86,9 @@ def main(args):
         command += "; $env:PATH=" + quote(r"D:\AgentWork\sdk\ffmpeg-7.1.1-full_build-shared\bin;") + "+$env:PATH"
         executable = REPO + r"\target\release\eternal-host.exe"
         if os.environ.get("EM_INSTALLED_HOST") == "1":
-            executable = ROOT + r"\installed\EternalMonitor-host.exe"
-        command += "; $p=Start-Process -PassThru -NoNewWindow -FilePath " + quote(executable)
+            executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
+        window_option = "-WindowStyle Hidden" if environment["ETERNAL_HEADLESS"] == "1" else "-NoNewWindow"
+        command += "; $p=Start-Process -PassThru " + window_option + " -FilePath " + quote(executable)
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
@@ -123,9 +127,9 @@ def main(args):
         session(script("Take-Screenshot", "-Path " + quote(remote)))
         pull(remote, EVIDENCE / "windows" / (args[0] + ".png"))
     elif action == "log" and (not args or (len(args) == 2 and args[0] == "-n" and args[1].isdigit())):
-        ps("Get-Content " + quote(ROOT + r"\host.log") + (" -Tail " + args[1] if args else ""))
+        ps("Get-Content " + quote(ROOT + r"\host.log") + " -Encoding UTF8" + (" -Tail " + args[1] if args else ""))
     elif action == "stderr" and not args:
-        ps("Get-Content " + quote(ROOT + r"\host.stderr.log"))
+        ps("Get-Content " + quote(ROOT + r"\host.stderr.log") + " -Encoding UTF8")
     elif action == "gui" and len(args) in (2, 3) and args[0] in ("Stream", "Settings", "QR"):
         if len(args) == 3 and args[2] != '--connected':
             raise ValueError('The optional GUI flag is --connected')
@@ -135,6 +139,12 @@ def main(args):
         session(script("Inspect-Host", "-View " + quote(args[0]) + " -Path " + quote(remote_path) +
                        (" -Connected" if len(args) == 3 else "")), idle=True)
         pull(remote_path, EVIDENCE / "windows" / (args[1] + ".png"))
+    elif action == "autostart" and len(args) == 1:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", args[0]):
+            raise ValueError('Autostart evidence name is invalid')
+        remote_path = ROOT + "\\shots\\" + args[0] + ".png"
+        session(script('Inspect-Host', '-View Settings -TestAutostart -Path ' + quote(remote_path)), idle=True)
+        pull(remote_path, EVIDENCE / 'windows' / (args[0] + '.png'))
     elif action == "diagnostic" and len(args) == 2 and args[0] in ("h264", "hevc"):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args[1]):
             raise ValueError("Diagnostic row name is invalid")
@@ -151,18 +161,40 @@ def main(args):
         ps("$line=Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1; "
            "$info=$line | ConvertFrom-Json; if ($info.event -ne 'Ready') { throw 'Probe is not ready' }; "
            "Get-Process -Id $info.pid -ErrorAction Stop | Out-Null; Write-Output $line")
+    elif action == "probe-arm" and not args:
+        # The host's startup console and VDD task can take focus. Arm only
+        # after capture opens; no test input runs until the probe confirms focus.
+        log = quote(ROOT + r"\input-probe.log")
+        ps("$deadline=(Get-Date).AddSeconds(30); while (!(Select-String -Path " +
+           quote(ROOT + r"\host.log") + " -Pattern 'Desktop duplication active' -Quiet)) { "
+           "if ((Get-Date) -gt $deadline) { throw 'Capture did not open before input arming' }; Start-Sleep -Milliseconds 100 }; "
+           "New-Item -ItemType File -Force " + quote(ROOT + r"\probe.arm") + " | Out-Null; "
+           "$deadline=(Get-Date).AddSeconds(10); while (!(Select-String -Path " + log +
+           " -Pattern '\"event\":\"Armed\"' -Quiet)) { "
+           "if ((Get-Date) -gt $deadline) { throw 'Input probe could not acquire foreground focus' }; Start-Sleep -Milliseconds 100 }; "
+           "Write-Output 'Input probe armed with foreground focus'")
     elif action in ("pattern", "probe") and args in (["start"], ["stop"], ["start", "virtual"], ["start", "fullscreen"]):
         if len(args) == 2 and (action, args[1]) not in (("pattern", "virtual"), ("probe", "fullscreen")):
             raise ValueError("Only pattern supports virtual; only probe supports fullscreen")
         flag = ROOT + "\\" + action + ".stop"
         if args == ["stop"]:
-            ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
+            if action == "probe":
+                ps(script("Stop-Probe"))
+            else:
+                ps("New-Item -ItemType File -Force " + quote(flag) + " | Out-Null")
         else:
             if action == "probe":
-                ps("Remove-Item " + quote(ROOT + r"\input-probe.log") + " -ErrorAction SilentlyContinue")
-            session(script("Pattern-Window" if action == "pattern" else "Input-Probe",
-                           "-Seconds 7200" + ((" -VirtualDisplay" if action == "pattern" else " -FullScreen") if len(args) == 2 else "")),
-                    detach=True, idle=True, timeout=7260)
+                ps("if (Test-Path " + quote(ROOT + r"\input-probe.log") + ") { Remove-Item " + quote(ROOT + r"\input-probe.log") + " }")
+            options = "-Seconds 7200"
+            if len(args) == 2:
+                options += " -VirtualDisplay" if action == "pattern" else " -FullScreen"
+            elif action == "pattern" and os.environ.get("EM_CAPTURE_DISPLAY") == "virtual":
+                options += " -VirtualDisplay"
+            elif action == "pattern" and os.environ.get("EM_CAPTURE_DISPLAY"):
+                options += " -DisplayName " + quote(os.environ["EM_CAPTURE_DISPLAY"])
+            session(script("Pattern-Window" if action == "pattern" else "Input-Probe", options),
+                    detach=True, idle=True, timeout=7260,
+                    run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
             if action == "probe":
                 ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not start' }; Start-Sleep -Milliseconds 100 }; "

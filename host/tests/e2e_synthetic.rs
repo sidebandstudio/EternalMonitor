@@ -1761,6 +1761,11 @@ fn pairing_flow_end_to_end() {
         assert_eq!(denied.status, HelloStatus::Unauthorized);
         assert_eq!(denied.auth_token, [0; 16]);
         assert!(!shared.client_connected());
+        for _ in 0..8 {
+            let retry = exchange(&hello);
+            assert_eq!(retry.status, HelloStatus::Unauthorized);
+            assert_eq!(retry.auth_token, [0; 16]);
+        }
         hello.client_nonce += 1;
         hello.pairing_code = shared.pairing.lock().code();
         let paired = exchange(&hello);

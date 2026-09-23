@@ -8,14 +8,14 @@ import re
 import subprocess
 import shutil
 import time
-import xml.etree.ElementTree as ET
 
-from real_checks import check_stream, clean
+from real_checks import check_stream, check_vdd_mode, clean
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / 'scripts/win/remote.sh'
 SCENARIOS = ('R-baseline', 'R-nvenc-h264', 'R-nvenc-hevc', 'R-amf-h264', 'R-amf-hevc',
              'R-nvenc-h264-loss3', 'R-nvenc-burst', 'R-audio', 'R-pairing', 'R-vdd', 'R-reconnect', 'R-gui', 'R-input')
+PERFORMANCE_SCENARIOS = ('R-yuv-nvenc', 'R-yuv-amf', 'R-bgra-nvenc', 'R-bgra-amf', 'R-fps120', 'R-autostart')
 # Input runs last: its SendInput events reset Windows' two-minute idle gate.
 
 
@@ -84,7 +84,7 @@ def verify_vdd_host_exit(row, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--list', action='store_true')
-    parser.add_argument('--rows', nargs='+', choices=SCENARIOS, default=list(SCENARIOS))
+    parser.add_argument('--rows', nargs='+', choices=SCENARIOS + PERFORMANCE_SCENARIOS, default=list(SCENARIOS))
     args = parser.parse_args()
     if args.list:
         print('\n'.join(args.rows))
@@ -123,6 +123,7 @@ def main():
         controller_log = None
         gui_checked = False
         vdd_owned = vdd_checked = False
+        measurement_host_log = None
         env = dict(os.environ, EM_SCENARIO=scenario, EM_OUTPUT_DIR=str(row),
                    EM_EVIDENCE_DIR=str(evidence), EM_UI_EVIDENCE_DIR=str(row / 'ui'),
                    DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer',
@@ -131,14 +132,22 @@ def main():
                    EM_SKIP_BUILD=skip_build, EM_REQUIRE_PAIRING='0', EM_AUDIO='0', EM_BITRATE_MBPS='15',
                    EM_REQUIRE_REPAIRS='0')
         hevc = scenario.endswith('hevc')
-        family = 'amf' if scenario.startswith('R-amf') else 'nvenc'
+        family = 'amf' if scenario.startswith('R-amf') or scenario.endswith('-amf') else 'nvenc'
         encoder = ('hevc_' if hevc else 'h264_') + family
+        host_fps = 120 if scenario == 'R-fps120' else 60
         host_args = ['ETERNAL_HEADLESS=1', 'ETERNAL_ENCODER=h264_' + family,
-                     f'ETERNAL_HEVC={int(hevc)}', 'ETERNAL_FPS=60', 'ETERNAL_MAX_DGRAM=1200',
+                     f'ETERNAL_HEVC={int(hevc)}', f'ETERNAL_FPS={host_fps}', 'ETERNAL_MAX_DGRAM=1200',
                      'ETERNAL_E2E_LOG=1', 'ETERNAL_USB_DIRECT=127.0.0.1:0']
         # These rows target the simulator over UDP. A physically attached
         # iPad must not claim their session through the USB supervisor.
         env['EM_CODEC'] = 'hevc' if hevc else 'h264'
+        if scenario.startswith(('R-yuv-', 'R-bgra-')):
+            direct = scenario.startswith('R-bgra-')
+            host_args += ['ETERNAL_INPUT=' + ('bgra' if direct else 'yuv420')]
+            if direct:
+                env.update(EM_DURATION='600', EM_TIMEOUT='720')
+        if scenario == 'R-fps120':
+            env.update(EM_TARGET_FPS='120', EM_DURATION='60', EM_MIN_FPS='0')
         if scenario == 'R-nvenc-h264-loss3':
             env['EM_REQUIRE_REPAIRS'] = '1'
             host_args += ['ETERNAL_DROP=0.03', 'ETERNAL_REORDER=0.01']
@@ -149,7 +158,7 @@ def main():
             host_args += ['ETERNAL_AMF_DIAG=1']
         if scenario == 'R-audio':
             env.update(EM_AUDIO='1', EM_DURATION='40')
-        if scenario in ('R-audio', 'R-pairing', 'R-gui'):
+        if scenario in ('R-audio', 'R-pairing', 'R-gui', 'R-autostart'):
             host_args[0] = 'ETERNAL_HEADLESS=0'
         if scenario == 'R-gui':
             env['EM_DURATION'] = '40'
@@ -183,6 +192,8 @@ def main():
                 remote('pattern', 'start', *(['virtual'] if scenario == 'R-vdd' else []), output=row / 'pattern-start.log')
             host_started = True
             remote('run-host', *host_args, env=env, output=row / 'host-start.log')
+            if scenario == 'R-input':
+                remote('probe-arm', output=row / 'probe-arm.log')
             if scenario in ('R-reconnect', 'R-input'):
                 lifecycle = row / 'lifecycle'
                 lifecycle.mkdir(exist_ok=True)
@@ -199,11 +210,16 @@ def main():
                 if controller.poll() is not None or (lifecycle / 'error.txt').exists():
                     raise ValueError('The real host restart controller failed')
             elif scenario == 'R-pairing':
-                log = remote('log')
-                (row / 'host.log').write_text(log)
-                match = re.search(r'pairing_code=(\d{6})', clean(log))
-                if not match:
-                    raise ValueError('No startup pairing code in the real host log')
+                deadline = time.monotonic() + 30
+                while True:
+                    log = remote('log')
+                    (row / 'host.log').write_text(log)
+                    match = re.search(r'pairing_code=(\d{6})', clean(log))
+                    if match:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError('No startup pairing code in the real host log')
+                    time.sleep(.2)
                 env.update(EM_PAIRING_CODE=match[1], EM_PAIRING_HOST='100.81.59.48:19876')
                 remote('gui', 'Stream', scenario + '-pairing', output=row / 'pairing-card.json')
                 run([str(ROOT / 'scripts/pixels.sh'), str(evidence / 'windows' / (scenario + '-pairing.png')),
@@ -215,7 +231,7 @@ def main():
                 with (row / 'run.log').open('w') as log:
                     client = subprocess.Popen([str(ROOT / 'scripts/e2e_ios.sh')], env=env,
                                               stdout=log, stderr=subprocess.STDOUT)
-                    deadline = time.monotonic() + 600
+                    deadline = time.monotonic() + int(env['EM_TIMEOUT']) + 120
                     try:
                         while client.poll() is None:
                             app_log = row / 'app.log'
@@ -223,14 +239,17 @@ def main():
                             if scenario == 'R-vdd' and not vdd_checked and 'w=2420 h=1668' in milestones:
                                 state = json.loads(remote('vdd-state'))
                                 save(row / 'vdd-connected.json', state)
-                                first = ET.fromstring(state['settings_xml']).find('./resolutions/resolution')
-                                if state['disabled'] or first is None or tuple(first.findtext(k) for k in ('width','height','refresh_rate')) != ('2420','1668','120'):
-                                    raise ValueError('Connected VDD did not expose 2420x1668@120 as its first mode')
+                                check_vdd_mode(state, milestones)
                                 remote('shot', scenario + '-connected', output=row / 'vdd-connected-shot.log')
                                 vdd_checked = True
                             if scenario == 'R-audio' and tone is None and 'E2E_FIRST_FRAME' in milestones:
                                 tone_log = (row / 'tone.log').open('w')
                                 tone = subprocess.Popen([str(REMOTE), 'tone', '30'], stdout=tone_log, stderr=subprocess.STDOUT)
+                            if scenario == 'R-autostart' and not gui_checked and milestones.count('E2E_STATS') >= 4:
+                                remote('autostart', scenario, output=row / 'autostart-controls.json')
+                                run([str(ROOT / 'scripts/pixels.sh'), str(evidence / 'windows' / (scenario + '.png')),
+                                     '--assert-ui'], output=row / 'autostart-pixels.json')
+                                gui_checked = True
                             if scenario in ('R-audio', 'R-gui') and not gui_checked and milestones.count('E2E_STATS') >= 4:
                                 for view in (('Stream', 'Settings', 'QR') if scenario == 'R-gui' else ('Stream',)):
                                     name = scenario + '-' + view.lower()
@@ -239,10 +258,13 @@ def main():
                                          '--assert-ui'], output=row / (view.lower() + '-pixels.json'))
                                 gui_checked = True
                             if time.monotonic() >= deadline:
-                                raise TimeoutError('Simulator row exceeded ten minutes')
+                                raise TimeoutError('Simulator row exceeded its startup and measurement deadline')
                             time.sleep(.2)
                         if client.returncode:
                             raise subprocess.CalledProcessError(client.returncode, client.args)
+                        # Only this runner builds the Release streaming app.
+                        # Pairing/input/lifecycle UI tests build Debug products.
+                        skip_build = '1'
                     finally:
                         if client.poll() is None:
                             client.terminate()
@@ -252,11 +274,15 @@ def main():
                         raise ValueError('The Windows tone was not started')
                     if tone.wait(timeout=60):
                         raise ValueError('The Windows tone failed; see tone.log')
-                if scenario in ('R-audio', 'R-gui') and not gui_checked:
+                if scenario in ('R-audio', 'R-gui', 'R-autostart') and not gui_checked:
                     raise ValueError('Connected host GUI evidence was not collected')
                 if scenario == 'R-vdd':
                     if not vdd_checked:
                         raise ValueError('VDD connection/mode evidence was not collected')
+                    # The next phase starts a separate client to test host exit.
+                    # Its traffic is outside the completed FPS measurement.
+                    measurement_host_log = remote('log')
+                    (row / 'host-measurement.log').write_text(measurement_host_log)
                     deadline = time.monotonic() + 20
                     while True:
                         state = json.loads(remote('vdd-state'))
@@ -267,21 +293,42 @@ def main():
                             raise ValueError('VDD remained enabled after the app disconnected')
                         time.sleep(.5)
                     verify_vdd_host_exit(row, env)
-            skip_build = '1'
             host_log = remote('log')
             (row / ('host-final.log' if scenario == 'R-reconnect' else 'host.log')).write_text(host_log)
             (row / 'host.stderr.log').write_text(remote('stderr'))
             result = json.loads(result_path.read_text())
             if scenario not in ('R-pairing', 'R-reconnect', 'R-input'):
-                check_stream(result, host_log, encoder,
+                check_stream(result, measurement_host_log if measurement_host_log is not None else host_log, encoder,
                              repairs=scenario.endswith('loss3'),
                              bitrate=40000000 if scenario.endswith('burst') else None,
                              audio=scenario == 'R-audio')
             save(result_path, result)
+            if scenario == 'R-fps120':
+                from real_checks import check_high_refresh
+                check_high_refresh(result, host_log)
+                save(result_path, result)
+            if scenario.startswith(('R-yuv-', 'R-bgra-')):
+                colors = json.loads(run([str(ROOT / 'scripts/pixels.sh'), str(row / 'simulator.png'),
+                                        '--video', size, '--quadrants', '--assert-pattern']))
+                save(row / 'colors.json', colors)
+                if scenario.startswith('R-bgra-'):
+                    baseline = out / ('R-yuv-' + family) / 'colors.json'
+                    if not baseline.exists():
+                        raise ValueError('Run R-yuv-' + family + ' before its BGRA comparison')
+                    if json.loads((baseline.parent / 'result.json').read_text())['status'] != 'PASS':
+                        raise ValueError('YUV color reference did not pass its stream checks')
+                    from real_checks import check_bgra
+                    check_bgra(result, host_log, colors, json.loads(baseline.read_text()))
+                    save(result_path, result)
             if family == 'amf':
                 remote('diagnostic', env['EM_CODEC'], scenario, output=row / 'bitstream-validation.log')
-            remote('shot', scenario, output=row / 'desktop-shot.log')
-            screenshot = evidence / 'windows' / (scenario + '.png')
+            if scenario == 'R-vdd':
+                # Assert the virtual display while it exists. After the teardown
+                # check, the pattern has returned to a different physical output.
+                screenshot = evidence / 'windows' / (scenario + '-connected.png')
+            else:
+                remote('shot', scenario, output=row / 'desktop-shot.log')
+                screenshot = evidence / 'windows' / (scenario + '.png')
             run([str(ROOT / 'scripts/pixels.sh'), str(screenshot), '--assert-pattern'], output=row / 'desktop-pixels.json')
             if result['status'] != 'PASS':
                 failed = True
@@ -316,7 +363,7 @@ def main():
             if host_started:
                 try:
                     (row / ('host-final.log' if scenario == 'R-reconnect' else 'host.log')).write_text(remote('log'))
-                except (OSError, subprocess.SubprocessError) as error:
+                except (OSError, UnicodeError, subprocess.SubprocessError) as error:
                     print('Could not collect final host log: ' + str(error), flush=True)
                 try:
                     remote('stop-host', output=row / 'host-stop.log')

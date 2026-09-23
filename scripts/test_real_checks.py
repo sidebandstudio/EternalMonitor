@@ -38,12 +38,46 @@ class RealChecksTests(unittest.TestCase):
         log += 'Audio stream stats quiet_packets=16\n'
         self.assertEqual(check_stream(self.result(), log, 'h264_nvenc', audio=True)['status'], 'PASS')
 
+    def test_high_refresh_requires_actual_120_fps_encoder(self):
+        from real_checks import check_high_refresh
+        with self.assertRaises(ValueError):
+            check_high_refresh(self.result(), self.log() + 'Encoder opened fps=60\n')
+        result = check_high_refresh(self.result(), self.log() + 'Encoder opened fps=120\n')
+        self.assertEqual(result['target_fps'], 120)
+
+
+class BgraChecksTests(unittest.TestCase):
+    def fixture(self):
+        return (dict(status='PASS', measured_seconds=601),
+                'Encoder opened encoder="h264_nvenc" input=BGRA\n',
+                dict(width=2420, height=1668, quadrants_rgb=[[210,40,50],[35,180,80],[40,70,210],[180,180,180]]))
+
+    def test_matching_color_and_ten_minutes_pass(self):
+        from real_checks import check_bgra
+        result, log, colors = self.fixture()
+        self.assertEqual(check_bgra(result, log, colors, colors)['color_mean_channel_errors'], [0,0,0,0])
+
+    def test_channel_swap_short_run_and_yuv_fallback_fail(self):
+        from real_checks import check_bgra
+        import copy
+        for defect in ('swap', 'duration', 'fallback', 'error', 'missing', 'geometry'):
+            with self.subTest(defect=defect):
+                result, log, colors = self.fixture()
+                reference = copy.deepcopy(colors)
+                if defect == 'swap': colors['quadrants_rgb'][0].reverse()
+                elif defect == 'duration': result['measured_seconds'] = 599
+                elif defect == 'fallback': log += 'Encoder opened input=YUV420P\n'
+                elif defect == 'error': log += 'ERROR Encoder failed\n'
+                elif defect == 'missing': colors['quadrants_rgb'] = []
+                else: colors['width'] += 1
+                with self.assertRaises(ValueError): check_bgra(result, log, colors, reference)
+
 
 class ProbeChecksTests(unittest.TestCase):
     def fixture(self):
         expected = dict(width=1920, height=1080, clicks=[[960,540],[20,20],[1899,20],[20,1059],[1899,1059]],
                         drag_start=[384,432], drag_end=[1536,648], right_click=[1152,432])
-        events = [dict(event='Ready',x=0,y=0,width=1920,height=1080)]
+        events = [dict(event='Ready',x=0,y=0,width=1920,height=1080), dict(event='Armed')]
         for x,y in expected['clicks']:
             events += [dict(event=kind,x=x,y=y,button='Left') for kind in ['MouseDown','MouseUp']]
         events += [dict(event='MouseDown',x=384,y=432,button='Left')]
@@ -60,7 +94,7 @@ class ProbeChecksTests(unittest.TestCase):
 
     def test_four_pixel_mapping_error_fails(self):
         events,expected = self.fixture()
-        events[1]['x'] += 4
+        next(e for e in events if e['event'] == 'MouseDown')['x'] += 4
         with self.assertRaisesRegex(ValueError,'4.0px'):
             check_probe(events,expected)
 
@@ -75,6 +109,48 @@ class ProbeChecksTests(unittest.TestCase):
                 elif defect == 'text': events = [e for e in events if e.get('char') != '!']
                 else: events = [e for e in events if e['event'] != 'MouseMove']
                 with self.assertRaises(ValueError): check_probe(events,expected)
+
+    def test_startup_focus_change_is_allowed_only_before_arming(self):
+        events, expected = self.fixture()
+        events.insert(1, dict(event='Deactivated'))
+        self.assertEqual(check_probe(events, expected)['input_mapping_error_px'], 0)
+        events.append(dict(event='Deactivated'))
+        with self.assertRaisesRegex(ValueError, 'lost foreground'):
+            check_probe(events, expected)
+
+    def test_missing_arm_or_input_before_arming_fails(self):
+        events, expected = self.fixture()
+        with self.assertRaisesRegex(ValueError, 'exactly once'):
+            check_probe([e for e in events if e['event'] != 'Armed'], expected)
+        events.insert(1, dict(event='KeyPress', char='H'))
+        with self.assertRaisesRegex(ValueError, 'before it was armed'):
+            check_probe(events, expected)
+
+    def test_only_one_explicit_center_click_can_activate_the_probe(self):
+        events, expected = self.fixture()
+        setup = [dict(event='FocusClick', x=960, y=540)] + [dict(event=kind, button='Left', x=960, y=540) for kind in ('MouseDown', 'MouseUp')]
+        events[1:1] = setup
+        self.assertEqual(check_probe(events, expected)['input_mapping_error_px'], 0)
+        setup[1]['x'] += 1
+        with self.assertRaisesRegex(ValueError, 'bounded center click'):
+            check_probe(events, expected)
+
+
+class AdvertisedDisplayTests(unittest.TestCase):
+    def state(self, hz):
+        return {'disabled': False, 'settings_xml': f'<vdd_settings><resolutions><resolution><width>2420</width><height>1668</height><refresh_rate>{hz}</refresh_rate></resolution></resolutions></vdd_settings>'}
+
+    def test_sixty_and_120_hz_modes_follow_advertisement(self):
+        from real_checks import check_vdd_mode
+        for hz in (60, 120):
+            for width, height in ((2420, 1668), (1668, 2420)):
+                self.assertEqual(check_vdd_mode(self.state(hz), f'E2E_HELLO w={width} h={height} refresh_hz={hz}'), (2420, 1668, hz))
+
+    def test_lower_mode_and_missing_advertisement_are_rejected(self):
+        from real_checks import check_vdd_mode
+        for milestone in ('', 'E2E_HELLO w=2420 h=1668 refresh_hz=120'):
+            with self.assertRaises(ValueError):
+                check_vdd_mode(self.state(60), milestone)
 
 
 if __name__ == '__main__':

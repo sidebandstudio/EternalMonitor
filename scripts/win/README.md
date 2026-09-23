@@ -18,10 +18,22 @@ current primary display requires `EM_SIZE=3440x1440`. The VDD row uses the
 simulator's advertised size instead. The input row verifies the probe bounds
 against `EM_SIZE` before it starts a host that can inject input.
 
+For a stream check on another physical display, set `EM_CAPTURE_DISPLAY` to
+its exact DXGI name, such as `\\.\DISPLAY2`, and set `EM_SIZE` to that display's
+pixel size. The test pattern follows the same output. This lets the 1080p
+loss/burst checks run on the secondary screen without changing the primary.
+Keep the input row on the primary screen where its probe is placed.
+
 The session runner refuses an RDP or missing console session. Pattern,
 probe, and host runs require two minutes idle because host startup can
 change the virtual display. Screenshots can run while the console is active.
-Detached tasks expire after their timeout and unregister on exit. Job output
+For a window the owner has explicitly made available, set `EM_PC_AVAILABLE=1`
+to bypass that idle check. It does not bypass the console-session check.
+Detached tasks expire after their timeout and unregister on exit. Limited
+tasks receive DELETE permission for the current user on their own temporary
+registration. This leaves the task definition and other permissions protected.
+Run `Test-InteractiveCleanup.ps1` on the reference PC to verify that a completed
+Limited task removes itself. Job output
 and exit status are in `D:\AgentWork\em-v030\jobs`. Host settings are isolated
 in `D:\AgentWork\em-v030\state`, preserving the installed app's preferences.
 
@@ -55,6 +67,10 @@ only. `probe-info` reports the process and bounds; `probe-log` retrieves the
 observed Windows events. Do not run this row while using the PC.
 It runs last because injected events reset the Windows input-idle clock;
 wait two minutes before manually starting another display/input row.
+After capture opens, `probe-arm` waits for foreground focus. If Windows denied
+the activation request, the probe hit-tests its own center and makes one
+activation click there. The checker separates that click from relayed test
+input and rejects events sent before the probe reports `Armed`.
 
 `gui Stream|Settings|QR <name>` uses UI Automation on the tracked host window
 and saves a cropped screenshot plus its accessible labels. `vdd-state`
@@ -66,6 +82,21 @@ AMF rows use `ETERNAL_AMF_DIAG=1`. `diagnostic h264|hevc <row>` validates the
 first 120 captured packets using the pinned Windows FFmpeg SDK and retrieves
 the bitstream. Hardware selection is asserted from the last opened encoder;
 an override request or software fallback cannot pass the row.
+
+Run the additional performance checks separately from the short matrix:
+
+```sh
+python3 scripts/e2e_real.py --rows R-yuv-nvenc R-yuv-amf R-bgra-nvenc R-bgra-amf R-fps120 R-autostart
+```
+
+Each BGRA row streams for ten minutes and checks that direct input remained
+active without encoder or capture errors. Four interior RGB patches are
+compared with the same encoder's passing YUV row; mean channel error must be
+below 12/255 in each quadrant. Channel medians exclude the moving amber stripe.
+The 120 FPS row requires an encoder negotiated at 120 and reports actual
+decode throughput without requiring the simulator to reach 120 FPS.
+The startup row toggles the real GUI checkbox, verifies the quoted executable
+in HKCU Run, verifies removal, and restores the original registry value.
 
 `EM_RUN_LEVEL=Limited` runs the host without elevation. After the installer
 campaign installs under `D:\AgentWork\em-v030\installed`, use

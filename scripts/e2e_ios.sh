@@ -197,7 +197,8 @@ echo "==> Launching app: transport=$TRANSPORT, autoconnect=$AUTOCONNECT"
 LAUNCH_RESULT=$(SIMCTL_CHILD_EM_AUTOCONNECT="$AUTOCONNECT" \
 SIMCTL_CHILD_EM_E2E_LOG=1 \
 SIMCTL_CHILD_EM_UDP_BACKEND="${EM_UDP_BACKEND:-}" \
-    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES -playPCaudio "$AUDIO")
+    xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB YES \
+        -playPCaudio "$AUDIO" -targetFPS "${EM_TARGET_FPS:-60}")
 APP_PID="${LAUNCH_RESULT##*: }"
 [[ "$APP_PID" =~ ^[0-9]+$ ]] || { echo "Missing app PID: $LAUNCH_RESULT" >&2; exit 1; }
 if [ "${EM_SOAK:-0}" = 1 ]; then
