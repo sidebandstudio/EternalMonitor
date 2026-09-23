@@ -62,8 +62,10 @@ __COMMAND__
     $_ | Out-String | Add-Content "$job\out.txt"
     $code = 1
 } finally {
-    Stop-Transcript | Out-Null
+    # Record the completed command before flushing the diagnostic transcript.
+    # A slow transcript writer must not hide a successful host shutdown.
     $code | Set-Content "$job\exit.txt"
+    Stop-Transcript | Out-Null
     Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
 }
 exit $code
