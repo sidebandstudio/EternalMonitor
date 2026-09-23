@@ -31,25 +31,28 @@ final class KeyboardRelayTests: XCTestCase {
         app.buttons["keyboard.key.80"].tap()
         XCTAssertEqual(control.value as? String, "Off")
         app.keyboards.buttons["Hide keyboard"].tap()
-        let dismissed = NSPredicate { _, _ in
-            !app.keyboards.firstMatch.isHittable && keyboard.label == "Keyboard"
-        }
-        expectation(for: dismissed, evaluatedWith: nil)
-        waitForExpectations(timeout: 5)
-        XCTAssertTrue(app.buttons["display.disconnect"].exists)
+        verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         capture("keyboard-dismissed", app: app)
-        // Prove the normal HUD timeout and the three-finger way back to it.
+        keyboard.tap()
+        XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
+        app.buttons["keyboard.done"].tap()
+        verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
+        app.buttons["display.disconnect"].tap()
+        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        app.terminate()
+    }
+
+    private func verifyDismissalAndRestoreHUD(app: XCUIApplication, keyboard: XCUIElement) {
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.keyboards.firstMatch)
+        waitForExpectations(timeout: 5)
+        // Accessibility queries may outlast the normal HUD timer. Prove the
+        // timeout first, then bring the controls back before checking state.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
         app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-        keyboard.tap()
-        XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
-        app.buttons["keyboard.done"].tap()
         XCTAssertEqual(keyboard.label, "Keyboard")
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
-        app.terminate()
+        XCTAssertTrue(app.buttons["display.disconnect"].exists)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {
