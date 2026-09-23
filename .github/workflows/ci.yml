@@ -177,7 +177,6 @@ jobs:
         env:
           EM_SIM_NAME: cistream
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
-          EM_PROFILE_HOST: "1"
         run: |
           mkdir -p build/e2e
           vm_stat > build/e2e/vm-before.txt
