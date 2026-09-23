@@ -200,11 +200,16 @@ def main():
                 if controller.poll() is not None or (lifecycle / 'error.txt').exists():
                     raise ValueError('The real host restart controller failed')
             elif scenario == 'R-pairing':
-                log = remote('log')
-                (row / 'host.log').write_text(log)
-                match = re.search(r'pairing_code=(\d{6})', clean(log))
-                if not match:
-                    raise ValueError('No startup pairing code in the real host log')
+                deadline = time.monotonic() + 30
+                while True:
+                    log = remote('log')
+                    (row / 'host.log').write_text(log)
+                    match = re.search(r'pairing_code=(\d{6})', clean(log))
+                    if match:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError('No startup pairing code in the real host log')
+                    time.sleep(.2)
                 env.update(EM_PAIRING_CODE=match[1], EM_PAIRING_HOST='100.81.59.48:19876')
                 remote('gui', 'Stream', scenario + '-pairing', output=row / 'pairing-card.json')
                 run([str(ROOT / 'scripts/pixels.sh'), str(evidence / 'windows' / (scenario + '-pairing.png')),
