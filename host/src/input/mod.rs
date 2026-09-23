@@ -13,6 +13,9 @@ pub use hid::hid_to_scancode;
 #[cfg(windows)]
 pub mod windows_inject;
 
+#[cfg(any(windows, test))]
+mod probe_guard;
+
 /// Desktop-space rectangle of the captured output (from DXGI's
 /// `DesktopCoordinates`) — the target space for absolute pointer mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
