@@ -261,6 +261,9 @@ def main():
                             time.sleep(.2)
                         if client.returncode:
                             raise subprocess.CalledProcessError(client.returncode, client.args)
+                        # Only this runner builds the Release streaming app.
+                        # Pairing/input/lifecycle UI tests build Debug products.
+                        skip_build = '1'
                     finally:
                         if client.poll() is None:
                             client.terminate()
@@ -285,7 +288,6 @@ def main():
                             raise ValueError('VDD remained enabled after the app disconnected')
                         time.sleep(.5)
                     verify_vdd_host_exit(row, env)
-            skip_build = '1'
             host_log = remote('log')
             (row / ('host-final.log' if scenario == 'R-reconnect' else 'host.log')).write_text(host_log)
             (row / 'host.stderr.log').write_text(remote('stderr'))

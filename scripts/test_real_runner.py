@@ -12,6 +12,45 @@ import e2e_real
 
 
 class RealRunnerCleanupTests(unittest.TestCase):
+    def test_pairing_build_does_not_skip_first_release_stream_build(self):
+        builds = []
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory) / 'container'
+            (container / 'tmp').mkdir(parents=True)
+            (container / 'tmp/eternal-e2e.log').write_text('pairing evidence')
+
+            def complete(env):
+                (Path(env['EM_OUTPUT_DIR']) / 'result.json').write_text(
+                    json.dumps(dict(scenario=env['EM_SCENARIO'], status='PASS', errors=[])))
+
+            def run(command, *, env=None, **kwargs):
+                if Path(command[0]).name == 'e2e_pairing.sh':
+                    complete(env)
+                return str(container)
+
+            def remote(*args, **kwargs):
+                if args == ('host-info',): return 'null'
+                if args == ('log',): return 'pairing_code=123456'
+                return ''
+
+            class Stream:
+                returncode = 0
+                def __init__(self, command, *, env, **kwargs):
+                    builds.append(env['EM_SKIP_BUILD'])
+                    complete(env)
+                def poll(self): return 0
+
+            with patch.dict(os.environ, {'EM_EVIDENCE_DIR': directory}), \
+                    patch('sys.argv', ['e2e_real.py', '--rows', 'R-pairing', 'R-baseline', 'R-nvenc-h264']), \
+                    patch.object(e2e_real, 'remote', side_effect=remote), \
+                    patch.object(e2e_real, 'run', side_effect=run), \
+                    patch.object(e2e_real, 'check_stream'), \
+                    patch.object(e2e_real.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
+                    patch.object(e2e_real.subprocess, 'Popen', Stream), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(e2e_real.main(), 0)
+        self.assertEqual(builds, ['0', '1'])
+
     def run_failure(self, remote):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {'EM_EVIDENCE_DIR':directory}), \
