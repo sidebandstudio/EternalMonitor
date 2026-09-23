@@ -16,7 +16,9 @@ def quote(value):
 
 
 def ps(command):
-    encoded = base64.b64encode(("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + command).encode("utf-16-le")).decode()
+    prefix = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+    prefix += "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+    encoded = base64.b64encode((prefix + command).encode("utf-16-le")).decode()
     subprocess.run(["ssh", "-o", "BatchMode=yes", "windows",
                     "powershell -NoProfile -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + encoded], check=True)
 
@@ -27,9 +29,14 @@ def script(name, arguments=""):
 
 def session(command, detach=False, idle=False, timeout=600):
     options = "-Command " + quote(command) + " -TimeoutSec " + str(timeout)
+    run_level = os.environ.get('EM_RUN_LEVEL', 'Highest')
+    if run_level not in ('Highest', 'Limited'):
+        raise ValueError('EM_RUN_LEVEL must be Highest or Limited')
+    options += ' -RunLevel ' + run_level
     if detach:
         options += " -Detach"
-    if idle:
+    # Set only for a window the owner has explicitly made available.
+    if idle and os.environ.get('EM_PC_AVAILABLE') != '1':
         options += " -RequireIdle"
     ps(script("Invoke-InSession", options))
 
@@ -87,7 +94,7 @@ def main(args):
         session(script("Take-Screenshot", "-Path " + quote(remote)))
         pull(remote, EVIDENCE / "windows" / (args[0] + ".png"))
     elif action == "log" and (not args or (len(args) == 2 and args[0] == "-n" and args[1].isdigit())):
-        ps("Get-Content " + quote(ROOT + r"\host.log") + (" -Tail " + args[1] if args else ""))
+        ps("Get-Content " + quote(ROOT + r"\host.log") + " -Encoding UTF8" + (" -Tail " + args[1] if args else ""))
     elif action == "probe-log" and not args:
         pull(ROOT + r"\input-probe.log", EVIDENCE / "windows" / "input-probe.log")
     elif action in ("pattern", "probe") and args in (["start"], ["stop"]):

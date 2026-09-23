@@ -15,6 +15,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig}"
 
 SIM_NAME="${EM_SIM_NAME:-iPad Pro 11-inch (M4)}"
+SIM_DESTINATION="platform=iOS Simulator,name=$SIM_NAME"
+if [ -n "${EM_SIM_UDID:-}" ]; then SIM_DESTINATION="platform=iOS Simulator,id=$EM_SIM_UDID"; fi
 PORT="${EM_PORT:-9876}"
 WANT_DECODED="${EM_WANT_DECODED:-120}"
 TIMEOUT_SECS="${EM_TIMEOUT:-120}"
@@ -66,7 +68,7 @@ echo "==> Building app for the simulator"
 xcodebuild build \
     -project "$ROOT/ios/EternalMonitor.xcodeproj" \
     -scheme EternalMonitor \
-    -destination "platform=iOS Simulator,name=$SIM_NAME" \
+    -destination "$SIM_DESTINATION" \
     -derivedDataPath "$ROOT/ios/build/e2e" \
     CODE_SIGNING_ALLOWED=NO -quiet
 echo "==> Building host"
@@ -92,6 +94,8 @@ fi
 CONNECT_HOST="${REMOTE_HOST:-127.0.0.1}"
 
 echo "==> Booting simulator: $SIM_NAME"
+UDID="${EM_SIM_UDID:-}"
+if [ -z "$UDID" ]; then
 UDID=$(xcrun simctl list -j devices available | /usr/bin/python3 -c '
 import json, sys
 data = json.load(sys.stdin)["devices"]
@@ -102,6 +106,7 @@ for devices in data.values():
             print(device["udid"]); sys.exit(0)
 sys.exit(1)
 ' "$SIM_NAME")
+fi
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
 echo "==> Installing app"
