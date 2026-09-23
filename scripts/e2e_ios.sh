@@ -269,7 +269,8 @@ decoded=0
 until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS"; do
     sleep 2
     elapsed=$((elapsed + 2))
-    decoded=$(grep -o 'decoded=[0-9]*' "$APP_LOG" | tail -1 | cut -d= -f2 || true)
+    # Audio milestones carry their own decoded= count; report video frames.
+    decoded=$(grep 'E2E_STATS' "$APP_LOG" | grep -o 'decoded=[0-9]*' | tail -1 | cut -d= -f2 || true)
     decoded=${decoded:-0}
     if [ "$elapsed" -ge "$TIMEOUT_SECS" ]; then
         echo "FAIL: only $decoded decoded frames after ${TIMEOUT_SECS}s"
@@ -277,8 +278,10 @@ until python3 "$ROOT/scripts/e2e_stats.py" "$APP_LOG" --link "$MEASURE_LINK" --m
         echo "----- host log -----"; tail -30 "$HOST_LOG"
         # Collect only after failure so sampling cannot affect the measured row.
         # The launch result identifies this simulator app, never another test's app.
-        sample "$APP_PID" 3 10 -file "$OUT/app-stall-stacks.txt" > "$OUT/app-stall-sample.log" 2>&1 || true
-        xcrun simctl spawn "$UDID" log show --style compact --info --last 3m \
+        # With developer mode off, attaching waits on an authorization prompt
+        # that nobody can answer on a headless Mac.
+        bounded 30 sample "$APP_PID" 3 10 -file "$OUT/app-stall-stacks.txt" > "$OUT/app-stall-sample.log" 2>&1 || true
+        bounded 60 xcrun simctl spawn "$UDID" log show --style compact --info --last 3m \
             --predicate 'subsystem == "com.eternal.monitor"' > "$OUT/app-diagnostics.log" 2>&1 || true
         exit 1
     fi
