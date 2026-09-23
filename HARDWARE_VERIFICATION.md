@@ -1,155 +1,133 @@
 # v0.3.0 hardware verification
 
-Status: candidate work is in draft phase branches. No v0.3.0 release candidate
-has been published. The installed host and VDD scripts were updated to `cac987c`
-on 2026-09-23 to repair physical USB extended-display startup. The full desktop
-campaign and installer upgrade/uninstall/reinstall checks remain pending.
-The user is keeping the iPad connected for USB testing; preserve that live
-session until the next test requires an interruption.
+Status as of 2026-09-23: no release candidate has been published. The reference
+PC has installer `0975ad8`, including the USB capture/logging fixes and verified
+VDD binding checks. Extended desktop and charging work together through the
+rear USB-C port and a USB-C-to-USB-C data cable. The full campaign still has
+failing UDP reliability rows, and final validation on `main` remains pending.
 
-Use the host and iPad app from the same candidate. Keep the evidence with the
-candidate's commit, version, build number, encoder, capture resolution, transport,
-and date. A failed or unavailable row remains pending until it is rerun.
+The results below belong to the stated phase revisions. They do not establish
+that a later candidate passed. Before release, run both complete matrices and
+both 30-minute soaks on `main`, then repeat R-baseline with the published
+installer. Keep failures with their original evidence.
 
 ## Verified by the automated campaign on the reference PC
 
 Reference hardware: Windows 11, Ryzen 7 7800X3D with Radeon integrated graphics,
-GeForce RTX 5080. The physical displays reported 3440×1440 and 1920×1080 during
-the USB check; record the primary display geometry again before the campaign.
-The following preliminary checks
-passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passed.
+GeForce RTX 5080. The primary display was 3440×1440 during the desktop campaign.
+The attached iPad ran app 0.3.0 build 6 on iPadOS 26.2 at 2732×2048.
+All paths below are relative to the private `EternalMonitor-Handoff` directory.
+Desktop images, pairing data and diagnostic captures must stay outside git and
+public PRs. All recorded runs in these tables are dated 2026-09-23.
 
-| Check | Result | Evidence in the handoff folder |
+| Check | Recorded result | Evidence |
 | --- | --- | --- |
-| Native Rust 1.98 release build, strict clippy, Windows unit and synthetic integration tests | Passed at `bd88cc4`; 184 tests with synthetic tests isolated from the attached iPad | `evidence/windows/em-bd88cc4-native-build.log` |
-| WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
-| Installer compilation | `EternalMonitor-USB-bd88cc4-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-installer-bd88cc4.log` |
-| Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
-| Physical USB extended display | Startup and delivery confirmed at 2732×2048 with NVENC H.264. A direct iPad screenshot at about 08:04 UTC shows the extended desktop correctly. Repeated capture interruptions persisted after the priority correction; intermittent stability remains open | `evidence/windows/usb-extend-installed-cac987c.log`, `ipad-physical-display-20260923-0805.png` |
-| Interactive task scheduling | New Limited and Highest tasks use Normal CPU, memory priority 5 and I/O priority 2. The old live host and its launcher were corrected in place at 06:07 UTC | `evidence/windows/new-task-priorities.log`, `installed-priority-repair.jsonl` |
-| Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
+| Native build, lint and tests | Release build, strict clippy and 191 Windows Rust tests passed for installer `0975ad8` | `evidence/windows/installer-0975ad8-verified-build.log`, `evidence/windows-native-current-repair.log` |
+| Physical USB extended desktop under motion | `7532347`: 642.93 seconds, 57.16 assembled FPS, zero drops, no capture watchdog or restart storm | `evidence/windows/usbc-7532347-motion-summary.json` |
+| Installed host after driver restoration | `0975ad8`: 113.49 seconds, 57.17 assembled FPS, zero drops; direct iPad screenshot passed pixel checks | `evidence/windows/usbc-restored-0975ad8-motion-summary.json`, `evidence/windows/ipad-usbc-restored-motion-0975ad8.png` |
+| Charging while displaying the extended desktop | Rear USB-C with C-to-C data cable reports a 15 W, 3 A source. Battery rose from 9% to 10% during the ten-minute motion run, with positive battery current. At 17:34 UTC the idle desktop remained connected and battery was 25%, charging at +2270 mA | `evidence/windows/ipad-battery-usbc-motion-*.json`, `evidence/windows/ipad-battery-usbc-1738.json` |
+| Interactive task execution | Capture runs in console session 1 with a Limited user token and normal scheduling priorities. New completed Limited test tasks remove their own registrations | `evidence/windows/new-task-priorities.log`, `evidence/windows/limited-task-cleanup-after-2.log` |
+| Installer fresh install, owned uninstall and restoration | All three stages passed at `0975ad8` without a reboot. Existing user settings and original vendor XML were preserved. The final installation retains the pre-existing driver's external ownership | `evidence/windows/owned-driver-fresh-0975ad8.log`, `evidence/windows/owned-driver-uninstall-0975ad8.log`, `evidence/windows/owned-driver-restore-0975ad8.log` |
 
-The endpoint read is an API/clock check. It does not prove PC audio was encoded,
-transported and heard on the iPad. The native tests use synthetic capture; they
-do not prove DXGI, AMF/NVENC, SendInput, or VDD behavior. The separate physical
-USB run exercised DXGI, NVENC and VDD startup. Receiver reports prove completed
-frames; the direct iPad screenshot confirms a rendered picture at that moment.
-The build-time interruptions remain part of the result. The original scheduled
-task also lowered memory and I/O priorities. All three effective priorities are
-now normal, but further capture stalls occurred
-while the installer compiled. The priority correction did not close this
-stability issue.
+The physical USB stability check followed a logging fix. Synchronous redirected
+output could stop streaming when its destination stalled. Separate bounded
+output workers keep capture and transport moving. The original failure,
+disk-reset correlation and before/after unread-pipe reproduction remain in
+`evidence/windows/usb-stalls/` and `evidence/async-logging-7f135a3/`.
+The evidence does not establish a hardware cause for the disk resets.
 
-The later native test run reproduced an interruption at 06:52:27–06:53:27 UTC.
-Log-triggered dumps captured recovery because the observer's log read also
-paused. The 08:33 native monitor captured another recovery dump at 08:41:05 UTC.
-Its CPU samples also paused for 48 seconds, so this dump does not establish
-the original blocking call. All monitors have ended.
-Candidate `bd88cc4` removes full session-log reads during GUI repaint, releases
-the statistics lock before logging, and records peer decode FPS/queue depth.
-It has passed native tests but is not installed; these corrections have not
-closed the physical USB stability gate.
+A fresh driver installation initially returned success while Windows had left
+the device unbound. Installer `0975ad8` now verifies the present device's bound
+INF, version and problem code before recording ownership or allowing launch.
+The actual Inno failure fixture exits 1; its bound-device fixture exits 0.
+See `evidence/windows/vdd-installer-exit-check.log`. The signed vendor driver
+required an interactive Windows publisher approval during this machine's fresh
+installation. Unattended publisher approval on a clean PC remains unverified.
 
-The refreshed log contains sixteen capture watchdog restarts from 08:02 to
-08:41 UTC, including intervals without builds or input tests. Windows recorded
-SATA resets and retried I/O on Disk 0, the D: Hitachi HDD that stores this test
-host's redirected stdout. Four reset timestamps fall 25.8–26.8 seconds after
-the three-second capture watchdog, consistent with a storage timeout. Windows
-still reports the disk as Healthy; the hardware cause is not established.
-Evidence is `evidence/windows/usb-stalls/disk-capture-correlation-20260923.json`.
+The pinned upstream asset is tagged `25.5.2`, its package reports `25.05.03`,
+and its bound driver version is `23.40.36.27`. These are different version
+fields. The final binding is `oem33.inf`; the uninstall/restore tests verified
+actual device binding, task permissions, product files and firewall rules.
 
-P6 `7f135a3` sends stdout and session-file output through separate bounded
-background workers and keeps recent logs in memory. An unread stdout pipe
-stopped the previous host after 420 decoded frames. With the correction,
-the same test decoded 960 frames at 60.00 FPS with zero drops. Strict clippy
-and all 185 phase Rust tests pass. Evidence is
-`evidence/async-logging-7f135a3/`. This change is not installed on the PC;
-physical stability and the Windows campaign remain open.
+The core Windows matrix has these recorded results. FPS values describe the
+measured interval after startup. A row's retained `result.json`, logs and pixel
+checks are authoritative.
 
-The physical iPad runs app version 0.3.0 build 6 on iPadOS 26.2. Its existing
-developer services allowed a read-only screen capture and app-scoped logs over
-USB, without a restart, new pairing or developer-image mount. The 30-second
-graphics sample had median compositor FPS 58.5 and no graphics recovery events;
-one sample fell to 10 FPS and the following sample was 47. These samples and
-the static picture do not replace motion, load or soak verification. Evidence
-is `evidence/windows/ipad-graphics-20260923-0809.jsonl` and the screenshot above.
-The newer decoder recovery fix has passed simulator tests but is not in the
-installed iPad build.
-
-The 30-minute simulator soak evidence is in
-`evidence/soak-b28687e/simulator/`. It used immutable source and binary copies.
-The earlier failing soak reports remain retained alongside it.
-
-Every row below is required before the release candidate. Save host stdout and
-stderr, app milestones, simulator and PC screenshots, pixel assertions, duration,
-and a machine-readable result under `evidence/real/<row>/`. Keep desktop images
-in the private handoff evidence directory, outside git and public PRs.
-
-| Row | Pass condition | Current result |
+| Row | Result and limits | Evidence directory under `evidence/` |
 | --- | --- | --- |
-| R-baseline | Installed/current host captures the primary screen through DXGI; H.264 reaches the simulator at ≥55 fps; quadrant pixels match | Pending |
-| R-nvenc-h264 | NVENC is actually selected; ≥55 fps for ≥20 measured seconds; no encoder error | Pending |
-| R-nvenc-hevc | NVENC HEVC opens; software VideoToolbox decodes the correct pattern at ≥55 fps | Pending |
-| R-amf-h264 | Radeon AMF opens; normalized packets decode and SDK FFmpeg validates the saved Annex B stream | Pending |
-| R-amf-hevc | Radeon HEVC opens and saved packets validate; record any explicit hardware/resource limitation | Pending |
-| R-nvenc-h264-loss3 | 3% first-transmission loss and 1% reorder; ≥55 fps, <2% unrecovered drops, nonzero repairs, no keyframe storm | Pending |
-| R-nvenc-burst | Fixed 40 Mbps, one IDR per second; ≥55 fps for ≥20 seconds; no overflow/freeze | Pending |
-| R-audio | Session-1 tone passes through WASAPI → Opus → simulator playback; ≥100 packets decoded, ≤2 lost, 1 kHz >−20 dBFS; silence uses small packets | Pending |
-| R-pairing | Wrong code rejected; real logged code accepted through the sheet; persisted token reconnects; pairing card captured | Pending |
-| R-input | Only the focused input probe receives center/corner clicks within ±3 px, drag, wheel, right-click and `Hi!` plus Enter | Pending |
-| R-vdd | Extended display attaches; advertised mode is first in VDD XML; heartbeat reports that resolution; disconnect and host exit remove the display | Physical iPad startup passed; full simulator row and teardown assertions pending |
-| R-reconnect | Kill only the tracked host; SIGNAL LOST appears; restart a new process; video resumes in <15 seconds | Pending |
-| R-gui | Stream/client/audio/USB/pairing cards, Settings and QR are driven and captured; labels reflect the actual session | Pending |
+| R-baseline | Passed on merged P0 `0965566`; 1,140 decoded frames at 3440×1440, final 59 FPS, quadrant pixels passed | `windows-p0-0965566/real/R-baseline/` |
+| R-nvenc-h264 | Passed: 58.54 FPS over 20.50 s, one drop | `windows-campaign-47909ed/real/R-nvenc-h264/` |
+| R-nvenc-hevc | Passed: 58.59 FPS over 20.48 s, zero drops | `windows-campaign-47909ed/real/R-nvenc-hevc/` |
+| R-amf-h264 | Passed: 58.66 FPS over 20.46 s, zero drops; SDK bitstream validation passed | `windows-campaign-47909ed/real/R-amf-h264/` |
+| R-amf-hevc | Passed: 58.38 FPS over 20.56 s, zero drops; SDK bitstream validation passed | `windows-campaign-3022d87/real/R-amf-hevc/` |
+| R-nvenc-h264-loss3 | Failing: recovery exceeds the limit of one keyframe request per ten seconds; some runs also exceed 2% drops. The 25 ms repair budget is unchanged | Latest retained `windows-campaign-*/real/R-nvenc-h264-loss3/` |
+| R-nvenc-burst | Failing reliability gate; a complete passing run is required | Latest retained `windows-campaign-*/real/R-nvenc-burst/` |
+| R-audio | Passed: 58.20 FPS, 2,155 audio packets, zero audio loss; WASAPI tone, decoded audio and silence assertions passed | `windows-campaign-01474bb/real/R-audio/` |
+| R-pairing | Passed: wrong code rejected, correct code accepted and Keychain token reconnect verified | `windows-campaign-b9f4514/real/R-pairing/` |
+| R-input | Passed: probe receives mapped clicks within one pixel and the required keyboard/pointer events | `windows-campaign-01474bb/real/R-input/` |
+| R-vdd | Latest installed `0975ad8` run failed overall: three keyframe requests in 20.89 s. Mode selection, attach, disconnect, reattach, active-host exit and connected pixels passed. 57.46 FPS, three dropped frames | `windows-vdd-0975ad8-measurement/real/R-vdd/` |
+| R-reconnect | Passed: video resumed in 10.30 s after the tracked host restarted | `windows-campaign-01474bb/real/R-reconnect/` |
+| R-gui | Passed: connected Stream, client/audio/USB/pairing cards, Settings and QR views inspected | `windows-campaign-01474bb/real/R-gui/` |
 
-Additional Windows gates:
+Additional gates:
 
-| Row | Pass condition | Current result |
+| Row | Result and limits | Evidence under `evidence/` |
 | --- | --- | --- |
-| R-usb-service | USB card truthfully reports the service/device state; native fake-server tests exercise TCP usbmuxd | Native tests and physical cable streaming passed; GUI assertion pending |
-| R-bgra-nvenc / R-bgra-amf | Each hardware encoder runs BGRA for ten minutes without errors; quadrant mean-channel difference versus its YUV run <12/255 | Pending; default stays YUV420P |
-| R-vdd-limited | A normal-user host can run the SYSTEM VDD tasks with the new read/execute ACLs | Passed on 2026-09-23; repeat after the full installer upgrade |
-| R-fps120 | Requested/negotiated 120 fps is visible; report achieved decode rate and any stutter/errors | Pending |
-| R-headless-ctrlc | Ctrl+C reaches the tracked host and exits cleanly with VDD removed | Pending |
-| R-autostart | Toggle writes/removes the correct HKCU Run entry and preserves the prior value after the test | Pending |
-| R-update-banner | A test build at version 0.0.1 shows the available-release banner; dismissal works | Pending |
-| R-installer | Upgrade, limited-user extended-display stream, uninstall cleanup, reinstall; files, task ACLs, TCP/UDP rules and pinned VDD version verified | Pending |
-| Simulator and real NVENC soaks | 30 minutes each; both host/app RSS grow <20% from minute five; ≥55 fps in ≥95% of samples | Simulator passed at `b28687e`: host +1.90%, app +0.16%, 60/60 FPS samples. Real NVENC and final main runs pending |
+| R-usb-service | Native fake-server tests and physical cable streaming passed. The existing Apple device service works; first-install trust flow and timed cable takeover/fallback remain open | `windows/usbc-restored-0975ad8-host.log` |
+| R-bgra-nvenc | Passed: 601.35 s, 58.27 FPS; quadrant mean-channel errors 0, 0, 0.33 and 1, below 12/255 | `windows-colors-a0823cc/real/R-bgra-nvenc/` |
+| R-bgra-amf | Unsupported by this Radeon encoder. Forced BGRA falls back to software; the hardware BGRA gate does not pass. Shipping default stays YUV420P | `windows-colors-a0823cc/real/R-bgra-amf/` |
+| R-vdd-limited | Passed on the final installation: the normal-user host invokes the SYSTEM tasks and attaches the physical iPad's extended display | `windows/owned-driver-restore-0975ad8.log`, `windows/usbc-restored-0975ad8-host.log` |
+| R-fps120 | Passed requested/negotiated 120 FPS and error checks. Actual simulator decode was 58.06 FPS; this does not prove ProMotion | `windows-campaign-755741b/real/R-fps120/` |
+| R-headless-ctrlc | Passed tracked host exit. The runner now records command completion before transcript flushing | `windows/headless-stop-trace.log` |
+| R-autostart | Passed quoted HKCU value write/remove; prior absent value restored | `windows-campaign-755741b/real/R-autostart/` |
+| R-update-banner | Passed the 0.0.1 native test build, available-release banner and dismissal check | `windows/update-banner-native-inspection.log`, `windows/R-update-banner.png` |
+| R-installer | Upgrade and fresh/owned lifecycle checks passed. Latest installed R-vdd still fails its UDP keyframe limit, as recorded above | `windows/installer-0975ad8/`, `windows/owned-driver-*-0975ad8.log` |
+| Simulator soak | Older `b28687e` passed 30 minutes: host RSS +1.90%, app +0.16%, 60/60 intervals at least 55 FPS. The newer `116d6f5` soak is in progress; host memory growth needs review | `soak-b28687e/simulator/report.json`, `soak-simulator-116d6f5/` |
+| Real NVENC soak and final main soaks | Pending: 30 minutes each, host/app RSS growth below 20% from minute five and at least 95% of intervals at 55 FPS | Required before an rc tag |
 
-Run simulator checks with `scripts/e2e_matrix.sh` and the long test with
-`scripts/soak.sh 1800`. The Windows entry points are
-`scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800`. Set
-`EM_SIZE=3440x1440` for the current primary monitor; verify it again before
-starting. Input tests reject mismatched probe bounds. Consult
-`scripts/win/README.md` for the session runner and evidence collection. A script
-entry point is not a claim that every hardware row has passed. The thirteen-row
-Windows runner is implemented, including cleanup and failure checks. Use the
-tables above to identify unfinished hardware execution.
+The independent Tailscale timing probe recorded 13 of 240 round trips above
+25 ms, with a maximum of 116.38 ms and no ICMP loss. That observation does not
+establish the cause of the UDP row failures. Keep the original repair and
+keyframe assertions while investigating them. Hosted macOS reliability and
+streaming jobs also remain release gates.
 
-For each merged host phase, retain the `release.yml` workflow-dispatch installer
-artifact URL in `PROGRESS.md`. Before tagging, repeat both matrices and both
-soaks on main. Then install the exact prerelease installer, verify its published
-SHA-256, and repeat R-baseline. Those release artifacts remain pending.
+Run `scripts/e2e_matrix.sh` and `scripts/soak.sh 1800` for simulator checks.
+Use `scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800` for Windows.
+Set `EM_PC_AVAILABLE=1` only with the user's availability authorization and
+`EM_RUN_LEVEL=Limited` for normal-user behavior. The user authorized the current
+campaign, including testing beyond the initial three hours. Verify current
+monitor geometry before each campaign; input tests reject mismatched bounds.
+See `scripts/win/README.md` for the interactive runner and evidence collection.
 
-Campaign prerequisites and cleanup:
+Keep each merged host phase's `release.yml` dry-run artifact URL in
+`PROGRESS.md`. Those ordered phase merges and release artifacts remain pending
+behind the reliability gates. No installer here is a published release candidate.
 
-1. The Windows console must be logged in, unlocked and free of secure-desktop
-   prompts. Run capture and input through the interactive session runner, not
-   SSH session 0. Check actual input idle time is at least two minutes before
-   opening probes or changing topology; do not use an RDP session.
-2. Build, stage and retain artifacts on D:. Preserve the installed profile while
-   using the separate harness profile. Do not click or dismiss other programs'
-   dialogs. Do not run installers during capture.
-3. Keep input inside the focused probe. Do not send Windows shortcuts, Alt+F4,
-   or text to another application. Stop if the foreground window changes.
-4. Stop only tracked processes, close probes/patterns, verify VDD disabled,
-   restore the power settings observed before testing, and remove temporary
-   debug/release firewall rules. Keep the installed product's rules.
-5. End with the verified newest installer installed and a clean desktop
-   screenshot. The reference PC currently has the `cac987c` host and task
-   scripts copied into the existing installation. The previous files are
-   backed up under `D:\AgentWork\em-v030\installed-before-cac987c`.
-   The driver is still 23.40.36.27; the pinned 25.5.2 upgrade remains pending.
-   Rollback installer: `C:\Users\aliyo\Downloads\EternalMonitor-Setup.exe`.
+Campaign cleanup and installed state:
+
+1. Use the unlocked console session for capture and input. Check input idle
+   time before probes or topology changes. Keep injection inside the focused
+   probe, and stop if its foreground identity changes.
+2. Build and stage on D:. Preserve the installed profile while using the
+   separate test profile. Do not install during capture or dismiss unrelated
+   programs' dialogs.
+3. Stop only tracked test processes and close all pattern/probe windows.
+   Completed Limited test tasks now remove their registrations. One hundred
+   earlier completed registrations were removed after verifying their action,
+   job identity and exit record; backups remain under the campaign directory.
+4. Before campaign completion, restore the recorded AC timeouts, 240 minutes
+   standby and 10 minutes display, and remove temporary binary firewall rules.
+   Keep installed product rules. Verify VDD removal after the final test. The
+   user's currently connected USB desktop remains active during ongoing work.
+5. Installer `0975ad8` is at
+   `D:\AgentWork\em-v030\installer-0975ad8\EternalMonitor-Setup.exe`.
+   Its SHA-256 is
+   `39E7C78E29F32B30E6204710170A82BBAEEAEC76FE8D244EF1C2A92375B9C32D`.
+   The installed host SHA-256 is
+   `BE67FA00AE7B5C42EA4F8F2A2DD69CDA371D7A94EFE4BCD683F49E641A0D39EF`.
+   Rollback is `C:\Users\aliyo\Downloads\EternalMonitor-Setup.exe`.
+   The final desktop cleanup screenshot and published rc installation remain
+   pending.
 
 ## Ali with the physical iPad
 
@@ -167,6 +145,7 @@ with each failure; include a short screen recording when timing or feel matters.
 | LAN discovery | On the same 10.0.0.x LAN, Scan finds the PC and stays stable for four minutes; quitting the host removes it promptly | Both LAN addresses, firewall profile, scan recording and host mDNS log |
 | QR and pairing | Fresh app prompts for the code; two wrong codes stay rejected; correct code connects. QR carries the token and skips the sheet. Regenerating the token requires pairing again. Six wrong attempts within a minute show a 60-second wait. | Host pairing/session log and sheet screenshots; redact tokens and QR codes before sharing |
 | USB service and trust | Apple Devices or desktop iTunes exposes the local usbmuxd service with the iPad attached; accept Trust on the iPad. Host sees the device and the app shows USB while open. | USB card, Device Manager, whether TCP 27015 listens, cable/trust state |
+| USB power | Rear USB-C with a C-to-C data cable has already charged this iPad during extended-desktop streaming. Recheck battery percentage and charging state with the intended cable, brightness and workload. The former rear USB-A connection supplied too little power. | Cable/port, brightness, battery before/after and charging diagnostics |
 | USB takeover and fallback | Connect over WiFi, then plug in: USB takes over within three seconds. Unplug: WiFi returns within five seconds. Repeat without duplicate sessions. Manual Disconnect stays disconnected. | Host link/session log, app link badge recording and timestamps |
 | Audio | PC music reaches the iPad with <150 ms perceived offset; changing Windows output recovers; iPad mute works without stopping video | Endpoint name, packet loss/buffer diagnostics, recording of the clap test |
 | Touch, Pencil and view-only | Center/corners hit correctly at 100% and 150% scaling; dragging and two-finger scrolling feel direct; hold gives right-click. Pencil contact/hover behave as advertised. View-only sends no input. | Capture/display geometry, scaling, probe log or recording; note that this release does not promise pressure-sensitive Windows pen injection |
