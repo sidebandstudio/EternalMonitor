@@ -14,7 +14,9 @@ and date. A failed or unavailable row remains pending until it is rerun.
 ## Verified by the automated campaign on the reference PC
 
 Reference hardware: Windows 11, Ryzen 7 7800X3D with Radeon integrated graphics,
-GeForce RTX 5080, 1920×1080 primary display. The following preliminary checks
+GeForce RTX 5080. The physical displays reported 3440×1440 and 1920×1080 during
+the USB check; record the primary display geometry again before the campaign.
+The following preliminary checks
 passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passed.
 
 | Check | Result | Evidence in the handoff folder |
@@ -23,7 +25,7 @@ passed on 2026-09-22 and 2026-09-23; the full desktop campaign has **not** passe
 | WASAPI endpoint opens and accounts for silent elapsed time | 96,015 stereo frames in 2.000 seconds at 48 kHz after the clock fix | `evidence/windows/p3-audio-read/` |
 | Installer compilation | `EternalMonitor-USB-cac987c-Setup.exe` compiled; installer execution remains pending | `evidence/windows/em-usb-installer-cac987c.log` |
 | Limited-user VDD tasks | Enable and disable completed through the host's task runner; missing-task and failed-action paths report failure | `evidence/windows/em-vdd-task-validation-3.log`, `em-vdd-toggle-unit.log`, `em-vdd-missing-task.log` |
-| Physical USB extended display | Two successful starts at 2732×2048 with NVENC H.264; the installed host exceeded 72,000 completed frames with zero reported video drops | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
+| Physical USB extended display | Two successful starts at 2732×2048 with NVENC H.264; the installed host exceeded 144,000 completed frames with zero reported video drops over 41 minutes | `evidence/windows/usb-extend-cac987c-complete.log`, `usb-extend-installed-cac987c.log` |
 | Desktop availability | The earlier firewall prompt is gone. The user is using the PC; fullscreen pattern and input rows must wait for an idle console | `PROGRESS.md` |
 
 The endpoint read is an API/clock check. It does not prove PC audio was encoded,
