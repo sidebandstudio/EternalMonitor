@@ -76,8 +76,10 @@ Apple Devices is closed or missing, the host says so and offers to open it or
 links to the Store. Pairing controls access but does not encrypt
 the stream. The iPad app requires iPadOS 17 or later.
 
-Follow [QUICKSTART.txt](scripts/QUICKSTART.txt). TestFlight setup and the signing
-workflow are documented in [FRIENDS_TESTING.md](FRIENDS_TESTING.md).
+New users should follow the step-by-step [setup guide](SETUP.md). The
+installer also adds [QUICKSTART.txt](scripts/QUICKSTART.txt) to the Start menu.
+TestFlight setup and the signing workflow are documented in
+[FRIENDS_TESTING.md](FRIENDS_TESTING.md).
 
 ## Build from source
 
@@ -211,6 +213,7 @@ docs/       eternalmonitor.dev website (GitHub Pages)
 
 ## Reference docs
 
+- [SETUP.md](SETUP.md) is the step-by-step setup guide for users
 - [ARCHITECTURE.md](ARCHITECTURE.md) covers the pipeline, protocol v2, and design
 - [DECISIONS.md](DECISIONS.md) explains why things are the way they are
 - [RELEASE_NOTES.md](RELEASE_NOTES.md)

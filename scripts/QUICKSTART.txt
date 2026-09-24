@@ -4,6 +4,8 @@ Use your iPad as a second display for a Windows PC, over WiFi or USB.
 You need matching Windows and iPad builds. The candidate is still being
 verified; use the installer and TestFlight invite supplied together.
 The latest older public installer does not include every feature below.
+Step-by-step guide with every screen explained:
+https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md
 
 What you need
 -------------
@@ -29,7 +31,7 @@ supplied. An unsigned developer archive is not a TestFlight install.
 2. Connect and pair over WiFi
 ----------------------------
 Keep the PC and iPad on the same local network, outside a guest network.
-In the iPad app, Scan for the PC or enter the address shown by the host
+In the iPad app, tap Find PCs or enter the address shown by the host
 (default port 9876). Enter the six-digit pairing code shown on the PC.
 Scanning the host QR instead carries its pairing token and skips code entry.
 The app remembers the host. On the PC, Settings > Forget all iPads resets pairing.
@@ -62,7 +64,7 @@ Enable Stream PC audio on the host and Play PC audio on the iPad. The
 speaker indicator shows playback; muting on the iPad leaves video running.
 Audio follows the Windows default output device.
 
-With Control PC with touch enabled:
+With Control PC on:
 - Tap clicks, drag moves with the button down, two fingers scroll, and a
   hold gives right-click. Pencil position also controls the mouse.
 - Three-finger tap reveals the controls. Keyboard opens the on-screen
@@ -71,7 +73,7 @@ With Control PC with touch enabled:
   to Ctrl; choose Win in Settings if needed. iPadOS retains Globe, Command-H,
   Command-Tab and Command-Space.
 - Supported trackpads/mice relay secondary/middle click, scroll and hover.
-- For view-only, turn Control PC with touch off and reconnect.
+- For view-only, turn Control PC off and reconnect.
 
 6. Quality and frame rate
 -------------------------
