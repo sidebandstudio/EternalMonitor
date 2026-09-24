@@ -17,6 +17,8 @@
 #endif
 
 [Setup]
+; Native Windows Ink pen injection requires the Windows 10 1809 APIs.
+MinVersion=10.0.17763
 AppId={{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}
 AppName=EternalMonitor
 AppVersion={#AppVersion}

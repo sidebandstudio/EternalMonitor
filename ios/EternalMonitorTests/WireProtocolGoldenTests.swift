@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 25,
+            Self.vectors.count, 28,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -49,6 +49,25 @@ final class WireProtocolGoldenTests: XCTestCase {
             XCTAssertEqual(ack.sessionId, 0)
             XCTAssertEqual(ack.authToken, Data(repeating: 0, count: 16))
             XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    func testNativePenVectorsAndTruncatedTilt() throws {
+        for (name, phase, buttons, pressure): (String, UInt8, UInt8, UInt16) in [
+            ("input_pen_down", 0, 1, 750), ("input_pen_hover", 1, 0, 0), ("input_pen_cancel", 3, 1, 0)
+        ] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .inputEvent(let event) = message else { return XCTFail("wrong type") }
+            XCTAssertEqual(event, WireInputEvent(inputVer: 2, kind: 1, phase: phase, buttons: buttons,
+                eventId: 43, xNorm: 65535, yNorm: 16384, pressureX1000: pressure,
+                clientTimeUs: 123456789, tiltX: -37, tiltY: 62))
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+            for missing in 1...4 {
+                var truncated = Data(data.dropLast(missing))
+                truncated[6] = UInt8(truncated.count - 16)
+                XCTAssertNil(Wire.parseControl(truncated))
+            }
         }
     }
 

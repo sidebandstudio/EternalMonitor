@@ -140,6 +140,39 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                     keycode,
                     modifiers: 2,
                     client_time_us: 123456789,
+                    tilt_x: 0,
+                    tilt_y: 0,
+                }),
+            ),
+        ));
+    }
+
+    for (name, phase, buttons, pressure) in [
+        ("input_pen_down", 0, 1, 750),
+        ("input_pen_hover", 1, 0, 0),
+        ("input_pen_cancel", 3, 1, 0),
+    ] {
+        vectors.push((
+            name,
+            encode_control(
+                0x1234_5678,
+                18,
+                &ControlMessage::InputEvent(InputEvent {
+                    input_ver: 2,
+                    kind: 1,
+                    phase,
+                    buttons,
+                    event_id: 43,
+                    x_norm: 65535,
+                    y_norm: 16384,
+                    pressure_x1000: pressure,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0,
+                    modifiers: 0,
+                    client_time_us: 123456789,
+                    tilt_x: -37,
+                    tilt_y: 62,
                 }),
             ),
         ));
@@ -292,6 +325,8 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 keycode: 0,
                 modifiers: 0,
                 client_time_us: 1_000_001,
+                tilt_x: 0,
+                tilt_y: 0,
             }),
         ),
     ];

@@ -287,6 +287,7 @@ struct HelloAck: Equatable {
     static let hostCapAudio: UInt16 = 1 << 1
     static let hostCapUSB: UInt16 = 1 << 2
     static let hostCapKeyboard: UInt16 = 1 << 3
+    static let hostCapPen: UInt16 = 1 << 4
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -382,6 +383,8 @@ struct WireInputEvent: Equatable {
     var keycode: UInt16 = 0
     var modifiers: UInt8 = 0
     var clientTimeUs: UInt64
+    var tiltX: Int16 = 0
+    var tiltY: Int16 = 0
 }
 
 enum ControlMessage: Equatable {
@@ -517,6 +520,10 @@ extension Wire {
             body.append(e.modifiers)
             body.append(0)  // reserved
             body.appendLE(e.clientTimeUs)
+            if e.inputVer == 2 {
+                body.appendLE(UInt16(bitPattern: e.tiltX))
+                body.appendLE(UInt16(bitPattern: e.tiltY))
+            }
         }
 
         var out = Data(capacity: ControlHeader.size + body.count)
@@ -706,11 +713,19 @@ extension Wire {
               let _ = r.readU8(),  // reserved
               let clientTimeUs = r.readU64()
         else { return nil }
+        var tiltX: Int16 = 0
+        var tiltY: Int16 = 0
+        if inputVer == 2 {
+            guard let x = r.readU16(), let y = r.readU16() else { return nil }
+            tiltX = Int16(bitPattern: x)
+            tiltY = Int16(bitPattern: y)
+        }
         return .inputEvent(WireInputEvent(
             inputVer: inputVer, kind: kind, phase: phase, buttons: buttons,
             eventId: eventId, xNorm: xNorm, yNorm: yNorm, pressureX1000: pressureX1000,
             scrollDx: Int16(bitPattern: scrollDxRaw), scrollDy: Int16(bitPattern: scrollDyRaw),
-            keycode: keycode, modifiers: modifiers, clientTimeUs: clientTimeUs))
+            keycode: keycode, modifiers: modifiers, clientTimeUs: clientTimeUs,
+            tiltX: tiltX, tiltY: tiltY))
     }
 }
 

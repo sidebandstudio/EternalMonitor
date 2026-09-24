@@ -87,6 +87,26 @@ struct SettingsView: View {
                 }
                 .listRowBackground(Theme.surfaceRaised)
 
+                Section {
+                    Toggle(isOn: $settings.drawingMode) {
+                        rowLabel("Drawing mode", "pencil.tip")
+                    }
+                    .accessibilityIdentifier("settings.drawingMode")
+                    .onChange(of: settings.drawingMode) { _, enabled in
+                        if enabled { settings.allowUSB = true }
+                    }
+                    if connectionManager.state == .connected {
+                        infoRow("Pencil", connectionManager.sessionHasPen ? "Windows Ink ready" : "Unavailable on this host", "pencil")
+                        infoRow("Drawing mode", connectionManager.sessionDrawingMode ? "Active" : "Off", "hand.draw")
+                    }
+                } header: {
+                    sectionHeader("Apple Pencil")
+                } footer: {
+                    footnote("Drawing mode ignores fingers on the canvas and mutes PC audio. Over USB it requests the iPad's highest frame rate, up to the PC's limit. Applies from the next connection. "
+                        + "In Clip Studio Paint, choose Preferences > Tablet > Tablet PC. Pressure requires a pressure-sensitive Pencil; Apple Pencil USB-C does not support pressure.")
+                }
+                .listRowBackground(Theme.surfaceRaised)
+
                 // Live values from HELLO_ACK, refreshed by heartbeats.
                 Section {
                     if let host = connectionManager.hostInfo,
@@ -198,6 +218,7 @@ struct SettingsView: View {
     }
 
     private var audioDescription: String {
+        if connectionManager.sessionDrawingMode { return "Muted for drawing" }
         if !settings.playPCaudio { return "Muted" }
         if let error = connectionManager.audioStats.error { return error }
         guard connectionManager.audioStats.playing else { return "Unavailable" }
