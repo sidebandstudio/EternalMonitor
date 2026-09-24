@@ -99,23 +99,54 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(counts.assemblerDepth, 0)
     }
 
+    /// While repairs keep arriving for other frames, a frame whose own
+    /// replacement never comes expires at its deadline.
     func testDeadlineDropsMissingFrameAndReleasesQueue() {
+        enableRepair()
+        add(seq: 1, index: 1, count: 2, byte: 1)
+        now = 2_000
+        add(seq: 2, index: 1, count: 2, byte: 2)
+        now = 4_000
+        add(seq: 2, index: 0, count: 2, byte: 3, retransmit: true)
+        now = 12_000
+        add(seq: 3, index: 1, count: 2, byte: 4)
+        now = 14_000
+        add(seq: 3, index: 0, count: 2, byte: 5, retransmit: true)
+        assembler.tick(at: 24_999)
+        XCTAssertTrue(completed.isEmpty)
+        assembler.tick(at: 25_000)
+        XCTAssertEqual(completed, [Data([3, 2]), Data([5, 4])])
+        XCTAssertEqual(keyframes, 1)
+        now = 26_000
+        add(seq: 1, index: 0, count: 2, byte: 6, retransmit: true)
+        XCTAssertEqual(completed.count, 2)
+        let counts = assembler.counters.withLock { $0 }
+        XCTAssertEqual(counts.framesDropped, 1)
+        XCTAssertEqual(counts.fragsLost, 1)
+        XCTAssertEqual(counts.fragsRepaired, 2)
+    }
+
+    /// WiFi can hold the uplink for about 100 ms. With no repair arriving for
+    /// any frame, the deadline waits and a late replacement still completes
+    /// its frame; the wait is bounded at 100 ms past the deadline.
+    func testSilentRepairPathDelaysTheDeadlineWithinItsAllowance() {
         enableRepair()
         add(seq: 1, index: 1, count: 2, byte: 2)
         now = 1_000
         add(seq: 2, index: 0, count: 1, byte: 3)
-        assembler.tick(at: 24_999)
+        assembler.tick(at: 60_000)
         XCTAssertTrue(completed.isEmpty)
-        assembler.tick(at: 25_000)
-        XCTAssertEqual(completed, [Data([3])])
-        XCTAssertEqual(keyframes, 1)
-        now = 26_000
+        now = 61_000
         add(seq: 1, index: 0, count: 2, byte: 1, retransmit: true)
-        XCTAssertEqual(completed.count, 1)
-        let counts = assembler.counters.withLock { $0 }
-        XCTAssertEqual(counts.framesDropped, 1)
-        XCTAssertEqual(counts.fragsLost, 1)
-        XCTAssertEqual(counts.fragsRepaired, 0)
+        XCTAssertEqual(completed, [Data([1, 2]), Data([3])])
+        XCTAssertEqual(keyframes, 0)
+
+        enableRepair()
+        add(seq: 1, index: 1, count: 2, byte: 2)
+        assembler.tick(at: 124_999)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 125_000)
+        XCTAssertEqual(keyframes, 1)
     }
 
     func testNackRetriesOnceAfterRTTPlusFiveMilliseconds() {
@@ -128,7 +159,9 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(nacks[1].missing, [0])
         assembler.tick(at: 20_000)
         XCTAssertEqual(nacks.count, 2)
-        assembler.tick(at: 25_000)
+        assembler.tick(at: 60_000)
+        XCTAssertEqual(nacks.count, 2, "one retry, even while the repair path is silent")
+        assembler.tick(at: 125_000)
         XCTAssertEqual(keyframes, 1)
     }
 
@@ -139,21 +172,38 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertTrue(nacks.isEmpty)
         assembler.tick(at: 16_667)
         XCTAssertEqual(nacks.first?.missing, [1])
-        assembler.tick(at: 41_667)
+        // Nothing else arrives, so the frame uses its stall allowance.
+        assembler.tick(at: 141_666)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 141_667)
         XCTAssertEqual(keyframes, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
     }
 
-    func testRepairHoldsAtMostThreeFrames() {
+    func testRepairHoldsAtMostEightFrames() {
         enableRepair()
         add(seq: 1, index: 0, count: 2, byte: 1)
-        add(seq: 2, index: 0, count: 1, byte: 2)
-        add(seq: 3, index: 0, count: 1, byte: 3)
+        for seq in UInt32(2)...8 { add(seq: seq, index: 0, count: 1, byte: UInt8(seq)) }
         XCTAssertTrue(completed.isEmpty)
-        add(seq: 4, index: 0, count: 1, byte: 4)
-        XCTAssertEqual(completed, [Data([2]), Data([3]), Data([4])])
+        add(seq: 9, index: 0, count: 1, byte: 9)
+        XCTAssertEqual(completed, (2...9).map { Data([UInt8($0)]) })
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
         XCTAssertEqual(keyframes, 1)
+    }
+
+    /// Measured on a physical iPad over WiFi: fragments arrive a few
+    /// milliseconds out of order, and a stall releases several frames at once.
+    func testLateFragmentCompletesItsFrameAfterABurstOfNewerFrames() {
+        enableRepair()
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        now = 1_000
+        for seq in UInt32(2)...4 { add(seq: seq, index: 0, count: 1, byte: UInt8(seq)) }
+        XCTAssertTrue(completed.isEmpty)
+        now = 3_000
+        add(seq: 1, index: 1, count: 2, byte: 5)
+        XCTAssertEqual(completed, [Data([1, 5]), Data([2]), Data([3]), Data([4])])
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        XCTAssertEqual(keyframes, 0)
     }
 
     func testMoreThanSixtyFourMissingFragmentsRequestsOneKeyframe() {
@@ -161,7 +211,7 @@ final class FrameAssemblerTests: XCTestCase {
         add(seq: 1, index: 65, count: 66, byte: 1)
         XCTAssertTrue(nacks.isEmpty)
         XCTAssertEqual(keyframes, 1)
-        assembler.tick(at: 25_000)
+        assembler.tick(at: 125_000)
         XCTAssertEqual(keyframes, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.fragsLost }, 65)
     }
@@ -170,7 +220,16 @@ final class FrameAssemblerTests: XCTestCase {
         enableRepair()
         assembler.framePeriodUs = 1_000
         assembler.rttUs = { 100 }
-        add(seq: 1, index: 1, count: 2, byte: 2)
+        // Media and repairs keep flowing, so no stall stretches the deadline.
+        add(seq: 1, index: 1, count: 2, byte: 1)
+        for (at, seq, index, retransmit) in [
+            (1_000, 2, 1, false), (2_000, 2, 0, true), (3_000, 3, 0, false), (4_000, 4, 0, false),
+            (5_000, 5, 1, false), (6_000, 5, 0, true), (7_000, 6, 0, false),
+        ] as [(UInt64, UInt32, UInt16, Bool)] {
+            now = at
+            let count: UInt16 = [2, 5].contains(seq) ? 2 : 1
+            add(seq: seq, index: index, count: count, byte: UInt8(seq), retransmit: retransmit)
+        }
         assembler.tick(at: 7_999)
         XCTAssertEqual(keyframes, 0)
         assembler.tick(at: 8_000)

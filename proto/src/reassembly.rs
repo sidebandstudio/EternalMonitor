@@ -8,7 +8,7 @@
 //! on every platform. If behavior here diverges from the Swift assembler,
 //! the Swift side is the specification.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::v2::control::Nack;
@@ -17,8 +17,12 @@ use crate::v2::media::{MediaHeader, MAX_FRAG_COUNT};
 pub const STREAM_RESTART_GAP: u32 = 256;
 pub const STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 pub const EPOCH_RESYNC_THRESHOLD: u32 = 512;
+/// Also bounds frames held behind an incomplete one in repair mode; the
+/// repair deadline limits the wait (see `FrameAssembler.maxPendingFrames`).
 pub const MAX_PENDING_FRAMES: usize = 8;
-pub const MAX_REPAIR_FRAMES: usize = 3;
+/// How far a stall can move one frame's repair deadline (see
+/// `FrameAssembler.maxStallAllowanceUs`).
+pub const MAX_STALL_ALLOWANCE: Duration = Duration::from_millis(100);
 pub const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +62,17 @@ struct PendingFrame {
     contiguous: u16,
     highest_index: u16,
     repaired: u64,
+    gap_at: Option<Instant>,
     deadline: Option<Instant>,
     retry_at: Option<Instant>,
-    nack_count: u8,
+    requested_at: Option<Instant>,
+    stall_used: Duration,
+    stall_counted_until: Option<Instant>,
+    /// Indices already requested; each is requested when first seen missing
+    /// and at most once more by the frame's single retry.
+    requested: HashSet<u16>,
+    retried: bool,
+    abandoned: bool,
     keyframe_requested: bool,
 }
 
@@ -105,6 +117,8 @@ pub struct Reassembler {
     clock_origin: Option<Instant>,
     previous_transit: Option<f64>,
     jitter: f64,
+    last_arrival: Option<Instant>,
+    last_repair: Option<Instant>,
 }
 
 impl Default for Reassembler {
@@ -126,6 +140,8 @@ impl Default for Reassembler {
             clock_origin: None,
             previous_transit: None,
             jitter: 0.0,
+            last_arrival: None,
+            last_repair: None,
         }
     }
 }
@@ -213,6 +229,15 @@ impl Reassembler {
             Some(_) => self.stale_epoch_streak = 0,
             None => self.current_epoch = Some(epoch),
         }
+        // Any current-stream datagram shows media flowing; any replacement
+        // shows repairs flowing, including one that lost the race to its original.
+        if self.repair_enabled {
+            self.resume_after_stall(now);
+        }
+        self.last_arrival = Some(now);
+        if header.is_retransmit {
+            self.last_repair = Some(now);
+        }
         let retired = self.latest_completed_seq.max(self.retired_seq);
         if retired > 0 {
             if seq == retired {
@@ -250,12 +275,7 @@ impl Reassembler {
         if payload.len() > MAX_PENDING_BYTES {
             return AddOutcome::Dropped(DropReason::Capacity);
         }
-        let limit = if self.repair_enabled {
-            MAX_REPAIR_FRAMES
-        } else {
-            MAX_PENDING_FRAMES
-        };
-        while (!self.pending.contains_key(&seq) && self.pending.len() >= limit)
+        while (!self.pending.contains_key(&seq) && self.pending.len() >= MAX_PENDING_FRAMES)
             || self.pending_bytes + payload.len() > MAX_PENDING_BYTES
         {
             let Some((&oldest, _)) = self.pending.first_key_value() else {
@@ -278,9 +298,15 @@ impl Reassembler {
             contiguous: 0,
             highest_index: 0,
             repaired: 0,
+            gap_at: None,
             deadline: None,
             retry_at: None,
-            nack_count: 0,
+            requested_at: None,
+            stall_used: Duration::ZERO,
+            stall_counted_until: None,
+            requested: HashSet::new(),
+            retried: false,
+            abandoned: false,
             keyframe_requested: false,
         });
         frame.fragments.insert(index, payload.to_vec());
@@ -349,7 +375,10 @@ impl Reassembler {
                 continue;
             }
             if self.repair_enabled {
-                if frame.deadline.is_some_and(|deadline| now >= deadline) {
+                if frame
+                    .deadline
+                    .is_some_and(|deadline| now >= deadline + self.stall(frame, now))
+                {
                     if self.pending.first_key_value().map(|(&s, _)| s) == Some(seq) {
                         self.drop_pending(seq);
                         self.retired_seq = self.retired_seq.max(seq);
@@ -360,9 +389,15 @@ impl Reassembler {
                 {
                     let through = frame.header.frag_count - 1;
                     self.begin_gap(seq, through, now);
-                } else if frame.nack_count < 2 && frame.retry_at.is_some_and(|retry| now >= retry) {
+                } else if !frame.retried
+                    && !frame.abandoned
+                    && frame.retry_at.is_some_and(|retry| now >= retry)
+                {
                     let through = frame.header.frag_count - 1;
-                    self.request_missing(seq, through);
+                    if let Some(frame) = self.pending.get_mut(&seq) {
+                        frame.retried = true;
+                    }
+                    self.request(seq, through, true, now);
                 }
             } else if now.saturating_duration_since(frame.created_at) >= STALE_FRAME_TIMEOUT {
                 self.drop_pending(seq);
@@ -374,39 +409,88 @@ impl Reassembler {
         self.update_depth();
     }
 
+    /// The first gap starts the repair deadline and schedules the one retry;
+    /// every gap requests the fragments it newly shows missing (see
+    /// `FrameAssembler.beginGap`).
     fn begin_gap(&mut self, seq: u32, through: u16, now: Instant) {
         let Some(frame) = self.pending.get_mut(&seq) else {
             return;
         };
-        if frame.deadline.is_some() {
-            return;
+        if frame.deadline.is_none() {
+            let window_us = (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2)
+                .clamp(8_000, 25_000);
+            frame.gap_at = Some(now);
+            frame.deadline = Some(now + Duration::from_micros(window_us as u64));
+            frame.retry_at = Some(now + self.rtt + Duration::from_millis(5));
         }
-        let window_us =
-            (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2).clamp(8_000, 25_000);
-        frame.deadline = Some(now + Duration::from_micros(window_us as u64));
-        frame.retry_at = Some(now + self.rtt + Duration::from_millis(5));
-        self.request_missing(seq, through);
+        self.request(seq, through, false, now);
     }
 
-    fn request_missing(&mut self, seq: u32, through: u16) {
+    /// How long this waiting frame has been stalled, not yet counted, within
+    /// its remaining allowance (see `FrameAssembler.stall(of:at:)`).
+    fn stall(&self, frame: &PendingFrame, now: Instant) -> Duration {
+        let Some(gap) = frame.gap_at else {
+            return Duration::ZERO;
+        };
+        let mut silent_from = self.last_arrival.map(|last| last + self.frame_period);
+        if let Some(asked) = frame.requested_at {
+            let due = self.last_repair.map_or(asked, |repair| repair.max(asked))
+                + self.rtt
+                + Duration::from_millis(5);
+            silent_from = Some(silent_from.map_or(due, |silent| silent.min(due)));
+        }
+        let Some(mut from) = silent_from else {
+            return Duration::ZERO;
+        };
+        from = from.max(gap);
+        if let Some(counted) = frame.stall_counted_until {
+            from = from.max(counted);
+        }
+        if now <= from {
+            return Duration::ZERO;
+        }
+        (now - from).min(MAX_STALL_ALLOWANCE - frame.stall_used)
+    }
+
+    /// Traffic arrived: move each waiting frame's deadline past the stall so far.
+    fn resume_after_stall(&mut self, now: Instant) {
+        let seqs: Vec<_> = self.pending.keys().copied().collect();
+        for seq in seqs {
+            let extra = match self.pending.get(&seq) {
+                Some(frame) if frame.deadline.is_some() => self.stall(frame, now),
+                _ => continue,
+            };
+            if extra.is_zero() {
+                continue;
+            }
+            if let Some(frame) = self.pending.get_mut(&seq) {
+                frame.deadline = frame.deadline.map(|deadline| deadline + extra);
+                frame.stall_used += extra;
+                frame.stall_counted_until = Some(now);
+            }
+        }
+    }
+
+    fn request(&mut self, seq: u32, through: u16, again: bool, now: Instant) {
         let Some(frame) = self.pending.get_mut(&seq) else {
             return;
         };
-        if frame.nack_count >= 2 {
+        if frame.abandoned || frame.contiguous > through {
             return;
         }
-        let missing: Vec<_> = (0..=through)
-            .filter(|i| !frame.fragments.contains_key(i))
+        let missing: Vec<_> = (frame.contiguous..=through)
+            .filter(|i| !frame.fragments.contains_key(i) && (again || !frame.requested.contains(i)))
             .collect();
         if missing.is_empty() {
             return;
         }
         if missing.len() > 64 {
-            frame.nack_count = 2;
+            frame.abandoned = true;
             self.request_keyframe(seq);
             return;
         }
-        frame.nack_count += 1;
+        frame.requested.extend(&missing);
+        frame.requested_at.get_or_insert(now);
         self.counters.nacks_sent += 1;
         self.nacks.push_back(Nack {
             stream_epoch: self.current_epoch.unwrap_or(0),
@@ -494,6 +578,8 @@ impl Reassembler {
         self.clock_origin = None;
         self.previous_transit = None;
         self.jitter = 0.0;
+        self.last_arrival = None;
+        self.last_repair = None;
         self.counters = ReassemblyCounters::default();
     }
 }

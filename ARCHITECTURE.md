@@ -95,14 +95,19 @@ a physical iPad.
 
 The host retains exact first-transmission datagrams in a per-session history,
 bounded to 96 frames and 12 MiB. NACK replies change only the retransmit flag;
-indexes, fragment counts and epochs must match. Per-fragment resend spacing
-bounds repeated work. Repairs bypass first-transmission fault injection and are
+indexes, fragment counts and epochs must match. A fragment is resent at most
+once per 5 ms. Repairs bypass first-transmission fault injection and are
 serviced while a paced keyframe is waiting.
 
-The iPad holds incomplete frames for an RTT-aware 8–25 ms repair window. It sends
-at most two requests, retires expired frames and drains completed frames in
-order. Reported repaired and unrecovered counts remain separate. Keyframe
-requests remain the fallback for expiry and decode errors.
+The iPad holds up to eight frames behind an incomplete one, for an RTT-aware
+8–25 ms repair window. It requests each missing fragment as soon as a later
+fragment shows the gap and retries once after its RTT plus 5 ms. The window
+counts only time in which traffic flows: it stops while media is silent for more
+than a frame period, or while no repair arrives for any frame although a request
+is overdue, by at most 100 ms per frame. The iPad retires expired frames and
+drains completed frames in order. Reported repaired and unrecovered counts
+remain separate. Keyframe requests remain the fallback for expiry and decode
+errors.
 
 ABR uses the host's 4–50 Mbps ladder under the user's ceiling. Unrecovered loss,
 repair pressure, jitter and receive/decode queues can lower bitrate; sustained

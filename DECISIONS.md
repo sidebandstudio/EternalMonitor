@@ -168,6 +168,29 @@ This avoids multiplying WiFi fragment loss into keyframe storms. FEC remains
 reserved: it would spend bandwidth on clean links and needs separate device
 measurements. Keyframe recovery remains available when repair expires.
 
+### Let the repair window follow real WiFi timing
+
+The first repair window held at most three frames for 8–25 ms and asked for a
+frame's missing fragments once, retrying once. A physical iPad on the LAN, with
+the PC wired, showed why that failed on real WiFi even without injected loss.
+Fragments arrived a few milliseconds out of order, so most repairs were filled
+by the late original. Stalls released several frames at once, and the
+three-frame bound evicted frames milliseconds before their last fragment. A
+second loss in the same frame waited for the retry. A packet capture on the PC
+showed the iPad's repair requests sometimes arriving about 100 ms late, while
+the host answered each within 0.1 ms.
+
+The iPad now holds up to eight frames, requests each missing fragment as soon as
+it is seen, and pauses the 25 ms deadline while media or repairs stop flowing,
+by at most 100 ms per frame. The host resends a fragment again after 5 ms rather
+than 20 ms, so a retry can replace a lost resend. On the physical iPad over WiFi
+with 3% injected loss and 1% reordering, keyframe requests fell from 5–22 to 0–1
+per 20 s; the clean and 40 Mbps burst rows had no drops. A frame that is truly
+lost waits up to 100 ms longer before its keyframe request when nothing else is
+flowing. Marking the socket as interactive voice did not change the request
+delay, so the default service class stays. Evidence:
+`EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
+
 ### Use Apple's usbmuxd tunnel for USB
 
 Apple's installed device service handles the cable/trust relationship. EMLINK
