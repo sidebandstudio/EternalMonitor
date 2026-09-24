@@ -225,6 +225,8 @@ struct DisplayView: View {
                 .font(.app(11, relativeTo: .caption2))
                 .foregroundStyle(Theme.textMuted)
         }
+        // A one-digit value leaves the pill too narrow for "fps" otherwise.
+        .fixedSize()
     }
 
     private var separator: some View {
