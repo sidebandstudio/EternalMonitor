@@ -198,7 +198,14 @@ to half a frame period for the missing one; keyframes do not wait. When a stall
 expires several frames together, the iPad sends one keyframe request per 500 ms,
 the host's own grant interval, instead of one per frame. With both changes the
 3% loss row passed three runs in a row with at most one drop and one keyframe
-request each. Evidence: `EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
+request each.
+
+A frame with more than 64 missing fragments used to request a keyframe at once,
+because one NACK names at most 64. At 40 Mbps a 3440×1440 frame is 72
+fragments, so over Tailscale a short stall made that rule fire, and 13 of 15
+such frames then completed from late or repaired fragments. The iPad now
+requests a wide gap in several NACKs and asks for a keyframe only when a frame
+is dropped. Evidence: `EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
 
 ### Use Apple's usbmuxd tunnel for USB
 

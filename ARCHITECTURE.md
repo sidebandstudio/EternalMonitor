@@ -101,7 +101,8 @@ serviced while a paced keyframe is waiting.
 
 The iPad holds up to eight frames behind an incomplete one, for an RTT-aware
 8–25 ms repair window. It requests each missing fragment as soon as a later
-fragment shows the gap and retries once after its RTT plus 5 ms. The window
+fragment shows the gap and retries once after its RTT plus 5 ms. A NACK names
+at most 64 fragments, so a wider gap takes several. The window
 counts only time in which traffic flows: it stops while media is silent for more
 than a frame period, or while no repair arrives for any frame although a request
 is overdue, by at most 100 ms per frame. The iPad retires expired frames and
