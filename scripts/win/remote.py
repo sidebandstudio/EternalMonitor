@@ -90,7 +90,13 @@ def main(args):
         if os.environ.get("EM_INSTALLED_HOST") == "1":
             executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
         window_option = "-WindowStyle Hidden" if environment["ETERNAL_HEADLESS"] == "1" else "-NoNewWindow"
+        # Jobs keep TEMP on D: to spare C:. An installed host has the user's
+        # TEMP and its own folder as working directory, and its PowerShell
+        # VDD children inherit both, so launch the host the same way.
+        command += "; $userTemp=[Environment]::GetEnvironmentVariable('TEMP','User')"
+        command += "; if ($userTemp) { $env:TEMP=$userTemp; $env:TMP=$userTemp }"
         command += "; $p=Start-Process -PassThru " + window_option + " -FilePath " + quote(executable)
+        command += " -WorkingDirectory " + quote(executable.rsplit("\\", 1)[0])
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
