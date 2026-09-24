@@ -115,6 +115,7 @@ final class FrameAssembler {
         var deadline: UInt64?
         var retryAt: UInt64?
         var requestedAt: UInt64?
+        var completedAt: UInt64?
         var stallAllowanceUsed: UInt64 = 0
         var stallCountedUntil: UInt64 = 0
         /// Indices already requested; each is requested when first seen
@@ -225,7 +226,7 @@ final class FrameAssembler {
             dropPending(oldest)
             if repairEnabled {
                 retiredSeq = max(retiredSeq, oldest)
-                drainReady()
+                drainReady(at: now)
                 if seq <= retiredSeq { return }
             }
         }
@@ -249,6 +250,7 @@ final class FrameAssembler {
             if let previousTransit { jitter += (abs(transit - previousTransit) - jitter) / 16 }
             previousTransit = transit
         }
+        if frame.isComplete { frame.completedAt = now }
         pending[seq] = frame
         counters.withLock {
             if !isRetransmit { $0.fragsReceived += 1 }
@@ -270,7 +272,7 @@ final class FrameAssembler {
                     }
                 }
             }
-            drainReady()
+            drainReady(at: now)
         } else if frame.isComplete {
             deliver(seq)
             for stale in pending.keys where stale <= seq { dropPending(stale) }
@@ -304,7 +306,7 @@ final class FrameAssembler {
                     if pending.keys.min() == seq {
                         dropPending(seq)
                         retiredSeq = max(retiredSeq, seq)
-                        drainReady()
+                        drainReady(at: now)
                     }
                 } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
                     beginGap(seq, through: frame.fragmentCount - 1, now: now)
@@ -316,7 +318,7 @@ final class FrameAssembler {
                 dropPending(seq)
             }
         }
-        if repairEnabled { drainReady() }
+        if repairEnabled { drainReady(at: now) }
         updateDepth()
     }
 
@@ -391,8 +393,21 @@ final class FrameAssembler {
         onNeedsKeyframe?(currentEpoch ?? 0, latestCompletedSeq)
     }
 
-    private func drainReady() {
-        while let seq = pending.keys.min(), pending[seq]?.isComplete == true { deliver(seq) }
+    /// Delivers complete frames in order. WiFi can deliver a one-datagram frame
+    /// after its successor, and decoding the successor first would leave the
+    /// earlier frame stale and the decoder without its reference. A complete
+    /// frame that skips a sequence number therefore waits up to half a frame
+    /// period for it. The host can also skip a number, so the wait stays
+    /// short, and a keyframe depends on no earlier frame.
+    private func drainReady(at now: UInt64) {
+        while let seq = pending.keys.min(), let frame = pending[seq], frame.isComplete {
+            let resolved = max(latestCompletedSeq, retiredSeq)
+            if resolved > 0, seq > resolved &+ 1, !frame.isKeyframe,
+               now < (frame.completedAt ?? now) + framePeriodUs / 2 {
+                break
+            }
+            deliver(seq)
+        }
     }
 
     private func deliver(_ seq: UInt32) {

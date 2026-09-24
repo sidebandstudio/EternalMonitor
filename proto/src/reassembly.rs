@@ -66,6 +66,7 @@ struct PendingFrame {
     deadline: Option<Instant>,
     retry_at: Option<Instant>,
     requested_at: Option<Instant>,
+    completed_at: Option<Instant>,
     stall_used: Duration,
     stall_counted_until: Option<Instant>,
     /// Indices already requested; each is requested when first seen missing
@@ -284,7 +285,7 @@ impl Reassembler {
             self.drop_pending(oldest);
             if self.repair_enabled {
                 self.retired_seq = self.retired_seq.max(oldest);
-                self.drain_ready();
+                self.drain_ready(now);
                 if seq <= self.retired_seq {
                     return AddOutcome::Dropped(DropReason::StaleSeq);
                 }
@@ -302,6 +303,7 @@ impl Reassembler {
             deadline: None,
             retry_at: None,
             requested_at: None,
+            completed_at: None,
             stall_used: Duration::ZERO,
             stall_counted_until: None,
             requested: HashSet::new(),
@@ -332,6 +334,9 @@ impl Reassembler {
         self.counters.stream_epoch = epoch;
         self.counters.jitter_us = self.jitter as u32;
         let complete = frame.complete();
+        if complete {
+            frame.completed_at = Some(now);
+        }
         if self.repair_enabled {
             if !complete && frame.contiguous < frame.highest_index {
                 let through = frame.highest_index;
@@ -348,7 +353,7 @@ impl Reassembler {
                     self.begin_gap(s, through, now);
                 }
             }
-            self.drain_ready();
+            self.drain_ready(now);
         } else if complete {
             self.deliver(seq);
             let stale: Vec<_> = self.pending.range(..=seq).map(|(&s, _)| s).collect();
@@ -382,7 +387,7 @@ impl Reassembler {
                     if self.pending.first_key_value().map(|(&s, _)| s) == Some(seq) {
                         self.drop_pending(seq);
                         self.retired_seq = self.retired_seq.max(seq);
-                        self.drain_ready();
+                        self.drain_ready(now);
                     }
                 } else if frame.deadline.is_none()
                     && now.saturating_duration_since(frame.created_at) >= self.frame_period
@@ -404,7 +409,7 @@ impl Reassembler {
             }
         }
         if self.repair_enabled {
-            self.drain_ready();
+            self.drain_ready(now);
         }
         self.update_depth();
     }
@@ -518,9 +523,21 @@ impl Reassembler {
         }
     }
 
-    fn drain_ready(&mut self) {
+    /// Delivers complete frames in order; a complete frame that skips a
+    /// sequence number waits up to half a frame period for it (see
+    /// `FrameAssembler.drainReady(at:)`).
+    fn drain_ready(&mut self, now: Instant) {
+        let hold = Duration::from_micros(self.frame_period.as_micros() as u64 / 2);
         while let Some((&seq, frame)) = self.pending.first_key_value() {
             if !frame.complete() {
+                break;
+            }
+            let resolved = self.latest_completed_seq.max(self.retired_seq);
+            if resolved > 0
+                && seq > resolved.wrapping_add(1)
+                && !frame.header.is_keyframe
+                && now < frame.completed_at.unwrap_or(now) + hold
+            {
                 break;
             }
             self.deliver(seq);

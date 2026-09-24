@@ -189,3 +189,27 @@ add 2100 1 1 4 5 0 5
 expect 0 0 3 0 0 2 1 - 0 1:1|1:3
 add 4000 1 1 3 5 1 4
 expect 1 0 3 0 2 2 0 1 0 1:1|1:3
+
+# WiFi can deliver a one-datagram frame after its successor. A complete frame
+# that skips a sequence number waits up to half a frame period for it.
+reset 16667 10000
+add 0 1 1 0 1 0 1
+add 1000 1 3 0 1 0 3
+expect 1 0 2 0 0 0 0 1 0 -
+add 2000 1 2 0 1 0 2
+expect 3 0 3 0 0 0 0 1,2,3 0 -
+
+# The host can skip a sequence number itself, so the wait is short.
+reset 16667 10000
+add 0 1 1 0 1 0 1
+add 1000 1 3 0 1 0 3
+tick 9332
+expect 1 0 2 0 0 0 0 1 0 -
+tick 9333
+expect 2 0 2 0 0 0 0 1,3 0 -
+
+# A keyframe depends on no earlier frame and is delivered at once.
+reset 16667 10000
+add 0 1 1 0 1 0 1
+add 1000 1 3 0 1 0 3 1
+expect 2 0 2 0 0 0 0 1,3 0 -
