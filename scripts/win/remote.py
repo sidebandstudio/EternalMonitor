@@ -97,7 +97,7 @@ def main(args):
         command += "; $p.WaitForExit(); if ($p.ExitCode -ne 0) { throw ('Host exited with ' + $p.ExitCode) }"
         session(command, detach=True, idle=True, timeout=7200,
                 run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
-        ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(pidfile) + ")) { "
+        ps("$deadline=(Get-Date).AddSeconds(60); while (!(Test-Path " + quote(pidfile) + ")) { "
            "if ((Get-Date) -gt $deadline) { throw 'Host did not start; inspect the interactive job' }; Start-Sleep -Milliseconds 100 }; "
            "$record=Get-Content " + quote(pidfile) + " -Raw | ConvertFrom-Json; "
            "$p=Get-Process -Id $record.id; if ($p.Path -ne $record.path -or "
@@ -198,7 +198,7 @@ def main(args):
                     detach=True, idle=True, timeout=7260,
                     run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
             if action == "probe":
-                ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
+                ps("$deadline=(Get-Date).AddSeconds(60); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not start' }; Start-Sleep -Milliseconds 100 }; "
                    "while (!(Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1)) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not become ready' }; Start-Sleep -Milliseconds 100 }")

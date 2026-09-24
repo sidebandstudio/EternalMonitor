@@ -23,9 +23,11 @@ REMOTE = ROOT / 'scripts/win/remote.sh'
 ROWS = {
     'D-h264-wifi': dict(link='udp'),
     'D-hevc-wifi': dict(link='udp', hevc=True),
+    'D-hevc-amf-wifi': dict(link='udp', hevc=True, family='amf'),
     'D-loss3-wifi': dict(link='udp', repairs=True, host=['ETERNAL_DROP=0.03', 'ETERNAL_REORDER=0.01']),
     'D-burst-wifi': dict(link='udp', bitrate=40, host=['ETERNAL_ABR=0', 'ETERNAL_FORCE_IDR_PERIOD=60']),
     'D-h264-usb': dict(link='usb'),
+    'D-hevc-usb': dict(link='usb', hevc=True),
     'D-fps120-usb': dict(link='usb', fps=120),
 }
 
@@ -50,8 +52,11 @@ def run_row(name, spec, out, args):
     save(result_path, dict(scenario=name, status='FAIL', errors=['Run did not finish']))
     fps = spec.get('fps', 60)
     codec = 'hevc' if spec.get('hevc') else 'h264'
-    host = ['ETERNAL_HEADLESS=1', 'ETERNAL_ENCODER=h264_nvenc', f'ETERNAL_HEVC={int(codec == "hevc")}',
+    family = spec.get('family', 'nvenc')
+    host = ['ETERNAL_HEADLESS=1', f'ETERNAL_ENCODER=h264_{family}', f'ETERNAL_HEVC={int(codec == "hevc")}',
             f'ETERNAL_FPS={fps}', 'ETERNAL_E2E_LOG=1', *spec.get('host', [])]
+    if family == 'amf':
+        host.append('ETERNAL_AMF_DIAG=1')
     if os.environ.get('EM_HOST_RUST_LOG'):
         host.append('RUST_LOG=' + os.environ['EM_HOST_RUST_LOG'])
     launch = {'EM_E2E_LOG': '1', 'OS_ACTIVITY_DT_MODE': 'YES'}
@@ -116,7 +121,7 @@ def run_row(name, spec, out, args):
             errors.append('loss row did not exercise retransmission repair')
         host_log = remote('log')
         (row / 'host.log').write_text(host_log)
-        encoder = ('hevc_' if codec == 'hevc' else 'h264_') + 'nvenc'
+        encoder = ('hevc_' if codec == 'hevc' else 'h264_') + family
         check_stream(result, host_log, encoder, repairs=spec.get('repairs', False),
                      bitrate=40_000_000 if spec.get('bitrate') == 40 else None)
         if fps == 120:
