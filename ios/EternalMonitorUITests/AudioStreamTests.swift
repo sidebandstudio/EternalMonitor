@@ -19,7 +19,9 @@ final class AudioStreamTests: XCTestCase {
         waitForValue(toggle, value: "0")
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio muted or unavailable")
-        XCTAssertTrue(control("display.disconnect", in: app).exists)
+        let disconnect = app.buttons["display.disconnect"]
+        revealControls(app, showing: disconnect)
+        XCTAssertTrue(appears(disconnect, within: 5))
         capture("audio-muted-hud", app: app)
         openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
@@ -35,29 +37,41 @@ final class AudioStreamTests: XCTestCase {
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio playing")
         capture("audio-playing-hud", app: app)
-        let host = app.textFields["connect.host"]
-        for _ in 0..<2 where !host.exists {
-            control("display.disconnect", in: app).tap()
-            _ = host.waitForExistence(timeout: 5)
-        }
-        XCTAssertTrue(host.exists)
+        tapControl("display.disconnect", in: app, until: app.textFields["connect.host"])
         app.terminate()
     }
 
-    // Display controls fade five seconds after they appear, sooner than a
-    // busy runner may finish waiting for audio. Bring them back with the
-    // user's three-finger gesture instead of racing the fade.
+    // Display controls fade five seconds after they appear. A busy runner can
+    // outlast that between finding a control and touching it, and a touch on
+    // a vanished element fails the test outright. Bring the controls back
+    // with the user's three-finger gesture, touch the control's position, and
+    // check the outcome before continuing.
     private func revealControls(_ app: XCUIApplication, showing element: XCUIElement) {
-        if !(element.exists && element.isHittable) {
-            app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
-        }
+        if !element.exists { app.tap(withNumberOfTaps: 1, numberOfTouches: 3) }
     }
 
-    private func control(_ identifier: String, in app: XCUIApplication) -> XCUIElement {
+    private func appears(_ element: XCUIElement, where format: String = "exists == true",
+                         _ arguments: CVarArg..., within timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate(format: format, argumentArray: arguments)
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func tapControl(_ identifier: String, in app: XCUIApplication, until result: XCUIElement) {
         let control = app.buttons[identifier]
-        revealControls(app, showing: control)
-        XCTAssertTrue(control.waitForExistence(timeout: 5))
-        return control
+        for _ in 0..<3 where !result.exists {
+            revealControls(app, showing: control)
+            guard appears(control, within: 5) else { continue }
+            let center = control.frame
+            app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: center.midX, dy: center.midY)).tap()
+            _ = appears(result, within: 5)
+        }
+        XCTAssertTrue(result.exists, "\(identifier) did not open \(result)")
+    }
+
+    private func openSettings(_ app: XCUIApplication) {
+        tapControl("display.settings", in: app, until: app.navigationBars["Settings"])
     }
 
     private func waitForHUD(_ app: XCUIApplication, containing text: String) {
@@ -65,19 +79,9 @@ final class AudioStreamTests: XCTestCase {
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
             revealControls(app, showing: hud)
-            if hud.waitForExistence(timeout: 2), hud.label.contains(text) { return }
+            if appears(hud, where: "exists == true AND label CONTAINS %@", text, within: 2) { return }
         }
-        XCTFail("HUD never showed \"\(text)\": \(hud.exists ? hud.label : "hidden")")
-    }
-
-    // A tap can still land just after the controls fade on a slow runner.
-    private func openSettings(_ app: XCUIApplication) {
-        let settings = app.navigationBars["Settings"]
-        for _ in 0..<2 where !settings.exists {
-            control("display.settings", in: app).tap()
-            _ = settings.waitForExistence(timeout: 5)
-        }
-        XCTAssertTrue(settings.exists)
+        XCTFail("HUD never showed \"\(text)\"")
     }
 
     private func waitForValue(_ element: XCUIElement, value: String) {
