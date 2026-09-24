@@ -20,13 +20,13 @@ struct SettingsView: View {
                     Picker(selection: $settings.targetFPS) {
                         Text("30 fps").tag(30)
                         Text("60 fps").tag(60)
+                        Text("120 fps").tag(120)
                     } label: {
                         Label("Frame Rate", systemImage: "speedometer")
                     }
 
-                    Toggle(isOn: $settings.promotionEnabled) {
-                        Label("ProMotion (120Hz)", systemImage: "display")
-                    }
+                    .accessibilityIdentifier("settings.targetFPS")
+                    .accessibilityValue("\(settings.targetFPS) fps")
 
                     Toggle(isOn: $settings.showHUD) {
                         Label("Show stats HUD", systemImage: "gauge.with.dots.needle.33percent")
@@ -57,7 +57,8 @@ struct SettingsView: View {
                     sectionHeader("Playback")
                 } footer: {
                     footnote(
-                        "Tap the video to toggle the HUD while streaming — "
+                        "Frame Rate sets the host limit on the next connection. "
+                            + "Tap the video to toggle the HUD while streaming — "
                             + "three fingers while Control PC is on."
                     )
                 }

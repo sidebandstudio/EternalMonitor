@@ -34,6 +34,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Surface the host's tracing in test output (best effort, once per process).
 fn init_test_tracing() {
+    // Never let a synthetic test claim a physically connected iPad. The USB
+    // test replaces this unreachable endpoint with its own loopback listener.
+    std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
@@ -188,6 +191,45 @@ fn usb_framed_stream_end_to_end() {
         assert!(dropped > 0, "a 500 ms read stall must overflow the video queue");
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
         eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
+
+        // A virtual-display startup restarts capture once. That closes USB,
+        // causing another HELLO on the replacement tunnel while the monitor
+        // is still attaching. It must not trigger a second pipeline restart.
+        use eternal_host::control::{CaptureTarget, VddStatus};
+        use eternal_host::supervisor::CURRENT_GENERATION;
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        let original_generation = CURRENT_GENERATION.load(Ordering::SeqCst);
+        let ControlMessage::Hello2(mut next_hello) = hello else { unreachable!() };
+        next_hello.client_nonce += 1;
+        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_datagram(&mut stream).await.is_ok() {}
+        }).await.expect("virtual-display start must close the previous tunnel");
+        drop(stream);
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+        read_preamble(&mut stream).await.unwrap();
+        next_hello.client_nonce += 1;
+        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello))).await.unwrap();
+        let mut received_ack = false;
+        let mut frames = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames < 30 || !received_ack {
+            assert!(Instant::now() < deadline, "USB reconnect must resume media during display startup");
+            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+            if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) {
+                assert_eq!(ack.status, HelloStatus::Ok);
+                received_ack = true;
+            } else if let Ok((header, _)) = MediaHeader::decode(&bytes) {
+                if header.frag_index == 0 { frames += 1; }
+            }
+        }
+        assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), original_generation + 1,
+            "USB HELLO during attach must not restart capture again");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        *shared.vdd_status.lock() = VddStatus::Inactive;
+        eprintln!("USB_VDD_RECONNECT frames={frames} restarts=1");
         drop(stream);
         let disconnected = Instant::now();
         while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
@@ -265,6 +307,7 @@ struct FakeReceiver {
     msg_seq: u32,
     last_report: Instant,
     host_caps: u16,
+    advertised_fps: u16,
 }
 
 impl FakeReceiver {
@@ -278,6 +321,15 @@ impl FakeReceiver {
     }
 
     fn connect_full(host_port: u16, decoder_caps: u16, feature_caps: u16) -> Self {
+        Self::connect_preferred(host_port, decoder_caps, feature_caps, 0)
+    }
+
+    fn connect_preferred(
+        host_port: u16,
+        decoder_caps: u16,
+        feature_caps: u16,
+        preferred_fps: u8,
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -300,7 +352,7 @@ impl FakeReceiver {
             refresh_hz: 120,
             device_name: "E2E fake iPad".to_string(),
             device_id: 0,
-            preferred_fps: 0,
+            preferred_fps,
             auth_token: [0; 16],
             pairing_code: 0,
         });
@@ -348,6 +400,7 @@ impl FakeReceiver {
             msg_seq: 1,
             last_report: Instant::now(),
             host_caps: ack.host_caps,
+            advertised_fps: ack.stream_config.fps,
         }
     }
 
@@ -384,12 +437,7 @@ fn audio_stream_end_to_end() {
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
     std::env::set_var("ETERNAL_AUDIO", "synthetic");
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
-    for name in [
-        "ETERNAL_DROP",
-        "ETERNAL_REORDER",
-        "ETERNAL_JITTER_MS",
-        "ETERNAL_USB_DIRECT",
-    ] {
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
         std::env::remove_var(name);
     }
     let listen_port = free_udp_port();
@@ -1644,7 +1692,6 @@ fn pairing_flow_end_to_end() {
         "ETERNAL_REORDER",
         "ETERNAL_JITTER_MS",
         "ETERNAL_FAULT_ENCODER_AFTER",
-        "ETERNAL_USB_DIRECT",
     ] {
         std::env::remove_var(name);
     }
@@ -1737,6 +1784,7 @@ fn pairing_flow_end_to_end() {
             msg_seq: 1,
             last_report: Instant::now(),
             host_caps: paired.host_caps,
+            advertised_fps: paired.stream_config.fps,
         };
         let mut assembler = Reassembler::new();
         let mut decoder = H264TestDecoder::new();
@@ -1794,6 +1842,99 @@ fn pairing_flow_end_to_end() {
     shared.stop();
     tx.send(SupervisorCommand::Shutdown).unwrap();
     supervisor.join().unwrap();
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn preferred_fps_caps_the_host() {
+    use std::sync::atomic::Ordering;
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", "640x360");
+    for name in [
+        "ETERNAL_DROP",
+        "ETERNAL_REORDER",
+        "ETERNAL_JITTER_MS",
+        "ETERNAL_FAULT_ENCODER_AFTER",
+    ] {
+        std::env::remove_var(name);
+    }
+    let port = free_udp_port();
+    let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    shared.target_fps.store(120, Ordering::SeqCst);
+    let (tx, rx) = mpsc::channel();
+    let host_shared = shared.clone();
+    let host_tx = tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(port, host_shared, GpuInfo::software_fallback(), host_tx, rx);
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 30);
+        assert_eq!(receiver.advertised_fps, 30);
+        let mut assembler = Reassembler::new();
+        let mut decoder = H264TestDecoder::new();
+        let mut frames = Vec::new();
+        let mut buffer = [0; 2048];
+        let mut heartbeat_seen = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while frames.len() < 45 || !heartbeat_seen {
+            assert!(Instant::now() < deadline, "capped stream must still decode");
+            receiver.maybe_report(0, frames.len() as u32);
+            let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if let Ok((_, ControlMessage::Heartbeat(heartbeat))) = parse_control(&buffer[..len]) {
+                assert_eq!(heartbeat.stream_config.fps, 30);
+                heartbeat_seen = true;
+            }
+            let Ok((header, payload)) = MediaHeader::decode(&buffer[..len]) else {
+                continue;
+            };
+            if let AddOutcome::Completed(bytes) = assembler.add_fragment(
+                header.frame_seq,
+                header.frag_index,
+                header.frag_count,
+                header.stream_epoch,
+                payload,
+                Instant::now(),
+            ) {
+                frames.extend(decoder.decode(&bytes));
+            }
+        }
+        assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
+        assert_eq!(shared.effective_fps(), 30);
+        assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.client_preferred_fps.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "disconnect must release the client cap"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(shared.effective_fps(), 120);
+        shared.target_fps.store(30, Ordering::SeqCst);
+        let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 120);
+        assert_eq!(receiver.advertised_fps, 30);
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    shared.stop();
+    tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bounded shutdown");
     if let Err(error) = outcome {
         std::panic::resume_unwind(error);
     }

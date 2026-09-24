@@ -278,10 +278,12 @@ pub async fn start_sender(
                                             }
                                         }
                                         if let Some(report) = actions.report.take() {
+                                            // A slow log sink must not hold the capture/encode stats lock.
+                                            let retransmits = PIPELINE_STATS.lock().transport_retransmits;
                                             info!(epoch = report.stream_epoch, complete = report.frames_complete,
                                                 dropped = report.frames_dropped, repaired = report.frags_repaired,
                                                 nacks = report.nacks_sent, jitter_us = report.jitter_us,
-                                                retransmits = PIPELINE_STATS.lock().transport_retransmits,
+                                                retransmits,
                                                 "Receiver report");
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
@@ -554,6 +556,14 @@ async fn execute_actions(
     }
 
     if let Some(target) = actions.new_target {
+        let preference = shared
+            .session
+            .lock()
+            .client_info()
+            .map_or(0, |info| u32::from(info.preferred_fps));
+        shared
+            .client_preferred_fps
+            .store(preference, Ordering::SeqCst);
         *shared.target_addr.lock() = target;
         {
             let mut stats = PIPELINE_STATS.lock();
@@ -565,9 +575,7 @@ async fn execute_actions(
         // user selected it before any client existed, this first registration
         // is the moment to bring it up — which needs a pipeline restart so the
         // capture loop re-runs reconciliation.
-        let needs_vdd_restart = *shared.capture_target.lock() == CaptureTarget::VirtualExtended
-            && *shared.vdd_status.lock() == VddStatus::WaitingForClient;
-        if needs_vdd_restart {
+        if shared.begin_virtual_display_attach() {
             info!("Client connected with extended display selected — restarting pipeline to enable it");
             shared.stop();
             if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
@@ -581,6 +589,7 @@ async fn execute_actions(
     }
 
     if actions.client_lost {
+        shared.client_preferred_fps.store(0, Ordering::SeqCst);
         let unspecified = PeerId {
             link: LinkId::Udp,
             addr: None,
@@ -595,7 +604,10 @@ async fn execute_actions(
         // connected. (This closes the DECISIONS.md "idle-disconnect teardown"
         // item, which was blocked on exactly this liveness signal.)
         let vdd_in_use = *shared.capture_target.lock() == CaptureTarget::VirtualExtended
-            && *shared.vdd_status.lock() == VddStatus::Active;
+            && matches!(
+                *shared.vdd_status.lock(),
+                VddStatus::Active | VddStatus::Attaching
+            );
         if vdd_in_use {
             info!("Client gone while streaming the virtual display — restarting pipeline to tear it down");
             shared.stop();

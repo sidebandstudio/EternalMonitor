@@ -11,6 +11,7 @@ getrandom = { version = "0.3.4", features = ["std"] }
 subtle = "2.6"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # GUI
@@ -23,6 +24,8 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 plist = "1"
+semver = "1"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 
 # mDNS service advertisement
 mdns-sd = "0.13.11"
@@ -44,6 +47,7 @@ features = [
     "Win32_Security",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_System_Performance",

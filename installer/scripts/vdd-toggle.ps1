@@ -13,19 +13,30 @@ param(
     [string]$Action
 )
 
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
 
-$dev = Get-PnpDevice -Class Display |
-    Where-Object { $_.FriendlyName -like '*Virtual Display*' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
-    Select-Object -First 1 -ExpandProperty InstanceId
+$devices = @(Get-PnpDevice -Class Display -PresentOnly | Where-Object {
+    $ids = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds').Data
+    $ids -contains 'Root\MttVDD'
+})
 
-if (-not $dev) {
-    # Nothing to toggle (driver not installed / not yet enumerated). Not an error.
-    exit 0
+if ($devices.Count -eq 0) {
+    if ($Action -eq 'disable') { exit 0 }
+    throw 'The bundled Virtual Display Driver device is not present. Reinstall EternalMonitor with its display driver.'
 }
 
-if ($Action -eq 'enable') {
-    & pnputil.exe /enable-device "$dev" | Out-Null
-} else {
-    & pnputil.exe /disable-device "$dev" | Out-Null
+foreach ($device in $devices) {
+    # PnPUtil can report this root device as disconnected even when its
+    # present devnode is disabled. The PnpDevice cmdlets address that devnode.
+    if ($Action -eq 'enable') {
+        Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
+    } else {
+        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
+    }
+    $actual = Get-PnpDevice -InstanceId $device.InstanceId
+    $expectedProblem = if ($Action -eq 'enable') { 0 } else { 22 }
+    if ([int]$actual.Problem -ne $expectedProblem) {
+        throw "Virtual display $Action failed: $($actual.InstanceId) reports $($actual.Problem)"
+    }
+    Write-Output "Virtual display $Action completed: $($actual.InstanceId)"
 }

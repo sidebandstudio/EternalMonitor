@@ -368,10 +368,17 @@ pub fn run(
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
 /// and after the pipeline has had a moment to warm up.
 fn wedge_reason(shared: &SharedControl, machine: &Machine) -> Option<String> {
+    wedge_reason_at(shared, machine, crate::clock::host_now_us() / 1000)
+}
+
+pub(crate) fn wedge_reason_at(
+    shared: &SharedControl,
+    machine: &Machine,
+    now_ms: u64,
+) -> Option<String> {
     if !matches!(machine.state, SupervisorState::Running { .. }) {
         return None;
     }
-    let now_ms = crate::clock::host_now_us() / 1000;
     let loop_ms = shared.hb_capture_loop_ms.load(Ordering::Relaxed);
     let frame_ms = shared.hb_capture_frame_ms.load(Ordering::Relaxed);
     let encode_ms = shared.hb_encode_frame_ms.load(Ordering::Relaxed);

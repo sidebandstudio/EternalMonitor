@@ -83,7 +83,7 @@ if ($driverSetup) {
         if ($StrictSignature) {
             throw "Driver setup signature is '$($sig.Status)', expected 'Valid'. Refusing to bundle an unverified driver in a release build."
         }
-        Write-Warning "Driver setup signature is '$($sig.Status)', expected 'Valid'. Bundling anyway — verify the source."
+        Write-Warning "Driver setup signature is '$($sig.Status)', expected 'Valid'. Bundling anyway. Verify the source."
     }
     $driverStage = Join-Path $staging "driver"
     New-Item -ItemType Directory -Path $driverStage | Out-Null

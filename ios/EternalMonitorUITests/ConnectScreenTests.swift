@@ -54,4 +54,31 @@ final class ConnectScreenTests: XCTestCase {
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
         waitForExpectations(timeout: 5)
     }
+
+    func testFrameRatePreference() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]
+        app.launch()
+        XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
+        app.buttons["settings.button"].tap()
+        let rate = app.buttons["settings.targetFPS"]
+        XCTAssertTrue(rate.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.switches["settings.allowUSB"].value as? String, "0")
+        XCTAssertEqual(rate.value as? String, "60 fps")
+        rate.tap()
+        app.buttons["120 fps"].tap()
+        XCTAssertEqual(rate.value as? String, "120 fps")
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "settings-fps120"; shot.lifetime = .keepAlways; add(shot)
+        app.terminate()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launch()
+        XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
+        app.buttons["settings.button"].tap()
+        XCTAssertTrue(rate.waitForExistence(timeout: 5))
+        XCTAssertEqual(rate.value as? String, "120 fps")
+        rate.tap()
+        app.buttons["60 fps"].tap()
+        app.buttons["settings.done"].tap()
+    }
 }

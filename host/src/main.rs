@@ -14,14 +14,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
+    let (stdout_writer, _stdout_guard) = logging::non_blocking_output(std::io::stdout());
+    let (memory_writer, _session_guard) = logging::MemoryLogWriter::start();
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO))
+        .with_writer(stdout_writer.with_max_level(tracing::Level::INFO))
         .with_filter(logging::MdnsDedupFilter::new());
     let memory_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(logging::MemoryLogWriter::new)
+        .with_writer(move || memory_writer.clone())
         .with_filter(logging::MdnsDedupFilter::new());
 
     tracing_subscriber::registry()
@@ -115,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_dgram
         .store(u32::from(max_dgram), std::sync::atomic::Ordering::SeqCst);
     info!(max_dgram, "Media packet size configured");
-    if persisted.target_fps == 30 || persisted.target_fps == 60 {
+    if [30, 60, 90, 120].contains(&persisted.target_fps) {
         shared
             .target_fps
             .store(persisted.target_fps, std::sync::atomic::Ordering::SeqCst);
@@ -123,6 +125,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = persisted.encoder_override.clone() {
         *shared.encoder_override.lock() = Some(name);
     }
+    *shared.encoder_input.lock() = match std::env::var("ETERNAL_INPUT") {
+        Ok(value) => eternal_host::encoder::input::EncoderInput::from_env(&value)
+            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))?,
+        Err(_) => persisted.encoder_input,
+    };
     *shared.capture_target.lock() =
         eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
     shared
@@ -181,14 +188,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     /// Set by the termination-signal handler; the headless loop polls it.
-    /// (On Windows no handler is registered — headless there still exits only
-    /// on a hard kill, same as before.)
     static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     #[cfg(unix)]
     extern "C" fn on_terminate_signal(_signal: libc::c_int) {
         // Async-signal-safe: only a flag store — the polling loop does the work.
         SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(windows)]
+    unsafe extern "system" fn on_console_control(event: u32) -> windows::Win32::Foundation::BOOL {
+        use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+            SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            true.into()
+        } else {
+            false.into()
+        }
     }
 
     let supervisor_thread = std::thread::spawn(move || {
@@ -208,6 +223,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let handler = on_terminate_signal as extern "C" fn(libc::c_int);
             libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
             libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        }
+        #[cfg(windows)]
+        unsafe {
+            if let Err(error) = windows::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(on_console_control),
+                true,
+            ) {
+                tracing::warn!(%error, "Could not register the console shutdown handler");
+            }
         }
         let log_e2e = std::env::var("ETERNAL_E2E_LOG").is_ok_and(|v| v == "1");
         let mut last_sample = std::time::Instant::now();

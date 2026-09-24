@@ -137,7 +137,7 @@ final class ConnectionManager: ObservableObject {
     static let connectionTimeoutSeconds: UInt64 = 10
 
     func refreshUSBAvailability() {
-        let allowed = UserDefaults.standard.object(forKey: "allowUSB") as? Bool ?? true
+        let allowed = UserDefaults.standard.flag(forKey: "allowUSB")
         guard allowed, isForeground, !usbPaused else {
             usbListener?.stop()
             usbListener = nil
@@ -267,9 +267,9 @@ final class ConnectionManager: ObservableObject {
         diagnostics.removeAll()
         didExtendTimeout = false
         videoSize = .zero
-        let wantsInput = UserDefaults.standard.object(forKey: "controlPC") as? Bool ?? true
+        let wantsInput = UserDefaults.standard.flag(forKey: "controlPC")
         sessionWantsInput = wantsInput
-        let wantsAudio = audioPreference ?? (UserDefaults.standard.object(forKey: "playPCaudio") as? Bool ?? true)
+        let wantsAudio = audioPreference ?? (UserDefaults.standard.flag(forKey: "playPCaudio"))
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
@@ -318,7 +318,7 @@ final class ConnectionManager: ObservableObject {
                     // Streaming is a passive activity — keep the iPad from
                     // dimming mid-session unless the user opted out.
                     UIApplication.shared.isIdleTimerDisabled =
-                        UserDefaults.standard.object(forKey: "keepScreenAwake") as? Bool ?? true
+                        UserDefaults.standard.flag(forKey: "keepScreenAwake")
                     E2E.firstFrame(width: frameWidth, height: frameHeight, link: isUSB ? "usb" : "udp")
                     RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
                         port: port, isUSB: isUSB)
@@ -515,18 +515,21 @@ final class ConnectionManager: ObservableObject {
         receiver.onControlDatagram = { [weak channel] data in
             channel?.handleControl(data)
         }
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        let screen = scene?.screen ?? UIScreen.main
         let identity = ControlChannel.ClientIdentity(
             deviceName: UIDevice.current.name,
-            screenPxW: UInt16(clamping: Int(UIScreen.main.nativeBounds.width)),
-            screenPxH: UInt16(clamping: Int(UIScreen.main.nativeBounds.height)),
-            screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
-            screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
-            refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
+            screenPxW: UInt16(clamping: Int(screen.nativeBounds.width)),
+            screenPxH: UInt16(clamping: Int(screen.nativeBounds.height)),
+            screenPtW: UInt16(clamping: Int(screen.bounds.width)),
+            screenPtH: UInt16(clamping: Int(screen.bounds.height)),
+            refreshHz: UInt8(clamping: screen.maximumFramesPerSecond),
             decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
             featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
                 | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
             deviceId: DeviceIdentity.load(),
-            preferredFPS: UInt8(clamping: UserDefaults.standard.object(forKey: "targetFPS") as? Int ?? 60),
+            preferredFPS: UInt8(UserDefaults.standard.frameRatePreference()),
             authToken: pairingToken
         )
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
@@ -699,7 +702,7 @@ final class ConnectionManager: ObservableObject {
 
     private func beginReconnect(reason: String) {
         let target = lastTarget
-        let auto = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
+        let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
         record(.warning, "ctrl", "Connection lost (\(reason))")
         disconnect()
         guard auto, let target else {
@@ -797,7 +800,7 @@ final class ConnectionManager: ObservableObject {
         refreshUSBAvailability()
         guard resumeOnForeground else { return }
         resumeOnForeground = false
-        guard UserDefaults.standard.object(forKey: "autoResumeOnForeground") as? Bool ?? true,
+        guard UserDefaults.standard.flag(forKey: "autoResumeOnForeground"),
               state == .disconnected,
               let target = lastTarget
         else { return }
@@ -1024,9 +1027,6 @@ final class AppSettings: ObservableObject {
     @Published var targetFPS: Int {
         didSet { UserDefaults.standard.set(targetFPS, forKey: "targetFPS") }
     }
-    @Published var promotionEnabled: Bool {
-        didSet { UserDefaults.standard.set(promotionEnabled, forKey: "promotionEnabled") }
-    }
     // last successfully-connected host+port for pre-fill on relaunch.
     @Published var lastHost: String {
         didSet { UserDefaults.standard.set(lastHost, forKey: "lastHost") }
@@ -1037,19 +1037,18 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        self.playPCaudio = defaults.object(forKey: "playPCaudio") as? Bool ?? true
-        self.allowUSB = defaults.object(forKey: "allowUSB") as? Bool ?? true
-        self.showHUD = defaults.object(forKey: "showHUD") as? Bool ?? true
-        self.keepScreenAwake = defaults.object(forKey: "keepScreenAwake") as? Bool ?? true
+        self.playPCaudio = defaults.flag(forKey: "playPCaudio")
+        self.allowUSB = defaults.flag(forKey: "allowUSB")
+        self.showHUD = defaults.flag(forKey: "showHUD")
+        self.keepScreenAwake = defaults.flag(forKey: "keepScreenAwake")
         self.autoResumeOnForeground =
-            defaults.object(forKey: "autoResumeOnForeground") as? Bool ?? true
-        self.controlPC = defaults.object(forKey: "controlPC") as? Bool ?? true
-        self.commandAsControl = defaults.object(forKey: "commandAsControl") as? Bool ?? true
-        self.autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
-        self.targetFPS = defaults.object(forKey: "targetFPS") as? Int ?? 60
-        self.promotionEnabled = defaults.object(forKey: "promotionEnabled") as? Bool ?? true
+            defaults.flag(forKey: "autoResumeOnForeground")
+        self.controlPC = defaults.flag(forKey: "controlPC")
+        self.commandAsControl = defaults.flag(forKey: "commandAsControl")
+        self.autoReconnect = defaults.flag(forKey: "autoReconnect")
+        self.targetFPS = defaults.frameRatePreference()
         self.lastHost = defaults.object(forKey: "lastHost") as? String ?? ""
-        let port = defaults.object(forKey: "lastPort") as? Int ?? 0
+        let port = defaults.integer(forKey: "lastPort")
         self.lastPort = UInt16(clamping: port)
     }
 }
@@ -1094,5 +1093,17 @@ final class RecentConnectionStore: ObservableObject {
     private func save() {
         guard let data = try? JSONEncoder().encode(connections) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+private extension UserDefaults {
+    // Foundation also accepts string-valued launch arguments used by UI tests.
+    func flag(forKey key: String) -> Bool {
+        object(forKey: key) == nil ? true : bool(forKey: key)
+    }
+
+    func frameRatePreference() -> Int {
+        let fps = integer(forKey: "targetFPS")
+        return [30, 60, 120].contains(fps) ? fps : 60
     }
 }

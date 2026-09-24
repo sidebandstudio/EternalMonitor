@@ -19,6 +19,8 @@ use crate::control::SharedControl;
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
+pub mod input;
+use input::{select_input, EncoderInput};
 #[cfg(target_os = "macos")]
 mod vimage;
 
@@ -111,6 +113,7 @@ fn run_encode_loop(
     }
 
     let mut encoder_state: Option<EncoderState> = None;
+    let input_mode = *shared.encoder_input.lock();
     let mut frames_since_last_idr: u64 = 0;
     let test_idr_period = std::env::var("ETERNAL_FORCE_IDR_PERIOD")
         .ok()
@@ -122,7 +125,7 @@ fn run_encode_loop(
     // iPad unable to build a format description.
     let mut amf_startup_idr_retries: u8 = 0;
     // Suppresses reopen retry storms after a failed bitrate change.
-    let mut failed_reopen_bitrate: Option<u32> = None;
+    let mut failed_reopen: Option<(u32, u32)> = None;
     // HEVC gating memory: warn only once when no HEVC sibling exists, and
     // don't retry an HEVC open that failed until the preference or the
     // session changes (hevc_wanted going false resets it).
@@ -164,7 +167,7 @@ fn run_encode_loop(
         }
 
         let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
-        let target_fps = shared.target_fps.load(Ordering::SeqCst);
+        let target_fps = shared.effective_fps();
 
         // HEVC negotiation, re-checked every frame so a settings toggle or a
         // new session takes effect at the next frame boundary: the user's
@@ -201,6 +204,7 @@ fn run_encode_loop(
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
+                input_mode,
             ) {
                 Ok(state) => {
                     encoder_state = Some(state);
@@ -238,6 +242,7 @@ fn run_encode_loop(
                         raw_frame.height,
                         desired_bitrate,
                         target_fps,
+                        input_mode,
                     )?);
                     note_encoder_opened(&shared, &encoder_name);
                 }
@@ -245,8 +250,8 @@ fn run_encode_loop(
             }
         } else if encoder_state.as_ref().is_some_and(|state| {
             state.opened_encoder != desired_encoder
-                || (state.opened_bitrate != desired_bitrate
-                    && failed_reopen_bitrate != Some(desired_bitrate))
+                || ((state.opened_bitrate != desired_bitrate || state.opened_fps != target_fps)
+                    && failed_reopen != Some((desired_bitrate, target_fps)))
         }) {
             // Bitrate changed (ABR rung or the user's slider) or the
             // negotiated codec changed (HEVC toggle / client capability):
@@ -263,6 +268,7 @@ fn run_encode_loop(
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
+                input_mode,
             ) {
                 Ok(state) => {
                     info!(
@@ -272,7 +278,7 @@ fn run_encode_loop(
                         "Reopened encoder session"
                     );
                     encoder_state = Some(state);
-                    failed_reopen_bitrate = None;
+                    failed_reopen = None;
                     shared.force_next_idr.store(true, Ordering::SeqCst);
                     note_encoder_opened(&shared, &desired_encoder);
                 }
@@ -290,7 +296,7 @@ fn run_encode_loop(
                         bitrate = desired_bitrate,
                         "Encoder reopen failed — keeping the current session"
                     );
-                    failed_reopen_bitrate = Some(desired_bitrate);
+                    failed_reopen = Some((desired_bitrate, target_fps));
                 }
             }
         }
@@ -323,17 +329,18 @@ fn run_encode_loop(
         #[cfg(not(target_os = "macos"))]
         let converted = false;
         if !converted {
-            let stride = encoder.bgra_frame.stride(0);
-            let bgra_plane = encoder.bgra_frame.data_mut(0);
+            let input_frame = encoder.bgra_frame.as_mut().unwrap_or(&mut encoder.frame);
+            let stride = input_frame.stride(0);
+            let bgra_plane = input_frame.data_mut(0);
             for y in 0..raw_frame.height as usize {
                 let src_offset = y * src_row_bytes;
                 let dst_offset = y * stride;
                 bgra_plane[dst_offset..dst_offset + src_row_bytes]
                     .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
             }
-            encoder
-                .scaler
-                .run(&encoder.bgra_frame, &mut encoder.frame)?;
+            if let (Some(scaler), Some(bgra)) = (&mut encoder.scaler, &encoder.bgra_frame) {
+                scaler.run(bgra, &mut encoder.frame)?;
+            }
         }
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
@@ -477,8 +484,8 @@ struct EncoderState {
     #[cfg(target_os = "macos")]
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
-    scaler: ffmpeg_next::software::scaling::Context,
-    bgra_frame: ffmpeg_next::frame::Video,
+    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    bgra_frame: Option<ffmpeg_next::frame::Video>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -488,6 +495,7 @@ struct EncoderState {
     opened_encoder: String,
     /// The bitrate this session was opened with; a change requests a reopen.
     opened_bitrate: u32,
+    opened_fps: u32,
     /// First frame's capture instant — the PTS epoch for this session.
     pts_epoch: Option<std::time::Instant>,
     last_pts: i64,
@@ -504,16 +512,29 @@ impl EncoderState {
         height: u32,
         bitrate_bps: u32,
         target_fps: u32,
+        input_mode: EncoderInput,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
+        // AVCodec owns this terminated static list. A null list means that
+        // native BGRA support is unknown, so Auto retains the YUV path.
+        let supported = unsafe {
+            let mut ptr = (*codec.as_ptr()).pix_fmts;
+            let mut formats = Vec::new();
+            while !ptr.is_null() && *ptr != ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                formats.push(ffmpeg_next::format::Pixel::from(*ptr));
+                ptr = ptr.add(1);
+            }
+            formats
+        };
+        let pixel_format = select_input(input_mode, encoder_name, &supported)?;
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
 
         encoder.set_width(width);
         encoder.set_height(height);
-        encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
+        encoder.set_format(pixel_format);
         if legacy_pts {
             encoder.set_time_base(ffmpeg_next::Rational(1, 60));
         } else {
@@ -538,52 +559,58 @@ impl EncoderState {
             bitrate = bitrate_bps,
             fps = target_fps,
             encoder = encoder_name,
+            input = ?pixel_format,
             "Encoder opened"
         );
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_next::format::Pixel::BGRA,
-            width,
-            height,
-            ffmpeg_next::format::Pixel::YUV420P,
-            width,
-            height,
-            // 1:1 scale — the "filter" only converts colorspace, so take the fast path.
-            ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
-        )?;
-        info!("swscale BGRA->YUV420P context created");
-
-        Ok(Self {
-            #[cfg(target_os = "macos")]
-            native_converter: match vimage::Converter::new() {
-                Ok(converter) => {
-                    info!("Accelerate BGRA->YUV420P converter ready");
-                    Some(converter)
-                }
-                Err(error) => {
-                    warn!(%error, "Using swscale color conversion");
-                    None
-                }
-            },
-            encoder,
-            scaler,
-            bgra_frame: ffmpeg_next::frame::Video::new(
+        let scaler = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            Some(ffmpeg_next::software::scaling::Context::get(
                 ffmpeg_next::format::Pixel::BGRA,
                 width,
                 height,
-            ),
-            frame: ffmpeg_next::frame::Video::new(
                 ffmpeg_next::format::Pixel::YUV420P,
                 width,
                 height,
-            ),
+                // 1:1 scale — the "filter" only converts colorspace, so take the fast path.
+                ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
+            )?)
+        } else {
+            None
+        };
+        if scaler.is_some() {
+            info!("swscale BGRA->YUV420P context created");
+        }
+
+        Ok(Self {
+            #[cfg(target_os = "macos")]
+            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+                match vimage::Converter::new() {
+                    Ok(converter) => {
+                        info!("Accelerate BGRA->YUV420P converter ready");
+                        Some(converter)
+                    }
+                    Err(error) => {
+                        warn!(%error, "Using swscale color conversion");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+            encoder,
+            scaler,
+            bgra_frame: (pixel_format == ffmpeg_next::format::Pixel::YUV420P).then(|| {
+                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height)
+            }),
+            frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
             opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
+            opened_fps: target_fps,
             pts_epoch: None,
             last_pts: -1,
             legacy_pts,

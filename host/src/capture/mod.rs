@@ -189,8 +189,56 @@ pub(crate) fn resolve_target(
 /// via `ETERNAL_VDD_TIMEOUT_SECS` for machines whose driver loads slowly.
 #[cfg(windows)]
 const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 10;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+#[cfg(any(windows, test))]
+enum AttachResult {
+    Attached(OutputInfo),
+    TimedOut,
+    Cancelled,
+}
+
+/// Polling remains bounded even while startup heartbeats keep the watchdog alive.
+/// A cancelled generation returns before inspecting or changing display state.
+#[cfg(any(windows, test))]
+fn wait_for_virtual_output(
+    before: &[String],
+    timeout: Duration,
+    mut poll: impl FnMut() -> Option<Vec<OutputInfo>>,
+    mut now: impl FnMut() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> AttachResult {
+    let deadline = now() + timeout;
+    loop {
+        let Some(outputs) = poll() else {
+            return AttachResult::Cancelled;
+        };
+        if let Some(chosen) = pick_new_virtual_output(before, &outputs) {
+            return AttachResult::Attached(chosen.clone());
+        }
+        if now() >= deadline {
+            return AttachResult::TimedOut;
+        }
+        wait(VDD_POLL_INTERVAL);
+    }
+}
+
+/// These timestamps measure stage liveness, not produced video. During the
+/// bounded driver attach wait, neither capture nor encode can produce a frame.
+#[cfg(any(windows, test))]
+fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
+    use std::sync::atomic::Ordering;
+    shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+    shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+    shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
+    shared.running.load(std::sync::atomic::Ordering::SeqCst)
+        && crate::supervisor::generation_is_current(generation)
+}
 
 #[cfg(windows)]
 fn vdd_attach_timeout() -> Duration {
@@ -218,21 +266,59 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
 pub(crate) fn reconcile_virtual_display(
     target: &CaptureTarget,
     shared: &SharedControl,
-) -> CaptureTarget {
+    generation: u64,
+) -> Option<CaptureTarget> {
+    // A previous capture thread may still be leaving its attach poll when the
+    // supervisor starts the next generation. Only one may trigger driver tasks.
+    let _lifecycle = shared.vdd_lifecycle.lock();
+    if !capture_is_current(shared, generation) {
+        return None;
+    }
+    let progress = || {
+        if capture_is_current(shared, generation) {
+            startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
+        }
+    };
     match target {
         CaptureTarget::VirtualExtended => {
             // Defer enabling the VDD until an iPad actually connects. The transport restarts the
             // pipeline on the first receiver registration, so this runs again with a connected
             // client at that point and the display comes up then — never while the PC sits idle.
-            if !client_connected(shared) {
+            let waiting_for_client = {
+                let session = shared.session.lock();
+                let waiting = !session.is_active();
+                *shared.vdd_status.lock() = if waiting {
+                    VddStatus::WaitingForClient
+                } else {
+                    VddStatus::Attaching
+                };
+                waiting
+            };
+            if waiting_for_client {
                 info!(
                     "Extended display selected but no iPad has connected yet — leaving the \
                      virtual display off and mirroring the primary display until a client registers"
                 );
-                crate::vdd::disable();
-                *shared.vdd_status.lock() = VddStatus::WaitingForClient;
-                return CaptureTarget::PrimaryAuto;
+                crate::vdd::set_enabled(false, progress);
+                *shared.vdd_output.lock() = None;
+                return capture_is_current(shared, generation)
+                    .then_some(CaptureTarget::PrimaryAuto);
             }
+
+            let outputs = enumerate_outputs();
+            // Settings and codec changes restart capture without removing the
+            // managed monitor. Reuse that output rather than waiting for it to
+            // appear a second time or selecting a physical secondary monitor.
+            if let Some(name) = shared.vdd_output.lock().as_ref() {
+                if outputs
+                    .iter()
+                    .any(|output| !output.is_primary && &output.device_name == name)
+                {
+                    *shared.vdd_status.lock() = VddStatus::Active;
+                    return Some(CaptureTarget::Output(name.clone()));
+                }
+            }
+            *shared.vdd_output.lock() = None;
 
             // Best effort: match the virtual display's mode list to the
             // connected iPad's panel BEFORE enabling the driver (it reads
@@ -259,47 +345,63 @@ pub(crate) fn reconcile_virtual_display(
                 }
             }
 
-            let before: Vec<String> = enumerate_outputs()
-                .into_iter()
-                .map(|o| o.device_name)
-                .collect();
-            if !crate::vdd::enable() {
+            let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
+            if !capture_is_current(shared, generation) {
+                return None;
+            }
+            startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
+            if !crate::vdd::set_enabled(true, progress) {
                 warn!(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
                 );
-                *shared.vdd_status.lock() = VddStatus::Failed;
-                return CaptureTarget::PrimaryAuto;
+                *shared.vdd_status.lock() = VddStatus::TaskFailed;
+                return Some(CaptureTarget::PrimaryAuto);
             }
-            let deadline = Instant::now() + vdd_attach_timeout();
-            while Instant::now() < deadline {
-                std::thread::sleep(VDD_POLL_INTERVAL);
-                let now = enumerate_outputs();
-                // Accept ONLY a genuinely new non-primary output (the freshly-enabled VDD). Never
-                // grab a pre-existing real second monitor that was attached before we enabled it.
-                if let Some(chosen) = pick_new_virtual_output(&before, &now) {
+            let result = wait_for_virtual_output(
+                &before,
+                vdd_attach_timeout(),
+                || {
+                    if !capture_is_current(shared, generation) {
+                        return None;
+                    }
+                    startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
+                    Some(enumerate_outputs())
+                },
+                Instant::now,
+                std::thread::sleep,
+            );
+            if !capture_is_current(shared, generation) {
+                return None;
+            }
+            match result {
+                AttachResult::Cancelled => return None,
+                AttachResult::Attached(chosen) => {
                     info!(
                         device = %chosen.device_name,
                         width = chosen.width,
                         height = chosen.height,
                         "Virtual display attached — capturing it"
                     );
+                    *shared.vdd_output.lock() = Some(chosen.device_name.clone());
                     *shared.vdd_status.lock() = VddStatus::Active;
-                    return CaptureTarget::Output(chosen.device_name.clone());
+                    return Some(CaptureTarget::Output(chosen.device_name));
                 }
+                AttachResult::TimedOut => {}
             }
             warn!("Virtual display did not attach in time — capturing the primary display instead");
             // enable() succeeded but nothing attached: turn it back off so we don't strand a
             // half-enabled device as a phantom monitor.
-            crate::vdd::disable();
+            crate::vdd::set_enabled(false, progress);
             *shared.vdd_status.lock() = VddStatus::Failed;
-            CaptureTarget::PrimaryAuto
+            Some(CaptureTarget::PrimaryAuto)
         }
         other => {
             // Any non-virtual target: ensure the virtual display is off.
-            crate::vdd::disable();
+            crate::vdd::set_enabled(false, progress);
+            *shared.vdd_output.lock() = None;
             *shared.vdd_status.lock() = VddStatus::Inactive;
-            other.clone()
+            Some(other.clone())
         }
     }
 }
@@ -374,6 +476,89 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 mod tests {
     use super::*;
     use crate::control::CaptureTarget;
+    use std::cell::Cell;
+
+    #[test]
+    fn slow_virtual_attach_keeps_watchdog_alive_without_hiding_a_stall() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        let machine = crate::supervisor::Machine::new(1);
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let before = vec!["primary".to_string(), "physical-secondary".to_string()];
+        let result = wait_for_virtual_output(
+            &before,
+            Duration::from_secs(10),
+            || {
+                startup_heartbeat(&shared, 1_000 + elapsed.get().as_millis() as u64);
+                let mut outputs = vec![out("primary", 0, 0), out("physical-secondary", 1920, 0)];
+                if elapsed.get() >= Duration::from_secs(6) {
+                    outputs.push(out("virtual", -1920, 0));
+                }
+                Some(outputs)
+            },
+            || start + elapsed.get(),
+            |duration| {
+                elapsed.set(elapsed.get() + duration);
+                assert!(
+                    crate::supervisor::wedge_reason_at(
+                        &shared,
+                        &machine,
+                        1_000 + elapsed.get().as_millis() as u64
+                    )
+                    .is_none(),
+                    "driver startup must not trip the 3s/5s watchdogs"
+                );
+            },
+        );
+        let AttachResult::Attached(output) = result else {
+            panic!("virtual display did not attach")
+        };
+        assert_eq!(output.device_name, "virtual");
+        assert!(
+            crate::supervisor::wedge_reason_at(
+                &shared,
+                &machine,
+                1_000 + elapsed.get().as_millis() as u64 + 3_001
+            )
+            .unwrap()
+            .contains("capture loop silent"),
+            "the normal watchdog must still detect a stalled driver"
+        );
+    }
+
+    #[test]
+    fn virtual_attach_timeout_stays_bounded_and_cancellation_wins() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = wait_for_virtual_output(
+            &[],
+            Duration::from_secs(10),
+            || Some(Vec::new()),
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert!(matches!(result, AttachResult::TimedOut));
+        assert!(elapsed.get() < Duration::from_secs(10) + VDD_POLL_INTERVAL);
+
+        let cancelled_at = Cell::new(false);
+        let result = wait_for_virtual_output(
+            &[],
+            Duration::from_secs(10),
+            || {
+                if cancelled_at.get() {
+                    None
+                } else {
+                    Some(Vec::new())
+                }
+            },
+            || start + elapsed.get(),
+            |duration| {
+                elapsed.set(elapsed.get() + duration);
+                cancelled_at.set(true);
+            },
+        );
+        assert!(matches!(result, AttachResult::Cancelled));
+    }
 
     fn out(name: &str, left: i32, top: i32) -> OutputInfo {
         OutputInfo {

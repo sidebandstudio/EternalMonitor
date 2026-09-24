@@ -70,6 +70,8 @@ Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion 
 ; toggle script the tasks invoke (it resolves the VDD device at trigger time).
 Source: "scripts\vdd-tasks-setup.ps1";  DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-tasks-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\vdd-driver-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\vdd-driver-verify.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-toggle.ps1";       DestDir: "{app}\scripts"; Flags: ignoreversion
 #endif
 
@@ -80,22 +82,107 @@ Name: "{group}\Uninstall EternalMonitor";  Filename: "{uninstallexe}"
 Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.exe"; Tasks: desktopicon
 
 [Run]
+; Replace only this product's named rules so upgrades remain idempotent.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=private,public enable=yes"; StatusMsg: "Allowing display traffic through Windows Firewall..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host TCP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=TCP profile=private,public enable=yes"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
-; Install the virtual display driver during setup. We're already elevated, so this
-; runs without a second UAC prompt. /VERYSILENT works when the bundled setup is
-; Inno-based; non-Inno installers ignore it and show their own short wizard instead.
-Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; StatusMsg: "Installing the virtual display driver (this enables the extended screen)..."; Flags: waituntilterminated
+; The vendor setup prompts to uninstall an existing installation even with silent
+; switches. Preserve an existing driver and install only when it is absent.
+Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; StatusMsg: "Installing the virtual display driver (this enables the extended screen)..."; Flags: waituntilterminated; Check: NeedsVddInstall; AfterInstall: RecordVddOwnership
 ; Register the enable/disable scheduled tasks and leave the virtual display OFF by default —
 ; EternalMonitor turns it on only while streaming to it, so there's no phantom monitor.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "Configuring the on-demand virtual display..."; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "Configuring the on-demand virtual display..."; Flags: runhidden waituntilterminated; Check: VddInstallSucceeded; AfterInstall: VerifyVddDriver
 #endif
 ; Launch the app at the end.
-Filename: "{app}\EternalMonitor-host.exe"; Description: "Launch EternalMonitor now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\EternalMonitor-host.exe"; Description: "Launch EternalMonitor now"; Flags: nowait postinstall skipifsilent; Check: VddInstallSucceeded
 
 [UninstallRun]
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated; RunOnceId: "EternalMonitorFirewallUDP"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated; RunOnceId: "EternalMonitorFirewallTCP"
 #ifdef IncludeDriver
-; Remove the scheduled tasks and re-enable the device before removing the driver.
+; Remove the scheduled tasks and disable the device before removing an owned driver.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-remove.ps1"""; Flags: runhidden; RunOnceId: "VddTasksRemove"
-; Best-effort driver uninstall via the bundled setup's uninstaller, if present.
-Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /uninstall"; Flags: waituntilterminated; RunOnceId: "VddUninstall"
+; Always record this entry to supersede older VddUninstall commands on upgrade.
+; A Check that returns false at install time leaves the old command in place.
+; The helper checks ownership when the uninstaller actually runs.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-driver-remove.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "VddUninstall"
+#endif
+
+#ifdef IncludeDriver
+[UninstallDelete]
+Type: files; Name: "{app}\driver\installed-by-eternalmonitor.txt"
+#endif
+
+[Code]
+var
+  VddInstallFailed: Boolean;
+
+function VddInstallSucceeded: Boolean;
+begin
+  Result := not VddInstallFailed;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := 0;
+  if VddInstallFailed then
+    Result := 1;
+end;
+
+#ifdef IncludeDriver
+const
+  VddRegistryKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VirtualDisplayDriver_is1';
+
+function ReadVddRegistration(var Directory, Version: String): Boolean;
+begin
+  Result := RegQueryStringValue(HKLM64, VddRegistryKey, 'InstallLocation', Directory);
+  if Result then
+    Result := RegQueryStringValue(HKLM64, VddRegistryKey, 'DisplayVersion', Version)
+  else begin
+    Result := RegQueryStringValue(HKLM32, VddRegistryKey, 'InstallLocation', Directory);
+    if Result then
+      Result := RegQueryStringValue(HKLM32, VddRegistryKey, 'DisplayVersion', Version);
+  end;
+  Result := Result and (Directory <> '') and (Version <> '');
+end;
+
+function NeedsVddInstall: Boolean;
+var
+  Directory, Version: String;
+begin
+  Result := not ReadVddRegistration(Directory, Version);
+  if not Result then
+    Log('Preserving existing Virtual Display Driver package ' + Version);
+end;
+
+procedure VerifyVddDriver;
+var
+  ExitCode: Integer;
+begin
+  { [Run] ignores a child process's exit code. Check the actual PnP binding
+    explicitly, including upgrades that preserve an existing registration. }
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\vdd-driver-verify.ps1') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
+    VddInstallFailed := True;
+    RaiseException('Windows did not finish installing the virtual display driver. Run setup while signed into Windows and approve its publisher prompt. If the driver already exists, repair it before trying again.');
+  end;
+end;
+
+procedure RecordVddOwnership;
+var
+  Directory, Version: String;
+begin
+  VerifyVddDriver;
+  if not ReadVddRegistration(Directory, Version) then
+    RaiseException('Virtual Display Driver installation did not register successfully.');
+  if not FileExists(AddBackslash(Directory) + 'unins000.exe') then
+    RaiseException('Virtual Display Driver uninstaller is missing after installation.');
+  if not SaveStringToFile(ExpandConstant('{app}\driver\installed-by-eternalmonitor.txt'),
+      AddBackslash(Directory) + 'unins000.exe' + #13#10 + Version, False) then
+    RaiseException('Could not record Virtual Display Driver installation ownership.');
+end;
+
 #endif
