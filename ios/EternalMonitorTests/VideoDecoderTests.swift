@@ -141,4 +141,39 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertEqual(requests.withLock { $0 }, 1, "wait for a sync sample without a request storm")
         XCTAssertEqual(sessionEvents.withLock { $0 }, 1, "bad data must not rebuild a healthy session")
     }
+
+    func testKeyframeThatFailsToDecodeRebuildsTheSession() throws {
+        // Hosted CI caught a software session that rejected every later frame,
+        // including each replacement IDR, so requesting keyframes never helped.
+        let data = try fixtureData()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let first = expectation(description: "initial frame")
+        let request = expectation(description: "failed keyframe requests another")
+        let recovered = expectation(description: "recovery frame")
+        let sessionEvents = OSAllocatedUnfairLock(initialState: 0)
+        decoder.onEvent = { message in
+            if message.hasPrefix("VideoToolbox session ready") {
+                sessionEvents.withLock { $0 += 1 }
+            }
+        }
+        decoder.onFrameDecoded = { _, timestamp in
+            if timestamp == 16_667 { first.fulfill() }
+            if timestamp == 20 * 16_667 { recovered.fulfill() }
+        }
+        decoder.onNeedsKeyframe = { request.fulfill() }
+        decoder.decode(packet: packet(seq: 1, data: data, keyframe: true))
+        wait(for: [first], timeout: 10)
+
+        // An IDR slice whose data cannot be decoded.
+        let corruptIDR = Data([0, 0, 0, 1, 0x65, 0x80])
+        decoder.decode(packet: packet(seq: 2, data: corruptIDR, keyframe: true))
+        guard XCTWaiter.wait(for: [request], timeout: 3) == .completed else {
+            XCTFail("VideoToolbox rejected a keyframe without requesting recovery")
+            return
+        }
+        decoder.decode(packet: packet(seq: 20, data: data, keyframe: true))
+        wait(for: [recovered], timeout: 10)
+        XCTAssertEqual(sessionEvents.withLock { $0 }, 2, "a failed keyframe must rebuild the session")
+    }
 }

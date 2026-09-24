@@ -1,0 +1,66 @@
+name: TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    name: iPad Release archive and TestFlight
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # App Store Connect has required the iOS 26 SDK since April 2026.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Select the build number
+        run: echo "BUILD=$((100 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+      - name: Verify versions and TestFlight notes
+        run: |
+          scripts/check-versions.sh
+          python3 scripts/testflight_notes.py --check
+      - name: Archive pull requests without signing credentials
+        if: github.event_name == 'pull_request'
+        run: scripts/testflight-local.sh --dry-run
+      - name: Archive and upload, or compile when secrets are absent
+        if: github.event_name != 'pull_request'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: scripts/testflight-local.sh
+      - name: Retain archive and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-iPad-${{ env.BUILD }}
+          path: |
+            build/testflight/EternalMonitor.xcarchive/
+            build/testflight/archive.log
+            build/testflight/export.log
+            build/testflight/result.json
+            ios/TESTFLIGHT_NOTES.md
+          retention-days: 14
+      - name: Summarize the result
+        if: success()
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          result=json.loads(pathlib.Path('build/testflight/result.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write(f"EternalMonitor {result['version']} ({result['build']}): {result['mode']} passed.\n")
+          PY
