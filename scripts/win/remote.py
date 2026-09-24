@@ -101,7 +101,13 @@ def main(args):
            "if ((Get-Date) -gt $deadline) { throw 'Host did not start; inspect the interactive job' }; Start-Sleep -Milliseconds 100 }; "
            "$record=Get-Content " + quote(pidfile) + " -Raw | ConvertFrom-Json; "
            "$p=Get-Process -Id $record.id; if ($p.Path -ne $record.path -or "
-           "$p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { throw 'Host identity changed at startup' }")
+           "$p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { throw 'Host identity changed at startup' }; "
+           # An autoconnecting app sends HELLO for about 10 s. A stalled disk
+           # has held host startup for 25 s, so return only once it listens.
+           "$deadline=(Get-Date).AddSeconds(60); while (!(Select-String -Path " + quote(ROOT + r"\host.log") +
+           " -Pattern 'UDP transport ready' -Quiet)) { "
+           "if ($p.HasExited) { throw 'Host exited during startup' }; "
+           "if ((Get-Date) -gt $deadline) { throw 'Host did not start listening within 60 s' }; Start-Sleep -Milliseconds 100 }")
     elif action == "host-info" and not args:
         path = quote(ROOT + r"\host.pid.json")
         ps("if (Test-Path " + path + ") { Get-Content " + path + " -Raw } else { Write-Output 'null' }")
