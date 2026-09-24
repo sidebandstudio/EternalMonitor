@@ -26,6 +26,8 @@ struct TouchRelayView: UIViewRepresentable {
         view.onToggleHUD = onToggleHUD
         view.commandAsControl = settings.commandAsControl
         view.keyboardSupported = connectionManager.sessionHasKeyboard
+        view.nativePenSupported = connectionManager.sessionHasPen
+        view.drawingMode = connectionManager.sessionDrawingMode
         view.active = active
         view.keyboardVisible = keyboardVisible
         view.updateKeyboardPresentation()
@@ -37,15 +39,24 @@ final class RelayTouchUIView: UIView {
     var onKeyboardDismiss: (() -> Void)?
     var commandAsControl = true
     var keyboardSupported = false
+    var nativePenSupported = false
+    var drawingMode = false
     var keyboardVisible = false
     var active = true { didSet { if !active && oldValue { cancelInput(); resignFirstResponder(); keyboardInput.resignFirstResponder() } } }
     override var canBecomeFirstResponder: Bool { active }
     var onToggleHUD: (() -> Void)?
     var videoSize: CGSize = .zero {
-        didSet { machine.videoPixelSize = videoSize }
+        didSet {
+            if oldValue != videoSize && pencil.isDown { cancelInput() }
+            machine.videoPixelSize = videoSize
+        }
     }
 
     private var machine = TouchRelayMachine()
+    private var pencil = PencilRelayMachine()
+    private var pencilTouch: UITouch?
+    private var ignoredTouches = Set<UITouch>()
+    private var inputBounds = CGSize.zero
     private var keyboard = KeyboardRelayMachine()
     private var pointer = PointerRelayMachine()
     private lazy var keyboardInput: RelayKeyboardInputView = {
@@ -78,7 +89,12 @@ final class RelayTouchUIView: UIView {
         scroll.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         scroll.cancelsTouchesInView = false
         addGestureRecognizer(scroll)
-        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(pointerHovered(_:))))
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(pointerHovered(_:)))
+        hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        addGestureRecognizer(hover)
+        let pencilHover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHovered(_:)))
+        pencilHover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        addGestureRecognizer(pencilHover)
         NotificationCenter.default.addObserver(self, selector: #selector(cancelInput),
             name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resumeInput),
@@ -103,7 +119,8 @@ final class RelayTouchUIView: UIView {
 
     private func centroid(of event: UIEvent?) -> TouchRelayMachine.Point? {
         guard let touches = event?.allTouches?.filter({
-            $0.phase == .began || $0.phase == .moved || $0.phase == .stationary
+            $0.type == .direct && !ignoredTouches.contains($0)
+                && ($0.phase == .began || $0.phase == .moved || $0.phase == .stationary)
         }), !touches.isEmpty else { return nil }
         var sum = CGPoint.zero
         for touch in touches {
@@ -132,6 +149,14 @@ final class RelayTouchUIView: UIView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if window == nil { cancelInput() } else { updateKeyboardPresentation() }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Rotation changes the mapping under a held tip. Release before a
+        // subsequent sample could draw a line across the newly fitted image.
+        if inputBounds != bounds.size && pencil.isDown { cancelInput() }
+        inputBounds = bounds.size
     }
 
     func updateKeyboardPresentation() {
@@ -185,7 +210,9 @@ final class RelayTouchUIView: UIView {
     @objc private func cancelInput() {
         holdTimer?.cancel()
         holdTimer = nil
-        onEvents?(keyboard.cancel() + pointer.ended(at: nil))
+        onEvents?(keyboard.cancel() + pointer.ended(at: nil) + pencil.cancel())
+        pencilTouch = nil
+        ignoredTouches.removeAll()
         // Cancel active touch edges without toggling the HUD.
         run(machine.threeFingerTap(timeUs: ControlChannel.clientNowUs()).filter {
             if case .toggleHUD = $0 { return false }; return true
@@ -242,12 +269,12 @@ final class RelayTouchUIView: UIView {
     }
 
     @objc private func pointerHovered(_ gesture: UIHoverGestureRecognizer) {
-        guard active, keyboardSupported, gesture.state == .began || gesture.state == .changed else { return }
+        guard active, keyboardSupported, !pencil.isDown, gesture.state == .began || gesture.state == .changed else { return }
         onEvents?(pointer.hover(at: point(gesture.location(in: self)), timeUs: ControlChannel.clientNowUs()))
     }
 
     @objc private func pointerScrolled(_ gesture: UIPanGestureRecognizer) {
-        guard active, keyboardSupported else { return }
+        guard active, keyboardSupported, !pencil.isDown else { return }
         let delta = gesture.translation(in: self)
         gesture.setTranslation(.zero, in: self)
         let rect = mapper.contentRect
@@ -260,7 +287,27 @@ final class RelayTouchUIView: UIView {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard active else { return }
         let now = ControlChannel.clientNowUs()
+        // Process Pencil first even when UIKit delivers palm and tip together.
+        if nativePenSupported, let touch = touches.first(where: { $0.type == .pencil }) {
+            if let reading = pencilReading(touch) {
+                holdTimer?.cancel()
+                run(machine.threeFingerTap(timeUs: now).filter {
+                    if case .toggleHUD = $0 { return false }; return true
+                })
+                machine = TouchRelayMachine()
+                machine.videoPixelSize = videoSize
+                ignoredTouches.formUnion(event?.allTouches?.filter { $0.type != .pencil } ?? [])
+                onEvents?(pointer.ended(at: nil) + pencil.began(reading))
+                pencilTouch = touch
+            }
+        }
         for touch in touches {
+            if touch.type == .pencil && (nativePenSupported || drawingMode) { continue }
+            if touch.type != .indirectPointer && (drawingMode || pencil.isDown || ignoredTouches.contains(touch)) {
+                ignoredTouches.insert(touch)
+                continue
+            }
+            if pencil.isDown { continue }
             if touch.type == .indirectPointer {
                 if keyboardSupported { onEvents?(pointer.began(at: norm(touch), mask: UInt8(truncatingIfNeeded: event?.buttonMask.rawValue ?? 1))) }
                 continue
@@ -272,12 +319,15 @@ final class RelayTouchUIView: UIView {
             ))
         }
 
-        let activeCount = event?.allTouches?.filter { $0.phase != .ended && $0.phase != .cancelled }.count ?? 0
+        let activeCount = event?.allTouches?.filter {
+            $0.type == .direct && !ignoredTouches.contains($0) && $0.phase != .ended && $0.phase != .cancelled
+        }.count ?? 0
         if activeCount >= 3 && !hudTapFired {
             hudTapFired = true
             run(machine.threeFingerTap(timeUs: now))
         }
 
+        guard activeCount > 0, !pencil.isDown, !drawingMode else { return }
         holdTimer?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -291,7 +341,17 @@ final class RelayTouchUIView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard active, let touch = touches.first else { return }
+        guard active else { return }
+        if let pencilTouch, touches.contains(pencilTouch) {
+            let samples = event?.coalescedTouches(for: pencilTouch) ?? [pencilTouch]
+            let events = samples.compactMap { pencilReading($0, clamp: true) }.flatMap { pencil.moved($0) }
+            onEvents?(events)
+            return
+        }
+        guard !pencil.isDown, let touch = touches.first(where: {
+            !ignoredTouches.contains($0) && (!drawingMode || $0.type == .indirectPointer)
+                && (!nativePenSupported || $0.type != .pencil)
+        }) else { return }
         if touch.type == .indirectPointer {
             if keyboardSupported { onEvents?(pointer.moved(to: norm(touch))) }
             return
@@ -316,7 +376,18 @@ final class RelayTouchUIView: UIView {
 
     private func finish(_ touches: Set<UITouch>, with event: UIEvent?, cancelled: Bool) {
         let now = ControlChannel.clientNowUs()
+        if let pencilTouch, touches.contains(pencilTouch) {
+            if !cancelled {
+                let samples = event?.coalescedTouches(for: pencilTouch) ?? []
+                onEvents?(samples.compactMap { pencilReading($0, clamp: true) }.flatMap { pencil.moved($0) })
+            }
+            onEvents?(pencil.ended(pencilReading(pencilTouch, clamp: true), cancelled: cancelled))
+            self.pencilTouch = nil
+        }
         for touch in touches {
+            if ignoredTouches.remove(touch) != nil { continue }
+            if touch.type == .pencil && (nativePenSupported || drawingMode) { continue }
+            if pencil.isDown || (drawingMode && touch.type != .indirectPointer) { continue }
             if touch.type == .indirectPointer {
                 if keyboardSupported { onEvents?(pointer.ended(at: norm(touch), remainingMask: UInt8(truncatingIfNeeded: event?.buttonMask.rawValue ?? 0))) }
                 continue
@@ -328,6 +399,31 @@ final class RelayTouchUIView: UIView {
             holdTimer?.cancel()
             holdTimer = nil
             hudTapFired = false
+        }
+    }
+
+    private func pencilReading(_ touch: UITouch, clamp: Bool = false) -> PencilReading? {
+        var location = touch.preciseLocation(in: self)
+        if clamp {
+            let rect = mapper.contentRect
+            guard rect.width > 0, rect.height > 0 else { return nil }
+            location.x = min(rect.maxX, max(rect.minX, location.x))
+            location.y = min(rect.maxY, max(rect.minY, location.y))
+        }
+        guard let point = point(location) else { return nil }
+        return PencilReading(point: point, force: touch.force, maximumForce: touch.maximumPossibleForce,
+            altitude: touch.altitudeAngle, azimuth: touch.azimuthAngle(in: self),
+            timeUs: UInt64(max(0, touch.timestamp) * 1_000_000))
+    }
+
+    @objc private func pencilHovered(_ gesture: UIHoverGestureRecognizer) {
+        guard active, nativePenSupported, !pencil.isDown else { return }
+        if (gesture.state == .began || gesture.state == .changed), let point = point(gesture.location(in: self)) {
+            onEvents?(pencil.hover(PencilReading(point: point, force: 0, maximumForce: 1,
+                altitude: gesture.altitudeAngle, azimuth: gesture.azimuthAngle(in: self),
+                timeUs: ControlChannel.clientNowUs())))
+        } else {
+            onEvents?(pencil.hover(nil))
         }
     }
 }

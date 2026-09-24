@@ -1,9 +1,9 @@
 //! Input relay: turns the client's INPUT_EVENT messages (normalized
 //! coordinates over the displayed video) into Windows input injection.
 //!
-//! Everything in this file is portable, pure, and unit-tested: coordinate
-//! mapping, event deduplication, and wheel scaling. The actual `SendInput`
-//! calls live in `windows.rs`; other platforms record events for the
+//! Coordinate mapping, stroke state, deduplication and wheel scaling are
+//! portable and unit-tested. Native pen and `SendInput`
+//! calls live in `windows_inject.rs`; other platforms record events for the
 //! end-to-end tests instead.
 
 use eternal_wire::v2::control::InputEvent;
@@ -51,10 +51,12 @@ pub const PHASE_MOVED: u8 = 1;
 pub const PHASE_ENDED: u8 = 2;
 pub const PHASE_CANCELLED: u8 = 3;
 
-/// A fully-resolved injection command, ready for `SendInput` (or a test
+/// A fully-resolved injection command, ready for the Windows backend (or a test
 /// recorder off Windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Injection {
+    /// Native pen coordinates are desktop pixels, not SendInput's 0..65535 space.
+    Pen(PenSample),
     KeyDown {
         scan: u16,
         extended: bool,
@@ -103,14 +105,34 @@ pub enum Injection {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+    Hover,
+    Leave,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PenSample {
+    pub phase: PenPhase,
+    pub x: i32,
+    pub y: i32,
+    pub pressure: u32,
+    pub tilt_x: i32,
+    pub tilt_y: i32,
+}
+
 /// Map a wire-normalized point (0..65535 over the displayed video, which the
 /// client letterbox-corrects before sending) to a desktop pixel on the
 /// captured output.
 pub fn norm_to_output_pixel(x_norm: u16, y_norm: u16, output: CaptureGeometry) -> (i32, i32) {
-    let x =
-        output.left + ((u32::from(x_norm) * output.width.saturating_sub(1).max(1)) / 65_535) as i32;
-    let y =
-        output.top + ((u32::from(y_norm) * output.height.saturating_sub(1).max(1)) / 65_535) as i32;
+    let x = output.left
+        + ((u64::from(x_norm) * u64::from(output.width.saturating_sub(1))) / 65_535) as i32;
+    let y = output.top
+        + ((u64::from(y_norm) * u64::from(output.height.saturating_sub(1))) / 65_535) as i32;
     (x, y)
 }
 
@@ -173,14 +195,38 @@ pub fn resolve(
     output: CaptureGeometry,
     screen: VirtualScreen,
 ) -> Vec<Injection> {
-    if event.input_ver != 1 {
+    if event.input_ver != 1 && !(event.input_ver == 2 && event.kind == KIND_PENCIL) {
         return Vec::new();
     }
     let (px, py) = norm_to_output_pixel(event.x_norm, event.y_norm, output);
     let (ax, ay) = desktop_pixel_to_abs(px, py, screen);
 
     match event.kind {
-        KIND_TOUCH | KIND_PENCIL | KIND_MOUSE_ABS => {
+        KIND_PENCIL => {
+            let contact = event.input_ver == 1 || event.buttons & 1 != 0;
+            let phase = match (event.phase, contact) {
+                (PHASE_BEGAN, true) => PenPhase::Down,
+                (PHASE_MOVED, true) => PenPhase::Move,
+                (PHASE_ENDED, true) => PenPhase::Up,
+                (PHASE_CANCELLED, true) => PenPhase::Cancel,
+                (PHASE_MOVED, false) => PenPhase::Hover,
+                (PHASE_ENDED | PHASE_CANCELLED, false) => PenPhase::Leave,
+                _ => return Vec::new(),
+            };
+            vec![Injection::Pen(PenSample {
+                phase,
+                x: px,
+                y: py,
+                pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
+                    (u32::from(event.pressure_x1000.min(1000)) * 1024 + 500) / 1000
+                } else {
+                    0
+                },
+                tilt_x: i32::from(event.tilt_x.clamp(-90, 90)),
+                tilt_y: i32::from(event.tilt_y.clamp(-90, 90)),
+            })]
+        }
+        KIND_TOUCH | KIND_MOUSE_ABS => {
             let right_button = event.buttons & 0b10 != 0;
             let middle_button = event.buttons & 0b100 != 0;
             match event.phase {
@@ -276,17 +322,6 @@ pub mod recorder {
     }
 }
 
-/// Execute injections on this platform.
-pub fn inject(injections: &[Injection]) {
-    #[cfg(windows)]
-    windows_inject::inject(injections);
-    #[cfg(not(windows))]
-    {
-        recorder::record(injections);
-        log_injections(injections);
-    }
-}
-
 fn log_injections(injections: &[Injection]) {
     if std::env::var("ETERNAL_INPUT_RECORDER_LOG").is_ok_and(|value| value == "1") {
         for injection in injections {
@@ -302,6 +337,10 @@ fn log_injections(injections: &[Injection]) {
 pub struct InputRelay {
     session: Option<(u32, EventDeduper)>,
     held: HeldInputs,
+    pen_sequence: Option<u32>,
+    last_pen_input: Option<std::time::Instant>,
+    #[cfg(windows)]
+    pen_device: windows_inject::PenDevice,
 }
 
 #[derive(Debug, Default)]
@@ -309,12 +348,23 @@ struct HeldInputs {
     keys: std::collections::BTreeSet<(u16, bool)>,
     buttons: u8,
     pointer: (u16, u16),
+    pen: Option<PenSample>,
 }
 
 impl HeldInputs {
     fn record(&mut self, injections: &[Injection]) {
         for injection in injections {
             match *injection {
+                Injection::Pen(sample) => {
+                    self.pen = if matches!(
+                        sample.phase,
+                        PenPhase::Up | PenPhase::Leave | PenPhase::Cancel
+                    ) {
+                        None
+                    } else {
+                        Some(sample)
+                    };
+                }
                 Injection::KeyDown { scan, extended } => {
                     self.keys.insert((scan, extended));
                 }
@@ -349,15 +399,71 @@ impl HeldInputs {
             releases.push(Injection::MiddleUp { x, y });
         }
         self.buttons = 0;
+        if let Some(mut sample) = self.pen.take() {
+            sample.phase = if matches!(sample.phase, PenPhase::Down | PenPhase::Move) {
+                PenPhase::Cancel
+            } else {
+                PenPhase::Leave
+            };
+            sample.pressure = 0;
+            releases.push(Injection::Pen(sample));
+        }
         releases
     }
 }
 
 impl InputRelay {
+    pub fn pen_available(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pen_device.available()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn inject(&mut self, injections: &[Injection]) {
+        #[cfg(windows)]
+        windows_inject::inject(injections, &mut self.pen_device);
+        #[cfg(not(windows))]
+        {
+            recorder::record(injections);
+            log_injections(injections);
+        }
+    }
+
     /// Release keys/buttons when a session ends, expires, or is superseded.
     pub fn reset(&mut self) {
-        inject(&self.held.release());
+        let releases = self.held.release();
+        self.inject(&releases);
         self.session = None;
+        self.pen_sequence = None;
+        self.last_pen_input = None;
+    }
+
+    /// Windows expires stationary synthetic contacts unless they are refreshed.
+    /// Real samples always win; never keep a released or disconnected tip down.
+    pub fn keep_pen_alive(&mut self) {
+        if let Some(refresh) = self.pen_refresh(std::time::Instant::now()) {
+            self.inject(&[refresh]);
+        }
+    }
+
+    fn pen_refresh(&mut self, now: std::time::Instant) -> Option<Injection> {
+        let last = self.last_pen_input?;
+        if now.saturating_duration_since(last) < std::time::Duration::from_millis(50) {
+            return None;
+        }
+        let mut sample = self.held.pen?;
+        sample.phase = match sample.phase {
+            PenPhase::Down | PenPhase::Move => PenPhase::Move,
+            PenPhase::Hover => PenPhase::Hover,
+            _ => return None,
+        };
+        self.last_pen_input = Some(now);
+        Some(Injection::Pen(sample))
     }
 
     /// Dedupe, map, and inject one session-validated event.
@@ -369,14 +475,80 @@ impl InputRelay {
                 self.session = Some((session_id, EventDeduper::default()));
             }
         }
+        // Pen updates are ordered samples. Replayed or reordered UDP packets
+        // must never move a stroke backwards or revive a released contact.
+        if event.kind == KIND_PENCIL {
+            if !matches!(event.input_ver, 1 | 2) || event.phase > PHASE_CANCELLED {
+                return;
+            }
+            if self
+                .pen_sequence
+                .is_some_and(|last| event.event_id.wrapping_sub(last) as i32 <= 0)
+            {
+                return;
+            }
+            self.pen_sequence = Some(event.event_id);
+        }
         let deduper = &mut self.session.as_mut().expect("just ensured").1;
         if !deduper.accept(event) {
             return;
         }
         let screen = current_virtual_screen(output);
-        let injections = resolve(event, output, screen);
+        let mut injections = resolve(event, output, screen);
+        if let Some(Injection::Pen(sample)) = injections.first().copied() {
+            let held = self
+                .held
+                .pen
+                .filter(|p| matches!(p.phase, PenPhase::Down | PenPhase::Move));
+            match (sample.phase, held) {
+                (PenPhase::Down, Some(mut previous)) => {
+                    previous.phase = PenPhase::Cancel;
+                    previous.pressure = 0;
+                    injections.insert(0, Injection::Pen(previous));
+                }
+                // A lost UDP down can recover at the first actual sample.
+                (PenPhase::Move, None) => {
+                    injections[0] = Injection::Pen(PenSample {
+                        phase: PenPhase::Down,
+                        ..sample
+                    })
+                }
+                (PenPhase::Up | PenPhase::Cancel, None) => return,
+                (PenPhase::Up, Some(previous))
+                    if (sample.x, sample.y) != (previous.x, previous.y) =>
+                {
+                    // Windows requires up at the last contact position. Carry
+                    // a final position update first when the tip lifted
+                    // between UIKit's last moved and ended callbacks.
+                    injections.insert(
+                        0,
+                        Injection::Pen(PenSample {
+                            phase: PenPhase::Move,
+                            pressure: previous.pressure,
+                            ..sample
+                        }),
+                    );
+                }
+                (PenPhase::Cancel, Some(previous)) => {
+                    injections[0] = Injection::Pen(PenSample {
+                        phase: PenPhase::Cancel,
+                        pressure: 0,
+                        ..previous
+                    });
+                }
+                (PenPhase::Hover | PenPhase::Leave, Some(mut previous)) => {
+                    previous.phase = PenPhase::Cancel;
+                    previous.pressure = 0;
+                    injections.insert(0, Injection::Pen(previous));
+                }
+                _ => {}
+            }
+        }
         self.held.record(&injections);
-        inject(&injections);
+        if event.kind == KIND_PENCIL {
+            self.last_pen_input = Some(std::time::Instant::now());
+        }
+        self.inject(&injections);
     }
 }
 
@@ -423,6 +595,8 @@ mod tests {
             keycode: 0,
             modifiers: 0,
             client_time_us: 0,
+            tilt_x: 0,
+            tilt_y: 0,
         }
     }
 
@@ -512,6 +686,70 @@ mod tests {
         assert!(injections.contains(&Injection::HWheel { delta: 30 }));
     }
 
+    #[test]
+    fn pen_preserves_pressure_tilt_and_desktop_pixels_without_mouse_events() {
+        let mut e = event(KIND_PENCIL, PHASE_BEGAN, 65_535, 0);
+        e.input_ver = 2;
+        e.pressure_x1000 = 750;
+        e.tilt_x = -37;
+        e.tilt_y = 62;
+        let output = CaptureGeometry {
+            left: -2560,
+            top: -200,
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(
+            resolve(&e, output, SINGLE_SCREEN),
+            vec![Injection::Pen(PenSample {
+                phase: PenPhase::Down,
+                x: -1,
+                y: -200,
+                pressure: 768,
+                tilt_x: -37,
+                tilt_y: 62,
+            })]
+        );
+        e.phase = PHASE_MOVED;
+        e.pressure_x1000 = u16::MAX;
+        e.tilt_x = i16::MIN;
+        e.tilt_y = i16::MAX;
+        let [Injection::Pen(sample)] = resolve(&e, output, SINGLE_SCREEN)[..] else {
+            panic!()
+        };
+        assert_eq!(
+            (sample.pressure, sample.tilt_x, sample.tilt_y),
+            (1024, -90, 90)
+        );
+        for (phase, buttons, expected) in [
+            (PHASE_ENDED, 1, PenPhase::Up),
+            (PHASE_CANCELLED, 1, PenPhase::Cancel),
+            (PHASE_MOVED, 0, PenPhase::Hover),
+            (PHASE_ENDED, 0, PenPhase::Leave),
+        ] {
+            e.phase = phase;
+            e.buttons = buttons;
+            let [Injection::Pen(sample)] = resolve(&e, output, SINGLE_SCREEN)[..] else {
+                panic!()
+            };
+            assert_eq!((sample.phase, sample.pressure), (expected, 0));
+        }
+        e.input_ver = 99;
+        assert!(resolve(&e, output, SINGLE_SCREEN).is_empty());
+        assert_eq!(
+            norm_to_output_pixel(
+                65535,
+                65535,
+                CaptureGeometry {
+                    width: 1,
+                    height: 1,
+                    ..output
+                }
+            ),
+            (-2560, -200)
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn relay_resets_dedupe_on_session_change() {
@@ -530,6 +768,104 @@ mod tests {
             recorder::take().as_slice(),
             [Injection::LeftUp { .. }]
         ));
+
+        let mut relay = InputRelay::default();
+        let mut pen = event(KIND_PENCIL, PHASE_BEGAN, 100, 100);
+        pen.input_ver = 2;
+        pen.event_id = u32::MAX - 1;
+        pen.pressure_x1000 = 500;
+        relay.relay(9, &pen, OUTPUT);
+        relay.relay(9, &pen, OUTPUT);
+        pen.phase = PHASE_MOVED;
+        pen.event_id = u32::MAX;
+        relay.relay(9, &pen, OUTPUT);
+        pen.event_id = 0; // wrapping IDs still advance
+        pen.phase = PHASE_ENDED;
+        relay.relay(9, &pen, OUTPUT);
+        pen.event_id = u32::MAX;
+        pen.phase = PHASE_MOVED;
+        relay.relay(9, &pen, OUTPUT); // delayed sample cannot revive the stroke
+        let phases: Vec<_> = recorder::take()
+            .iter()
+            .map(|i| match i {
+                Injection::Pen(p) => p.phase,
+                _ => panic!("Pencil became mouse input"),
+            })
+            .collect();
+        assert_eq!(phases, [PenPhase::Down, PenPhase::Move, PenPhase::Up]);
+        pen.event_id = 1;
+        relay.relay(9, &pen, OUTPUT); // lost down recovers
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::Pen(PenSample {
+                phase: PenPhase::Down,
+                ..
+            })]
+        ));
+        pen.event_id = 2;
+        pen.phase = PHASE_BEGAN;
+        relay.relay(9, &pen, OUTPUT); // new stroke after lost up cancels old one
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Cancel,
+                    ..
+                }),
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Down,
+                    ..
+                })
+            ]
+        ));
+        relay.reset();
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::Pen(PenSample {
+                phase: PenPhase::Cancel,
+                pressure: 0,
+                ..
+            })]
+        ));
+        relay.reset();
+        assert!(recorder::take().is_empty());
+
+        pen.event_id = 3;
+        relay.relay(10, &pen, OUTPUT);
+        let now = relay.last_pen_input.unwrap();
+        assert!(relay
+            .pen_refresh(now + std::time::Duration::from_millis(49))
+            .is_none());
+        assert!(matches!(
+            relay.pen_refresh(now + std::time::Duration::from_millis(50)),
+            Some(Injection::Pen(PenSample {
+                phase: PenPhase::Move,
+                ..
+            }))
+        ));
+        recorder::take();
+        pen.event_id = 4;
+        pen.phase = PHASE_ENDED;
+        pen.x_norm = 200;
+        relay.relay(10, &pen, OUTPUT);
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Move,
+                    ..
+                }),
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Up,
+                    ..
+                })
+            ]
+        ));
+        assert!(relay
+            .pen_refresh(now + std::time::Duration::from_secs(1))
+            .is_none());
+        relay.reset();
+        assert!(recorder::take().is_empty());
     }
 
     #[test]

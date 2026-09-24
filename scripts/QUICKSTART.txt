@@ -66,13 +66,22 @@ Audio follows the Windows default output device.
 
 With Control PC on:
 - Tap clicks, drag moves with the button down, two fingers scroll, and a
-  hold gives right-click. Pencil position also controls the mouse.
+  hold gives right-click. Apple Pencil sends native Windows Ink pressure and tilt.
 - Three-finger tap reveals the controls. Keyboard opens the on-screen
   keyboard and Esc/Tab/modifier/arrow accessory keys.
 - Hardware keyboards relay text and shortcuts. The default maps Command
   to Ctrl; choose Win in Settings if needed. iPadOS retains Globe, Command-H,
   Command-Tab and Command-Space.
 - Supported trackpads/mice relay secondary/middle click, scroll and hover.
+
+For drawing in Clip Studio Paint:
+- Enable Drawing mode in the iPad settings, then reconnect over USB. The
+  canvas ignores fingers, audio is muted, and USB requests up to the iPad's
+  maximum frame rate. Set the PC frame-rate limit to 60 or 120 as appropriate.
+- In CSP choose Preferences > Tablet > Tablet PC, then configure pen pressure.
+- Use the on-screen drawing controls button to reveal the toolbar.
+- Apple Pencil USB-C has no pressure sensor. Use a pressure-sensitive Pencil
+  model for variable brush pressure. See docs/pencil-drawing.md.
 - For view-only, turn Control PC off and reconnect.
 
 6. Quality and frame rate

@@ -36,8 +36,10 @@ will be linked together when their release gates pass.
   to require pairing again. USB trusts physical access.
 - **Touch, keyboard and pointer.** Tap, drag, scroll and hold for right-click;
   hardware and on-screen keyboards, sticky modifiers, secondary/middle buttons
-  and hover. Pencil position is relayed as mouse input; Windows pen-pressure
-  injection is not implemented. iPadOS reserves Globe, ⌘H, ⌘Tab and ⌘Space.
+  and hover. Apple Pencil sends native Windows Ink pressure, tilt and supported
+  hover. Drawing mode adds a Pencil-only canvas and a USB frame-rate preset.
+  See [drawing with Apple Pencil](docs/pencil-drawing.md) for Clip Studio setup.
+  iPadOS reserves Globe, ⌘H, ⌘Tab and ⌘Space.
 - **Reliability and diagnostics.** Bounded NACK repair, adaptive bitrate up to
   50 Mbps, repaired/lost fragment counts, queue and jitter reports, measured
   latency, reconnect, and supervised pipeline recovery.
@@ -89,7 +91,7 @@ implements the Apple device-service client.
 
 ### Windows host
 
-Requirements: Rust 1.98.0 (pinned by `rust-toolchain.toml`, MSVC), an FFmpeg **7.1 shared** SDK, LLVM/libclang
+Requirements: Windows 10 version 1809 or later, Rust 1.98.0 (pinned by `rust-toolchain.toml`, MSVC), an FFmpeg **7.1 shared** SDK, LLVM/libclang
 for bindgen.
 
 ```powershell

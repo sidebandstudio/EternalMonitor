@@ -6,7 +6,7 @@ The accessory row has Esc, Tab, Ctrl, Alt, Win, arrows, Home, End and Delete. Ct
 
 A hardware keyboard sends physical HID keys, including both sides of each modifier, function keys and the numeric keypad. **⌘ key acts as** defaults to Ctrl for familiar copy and paste shortcuts. Choose Win to send the Windows key instead. iPadOS reserves Globe and system shortcuts such as ⌘H, ⌘Tab and ⌘Space, so those may not reach the PC. Keyboard layout affects physical keys and modifier shortcuts. Ordinary software-keyboard text is sent as UTF-16, including two units for a surrogate pair.
 
-A connected mouse or trackpad relays left, right and middle buttons, wheel scrolling and hover. Pointer and supported Pencil hover move the PC cursor without clicking. Hover is limited to 60 updates per second. Touch and Pencil gestures continue to work as before.
+A connected mouse or trackpad relays left, right and middle buttons, wheel scrolling and hover. Pointer hover is limited to 60 updates per second. Apple Pencil has a separate native Windows Ink path with pressure, tilt and supported hover. See [drawing with Apple Pencil](pencil-drawing.md).
 
 Opening stream settings, backgrounding the app, hiding the keyboard or losing the session releases held keys as appropriate. The host also releases tracked buttons and keys when the session ends or changes. Key edges use the same duplicate suppression as touch edges. All input sources share one event sequence, so switching between touch, keyboard and mouse does not discard unrelated events.
 

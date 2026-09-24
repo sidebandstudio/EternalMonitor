@@ -363,10 +363,18 @@ final class ControlChannel {
     /// Fire-and-forget input relay event. Hot path (up to ~240 Hz while
     /// dragging) — no logging, silently dropped before the session is up.
     func sendInput(_ event: WireInputEvent) {
+        sendInputs([event])
+    }
+
+    /// Keep a coalesced Pencil sample batch in order through one queue hop.
+    func sendInputs(_ events: [WireInputEvent]) {
         queue.async { [self] in
             guard sessionId != 0 else { return }
-            guard event.kind < 4 || hostCaps & HelloAck.hostCapKeyboard != 0 else { return }
-            sendMessage(.inputEvent(event))
+            for event in events {
+                if event.inputVer == 2 && self.hostCaps & HelloAck.hostCapPen == 0 { continue }
+                guard event.kind < 4 || hostCaps & HelloAck.hostCapKeyboard != 0 else { continue }
+                sendMessage(.inputEvent(event))
+            }
         }
     }
 

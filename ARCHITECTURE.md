@@ -149,8 +149,20 @@ video, audio, input and pairing credentials are not confidential on the network.
 Touch coordinates are normalized within the displayed video, excluding letterbox
 bars. The host maps them through the captured output rectangle onto the Windows
 virtual desktop. A pure gesture machine handles tap, drag, two-finger scrolling
-and hold/right-click. Pencil contact moves the mouse immediately; Windows pen
-pressure injection is not implemented.
+and hold/right-click. A separate Pencil relay sends precise, coalesced UIKit
+samples without a movement throttle or predicted points. The host creates one
+native PT_PEN device and injects pressure, signed tilt and hover with
+InjectSyntheticPointerInput. Pen coordinates are physical desktop pixels;
+mouse coordinates retain SendInput's normalized virtual-screen space.
+
+HOSTCAP_PEN advertises successful native device creation. Input version 2
+appends two signed i16 tilt angles to the 30-byte input body. Version 1 remains
+byte-compatible. Pencil sample IDs reject duplicates and reordered packets;
+session reset cancels any active pen contact. Drawing mode ignores fingers on
+the remote canvas, mutes audio, and requests up to the iPad's maximum refresh
+rate on USB, still capped by the host's setting. USB input uses TCP_NODELAY,
+one dispatch per coalesced batch, and no redundant edges. See
+[the pen input contract](docs/pencil-drawing.md).
 
 Keyboard events carry USB HID page 0x07 usages, mapped to Windows scan codes and
 extended-key flags. Text carries UTF-16 units for SendInput Unicode events.

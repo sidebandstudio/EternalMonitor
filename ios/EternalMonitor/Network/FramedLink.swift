@@ -85,7 +85,11 @@ final class FramedLink: MediaLink {
     private func sendNext() {
         guard let connection, !sending, !pendingSends.isEmpty else { return }
         sending = true
-        let packet = pendingSends.removeFirst()
+        // Coalesced Pencil samples already waiting can share one TCP write.
+        // There is no timer or extra buffering delay, and framing preserves
+        // every sample and edge in its original order.
+        let packet = pendingSends.reduce(into: Data()) { $0.append($1) }
+        pendingSends.removeAll(keepingCapacity: true)
         connection.send(content: packet, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection, self.connection === connection else { return }
             self.sending = false

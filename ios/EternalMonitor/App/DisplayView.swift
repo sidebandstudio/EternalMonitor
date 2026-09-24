@@ -46,6 +46,17 @@ struct DisplayView: View {
             VStack {
                 HStack {
                     Spacer()
+                    if connectionManager.sessionDrawingMode {
+                        Button { toggleHUD() } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .frame(width: 44, height: 44)
+                                .foregroundStyle(Theme.text)
+                                .background(glass(Circle()))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show or hide drawing controls")
+                        .accessibilityIdentifier("display.drawingControls")
+                    }
                     if showHUD && settings.showHUD {
                         hudOverlay
                             .transition(.opacity.combined(with: .move(edge: .top)))
@@ -53,6 +64,16 @@ struct DisplayView: View {
                 }
                 .padding(.top, 12)
                 .padding(.trailing, 16)
+
+                if connectionManager.sessionDrawingMode && !connectionManager.sessionHasPen {
+                    Text("Native Pencil input is unavailable. Check that your Windows host supports Windows Ink.")
+                        .font(.app(14, relativeTo: .footnote))
+                        .foregroundStyle(Theme.text)
+                        .padding(12)
+                        .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 12))
+                        .padding(.horizontal, 16)
+                        .accessibilityIdentifier("display.penUnavailable")
+                }
 
                 Spacer()
 
