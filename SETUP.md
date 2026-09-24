@@ -140,10 +140,28 @@ you disconnect.
 
 To mirror again, choose **Main display (mirror)** and click **Restart now**.
 
+## Draw with Apple Pencil (optional)
+
+Apple Pencil works as a pen in Windows drawing apps, with pressure and tilt.
+
+1. In the app's settings on the iPad, turn on **Drawing mode**. This also turns
+   on **Allow USB connections**.
+2. Connect again. Drawing mode applies from the next connection, and a USB
+   cable gives the smoothest strokes.
+3. In your drawing app, pick the Windows pen setting. In Clip Studio Paint,
+   choose **Preferences**, then **Tablet**, then **Tablet PC**, and set up pen
+   pressure there.
+
+In Drawing mode, fingers on the canvas are ignored and PC audio is muted. Tap
+the round sliders button in the top right corner to show the controls. Apple
+Pencil (USB-C) has no pressure sensor, so its strokes don't change width with
+pressure. If the iPad says **Native Pencil input is unavailable**, the PC has
+an older EternalMonitor or a Windows 10 version before 1809. Update both.
+
 ## Using EternalMonitor
 
 - **Tap** to click. **Drag** to move something. **Two fingers** scroll.
-  **Touch and hold** to right-click. Apple Pencil moves the mouse too.
+  **Touch and hold** to right-click. Apple Pencil works as a pen in Windows.
 - **Show the controls:** tap with **three fingers**. With **Control PC** off,
   a single tap works. The controls have **Keyboard**, a gear button for settings
   and **Disconnect**.
