@@ -43,11 +43,11 @@ final class AudioStreamTests: XCTestCase {
 
     // Display controls fade five seconds after they appear. A busy runner can
     // outlast that between finding a control and touching it, and a touch on
-    // a vanished element fails the test outright. Bring the controls back
-    // with the user's three-finger gesture, touch the control's position, and
-    // check the outcome before continuing.
+    // a vanished element fails the test outright. Input relay is off in this
+    // test, so one tap on the picture brings the controls back; then touch the
+    // control's position and check the outcome before continuing.
     private func revealControls(_ app: XCUIApplication, showing element: XCUIElement) {
-        if !element.exists { app.tap(withNumberOfTaps: 1, numberOfTouches: 3) }
+        if !element.exists { app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
     }
 
     private func appears(_ element: XCUIElement, where format: String = "exists == true",
