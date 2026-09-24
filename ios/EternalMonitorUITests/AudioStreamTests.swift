@@ -59,10 +59,11 @@ final class AudioStreamTests: XCTestCase {
         let control = app.buttons[identifier]
         for _ in 0..<3 where !result.exists {
             revealControls(app, showing: control)
-            guard appears(control, within: 5) else { continue }
-            let center = control.frame
+            // A snapshot throws, instead of failing the test, if the control
+            // fades between the check and the read.
+            guard appears(control, within: 5), let frame = try? control.snapshot().frame else { continue }
             app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: center.midX, dy: center.midY)).tap()
+                .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
             _ = appears(result, within: 5)
         }
         XCTAssertTrue(result.exists, "\(identifier) did not open \(result)")
