@@ -116,6 +116,35 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         ));
     }
 
+    for (name, kind, phase, keycode) in [
+        ("input_key_down", 4, 0, 0x4f),
+        ("input_text", 5, 0, 0xd83d),
+        ("input_hover", 6, 1, 0),
+    ] {
+        vectors.push((
+            name,
+            encode_control(
+                0x1234_5678,
+                17,
+                &ControlMessage::InputEvent(InputEvent {
+                    input_ver: 1,
+                    kind,
+                    phase,
+                    buttons: 0,
+                    event_id: 42,
+                    x_norm: 32768,
+                    y_norm: 16384,
+                    pressure_x1000: 0,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode,
+                    modifiers: 2,
+                    client_time_us: 123456789,
+                }),
+            ),
+        ));
+    }
+
     let control: Vec<(&'static str, u32, u32, ControlMessage)> = vec![
         (
             "hello2",

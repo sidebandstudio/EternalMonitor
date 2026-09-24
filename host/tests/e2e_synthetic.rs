@@ -1292,7 +1292,10 @@ fn hevc_stream_negotiates_and_decodes() {
 #[cfg(not(windows))]
 #[test]
 fn input_relay_maps_touches_end_to_end() {
-    use eternal_host::input::{recorder, Injection, KIND_SCROLL, KIND_TOUCH};
+    use eternal_host::input::{
+        recorder, Injection, KIND_HOVER, KIND_KEY, KIND_MOUSE_ABS, KIND_SCROLL, KIND_TEXT,
+        KIND_TOUCH,
+    };
     use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
 
     let _guard = ENV_LOCK.lock().unwrap();
@@ -1399,19 +1402,40 @@ fn input_relay_maps_touches_end_to_end() {
         ..base
     }));
 
+    for (event_id, kind, phase, keycode, buttons) in [
+        (5, KIND_KEY, 0, 0x4f, 0),
+        (6, KIND_KEY, 2, 0x4f, 0),
+        (7, KIND_TEXT, 0, 72, 0),
+        (8, KIND_HOVER, 1, 0, 0),
+        (9, KIND_MOUSE_ABS, 0, 0, 4),
+        (10, KIND_MOUSE_ABS, 2, 0, 4),
+    ] {
+        let event = InputEvent {
+            event_id,
+            kind,
+            phase,
+            keycode,
+            buttons,
+            ..base
+        };
+        receiver.send(&ControlMessage::InputEvent(event));
+        if phase != 1 {
+            receiver.send(&ControlMessage::InputEvent(event));
+        }
+    }
+
     // Give the loopback datagrams a moment to be routed and injected. The
-    // scroll event was sent last, so once its two injections appear (7 total)
-    // everything before it has been processed; a short settle then catches
+    // final middle-button release brings the count to 15; a short settle catches
     // any wrongly-injected duplicate.
     let inject_deadline = Instant::now() + Duration::from_secs(5);
-    while recorder::peek().len() < 7 && Instant::now() < inject_deadline {
+    while recorder::peek().len() < 15 && Instant::now() < inject_deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(150));
     let recorded = recorder::take();
     assert!(
-        recorded.len() >= 7,
-        "expected 7 injections within 5s, got {recorded:?}"
+        recorded.len() >= 15,
+        "expected 15 injections within 5s, got {recorded:?}"
     );
 
     // Tap at (0,0): move + left down, then move + left up — exactly once
@@ -1441,7 +1465,26 @@ fn input_relay_maps_touches_end_to_end() {
     assert!((i32::from(x) - 32_768).unsigned_abs() < 300, "scroll x {x}");
     assert!((i32::from(y) - 32_768).unsigned_abs() < 300, "scroll y {y}");
     assert_eq!(recorded[6], Injection::Wheel { delta: -120 });
-    assert_eq!(recorded.len(), 7, "no extra injections: {recorded:?}");
+    assert_eq!(
+        &recorded[7..],
+        &[
+            Injection::KeyDown {
+                scan: 0x4d,
+                extended: true
+            },
+            Injection::KeyUp {
+                scan: 0x4d,
+                extended: true
+            },
+            Injection::Unicode(72),
+            Injection::MoveAbs { x: 0, y: 0 },
+            Injection::MoveAbs { x: 0, y: 0 },
+            Injection::MiddleDown { x: 0, y: 0 },
+            Injection::MoveAbs { x: 0, y: 0 },
+            Injection::MiddleUp { x: 0, y: 0 },
+        ]
+    );
+    assert_eq!(recorded.len(), 15, "no extra injections: {recorded:?}");
 
     shared.stop();
     supervisor_tx

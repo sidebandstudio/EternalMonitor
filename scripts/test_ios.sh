@@ -52,7 +52,7 @@ for name in ['ui-state', 'ui-usb-state']:
 PYSETTINGS
     APPDATA="$ROOT/build/ui-state" ETERNAL_HEADLESS=1 ETERNAL_CAPTURE=synthetic \
         ETERNAL_SYNTH_SIZE=640x360 ETERNAL_ENCODER=libx264 ETERNAL_FPS=60 \
-        ETERNAL_DROP=0.03 ETERNAL_REORDER=0.01 \
+        ETERNAL_DROP=0.03 ETERNAL_REORDER=0.01 ETERNAL_INPUT_RECORDER_LOG=1 \
         "$ROOT/target/release/eternal-host" 19875 > "$ROOT/build/ios-ui-host-$STAMP.log" 2>&1 &
     HOST_PID=$!
     python3 "$ROOT/scripts/usb_proxy.py" --control-port 19874 > "$ROOT/build/ios-usb-proxy-$STAMP.log" 2>&1 &
@@ -76,15 +76,17 @@ PYPAIR
 fi
 # Pass the startup code to the XCTest runner, not the application. This is
 # read from the real host log; there is no fixed code or app-side bypass.
-RUNFILE=$(python3 - "$DERIVED/Build/Products" "$PAIR_HOST_LOG" "$NEED_STREAM" <<'PYRUN'
+RUNFILE=$(python3 - "$DERIVED/Build/Products" "$PAIR_HOST_LOG" "$NEED_STREAM" "$ROOT/build/ios-ui-host-$STAMP.log" <<'PYRUN'
 import os,pathlib,plistlib,re,sys,time
 products=pathlib.Path(sys.argv[1])
 runfile=max(products.glob('*.xctestrun'),key=lambda p:p.stat().st_mtime)
 data=plistlib.loads(runfile.read_bytes())
 env=data['EternalMonitorUITests'].setdefault('EnvironmentVariables',{})
-for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST']:
+for key in ['EM_PAIRING_CODE','EM_PAIRING_HOST','EM_INPUT_HOST_LOG','EM_INPUT_HOST']:
     env.pop(key,None)
 if sys.argv[3]=='1':
+    env['EM_INPUT_HOST_LOG']=os.environ.get('EM_INPUT_HOST_LOG', sys.argv[4])
+    env['EM_INPUT_HOST']=os.environ.get('EM_INPUT_HOST','127.0.0.1:19875')
     code=os.environ.get('EM_PAIRING_CODE')
     deadline=time.monotonic()+10
     while not code and time.monotonic()<deadline:

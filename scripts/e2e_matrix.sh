@@ -116,12 +116,12 @@ PY
     done
 else
     skip=0
-    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio pairing; do
-        if [ "$scenario" = pairing ]; then
+    for scenario in h264-udp hevc-udp h264-udp-loss3 h264-udp-burst h264-udp-burst-bsd h264-usb usb-takeover h264-udp-audio h264-usb-audio pairing keyboard; do
+        if [ "$scenario" = pairing ] || [ "$scenario" = keyboard ]; then
             rows+=("$OUT/$scenario/result.json")
             echo "==> $scenario"
             if ! EM_SCENARIO="$scenario" EM_OUTPUT_DIR="$OUT/$scenario" \
-                "$ROOT/scripts/e2e_pairing.sh" > "$OUT/$scenario-run.log" 2>&1; then failed=1; fi
+                "$ROOT/scripts/e2e_$scenario.sh" > "$OUT/$scenario-run.log" 2>&1; then failed=1; fi
             tail -5 "$OUT/$scenario-run.log"
             continue
         fi

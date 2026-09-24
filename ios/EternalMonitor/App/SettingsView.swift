@@ -65,14 +65,20 @@ struct SettingsView: View {
                 // Control (input relay)
                 Section {
                     Toggle(isOn: $settings.controlPC) {
-                        Label("Control PC with touch", systemImage: "hand.point.up.left")
+                        Label("Control PC", systemImage: "hand.point.up.left")
                     }
+                    Picker("⌘ key acts as", selection: $settings.commandAsControl) {
+                        Text("Ctrl").tag(true)
+                        Text("Win").tag(false)
+                    }
+                    .accessibilityIdentifier("settings.commandMapping")
                 } header: {
                     sectionHeader("Control")
                 } footer: {
                     footnote(
                         "Tap to click, drag to move the mouse, two fingers to scroll, "
-                            + "hold for a right-click. Takes effect on the next connect. "
+                            + "hold for a right-click. Keyboard, trackpad and pencil hover also control the PC. "
+                            + "Control PC takes effect on the next connect. iPadOS keeps Globe, ⌘H, ⌘Tab and ⌘Space. "
                             + "While control is on, tap with three fingers to toggle the HUD."
                     )
                 }

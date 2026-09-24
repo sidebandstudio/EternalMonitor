@@ -286,6 +286,7 @@ struct HelloAck: Equatable {
     static let hostCapNack: UInt16 = 1 << 0
     static let hostCapAudio: UInt16 = 1 << 1
     static let hostCapUSB: UInt16 = 1 << 2
+    static let hostCapKeyboard: UInt16 = 1 << 3
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32

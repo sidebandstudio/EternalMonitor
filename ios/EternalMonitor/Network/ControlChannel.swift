@@ -354,6 +354,7 @@ final class ControlChannel {
     func sendInput(_ event: WireInputEvent) {
         queue.async { [self] in
             guard sessionId != 0 else { return }
+            guard event.kind < 4 || hostCaps & HelloAck.hostCapKeyboard != 0 else { return }
             sendMessage(.inputEvent(event))
         }
     }

@@ -40,6 +40,7 @@ pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
+pub const HOSTCAP_KEYBOARD: u16 = 1 << 3;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;

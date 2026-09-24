@@ -80,11 +80,13 @@ impl ConfigSource for SharedConfigSource<'_> {
         } else {
             0
         };
-        usb | if crate::audio::codec_available() {
-            eternal_wire::v2::control::HOSTCAP_AUDIO
-        } else {
-            0
-        }
+        eternal_wire::v2::control::HOSTCAP_KEYBOARD
+            | usb
+            | if crate::audio::codec_available() {
+                eternal_wire::v2::control::HOSTCAP_AUDIO
+            } else {
+                0
+            }
     }
 
     fn host_name(&self) -> String {
@@ -221,7 +223,7 @@ pub async fn start_sender(
             }
             _ = heartbeat.tick() => {
                 let actions = shared.session.lock().tick(&config, true, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
             _ = liveness_tick.tick() => {
@@ -231,7 +233,7 @@ pub async fn start_sender(
                     break;
                 }
                 let actions = shared.session.lock().tick(&config, false, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
 
@@ -259,6 +261,7 @@ pub async fn start_sender(
                                             Instant::now(),
                                         );
                                         if actions.new_target.is_some() || actions.client_lost {
+                                            input_relay.reset();
                                             retransmit_ring.clear();
                                             fault.clear();
                                         }
