@@ -532,6 +532,7 @@ final class ConnectionManager: ObservableObject {
             preferredFPS: UInt8(UserDefaults.standard.frameRatePreference()),
             authToken: pairingToken
         )
+        E2E.emit("E2E_HELLO w=\(identity.screenPxW) h=\(identity.screenPxH) refresh_hz=\(identity.refreshHz)")
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
             channel?.startHandshake(listenPort: actualPort, identity: identity)
             Task { @MainActor in
@@ -790,7 +791,12 @@ final class ConnectionManager: ObservableObject {
         guard state != .disconnected else { return }
         resumeOnForeground = true
         record(.info, "ctrl", "App backgrounded — sent BYE and disconnected")
+        // The goodbye is still queued in Network.framework when this returns.
+        // Ask for time to send it; a prompt suspension would strand it.
+        let application = UIApplication.shared
+        let goodbye = application.beginBackgroundTask(withName: "EternalMonitor goodbye")
         disconnect(reason: .appBackground)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { application.endBackgroundTask(goodbye) }
     }
 
     /// Resume the session that backgrounding interrupted (opt-out toggle).

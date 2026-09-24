@@ -83,6 +83,10 @@ struct DisplayView: View {
             if presented { showKeyboard = false; hudDismissTask?.cancel() }
             else { scheduleHUDDismiss() }
         }
+        .onChange(of: connectionManager.signalLost) { _, lost in
+            if lost { hudDismissTask?.cancel(); showHUD = true }
+            else { scheduleHUDDismiss() }
+        }
     }
 
     // MARK: - HUD overlay
@@ -226,6 +230,7 @@ struct DisplayView: View {
             .accessibilityLabel(
                 connectionManager.signalLost ? "Signal lost, reconnecting" : "On air"
             )
+            .accessibilityIdentifier("display.signal")
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .background(
@@ -297,7 +302,7 @@ struct DisplayView: View {
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
         withAnimation(.easeOut(duration: 0.25)) { showHUD = true }
-        guard !showKeyboard && !showSettings else { return }
+        guard !showKeyboard && !showSettings && !connectionManager.signalLost else { return }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {

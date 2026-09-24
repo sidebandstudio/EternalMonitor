@@ -197,6 +197,13 @@ fn run_encode_loop(
             encoder_name.clone()
         };
 
+        if let Some(state) = encoder_state.as_mut() {
+            if state.update_bitrate_without_reopening(&desired_encoder, desired_bitrate, target_fps)
+            {
+                failed_reopen = None;
+            }
+        }
+
         if encoder_state.is_none() {
             match EncoderState::new(
                 &desired_encoder,
@@ -425,6 +432,12 @@ fn run_encode_loop(
                             is_keyframe,
                         );
                     }
+                    if let Some(capture) = encoder.hevc_capture.as_mut() {
+                        if let Err(error) = capture.observe(&nal_data, is_keyframe) {
+                            warn!(%error, "Stopping opt-in HEVC diagnostic capture");
+                            encoder.hevc_capture = None;
+                        }
+                    }
 
                     // AMF startup safety net: a keyframe went out but we still have no cached
                     // SPS/PPS (empty extradata and none inline), so the iPad can't build a format
@@ -490,10 +503,11 @@ struct EncoderState {
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
     amf_diagnostics: Option<AmfBitstreamDiagnostics>,
+    hevc_capture: Option<HevcBitstreamCapture>,
     /// The FFmpeg encoder this session was opened with; a negotiated codec
     /// change (H.264 ↔ HEVC) requests a reopen.
     opened_encoder: String,
-    /// The bitrate this session was opened with; a change requests a reopen.
+    /// Last applied bitrate. Hardware encoders reopen when this changes.
     opened_bitrate: u32,
     opened_fps: u32,
     /// First frame's capture instant — the PTS epoch for this session.
@@ -506,6 +520,40 @@ struct EncoderState {
 }
 
 impl EncoderState {
+    fn update_bitrate_without_reopening(
+        &mut self,
+        desired_encoder: &str,
+        bitrate_bps: u32,
+        target_fps: u32,
+    ) -> bool {
+        if self.opened_encoder != "libx264"
+            || desired_encoder != self.opened_encoder
+            || target_fps != self.opened_fps
+            || bitrate_bps == self.opened_bitrate
+        {
+            return false;
+        }
+        // FFmpeg 7.1's libx264 wrapper applies bitrate and VBV changes through
+        // x264_encoder_reconfig before the next frame. Preserve its reference
+        // frames, PTS epoch and buffers instead of allocating a second encoder
+        // for every ABR step. Other encoders retain the existing reopen path.
+        self.encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
+        self.encoder
+            .set_max_bit_rate(bitrate_bps.max(500_000) as usize);
+        // A half-second VBV is enabled at open, as required for x264's live
+        // bitrate reconfiguration. The context belongs to this encode thread.
+        unsafe {
+            (*self.encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
+        };
+        info!(
+            from = self.opened_bitrate,
+            to = bitrate_bps,
+            "Updated software encoder bitrate"
+        );
+        self.opened_bitrate = bitrate_bps;
+        true
+    }
+
     fn new(
         encoder_name: &str,
         width: u32,
@@ -546,6 +594,14 @@ impl EncoderState {
         }
         encoder.set_max_b_frames(0);
         encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
+        if encoder_name == "libx264" {
+            // x264 can only reconfigure bitrate when VBV was enabled at open.
+            // Limit bursts to half a second at the current target bitrate.
+            encoder.set_max_bit_rate(bitrate_bps.max(500_000) as usize);
+            unsafe {
+                (*encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
+            };
+        }
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
@@ -608,6 +664,7 @@ impl EncoderState {
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
+            hevc_capture: HevcBitstreamCapture::for_encoder(encoder_name),
             opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
             opened_fps: target_fps,
@@ -816,6 +873,107 @@ fn prepare_frame_for_encode(
 /// Check if an ffmpeg error is EAGAIN (no output available yet).
 fn is_eagain(e: &ffmpeg_next::Error) -> bool {
     matches!(e, ffmpeg_next::Error::Other { errno } if *errno == libc::EAGAIN)
+}
+
+// The existing H.264 diagnostics remain unchanged. HEVC uses its own bounded,
+// opt-in file so the hardware campaign can validate the actual AMF bitstream.
+struct HevcBitstreamCapture {
+    file: Option<File>,
+    packets: u64,
+}
+
+impl HevcBitstreamCapture {
+    fn for_encoder(name: &str) -> Option<Self> {
+        Self::open_for_encoder(
+            name,
+            std::env::var("ETERNAL_AMF_DIAG").is_ok_and(|v| v.trim() == "1"),
+            diagnostic_dir().join("amf-first-120-packets.hevc"),
+        )
+    }
+
+    fn open_for_encoder(name: &str, enabled: bool, path: PathBuf) -> Option<Self> {
+        if name != "hevc_amf" || !enabled {
+            return None;
+        }
+        let opened = fs::create_dir_all(path.parent().unwrap()).and_then(|()| File::create(&path));
+        match opened {
+            Ok(file) => {
+                info!(path = %path.display(), "Capturing AMF HEVC packets for diagnostics");
+                Some(Self {
+                    file: Some(file),
+                    packets: 0,
+                })
+            }
+            Err(error) => {
+                warn!(%error, "Could not create opt-in HEVC diagnostic capture");
+                None
+            }
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], keyframe: bool) -> std::io::Result<()> {
+        if self.packets == 0 && !keyframe {
+            return Ok(());
+        }
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(bytes)?;
+            self.packets += 1;
+            if self.packets == AMF_CAPTURE_PACKET_LIMIT {
+                file.flush()?;
+                self.file = None;
+                info!(
+                    packets = self.packets,
+                    "AMF HEVC diagnostic capture complete"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hevc_capture_tests {
+    use super::*;
+
+    #[test]
+    fn opted_in_hevc_amf_creates_capture_and_other_encoders_do_not() {
+        let path = std::env::temp_dir().join(format!("em-hevc-select-{}.bin", std::process::id()));
+        for (name, enabled) in [
+            ("hevc_amf", false),
+            ("h264_amf", true),
+            ("hevc_nvenc", true),
+        ] {
+            assert!(HevcBitstreamCapture::open_for_encoder(name, enabled, path.clone()).is_none());
+            assert!(!path.exists());
+        }
+        let mut capture = HevcBitstreamCapture::open_for_encoder("hevc_amf", true, path.clone())
+            .expect("opted-in AMD HEVC must create its diagnostic capture");
+        capture.observe(&[1, 2, 3], true).unwrap();
+        drop(capture);
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capture_starts_at_a_keyframe_and_closes_at_the_packet_limit() {
+        let path = std::env::temp_dir().join(format!("em-hevc-capture-{}.bin", std::process::id()));
+        let mut capture = HevcBitstreamCapture {
+            file: Some(File::create(&path).unwrap()),
+            packets: 0,
+        };
+        capture.observe(&[99], false).unwrap();
+        capture.observe(&[1], true).unwrap();
+        for _ in 1..AMF_CAPTURE_PACKET_LIMIT {
+            capture.observe(&[2], false).unwrap();
+        }
+        capture.observe(&[3], true).unwrap();
+        assert!(capture.file.is_none());
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(bytes.len(), AMF_CAPTURE_PACKET_LIMIT as usize);
+        assert_eq!(bytes[0], 1);
+        assert!(bytes[1..].iter().all(|&byte| byte == 2));
+    }
 }
 
 struct AmfBitstreamDiagnostics {
@@ -1124,6 +1282,81 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_bitrate_changes_preserve_decoding_and_reduce_packet_size() {
+        ffmpeg_next::init().unwrap();
+        let mut state =
+            EncoderState::new("libx264", 640, 360, 8_000_000, 60, EncoderInput::Yuv420).unwrap();
+        let context = unsafe { state.encoder.as_ptr() };
+        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+        let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut decoded_frames = 0;
+        let mut sizes = [0usize; 3];
+        let mut random = 1u32;
+        for number in 0..360 {
+            if number == 120 || number == 240 {
+                let bitrate = if number == 120 { 1_000_000 } else { 8_000_000 };
+                assert!(state.update_bitrate_without_reopening("libx264", bitrate, 60));
+            }
+            // Changing noise forces rate control to work at both targets.
+            for value in state.frame.data_mut(0) {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = (random >> 24) as u8;
+            }
+            state.frame.data_mut(1).fill(128);
+            state.frame.data_mut(2).fill(128);
+            state.frame.set_pts(Some(number as i64 * 1_000_000 / 60));
+            state.encoder.send_frame(&state.frame).unwrap();
+            loop {
+                match state.encoder.receive_packet(&mut state.packet) {
+                    Ok(()) => {
+                        if number % 120 >= 60 {
+                            sizes[number / 120] += state.packet.size();
+                        }
+                        decoder.send_packet(&state.packet).unwrap();
+                        loop {
+                            match decoder.receive_frame(&mut decoded) {
+                                Ok(()) => {
+                                    assert_eq!(
+                                        decoded.pts(),
+                                        Some(decoded_frames * 1_000_000 / 60)
+                                    );
+                                    assert_eq!((decoded.width(), decoded.height()), (640, 360));
+                                    decoded_frames += 1;
+                                }
+                                Err(error) if is_eagain(&error) => break,
+                                Err(error) => panic!("decode failed: {error}"),
+                            }
+                        }
+                    }
+                    Err(error) if is_eagain(&error) => break,
+                    Err(error) => panic!("encode failed: {error}"),
+                }
+            }
+        }
+        assert_eq!(decoded_frames, 360);
+        assert_eq!(unsafe { state.encoder.as_ptr() }, context);
+        assert!(
+            sizes[1] * 2 < sizes[0],
+            "lower bitrate was not applied: {sizes:?}"
+        );
+        assert!(
+            sizes[2] > sizes[1] * 2,
+            "higher bitrate was not applied: {sizes:?}"
+        );
+        // FPS and codec changes must still use the existing reopen path.
+        assert!(!state.update_bitrate_without_reopening("libx264", 4_000_000, 120));
+        assert!(!state.update_bitrate_without_reopening("libx265", 4_000_000, 60));
+        for name in ["h264_nvenc", "h264_amf", "h264_qsv", "libx265"] {
+            state.opened_encoder = name.to_string();
+            assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
+        }
+    }
 
     #[test]
     fn hevc_variants_cover_every_supported_encoder() {

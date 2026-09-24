@@ -32,6 +32,7 @@ final class UDPReceiver: MediaLink {
     var onListenerReady: ((UInt16) -> Void)?
 
     private var connection: NWConnection?
+    private var pendingWrites = DispatchGroup()
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var receiveBuffer = [UInt8](repeating: 0, count: 2048)
@@ -100,6 +101,7 @@ final class UDPReceiver: MediaLink {
                 let actualPort = self.localPort() ?? 0
                 print("[UDPReceiver] NW socket ready, ephemeral port \(actualPort)")
                 self.onListenerReady?(actualPort)
+                guard self.connection === connection else { return }
                 self.onConnectionEstablished?()
                 self.startRepairTimer()
                 self.receiveLoop()
@@ -192,8 +194,10 @@ final class UDPReceiver: MediaLink {
                 data.withUnsafeBytes { bytes in
                     _ = Darwin.send(socketFD, bytes.baseAddress, bytes.count, 0)
                 }
-            } else {
-                connection?.send(content: data, completion: .contentProcessed { _ in })
+            } else if let connection {
+                let writes = pendingWrites
+                writes.enter()
+                connection.send(content: data, completion: .contentProcessed { _ in writes.leave() })
             }
         }
         if DispatchQueue.getSpecific(key: queueKey) != nil { write() }
@@ -222,10 +226,10 @@ final class UDPReceiver: MediaLink {
     }
 
     func stop() {
-        onQueue { stopOnQueue() }
+        onQueue { stopOnQueue(flush: true) }
     }
 
-    private func stopOnQueue() {
+    private func stopOnQueue(flush: Bool = false) {
         repairTimer?.setEventHandler {}
         repairTimer?.cancel()
         repairTimer = nil
@@ -235,9 +239,20 @@ final class UDPReceiver: MediaLink {
         socketFD = -1
         // Break the handler → connection reference before cancel so each
         // connect/disconnect cycle can actually deallocate the NWConnection.
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
+        if let closing = connection {
+            closing.stateUpdateHandler = nil
+            // send() queues Network.framework work even on our serial queue.
+            // Wait for queued writes (including BYE) before cancellation. Keep
+            // a bounded fallback for a failed/unready peer; never block the UI.
+            if flush {
+                pendingWrites.notify(queue: queue) { closing.cancel() }
+                queue.asyncAfter(deadline: .now() + .milliseconds(250)) { closing.cancel() }
+            } else {
+                closing.cancel()
+            }
+        }
         connection = nil
+        pendingWrites = DispatchGroup()
         datagrams.reset()
     }
 

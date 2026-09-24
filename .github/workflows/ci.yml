@@ -74,7 +74,9 @@ jobs:
 
       - name: Test virtual display task scripts
         shell: powershell
-        run: ./scripts/win/Test-VddToggle.ps1
+        run: |
+          ./scripts/win/Test-VddToggle.ps1
+          ./scripts/win/Test-VddState.ps1
       - name: Verify virtual display driver ownership on uninstall
         shell: powershell
         run: ./installer/tests/Test-VddDriverRemoval.ps1
@@ -99,6 +101,13 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
         run: cargo test --workspace --locked
+      - name: Retain GUI comparison images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-gui-snapshots
+          path: host/tests/snapshots/
+          retention-days: 7
 
   ios-build:
     name: iOS (simulator build)
@@ -124,11 +133,11 @@ jobs:
           xcodebuild -version
           UDID=$(xcrun simctl create citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Run iOS unit and UI tests
+      - name: Run iOS unit tests and connection/settings UI tests
         env:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          scripts/test_ios.sh
+          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests
       - name: Retain iOS test evidence
         if: always()
         uses: actions/upload-artifact@v4

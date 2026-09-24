@@ -81,6 +81,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.eternal.monitor.uitests
         TEST_TARGET_NAME: EternalMonitor
+        SWIFT_OBJC_BRIDGING_HEADER: EternalMonitorUITests/TouchSynthesis.h
 
 schemes:
   EternalMonitor:
