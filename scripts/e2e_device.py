@@ -55,8 +55,6 @@ def run_row(name, spec, out, args):
     family = spec.get('family', 'nvenc')
     host = ['ETERNAL_HEADLESS=1', f'ETERNAL_ENCODER=h264_{family}', f'ETERNAL_HEVC={int(codec == "hevc")}',
             f'ETERNAL_FPS={fps}', 'ETERNAL_E2E_LOG=1', *spec.get('host', [])]
-    if family == 'amf':
-        host.append('ETERNAL_AMF_DIAG=1')
     if os.environ.get('EM_HOST_RUST_LOG'):
         host.append('RUST_LOG=' + os.environ['EM_HOST_RUST_LOG'])
     launch = {'EM_E2E_LOG': '1', 'OS_ACTIVITY_DT_MODE': 'YES'}
