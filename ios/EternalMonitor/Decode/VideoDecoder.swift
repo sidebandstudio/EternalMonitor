@@ -585,7 +585,9 @@ final class VideoDecoder {
             }
             guard status == noErr else {
                 self.decodeQueue.async {
-                    self.recoverFromDecodeFailure(status, generation: generation, source: "Decoder callback")
+                    self.recoverFromDecodeFailure(
+                        status, generation: generation, source: "Decoder callback", onSyncSample: isSyncSample
+                    )
                 }
                 return
             }
@@ -595,20 +597,23 @@ final class VideoDecoder {
 
         if status != noErr || infoFlags.contains(.frameDropped) { finish() }
         if status != noErr {
-            recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame")
+            recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame", onSyncSample: isSyncSample)
         }
     }
 
     /// Both submission and asynchronous output errors arrive here on decodeQueue.
     /// Hold dependent frames until a replacement sync sample, and coalesce errors
     /// already in flight so one damaged frame cannot cause a request storm.
-    private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String) {
+    private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String,
+                                          onSyncSample: Bool) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
         waitingForSyncSample = true
         onEvent?("\(source) status=\(status); waiting for a keyframe")
-        if status == kVTInvalidSessionErr {
-            // The session died underneath us (typical after app backgrounding).
-            // Bad bitstream data alone does not rebuild a healthy session.
+        if status == kVTInvalidSessionErr || onSyncSample {
+            // The session died underneath us (typical after app backgrounding),
+            // or it rejected a keyframe: a session in that state rejected every
+            // later IDR too. Bad data in a dependent frame alone does not
+            // rebuild a healthy session.
             createDecompressionSession()
         }
         onNeedsKeyframe?()
