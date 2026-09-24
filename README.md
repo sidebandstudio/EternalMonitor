@@ -20,10 +20,10 @@ Contributions welcome. Transport, encoders, rendering, docs, anything. Ping
 
 ## v0.3.0 candidate
 
-The v0.3.0 work is merged to `main`. A v0.3.0 RC has not been published.
-The latest public installer is an older build; it does not contain all the
-features described here. The matching candidate installer and TestFlight app
-will be linked together when their release gates pass.
+v0.3.0-rc.1 is the release candidate. Its Windows installer is a GitHub
+pre-release and appears on the site's download page as a preview for testers.
+Install the matching iPad build through TestFlight; invite: ask Ali. The latest
+full release is older and does not contain the features below.
 
 - **Mirror or extend.** Capture the primary or another monitor, or create a
   managed virtual display while the iPad is connected.
@@ -47,13 +47,13 @@ will be linked together when their release gates pass.
   offers 30/60/90/120 fps and honors the iPad's lower preference. YUV420 remains
   the default input; BGRA is opt-in until both hardware gates pass.
 
-The full simulator matrix and the 30-minute simulator soak have passed locally.
-Native Windows builds and tests have passed, but the reference-PC desktop
-campaign on the final build, the 30-minute Windows soak and physical iPad
-checks are still pending. See
-[HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) for dated evidence and
-remaining checks. No physical USB cable, hardware iPad decoding or 120 Hz panel
-result is implied by a simulator pass.
+On 2026-09-24 the candidate passed the full simulator matrix and 30-minute
+soak, the Windows test suite and real-hardware matrix on the reference PC, the
+automated physical-iPad rows over WiFi and USB, a Windows pen-injection probe,
+and 30-minute soaks on a physical iPad over WiFi and over USB with the extended
+display. [HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) has the evidence
+and the checks that still need a person: Pencil drawing in a real app, audio
+sync, first-time USB trust and ProMotion on a 120 Hz source.
 
 ## Install for testing
 

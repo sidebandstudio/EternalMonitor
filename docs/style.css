@@ -1096,7 +1096,8 @@ code {
 }
 
 .download-note a,
-.download-hero a {
+.download-hero a,
+.status-card a {
   color: var(--accent);
 }
 

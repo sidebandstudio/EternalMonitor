@@ -1,8 +1,9 @@
 # EternalMonitor 0.3.0: What to Test
 
-Release candidate work is in progress. Use the matching Windows installer and
-iPad build when an RC is published. The Windows desktop campaign, long-run
-Windows soak and physical iPad verification are still pending. No RC is published yet.
+v0.3.0-rc.1 is the release candidate for testers. Install the Windows preview
+and the matching iPad build from TestFlight together. It passed the automated
+tests on the reference PC and a physical iPad; the hands-on checks below remain.
+New users can follow SETUP.md.
 
 ### What changed
 
@@ -23,6 +24,9 @@ Windows soak and physical iPad verification are still pending. No RC is publishe
   stored in the iPad Keychain. Regenerating the host token requires pairing again.
 - Hardware and on-screen keyboards, sticky modifiers, indirect pointer buttons
   and hover extend the existing touch and Pencil controls.
+- Apple Pencil draws as a Windows Ink pen with pressure and tilt. Drawing mode
+  ignores fingers on the canvas, mutes PC audio and asks for the highest USB
+  frame rate. In Clip Studio Paint, choose the Tablet PC setting.
 - The host offers 30/60/90/120 fps; the iPad requests 30/60/120 fps. The lower limit
   wins. HEVC remains optional. YUV420 remains the default encoder input because
   the AMD encoder does not accept BGRA; BGRA input is opt-in.
@@ -36,11 +40,14 @@ Pair on the local network, test H.264 and HEVC, then type and scroll through the
 keyboard and trackpad. Connect, unplug and reconnect USB. Play audio and check
 sync, mute and a Windows output-device change. Walk toward the WiFi edge and
 watch repairs rise without long freezes. On a ProMotion iPad, try 120 fps with
-the virtual display at 120 Hz. Report the GPU, codec, host log and visible error.
+the virtual display at 120 Hz. Draw in Clip Studio Paint with Drawing mode over
+USB, including pressure, tilt and a resting palm. Report the GPU, codec, host
+log and visible error.
 
-On the reference PC a physical iPad streamed a moving 2732×2048 extended desktop
-over USB-C for 643 seconds while charging. First-install trust, timed takeover and
-WiFi fallback still need the physical iPad pass. Pairing controls access but does
+On the reference PC a physical iPad streamed the 2732×2048 extended desktop over
+USB-C for 30 minutes at 58 FPS with no dropped frames, and 3440×1440 over WiFi
+for 30 minutes with 19 of 105,600 frames dropped. First-install trust, timed
+takeover and WiFi fallback still need the hands-on pass. Pairing controls access but does
 not encrypt video, audio or input, so use a trusted local network.
 
 Known issue: on the reference PC (NVIDIA driver 591.86), Windows once stopped

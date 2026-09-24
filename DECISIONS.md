@@ -292,5 +292,5 @@ App Store Connect steps. A dry archive is not an installable TestFlight build.
 - Physical iPad and full reference-PC campaign results: tracked in the hardware runbook.
 - FEC, encryption, zero-copy GPU capture and dirty-rectangle encoding.
 - Native macOS screen capture via ScreenCaptureKit; macOS currently supplies synthetic capture.
-- Windows pressure-sensitive pen injection and a first-party signed display driver.
+- A first-party signed display driver.
 - Public App Store distribution; testers use TestFlight or source builds.

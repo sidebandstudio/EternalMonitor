@@ -143,11 +143,11 @@ so its display task is registered.
 ## Build parity and candidate status
 
 Hand out the Windows installer and iPad app from the same candidate, and record
-both versions and the TestFlight build number. The v0.3 features are implemented
-in draft branches. Local simulator and native build evidence is recorded, but
-the reference-PC desktop campaign, long-run memory gate and physical iPad pass
-are still pending. Do not present an unsigned archive or older release as the
-finished v0.3 product.
+both versions and the TestFlight build number. v0.3.0-rc.1 passed the automated
+gates on the reference PC and a physical iPad on 2026-09-24; see
+`HARDWARE_VERIFICATION.md`. The checks there that need a person are what testers
+should focus on. Do not present an unsigned archive or older release as the
+finished v0.3 product. Point new testers to `SETUP.md`.
 
 ## What to test in v0.3
 
@@ -164,7 +164,8 @@ Use `HARDWARE_VERIFICATION.md` for the complete checklist and expected results.
   compare audio/video timing. Report endpoint, buffer and loss statistics.
 - Type through both keyboards; test Ctrl shortcuts, sticky modifiers, arrows,
   pointer buttons/scroll, Pencil position/hover and touch in every corner.
-  Windows pressure-sensitive pen injection is not implemented.
+  Test Apple Pencil pressure and tilt in a Windows Ink app; see
+  `docs/pencil-drawing.md`.
 - Background/resume, kill/restart the host, and move toward poor WiFi coverage.
   Watch repaired fragments separately from unrecovered drops and latency.
 - Try the extended display at 120 Hz on a ProMotion iPad; record the achieved
