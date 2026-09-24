@@ -1,19 +1,78 @@
 # v0.3.0 hardware verification
 
-Status as of 2026-09-23: no release candidate has been published. The reference
-PC has installer `0975ad8`, including the USB capture/logging fixes and verified
-VDD binding checks. Extended desktop and charging passed together through the
-rear USB-C port and a USB-C-to-USB-C data cable. Later, Windows crashed during
-virtual-display activation; GPU, display and installer tests are suspended.
-The full campaign also has failing UDP reliability rows, and final validation
-on `main` remains pending.
+Status as of 2026-09-24: the release-candidate gates below ran on the combined
+code, including Apple Pencil drawing (#47), on the reference PC, the physical
+iPad and the development Mac. The NVIDIA crash did not recur in a bounded
+retest. The 2026-09-23 campaign further down is kept as history; its failing
+UDP rows are superseded by the fixes and runs in the next section.
 
-The results below belong to the stated phase revisions. They do not establish
-that a later candidate passed. Before release, run both complete matrices and
-both 30-minute soaks on `main`, then repeat R-baseline with the published
-installer. Keep failures with their original evidence.
+Results belong to the stated revisions. Keep failures with their original
+evidence. All paths are relative to the private `EternalMonitor-Handoff`
+directory; desktop images, pairing data and captures stay out of git.
 
-## Verified by the automated campaign on the reference PC
+## Release candidate verification (2026-09-24)
+
+Reference PC: Windows 11, Ryzen 7 7800X3D with Radeon graphics, GeForce RTX 5080
+(driver 591.86), 3440×1440 primary display. Physical iPad: iPad Pro 12.9-inch
+(M2), iPadOS 26.2, on the 10.0.0.x WiFi LAN and the PC's rear USB-C port.
+Simulator rows use the iPad Pro 11-inch (M4) simulator on iOS 18.6 and reach the
+PC over Tailscale. Evidence is under `evidence/rc-hardware-20260924/`.
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Local simulator matrix, `ebb8a29` | 14/14 PASS with the 55 FPS gate: 59.91–60.08 FPS, 0 drops; loss row 886 repaired, 0 dropped | `matrix-sim-ebb8a29/report.md` |
+| Simulator soak, `ebb8a29` | PASS: 1801.5 s, 60/60 intervals ≥55 FPS; RSS from minute 5: host +4.56%, app +0.33% | `soak-sim-ebb8a29/` |
+| Windows native suite, `ebb8a29` | Release build clean; 7 test binaries, 199 tests, 0 failures, run from an NVMe copy | `pc-build-test-ebb8a29.log` |
+| Windows real matrix, `ed55b55` (before #47) | 13/13 PASS in one run: 57.15–58.74 FPS, 0 drops; loss 0 and burst 0 keyframe requests over Tailscale | `win-matrix-full-2/report.md` |
+| Windows real matrix, `ebb8a29` | 12 rows PASS: baseline 58.53, NVENC H.264 58.72, NVENC HEVC 57.93, AMF H.264 58.34, AMF HEVC 58.36, burst 58.73 (0 keyframe requests), audio 57.55, pairing, VDD 58.39, reconnect, GUI 57.28, input. **Loss row: FAIL once** (4 keyframe requests, limit 3; 20 dropped in two WiFi stalls on the Tailscale path, jitter to 7.7 ms), then PASS in 3 separate repeats (1, 2, 2 requests). #47 does not touch the repair path; the same row passed on the physical LAN and in the simulator matrix on this code | `win-matrix-ebb8a29/`, `win-matrix-ebb8a29-rest/`, `win-loss3-ebb8a29-repeat*/` |
+| Windows pen injection, `ebb8a29` | PASS: 60 samples, low/high pressure, left/right tilt, positions, stationary hold, 2 downs/2 ups, release on reset | `pen-probe-ebb8a29/result.json` |
+| Physical iPad rows, `ebb8a29` | 9/9 PASS, hardware decode, 0 drops: WiFi H.264 58.73, NVENC HEVC 58.77, AMF HEVC 58.90, 3% loss 58.16 (779 repaired, 1 keyframe request), 40 Mbps burst 58.91; USB H.264 58.79, HEVC 58.97, 120 FPS negotiated 59.34 (60 Hz source), extended 2732×2048 58.61 | `device-ebb8a29/device/` |
+| Physical USB extended soak, branch before #47 | PASS: 1800.4 s at 2732×2048, 58.42 FPS, 105,240 decoded, 0 drops, 60/60 intervals ≥55 FPS, host RSS +0.11% | `soak-extended-usb/` |
+| NVENC WiFi soak on the physical iPad, `ebb8a29` | PASS: 1800.7 s at 3440×1440, 58.61 FPS, 105,600 decoded, 19 dropped, 256 repaired, 10 keyframe requests; 57/60 intervals ≥55 FPS (the 95% minimum); host RSS +1.85% | `soak-nvenc-wifi-ebb8a29/` |
+| Installer upgrade and installed host, `11315de` | Release dry-run installer (SHA-256 `1d046e10…ab0a`) upgraded `0975ad8` silently in the console session: exit 0, settings unchanged, 2 VDD tasks and 2 firewall rules, driver `oem33.inf` 23.40.36.27 kept, VDD disabled. Installed host: R-baseline 58.43 FPS, R-vdd 58.63 FPS | `install-state-*.json`, `install-11315de.log`, `installed-11315de/` |
+
+**NVIDIA crash retest.** The installed `0975ad8` host, which crashed on
+2026-09-23, ran five cycles of NVENC mirroring (1–8 minutes) followed by the
+physical iPad arriving over USB and switching to the extended display. Every
+cycle attached the virtual display, streamed 2732×2048 at 60 FPS with 0 drops,
+then removed it. Including the later extended-display runs above, the logs
+record at least 22 activations on driver 591.86 without a crash, GPU event or
+new dump. The fault is not understood; NVIDIA 617.14 is staged on the PC but was
+not installed. Evidence: `crash-retest-0975ad8/`.
+
+**WiFi repair.** The physical iPad showed reordering, stalls and a late repair
+path on real WiFi; the fixes are recorded in DECISIONS.md ("Let the repair
+window follow real WiFi timing"). Over Tailscale the 40 Mbps burst row also
+exposed a keyframe request for any frame with more than 64 missing fragments;
+13 of 15 such frames later completed (`diag-burst-abandon/`). The loss rows
+pass on the physical LAN; over Tailscale the loss row passed 3 of 4 runs on the
+final code (see the table).
+
+**Repair overhead on real WiFi.** During the NVENC WiFi soak the iPad sent
+58,350 NACKs and the host resent 226,480 fragments, of which 256 filled a gap:
+on WiFi most missing fragments are only a few milliseconds late, and the iPad
+requests each one as soon as it sees the gap. That is about 1.2–1.4 Mbps, 8–10%
+of the 15 Mbps ceiling. A short reorder wait before the first request is a
+follow-up; it was not tuned for this candidate.
+
+**Apple Devices notice.** With an iPad on the cable, closing Apple Devices
+shows "Your iPad is plugged in, but Apple Devices is not running" and an Open
+Apple Devices button, which restarted the service and cleared the notice.
+Screenshots: `apple-devices/`.
+
+**Test runner on this PC.** The PC's D: drive (3 TB HDD, 62,237 power-on hours)
+stalls for 10–45 s every few minutes and logs controller resets. It failed
+test binaries, one host shutdown, a runner job, a host settings write and a log
+mirror, while the product checks in those rows passed; each failure keeps its
+evidence (`win-matrix-69c4cee*`, `win-matrix-4b0729b-part5`,
+`win-matrix-31b363b-part6`). One R-audio run failed at 54.68 FPS after a 1.5 s
+capture gap whose cause was not established (`win-matrix-69c4cee-part2`). The
+runner now waits for the host to listen,
+launches it with an installed host's TEMP and folder, can move its root with
+`EM_WIN_ROOT` (these runs used a C: root), and captures every monitor at full
+resolution.
+
+## 2026-09-23 campaign
 
 Reference hardware: Windows 11, Ryzen 7 7800X3D with Radeon integrated graphics,
 GeForce RTX 5080. The primary display was 3440×1440 during the desktop campaign.
@@ -148,8 +207,10 @@ Campaign cleanup and installed state:
 
 ## Ali with the physical iPad
 
-These checks require an iPad, its accessories and the real LAN. Simulator
-software decode and loopback USB tests cannot prove them. Record the iPad model,
+The automated physical-iPad rows above already prove hardware H.264 and HEVC
+decoding, LAN streaming with loss repair, USB through Apple Devices, 120 FPS
+negotiation and the extended display. These checks still need a person with the
+iPad, its accessories and the real LAN. Record the iPad model,
 iPadOS version, app version/build, host version, WiFi band/router, cable and
 Windows display scaling. Save the host session log and the app's diagnostics
 with each failure; include a short screen recording when timing or feel matters.
@@ -161,12 +222,13 @@ with each failure; include a short screen recording when timing or feel matters.
 | HEVC hardware decoding | Explicitly enable HEVC; diagnostics and host both report HEVC and hardware decoding | Both codec lines and the first session/decoder error |
 | LAN discovery | On the same 10.0.0.x LAN, Scan finds the PC and stays stable for four minutes; quitting the host removes it promptly | Both LAN addresses, firewall profile, scan recording and host mDNS log |
 | QR and pairing | Fresh app prompts for the code; two wrong codes stay rejected; correct code connects. QR carries the token and skips the sheet. Regenerating the token requires pairing again. Six wrong attempts within a minute show a 60-second wait. | Host pairing/session log and sheet screenshots; redact tokens and QR codes before sharing |
-| USB service and trust | Apple Devices or desktop iTunes exposes the local usbmuxd service with the iPad attached; accept Trust on the iPad. Host sees the device and the app shows USB while open. | USB card, Device Manager, whether TCP 27015 listens, cable/trust state |
+| USB service and trust | On a PC that has never trusted the iPad, open Apple Devices, plug in and accept Trust. The host shows the Apple Devices notice while the app is closed or missing, and the iPad connects once it runs. | USB card and notice text, whether TCP 27015 listens, cable/trust state |
 | USB power | Rear USB-C with a C-to-C data cable has already charged this iPad during extended-desktop streaming. Recheck battery percentage and charging state with the intended cable, brightness and workload. The former rear USB-A connection supplied too little power. | Cable/port, brightness, battery before/after and charging diagnostics |
 | USB takeover and fallback | Connect over WiFi, then plug in: USB takes over within three seconds. Unplug: WiFi returns within five seconds. Repeat without duplicate sessions. Manual Disconnect stays disconnected. | Host link/session log, app link badge recording and timestamps |
 | Audio | PC music reaches the iPad with <150 ms perceived offset; changing Windows output recovers; iPad mute works without stopping video | Endpoint name, packet loss/buffer diagnostics, recording of the clap test |
-| Touch, Pencil and view-only | Center/corners hit correctly at 100% and 150% scaling; dragging and two-finger scrolling feel direct; hold gives right-click. Pencil contact/hover behave as advertised. View-only sends no input. | Capture/display geometry, scaling, probe log or recording; note that this release does not promise pressure-sensitive Windows pen injection |
+| Touch, Pencil and view-only | Center/corners hit correctly at 100% and 150% scaling; dragging and two-finger scrolling feel direct; hold gives right-click. Pencil contact/hover behave as advertised. View-only sends no input. | Capture/display geometry, scaling, probe log or recording; Pencil pressure and tilt are covered by the drawing row |
 | Hardware keyboard and pointer | Magic Keyboard text, Shift/Ctrl, arrows and copy/paste work with ⌘ as Ctrl; on-screen accessory keys work; trackpad secondary click/scroll and supported Pencil hover work | Exact key/gesture, mapping setting, host input log collected in a harmless test window |
+| Apple Pencil drawing | With Drawing mode on over USB, Clip Studio Paint (Tablet PC) shows light-to-heavy strokes, pressure-sensitive dots, tilted brushes, diagonals and all canvas corners. A resting palm draws nothing; unplugging mid-stroke ends the stroke. Test both orientations and 100%/150% scaling. The automated pen probe covers Windows injection only. | Pencil model, CSP version, scaling, a recording and the measured latency; see `docs/pencil-drawing.md` |
 | Reserved iPadOS keys | Globe, ⌘H, ⌘Tab and ⌘Space keep their system behavior | Describe any unexpected interception |
 | ProMotion | On a supported iPad, host/virtual display/app request 120 Hz. A strong link sustains 100+ decoded fps; record the actual rate. Compare 60/90/120 host settings. | App/host requested and effective rates, VDD mode, power mode and network |
 | Background and reconnect | Home sends BYE; returning resumes. Host restart shows SIGNAL LOST and recovers without tapping. Extended display is removed when disconnected. | Host/app timestamps, recording, VDD device state |

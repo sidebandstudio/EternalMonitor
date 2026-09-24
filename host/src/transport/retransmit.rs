@@ -7,7 +7,10 @@ use eternal_wire::v2::media::MEDIA_FLAG_RETRANSMIT;
 
 const FRAME_LIMIT: usize = 96;
 const BYTE_LIMIT: usize = 12 * 1024 * 1024;
-const RESEND_INTERVAL: Duration = Duration::from_millis(20);
+// The iPad requests each fragment once, retries once after its RTT plus 5 ms,
+// and once more after a WiFi stall. A longer interval would swallow the retry
+// that replaces a lost resend.
+const RESEND_INTERVAL: Duration = Duration::from_millis(5);
 
 struct StoredFrame {
     epoch: u32,
@@ -182,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn enforces_count_epoch_and_per_fragment_twenty_ms_limit() {
+    fn enforces_count_epoch_and_per_fragment_five_ms_limit() {
         let mut ring = RetransmitRing::default();
         ring.insert(1, 7, frame(1, 7, 2));
         let now = Instant::now();
@@ -191,11 +194,11 @@ mod tests {
         assert!(ring.resend(1, 7, 2, &[2], now).is_empty());
         assert_eq!(ring.resend(1, 7, 2, &[0, 0], now).len(), 1);
         assert!(ring
-            .resend(1, 7, 2, &[0], now + Duration::from_millis(19))
+            .resend(1, 7, 2, &[0], now + Duration::from_millis(4))
             .is_empty());
         assert_eq!(ring.resend(1, 7, 2, &[1], now).len(), 1);
         assert_eq!(
-            ring.resend(1, 7, 2, &[0], now + Duration::from_millis(20))
+            ring.resend(1, 7, 2, &[0], now + Duration::from_millis(5))
                 .len(),
             1
         );

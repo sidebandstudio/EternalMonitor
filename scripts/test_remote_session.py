@@ -42,6 +42,24 @@ class InstalledHostTests(unittest.TestCase):
         self.assertIn(remote.REPO + r'\target\release\eternal-host.exe', launch.call_args.args[0])
         self.assertNotIn('wrong.exe', launch.call_args.args[0])
 
+class HostReadinessTests(unittest.TestCase):
+    def test_run_host_returns_only_once_the_host_listens(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(remote, 'ps') as check, \
+                patch.object(remote, 'session'):
+            remote.main(['run-host'])
+        readiness = check.call_args_list[-1].args[0]
+        self.assertIn('UDP transport ready', readiness)
+        self.assertIn('HasExited', readiness)
+
+    def test_host_gets_the_temp_and_working_directory_of_an_installed_launch(self):
+        path = r'C:\Users\aliyo\AppData\Local\em-runtime\eternal-host.exe'
+        with patch.dict(os.environ, {'EM_INSTALLED_HOST': '1', 'EM_INSTALLED_HOST_PATH': path}, clear=True), \
+                patch.object(remote, 'ps'), patch.object(remote, 'session') as launch:
+            remote.main(['run-host'])
+        command = launch.call_args.args[0]
+        self.assertIn("GetEnvironmentVariable('TEMP','User')", command)
+        self.assertIn(r"-WorkingDirectory 'C:\Users\aliyo\AppData\Local\em-runtime'", command)
+
 class ProbeTokenTests(unittest.TestCase):
     def test_probe_uses_the_same_limited_token_as_the_host(self):
         with patch.dict(os.environ, {'EM_RUN_LEVEL': 'Limited'}, clear=True), \

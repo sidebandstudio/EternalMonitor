@@ -1,6 +1,6 @@
 param([switch]$Force)
 $ErrorActionPreference = 'Stop'
-$file = 'D:\AgentWork\em-v030\host.pid.json'
+$file = Join-Path (Split-Path -Parent $PSScriptRoot) 'host.pid.json'
 if (!(Test-Path $file)) { return }
 $record = Get-Content $file -Raw | ConvertFrom-Json
 $p = Get-Process -Id $record.id -ErrorAction SilentlyContinue

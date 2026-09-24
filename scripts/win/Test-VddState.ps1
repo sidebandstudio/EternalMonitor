@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $global:EMVddStateDevices = @(
-    [pscustomobject]@{InstanceId='PCI\GPU';Status='OK';Ids=@('PCI\GPU')},
-    [pscustomobject]@{InstanceId='ROOT\DISPLAY\0002';Status='Error';Ids=@('Root\MttVDD')}
+    [pscustomobject]@{InstanceId='PCI\GPU';Status='OK';Problem=0;Ids=@('PCI\GPU')},
+    [pscustomobject]@{InstanceId='ROOT\DISPLAY\0002';Status='Error';Problem=22;Ids=@('Root\MttVDD')}
 )
 $global:EMVddStateInf = 'oem33.inf'
 $global:EMVddStateVersion = '23.40.36.27'
@@ -15,7 +15,8 @@ function Get-PnpDeviceProperty {
     [CmdletBinding()] param([string]$InstanceId,[string]$KeyName)
     $data = switch ($KeyName) {
         'DEVPKEY_Device_HardwareIds' { ($global:EMVddStateDevices | Where-Object {$_.InstanceId -eq $InstanceId}).Ids }
-        'DEVPKEY_Device_ProblemCode' { 22 }
+        # Rebooted disabled devices have no live problem-code property.
+        'DEVPKEY_Device_ProblemCode' { $null }
         'DEVPKEY_Device_DriverInfPath' { $global:EMVddStateInf }
         'DEVPKEY_Device_DriverVersion' { $global:EMVddStateVersion }
         default { throw 'Unexpected PnP property' }

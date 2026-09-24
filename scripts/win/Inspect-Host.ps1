@@ -14,7 +14,7 @@ public static class EMHostWindow {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
 }
 '@
-$record = Get-Content 'D:\AgentWork\em-v030\host.pid.json' -Raw | ConvertFrom-Json
+$record = Get-Content (Join-Path (Split-Path -Parent $PSScriptRoot) 'host.pid.json') -Raw | ConvertFrom-Json
 $p = Get-Process -Id $record.id
 if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) {
     throw 'The tracked host identity changed'
@@ -23,7 +23,7 @@ $deadline = (Get-Date).AddSeconds(15)
 $pidCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$p.Id)
 do {
     $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$pidCondition)
-    $window = @($windows | Where-Object { $_.Current.Name -eq 'EternalMonitor // SIGNAL' }) | Select-Object -First 1
+    $window = @($windows | Where-Object { $_.Current.Name -eq 'EternalMonitor' }) | Select-Object -First 1
     if ($window) { break }
     if ((Get-Date) -gt $deadline) { throw 'The tracked host has no EternalMonitor GUI window' }
     Start-Sleep -Milliseconds 100
@@ -34,8 +34,12 @@ if ($window.Current.ProcessId -ne $p.Id -or $handle -eq [IntPtr]::Zero) { throw 
 # Raise only the named GUI belonging to the verified tracked process.
 if (![EMHostWindow]::SetWindowPos($handle,[IntPtr](-1),30,10,1100,1000,0x40)) { throw 'Could not raise the tracked host' }
 [void][EMHostWindow]::SetForegroundWindow($handle)
+# Names follow the automation contract in host/src/gui/mod.rs. Navigation
+# and the QR code are buttons; a label with the same text must not match.
 function Invoke-HostControl([string]$Name) {
-    $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
+    $condition = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)),
+        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button)))
     $deadline = (Get-Date).AddSeconds(5)
     do {
         $control = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
@@ -48,24 +52,24 @@ function Invoke-HostControl([string]$Name) {
     elseif ($control.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$pattern)) { $pattern.Select() }
     else { throw "Host control cannot be invoked through UI Automation: $Name" }
 }
-Invoke-HostControl $(if ($View -eq 'Settings') { 'SETTINGS' } else { 'STREAM' })
-if ($View -eq 'QR') { Invoke-HostControl 'QR CODE' }
+Invoke-HostControl $(if ($View -eq 'Settings') { 'Settings' } else { 'Stream' })
+if ($View -eq 'QR') { Invoke-HostControl 'QR code' }
 Start-Sleep -Milliseconds 300
 $nodes = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
 $names = @($nodes | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
 if ($View -eq 'Stream') {
-    foreach ($label in @('PAIRING','USB CONNECTION','PC AUDIO')) {
+    foreach ($label in @('Pairing','USB connection','PC audio')) {
         if (!($names -contains $label)) { throw "Host Stream card absent: $label" }
     }
     if ($Connected) {
-        foreach ($label in @('CONNECTED IPAD','Decode rate','Repaired fragments')) {
+        foreach ($label in @('Connected iPad','Decode rate','Repaired fragments')) {
             if (!($names -contains $label)) { throw "Connected client evidence absent: $label" }
         }
         if ($names -contains 'Waiting for an iPad') { throw 'Host GUI has no connected client' }
     }
 }
 if ($View -eq 'Settings' -and !($names -contains 'Encoder input')) { throw 'Settings content did not appear' }
-if ($View -eq 'QR' -and !($names -contains 'QR Code')) { throw 'QR modal did not appear' }
+if ($View -eq 'QR' -and !($names -contains 'Scan to connect')) { throw 'QR modal did not appear' }
 $autostart = $null
 if ($TestAutostart) {
     if ($View -ne 'Settings') { throw 'Autostart must be tested from Settings' }

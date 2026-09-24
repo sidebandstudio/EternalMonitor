@@ -4,14 +4,17 @@ Use your iPad as a second display for a Windows PC, over WiFi or USB.
 You need matching Windows and iPad builds. The candidate is still being
 verified; use the installer and TestFlight invite supplied together.
 The latest older public installer does not include every feature below.
+Step-by-step guide with every screen explained:
+https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md
 
 What you need
 -------------
 - Windows 10/11, a supported NVIDIA/AMD/Intel GPU, and the host installer.
 - iPadOS 17 or later and the EternalMonitor app through TestFlight or Xcode.
 - A trusted local network for WiFi. Ethernet for the PC usually helps.
-- For USB: a data cable, Apple Devices or desktop iTunes on Windows, and
-  acceptance of the iPad's Trust This Computer prompt.
+- For USB: a data cable, the Apple Devices app from the Microsoft Store
+  (open while you stream), and acceptance of the iPad's Trust This Computer
+  prompt.
 
 1. Install the matching build
 ----------------------------
@@ -28,7 +31,7 @@ supplied. An unsigned developer archive is not a TestFlight install.
 2. Connect and pair over WiFi
 ----------------------------
 Keep the PC and iPad on the same local network, outside a guest network.
-In the iPad app, Scan for the PC or enter the address shown by the host
+In the iPad app, tap Find PCs or enter the address shown by the host
 (default port 9876). Enter the six-digit pairing code shown on the PC.
 Scanning the host QR instead carries its pairing token and skips code entry.
 The app remembers the host. On the PC, Settings > Forget all iPads resets pairing.
@@ -36,14 +39,16 @@ Pairing does not encrypt video, audio or input; use a network you trust.
 
 3. Connect by USB
 ----------------
-Keep the iPad app open, plug in a data cable and accept Trust This Computer.
-The app should show USB. A cable can take over an existing WiFi stream;
-unplugging falls back to WiFi if that host remains reachable.
+Windows reaches the iPad over the cable through Apple's Apple Devices app.
+Open Apple Devices and leave it running; it can stay minimized. Keep the
+iPad app open, plug in a data cable and accept Trust This Computer. The app
+should show USB. A cable can take over an existing WiFi stream; unplugging
+falls back to WiFi if that host remains reachable.
 
-If the USB card asks for Apple's device service, install Apple Devices or
-desktop iTunes and reconnect the cable. The service must expose usbmuxd at
-127.0.0.1:27015. Physical cable/service verification is still pending in
-this candidate; include the card's exact message in a failure report.
+If the iPad is plugged in but Apple Devices is closed, the host says so and
+offers Open Apple Devices. If Apple Devices is not installed, it links to the
+Microsoft Store. If the iPad still does not appear after Apple Devices
+opens, unplug the cable and plug it in again.
 
 4. Choose mirror or extended display
 -----------------------------------
@@ -59,7 +64,7 @@ Enable Stream PC audio on the host and Play PC audio on the iPad. The
 speaker indicator shows playback; muting on the iPad leaves video running.
 Audio follows the Windows default output device.
 
-With Control PC with touch enabled:
+With Control PC on:
 - Tap clicks, drag moves with the button down, two fingers scroll, and a
   hold gives right-click. Apple Pencil sends native Windows Ink pressure and tilt.
 - Three-finger tap reveals the controls. Keyboard opens the on-screen
@@ -77,7 +82,7 @@ For drawing in Clip Studio Paint:
 - Use the on-screen drawing controls button to reveal the toolbar.
 - Apple Pencil USB-C has no pressure sensor. Use a pressure-sensitive Pencil
   model for variable brush pressure. See docs/pencil-drawing.md.
-- For view-only, turn Control PC with touch off and reconnect.
+- For view-only, turn Control PC off and reconnect.
 
 6. Quality and frame rate
 -------------------------

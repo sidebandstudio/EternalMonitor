@@ -168,6 +168,45 @@ This avoids multiplying WiFi fragment loss into keyframe storms. FEC remains
 reserved: it would spend bandwidth on clean links and needs separate device
 measurements. Keyframe recovery remains available when repair expires.
 
+### Let the repair window follow real WiFi timing
+
+The first repair window held at most three frames for 8–25 ms and asked for a
+frame's missing fragments once, retrying once. A physical iPad on the LAN, with
+the PC wired, showed why that failed on real WiFi even without injected loss.
+Fragments arrived a few milliseconds out of order, so most repairs were filled
+by the late original. Stalls released several frames at once, and the
+three-frame bound evicted frames milliseconds before their last fragment. A
+second loss in the same frame waited for the retry. A packet capture on the PC
+showed the iPad's repair requests sometimes arriving about 100 ms late, while
+the host answered each within 0.1 ms.
+
+The iPad now holds up to eight frames, requests each missing fragment as soon as
+it is seen, and pauses the 25 ms deadline while media or repairs stop flowing,
+by at most 100 ms per frame. The host resends a fragment again after 5 ms rather
+than 20 ms, so a retry can replace a lost resend. On the physical iPad over WiFi
+with 3% injected loss and 1% reordering, keyframe requests fell from 5–22 to 0–1
+per 20 s; the clean and 40 Mbps burst rows had no drops. A frame that is truly
+lost waits up to 100 ms longer before its keyframe request when nothing else is
+flowing. Marking the socket as interactive voice did not change the request
+delay, so the default service class stays.
+
+WiFi also delivered some one-datagram frames after their successor. Handing the
+successor to the decoder first made the HEVC decoder reject the late frame and
+every frame that referred to it. The same bitstream decoded cleanly on the iPad
+offline and over USB. A complete frame that skips a sequence number now waits up
+to half a frame period for the missing one; keyframes do not wait. When a stall
+expires several frames together, the iPad sends one keyframe request per 500 ms,
+the host's own grant interval, instead of one per frame. With both changes the
+3% loss row passed three runs in a row with at most one drop and one keyframe
+request each.
+
+A frame with more than 64 missing fragments used to request a keyframe at once,
+because one NACK names at most 64. At 40 Mbps a 3440×1440 frame is 72
+fragments, so over Tailscale a short stall made that rule fire, and 13 of 15
+such frames then completed from late or repaired fragments. The iPad now
+requests a wide gap in several NACKs and asks for a keyframe only when a frame
+is dropped. Evidence: `EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
+
 ### Use Apple's usbmuxd tunnel for USB
 
 Apple's installed device service handles the cable/trust relationship. EMLINK
@@ -253,5 +292,5 @@ App Store Connect steps. A dry archive is not an installable TestFlight build.
 - Physical iPad and full reference-PC campaign results: tracked in the hardware runbook.
 - FEC, encryption, zero-copy GPU capture and dirty-rectangle encoding.
 - Native macOS screen capture via ScreenCaptureKit; macOS currently supplies synthetic capture.
-- Windows pressure-sensitive pen injection and a first-party signed display driver.
+- A first-party signed display driver.
 - Public App Store distribution; testers use TestFlight or source builds.

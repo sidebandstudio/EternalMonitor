@@ -21,6 +21,17 @@ class SoakMeasurements(unittest.TestCase):
         samples[-1]['host_rss_kib'] = 120_000
         self.assertEqual(assess(samples, 1800)['status'], 'FAIL')
 
+    def test_physical_ipad_soak_checks_host_memory_only(self):
+        samples = trace()
+        for sample in samples:
+            del sample['app_rss_kib']
+        self.assertEqual(assess(samples, 1800)['status'], 'FAIL')
+        result = assess(samples, 1800, processes=('host',))
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(list(result['memory']), ['host'])
+        samples[-1]['host_rss_kib'] = 120_000
+        self.assertEqual(assess(samples, 1800, processes=('host',))['status'], 'FAIL')
+
     def test_stalled_decoder_cannot_pass_using_its_last_logged_fps(self):
         samples = trace()
         for sample in samples[-5:]:

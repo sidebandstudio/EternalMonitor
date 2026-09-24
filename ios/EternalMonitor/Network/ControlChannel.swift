@@ -70,9 +70,17 @@ final class ControlChannel {
     private static let pingIntervalMs = 2000
     private static let pingBurstCount = 5
     private static let pingBurstSpacingMs = 200
+    /// The host grants one keyframe per 500 ms and ignores the rest. A WiFi
+    /// stall can damage many frames at once; ask once for all of them.
+    static let keyframeRequestSpacingUs: UInt64 = 500_000
 
-    init(queue: DispatchQueue, send: @escaping (Data) -> Void) {
+    private let nowUs: () -> UInt64
+    private var lastKeyframeRequestUs: UInt64?
+
+    init(queue: DispatchQueue, nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs,
+         send: @escaping (Data) -> Void) {
         self.queue = queue
+        self.nowUs = nowUs
         self.send = send
     }
 
@@ -271,6 +279,9 @@ final class ControlChannel {
     func sendKeyframeRequest(streamEpoch: UInt32, lastCompleteSeq: UInt32, reason: KeyframeReason) {
         queue.async { [self] in
             guard sessionId != 0 else { return }
+            let now = nowUs()
+            if let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
+            lastKeyframeRequestUs = now
             onDiagnostic?("Requesting keyframe (\(reason))")
             sendMessage(.keyframeRequest(KeyframeRequest(
                 streamEpoch: streamEpoch,

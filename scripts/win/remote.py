@@ -7,7 +7,8 @@ import re
 import subprocess
 import sys
 
-ROOT = r"D:\AgentWork\em-v030"
+# EM_WIN_ROOT moves the runner's files, e.g. off a failing data drive.
+ROOT = os.environ.get("EM_WIN_ROOT", r"D:\AgentWork\em-v030")
 REPO = r"D:\AgentWork\Eternal-Monitor"
 EVIDENCE = pathlib.Path(os.environ.get("EM_EVIDENCE_DIR", "/Users/aldo/Desktop/EternalMonitor-Handoff/evidence"))
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -59,7 +60,7 @@ def main(args):
     elif action == "sync" and len(args) == 1:
         ps("New-Item -ItemType Directory -Force " + quote(ROOT + r"\scripts") + " | Out-Null")
         sources = sorted(pathlib.Path(__file__).parent.glob("*.ps1"))
-        subprocess.run(["scp", *SSH_OPTIONS, *map(str, sources), "windows:D:/AgentWork/em-v030/scripts/"], check=True)
+        subprocess.run(["scp", *SSH_OPTIONS, *map(str, sources), "windows:" + ROOT.replace("\\", "/") + "/scripts/"], check=True)
         ps(script("Sync-Repo", "-Branch " + quote(args[0])))
     elif action == "build" and all(a == "--release" for a in args):
         ps(script("Build-Host", "-Test -Lint" + (" -Release" if args else "")))
@@ -67,7 +68,7 @@ def main(args):
         environment = {"APPDATA": ROOT + r"\state", "ETERNAL_HEADLESS": "1", "ETERNAL_FPS": "60"}
         for arg in args:
             key, sep, value = arg.partition("=")
-            if not sep or not re.fullmatch(r"ETERNAL_[A-Z0-9_]+", key):
+            if not sep or not (re.fullmatch(r"ETERNAL_[A-Z0-9_]+", key) or key == "RUST_LOG"):
                 raise ValueError("Host arguments must be ETERNAL_NAME=value")
             environment[key] = value
         pidfile = ROOT + r"\host.pid.json"
@@ -90,18 +91,31 @@ def main(args):
         if os.environ.get("EM_INSTALLED_HOST") == "1":
             executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
         window_option = "-WindowStyle Hidden" if environment["ETERNAL_HEADLESS"] == "1" else "-NoNewWindow"
+        # Jobs keep TEMP in the runner root, D: by default, to spare C:. An
+        # installed host has the user's TEMP and its own folder as working
+        # directory, and its PowerShell VDD children inherit both, so launch
+        # the host the same way.
+        command += "; $userTemp=[Environment]::GetEnvironmentVariable('TEMP','User')"
+        command += "; if ($userTemp) { $env:TEMP=$userTemp; $env:TMP=$userTemp }"
         command += "; $p=Start-Process -PassThru " + window_option + " -FilePath " + quote(executable)
+        command += " -WorkingDirectory " + quote(executable.rsplit("\\", 1)[0])
         command += " -ArgumentList '19876' -RedirectStandardOutput " + quote(ROOT + r"\host.log")
         command += " -RedirectStandardError " + quote(ROOT + r"\host.stderr.log")
         command += "; @{id=$p.Id;start=$p.StartTime.ToUniversalTime().Ticks.ToString();path=$p.Path} | ConvertTo-Json | Set-Content " + quote(pidfile)
         command += "; $p.WaitForExit(); if ($p.ExitCode -ne 0) { throw ('Host exited with ' + $p.ExitCode) }"
         session(command, detach=True, idle=True, timeout=7200,
                 run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
-        ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(pidfile) + ")) { "
+        ps("$deadline=(Get-Date).AddSeconds(60); while (!(Test-Path " + quote(pidfile) + ")) { "
            "if ((Get-Date) -gt $deadline) { throw 'Host did not start; inspect the interactive job' }; Start-Sleep -Milliseconds 100 }; "
            "$record=Get-Content " + quote(pidfile) + " -Raw | ConvertFrom-Json; "
            "$p=Get-Process -Id $record.id; if ($p.Path -ne $record.path -or "
-           "$p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { throw 'Host identity changed at startup' }")
+           "$p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) { throw 'Host identity changed at startup' }; "
+           # An autoconnecting app sends HELLO for about 10 s. A stalled disk
+           # has held host startup for 25 s, so return only once it listens.
+           "$deadline=(Get-Date).AddSeconds(60); while (!(Select-String -Path " + quote(ROOT + r"\host.log") +
+           " -Pattern 'UDP transport ready' -Quiet)) { "
+           "if ($p.HasExited) { throw 'Host exited during startup' }; "
+           "if ((Get-Date) -gt $deadline) { throw 'Host did not start listening within 60 s' }; Start-Sleep -Milliseconds 100 }")
     elif action == "host-info" and not args:
         path = quote(ROOT + r"\host.pid.json")
         ps("if (Test-Path " + path + ") { Get-Content " + path + " -Raw } else { Write-Output 'null' }")
@@ -198,7 +212,7 @@ def main(args):
                     detach=True, idle=True, timeout=7260,
                     run_level=os.environ.get("EM_RUN_LEVEL", "Highest"))
             if action == "probe":
-                ps("$deadline=(Get-Date).AddSeconds(15); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
+                ps("$deadline=(Get-Date).AddSeconds(60); while (!(Test-Path " + quote(ROOT + r"\input-probe.log") + ")) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not start' }; Start-Sleep -Milliseconds 100 }; "
                    "while (!(Get-Content " + quote(ROOT + r"\input-probe.log") + " -First 1)) { "
                    "if ((Get-Date) -gt $deadline) { throw 'Probe did not become ready' }; Start-Sleep -Milliseconds 100 }")

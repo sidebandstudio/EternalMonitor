@@ -20,10 +20,10 @@ Contributions welcome. Transport, encoders, rendering, docs, anything. Ping
 
 ## v0.3.0 candidate
 
-The v0.3.0 work is merged to `main`. A v0.3.0 RC has not been published.
-The latest public installer is an older build; it does not contain all the
-features described here. The matching candidate installer and TestFlight app
-will be linked together when their release gates pass.
+v0.3.0-rc.1 is the release candidate. Its Windows installer is a GitHub
+pre-release and appears on the site's download page as a preview for testers.
+Install the matching iPad build through TestFlight; invite: ask Ali. The latest
+full release is older and does not contain the features below.
 
 - **Mirror or extend.** Capture the primary or another monitor, or create a
   managed virtual display while the iPad is connected.
@@ -47,13 +47,13 @@ will be linked together when their release gates pass.
   offers 30/60/90/120 fps and honors the iPad's lower preference. YUV420 remains
   the default input; BGRA is opt-in until both hardware gates pass.
 
-The full simulator matrix and the 30-minute simulator soak have passed locally.
-Native Windows builds and tests have passed, but the reference-PC desktop
-campaign on the final build, the 30-minute Windows soak and physical iPad
-checks are still pending. See
-[HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) for dated evidence and
-remaining checks. No physical USB cable, hardware iPad decoding or 120 Hz panel
-result is implied by a simulator pass.
+On 2026-09-24 the candidate passed the full simulator matrix and 30-minute
+soak, the Windows test suite and real-hardware matrix on the reference PC, the
+automated physical-iPad rows over WiFi and USB, a Windows pen-injection probe,
+and 30-minute soaks on a physical iPad over WiFi and over USB with the extended
+display. [HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) has the evidence
+and the checks that still need a person: Pencil drawing in a real app, audio
+sync, first-time USB trust and ProMotion on a 120 Hz source.
 
 ## Install for testing
 
@@ -71,14 +71,17 @@ SHA-256 before approving a SmartScreen exception. Older installers can still
 require a separate firewall prompt.
 
 For WiFi, use a trusted local network; wired Ethernet for the PC helps.
-For USB, install Apple Devices or desktop iTunes if the host's USB card asks,
-use a data cable and accept Trust This Computer on the iPad. The service must
-expose usbmuxd at 127.0.0.1:27015; the actual cable/service combination remains
-part of the physical-device gate. Pairing controls access but does not encrypt
+For USB, install the Apple Devices app from the Microsoft Store and keep it
+open while you stream; Windows reaches the iPad through it. Use a data cable
+and accept Trust This Computer on the iPad. When an iPad is plugged in and
+Apple Devices is closed or missing, the host says so and offers to open it or
+links to the Store. Pairing controls access but does not encrypt
 the stream. The iPad app requires iPadOS 17 or later.
 
-Follow [QUICKSTART.txt](scripts/QUICKSTART.txt). TestFlight setup and the signing
-workflow are documented in [FRIENDS_TESTING.md](FRIENDS_TESTING.md).
+New users should follow the step-by-step [setup guide](SETUP.md). The
+installer also adds [QUICKSTART.txt](scripts/QUICKSTART.txt) to the Start menu.
+TestFlight setup and the signing workflow are documented in
+[FRIENDS_TESTING.md](FRIENDS_TESTING.md).
 
 ## Build from source
 
@@ -212,6 +215,7 @@ docs/       eternalmonitor.dev website (GitHub Pages)
 
 ## Reference docs
 
+- [SETUP.md](SETUP.md) is the step-by-step setup guide for users
 - [ARCHITECTURE.md](ARCHITECTURE.md) covers the pipeline, protocol v2, and design
 - [DECISIONS.md](DECISIONS.md) explains why things are the way they are
 - [RELEASE_NOTES.md](RELEASE_NOTES.md)

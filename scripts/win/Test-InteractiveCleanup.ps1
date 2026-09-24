@@ -6,7 +6,7 @@ $match=[regex]::Match($output,'EM_JOB=([0-9]{8}-[0-9]{6}-[a-f0-9]{8})')
 if(!$match.Success){throw 'Fixture job identity missing'}
 $id=$match.Groups[1].Value
 $name="EM-$id"
-$job="D:\AgentWork\em-v030\jobs\$id"
+$job=Join-Path (Split-Path -Parent $PSScriptRoot) "jobs\$id"
 try {
     $deadline=(Get-Date).AddSeconds(12)
     while(!(Test-Path "$job\exit.txt")) {

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 
-def assess(samples, seconds):
+def assess(samples, seconds, processes=("host", "app")):
     errors = []
     if seconds < 330:
         errors.append("At least 330 seconds are needed for the minute-five memory baseline")
@@ -32,7 +32,7 @@ def assess(samples, seconds):
     if fraction < .95:
         errors.append(f"Only {good}/{len(intervals)} samples reached 55 fps")
     memory = {}
-    for name in ("host", "app"):
+    for name in processes:
         key = name + "_rss_kib"
         if any(not isinstance(s.get(key), (int, float)) or s[key] <= 0 for s in samples):
             errors.append(f"{name} memory or process identity was missing")

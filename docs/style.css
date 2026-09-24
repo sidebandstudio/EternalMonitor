@@ -1095,7 +1095,9 @@ code {
   font-size: 0.9rem;
 }
 
-.download-note a {
+.download-note a,
+.download-hero a,
+.status-card a {
   color: var(--accent);
 }
 
