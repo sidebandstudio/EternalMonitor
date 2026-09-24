@@ -89,6 +89,7 @@ final class ConnectionManager: ObservableObject {
     /// Whether this session asked the host to relay input (the Settings
     /// toggle, latched at HELLO2 time — mid-session flips need a reconnect).
     @Published private(set) var sessionWantsInput = false
+    @Published private(set) var sessionDrawingMode = false
     @Published private(set) var sessionWantsAudio = false
     @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
@@ -194,12 +195,14 @@ final class ConnectionManager: ObservableObject {
     var sessionHasKeyboard: Bool {
         sessionWantsInput && (hostInfo?.hostCaps ?? 0) & HelloAck.hostCapKeyboard != 0
     }
+    var sessionHasPen: Bool {
+        sessionWantsInput && (hostInfo?.hostCaps ?? 0) & HelloAck.hostCapPen != 0
+    }
 
     func sendInputs(_ events: [WireInputEvent]) {
         guard sessionWantsInput else { return }
-        for event in inputSequence.packets(events, timeUs: ControlChannel.clientNowUs()) {
-            controlChannelBox.value?.sendInput(event)
-        }
+        controlChannelBox.value?.sendInputs(inputSequence.packets(events,
+            timeUs: ControlChannel.clientNowUs(), reliable: mediaLink?.isUSB == true))
     }
 
     // MARK: - Connect / Disconnect
@@ -267,9 +270,11 @@ final class ConnectionManager: ObservableObject {
         diagnostics.removeAll()
         didExtendTimeout = false
         videoSize = .zero
-        let wantsInput = UserDefaults.standard.flag(forKey: "controlPC")
+        let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
+        sessionDrawingMode = drawing.enabled
+        let wantsInput = drawing.enabled || UserDefaults.standard.flag(forKey: "controlPC")
         sessionWantsInput = wantsInput
-        let wantsAudio = audioPreference ?? (UserDefaults.standard.flag(forKey: "playPCaudio"))
+        let wantsAudio = !drawing.enabled && (audioPreference ?? UserDefaults.standard.flag(forKey: "playPCaudio"))
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
@@ -529,7 +534,7 @@ final class ConnectionManager: ObservableObject {
             featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
                 | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
             deviceId: DeviceIdentity.load(),
-            preferredFPS: UInt8(UserDefaults.standard.frameRatePreference()),
+            preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),
             authToken: pairingToken
         )
         E2E.emit("E2E_HELLO w=\(identity.screenPxW) h=\(identity.screenPxH) refresh_hz=\(identity.refreshHz)")
@@ -769,6 +774,7 @@ final class ConnectionManager: ObservableObject {
 
     func refreshAudioPreference(_ enabled: Bool) {
         audioPreference = enabled
+        guard !sessionDrawingMode || state == .disconnected else { return }
         if !enabled || sessionWantsAudio {
             audioPlayer?.setEnabled(enabled)
             audioStats.playing = false
@@ -1020,9 +1026,12 @@ final class AppSettings: ObservableObject {
     @Published var autoResumeOnForeground: Bool {
         didSet { UserDefaults.standard.set(autoResumeOnForeground, forKey: "autoResumeOnForeground") }
     }
-    /// Relay touches/pencil to the PC as mouse input (negotiated at connect).
+    /// Relay touch, pen and keyboard input (negotiated at connect).
     @Published var controlPC: Bool {
         didSet { UserDefaults.standard.set(controlPC, forKey: "controlPC") }
+    }
+    @Published var drawingMode: Bool {
+        didSet { UserDefaults.standard.set(drawingMode, forKey: "drawingMode") }
     }
     @Published var commandAsControl: Bool {
         didSet { UserDefaults.standard.set(commandAsControl, forKey: "commandAsControl") }
@@ -1050,6 +1059,7 @@ final class AppSettings: ObservableObject {
         self.autoResumeOnForeground =
             defaults.flag(forKey: "autoResumeOnForeground")
         self.controlPC = defaults.flag(forKey: "controlPC")
+        self.drawingMode = defaults.bool(forKey: "drawingMode")
         self.commandAsControl = defaults.flag(forKey: "commandAsControl")
         self.autoReconnect = defaults.flag(forKey: "autoReconnect")
         self.targetFPS = defaults.frameRatePreference()

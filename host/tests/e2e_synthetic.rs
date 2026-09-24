@@ -1419,6 +1419,8 @@ fn input_relay_maps_touches_end_to_end() {
         keycode: 0,
         modifiers: 0,
         client_time_us: 0,
+        tilt_x: 0,
+        tilt_y: 0,
     };
 
     // Tap the top-left corner: began ×2 (edge redundancy), ended ×2.
@@ -1533,6 +1535,63 @@ fn input_relay_maps_touches_end_to_end() {
         ]
     );
     assert_eq!(recorded.len(), 15, "no extra injections: {recorded:?}");
+
+    // The same authenticated transport must carry a pressure-sensitive pen,
+    // with no extra mouse press or replayed sample after the pen lifts.
+    use eternal_host::input::{PenPhase, PenSample, KIND_PENCIL};
+    let pen = InputEvent {
+        input_ver: 2,
+        kind: KIND_PENCIL,
+        event_id: 11,
+        pressure_x1000: 250,
+        tilt_x: -40,
+        tilt_y: 30,
+        ..base
+    };
+    receiver.send(&ControlMessage::InputEvent(pen));
+    receiver.send(&ControlMessage::InputEvent(pen));
+    let moved = InputEvent {
+        event_id: 12,
+        phase: 1,
+        pressure_x1000: 1000,
+        ..pen
+    };
+    receiver.send(&ControlMessage::InputEvent(moved));
+    receiver.send(&ControlMessage::InputEvent(InputEvent {
+        event_id: 13,
+        phase: 2,
+        ..moved
+    }));
+    receiver.send(&ControlMessage::InputEvent(moved));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while recorder::peek().len() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let sample = PenSample {
+        phase: PenPhase::Down,
+        x: 0,
+        y: 0,
+        pressure: 256,
+        tilt_x: -40,
+        tilt_y: 30,
+    };
+    assert_eq!(
+        recorder::take(),
+        vec![
+            Injection::Pen(sample),
+            Injection::Pen(PenSample {
+                phase: PenPhase::Move,
+                pressure: 1024,
+                ..sample
+            }),
+            Injection::Pen(PenSample {
+                phase: PenPhase::Up,
+                pressure: 0,
+                ..sample
+            })
+        ]
+    );
 
     shared.stop();
     supervisor_tx

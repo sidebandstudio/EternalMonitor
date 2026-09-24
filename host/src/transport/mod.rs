@@ -42,6 +42,7 @@ static STREAM_EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
     stream_epoch: u32,
+    pen_available: bool,
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
@@ -81,6 +82,11 @@ impl ConfigSource for SharedConfigSource<'_> {
             0
         };
         eternal_wire::v2::control::HOSTCAP_KEYBOARD
+            | if self.pen_available {
+                eternal_wire::v2::control::HOSTCAP_PEN
+            } else {
+                0
+            }
             | usb
             | if crate::audio::codec_available() {
                 eternal_wire::v2::control::HOSTCAP_AUDIO
@@ -158,9 +164,11 @@ pub async fn start_sender(
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
 
+    let mut input_relay = crate::input::InputRelay::default();
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
+        pen_available: input_relay.pen_available(),
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -196,7 +204,6 @@ pub async fn start_sender(
     let mut last_session_id: Option<u32> = None;
     let mut awaiting_keyframe = true;
 
-    let mut input_relay = crate::input::InputRelay::default();
     let mut retransmit_ring = RetransmitRing::default();
     let mut audio_sender = audio::AudioSender::default();
     let pacing_clock = PacingClock::new()?;
@@ -208,6 +215,8 @@ pub async fn start_sender(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
+    pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -215,6 +224,9 @@ pub async fn start_sender(
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
+            _ = pen_tick.tick(), if input_relay.pen_available() => {
+                input_relay.keep_pen_alive();
+            }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
                 let destination = *shared.target_addr.lock();
                 for datagram in fault.drain_due(Instant::now()) {
@@ -639,6 +651,7 @@ mod tests {
         let config = SharedConfigSource {
             shared: &shared,
             stream_epoch: 1,
+            pen_available: false,
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -688,6 +701,7 @@ mod tests {
             let config = SharedConfigSource {
                 shared: &shared,
                 stream_epoch: 1,
+                pen_available: false,
             };
             let mut deferred = DeferredControl::new();
             repair_while_pacing(

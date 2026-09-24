@@ -41,6 +41,8 @@ pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
 pub const HOSTCAP_KEYBOARD: u16 = 1 << 3;
+/// Native Windows pen injection, including input_ver 2 tilt and hover.
+pub const HOSTCAP_PEN: u16 = 1 << 4;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;
@@ -301,9 +303,13 @@ pub struct InputEvent {
     pub keycode: u16,
     pub modifiers: u8,
     pub client_time_us: u64,
+    /// input_ver 2 appends signed degrees, positive right / toward the user.
+    pub tilt_x: i16,
+    pub tilt_y: i16,
 }
 
 pub const INPUT_EVENT_SIZE: usize = 30;
+pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
 
 /// One parsed control message.
 #[derive(Debug, Clone, PartialEq)]
@@ -459,6 +465,10 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.push(e.modifiers);
             body.push(0); // reserved
             body.extend_from_slice(&e.client_time_us.to_le_bytes());
+            if e.input_ver == 2 {
+                body.extend_from_slice(&e.tilt_x.to_le_bytes());
+                body.extend_from_slice(&e.tilt_y.to_le_bytes());
+            }
         }
     }
 
@@ -636,25 +646,30 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
         PacketType::StreamConfig => {
             ControlMessage::StreamConfig(StreamConfig::decode(r.take(STREAM_CONFIG_SIZE)?)?)
         }
-        PacketType::InputEvent => ControlMessage::InputEvent(InputEvent {
-            input_ver: r.u8()?,
-            kind: r.u8()?,
-            phase: r.u8()?,
-            buttons: r.u8()?,
-            event_id: r.u32()?,
-            x_norm: r.u16()?,
-            y_norm: r.u16()?,
-            pressure_x1000: r.u16()?,
-            scroll_dx: r.i16()?,
-            scroll_dy: r.i16()?,
-            keycode: r.u16()?,
-            modifiers: {
-                let m = r.u8()?;
-                let _reserved = r.u8()?;
-                m
-            },
-            client_time_us: r.u64()?,
-        }),
+        PacketType::InputEvent => {
+            let input_ver = r.u8()?;
+            ControlMessage::InputEvent(InputEvent {
+                input_ver,
+                kind: r.u8()?,
+                phase: r.u8()?,
+                buttons: r.u8()?,
+                event_id: r.u32()?,
+                x_norm: r.u16()?,
+                y_norm: r.u16()?,
+                pressure_x1000: r.u16()?,
+                scroll_dx: r.i16()?,
+                scroll_dy: r.i16()?,
+                keycode: r.u16()?,
+                modifiers: {
+                    let m = r.u8()?;
+                    let _reserved = r.u8()?;
+                    m
+                },
+                client_time_us: r.u64()?,
+                tilt_x: if input_ver == 2 { r.i16()? } else { 0 },
+                tilt_y: if input_ver == 2 { r.i16()? } else { 0 },
+            })
+        }
         PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
             return Err(WireError::InvalidField("packet_type"));
         }
@@ -929,6 +944,8 @@ mod tests {
                 keycode: 0,
                 modifiers: 0,
                 client_time_us: 1_000_001,
+                tilt_x: 0,
+                tilt_y: 0,
             }),
         ]
     }

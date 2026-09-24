@@ -155,13 +155,13 @@ struct KeyboardRelayMachine {
 /// view recreation during a session. Retransmitted edges keep the same ID.
 struct InputEventSequencer {
     private var next: UInt32 = 0
-    mutating func packets(_ events: [WireInputEvent], timeUs: UInt64) -> [WireInputEvent] {
+    mutating func packets(_ events: [WireInputEvent], timeUs: UInt64, reliable: Bool = false) -> [WireInputEvent] {
         events.flatMap { source in
             next &+= 1
             var event = source
             event.eventId = next
-            event.clientTimeUs = timeUs
-            return event.phase == 1 ? [event] : [event, event]
+            if event.kind != 1 || event.inputVer != 2 || event.clientTimeUs == 0 { event.clientTimeUs = timeUs }
+            return reliable || event.phase == 1 ? [event] : [event, event]
         }
     }
 }

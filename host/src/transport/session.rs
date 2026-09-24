@@ -1154,6 +1154,8 @@ mod tests {
             keycode: 0,
             modifiers: 0,
             client_time_us: 0,
+            tilt_x: 0,
+            tilt_y: 0,
         })
     }
 

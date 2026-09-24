@@ -29,7 +29,9 @@ final class USBListener {
         queue.async { [self] in
             guard listener == nil else { return }
             do {
-                let parameters = NWParameters.tcp
+                let tcp = NWProtocolTCP.Options()
+                tcp.noDelay = true
+                let parameters = NWParameters(tls: nil, tcp: tcp)
                 parameters.allowLocalEndpointReuse = true
                 let localPort = port == 0 ? NWEndpoint.Port.any : NWEndpoint.Port(rawValue: port)!
                 parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: localPort)

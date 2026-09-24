@@ -21,6 +21,12 @@ pub fn permits(
     };
     for injection in injections {
         match *injection {
+            Injection::Pen(sample) => {
+                cursor = (sample.x, sample.y);
+                if !inside(cursor) {
+                    return false;
+                }
+            }
             Injection::MoveAbs { x, y }
             | Injection::LeftDown { x, y }
             | Injection::LeftUp { x, y }
