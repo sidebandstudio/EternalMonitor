@@ -188,8 +188,17 @@ with 3% injected loss and 1% reordering, keyframe requests fell from 5–22 to 0
 per 20 s; the clean and 40 Mbps burst rows had no drops. A frame that is truly
 lost waits up to 100 ms longer before its keyframe request when nothing else is
 flowing. Marking the socket as interactive voice did not change the request
-delay, so the default service class stays. Evidence:
-`EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
+delay, so the default service class stays.
+
+WiFi also delivered some one-datagram frames after their successor. Handing the
+successor to the decoder first made the HEVC decoder reject the late frame and
+every frame that referred to it. The same bitstream decoded cleanly on the iPad
+offline and over USB. A complete frame that skips a sequence number now waits up
+to half a frame period for the missing one; keyframes do not wait. When a stall
+expires several frames together, the iPad sends one keyframe request per 500 ms,
+the host's own grant interval, instead of one per frame. With both changes the
+3% loss row passed three runs in a row with at most one drop and one keyframe
+request each. Evidence: `EternalMonitor-Handoff/evidence/rc-hardware-20260924/`.
 
 ### Use Apple's usbmuxd tunnel for USB
 
