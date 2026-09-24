@@ -3,6 +3,7 @@ import SwiftUI
 struct DisplayView: View {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var settings: AppSettings
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     @State private var showHUD = true
     @State private var hudDismissTask: Task<Void, Never>?
@@ -23,19 +24,21 @@ struct DisplayView: View {
                 TouchRelayView(keyboardVisible: $showKeyboard, active: !showSettings && !connectionManager.signalLost, onToggleHUD: { toggleHUD() })
                     .ignoresSafeArea()
             } else {
-                // One gesture, one meaning: tap toggles the HUD. (The old
-                // single-tap-hide + triple-tap-toggle pair made every triple
-                // tap race its own first tap.)
+                // One gesture, one meaning: tap toggles the HUD.
                 MetalView()
                     .ignoresSafeArea()
                     .onTapGesture { toggleHUD() }
             }
 
-            // Viewfinder registration marks frame the picture (fade with the HUD).
-            if showHUD {
-                ViewfinderCorners(armLength: 26, inset: 18)
-                    .stroke(Theme.amber.opacity(0.55), lineWidth: 1.5)
-                    .ignoresSafeArea()
+            #if DEBUG
+            if UIPreview.showsBackdrop {
+                UIPreview.Backdrop()
+                    .onTapGesture { toggleHUD() }
+            }
+            #endif
+
+            if connectionManager.signalLost {
+                reconnectingCard
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
@@ -48,7 +51,7 @@ struct DisplayView: View {
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
-                .padding(.top, 8)
+                .padding(.top, 12)
                 .padding(.trailing, 16)
 
                 Spacer()
@@ -56,14 +59,20 @@ struct DisplayView: View {
                 if showHUD {
                     bottomBar
                         .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
+                        .padding(.bottom, 12)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
             }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .onAppear { scheduleHUDDismiss() }
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
+        .onAppear {
+            scheduleHUDDismiss()
+            #if DEBUG
+            if UIPreview.opensQuality { showQualityPopover = true }
+            #endif
+        }
         .onDisappear { hudDismissTask?.cancel() }
         .onChange(of: showQualityPopover) { _, presented in
             if presented { hudDismissTask?.cancel() }
@@ -89,44 +98,41 @@ struct DisplayView: View {
         }
     }
 
-    // MARK: - HUD overlay
+    private var transportName: String {
+        connectionManager.transportMode == "WiFi" ? "Wi-Fi" : connectionManager.transportMode
+    }
+
+    private var audioPlaying: Bool {
+        connectionManager.audioStats.playing && settings.playPCaudio
+    }
+
+    // MARK: - Stats pill
 
     private var hudOverlay: some View {
         Button { showQualityPopover.toggle() } label: {
-            HStack(spacing: 14) {
-                stat("\(Int(connectionManager.fps))", unit: "fps", color: Theme.amber)
-                divider
-                stat(
-                    connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "—",
-                    unit: "ms",
-                    color: Theme.phosphor
-                )
-                divider
-                stat(connectionManager.transportMode, unit: "", color: Theme.text)
-                divider
-                Image(systemName: connectionManager.audioStats.playing && settings.playPCaudio
-                    ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(Theme.text2)
+            HStack(spacing: 12) {
+                stat("\(Int(connectionManager.fps))", unit: "fps")
+                separator
+                stat(connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "–", unit: "ms")
+                separator
+                Text(transportName)
+                    .font(.app(13, .medium, relativeTo: .footnote))
+                    .foregroundStyle(Theme.text)
+                Image(systemName: audioPlaying ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(audioPlaying ? Theme.text : Theme.textFaint)
                 qualityBars
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .strokeBorder(Theme.hairline, lineWidth: 1)
-                    )
-            )
+            .frame(minHeight: 38)
+            .background(glass(Capsule()))
         }
         .buttonStyle(.plain)
         .popover(isPresented: $showQualityPopover) {
             qualityPopover
-                .padding(14)
-                .background(Theme.panel)
+                .padding(18)
+                .frame(minWidth: 300)
+                .background(Theme.surface)
                 .presentationCompactAdaptation(.popover)
         }
         .accessibilityElement(children: .ignore)
@@ -141,7 +147,7 @@ struct DisplayView: View {
             ?? "unknown latency"
         return "Stream statistics: \(Int(connectionManager.fps)) frames per second, "
             + "\(latency), \(connectionManager.transportMode), \(connectionManager.stats.bars) of 4 signal bars, "
-            + (connectionManager.audioStats.playing && settings.playPCaudio ? "PC audio playing" : "PC audio muted or unavailable")
+            + (audioPlaying ? "PC audio playing" : "PC audio muted or unavailable")
     }
 
     private var qualityBars: some View {
@@ -149,139 +155,181 @@ struct DisplayView: View {
         let color = Theme.quality(bars: bars)
         return HStack(alignment: .bottom, spacing: 2) {
             ForEach(0..<4, id: \.self) { idx in
-                RoundedRectangle(cornerRadius: 0.5)
-                    .fill(idx < bars ? color : Color.white.opacity(0.15))
-                    .frame(width: 3, height: CGFloat(4 + idx * 3))
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(idx < bars ? color : Color.white.opacity(0.18))
+                    .frame(width: 3, height: CGFloat(5 + idx * 3))
             }
         }
-        .frame(height: 13)
-        .contentShape(Rectangle())
+        .frame(height: 14)
     }
 
     private var qualityPopover: some View {
         let q = connectionManager.stats
-        return VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "Connection quality")
-            HStack(spacing: 18) {
-                Readout(
-                    value: String(format: "%.1f", q.lossPercent), unit: "%", label: "loss",
-                    color: q.lossPercent < 3 ? Theme.phosphor : Theme.caution
-                )
-                Readout(
-                    value: q.rttMs.map { String(format: "%.0f", $0) } ?? "—", unit: "ms",
-                    label: "rtt", color: Theme.text
-                )
-                Readout(value: "\(q.framesDropped)", unit: "", label: "dropped", color: Theme.text)
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Connection quality")
+                    .font(.app(17, .semibold, relativeTo: .headline))
+                    .foregroundStyle(Theme.text)
+                Text("\(transportName) · measured on this iPad")
+                    .font(.app(13, relativeTo: .footnote))
+                    .foregroundStyle(Theme.textMuted)
             }
-            HStack(spacing: 18) {
-                Readout(value: "\(q.fragsRepaired)", unit: "", label: "repaired", color: Theme.text)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Repaired fragments")
-                    .accessibilityValue("\(q.fragsRepaired)")
-                    .accessibilityIdentifier("quality.repaired")
-                Readout(value: String(format: "%.1f", q.jitterMs), unit: "ms", label: "jitter", color: Theme.text)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Jitter")
-                    .accessibilityValue(String(format: "%.1f milliseconds", q.jitterMs))
-                    .accessibilityIdentifier("quality.jitter")
+            Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 14) {
+                GridRow {
+                    metric("Loss", String(format: "%.1f", q.lossPercent), "%", color: q.lossPercent < 3 ? Theme.text : Theme.warning)
+                    metric("Round trip", q.rttMs.map { String(format: "%.0f", $0) } ?? "–", "ms")
+                    metric("Dropped", "\(q.framesDropped)", "")
+                }
+                GridRow {
+                    metric("Repaired", "\(q.fragsRepaired)", "")
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Repaired fragments")
+                        .accessibilityValue("\(q.fragsRepaired)")
+                        .accessibilityIdentifier("quality.repaired")
+                    metric("Jitter", String(format: "%.1f", q.jitterMs), "ms")
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Jitter")
+                        .accessibilityValue(String(format: "%.1f milliseconds", q.jitterMs))
+                        .accessibilityIdentifier("quality.jitter")
+                    metric("Latency", q.e2eMs.map { String(format: "%.0f", $0) } ?? "–", "ms")
+                }
             }
         }
     }
 
-    private func stat(_ value: String, unit: String, color: Color) -> some View {
-        HStack(spacing: 3) {
+    private func metric(_ label: String, _ value: String, _ unit: String, color: Color = Theme.text) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.app(12, relativeTo: .caption))
+                .foregroundStyle(Theme.textMuted)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value)
+                    .font(.appMono(20, medium: true, relativeTo: .title3))
+                    .foregroundStyle(color)
+                if !unit.isEmpty {
+                    Text(unit)
+                        .font(.app(12, relativeTo: .caption))
+                        .foregroundStyle(Theme.textMuted)
+                }
+            }
+        }
+    }
+
+    private func stat(_ value: String, unit: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
             Text(value)
-                .font(.appMonoMedium(size: 13))
-                .foregroundColor(color)
-            if !unit.isEmpty {
-                Text(unit)
-                    .font(.appMonoRegular(size: 10))
-                    .foregroundColor(Theme.text2)
-            }
+                .font(.appMono(14, medium: true, relativeTo: .footnote))
+                .foregroundStyle(Theme.text)
+                .monospacedDigit()
+            Text(unit)
+                .font(.app(11, relativeTo: .caption2))
+                .foregroundStyle(Theme.textMuted)
         }
+        // A one-digit value leaves the pill too narrow for "fps" otherwise.
+        .fixedSize()
     }
 
-    private var divider: some View {
+    private var separator: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.18))
-            .frame(width: 1, height: 13)
+            .fill(Color.white.opacity(0.16))
+            .frame(width: 1, height: 14)
     }
 
-    // MARK: - Bottom bar
+    // MARK: - Controls
 
     private var bottomBar: some View {
-        HStack {
-            HStack(spacing: 8) {
-                SignalDot(
-                    color: connectionManager.signalLost ? Theme.caution : Theme.phosphor,
-                    size: 8
-                )
-                Text(connectionManager.signalLost ? "SIGNAL LOST" : "ON AIR")
-                    .font(.appMonoMedium(size: 12))
-                    .tracking(1)
-                    .foregroundColor(connectionManager.signalLost ? Theme.caution : Theme.phosphor)
-                Text("·")
-                    .foregroundColor(Theme.text3)
-                Text(connectionManager.transportMode)
-                    .font(.appMonoRegular(size: 12))
-                    .foregroundColor(Theme.text2)
+        HStack(spacing: 8) {
+            HStack(spacing: 10) {
+                StatusDot(color: connectionManager.signalLost ? Theme.warning : Theme.accent, size: 8)
+                Text(connectionManager.signalLost ? "Reconnecting" : "Live")
+                    .font(.app(14, .semibold, relativeTo: .subheadline))
+                    .foregroundStyle(Theme.text)
+                if sizeClass != .compact {
+                    Text(transportName)
+                        .font(.app(14, relativeTo: .subheadline))
+                        .foregroundStyle(Theme.textMuted)
+                }
             }
+            .padding(.leading, 14)
+            .padding(.trailing, 6)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(
                 connectionManager.signalLost ? "Signal lost, reconnecting" : "On air"
             )
             .accessibilityIdentifier("display.signal")
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                    .overlay(Capsule().strokeBorder(Theme.hairline, lineWidth: 0.5))
-            )
 
-            Spacer()
+            Spacer(minLength: 12)
 
             if connectionManager.sessionHasKeyboard {
                 Button { showKeyboard.toggle() } label: {
-                    Label(showKeyboard ? "Hide keyboard" : "Keyboard", systemImage: "keyboard")
-                        .font(.appMonoMedium(size: 12))
-                        .foregroundColor(Theme.amber)
-                        .frame(minWidth: 44, minHeight: 44)
+                    toolbarLabel(showKeyboard ? "Hide keyboard" : "Keyboard", "keyboard")
                 }
+                .buttonStyle(PillButtonStyle(
+                    foreground: showKeyboard ? Theme.onAccent : Theme.text,
+                    fill: showKeyboard ? Theme.accent : Color.white.opacity(0.08)
+                ))
                 .accessibilityIdentifier("display.keyboard")
             }
 
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape")
-                    .foregroundColor(Theme.text2)
-                    .frame(width: 44, height: 44)
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 40, height: 40)
             }
+            .buttonStyle(PillButtonStyle())
             .accessibilityLabel("Stream settings")
             .accessibilityIdentifier("display.settings")
 
             Button {
                 connectionManager.cancel()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "stop.fill").font(.system(size: 10))
-                    Text("Disconnect")
-                        .font(.appMonoMedium(size: 12))
-                }
-                .foregroundColor(Theme.amber)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(Capsule().fill(Theme.amber.opacity(0.12)))
+                toolbarLabel("Disconnect", "xmark")
             }
+            .buttonStyle(PillButtonStyle(foreground: Theme.danger, fill: Theme.danger.opacity(0.14)))
             .accessibilityLabel("Disconnect")
             .accessibilityIdentifier("display.disconnect")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
-        )
+        .padding(6)
+        .frame(maxWidth: 620)
+        .background(glass(RoundedRectangle(cornerRadius: 26, style: .continuous)))
+    }
+
+    /// Icon and title, or just the icon when the app is narrow (Split View,
+    /// Stage Manager). The accessibility label is the title either way.
+    @ViewBuilder
+    private func toolbarLabel(_ title: String, _ symbol: String) -> some View {
+        if sizeClass == .compact {
+            Label(title, systemImage: symbol).labelStyle(.iconOnly)
+        } else {
+            Label(title, systemImage: symbol)
+        }
+    }
+
+    private var reconnectingCard: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .tint(Theme.text)
+                .controlSize(.large)
+            Text("Reconnecting to your PC")
+                .font(.app(18, .semibold, relativeTo: .headline))
+                .foregroundStyle(Theme.text)
+            Text("The picture comes back as soon as the PC answers.")
+                .font(.app(14, relativeTo: .callout))
+                .foregroundStyle(Theme.textMuted)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 24)
+        .frame(maxWidth: 360)
+        .background(glass(RoundedRectangle(cornerRadius: 22, style: .continuous)))
+    }
+
+    private func glass<S: InsettableShape>(_ shape: S) -> some View {
+        shape
+            .fill(.ultraThinMaterial)
+            .environment(\.colorScheme, .dark)
+            .overlay(shape.strokeBorder(Color.white.opacity(0.1), lineWidth: 1))
+            .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
     }
 
     // MARK: - Auto-hide HUD

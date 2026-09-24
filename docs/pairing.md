@@ -4,7 +4,7 @@ The Windows host requires pairing by default. Enter the six-digit code from its 
 
 The host generates a nonzero 128-bit token with the operating system random source and stores it in the host settings. The QR URL includes that token. The iPad saves it in the Keychain under the host name and address, accessible while the device is unlocked and restricted to that device. Reconnecting sends the saved token; a rejected token opens the code sheet again.
 
-"New code" replaces the displayed code without forgetting existing iPads. "Regenerate token" forgets every paired iPad and ends the current authorized session. The iPad's "Forget paired hosts" removes its saved tokens; its next connection requires a code. Turning "Require pairing" back on also ends any session established while pairing was disabled.
+"New code" replaces the displayed code without forgetting existing iPads. Settings → "Forget all iPads" regenerates the pairing token, forgets every paired iPad and ends the current authorized session. The iPad's "Forget paired PCs" removes its saved tokens; its next connection requires a code. Turning "Require pairing" back on also ends any session established while pairing was disabled.
 
 Five failed authorization attempts from one IP within 60 seconds block further code attempts from that IP for 60 seconds. The countdown does not restart for blocked retries. Existing token-authenticated connections and USB connections remain available. The host bounds address tracking and never evicts an active ban to admit another address.
 

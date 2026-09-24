@@ -26,9 +26,11 @@
     <true/>
     <key>UIAppFonts</key>
     <array>
-        <string>Syne-Bold.ttf</string>
-        <string>JetBrainsMono-Regular.ttf</string>
-        <string>JetBrainsMono-Medium.ttf</string>
+        <string>Geist-Regular.ttf</string>
+        <string>Geist-Medium.ttf</string>
+        <string>Geist-SemiBold.ttf</string>
+        <string>GeistMono-Regular.ttf</string>
+        <string>GeistMono-Medium.ttf</string>
     </array>
     <key>UILaunchScreen</key>
     <dict>
@@ -54,6 +56,6 @@
         <string>_eternaldisplay._udp</string>
     </array>
     <key>NSCameraUsageDescription</key>
-    <string>EternalMonitor uses the camera to scan a QR code displayed by the Windows host so you can connect without typing an IP.</string>
+    <string>Scan the QR code shown in EternalMonitor on your PC to connect without typing its address.</string>
 </dict>
 </plist>

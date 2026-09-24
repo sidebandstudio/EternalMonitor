@@ -1,134 +1,177 @@
 # EternalMonitor architecture
 
-Accurate as of v0.2.0 (protocol v2).
+The v0.3.0 candidate keeps protocol v2. Implementation details below describe the
+candidate branches; release and hardware gate status lives in
+[HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md).
 
-## The pipeline
+## Video and session pipeline
 
 ```text
-[Windows desktop]                                [iPad]
-      |                                            ^
-      v                                            | Metal (NV12 + BT.601/709 shader,
-+-------------------------- host/ ---------------|-- aspect-fit, draw-on-demand)
-| capture thread          encode thread          | VideoToolbox (H.264/HEVC, hw on
-|   DXGI duplication  -->   BGRA->YUV420P    -->  |  device, sw in the simulator)
-|   (or synthetic)    slot  swscale, then         | FrameAssembler (per-frame
-|   cursor composite        NVENC/AMF/QSV/x264/   |  fragment reassembly, caps)
-|                           x265/VideoToolbox     | UDPReceiver (ephemeral port,
-|                              |                  |  media/control demux)
-|                              v  channel         |
-|                    transport task (tokio)  -----+--> media datagrams (UDP)
-|                      v2 fragmentation, pacing,  <--- control datagrams (same socket)
-|                      session, heartbeats, ABR   |
-+-------------------------------------------------+
-         supervised by supervisor.rs (health, watchdogs, backoff restarts)
+Windows desktop → DXGI capture → latest-frame slot → encoder → bounded channel
+                                                       ↓
+                              transport: session + links + NACK history + ABR
+                                      ↙                            ↘
+                               UDP datagrams                 framed USB tunnel
+                                      ↘                            ↙
+                                  iPad MediaLink → MediaDatagrams
+                                       ↓                ↓
+                                 FrameAssembler     ControlChannel
+                                       ↓                ↕
+                                 VideoToolbox       input / reports / clock
+                                       ↓
+                                 Metal NV12 display
 ```
 
-Host stages are dedicated OS threads. Capture hands frames to the encoder
-through a latest-wins slot: an unconsumed frame gets displaced, so the
-encoder always works on the freshest picture. The encoder hands access units
-to transport through a lossless channel, because dropping an encoded P-frame
-would corrupt the GOP. Frame pixels travel in `Arc<Vec<u8>>` buffers that
-get recycled; steady state does one full-frame copy, the DXGI staging
-readback.
+Capture, encode and audio have dedicated threads. Capture publishes the latest
+raw frame; a slow encoder skips obsolete raw frames. The encoder copies into its
+own input buffer and releases capture's reference for reuse. Encoded access
+units use a bounded channel: silently dropping an arbitrary encoded P-frame
+would corrupt the GOP. The USB sender instead drops whole queued access units
+when necessary and requests an IDR, keeping its queue bounded.
 
-The supervisor owns the pipeline. Stage threads report their exits, wedge
-watchdogs fire on silent stalls (loop heartbeat stale 3 s, no frame for 5 s
-with a client connected, encoder flat 3 s), and restarts back off
-exponentially with a restart-storm brake. The client session lives outside
-the pipeline, so a crash-restart resumes streaming to the same session. The
-client sees a new stream epoch, resets reassembly, and never re-handshakes.
+DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
+capture supplies a deterministic moving pattern and an encoded frame counter on
+macOS and in tests. YUV420P is the encoder-input default. The optional Auto/BGRA
+path checks the selected codec's advertised formats; software x264 stays YUV.
+Windows converts with swscale; the macOS development path uses a tested
+Accelerate conversion with a swscale fallback.
 
-## Wire protocol v2
+The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
+restart-storm brake. The client session outlives an encoder/capture restart. A new
+stream epoch resets assembly and requests a fresh keyframe. The iPad keeps one
+VideoToolbox session per format, sniffs the bitstream codec, and renders NV12 with
+Metal using aspect-fit geometry.
 
-One UDP socket carries both media and control. Every datagram starts with an
-8-byte prefix: magic `"EM"`, version `2`, packet type, flags (media bit 0 =
-keyframe), a reserved byte, and a strict payload length. Legacy v1 datagrams
-began with `"ET"`, so the two never get confused. v2 is otherwise a clean
-break; each side tells the user to update the other on contact with v1.
+The host offers 30/60/90/120 fps. When HELLO2 includes a preference, the effective
+rate is the lower host/client value. The iPad requests 30/60/120 fps. A requested
+rate is not a claim about achieved decode or panel refresh rate.
 
-Media (type 0x01) is a 32-byte header followed by a raw Annex B chunk. The
-header carries session id, stream epoch, frame sequence, fragment
-index/count (up to 3066, about 4 MiB per frame), and the capture timestamp
-in microseconds on the host process clock. There is no serialization
-framework; width, height, and codec travel in the control plane.
+## Wire protocol and transport links
 
-Control messages share a 16-byte header (session id, message sequence,
-type):
+The v2 prefix remains eight bytes: EM magic, version, type, flags, reserved byte
+and body length. Video uses the existing 32-byte header with session, epoch,
+frame/fragment sequence, keyframe flag and capture timestamp. Repair adds a flag
+without changing the prefix. New packet types require negotiated capability bits;
+optional control tails are append-only and decoders tolerate trailing bytes.
+Rust and Swift share golden vectors and stable packet-type registry tests.
 
-| Message | Direction | Purpose |
-| --- | --- | --- |
-| HELLO2 / HELLO_ACK | C→H / H→C | Session establishment. Capability bits (H.264/HEVC decode, wants-input), screen size and refresh, a nonce-idempotent ACK carrying the session id, host-dictated timing, and the stream config |
-| HEARTBEAT | H→C | 1 Hz liveness plus the embedded stream config, which self-heals lost config changes |
-| RECEIVER_REPORT | C→H | Every 500 ms: loss, completion, jitter, queue depths. Feeds ABR and doubles as client liveness |
-| KEYFRAME_REQUEST | C→H | Recovery after loss or a decode error; the host rate-limits to one per 500 ms |
-| PING / PONG | C→H→C | NTP-style clock sync (min-RTT offset) behind the HUD's measured end-to-end latency |
-| STREAM_CONFIG | H→C | Immediate notify on a bitrate, codec, or resolution change |
-| INPUT_EVENT | C→H | Input relay (below) |
-| BYE | both | Clean teardown with a reason (user, backgrounded, shutdown) |
+| Message | Purpose |
+| --- | --- |
+| HELLO2 / HELLO_ACK | Nonce-idempotent session setup, capabilities, device/screen information, preferences and pairing credentials |
+| HEARTBEAT / STREAM_CONFIG | Host liveness and current codec, resolution, rate and bitrate |
+| RECEIVER_REPORT | Cumulative fragment/loss/repair counts, queue depth, jitter and audio statistics every 500 ms |
+| NACK | Missing fragment indexes for a specific session, epoch and frame |
+| KEYFRAME_REQUEST | Recovery after repair expiry or decoder error |
+| PING / PONG | Min-RTT clock estimate for end-to-end latency |
+| INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
+| Audio | Sequenced Opus packets with discontinuity and capture timing |
+| BYE | User, background or shutdown teardown |
 
-Session rules, implemented as a pure state machine on the host: one client
-at a time, and a second device gets `busy`. The same device reconnecting
-supersedes in place with a fresh session id. Duplicate HELLO2 nonces get an
-identical ACK, which makes handshake retransmits harmless. Liveness expires
-3 s after the last report or input event, and expiry also tears down the
-virtual display.
+One session owns the active link. Another device receives Busy; a reconnect from
+the same device supersedes its prior session. Duplicate accepted nonces replay
+the same ACK. All established-session traffic is session-id gated. Reports/input
+maintain liveness; expiry removes the client and its managed virtual display.
 
-## Reliability
+UDP carries video, audio and control on the same socket. The iPad's established
+Network.framework backend remains the default. A selectable BSD backend uses a
+nonblocking socket, enlarged receive buffer and dispatch-source burst draining;
+both feed the same datagram classifier and assembler. Local burst measurements
+did not show a reason to change the default before physical iPad testing.
 
-- ABR: a bitrate ladder (4 to 20 Mbps, capped by the GUI "Max bitrate"
-  slider) driven by receiver reports. Loss or keyframe-request pressure
-  steps down with a 3 s cooldown; 15 s of clean reports steps back up. A
-  bitrate change reopens the encoder session (50 to 200 ms, same epoch) and
-  forces an IDR.
-- Pacing: keyframe bursts go out in batches with microsleeps under a hard
-  3 ms wall-clock budget, on a socket with a 4 MiB kernel send buffer. This
-  smooths WiFi loss without adding latency.
-- Recovery: the client requests keyframes on gaps and decode errors; the
-  host honors at most two per second. The app shows "SIGNAL LOST" after 3 s
-  of silence and reconnects with backoff.
+For USB, the host's `transport/usbmuxd.rs` client connects to Apple's service at
+127.0.0.1:27015 on Windows (the development Mac uses its Unix socket). It discovers
+a device and requests a tunnel to iPad port 9877. The app listener binds only to
+loopback. EMLINK v1 starts with an eight-byte preamble, then a little-endian
+16-bit length and each existing datagram; invalid lengths over 1400 bytes fail
+before allocation. Host video queues are limited by whole-frame count and bytes.
 
-## Input relay
+ConnectionManager switches to an authenticated physical USB link when available,
+tears down the old session, and returns to a remembered WiFi target after unplug.
+Manual Disconnect pauses automatic USB attachment. Loopback fixtures prove this
+state machine and framing, while the cable/trust/device-service path still needs
+a physical iPad.
 
-The iPad normalizes touches over the displayed video (letterbox-corrected)
-to a 0–65535 grid. A pure gesture machine turns raw touches into events: tap
-means click at the touch-down point, a drag commits after slop, two fingers
-scroll in the direct-manipulation direction, a 500 ms hold right-clicks, and
-Apple Pencil presses immediately with pressure. Press/release edges are sent
-twice with one event id; the host dedupes, maps through the captured
-output's desktop rectangle onto the Windows virtual screen, and injects with
-`SendInput`. Sessions that didn't set the wants-input capability never get
-injected for.
+## Loss repair and adaptive bitrate
 
-## Codecs
+The host retains exact first-transmission datagrams in a per-session history,
+bounded to 96 frames and 12 MiB. NACK replies change only the retransmit flag;
+indexes, fragment counts and epochs must match. Per-fragment resend spacing
+bounds repeated work. Repairs bypass first-transmission fault injection and are
+serviced while a paced keyframe is waiting.
 
-H.264 is the default everywhere. With the host's "Prefer HEVC" setting on
-and a client that advertises HEVC decode, the encoder live-switches to the
-HEVC sibling (NVENC/AMF/QSV/VideoToolbox/x265) through the same reopen
-mechanism. The iPad decoder detects the codec from the bitstream itself (an
-HEVC VPS in a keyframe), so the switch has no ordering race between config
-and media. HEVC encoders repeat VPS/SPS/PPS in-band; H.264 keyframes get
-cached SPS/PPS prepended. The AMF path carries extra guards developed
-against real hardware.
+The iPad holds incomplete frames for an RTT-aware 8–25 ms repair window. It sends
+at most two requests, retires expired frames and drains completed frames in
+order. Reported repaired and unrecovered counts remain separate. Keyframe
+requests remain the fallback for expiry and decode errors.
 
-## Discovery
+ABR uses the host's 4–50 Mbps ladder under the user's ceiling. Unrecovered loss,
+repair pressure, jitter and receive/decode queues can lower bitrate; sustained
+clean reports permit an increase. It uses report deltas and resets on epoch
+changes. A bitrate change reopens the encoder and forces an IDR. Packet pacing
+bounds keyframe bursts without blocking urgent control repairs.
 
-The host advertises `_eternaldisplay._udp` over mDNS with `version`,
-`proto=2`, and `platform` TXT records. The advertisement re-upserts every
-60 s without an unregister gap and goes out with goodbye packets on exit.
-Manual IP entry and the QR code remain the fallback for networks that
-filter multicast.
+## Audio
 
-## Portability and testing
+WASAPI loopback captures the Windows default render endpoint. Endpoint or format
+changes reopen capture; failure disables audio with a visible status instead of
+killing video. The portable source produces a known 1 kHz tone and silence gaps.
+FFmpeg resamples to 48 kHz stereo and encodes 20 ms Opus packets at 128 kbps. Audio
+is sent only when the host setting and client WANTS_AUDIO capability both allow
+it. UDP audio is unpaced; USB uses the existing frame wrapper.
 
-Everything protocol- or logic-shaped lives in the pure `eternal-wire` crate
-(v2 codecs, H.264/HEVC bitstream helpers, reassembly) or in host modules
-with injected clocks (session, ABR, pacer, supervisor, input mapping), all
-tested on every platform. Windows-only code (DXGI, SendInput, VDD control)
-sits behind `cfg(windows)`. A synthetic capture source with a
-machine-readable frame counter lets the full host run on macOS and CI,
-where the Rust E2E suite drives a fake receiver through handshake, loss,
-crash-recovery, input, and HEVC scenarios, and `scripts/e2e_ios.sh` streams
-into the real iPad app in the simulator. Golden wire vectors are parsed
-byte-for-byte by both languages. What only hardware can prove (GPU
-encoders, the display driver, real WiFi) is enumerated in
-HARDWARE_VERIFICATION.md.
+The iPad builds libopus from the pinned Swift package and uses one decoder path
+on simulator and device. A bounded jitter buffer starts at 60 ms, grows to 120 ms
+after repeated underruns and shrinks after sustained clean playback. Missing
+packets use Opus concealment; compact quiet packets and DTX gaps do not count as
+network loss. AVAudioSourceNode supplies Float32 audio to AVAudioEngine. Muting
+leaves video connected.
+
+FFmpeg's low-delay CELT mode does not provide SILK in-band FEC or a working DTX
+AVOption. Quiet periods use explicitly reset, compact Opus silence packets.
+[Audio codec notes](docs/audio-codec.md) record the decision and fixture tests.
+
+## Pairing and input
+
+Pairing is required by default. A random 128-bit host token authenticates known
+iPads; a six-digit code authorizes first contact and rotates after success. Five
+failed attempts per source IP in a minute trigger the cooldown; the tracking map
+is bounded. QR links include the token. The iPad stores learned credentials in
+Keychain, clears rejected stale tokens, and offers Forget paired hosts. USB trusts
+physical access. This is access control over an unencrypted local connection;
+video, audio, input and pairing credentials are not confidential on the network.
+
+Touch coordinates are normalized within the displayed video, excluding letterbox
+bars. The host maps them through the captured output rectangle onto the Windows
+virtual desktop. A pure gesture machine handles tap, drag, two-finger scrolling
+and hold/right-click. Pencil contact moves the mouse immediately; Windows pen
+pressure injection is not implemented.
+
+Keyboard events carry USB HID page 0x07 usages, mapped to Windows scan codes and
+extended-key flags. Text carries UTF-16 units for SendInput Unicode events.
+Pointer buttons and hover share the same session gate. Edge duplicates carry
+one event ID, and disconnect releases held keys/buttons. The on-screen keyboard
+has sticky modifiers and navigation keys. Command maps to Ctrl by default, with
+an opt-in Win mapping; iPadOS retains its reserved shortcuts.
+
+## Host integration and verification
+
+The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
+Users read/execute permission. The host starts a virtual display only for a
+connected client, writes the requested mode first in VDD XML, and reports actual
+task failures. It also ships TCP/UDP firewall rules. Runtime upgrade, task-ACL and
+uninstall checks remain hardware gates.
+
+mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,
+refreshes without an unregister gap, and sends goodbye on exit. Manual IP and QR
+remain alternatives. Logs rotate through the current session and two prior files.
+An optional background update request runs at most once per day with a three-second
+timeout. The GUI shows current client/link, codec, repair/loss, audio and fallback
+state; 0.36 egui snapshots cover representative views.
+
+Pure Rust/Swift tests, golden vectors, encoded-stream integration tests, native
+UI tests, the simulator matrix and RSS/FPS soaks provide complementary checks.
+Windows builds compile every platform-specific path; the interactive reference-PC
+campaign proves DXGI, hardware encoders, WASAPI, SendInput and installer behavior.
+The physical iPad runbook covers device decoding, cable trust, LAN discovery,
+latency/input feel and ProMotion. None of those hardware results are inferred
+from a compile or simulator pass.

@@ -7,91 +7,94 @@ struct SettingsView: View {
 
     private var appVersion: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "—"
-        let build = info?["CFBundleVersion"] as? String ?? "—"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "–"
+        let build = info?["CFBundleVersion"] as? String ?? "–"
         return "\(version) (\(build))"
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                // Playback (local device preferences)
+                // Keep Frame Rate, Play PC audio and Allow USB within the first
+                // screen of the sheet; UI tests toggle them without scrolling.
                 Section {
                     Picker(selection: $settings.targetFPS) {
                         Text("30 fps").tag(30)
                         Text("60 fps").tag(60)
                         Text("120 fps").tag(120)
                     } label: {
-                        Label("Frame Rate", systemImage: "speedometer")
+                        rowLabel("Frame rate", "speedometer")
                     }
-
                     .accessibilityIdentifier("settings.targetFPS")
                     .accessibilityValue("\(settings.targetFPS) fps")
 
-                    Toggle(isOn: $settings.showHUD) {
-                        Label("Show stats HUD", systemImage: "gauge.with.dots.needle.33percent")
-                    }
-
                     Toggle(isOn: $settings.playPCaudio) {
-                        Label("Play PC audio", systemImage: "speaker.wave.2")
+                        rowLabel("Play PC audio", "speaker.wave.2")
                     }
                     .accessibilityIdentifier("settings.playPCaudio")
 
-                    Toggle(isOn: $settings.autoReconnect) {
-                        Label("Auto-reconnect", systemImage: "arrow.triangle.2.circlepath")
+                    Toggle(isOn: $settings.showHUD) {
+                        rowLabel("Show stream stats", "gauge.with.dots.needle.33percent")
                     }
 
+                    Toggle(isOn: $settings.keepScreenAwake) {
+                        rowLabel("Keep screen awake", "sun.max")
+                    }
+                } header: {
+                    sectionHeader("Streaming")
+                } footer: {
+                    footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls.")
+                }
+                .listRowBackground(Theme.surfaceRaised)
+
+                Section {
                     Toggle(isOn: $settings.allowUSB) {
-                        Label("Allow USB connections", systemImage: "cable.connector")
+                        rowLabel("Allow USB connections", "cable.connector")
                     }
                     .accessibilityIdentifier("settings.allowUSB")
 
-                    Toggle(isOn: $settings.keepScreenAwake) {
-                        Label("Keep screen awake", systemImage: "sun.max")
+                    Toggle(isOn: $settings.autoReconnect) {
+                        rowLabel("Reconnect automatically", "arrow.triangle.2.circlepath")
                     }
 
                     Toggle(isOn: $settings.autoResumeOnForeground) {
-                        Label("Resume after switching apps", systemImage: "arrow.uturn.forward")
+                        rowLabel("Resume after switching apps", "arrow.uturn.forward")
                     }
                 } header: {
-                    sectionHeader("Playback")
-                } footer: {
-                    footnote(
-                        "Frame Rate sets the host limit on the next connection. "
-                            + "Tap the video to toggle the HUD while streaming — "
-                            + "three fingers while Control PC is on."
-                    )
+                    sectionHeader("Connection")
                 }
+                .listRowBackground(Theme.surfaceRaised)
 
-                // Control (input relay)
                 Section {
                     Toggle(isOn: $settings.controlPC) {
-                        Label("Control PC", systemImage: "hand.point.up.left")
+                        rowLabel("Control PC", "hand.point.up.left")
                     }
-                    Picker("⌘ key acts as", selection: $settings.commandAsControl) {
+                    Picker(selection: $settings.commandAsControl) {
                         Text("Ctrl").tag(true)
                         Text("Win").tag(false)
+                    } label: {
+                        rowLabel("⌘ key acts as", "command")
                     }
                     .accessibilityIdentifier("settings.commandMapping")
                 } header: {
                     sectionHeader("Control")
                 } footer: {
                     footnote(
-                        "Tap to click, drag to move the mouse, two fingers to scroll, "
-                            + "hold for a right-click. Keyboard, trackpad and pencil hover also control the PC. "
-                            + "Control PC takes effect on the next connect. iPadOS keeps Globe, ⌘H, ⌘Tab and ⌘Space. "
-                            + "While control is on, tap with three fingers to toggle the HUD."
+                        "Tap to click, drag to move, two fingers to scroll, hold to right-click. "
+                            + "Keyboard, trackpad and Apple Pencil work too. Applies from the next connection. "
+                            + "While Control PC is on, tap with three fingers to show the controls."
                     )
                 }
+                .listRowBackground(Theme.surfaceRaised)
 
-                // Host — live values from HELLO_ACK, refreshed by heartbeats.
+                // Live values from HELLO_ACK, refreshed by heartbeats.
                 Section {
                     if let host = connectionManager.hostInfo,
                        let config = connectionManager.hostStreamConfig {
-                        infoRow("Host", host.hostName, "desktopcomputer")
+                        infoRow("PC", host.hostName, "desktopcomputer")
                         infoRow(
                             "Resolution",
-                            "\(config.width)×\(config.height) @ \(config.fps) fps",
+                            "\(config.width) × \(config.height) at \(config.fps) fps",
                             "rectangle.on.rectangle"
                         )
                         infoRow(
@@ -102,7 +105,7 @@ struct SettingsView: View {
                         infoRow(
                             "Bitrate",
                             String(format: "%.1f Mbps", Double(config.bitrateBps) / 1_000_000.0),
-                            "slider.horizontal.3"
+                            "chart.bar"
                         )
                         infoRow("Audio", audioDescription, "speaker.wave.2")
                             .accessibilityElement(children: .ignore)
@@ -110,98 +113,88 @@ struct SettingsView: View {
                             .accessibilityValue(audioDescription)
                             .accessibilityIdentifier("settings.hostAudio")
                     } else {
-                        infoRow("Host", "Not connected", "desktopcomputer")
+                        infoRow("PC", "Not connected", "desktopcomputer")
                     }
                 } header: {
-                    sectionHeader("Host stream")
+                    sectionHeader("Connected PC")
                 } footer: {
-                    footnote(
-                        "Live values from the connected host. Resolution, codec and bitrate "
-                            + "are configured in the EternalMonitor app on your Windows PC."
-                    )
+                    footnote("Resolution, codec and bitrate are set in EternalMonitor on your PC.")
                 }
+                .listRowBackground(Theme.surfaceRaised)
 
                 Section {
-                    Button("Forget paired hosts", role: .destructive) {
+                    Button(role: .destructive) {
                         connectionManager.forgetPairedHosts()
+                    } label: {
+                        Text("Forget paired PCs")
+                            .font(.app(16, .medium, relativeTo: .body))
+                            .foregroundStyle(Theme.danger)
                     }
                     .accessibilityIdentifier("settings.forgetPairings")
                 } header: {
                     sectionHeader("Pairing")
                 } footer: {
-                    footnote("Saved hosts will ask for a code on your next connection.")
+                    footnote("Each PC asks for its six-digit code again on the next Wi-Fi connection.")
                 }
+                .listRowBackground(Theme.surfaceRaised)
 
-                // About
                 Section {
-                    HStack {
-                        Text("Version")
-                            .foregroundColor(Theme.text)
-                        Spacer()
-                        Text(appVersion)
-                            .font(.appMonoRegular(size: 13))
-                            .foregroundColor(Theme.text2)
+                    HStack(spacing: 14) {
+                        LogoMark(size: 40)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("EternalMonitor")
+                                .font(.app(16, .semibold, relativeTo: .headline))
+                                .foregroundStyle(Theme.text)
+                            Text("Version \(appVersion)")
+                                .font(.app(13, relativeTo: .footnote))
+                                .foregroundStyle(Theme.textMuted)
+                        }
                     }
-                    HStack {
-                        Text("Build")
-                            .foregroundColor(Theme.text)
-                        Spacer()
-                        Text("SIGNAL")
-                            .font(.appMonoMedium(size: 12))
-                            .tracking(2)
-                            .foregroundColor(Theme.amber)
-                    }
+                    .padding(.vertical, 4)
+                    creditLink("Developer", "github.com/whoisaldo", symbol: "person", url: "https://github.com/whoisaldo")
+                    creditLink("Source code", "EternalMonitor", symbol: "chevron.left.forwardslash.chevron.right", url: "https://github.com/whoisaldo/EternalMonitor")
+                    creditLink("Contact", "aliyounes@eternalreverse.com", symbol: "envelope", url: "mailto:aliyounes@eternalreverse.com")
                 } header: {
                     sectionHeader("About")
-                }
-
-                // Credits
-                Section {
-                    creditLink(
-                        "Developer",
-                        "github.com/whoisaldo",
-                        symbol: "chevron.left.forwardslash.chevron.right",
-                        url: "https://github.com/whoisaldo"
-                    )
-                    creditLink(
-                        "Repository",
-                        "EternalMonitor",
-                        symbol: "shippingbox",
-                        url: "https://github.com/whoisaldo/EternalMonitor"
-                    )
-                    creditLink(
-                        "Questions & concerns",
-                        "aliyounes@eternalreverse.com",
-                        symbol: "envelope",
-                        url: "mailto:aliyounes@eternalreverse.com"
-                    )
-                } header: {
-                    sectionHeader("Credits")
                 } footer: {
-                    footnote("Built by Ali Younes (@whoisaldo).")
+                    footnote("Built by Ali Younes (@whoisaldo). Set in Geist.")
                 }
+                .listRowBackground(Theme.surfaceRaised)
             }
             .scrollContentBackground(.hidden)
-            .background(Theme.void.ignoresSafeArea())
+            .background(Theme.canvas.ignoresSafeArea())
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
+                        .font(.app(16, .semibold, relativeTo: .body))
+                        .foregroundStyle(Theme.accent)
                         .accessibilityIdentifier("settings.done")
-                        .font(.appMonoMedium(size: 15))
-                        .foregroundColor(Theme.amber)
                 }
             }
-            .tint(Theme.amber)
+            .toolbarBackground(Theme.canvas, for: .navigationBar)
+            .tint(Theme.accent)
+        }
+        .presentationBackground(Theme.canvas)
+    }
+
+    private func rowLabel(_ title: String, _ symbol: String) -> some View {
+        Label {
+            Text(title)
+                .font(.app(16, relativeTo: .body))
+                .foregroundStyle(Theme.text)
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(Theme.textMuted)
         }
     }
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title.uppercased())
-            .font(.appMonoMedium(size: 11))
-            .tracking(1.5)
-            .foregroundColor(Theme.text3)
+            .font(.app(12, .medium, relativeTo: .caption))
+            .tracking(1.1)
+            .foregroundStyle(Theme.textFaint)
     }
 
     private var audioDescription: String {
@@ -213,18 +206,18 @@ struct SettingsView: View {
 
     private func footnote(_ text: String) -> some View {
         Text(text)
-            .font(.appMonoRegular(size: 11))
-            .foregroundColor(Theme.text3)
+            .font(.app(13, relativeTo: .footnote))
+            .foregroundStyle(Theme.textFaint)
     }
 
     private func infoRow(_ title: String, _ value: String, _ symbol: String) -> some View {
         HStack {
-            Label(title, systemImage: symbol)
-                .foregroundColor(Theme.text)
+            rowLabel(title, symbol)
             Spacer()
             Text(value)
-                .font(.appMonoRegular(size: 13))
-                .foregroundColor(Theme.text2)
+                .font(.app(15, relativeTo: .callout))
+                .foregroundStyle(Theme.textMuted)
+                .multilineTextAlignment(.trailing)
         }
     }
 
@@ -233,17 +226,16 @@ struct SettingsView: View {
         if let destination = URL(string: url) {
             Link(destination: destination) {
                 HStack {
-                    Label(title, systemImage: symbol)
-                        .foregroundColor(Theme.text)
+                    rowLabel(title, symbol)
                     Spacer()
                     Text(value)
-                        .font(.appMonoRegular(size: 13))
-                        .foregroundColor(Theme.amber)
+                        .font(.app(15, relativeTo: .callout))
+                        .foregroundStyle(Theme.accent)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Image(systemName: "arrow.up.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(Theme.text3)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textFaint)
                 }
             }
         }

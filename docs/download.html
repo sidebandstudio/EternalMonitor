@@ -3,163 +3,157 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Download — EternalMonitor</title>
-  <meta name="description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency. No subscription, no dongle.">
-  <meta property="og:title" content="EternalMonitor">
-  <meta property="og:description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency.">
-  <meta property="og:url" content="https://eternalmonitor.dev">
-  <meta property="og:image" content="https://eternalmonitor.dev/assets/icon.png">
+  <title>Download EternalMonitor</title>
+  <meta name="description" content="Download EternalMonitor for Windows and get the matching iPad app. Free and open source.">
+  <meta property="og:title" content="Download EternalMonitor">
+  <meta property="og:description" content="Your iPad as a second screen for Windows. Free and open source.">
+  <meta property="og:url" content="https://eternalmonitor.dev/download.html">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="EternalMonitor">
-  <meta name="twitter:description" content="Use your iPad as a second monitor for Windows. Free, open source.">
-  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/icon.png">
-  <link rel="canonical" href="https://eternalmonitor.dev">
+  <meta name="twitter:title" content="Download EternalMonitor">
+  <meta name="twitter:description" content="Your iPad as a second screen for Windows. Free and open source.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
+  <link rel="canonical" href="https://eternalmonitor.dev/download.html">
   <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
-  <meta name="theme-color" content="#080808">
-  <link rel="icon" type="image/png" href="assets/icon.png">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <a class="skip-link" href="#main">Skip to content</a>
 
-  <!-- ===== Nav (shared) ===== -->
-  <nav class="nav">
+  <nav class="nav" aria-label="Main">
     <div class="container nav-inner">
-      <a href="index.html" class="nav-brand">
-        <div class="logo-mark"><span></span><span></span><span></span></div>
+      <a href="index.html" class="nav-brand" aria-label="EternalMonitor home">
+        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
         <span>EternalMonitor</span>
       </a>
       <div class="nav-links">
-        <a href="download.html" class="btn-primary btn-sm">Download</a>
+        <a href="index.html#features" class="nav-link hide-sm">Features</a>
+        <a href="index.html#faq" class="nav-link hide-sm">FAQ</a>
         <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener" class="nav-link" aria-label="GitHub repository">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           <span class="nav-link-label">GitHub</span>
-          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
       </div>
     </div>
   </nav>
 
-  <!-- ===== Download Hero ===== -->
-  <section class="download-hero">
-    <div class="container">
-      <h1>Download EternalMonitor</h1>
-      <p>Windows host + iPad app &middot; matching versions required</p>
-    </div>
-  </section>
-
-  <!-- ===== Download Cards ===== -->
-  <section>
-    <div class="container download-grid">
-
-      <!-- Windows Host Card -->
-      <div class="download-card download-card--primary">
-        <div class="download-card-header">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-          <h2>Windows Host</h2>
-          <span class="badge badge-green" id="release-version">latest</span>
-        </div>
-        <p>Runs on your PC. Captures and streams your display.</p>
-        <div class="download-requirements">
-          <span class="pill">NVIDIA / AMD / Intel &middot; Windows 10/11</span>
-        </div>
-        <div class="download-btn-wrap">
-          <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="download-btn" class="btn-primary btn-lg" target="_blank" rel="noopener">Download for Windows</a>
-          <p class="download-meta" id="release-meta">Fetching latest release&hellip;</p>
-        </div>
-        <div class="sha256">
-          <span class="sha256-label">SHA-256</span>
-          <code id="sha256-value">Available on release page</code>
-        </div>
+  <main id="main">
+    <section class="download-hero">
+      <div class="container">
+        <h1>Download EternalMonitor</h1>
+        <p>Install the Windows app on your PC and the iPad app on your iPad. Both need the same version.</p>
       </div>
+    </section>
 
-      <!-- iPad App Card -->
-      <div class="download-card">
-        <div class="download-card-header">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="3"/><circle cx="12" cy="18" r="1"/></svg>
-          <h2>iPad App</h2>
-          <span class="badge badge-muted">TestFlight</span>
-        </div>
-        <p>Install the matching iPad build through TestFlight.</p>
-        <div class="download-btn-wrap">
-          <p id="testflight-status">TestFlight invite: ask Ali</p>
-          <a id="testflight-link" class="btn-primary btn-lg" target="_blank" rel="noopener" hidden>Join the TestFlight</a>
-        </div>
-        <p class="download-note">iPadOS 17 or later. Developers can also <a href="https://github.com/whoisaldo/EternalMonitor/tree/main/ios" target="_blank" rel="noopener">build from source</a>.</p>
-      </div>
-
-    </div>
-  </section>
-
-  <!-- ===== Preview build (revealed only when a pre-release exists) ===== -->
-  <section class="preview-section" id="preview-section" hidden>
-    <div class="container">
-      <div class="preview-card">
-        <div class="preview-head">
-          <span class="limitations-badge" id="preview-version">preview</span>
-          <h2>Preview build for testers</h2>
-        </div>
-        <p class="preview-warning">
-          <strong>This is a test build, not a release.</strong> It is here so testers can try
-          new hardware paths before they are signed off. Expect rough edges, and please report
-          what breaks.
-        </p>
-        <p class="preview-parity">
-          The Windows host and the iPad app must both come from <em>this same preview</em>.
-          Mixing a preview host with a release app (or the reverse) will not stream &mdash; each
-          side will tell you to update the other. The matching iPad build is distributed through
-          TestFlight; ask for an invite.
-        </p>
-        <div class="download-btn-wrap">
-          <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="preview-btn"
-             class="btn-ghost" target="_blank" rel="noopener">Download preview for Windows</a>
-          <p class="download-meta" id="preview-meta"></p>
-        </div>
-        <div class="sha256">
-          <span class="sha256-label">SHA-256</span>
-          <code id="preview-sha256">Available on the release page</code>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ===== Build from Source ===== -->
-  <section class="build-section">
-    <div class="container">
-      <details class="build-details">
-        <summary>Build from source</summary>
-        <div class="build-content">
-          <h3>Requirements</h3>
-          <ul class="build-reqs">
-            <li>Rust stable MSVC</li>
-            <li>FFmpeg 7.1 shared SDK (set <code>FFMPEG_DIR</code>)</li>
-            <li>GPU with hardware encoder (NVIDIA/AMD/Intel) or software fallback</li>
+    <section>
+      <div class="container download-grid">
+        <!-- Windows -->
+        <article class="download-card download-card--primary card">
+          <div class="download-card-header">
+            <span class="platform-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+            <h2>Windows</h2>
+            <span class="badge badge-accent" id="release-version">latest</span>
+          </div>
+          <p>Runs on your PC. It captures your screen, encodes it on the GPU and streams it to the iPad. The download below is the latest published release. It predates the v0.3 candidate, whose USB, PC audio and pairing are still in testing.</p>
+          <ul class="spec-list" aria-label="Requirements">
+            <li>Windows 10 or 11, 64-bit</li>
+            <li>NVIDIA, AMD or Intel GPU</li>
           </ul>
-          <h3>Windows Host</h3>
-          <pre><code>git clone https://github.com/whoisaldo/EternalMonitor
+          <div class="download-btn-wrap">
+            <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="download-btn" class="btn btn-primary btn-block" target="_blank" rel="noopener">Download for Windows</a>
+            <p class="download-meta" id="release-meta">Checking for the latest release…</p>
+          </div>
+          <div class="sha256">
+            <span class="sha256-label">SHA-256</span>
+            <code id="sha256-value">Listed on the release page</code>
+          </div>
+        </article>
+
+        <!-- iPad -->
+        <article class="download-card card">
+          <div class="download-card-header">
+            <span class="platform-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
+            <h2>iPad</h2>
+            <span class="badge badge-muted">TestFlight</span>
+          </div>
+          <p>Shows your PC's screen and sends touch, Apple Pencil and keyboard input back. Install the build that matches your Windows version.</p>
+          <ul class="spec-list" aria-label="Requirements">
+            <li>iPadOS 17 or later</li>
+          </ul>
+          <div class="download-btn-wrap">
+            <p id="testflight-status" class="testflight-status">TestFlight invites are by request for now. Ask Ali for one.</p>
+            <a id="testflight-link" class="btn btn-primary btn-block" target="_blank" rel="noopener" hidden>Join the TestFlight</a>
+          </div>
+          <p class="download-note">Developers can also <a href="https://github.com/whoisaldo/EternalMonitor/tree/main/ios" target="_blank" rel="noopener">build it from source</a>.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- Preview build (shown only when a pre-release exists) -->
+    <section class="preview-section" id="preview-section" hidden>
+      <div class="container">
+        <div class="preview-card card">
+          <div class="preview-head">
+            <span class="badge badge-warning" id="preview-version">preview</span>
+            <h2>Preview build for testers</h2>
+          </div>
+          <p><strong>This is a test build, not a release.</strong> It lets testers try new hardware paths before they are signed off. Expect rough edges, and please report what breaks.</p>
+          <p>The Windows app and the iPad app must both come from this same preview. Mixing builds is not a supported setup: v0.1 and v2 builds can't stream together, and newer v2 builds negotiate the features they share. Install the matching iPad build through TestFlight; ask for an invite.</p>
+          <div class="download-btn-wrap">
+            <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="preview-btn" class="btn btn-secondary btn-block" target="_blank" rel="noopener">Download the preview for Windows</a>
+            <p class="download-meta" id="preview-meta"></p>
+          </div>
+          <div class="sha256">
+            <span class="sha256-label">SHA-256</span>
+            <code id="preview-sha256">Listed on the release page</code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="build-section">
+      <div class="container">
+        <details class="build-details card">
+          <summary>Build from source</summary>
+          <div class="build-content">
+            <h3>Requirements</h3>
+            <ul>
+              <li>Rust stable with the MSVC toolchain</li>
+              <li>FFmpeg 7.1 shared SDK (set <code>FFMPEG_DIR</code>)</li>
+              <li>A GPU with a hardware encoder (NVIDIA, AMD or Intel), or the software fallback</li>
+            </ul>
+            <h3>Windows app</h3>
+            <pre><code>git clone https://github.com/whoisaldo/EternalMonitor
 cd EternalMonitor
 $env:FFMPEG_DIR = "C:\ffmpeg"   # your FFmpeg 7.1 shared SDK
 cargo build --release -p eternal-host</code></pre>
-          <h3>iPad App</h3>
-          <pre><code>cd ios
+            <h3>iPad app</h3>
+            <pre><code>cd ios
 xcodegen generate
-# Open in Xcode, build for physical device</code></pre>
-        </div>
-      </details>
-    </div>
-  </section>
+# Open EternalMonitor.xcodeproj in Xcode and build for your iPad</code></pre>
+          </div>
+        </details>
+      </div>
+    </section>
+  </main>
 
-  <!-- ===== Footer (shared) ===== -->
   <footer class="footer">
     <div class="container footer-inner">
-      <div class="footer-brand">
-        <div class="logo-mark"><span></span><span></span><span></span></div>
-        <span>EternalMonitor</span>
-      </div>
-      <p class="footer-copy">Built by whoisaldo &middot; Open source under MIT</p>
+      <a href="index.html" class="footer-brand">
+        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
+        EternalMonitor
+      </a>
+      <p class="footer-copy">Built by whoisaldo · Open source under MIT</p>
       <div class="footer-links">
+        <a href="index.html">Home</a>
         <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="mailto:aliyounes@eternalreverse.com">Contact</a>
       </div>
     </div>
   </footer>

@@ -15,8 +15,7 @@ final class AudioStreamTests: XCTestCase {
         let toggle = app.switches["settings.playPCaudio"]
         XCTAssertTrue(toggle.exists)
         XCTAssertEqual(toggle.value as? String, "1")
-        pressSwitch(toggle)
-        waitForValue(toggle, value: "0")
+        setSwitch(toggle, to: "0")
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio muted or unavailable")
         let disconnect = app.buttons["display.disconnect"]
@@ -25,8 +24,7 @@ final class AudioStreamTests: XCTestCase {
         capture("audio-muted-hud", app: app)
         openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-        pressSwitch(toggle)
-        waitForValue(toggle, value: "1")
+        setSwitch(toggle, to: "1")
         app.swipeUp()
         let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
         XCTAssertTrue(audio.waitForExistence(timeout: 5))
@@ -61,10 +59,11 @@ final class AudioStreamTests: XCTestCase {
         let control = app.buttons[identifier]
         for _ in 0..<3 where !result.exists {
             revealControls(app, showing: control)
-            guard appears(control, within: 5) else { continue }
-            let center = control.frame
+            // A snapshot throws, instead of failing the test, if the control
+            // fades between the check and the read.
+            guard appears(control, within: 5), let frame = try? control.snapshot().frame else { continue }
             app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: center.midX, dy: center.midY)).tap()
+                .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
             _ = appears(result, within: 5)
         }
         XCTAssertTrue(result.exists, "\(identifier) did not open \(result)")
@@ -84,9 +83,14 @@ final class AudioStreamTests: XCTestCase {
         XCTFail("HUD never showed \"\(text)\"")
     }
 
-    private func waitForValue(_ element: XCUIElement, value: String) {
-        expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: element)
-        waitForExpectations(timeout: 5)
+    // A single press can be lost on a busy runner. Re-read the value before
+    // pressing again so a late press is never undone.
+    private func setSwitch(_ element: XCUIElement, to value: String) {
+        for _ in 0..<3 where !appears(element, where: "value == %@", value, within: 0.5) {
+            pressSwitch(element)
+            if appears(element, where: "value == %@", value, within: 5) { return }
+        }
+        XCTAssertEqual(element.value as? String, value)
     }
 
     private func pressSwitch(_ element: XCUIElement) {

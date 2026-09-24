@@ -95,14 +95,15 @@ Additional gates:
 | R-autostart | Passed quoted HKCU value write/remove; prior absent value restored | `windows-campaign-755741b/real/R-autostart/` |
 | R-update-banner | Passed the 0.0.1 native test build, available-release banner and dismissal check | `windows/update-banner-native-inspection.log`, `windows/R-update-banner.png` |
 | R-installer | Upgrade and fresh/owned lifecycle checks passed. Latest installed R-vdd still fails its UDP keyframe limit, as recorded above | `windows/installer-0975ad8/`, `windows/owned-driver-*-0975ad8.log` |
-| Simulator soak | `4f0c706` passes 30 minutes after the mdns-sd timer-heap correction: host RSS +1.61%, app -0.007%, 60/60 intervals at least 55 FPS, 59.99 average FPS and zero drops. Post-measurement simulator termination required a recorded manual cleanup. Earlier `116d6f5` failed host RSS at +55.57%; keep that failure | `soak-discovery-4f0c706/report.json`, `soak-discovery-4f0c706/cleanup-intervention.json`, `soak-simulator-116d6f5/` |
+| Simulator soak | `79d0660` (P7) passes 30 minutes with unattended cleanup: host RSS -9.04%, app -22.47%, 60/60 intervals at least 55 FPS. `4f0c706` passes 30 minutes after the mdns-sd timer-heap correction: host RSS +1.61%, app -0.007%, 60/60 intervals at least 55 FPS, 59.99 average FPS and zero drops. Post-measurement simulator termination required a recorded manual cleanup. Earlier `116d6f5` failed host RSS at +55.57%; keep that failure | `soak-simulator-p7-79d0660/report.md`, `soak-discovery-4f0c706/report.json`, `soak-discovery-4f0c706/cleanup-intervention.json`, `soak-simulator-116d6f5/` |
 | Real NVENC soak and final main soaks | Pending: 30 minutes each, host/app RSS growth below 20% from minute five and at least 95% of intervals at 55 FPS | Required before an rc tag |
 
 The independent Tailscale timing probe recorded 13 of 240 round trips above
 25 ms, with a maximum of 116.38 ms and no ICMP loss. That observation does not
 establish the cause of the UDP row failures. Keep the original repair and
-keyframe assertions while investigating them. Hosted macOS reliability and
-streaming jobs also remain release gates.
+keyframe assertions while investigating them. Hosted CI records simulator FPS
+because its three-vCPU VM cannot encode and decode in software at 55 FPS; the
+local matrix and soak on the development Mac enforce that gate.
 
 Run `scripts/e2e_matrix.sh` and `scripts/soak.sh 1800` for simulator checks.
 Use `scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800` for Windows.
@@ -113,9 +114,10 @@ currently suspends Windows GPU/display tests despite that availability.
 Verify current monitor geometry before each campaign; input tests reject mismatched bounds.
 See `scripts/win/README.md` for the interactive runner and evidence collection.
 
-Keep each merged host phase's `release.yml` dry-run artifact URL in
-`PROGRESS.md`. Those ordered phase merges and release artifacts remain pending
-behind the reliability gates. No installer here is a published release candidate.
+Each merged host phase's `release.yml` dry-run artifact is recorded in
+`PROGRESS.md`. The phases are merged to `main` with the Windows rows above still
+open, by Ali's decision; no release candidate is tagged until Windows is
+re-verified. No installer here is a published release candidate.
 
 Campaign cleanup and installed state:
 
