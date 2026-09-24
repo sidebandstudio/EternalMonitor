@@ -19,7 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-pid", type=int)
     parser.add_argument("--remote", type=Path)
-    parser.add_argument("--app-pid", type=int, required=True)
+    # A physical iPad's app memory is not visible to ps; omit it there.
+    parser.add_argument("--app-pid", type=int)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -40,7 +41,8 @@ def main():
         while True:
             sample = dict(elapsed=time.monotonic() - started)
             try:
-                sample["app_rss_kib"] = rss(args.app_pid)
+                if args.app_pid:
+                    sample["app_rss_kib"] = rss(args.app_pid)
                 if args.remote:
                     host = json.loads(subprocess.check_output([str(args.remote), "rss"], text=True))
                     sample["host_rss_kib"] = host["rss_kib"]

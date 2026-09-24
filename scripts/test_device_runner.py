@@ -53,7 +53,7 @@ class DeviceRunnerTests(unittest.TestCase):
                 patch.object(e2e_device.subprocess, 'Popen', side_effect=popen), \
                 patch.object(e2e_device.time, 'monotonic', side_effect=lambda: next(clock)), \
                 patch.object(e2e_device.time, 'sleep'):
-            args = argparse.Namespace(device='ipad', pc='10.0.0.45', size='3440x1440', duration=20)
+            args = argparse.Namespace(device='ipad', pc='10.0.0.45', size='3440x1440', duration=20, soak=False)
             passed = e2e_device.run_row(name, e2e_device.ROWS[name], Path(directory), args)
             result = json.loads((Path(directory) / name / 'result.json').read_text())
         return passed, result, calls, apps

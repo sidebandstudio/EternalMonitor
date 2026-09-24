@@ -17,6 +17,7 @@ import time
 
 from e2e_stats import measure
 from real_checks import check_high_refresh, check_stream, clean
+import soak_stats
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / 'scripts/win/remote.sh'
@@ -29,6 +30,8 @@ ROWS = {
     'D-h264-usb': dict(link='usb'),
     'D-hevc-usb': dict(link='usb', hevc=True),
     'D-fps120-usb': dict(link='usb', fps=120),
+    # The iPad's own panel as an extended desktop through the virtual display.
+    'D-extended-usb': dict(link='usb', display='virtual'),
 }
 
 
@@ -62,8 +65,10 @@ def run_row(name, spec, out, args):
         # The cable stays attached; keep the host's USB supervisor off it.
         host.append('ETERNAL_USB_DIRECT=127.0.0.1:0')
         launch['EM_AUTOCONNECT'] = f'{args.pc}:19876'
-    env = dict(os.environ, EM_BITRATE_MBPS=str(spec.get('bitrate', 15)), EM_REQUIRE_PAIRING='0', EM_AUDIO='0')
+    env = dict(os.environ, EM_BITRATE_MBPS=str(spec.get('bitrate', 15)), EM_REQUIRE_PAIRING='0', EM_AUDIO='0',
+               EM_CAPTURE_DISPLAY=spec.get('display', ''))
     os.environ.update(env)
+    sampler = None
     app = console = None
     host_started = pattern_started = False
     result = json.loads(result_path.read_text())
@@ -84,6 +89,10 @@ def run_row(name, spec, out, args):
             env=dict(os.environ, DEVELOPER_DIR='/Applications/Xcode.app/Contents/Developer'),
             stdout=console, stderr=subprocess.STDOUT)
         app_log = row / 'app.log'
+        if args.soak:
+            sampler = subprocess.Popen(['python3', str(ROOT / 'scripts/soak_sample.py'), '--remote', str(REMOTE),
+                                        '--log', str(app_log), '--output', str(row / 'resources.jsonl')],
+                                       stdout=(row / 'sampler.log').open('w'), stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 90
         started = None
         while True:
@@ -107,6 +116,11 @@ def run_row(name, spec, out, args):
         if 'E2E_DECODER kind=hw' not in milestones:
             errors.append('The iPad did not report its hardware decoder')
         width, height = map(int, args.size.split('x'))
+        if spec.get('display') == 'virtual':
+            # The extended desktop takes the iPad's own panel size, landscape.
+            hello = re.search(r'E2E_HELLO w=(\d+) h=(\d+)', milestones)
+            if hello:
+                width, height = sorted(map(int, hello.groups()), reverse=True)
         if (result.get('w'), result.get('h')) != (width, height):
             errors.append(f'Decoded {result.get("w")}x{result.get("h")}, expected {args.size}')
         if result['measured_seconds'] < args.duration:
@@ -126,12 +140,24 @@ def run_row(name, spec, out, args):
             check_high_refresh(result, host_log)
         if spec['link'] == 'usb' and 'USB tunnel connected' not in clean(host_log):
             errors.append('The host never opened the USB tunnel')
+        if spec.get('display') == 'virtual' and 'Virtual display attached' not in clean(host_log):
+            errors.append('The host never attached the virtual display')
+        if sampler is not None:
+            sampler.send_signal(signal.SIGINT)
+            sampler.wait(timeout=60)
+            samples = [json.loads(line) for line in (row / 'resources.jsonl').read_text().splitlines() if line]
+            soak = soak_stats.assess(samples, int(args.duration), processes=('host',))
+            save(row / 'soak.json', soak)
+            result['soak'] = {k: soak[k] for k in ('status', 'samples', 'samples_at_55_fps', 'memory')}
+            errors.extend(soak['errors'])
         if errors:
             result['status'] = 'FAIL'
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         result['status'] = 'FAIL'
         result.setdefault('errors', []).append(str(error))
     finally:
+        if sampler is not None and sampler.poll() is None:
+            sampler.kill()
         if app is not None:
             app.send_signal(signal.SIGINT)
             try:
@@ -171,6 +197,8 @@ def main():
     parser.add_argument('--size', default=os.environ.get('EM_SIZE', '1920x1080'),
                         help='the captured primary display size')
     parser.add_argument('--duration', type=float, default=20)
+    parser.add_argument('--soak', action='store_true',
+                        help='sample host memory every 30 s and apply the soak criteria')
     args = parser.parse_args()
     evidence = Path(os.environ.get('EM_EVIDENCE_DIR', '/Users/aldo/Desktop/EternalMonitor-Handoff/evidence'))
     out = evidence.resolve() / 'device'

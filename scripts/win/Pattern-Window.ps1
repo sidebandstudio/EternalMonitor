@@ -18,10 +18,15 @@ public class EMTestPattern : Form {
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly int seconds;
     readonly bool virtualDisplay;
+    // The virtual display is the screen that appears after the pattern starts;
+    // its size follows the connected iPad or simulator.
+    readonly System.Collections.Generic.HashSet<string> initialScreens =
+        new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
     long frame = -1;
     public EMTestPattern(int seconds, bool virtualDisplay, string displayName) {
         this.seconds = seconds;
         this.virtualDisplay = virtualDisplay;
+        foreach (var screen in Screen.AllScreens) initialScreens.Add(screen.DeviceName);
         Text = "EternalMonitor test pattern";
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -50,7 +55,7 @@ public class EMTestPattern : Form {
             if (this.virtualDisplay) {
                 Rectangle target = Screen.PrimaryScreen.Bounds;
                 foreach (var screen in Screen.AllScreens) {
-                    if (!screen.Primary && screen.Bounds.Width == 2420 && screen.Bounds.Height == 1668) {
+                    if (!screen.Primary && !initialScreens.Contains(screen.DeviceName)) {
                         target = screen.Bounds;
                         break;
                     }
