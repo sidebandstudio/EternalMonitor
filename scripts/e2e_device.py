@@ -52,6 +52,8 @@ def run_row(name, spec, out, args):
     codec = 'hevc' if spec.get('hevc') else 'h264'
     host = ['ETERNAL_HEADLESS=1', 'ETERNAL_ENCODER=h264_nvenc', f'ETERNAL_HEVC={int(codec == "hevc")}',
             f'ETERNAL_FPS={fps}', 'ETERNAL_E2E_LOG=1', *spec.get('host', [])]
+    if os.environ.get('EM_HOST_RUST_LOG'):
+        host.append('RUST_LOG=' + os.environ['EM_HOST_RUST_LOG'])
     launch = {'EM_E2E_LOG': '1', 'OS_ACTIVITY_DT_MODE': 'YES'}
     if spec['link'] == 'udp':
         # The cable stays attached; keep the host's USB supervisor off it.

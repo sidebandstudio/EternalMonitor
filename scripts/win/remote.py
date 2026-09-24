@@ -67,7 +67,7 @@ def main(args):
         environment = {"APPDATA": ROOT + r"\state", "ETERNAL_HEADLESS": "1", "ETERNAL_FPS": "60"}
         for arg in args:
             key, sep, value = arg.partition("=")
-            if not sep or not re.fullmatch(r"ETERNAL_[A-Z0-9_]+", key):
+            if not sep or not (re.fullmatch(r"ETERNAL_[A-Z0-9_]+", key) or key == "RUST_LOG"):
                 raise ValueError("Host arguments must be ETERNAL_NAME=value")
             environment[key] = value
         pidfile = ROOT + r"\host.pid.json"
