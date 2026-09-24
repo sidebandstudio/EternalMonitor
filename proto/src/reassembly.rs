@@ -392,8 +392,7 @@ impl Reassembler {
                 {
                     let through = frame.header.frag_count - 1;
                     self.begin_gap(seq, through, now);
-                } else if !frame.retried && frame.retry_at.is_some_and(|retry| now >= retry)
-                {
+                } else if !frame.retried && frame.retry_at.is_some_and(|retry| now >= retry) {
                     let through = frame.header.frag_count - 1;
                     if let Some(frame) = self.pending.get_mut(&seq) {
                         frame.retried = true;
