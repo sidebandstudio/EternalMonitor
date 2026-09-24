@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root = 'D:\AgentWork\em-v030'
+$root = Split-Path -Parent $PSScriptRoot
 if (!(Test-Path "$root\input-probe.log")) { return }
 $record = Get-Content "$root\input-probe.log" -First 1 | ConvertFrom-Json
 if ($record.event -ne 'Ready') { throw 'No probe identity in its log' }

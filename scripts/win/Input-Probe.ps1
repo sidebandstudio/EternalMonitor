@@ -1,6 +1,7 @@
 param([int]$Seconds = 600, [switch]$FullScreen)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.Web.Extensions
+$root = Split-Path -Parent $PSScriptRoot
 $source = @'
 using System;
 using System.Collections.Generic;
@@ -22,7 +23,7 @@ public class EMInputProbe : Form {
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
     [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
-    readonly StreamWriter log = new StreamWriter(@"D:\AgentWork\em-v030\input-probe.log", false);
+    readonly StreamWriter log = new StreamWriter(@"__ROOT__\input-probe.log", false);
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     readonly Timer timer = new Timer();
     readonly Stopwatch clock = Stopwatch.StartNew();
@@ -64,8 +65,8 @@ public class EMInputProbe : Form {
         if (SetThreadExecutionState(0x80000003) == 0) throw new InvalidOperationException("Could not keep the probe awake");
         timer.Interval = 4;
         timer.Tick += delegate {
-            if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"D:\AgentWork\em-v030\probe.stop")) { Close(); return; }
-            if (File.Exists(@"D:\AgentWork\em-v030\probe.arm")) {
+            if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"__ROOT__\probe.stop")) { Close(); return; }
+            if (File.Exists(@"__ROOT__\probe.arm")) {
                 Activate(); bool focus = Focus(); bool foreground = SetForegroundWindow(Handle);
                 if (!armAttempted) {
                     uint pid;
@@ -90,7 +91,7 @@ public class EMInputProbe : Form {
                     }
                 }
                 if (GetForegroundWindow() == Handle && (!focusClickSent || focusClickComplete)) {
-                    File.Delete(@"D:\AgentWork\em-v030\probe.arm");
+                    File.Delete(@"__ROOT__\probe.arm");
                     Write("Armed", new Dictionary<string,object> { {"pid",Process.GetCurrentProcess().Id} });
                 }
             }
@@ -141,9 +142,9 @@ public class EMInputProbe : Form {
     }
 }
 '@
-Add-Type -TypeDefinition $source -ReferencedAssemblies System.Windows.Forms,System.Drawing,System.Web.Extensions
-Remove-Item 'D:\AgentWork\em-v030\probe.stop' -ErrorAction SilentlyContinue
-Remove-Item 'D:\AgentWork\em-v030\probe.arm' -ErrorAction SilentlyContinue
+Add-Type -TypeDefinition $source.Replace('__ROOT__', $root) -ReferencedAssemblies System.Windows.Forms,System.Drawing,System.Web.Extensions
+Remove-Item (Join-Path $root 'probe.stop') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $root 'probe.arm') -ErrorAction SilentlyContinue
 [Windows.Forms.Application]::EnableVisualStyles()
 $window = New-Object EMInputProbe $Seconds,([bool]$FullScreen)
 try { [Windows.Forms.Application]::Run($window) } finally { $window.Dispose() }

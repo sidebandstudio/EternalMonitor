@@ -6,7 +6,7 @@ param(
     [switch]$RequireIdle
 )
 $ErrorActionPreference = 'Stop'
-$root = 'D:\AgentWork\em-v030'
+$root = Split-Path -Parent $PSScriptRoot
 $users = (& query user 2>&1 | Out-String)
 Write-Output $users
 $console = [regex]::Match($users, '(?im)^\s*>?\s*(\S+)\s+console\s+(\d+)\s+Active\s+(\S+)')
@@ -23,9 +23,9 @@ $task = "EM-$id"
 New-Item -ItemType Directory -Force $job | Out-Null
 $template = @'
 $ErrorActionPreference = 'Stop'
-$env:TEMP = 'D:\AgentWork\temp'
+$env:TEMP = '__ROOT__\temp'
 $env:TMP = $env:TEMP
-Set-Location 'D:\AgentWork\em-v030'
+Set-Location '__ROOT__'
 $job = '__JOB__'
 $task = '__TASK__'
 $code = 0
@@ -71,7 +71,8 @@ __COMMAND__
 exit $code
 '@
 $requireIdleLiteral = if ($RequireIdle) { '$true' } else { '$false' }
-$script = $template.Replace('__JOB__',$job).Replace('__TASK__',$task).Replace('__COMMAND__',$Command).Replace('__SESSION_ID__',$console.Groups[2].Value).Replace('__REQUIRE_IDLE__',$requireIdleLiteral)
+New-Item -ItemType Directory -Force (Join-Path $root 'temp') | Out-Null
+$script = $template.Replace('__ROOT__',$root).Replace('__JOB__',$job).Replace('__TASK__',$task).Replace('__COMMAND__',$Command).Replace('__SESSION_ID__',$console.Groups[2].Value).Replace('__REQUIRE_IDLE__',$requireIdleLiteral)
 $script | Set-Content -Encoding UTF8 (Join-Path $job 'run.ps1')
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$job\run.ps1`""
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel $RunLevel

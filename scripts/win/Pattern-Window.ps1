@@ -1,6 +1,7 @@
 param([int]$Seconds = 600, [switch]$VirtualDisplay, [string]$DisplayName = '')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$root = Split-Path -Parent $PSScriptRoot
 $source = @'
 using System;
 using System.Diagnostics;
@@ -51,7 +52,7 @@ public class EMTestPattern : Form {
             throw new InvalidOperationException("Could not keep the test display awake");
         timer.Interval = 4;
         timer.Tick += delegate {
-            if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"D:\AgentWork\em-v030\pattern.stop")) { Close(); return; }
+            if (clock.Elapsed.TotalSeconds >= seconds || File.Exists(@"__ROOT__\pattern.stop")) { Close(); return; }
             if (this.virtualDisplay) {
                 Rectangle target = Screen.PrimaryScreen.Bounds;
                 foreach (var screen in Screen.AllScreens) {
@@ -89,8 +90,8 @@ public class EMTestPattern : Form {
     }
 }
 '@
-Add-Type -TypeDefinition $source -ReferencedAssemblies System.Windows.Forms,System.Drawing
-Remove-Item 'D:\AgentWork\em-v030\pattern.stop' -ErrorAction SilentlyContinue
+Add-Type -TypeDefinition $source.Replace('__ROOT__', $root) -ReferencedAssemblies System.Windows.Forms,System.Drawing
+Remove-Item (Join-Path $root 'pattern.stop') -ErrorAction SilentlyContinue
 # Match capture dimensions in physical pixels, including secondary screens
 # with a different scale from the primary monitor. PowerShell is system-aware.
 if ([EMTestPattern]::SetThreadDpiAwarenessContext([IntPtr](-4)) -eq [IntPtr]::Zero) {

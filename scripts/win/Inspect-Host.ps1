@@ -14,7 +14,7 @@ public static class EMHostWindow {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
 }
 '@
-$record = Get-Content 'D:\AgentWork\em-v030\host.pid.json' -Raw | ConvertFrom-Json
+$record = Get-Content (Join-Path (Split-Path -Parent $PSScriptRoot) 'host.pid.json') -Raw | ConvertFrom-Json
 $p = Get-Process -Id $record.id
 if ($p.Path -ne $record.path -or $p.StartTime.ToUniversalTime().Ticks.ToString() -ne $record.start) {
     throw 'The tracked host identity changed'

@@ -7,7 +7,8 @@ import re
 import subprocess
 import sys
 
-ROOT = r"D:\AgentWork\em-v030"
+# EM_WIN_ROOT moves the runner's files, e.g. off a failing data drive.
+ROOT = os.environ.get("EM_WIN_ROOT", r"D:\AgentWork\em-v030")
 REPO = r"D:\AgentWork\Eternal-Monitor"
 EVIDENCE = pathlib.Path(os.environ.get("EM_EVIDENCE_DIR", "/Users/aldo/Desktop/EternalMonitor-Handoff/evidence"))
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -59,7 +60,7 @@ def main(args):
     elif action == "sync" and len(args) == 1:
         ps("New-Item -ItemType Directory -Force " + quote(ROOT + r"\scripts") + " | Out-Null")
         sources = sorted(pathlib.Path(__file__).parent.glob("*.ps1"))
-        subprocess.run(["scp", *SSH_OPTIONS, *map(str, sources), "windows:D:/AgentWork/em-v030/scripts/"], check=True)
+        subprocess.run(["scp", *SSH_OPTIONS, *map(str, sources), "windows:" + ROOT.replace("\\", "/") + "/scripts/"], check=True)
         ps(script("Sync-Repo", "-Branch " + quote(args[0])))
     elif action == "build" and all(a == "--release" for a in args):
         ps(script("Build-Host", "-Test -Lint" + (" -Release" if args else "")))
@@ -90,9 +91,10 @@ def main(args):
         if os.environ.get("EM_INSTALLED_HOST") == "1":
             executable = os.environ.get("EM_INSTALLED_HOST_PATH", ROOT + r"\installed\EternalMonitor-host.exe")
         window_option = "-WindowStyle Hidden" if environment["ETERNAL_HEADLESS"] == "1" else "-NoNewWindow"
-        # Jobs keep TEMP on D: to spare C:. An installed host has the user's
-        # TEMP and its own folder as working directory, and its PowerShell
-        # VDD children inherit both, so launch the host the same way.
+        # Jobs keep TEMP in the runner root, D: by default, to spare C:. An
+        # installed host has the user's TEMP and its own folder as working
+        # directory, and its PowerShell VDD children inherit both, so launch
+        # the host the same way.
         command += "; $userTemp=[Environment]::GetEnvironmentVariable('TEMP','User')"
         command += "; if ($userTemp) { $env:TEMP=$userTemp; $env:TMP=$userTemp }"
         command += "; $p=Start-Process -PassThru " + window_option + " -FilePath " + quote(executable)

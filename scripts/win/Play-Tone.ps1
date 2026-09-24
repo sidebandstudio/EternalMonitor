@@ -21,7 +21,7 @@ public static class EMTone {
     }
 }
 '@
-$path = 'D:\AgentWork\em-v030\tone.wav'
+$path = Join-Path (Split-Path -Parent $PSScriptRoot) 'tone.wav'
 [EMTone]::Write($path, $Seconds, $Hz)
 $player = New-Object System.Media.SoundPlayer $path
 try { $player.PlaySync() } finally { $player.Dispose() }
