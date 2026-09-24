@@ -1,4 +1,5 @@
 pub mod abr;
+pub mod apple_usb;
 mod audio;
 pub mod fault;
 pub mod link;

@@ -49,6 +49,16 @@ impl AnalyzerApp {
 
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        if let Some((title, body)) = usb_cable_notice(
+            snap.usb_service_reachable,
+            snap.usb_cabled_devices,
+            snap.apple_devices_installed,
+        ) {
+            widgets::banner(ui, WARNING, Icon::Plug, title, body, 170.0, |ui| {
+                apple_devices_action(ui, snap.apple_devices_installed);
+            });
+            ui.add_space(GAP - 10.0);
+        }
         if snap.using_software_fallback {
             widgets::banner(
                 ui,
@@ -393,6 +403,8 @@ impl AnalyzerApp {
                 snap.usb_service_reachable,
                 snap.usb_devices,
                 &snap.usb_link_state,
+                snap.usb_cabled_devices,
+                snap.apple_devices_installed,
             );
             let usb_color = if usb.available { ACCENT } else { TEXT_MUTED };
             let (usb_text, usb_badge) = (usb.text, usb.badge);
@@ -405,17 +417,13 @@ impl AnalyzerApp {
                 if snap.usb_service_reachable {
                     110.0
                 } else {
-                    150.0
+                    170.0
                 },
                 |ui| {
                     if snap.usb_service_reachable {
                         widgets::badge(ui, usb_badge, usb_color);
                     } else {
-                        widgets::link(
-                            ui,
-                            "Get Apple Devices",
-                            "https://apps.microsoft.com/detail/9np83lwlpz9k",
-                        );
+                        apple_devices_action(ui, snap.apple_devices_installed);
                     }
                 },
             );
@@ -643,13 +651,62 @@ pub(super) struct UsbSummary {
     pub available: bool,
 }
 
-/// What the USB row says. The install hint appears only when Apple's device
-/// service cannot be reached.
-pub(super) fn usb_summary(reachable: bool, devices: usize, link_state: &str) -> UsbSummary {
+/// Opens Apple Devices when it is installed, otherwise links to its Store page.
+fn apple_devices_action(ui: &mut Ui, installed: bool) {
+    if installed {
+        if widgets::button(ui, Tone::Primary, None, "Open Apple Devices").clicked() {
+            crate::transport::apple_usb::open_apple_devices();
+        }
+    } else {
+        widgets::link(
+            ui,
+            "Get Apple Devices",
+            crate::transport::apple_usb::APPLE_DEVICES_STORE_URL,
+        );
+    }
+}
+
+/// The Stream page notice for an iPad on the cable that Windows cannot reach
+/// because Apple Devices is not running or not installed.
+pub(super) fn usb_cable_notice(
+    reachable: bool,
+    cabled: usize,
+    installed: bool,
+) -> Option<(&'static str, &'static str)> {
+    if reachable || cabled == 0 {
+        return None;
+    }
+    Some(if installed {
+        (
+            "Your iPad is plugged in, but Apple Devices is not running",
+            "EternalMonitor reaches an iPad over the USB cable through Apple Devices. Open it and leave it running; it can stay minimized. WiFi works without it.",
+        )
+    } else {
+        (
+            "Your iPad is plugged in, but Apple Devices is not installed",
+            "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. WiFi works without it.",
+        )
+    })
+}
+
+/// What the USB row says. The Apple Devices hint appears only when Apple's
+/// device service cannot be reached.
+pub(super) fn usb_summary(
+    reachable: bool,
+    devices: usize,
+    link_state: &str,
+    cabled: usize,
+    installed: bool,
+) -> UsbSummary {
     if !reachable {
+        let text = match (cabled > 0, installed) {
+            (true, true) => "iPad plugged in. Open Apple Devices and keep it running to stream over the cable.",
+            (true, false) => "iPad plugged in, but Apple Devices is not installed. Get it from the Microsoft Store to use USB.",
+            (false, true) => "Open Apple Devices to use USB. It must stay running while you stream.",
+            (false, false) => "Install the Apple Devices app from the Microsoft Store to use USB.",
+        };
         return UsbSummary {
-            text: "Install the Apple Devices app from the Microsoft Store (or iTunes) to use USB."
-                .into(),
+            text: text.into(),
             badge: "Unavailable",
             available: false,
         };

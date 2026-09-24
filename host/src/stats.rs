@@ -46,6 +46,9 @@ pub struct PipelineStats {
     pub usb_service_reachable: bool,
     pub usb_devices: usize,
     pub usb_link_state: String,
+    /// iPads on the cable while Apple's device service is unreachable.
+    pub usb_cabled_devices: usize,
+    pub apple_devices_installed: bool,
     pub usb_frames_dropped: u64,
     pub target_addr: String,
     pub latency_ms: f64,
@@ -103,6 +106,8 @@ impl PipelineStats {
             usb_service_reachable: false,
             usb_devices: 0,
             usb_link_state: "Checking Apple device service".into(),
+            usb_cabled_devices: 0,
+            apple_devices_installed: false,
             usb_frames_dropped: 0,
             target_addr: String::new(),
             latency_ms: 0.0,

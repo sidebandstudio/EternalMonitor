@@ -9,8 +9,9 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use super::apple_usb::{self, AppleUsbState};
 use super::link::{FramedLink, Link, LinkId, PeerId, UdpLink};
 use super::usbmuxd::{self, BoxedTunnel, Client};
 use crate::stats::PIPELINE_STATS;
@@ -281,6 +282,7 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     let mut handles: HashMap<u32, AbortHandle> = HashMap::new();
     let mut poll = tokio::time::interval(Duration::from_secs(2));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut unreachable = AppleUsbState::default();
     loop {
         tokio::select! {
             _ = poll.tick() => {
@@ -288,10 +290,27 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
                 let available = devices.is_ok();
                 let devices = devices.unwrap_or_default();
                 let ids: HashSet<_> = devices.iter().map(|device| device.device_id).collect();
+                // Without the service the cable is invisible to us; ask
+                // Windows whether an iPad is attached so the GUI can say why.
+                let cabled = if available {
+                    AppleUsbState::default()
+                } else {
+                    tokio::task::spawn_blocking(apple_usb::probe).await.unwrap_or_default()
+                };
+                if cabled != unreachable && cabled.cabled_devices > 0 {
+                    if cabled.apple_devices_installed {
+                        warn!("An iPad is plugged in over USB, but Apple Devices is not running. Open Apple Devices to stream over the cable");
+                    } else {
+                        warn!("An iPad is plugged in over USB, but Apple Devices is not installed. Get it from the Microsoft Store to stream over the cable");
+                    }
+                }
+                unreachable = cabled;
                 {
                     let mut stats = PIPELINE_STATS.lock();
                     stats.usb_service_reachable = available;
                     stats.usb_devices = devices.len();
+                    stats.usb_cabled_devices = cabled.cabled_devices;
+                    stats.apple_devices_installed = cabled.apple_devices_installed;
                     if !available { stats.usb_link_state = "Apple device service unavailable".into(); }
                     else if devices.is_empty() { stats.usb_link_state = "Waiting for an iPad".into(); }
                     else if stats.usb_link_state != "Connected" { stats.usb_link_state = "Waiting for the iPad app".into(); }
