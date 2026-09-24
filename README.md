@@ -69,10 +69,11 @@ SHA-256 before approving a SmartScreen exception. Older installers can still
 require a separate firewall prompt.
 
 For WiFi, use a trusted local network; wired Ethernet for the PC helps.
-For USB, install Apple Devices or desktop iTunes if the host's USB card asks,
-use a data cable and accept Trust This Computer on the iPad. The service must
-expose usbmuxd at 127.0.0.1:27015; the actual cable/service combination remains
-part of the physical-device gate. Pairing controls access but does not encrypt
+For USB, install the Apple Devices app from the Microsoft Store and keep it
+open while you stream; Windows reaches the iPad through it. Use a data cable
+and accept Trust This Computer on the iPad. When an iPad is plugged in and
+Apple Devices is closed or missing, the host says so and offers to open it or
+links to the Store. Pairing controls access but does not encrypt
 the stream. The iPad app requires iPadOS 17 or later.
 
 Follow [QUICKSTART.txt](scripts/QUICKSTART.txt). TestFlight setup and the signing

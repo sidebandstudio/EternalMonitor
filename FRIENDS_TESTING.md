@@ -172,13 +172,14 @@ Use `HARDWARE_VERIFICATION.md` for the complete checklist and expected results.
 
 ## USB tester setup
 
-Install Apple Devices or desktop iTunes when the host asks for Apple's service.
-Use a data cable, unlock the iPad and accept Trust This Computer. Keep the app
-open. On Windows, the service must listen at 127.0.0.1:27015 and expose the device;
-the app listens on iPad loopback port 9877. Do not open that iPad port to the LAN.
-If Apple Devices does not expose the service, record the observation and try the
-desktop iTunes package. The reference-PC package/cable combination is still an
-open device gate.
+Install the Apple Devices app from the Microsoft Store and keep it open while
+streaming; its device service runs only while the app runs. Use a data cable,
+unlock the iPad and accept Trust This Computer. Keep the EternalMonitor app
+open. The host shows a notice when an iPad is plugged in and Apple Devices is
+closed or missing. On Windows the service listens at 127.0.0.1:27015; the app
+listens on iPad loopback port 9877. Do not open that iPad port to the LAN. If
+the iPad does not appear after Apple Devices opens, unplug and replug the
+cable, and record the host's USB card text.
 
 ## GPU coverage
 
