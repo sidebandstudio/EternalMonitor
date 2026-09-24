@@ -7,11 +7,15 @@ Windows soak and physical iPad verification are still pending. No RC is publishe
 ### What changed
 
 - Lost video fragments can be requested again within a bounded repair window.
-  The quality popover reports repaired fragments, dropped frames and jitter.
+  The window follows real WiFi timing: it waits for late and reordered packets
+  instead of discarding their frames. The quality popover reports repaired
+  fragments, dropped frames and jitter.
 - A USB connection uses Apple's device service on Windows and the same negotiated
   session as WiFi. The app can take over when a cable connects and reconnect to
-  WiFi when it disconnects. Install Apple Devices or desktop iTunes if prompted
-  by the host's USB card, then accept Trust This Computer on the iPad.
+  WiFi when it disconnects. USB needs Apple's Apple Devices app from the
+  Microsoft Store, open while you stream. When an iPad is plugged in and Apple
+  Devices is closed or missing, the host says so and offers to open it or links
+  to the Store. Accept Trust This Computer on the iPad.
 - PC audio uses 48 kHz stereo Opus. The iPad's audio setting mutes playback without
   disconnecting video. Quiet packets are compact; Opus packet-loss concealment
   covers missing audio. This version does not provide Opus in-band FEC.
@@ -39,8 +43,9 @@ over USB-C for 643 seconds while charging. First-install trust, timed takeover a
 WiFi fallback still need the physical iPad pass. Pairing controls access but does
 not encrypt video, audio or input, so use a trusted local network.
 
-Known issue under investigation: on the reference PC (NVIDIA driver 591.86),
-Windows stopped with an NVIDIA kernel error about two seconds after a USB
-connection switched a running mirror session to the extended display. Earlier
-extended-display sessions on the same build and driver worked. It must be
-understood before a release candidate is published.
+Known issue: on the reference PC (NVIDIA driver 591.86), Windows once stopped
+with an NVIDIA kernel error about two seconds after a USB connection switched a
+running mirror session to the extended display. A bounded retest of the same
+build and driver repeated that switch five times, and later runs repeated it
+again, without a crash. The driver fault is not understood. If it happens,
+report the GPU driver version and the time.
