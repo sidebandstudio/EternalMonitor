@@ -206,14 +206,30 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(keyframes, 0)
     }
 
-    func testMoreThanSixtyFourMissingFragmentsRequestsOneKeyframe() {
+    func testWideGapIsRequestedInNacksOfAtMostSixtyFour() {
         enableRepair()
         add(seq: 1, index: 65, count: 66, byte: 1)
-        XCTAssertTrue(nacks.isEmpty)
-        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(nacks.map(\.missing), [Array(0..<64), [64]])
+        XCTAssertTrue(nacks.allSatisfy(\.isValid))
+        XCTAssertEqual(keyframes, 0)
         assembler.tick(at: 125_000)
         XCTAssertEqual(keyframes, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.fragsLost }, 65)
+    }
+
+    func testLateFragmentsCompleteAWideGapWithoutAKeyframe() {
+        // A 40 Mbps frame is 72 fragments; WiFi held all but the first for
+        // longer than a frame period, then delivered them.
+        enableRepair()
+        add(seq: 1, index: 0, count: 72, byte: 0)
+        now = 17_000
+        assembler.tick()
+        XCTAssertEqual(nacks.map(\.missing), [Array(1...64), Array(65...71)])
+        now = 20_000
+        for index in UInt16(1)...71 { add(seq: 1, index: index, count: 72, byte: UInt8(index)) }
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
     }
 
     func testRepairDeadlineUsesRTTAndFramePeriodWithEightMillisecondFloor() {

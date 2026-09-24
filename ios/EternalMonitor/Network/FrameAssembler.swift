@@ -122,7 +122,6 @@ final class FrameAssembler {
         /// missing and at most once more by the frame's single retry.
         var requested = Set<UInt16>()
         var retried = false
-        var abandoned = false
         var keyframeRequested = false
 
         var isComplete: Bool {
@@ -310,7 +309,7 @@ final class FrameAssembler {
                     }
                 } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
                     beginGap(seq, through: frame.fragmentCount - 1, now: now)
-                } else if let retry = frame.retryAt, now >= retry, !frame.retried, !frame.abandoned {
+                } else if let retry = frame.retryAt, now >= retry, !frame.retried {
                     pending[seq]?.retried = true
                     request(seq, through: frame.fragmentCount - 1, again: true, now: now)
                 }
@@ -366,22 +365,22 @@ final class FrameAssembler {
         request(seq, through: index, again: false, now: now)
     }
 
+    /// A NACK names at most 64 fragments, so a wider gap takes several. A
+    /// large frame whose fragments are only late is still repaired or
+    /// completed; a keyframe is requested only once a frame is dropped.
     private func request(_ seq: UInt32, through index: UInt16, again: Bool, now: UInt64) {
-        guard let frame = pending[seq], !frame.abandoned, frame.contiguous <= index else { return }
+        guard let frame = pending[seq], frame.contiguous <= index else { return }
         let missing = (frame.contiguous...index).filter {
             frame.fragments[$0] == nil && (again || !frame.requested.contains($0))
         }
         guard !missing.isEmpty else { return }
-        if missing.count > 64 {
-            pending[seq]?.abandoned = true
-            requestKeyframe(seq)
-            return
-        }
         pending[seq]?.requested.formUnion(missing)
         if pending[seq]?.requestedAt == nil { pending[seq]?.requestedAt = now }
-        counters.withLock { $0.nacksSent += 1 }
-        onNack?(Nack(streamEpoch: currentEpoch ?? 0, frameSeq: seq,
-                     fragCount: frame.fragmentCount, missing: missing))
+        for start in stride(from: 0, to: missing.count, by: 64) {
+            counters.withLock { $0.nacksSent += 1 }
+            onNack?(Nack(streamEpoch: currentEpoch ?? 0, frameSeq: seq, fragCount: frame.fragmentCount,
+                         missing: Array(missing[start..<min(start + 64, missing.count)])))
+        }
     }
 
     private func requestKeyframe(_ seq: UInt32) {

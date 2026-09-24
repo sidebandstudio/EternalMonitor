@@ -73,7 +73,6 @@ struct PendingFrame {
     /// and at most once more by the frame's single retry.
     requested: HashSet<u16>,
     retried: bool,
-    abandoned: bool,
     keyframe_requested: bool,
 }
 
@@ -308,7 +307,6 @@ impl Reassembler {
             stall_counted_until: None,
             requested: HashSet::new(),
             retried: false,
-            abandoned: false,
             keyframe_requested: false,
         });
         frame.fragments.insert(index, payload.to_vec());
@@ -394,9 +392,7 @@ impl Reassembler {
                 {
                     let through = frame.header.frag_count - 1;
                     self.begin_gap(seq, through, now);
-                } else if !frame.retried
-                    && !frame.abandoned
-                    && frame.retry_at.is_some_and(|retry| now >= retry)
+                } else if !frame.retried && frame.retry_at.is_some_and(|retry| now >= retry)
                 {
                     let through = frame.header.frag_count - 1;
                     if let Some(frame) = self.pending.get_mut(&seq) {
@@ -480,7 +476,7 @@ impl Reassembler {
         let Some(frame) = self.pending.get_mut(&seq) else {
             return;
         };
-        if frame.abandoned || frame.contiguous > through {
+        if frame.contiguous > through {
             return;
         }
         let missing: Vec<_> = (frame.contiguous..=through)
@@ -489,20 +485,18 @@ impl Reassembler {
         if missing.is_empty() {
             return;
         }
-        if missing.len() > 64 {
-            frame.abandoned = true;
-            self.request_keyframe(seq);
-            return;
-        }
         frame.requested.extend(&missing);
         frame.requested_at.get_or_insert(now);
-        self.counters.nacks_sent += 1;
-        self.nacks.push_back(Nack {
-            stream_epoch: self.current_epoch.unwrap_or(0),
-            frame_seq: seq,
-            frag_count: frame.header.frag_count,
-            missing,
-        });
+        let frag_count = frame.header.frag_count;
+        for chunk in missing.chunks(64) {
+            self.counters.nacks_sent += 1;
+            self.nacks.push_back(Nack {
+                stream_epoch: self.current_epoch.unwrap_or(0),
+                frame_seq: seq,
+                frag_count,
+                missing: chunk.to_vec(),
+            });
+        }
     }
 
     fn request_keyframe(&mut self, seq: u32) {
