@@ -16,7 +16,20 @@ installer and the extended-display option won't appear.
 ## Getting a tester onto the iPad app (TestFlight)
 
 A tester needs no Xcode and no developer account. They need the TestFlight
-app from the App Store and a link from you.
+app from the App Store and the public invite:
+https://testflight.apple.com/join/ppc9QfXc
+
+### Current setup
+
+The App Store Connect app and CI signing credentials are already configured
+for `sidebandstudio/EternalMonitor`. iPad v0.3.0, build 143, was uploaded and
+submitted for external beta review on September 25, 2026. It belongs to the
+`FriendsExternal` group, whose public link and automatic tester notification
+are enabled. The feedback and review contact email is `Whois.younes@gmail.com`.
+
+External installation opens after Apple approves the build. Pair it with the
+[current stable Windows release](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0).
+The setup instructions below are for maintaining or replacing that configuration.
 
 ### Automated archive and upload
 

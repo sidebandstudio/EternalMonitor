@@ -1,9 +1,8 @@
-EternalMonitor v0.3.0 candidate - Quick Start
-============================================
+EternalMonitor v0.3.0 - Quick Start
+=================================
 Use your iPad as a second display for a Windows PC, over WiFi or USB.
-You need matching Windows and iPad builds. The candidate is still being
-verified; use the installer and TestFlight invite supplied together.
-The latest older public installer does not include every feature below.
+v0.3.0 is the current stable Windows release. Use it with iPad v0.3.0,
+TestFlight build 143. Download both from https://eternalmonitor.dev/download.html.
 Step-by-step guide with every screen explained:
 https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
 
@@ -18,15 +17,17 @@ What you need
 
 1. Install the matching build
 ----------------------------
-Download EternalMonitor-Setup.exe from the project's release page and
+Download EternalMonitor-Setup.exe from
+https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0 and
 check its published SHA-256. The unsigned installer may show SmartScreen;
 use More info > Run anyway only for the build you intended to install.
 Approve the installer UAC prompt. It installs the host, virtual display
 and its tasks, plus TCP/UDP firewall rules. Start EternalMonitor.
 
-Install Apple's TestFlight app, then open the supplied invite link for the
-matching EternalMonitor build. TestFlight invite: ask Ali if no link was
-supplied. An unsigned developer archive is not a TestFlight install.
+Install Apple's TestFlight app, then open the EternalMonitor invite:
+https://testflight.apple.com/join/ppc9QfXc
+Install v0.3.0, build 143. External installation opens after Apple approves
+the build; the download page above shows its availability.
 
 2. Connect and pair over WiFi
 ----------------------------
@@ -99,7 +100,7 @@ explicitly testing the BGRA option.
 Connection troubleshooting
 --------------------------
 - Try the host's LAN IP instead of discovery; keep its window open.
-- Confirm both builds came from the same candidate.
+- Confirm both apps are v0.3.0 and the iPad build is 143.
 - The v0.3 installer configures Windows Firewall. If a security product or
   an older installation blocks it, allow the host in Windows Security >
   Firewall & network protection > Allow an app through firewall.
