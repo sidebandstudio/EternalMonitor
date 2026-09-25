@@ -41,7 +41,7 @@ new dump. The fault is not understood; NVIDIA 617.14 is staged on the PC but was
 not installed. Evidence: `crash-retest-0975ad8/`.
 
 **WiFi repair.** The physical iPad showed reordering, stalls and a late repair
-path on real WiFi; the fixes are recorded in DECISIONS.md ("Let the repair
+path on real WiFi; the fixes are recorded in `docs/decisions.md` ("Let the repair
 window follow real WiFi timing"). Over Tailscale the 40 Mbps burst row also
 exposed a keyframe request for any frame with more than 64 missing fragments;
 13 of 15 such frames later completed (`diag-burst-abandon/`). The loss rows
@@ -217,7 +217,7 @@ with each failure; include a short screen recording when timing or feel matters.
 
 | Check | Expected result | Collect if it fails |
 | --- | --- | --- |
-| TestFlight installation | Install from the external invite/public link. App and installed host show the same marketing version. Connect on the first attempt after pairing. | Invite/build number, install/review error, both versions; setup is in `FRIENDS_TESTING.md` |
+| TestFlight installation | Install from the external invite/public link. App and installed host show the same marketing version. Connect on the first attempt after pairing. | Invite/build number, install/review error, both versions; setup is in `docs/beta-testing.md` |
 | H.264 hardware decoding | With HEVC off, diagnostics say hardware decoder; video is stable near the selected rate | App diagnostics, host encoder line, iPad model |
 | HEVC hardware decoding | Explicitly enable HEVC; diagnostics and host both report HEVC and hardware decoding | Both codec lines and the first session/decoder error |
 | LAN discovery | On the same 10.0.0.x LAN, Scan finds the PC and stays stable for four minutes; quitting the host removes it promptly | Both LAN addresses, firewall profile, scan recording and host mDNS log |

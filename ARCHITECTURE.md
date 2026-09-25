@@ -1,8 +1,7 @@
 # EternalMonitor architecture
 
-The v0.3.0 candidate keeps protocol v2. Implementation details below describe the
-candidate branches; release and hardware gate status lives in
-[HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md).
+v0.3.0 keeps protocol v2. Release and hardware gate status lives in
+[docs/hardware-verification.md](docs/hardware-verification.md).
 
 ## Video and session pipeline
 
