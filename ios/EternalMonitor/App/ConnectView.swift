@@ -18,6 +18,9 @@ struct ConnectView: View {
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // Flipped on appear; the header and cards rise in one after another.
+    @State private var appeared = false
 
     private enum Field: Hashable {
         case host, port
@@ -53,9 +56,11 @@ struct ConnectView: View {
                             header
                                 .padding(.top, 24)
                                 .padding(.bottom, 8)
+                                .entrance(appeared)
 
                             if !didSeeOnboarding {
                                 onboardingCard
+                                    .entrance(appeared, delay: 0.08)
                             }
 
                             if let error = connectionManager.connectionError {
@@ -64,11 +69,15 @@ struct ConnectView: View {
 
                             if isConnecting {
                                 connectingCard
+                                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
                             } else {
                                 connectCard
+                                    .entrance(appeared, delay: 0.14)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
                             }
 
                             usbCard
+                                .entrance(appeared, delay: 0.2)
 
                             if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
                                 scanEmptyState
@@ -80,6 +89,7 @@ struct ConnectView: View {
 
                             if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
                                 recentSection
+                                    .entrance(appeared, delay: 0.26)
                             }
 
                             if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
@@ -126,6 +136,7 @@ struct ConnectView: View {
                 )
             }
             .onAppear {
+                appeared = true
                 #if DEBUG
                 if UIPreview.opensSettings { showSettings = true }
                 #endif
@@ -148,6 +159,8 @@ struct ConnectView: View {
     private var header: some View {
         VStack(spacing: 14) {
             LogoMark(size: 68)
+                .scaleEffect(appeared || reduceMotion ? 1 : 0.9)
+                .animation(reduceMotion ? nil : Motion.gentle, value: appeared)
             VStack(spacing: 6) {
                 Text("EternalMonitor")
                     .font(.app(30, .semibold, relativeTo: .largeTitle))
@@ -337,6 +350,7 @@ struct ConnectView: View {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(focusedField == field ? Theme.accent : Theme.borderStrong, lineWidth: focusedField == field ? 1.5 : 1)
                 )
+                .animation(Motion.fade, value: focusedField == field)
                 .keyboardType(keyboard)
                 .textContentType(.none)
                 .textInputAutocapitalization(.never)
@@ -361,9 +375,7 @@ struct ConnectView: View {
     private var connectingCard: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 14) {
-                ProgressView()
-                    .tint(Theme.accent)
-                    .controlSize(.regular)
+                PulseRings(size: 44)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Connecting…")
                         .font(.app(18, .semibold, relativeTo: .headline))
@@ -395,6 +407,7 @@ struct ConnectView: View {
             Image(systemName: "cable.connector")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(settings.allowUSB ? Theme.accent : Theme.textFaint)
+                .animation(Motion.fade, value: settings.allowUSB)
                 .frame(width: 40, height: 40)
                 .background(
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -474,9 +487,10 @@ struct ConnectView: View {
                             paired: false
                         )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(RowButtonStyle())
                 }
             }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .card(padding: 0)
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -506,9 +520,10 @@ struct ConnectView: View {
                             paired: conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port)
                         )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(RowButtonStyle())
                 }
             }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .card(padding: 0)
         }
         .opacity(isConnecting ? 0.5 : 1)

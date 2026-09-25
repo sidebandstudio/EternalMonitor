@@ -39,7 +39,7 @@ struct DisplayView: View {
 
             if connectionManager.signalLost {
                 reconnectingCard
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .allowsHitTesting(false)
             }
 
@@ -182,6 +182,7 @@ struct DisplayView: View {
             }
         }
         .frame(height: 14)
+        .animation(Motion.fade, value: bars)
     }
 
     private var qualityPopover: some View {
@@ -242,6 +243,9 @@ struct DisplayView: View {
                 .font(.appMono(14, medium: true, relativeTo: .footnote))
                 .foregroundStyle(Theme.text)
                 .monospacedDigit()
+                // Digits roll to the new value instead of snapping.
+                .contentTransition(.numericText())
+                .animation(Motion.fade, value: value)
             Text(unit)
                 .font(.app(11, relativeTo: .caption2))
                 .foregroundStyle(Theme.textMuted)
@@ -261,7 +265,7 @@ struct DisplayView: View {
     private var bottomBar: some View {
         HStack(spacing: 8) {
             HStack(spacing: 10) {
-                StatusDot(color: connectionManager.signalLost ? Theme.warning : Theme.accent, size: 8)
+                StatusDot(color: connectionManager.signalLost ? Theme.warning : Theme.accent, size: 8, pulses: !connectionManager.signalLost)
                 Text(connectionManager.signalLost ? "Reconnecting" : "Live")
                     .font(.app(14, .semibold, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
@@ -289,6 +293,7 @@ struct DisplayView: View {
                     foreground: showKeyboard ? Theme.onAccent : Theme.text,
                     fill: showKeyboard ? Theme.accent : Color.white.opacity(0.08)
                 ))
+                .animation(Motion.fade, value: showKeyboard)
                 .accessibilityIdentifier("display.keyboard")
             }
 
@@ -328,9 +333,7 @@ struct DisplayView: View {
 
     private var reconnectingCard: some View {
         VStack(spacing: 12) {
-            ProgressView()
-                .tint(Theme.text)
-                .controlSize(.large)
+            PulseRings(color: Theme.warning, size: 56)
             Text("Reconnecting to your PC")
                 .font(.app(18, .semibold, relativeTo: .headline))
                 .foregroundStyle(Theme.text)
@@ -370,7 +373,7 @@ struct DisplayView: View {
 
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
-        withAnimation(.easeOut(duration: 0.25)) { showHUD = true }
+        withAnimation(Motion.gentle) { showHUD = true }
         guard !showKeyboard && !showSettings && !connectionManager.signalLost else { return }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))

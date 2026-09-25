@@ -675,6 +675,11 @@ impl eframe::App for AnalyzerApp {
                                 bottom: 36,
                             })
                             .show(ui, |ui| {
+                                // Each page fades and settles in when opened.
+                                let shown =
+                                    widgets::appear(ui, egui::Id::new(("page", self.page)), 0.22);
+                                ui.add_space((1.0 - shown) * 10.0);
+                                ui.set_opacity(shown);
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
                                 match self.page {
@@ -710,9 +715,26 @@ impl AnalyzerApp {
                 self.draw_brand(ui);
                 ui.add_space(26.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
-                self.nav_item(ui, Page::Stream, Icon::Display, "Stream");
-                self.nav_item(ui, Page::Performance, Icon::Activity, "Performance");
-                self.nav_item(ui, Page::Settings, Icon::Sliders, "Settings");
+                let stream = self.nav_item(ui, Page::Stream, Icon::Display, "Stream");
+                let performance =
+                    self.nav_item(ui, Page::Performance, Icon::Activity, "Performance");
+                let settings = self.nav_item(ui, Page::Settings, Icon::Sliders, "Settings");
+                // A lime bar marks the open page and slides to the one clicked.
+                let active = match self.page {
+                    Page::Stream => stream,
+                    Page::Performance => performance,
+                    Page::Settings => settings,
+                };
+                let y = ui.ctx().animate_value_with_time(
+                    egui::Id::new("nav-active-bar"),
+                    active.center().y,
+                    0.18,
+                );
+                ui.painter().rect_filled(
+                    Rect::from_center_size(pos2(active.left() + 2.5, y), vec2(3.0, 16.0)),
+                    1.5,
+                    ACCENT,
+                );
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
@@ -749,27 +771,34 @@ impl AnalyzerApp {
         });
     }
 
-    fn nav_item(&mut self, ui: &mut egui::Ui, page: Page, icon: Icon, label: &str) {
-        let active = self.page == page;
+    /// One sidebar entry. Returns its rectangle for the active-page bar.
+    fn nav_item(&mut self, ui: &mut egui::Ui, page: Page, icon: Icon, label: &str) -> Rect {
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
         if response.clicked() {
             self.page = page;
         }
-        let hovered = response.hovered();
+        let active = self.page == page;
+        // Hover and selection fade in and out instead of switching.
+        let hover = ui.ctx().animate_bool_with_time(
+            response.id.with("hover"),
+            response.hovered() && !active,
+            0.12,
+        );
+        let selected = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("active"), active, 0.18);
         let painter = ui.painter();
-        if active {
-            painter.rect(
-                rect,
-                8.0,
-                SURFACE_RAISED,
-                Stroke::new(1.0, BORDER),
-                StrokeKind::Inside,
-            );
-        } else if hovered {
-            painter.rect_filled(rect, 8.0, SURFACE);
-        }
+        painter.rect(
+            rect,
+            8.0,
+            SIDEBAR
+                .lerp_to_gamma(SURFACE, hover)
+                .lerp_to_gamma(SURFACE_RAISED, selected),
+            Stroke::new(1.0, BORDER.gamma_multiply(selected)),
+            StrokeKind::Inside,
+        );
         if response.has_focus() {
             painter.rect_stroke(
                 rect.expand(2.0),
@@ -778,27 +807,23 @@ impl AnalyzerApp {
                 StrokeKind::Outside,
             );
         }
-        let icon_color = if active {
-            ACCENT
-        } else if hovered {
-            TEXT_MUTED
-        } else {
-            TEXT_FAINT
-        };
         icons::paint(
             painter,
             Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(16.0, 16.0)),
             icon,
-            icon_color,
+            TEXT_FAINT
+                .lerp_to_gamma(TEXT_MUTED, hover)
+                .lerp_to_gamma(ACCENT, selected),
         );
         painter.text(
             pos2(rect.left() + 38.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::new(13.5, medium()),
-            if active || hovered { TEXT } else { TEXT_MUTED },
+            TEXT_MUTED.lerp_to_gamma(TEXT, hover.max(selected)),
         );
         response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        rect
     }
 }
 

@@ -44,6 +44,26 @@ under the SIL Open Font License 1.1.
 - iPad: `ios/EternalMonitor/App/DesignSystem.swift`.
 - Website: `docs/style.css`.
 
+## Motion
+
+Movement explains state; it never decorates. Everything settles in well under
+half a second, continuous effects run only while something is live or waiting,
+and every surface honours the system's reduce-motion setting.
+
+- Website: `docs/style.css` keeps the keyframes and the `.reveal` /
+  `.reveal-stagger` scroll reveals; `docs/script.js` adds `.visible`, the nav
+  scroll state and the card spotlight. The hero and showcase enter on load.
+  Nothing is hidden without JavaScript (`html.no-js`).
+- iPad: `Motion` in `ios/EternalMonitor/App/DesignSystem.swift` holds the shared
+  springs. `entrance(_:delay:)` staggers the connect screen, `PulseRings` waits
+  for a PC, `StatusDot(pulses:)` breathes while live, `Shake` rejects a wrong
+  pairing code, and the HUD numbers roll with `contentTransition(.numericText())`.
+- Windows: `widgets::appear` in `host/src/gui/widgets.rs` fades and settles
+  pages and notices in; hover, the sidebar's active bar, the segmented pill and
+  the slider knob interpolate with egui's `animate_bool` / `animate_value`. The
+  window still repaints only while something animates, so the encoder keeps the
+  GPU.
+
 ## Writing
 
 Sentence case everywhere. Say what happens and what to do next, in plain

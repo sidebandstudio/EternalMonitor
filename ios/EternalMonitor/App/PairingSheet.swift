@@ -5,6 +5,10 @@ struct PairingSheet: View {
     let submit: () -> Void
     let cancel: () -> Void
     @FocusState private var focused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appeared = false
+    // Counts wrong codes; each one shakes the field once.
+    @State private var shakes: CGFloat = 0
 
     var body: some View {
         NavigationStack {
@@ -18,6 +22,9 @@ struct PairingSheet: View {
                             RoundedRectangle(cornerRadius: 18, style: .continuous)
                                 .fill(Theme.accent.opacity(0.1))
                         )
+                        .scaleEffect(appeared || reduceMotion ? 1 : 0.8)
+                        .opacity(appeared ? 1 : 0)
+                        .animation(reduceMotion ? nil : Motion.gentle, value: appeared)
                         .accessibilityHidden(true)
 
                     VStack(spacing: 8) {
@@ -48,6 +55,9 @@ struct PairingSheet: View {
                             RoundedRectangle(cornerRadius: 16, style: .continuous)
                                 .strokeBorder(model.error == nil ? (focused ? Theme.accent : Theme.borderStrong) : Theme.danger, lineWidth: 1.5)
                         )
+                        .animation(Motion.fade, value: model.error == nil)
+                        .animation(Motion.fade, value: focused)
+                        .modifier(Shake(animatableData: shakes))
                         .focused($focused)
                         .onChange(of: model.code) { _, code in
                             // Digits only, at most six.
@@ -68,6 +78,7 @@ struct PairingSheet: View {
                         .font(.app(14, relativeTo: .callout))
                         .foregroundStyle(Theme.danger)
                         .frame(maxWidth: 360)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                     }
 
                     TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -96,6 +107,12 @@ struct PairingSheet: View {
                 .padding(.top, 28)
                 .padding(.bottom, 24)
                 .frame(maxWidth: .infinity)
+                .animation(Motion.fade, value: model.error)
+                .onChange(of: model.error) { _, error in
+                    if error != nil && !reduceMotion {
+                        withAnimation(.easeInOut(duration: 0.45)) { shakes += 1 }
+                    }
+                }
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationTitle("Pair with PC")
@@ -109,7 +126,10 @@ struct PairingSheet: View {
             }
             .tint(Theme.accent)
             .accessibilityIdentifier("pairing.sheet")
-            .onAppear { focused = true }
+            .onAppear {
+                focused = true
+                appeared = true
+            }
         }
         .presentationBackground(Theme.canvas)
     }

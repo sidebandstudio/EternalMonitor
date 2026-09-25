@@ -30,3 +30,6 @@ __pycache__/
 # Keep only accepted GUI references. CI uploads comparison images separately.
 **/tests/snapshots/**/*.diff.png
 **/tests/snapshots/**/*.new.png
+
+# /brag launch-video runs (rendered locally, never committed)
+/brag-output*/
