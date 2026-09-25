@@ -257,4 +257,4 @@ including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual
 and FFmpeg.
 
 Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)). Questions go to
-[aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com).
+[aldo@sideband.studio](mailto:aldo@sideband.studio).

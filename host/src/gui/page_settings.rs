@@ -315,7 +315,7 @@ impl AnalyzerApp {
                 ui.spacing_mut().item_spacing.x = 18.0;
                 widgets::link(ui, "github.com/whoisaldo", "https://github.com/whoisaldo");
                 widgets::link(ui, "Source code", "https://github.com/sidebandstudio/EternalMonitor");
-                widgets::link(ui, "aliyounes@eternalreverse.com", "mailto:aliyounes@eternalreverse.com");
+                widgets::link(ui, "aldo@sideband.studio", "mailto:aldo@sideband.studio");
             });
             ui.add_space(6.0);
             ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
