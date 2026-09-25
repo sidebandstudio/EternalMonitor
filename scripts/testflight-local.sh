@@ -86,7 +86,8 @@ PY
         security import "$TF_PRIVATE/distribution.p12" -P "$IOS_DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$TF_KEYCHAIN"
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TF_KEYCHAIN_PASSWORD" "$TF_KEYCHAIN" >/dev/null
         security list-keychains -d user -s "$TF_KEYCHAIN" "${TF_OLD_KEYCHAINS[@]}"
-        ARCHIVE_ARGS+=("CODE_SIGN_IDENTITY=Apple Distribution")
+        # Automatic archives use development signing. The imported distribution
+        # identity is selected during export, when the app is signed for upload.
     fi
 fi
 echo "Archiving EternalMonitor $VERSION build $BUILD, mode=$MODE"
