@@ -4,8 +4,8 @@
 
 # EternalMonitor
 
-**Your iPad as a second screen for Windows.**<br>
-Mirror or extend your desktop over Wi-Fi or USB, and control the PC with touch, a keyboard or Apple Pencil.
+Mirror or extend your Windows desktop onto an iPad over Wi-Fi or USB,<br>
+and control the PC with touch, a keyboard or Apple Pencil.
 
 [![Release](https://img.shields.io/github/v/release/whoisaldo/EternalMonitor?include_prereleases&label=release&labelColor=111&color=e8ff47)](https://github.com/whoisaldo/EternalMonitor/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/whoisaldo/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/actions/workflows/ci.yml)
@@ -29,6 +29,8 @@ the MIT license, and needs no account.
 
 ## Features
 
+<img src="docs/assets/ipad-app.webp" align="right" width="270" alt="The iPad app's connect screen with Connect, Scan QR code and Find PCs">
+
 - **Extend or mirror.** Add the iPad as an extra display beside your monitor, or
   mirror any screen you have. The extra display exists only while the iPad is
   connected, so Windows never keeps a phantom monitor around.
@@ -51,16 +53,7 @@ the MIT license, and needs no account.
 - **Pairing.** The first Wi-Fi connection asks for a six-digit code or a QR scan.
   After that the iPad remembers the PC. USB needs no code.
 
-<table>
-  <tr>
-    <td width="62%"><img src="docs/assets/host-app.webp" alt="The Windows app showing an iPad streaming over USB at 60 fps"></td>
-    <td><img src="docs/assets/ipad-app.webp" alt="The iPad app's connect screen with Scan QR code and Find PCs"></td>
-  </tr>
-  <tr>
-    <td align="center">The Windows app</td>
-    <td align="center">The iPad app</td>
-  </tr>
-</table>
+<br clear="right">
 
 ## Download
 
@@ -106,15 +99,19 @@ Known limits:
 ## How it works
 
 ```mermaid
-flowchart LR
-  subgraph pc["Windows PC"]
-    capture["Desktop capture (DXGI)"] --> encode["GPU encode (NVENC, AMF, QSV)"]
+flowchart RL
+  subgraph pc [Windows PC]
+    direction TB
+    capture[Desktop capture] --> encode[GPU encoder]
+    inject[Input injection]
   end
-  subgraph ipad["iPad"]
-    repair["Reassembly and loss repair"] --> decode["VideoToolbox decode"] --> draw["Metal"]
+  subgraph ipad [iPad]
+    direction TB
+    repair[Reassembly and repair] --> decode[VideoToolbox decode] --> show[Metal display]
+    touch[Touch, keyboard, Pencil]
   end
-  encode -- "video and audio over UDP or USB" --> repair
-  ipad -- "touch, keys, Pencil, repair requests" --> pc
+  pc -- "video and audio over Wi-Fi or USB" --> ipad
+  ipad -- "input and repair requests" --> pc
 ```
 
 The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
