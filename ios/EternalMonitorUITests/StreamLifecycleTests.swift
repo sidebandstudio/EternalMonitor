@@ -42,18 +42,21 @@ final class StreamLifecycleTests: XCTestCase {
 
     func testBackgroundResume() {
         let app = launch()
-        let before = readHostLog().count
-        XCUIDevice.shared.press(.home)
-        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
-        expectation(for: NSPredicate { _, _ in
-            self.readHostLog().dropFirst(before).contains("AppBackground")
-        }, evaluatedWith: nil)
-        waitForExpectations(timeout: 5)
-        print("E2E_LIFECYCLE_BACKGROUND bye=AppBackground")
-        let started = ProcessInfo.processInfo.systemUptime
-        app.activate()
-        waitForSignal("On air", app: app, timeout: 15)
-        print("E2E_LIFECYCLE_FOREGROUND elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
+        // Repeat in one process to cover task cleanup and the next assertion.
+        for cycle in 1...3 {
+            let before = readHostLog().count
+            XCUIDevice.shared.press(.home)
+            XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+            expectation(for: NSPredicate { _, _ in
+                self.readHostLog().dropFirst(before).contains("AppBackground")
+            }, evaluatedWith: nil)
+            waitForExpectations(timeout: 5)
+            print("E2E_LIFECYCLE_BACKGROUND bye=AppBackground cycle=\(cycle)")
+            let started = ProcessInfo.processInfo.systemUptime
+            app.activate()
+            waitForSignal("On air", app: app, timeout: 15)
+            print("E2E_LIFECYCLE_FOREGROUND elapsed=\(ProcessInfo.processInfo.systemUptime - started) cycle=\(cycle)")
+        }
         capture("background-resumed", app: app)
         disconnect(app)
     }

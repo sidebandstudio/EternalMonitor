@@ -23,6 +23,12 @@ SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
 [ ! -f "$TEST_ROOT/ios-tests-$STAMP.log" ] || cp "$TEST_ROOT/ios-tests-$STAMP.log" "$OUT/app.log"
 HOST_LOG="${EM_INPUT_HOST_LOG:-$ROOT/build/ios-ui-host-$STAMP.log}"
 [ ! -f "$HOST_LOG" ] || cp "$HOST_LOG" "$OUT/host.log"
+# Retain app-side lifecycle events before the next matrix row relaunches it.
+UDID="${EM_SIM_UDID:-06416ADB-C33D-4EE4-82DB-44FCD663362F}"
+CONTAINER=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data 2>/dev/null) || CONTAINER=""
+if [ -n "$CONTAINER" ] && [ -f "$CONTAINER/tmp/eternal-e2e.log" ]; then
+    cp "$CONTAINER/tmp/eternal-e2e.log" "$OUT/client.log"
+fi
 if [ -d "$RESULT" ]; then
     xcrun xcresulttool get test-results summary --path "$RESULT" --format json > "$OUT/tests.json" || status=1
 fi
@@ -52,8 +58,8 @@ app=(out/'app.log').read_text(errors='replace') if (out/'app.log').exists() else
 host=(out/'host.log').read_text(errors='replace') if (out/'host.log').exists() else ''
 host=re.sub(r'\x1b\[[0-9;]*m','',host)
 marker='E2E_LIFECYCLE_RESUMED' if reconnect else 'E2E_LIFECYCLE_FOREGROUND'
-match=re.search(marker+r' elapsed=([0-9.]+)',app)
-recovery=float(match[1]) if match else None
+recoveries=[float(value) for value in re.findall(marker+r' elapsed=([0-9.]+)',app)]
+recovery=max(recoveries) if recoveries else None
 if recovery is None or recovery>=15: errors.append('Recovery was not measured below fifteen seconds')
 if reconnect:
     events=[json.loads(line.split('E2E_LIFECYCLE ',1)[1]) for line in host.splitlines() if line.startswith('E2E_LIFECYCLE ')]
@@ -65,7 +71,7 @@ else:
     if 'Client said goodbye' not in host or 'reason=AppBackground' not in host:
         errors.append('The host did not receive the background BYE')
 report=dict(scenario=scenario,status='FAIL' if errors else 'PASS',elapsed=int(sys.argv[6]),
-    recovery_seconds=recovery,tests_passed=summary.get('passedTests',0),screenshot=str(out/(names[-1]+'.png')),errors=errors)
+    recovery_seconds=recovery,recovery_cycles=len(recoveries),tests_passed=summary.get('passedTests',0),screenshot=str(out/(names[-1]+'.png')),errors=errors)
 (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
 if errors: sys.exit('; '.join(errors))
 print(f'PASS: {scenario} recovered in {recovery:.2f} seconds')

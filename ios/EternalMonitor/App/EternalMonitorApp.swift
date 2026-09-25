@@ -33,8 +33,12 @@ struct EternalMonitorApp: App {
                 .onChange(of: settings.playPCaudio) { _, enabled in
                     connectionManager.refreshAudioPreference(enabled)
                 }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                    connectionManager.prepareForBackground()
+                }
         }
         .onChange(of: scenePhase) { _, phase in
+            E2E.emit("E2E_SCENE phase=\(phase) uptime=\(ProcessInfo.processInfo.systemUptime)")
             // A backgrounded app cannot keep receiving UDP; tell the host
             // goodbye so it stops streaming (and can tear the virtual display
             // down) instead of timing out on liveness. Coming back to the
