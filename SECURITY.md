@@ -9,7 +9,7 @@ releases are no longer maintained; please update both apps.
 
 Please report privately rather than in a public issue:
 
-- Use GitHub's [private vulnerability reporting](https://github.com/whoisaldo/EternalMonitor/security/advisories/new), or
+- Use GitHub's [private vulnerability reporting](https://github.com/sidebandstudio/EternalMonitor/security/advisories/new), or
 - email [aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com).
 
 Include the versions of both apps, what an attacker can do, and the steps to

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Setup help
-    url: https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md
+    url: https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
     about: Step-by-step setup, USB with Apple Devices, and fixes for common problems.
   - name: Report a security vulnerability
-    url: https://github.com/whoisaldo/EternalMonitor/security/advisories/new
+    url: https://github.com/sidebandstudio/EternalMonitor/security/advisories/new
     about: Please report security problems privately, not in a public issue.
