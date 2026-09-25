@@ -1,8 +1,8 @@
-# Friends Testing Guide (organizer notes)
+# Beta testing (organizer notes)
 
-Notes for coordinating a friends/beta test across mixed hardware. The tester-facing
-instructions live in `scripts/QUICKSTART.txt`; this file is for you, the person handing the
-build out.
+Notes for coordinating a beta test across mixed hardware. Testers follow
+`SETUP.md`, and the installer adds the shorter `scripts/QUICKSTART.txt` to the
+Start menu. This file is for you, the person handing the build out.
 
 ## Hand out the installer, not the zip
 
@@ -145,13 +145,13 @@ so its display task is registered.
 Hand out the Windows installer and iPad app from the same candidate, and record
 both versions and the TestFlight build number. v0.3.0-rc.1 passed the automated
 gates on the reference PC and a physical iPad on 2026-09-24; see
-`HARDWARE_VERIFICATION.md`. The checks there that need a person are what testers
+`docs/hardware-verification.md`. The checks there that need a person are what testers
 should focus on. Do not present an unsigned archive or older release as the
 finished v0.3 product. Point new testers to `SETUP.md`.
 
 ## What to test in v0.3
 
-Use `HARDWARE_VERIFICATION.md` for the complete checklist and expected results.
+Use `docs/hardware-verification.md` for the complete checklist and expected results.
 
 - Pair with a wrong code, then the correct code; reconnect from Keychain, scan
   the token QR, regenerate the token, and exercise the failed-code cooldown.

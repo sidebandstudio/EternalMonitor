@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest something EternalMonitor should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the situation, not the solution. For example, "I draw on the iPad and want to switch brushes without reaching for the keyboard."
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: Your idea for how it could work, if you have one.
+  - type: input
+    id: setup
+    attributes:
+      label: Your setup
+      description: Windows version, graphics card and iPad model, if it matters for this idea.

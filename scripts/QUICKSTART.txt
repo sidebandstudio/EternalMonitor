@@ -113,5 +113,5 @@ WiFi/USB, capture target, and what failed. Use Copy logs on the host's
 Performance page. Session logs also live at:
 %APPDATA%\EternalMonitor\logs\eternal-host-session.log
 Previous sessions are .1 and .2. Redact pairing tokens and QR codes before
-posting logs publicly. HARDWARE_VERIFICATION.md lists the remaining iPad
-checks and expected results.
+posting logs publicly. docs/hardware-verification.md in the repository lists
+the remaining iPad checks and expected results.

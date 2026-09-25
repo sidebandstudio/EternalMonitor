@@ -616,7 +616,7 @@ async fn execute_actions(
 
         // Tear the managed virtual display down when its viewer disappears —
         // the capture reconcile disables it on restart once no client is
-        // connected. (This closes the DECISIONS.md "idle-disconnect teardown"
+        // connected. (This closes the docs/decisions.md "idle-disconnect teardown"
         // item, which was blocked on exactly this liveness signal.)
         let vdd_in_use = *shared.capture_target.lock() == CaptureTarget::VirtualExtended
             && matches!(

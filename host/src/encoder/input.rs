@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum EncoderInput {
     Auto,
     Bgra,
-    // AMD BGRA is unsupported in the pinned SDK; see DECISIONS.md.
+    // AMD BGRA is unsupported in the pinned SDK; see docs/decisions.md.
     #[default]
     Yuv420,
 }

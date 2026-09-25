@@ -1,0 +1,81 @@
+name: Bug report
+description: Something doesn't work the way the setup guide describes.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing EternalMonitor. Please check the troubleshooting table in the
+        [setup guide](https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong) first.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead? Include any error message word for word.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect over USB
+        2. Choose Extended display (iPad) and click Restart now
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: pc-version
+    attributes:
+      label: EternalMonitor version on the PC
+      description: Shown at the bottom of the PC window's sidebar.
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: ipad-version
+    attributes:
+      label: iPad app version
+      description: Shown at the bottom of the app's settings on the iPad. The number in brackets is the TestFlight build.
+      placeholder: 0.3.0 (112)
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - Wi-Fi
+        - USB cable
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: pc-hardware
+    attributes:
+      label: Windows version and graphics card
+      placeholder: Windows 11 24H2, GeForce RTX 4070
+    validations:
+      required: true
+  - type: input
+    id: ipad-hardware
+    attributes:
+      label: iPad model and iPadOS version
+      placeholder: iPad Pro 12.9-inch (M2), iPadOS 26.2
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Host log
+      description: |
+        In the PC window, open Performance and click Copy logs, then paste here. The log includes the
+        current pairing code, so click New code on the Stream page afterwards.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed pairing codes, QR codes and anything private from the log and screenshots.
+          required: true

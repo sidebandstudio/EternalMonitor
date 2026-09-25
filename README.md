@@ -1,125 +1,175 @@
+<div align="center">
+
+<img src="docs/assets/icon.png" width="88" height="88" alt="EternalMonitor logo">
+
 # EternalMonitor
 
-Use your iPad as a second display for Windows, with WiFi or USB and input relay.
+Mirror or extend your Windows desktop onto an iPad over Wi-Fi or USB,<br>
+and control the PC with touch, a keyboard or Apple Pencil.
 
-[![CI](https://github.com/whoisaldo/EternalMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/whoisaldo/EternalMonitor/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/whoisaldo/EternalMonitor?labelColor=111&color=e8ff47)](https://github.com/whoisaldo/EternalMonitor/releases/latest)
-[![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
+[![Release](https://img.shields.io/github/v/release/whoisaldo/EternalMonitor?include_prereleases&label=release&labelColor=111&color=e8ff47)](https://github.com/whoisaldo/EternalMonitor/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/whoisaldo/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-e8ff47?labelColor=111)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
+[![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
 
-![The EternalMonitor Windows app streaming to an iPad Pro](docs/assets/og.png)
+[Download](#download) · [Setup guide](SETUP.md) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
 
-A Rust host on the PC captures the desktop with DXGI, encodes on the GPU
-(NVENC/AMF/QSV, H.264 or opt-in HEVC), and streams over UDP on the local
-network or a framed USB tunnel through Apple's device service. A native Swift
-app on the iPad decodes with VideoToolbox and renders
-with Metal. Touch, Pencil, pointer and keyboard events travel back to the PC.
-PC audio travels to the iPad as Opus. MIT licensed.
+</div>
 
-Contributions welcome. Transport, encoders, rendering, docs, anything. Ping
-`aldobenches285` on Discord to collaborate.
+<p align="center">
+  <img src="docs/assets/og.png" width="860" alt="The EternalMonitor Windows app streaming a desktop to an iPad Pro">
+</p>
 
-## v0.3.0 candidate
+EternalMonitor streams your Windows desktop to an iPad and sends your input back.
+A small Windows app captures the screen and encodes it on your graphics card. The
+iPad app decodes the video in hardware and draws it with Metal, and every tap,
+keystroke and Pencil stroke travels back to the PC. It is free, open source under
+the MIT license, and needs no account.
 
-v0.3.0-rc.1 is the release candidate. Its Windows installer is a GitHub
-pre-release and appears on the site's download page as a preview for testers.
-Install the matching iPad build through TestFlight; invite: ask Ali. The latest
-full release is older and does not contain the features below.
+## Features
 
-- **Mirror or extend.** Capture the primary or another monitor, or create a
-  managed virtual display while the iPad is connected.
-- **WiFi and USB.** UDP streaming with negotiated fragment repair; a USB cable
-  can take over through Apple's device service, with WiFi fallback on unplug.
-- **PC audio.** 48 kHz stereo Opus with jitter buffering and packet-loss
-  concealment. Mute playback on the iPad without stopping video.
-- **Pairing.** Enter the host's six-digit code or scan its token-bearing QR.
-  Remembered hosts use a token in the iPad Keychain. Regenerate the host token
-  to require pairing again. USB trusts physical access.
-- **Touch, keyboard and pointer.** Tap, drag, scroll and hold for right-click;
-  hardware and on-screen keyboards, sticky modifiers, secondary/middle buttons
-  and hover. Apple Pencil sends native Windows Ink pressure, tilt and supported
-  hover. Drawing mode adds a Pencil-only canvas and a USB frame-rate preset.
-  See [drawing with Apple Pencil](docs/pencil-drawing.md) for Clip Studio setup.
-  iPadOS reserves Globe, ⌘H, ⌘Tab and ⌘Space.
-- **Reliability and diagnostics.** Bounded NACK repair, adaptive bitrate up to
-  50 Mbps, repaired/lost fragment counts, queue and jitter reports, measured
-  latency, reconnect, and supervised pipeline recovery.
-- **Codecs and rates.** H.264 by default, HEVC by explicit preference. The host
-  offers 30/60/90/120 fps and honors the iPad's lower preference. YUV420 remains
-  the default input; BGRA is opt-in until both hardware gates pass.
+<img src="docs/assets/ipad-app.webp" align="right" width="270" alt="The iPad app's connect screen with Connect, Scan QR code and Find PCs">
 
-On 2026-09-24 the candidate passed the full simulator matrix and 30-minute
-soak, the Windows test suite and real-hardware matrix on the reference PC, the
-automated physical-iPad rows over WiFi and USB, a Windows pen-injection probe,
-and 30-minute soaks on a physical iPad over WiFi and over USB with the extended
-display. [HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) has the evidence
-and the checks that still need a person: Pencil drawing in a real app, audio
-sync, first-time USB trust and ProMotion on a 120 Hz source.
+- **Extend or mirror.** Add the iPad as an extra display beside your monitor, or
+  mirror any screen you have. The extra display exists only while the iPad is
+  connected, so Windows never keeps a phantom monitor around.
+- **Wi-Fi or USB.** Stream over your home network, or plug in a cable for a
+  steadier picture that also charges the iPad. A cable takes over a running
+  Wi-Fi session, and unplugging it falls back to Wi-Fi.
+- **Touch, keyboard and pointer.** Tap to click, drag, scroll with two fingers and
+  hold to right-click. Hardware keyboards, trackpads and mice work too, with
+  sticky modifiers and middle-click.
+- **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt.
+  Drawing mode ignores your palm on the canvas, and Clip Studio Paint works with
+  its Tablet PC setting.
+- **PC audio.** Sound plays on the iPad as Opus, with a jitter buffer and loss
+  concealment. You can mute it without stopping the video.
+- **Loss repair for real Wi-Fi.** When a packet goes missing, the iPad asks for
+  that fragment again right away, so one dropped packet rarely costs a frame. The
+  bitrate adapts between 4 and 50 Mbps.
+- **Your GPU does the work.** NVIDIA NVENC, AMD AMF or Intel Quick Sync encode
+  H.264 by default, or HEVC if you prefer it, at 30, 60, 90 or 120 fps.
+- **Pairing.** The first Wi-Fi connection asks for a six-digit code or a QR scan.
+  After that the iPad remembers the PC. USB needs no code.
 
-## Install for testing
+<br clear="right">
 
-Use **EternalMonitor-Setup.exe** and the iPad build from the same candidate.
-Published candidates appear under
-[GitHub prereleases](https://github.com/whoisaldo/EternalMonitor/releases) and
-on the site's preview card. TestFlight invite: ask Ali. An unsigned archive is
-only a compile check and cannot be installed through TestFlight.
+## Download
 
-The v0.3 installer sets up the host, bundled
-[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver),
-its tasks and TCP/UDP firewall rules. It needs one UAC approval. The installer
-is not code-signed; obtain it from the release page and verify its published
-SHA-256 before approving a SmartScreen exception. Older installers can still
-require a separate firewall prompt.
+| | Requirements | Get it |
+| --- | --- | --- |
+| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.3.0-rc.1) (v0.3.0-rc.1) |
+| **iPad** | iPadOS 17 or later | TestFlight. Invites are on request until the public link opens; [ask for one](mailto:aliyounes@eternalreverse.com?subject=EternalMonitor%20TestFlight) |
 
-For WiFi, use a trusted local network; wired Ethernet for the PC helps.
-For USB, install the Apple Devices app from the Microsoft Store and keep it
-open while you stream; Windows reaches the iPad through it. Use a data cable
-and accept Trust This Computer on the iPad. When an iPad is plugged in and
-Apple Devices is closed or missing, the host says so and offers to open it or
-links to the Store. Pairing controls access but does not encrypt
-the stream. The iPad app requires iPadOS 17 or later.
+Install both apps from the same version. The older v0.1 releases use a different
+protocol and cannot connect to the v0.3 iPad app.
 
-New users should follow the step-by-step [setup guide](SETUP.md). The
-installer also adds [QUICKSTART.txt](scripts/QUICKSTART.txt) to the Start menu.
-TestFlight setup and the signing workflow are documented in
-[FRIENDS_TESTING.md](FRIENDS_TESTING.md).
+The installer is not code-signed yet, so Windows SmartScreen asks before it runs.
+Choose **More info**, then **Run anyway**, only after checking that the file's
+SHA-256 matches the one on the [release page](https://github.com/whoisaldo/EternalMonitor/releases).
+
+For USB you also need Apple's free [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k)
+app, open while you stream. Windows can only reach an iPad over a cable through
+it, and EternalMonitor tells you when it is closed or missing.
+
+**Next, follow the [setup guide](SETUP.md).** It walks through installing both
+apps, pairing, USB, the extended display and drawing, with the exact button names
+you will see.
+
+## Status
+
+v0.3.0-rc.1 is a release candidate. On 2026-09-24 it passed the automated tests
+on a reference PC with GeForce RTX 5080 and Radeon graphics and on a physical
+iPad Pro.
+Those included 30-minute runs at about 58 fps, one over Wi-Fi at 3440×1440 and
+one over USB at 2732×2048. Testers are now checking what needs hands on the
+device, such as drawing in Clip Studio Paint and audio sync.
+[docs/hardware-verification.md](docs/hardware-verification.md) has every result,
+including the failures.
+
+Known limits:
+
+- The stream is not encrypted. Pairing keeps other devices out, so use a network
+  you trust, such as your home Wi-Fi.
+- The Windows app is the only host. The host builds on macOS for development,
+  but there it streams a test pattern instead of your screen.
+- Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.
+
+## How it works
+
+```mermaid
+flowchart RL
+  subgraph pc [Windows PC]
+    direction TB
+    capture[Desktop capture] --> encode[GPU encoder]
+    inject[Input injection]
+  end
+  subgraph ipad [iPad]
+    direction TB
+    repair[Reassembly and repair] --> decode[VideoToolbox decode] --> show[Metal display]
+    touch[Touch, keyboard, Pencil]
+  end
+  pc -- "video and audio over Wi-Fi or USB" --> ipad
+  ipad -- "input and repair requests" --> pc
+```
+
+The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
+the GPU through FFmpeg, and sends each frame as numbered UDP fragments. Over USB
+the same messages travel through a framed tunnel that Apple's device service
+provides. The iPad app is native Swift. It reassembles fragments, requests any
+that are missing, decodes with VideoToolbox and renders with Metal. Input and
+receiver reports go back on the same session, and the host uses those reports
+to adapt the bitrate.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the pipeline and protocol v2, and
+[docs/decisions.md](docs/decisions.md) explains why each part works the way it
+does.
 
 ## Build from source
 
-The workspace contains the Rust host and the pure `eternal-wire` protocol
-crate, plus the Swift app in `ios/`. The host's `transport/usbmuxd.rs` module
-implements the Apple device-service client.
+The workspace holds the Rust host (`host/`), the protocol crate `eternal-wire`
+(`proto/`) and the Swift iPad app (`ios/`).
 
-### Windows host
+<details>
+<summary><b>Windows host</b></summary>
 
-Requirements: Windows 10 version 1809 or later, Rust 1.98.0 (pinned by `rust-toolchain.toml`, MSVC), an FFmpeg **7.1 shared** SDK, LLVM/libclang
-for bindgen.
+Requirements: Windows 10 version 1809 or later, Rust 1.98.0 (pinned by
+`rust-toolchain.toml`, MSVC), an FFmpeg **7.1 shared** SDK and LLVM/libclang for
+bindgen.
 
 ```powershell
-# Point the build at your FFmpeg 7.1 shared SDK (folder containing bin\avcodec-*.dll)
+# Point the build at your FFmpeg 7.1 shared SDK (the folder with bin\avcodec-*.dll)
 $env:FFMPEG_DIR = "C:\ffmpeg"
 cargo build --release -p eternal-host
 .\target\release\eternal-host.exe          # optional port argument, default 9876
 ```
 
-`scripts\build-installer.ps1` builds the full Setup.exe (needs Inno Setup and
-the same `FFMPEG_DIR`). `scripts\package.ps1` builds the bare zip.
+`scripts\build-installer.ps1` builds the full Setup.exe with Inno Setup and the
+same `FFMPEG_DIR`. `scripts\package.ps1` builds a bare zip.
 
-### macOS development loop (no Windows required)
+</details>
 
-The host builds and runs on macOS with a synthetic capture source. The
-protocol, encoder, transport, and supervisor stack all run for real:
+<details>
+<summary><b>macOS development loop</b> (no Windows needed)</summary>
+
+On macOS the host swaps screen capture for a synthetic test pattern. The
+protocol, encoder, transport and supervisor all run for real.
 
 ```bash
 brew install ffmpeg@7 pkgconf xcodegen
 export PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
-cargo test --workspace          # unit + golden-vector + synthetic end-to-end tests
+cargo test --workspace          # unit, golden-vector and synthetic end-to-end tests
 ETERNAL_CAPTURE=synthetic cargo run -p eternal-host
 ```
 
-If Xcode's command-line tools are the selected developer directory, prefix
-Xcode commands with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+If Xcode's command-line tools are the selected developer directory, prefix Xcode
+commands with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
-### iPad app
+</details>
+
+<details>
+<summary><b>iPad app</b></summary>
 
 ```bash
 cd ios
@@ -128,108 +178,82 @@ xcodebuild test -project EternalMonitor.xcodeproj -scheme EternalMonitor \
   -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M4)'
 ```
 
-Open the generated project in Xcode to run on a physical iPad with your own
+To run on a physical iPad, open the generated project in Xcode and pick your own
 signing team.
 
-### Full-system test on one Mac
+</details>
+
+<details>
+<summary><b>End-to-end tests</b></summary>
 
 ```bash
-./scripts/e2e_ios.sh                 # host (synthetic) → iPad simulator, H.264
-EM_CODEC=hevc ./scripts/e2e_ios.sh   # same, over HEVC
+./scripts/e2e_ios.sh              # synthetic host to the iPad simulator, H.264
+EM_CODEC=hevc ./scripts/e2e_ios.sh
+scripts/test_ios.sh               # iPad unit and UI tests
+scripts/e2e_matrix.sh             # UDP, loss, burst, USB, audio, pairing, input, lifecycle
+scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 ```
 
-The harness launches the headless host and the simulator app, auto-connects,
-and checks decoded frame rate, loss and rendered pixels from the real app.
-Run the broader gates with:
+Each row checks the decoded frame rate (at least 55 fps), drops, repairs and the
+rendered pixels. `e2e_matrix.sh --real` runs the Windows hardware rows through the
+runner in `scripts/win/`; read [scripts/win/README.md](scripts/win/README.md)
+first. CI runs the Rust suites on Linux, macOS and Windows, the iPad tests and a
+streaming system test on every pull request.
 
-```bash
-scripts/test_ios.sh         # unit + native UI tests
-scripts/e2e_matrix.sh       # UDP, loss/burst, USB, audio, pairing, input, lifecycle
-scripts/soak.sh 1800        # 30-minute FPS and host/app RSS check
-```
+</details>
 
-`scripts/e2e_matrix.sh --real` and `scripts/soak.sh --real 1800` target the
-reference Windows PC through its interactive runner. Read the hardware runbook
-and `scripts/win/README.md` before using those commands.
-
-## How it's tested
-
-- Golden wire vectors (`proto/testdata/`) parsed byte-for-byte by both the
-  Rust and Swift codecs, plus fuzz "never crashes" tests on both sides.
-- Pure-logic unit tests with injected clocks: session machine, ABR ladder,
-  pacer, reassembly, input mapping, gesture state machine, supervisor.
-- End-to-end tests that run the real pipeline. The Rust E2E covers
-  handshake, lossy ABR step-down, encoder-crash recovery, input relay, and
-  HEVC negotiation; the simulator harness above covers the full system.
-- CI on every PR: Linux (wire crate), Windows (full host against pinned
-  FFmpeg 7.1), macOS (full workspace including E2E), and the iOS simulator
-  suite, a separate simulator system job and an unsigned Release archive job.
-
-CI cannot verify real GPU encoders, the virtual display driver, or real
-WiFi. [HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) is the runbook
-that covers those before each release.
-
-## Repo layout
-
-```text
-host/       Rust host: capture, encode, transport, session, supervisor, egui GUI
-proto/      eternal-wire crate: protocol v2 codecs, H.264/HEVC helpers, golden vectors
-ios/        Swift iPad app (xcodegen project): receive, decode, render, input relay
-installer/  Inno Setup script + bundled-driver staging for EternalMonitor-Setup.exe
-scripts/    build-installer.ps1, package.ps1, e2e_ios.sh, QUICKSTART.txt
-docs/       eternalmonitor.dev website (GitHub Pages)
-```
-
-## Environment variables (host)
+<details>
+<summary><b>Host environment variables</b></summary>
 
 | Variable | Effect |
 | --- | --- |
 | `ETERNAL_ENCODER` | Force an encoder (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
-| `ETERNAL_HEVC` | `1`/`0` overrides the HEVC preference (automation) |
-| `ETERNAL_FPS` | Override host FPS; client preference still caps it |
-| `ETERNAL_INPUT` | Encoder input: `yuv420` (default), `auto`, or `bgra` |
-| `ETERNAL_MAX_DGRAM` | Media datagram size (576–1400 bytes) |
-| `ETERNAL_AUDIO` | `synthetic` selects the deterministic audio test source |
-| `ETERNAL_USB_DIRECT` | Test-only TCP tunnel endpoint |
-| `ETERNAL_REORDER` / `ETERNAL_JITTER_MS` | Test-only first-transmission faults |
+| `ETERNAL_HEVC` | `1` or `0` overrides the HEVC preference |
+| `ETERNAL_FPS` | Override the host frame rate; the iPad's preference still caps it |
+| `ETERNAL_INPUT` | Encoder input: `yuv420` (default), `auto` or `bgra` |
+| `ETERNAL_MAX_DGRAM` | Media datagram size, 576 to 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` swaps DXGI for a generated test pattern |
-| `ETERNAL_HEADLESS` | `1` runs without the GUI; Ctrl+C shuts down cleanly |
-| `ETERNAL_VDD_TIMEOUT_SECS` | Virtual-display attach timeout |
+| `ETERNAL_AUDIO` | `synthetic` selects the deterministic audio test source |
+| `ETERNAL_HEADLESS` | `1` runs without the window; Ctrl+C shuts down cleanly |
 | `ETERNAL_ABR` | `0` disables adaptive bitrate |
-| `ETERNAL_DROP` | Test-only: inject fractional datagram loss |
+| `ETERNAL_VDD_TIMEOUT_SECS` | How long to wait for the virtual display to attach |
 | `ETERNAL_AMF_DIAG` | `1` writes AMF bitstream diagnostics |
-| `ETERNAL_LEGACY_PTS` | `1` restores the old frame-counter PTS (escape hatch) |
+| `ETERNAL_LEGACY_PTS` | `1` restores the old frame-counter timestamps |
+| `ETERNAL_DROP`, `ETERNAL_REORDER`, `ETERNAL_JITTER_MS` | Test only: inject loss, reordering or jitter |
+| `ETERNAL_USB_DIRECT` | Test only: a TCP endpoint in place of the USB tunnel |
 
-## Troubleshooting
+</details>
 
-- iPad can't connect: same WiFi (not a guest network), firewall allowed for
-  Private and Public, and manual IP entry beats discovery on tricky
-  networks. The host window shows the address and a QR code.
-- Choppy video: compare capture/encode/decode FPS, loss, repairs and jitter.
-  Try 5 GHz or a wired PC, then check encoder fallback and CPU/GPU load.
-- A "Hardware encoder unavailable" banner on the Stream page means the
-  hardware encoder failed to open and the host fell back to CPU encoding.
-  Update GPU drivers and restart the stream.
-- Version mismatch: protocol v2 is a clean break. A v0.1.x app or host
-  shows a clear "update the other side" message instead of streaming.
+## Documentation
 
-## Reference docs
+| Document | What it covers |
+| --- | --- |
+| [SETUP.md](SETUP.md) | Step-by-step setup for anyone, including USB and drawing |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | The pipeline, protocol v2 and each component |
+| [docs/decisions.md](docs/decisions.md) | Why things are the way they are, with measurements |
+| [docs/pencil-drawing.md](docs/pencil-drawing.md) | Apple Pencil, Windows Ink and Clip Studio Paint |
+| [docs/pairing.md](docs/pairing.md), [docs/keyboard-input.md](docs/keyboard-input.md), [docs/host-settings.md](docs/host-settings.md), [docs/audio-codec.md](docs/audio-codec.md) | Feature details |
+| [docs/hardware-verification.md](docs/hardware-verification.md) | The release test record and the hands-on checklist |
+| [docs/beta-testing.md](docs/beta-testing.md) | Running a beta: TestFlight, signing and what to test |
+| [docs/design.md](docs/design.md) | The shared look of the apps and the website |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | What changed in each version |
 
-- [SETUP.md](SETUP.md) is the step-by-step setup guide for users
-- [ARCHITECTURE.md](ARCHITECTURE.md) covers the pipeline, protocol v2, and design
-- [DECISIONS.md](DECISIONS.md) explains why things are the way they are
-- [RELEASE_NOTES.md](RELEASE_NOTES.md)
-- [FRIENDS_TESTING.md](FRIENDS_TESTING.md) has organizer notes for beta testing
-- [HARDWARE_VERIFICATION.md](HARDWARE_VERIFICATION.md) is the pre-release
-  runbook for everything CI can't prove
+## Contributing
 
-## Credits
+Contributions are welcome, from transport and encoders to rendering and docs.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. To talk an
+idea through first, message `aldobenches285` on Discord.
 
-Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)).
-
-- Repository: [github.com/whoisaldo/EternalMonitor](https://github.com/whoisaldo/EternalMonitor)
-- Questions & concerns: [aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com)
+Found a bug? [Open an issue](https://github.com/whoisaldo/EternalMonitor/issues/new/choose)
+with both app versions and the host log. Report security problems privately as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-Released under the MIT License. See [LICENSE](LICENSE). © 2026 Ali Younes.
+EternalMonitor is released under the [MIT License](LICENSE), © 2026 Ali Younes.
+The Windows installer also ships third-party components under their own licenses,
+including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+and FFmpeg.
+
+Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)). Questions go to
+[aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com).

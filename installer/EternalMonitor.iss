@@ -40,7 +40,7 @@ OutputDir={#StagingDir}\..\out
 OutputBaseFilename=EternalMonitor-Setup
 Compression=lzma2/max
 SolidCompression=yes
-; --- Branding (see DESIGN.md) -------------------------------------------------
+; --- Branding (see docs/design.md) --------------------------------------------
 WizardStyle=modern
 SetupIconFile=..\host\assets\icon.ico
 WizardImageFile=assets\wizard-large.bmp

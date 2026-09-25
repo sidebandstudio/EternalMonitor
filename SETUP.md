@@ -203,9 +203,9 @@ iPad pair again.
 ## Getting help
 
 In the PC window, open **Performance** and click **Copy logs**. Paste the
-result into an email to
-[aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com). Say
-what you tried, what you saw, your iPad model, and whether you used Wi-Fi or
+result into a [bug report on GitHub](https://github.com/whoisaldo/EternalMonitor/issues/new/choose)
+or an email to [aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com).
+Say what you tried, what you saw, your iPad model, and whether you used Wi-Fi or
 USB. The logs include the current pairing code. Click **New code** in the PC
 window after sharing them. Don't post the QR code publicly either, because
 anyone who scans it can connect.
