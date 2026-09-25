@@ -131,7 +131,7 @@ jobs:
           DEVICE_TYPE=com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB
           echo "Using device type: $DEVICE_TYPE"
           xcodebuild -version
-          UDID=$(xcrun simctl create citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
+          UDID=$(python3 scripts/ci_simulator.py citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
       - name: Run iOS unit tests and connection/settings UI tests
         env:
@@ -179,7 +179,7 @@ jobs:
         run: |
           DEVICE_TYPE=com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB
           xcodebuild -version
-          UDID=$(xcrun simctl create cistream "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
+          UDID=$(python3 scripts/ci_simulator.py cistream "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           # Finish the cold boot before compilation gives background setup time to settle.
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
