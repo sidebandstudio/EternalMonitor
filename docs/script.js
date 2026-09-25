@@ -3,17 +3,6 @@
 (function () {
   'use strict';
 
-  // Set this after the external group and Beta App Review are ready.
-  const TESTFLIGHT_URL = '';
-  var testflightLink = document.getElementById('testflight-link');
-  var testflightStatus = document.getElementById('testflight-status');
-  if (testflightLink && TESTFLIGHT_URL) {
-    testflightLink.href = TESTFLIGHT_URL;
-    testflightLink.textContent = 'Join the TestFlight';
-    testflightLink.hidden = false;
-    if (testflightStatus) testflightStatus.hidden = true;
-  }
-
   /* --- macOS Notice --- */
   // iPadOS reports platform 'MacIntel' too, so require a non-touch device.
   var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
@@ -79,7 +68,8 @@
     return (bytes / 1048576).toFixed(1) + ' MB';
   }
 
-  fetch('https://api.github.com/repos/whoisaldo/EternalMonitor/releases/latest', {
+  // Keep the Windows download paired with the TestFlight build shown in the HTML.
+  fetch('https://api.github.com/repos/whoisaldo/EternalMonitor/releases/tags/v0.3.0', {
     headers: { 'Accept': 'application/vnd.github.v3+json' }
   })
     .then(function (res) {
@@ -88,13 +78,12 @@
     })
     .then(function (release) {
       var asset = release.assets.find(function (a) {
-        return a.name.endsWith('.zip') || a.name.endsWith('.exe') || a.name.endsWith('.msi');
+        return a.name === 'EternalMonitor-Setup.exe';
       });
 
       if (!asset) throw new Error('No Windows asset found');
 
       downloadBtn.href = asset.browser_download_url;
-      downloadBtn.textContent = 'Download ' + asset.name;
       if (versionEl) versionEl.textContent = release.tag_name;
       if (metaEl) metaEl.textContent = asset.name + ' \u00B7 ' + formatBytes(asset.size);
 
@@ -105,53 +94,6 @@
       }
     })
     .catch(function () {
-      downloadBtn.href = 'https://github.com/whoisaldo/EternalMonitor/releases';
-      downloadBtn.textContent = 'View Releases on GitHub';
-      if (metaEl) metaEl.textContent = 'Find the latest release on GitHub.';
-    });
-
-  /* --- Preview build ---
-     /releases/latest above deliberately skips pre-releases, so testers would
-     never see a build that has not shipped yet. Look for the newest one and
-     reveal the preview card only if it exists; once a stable release
-     supersedes it, the card disappears on its own. */
-  var previewSection = document.getElementById('preview-section');
-  if (!previewSection) return;
-
-  fetch('https://api.github.com/repos/whoisaldo/EternalMonitor/releases?per_page=10', {
-    headers: { 'Accept': 'application/vnd.github.v3+json' }
-  })
-    .then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    })
-    .then(function (releases) {
-      var preview = releases.find(function (r) {
-        return r.prerelease && !r.draft;
-      });
-      if (!preview) return; // nothing in testing right now
-
-      var asset = preview.assets.find(function (a) {
-        return a.name.endsWith('.exe') || a.name.endsWith('.zip') || a.name.endsWith('.msi');
-      });
-      if (!asset) return;
-
-      var btn = document.getElementById('preview-btn');
-      var version = document.getElementById('preview-version');
-      var meta = document.getElementById('preview-meta');
-      var sha = document.getElementById('preview-sha256');
-
-      btn.href = asset.browser_download_url;
-      btn.textContent = 'Download ' + asset.name;
-      if (version) version.textContent = preview.tag_name;
-      if (meta) meta.textContent = asset.name + ' \u00B7 ' + formatBytes(asset.size);
-      if (sha && preview.body) {
-        var match = preview.body.match(/[a-fA-F0-9]{64}/);
-        if (match) sha.textContent = match[0];
-      }
-      previewSection.hidden = false;
-    })
-    .catch(function () {
-      /* No preview, or the API is unreachable: leave the card hidden. */
+      // The matching download, size and checksum are already present in the HTML.
     });
 })();
