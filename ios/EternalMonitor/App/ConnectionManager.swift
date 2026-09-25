@@ -134,6 +134,7 @@ final class ConnectionManager: ObservableObject {
     private var prevCounters = FrameAssembler.Counters()
     /// True when backgrounding ended a live session — foregrounding may resume it.
     private var resumeOnForeground = false
+    private var backgroundGoodbyeTask: UIBackgroundTaskIdentifier = .invalid
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
@@ -788,25 +789,50 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// Request execution time before entering the background. UIKit grants
+    /// this assertion asynchronously; requesting it after backgrounding can
+    /// leave the goodbye queued when the app is suspended.
+    func prepareForBackground() {
+        guard state != .disconnected, backgroundGoodbyeTask == .invalid else { return }
+        backgroundGoodbyeTask = UIApplication.shared.beginBackgroundTask(withName: "EternalMonitor goodbye") { [weak self] in
+            self?.endBackgroundGoodbye()
+        }
+        E2E.emit("E2E_BACKGROUND_PREPARED task=\(backgroundGoodbyeTask.rawValue)")
+    }
+
+    private func endBackgroundGoodbye() {
+        let task = backgroundGoodbyeTask
+        backgroundGoodbyeTask = .invalid
+        guard task != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(task)
+        E2E.emit("E2E_BACKGROUND_ENDED task=\(task.rawValue)")
+    }
+
     /// The app is leaving the foreground: say goodbye so the host stops
     /// streaming promptly instead of waiting out its liveness window.
     func handleAppBackgrounded() {
+        // Fallback for a transition that did not send willResignActive.
+        prepareForBackground()
         isForeground = false
         usbListener?.stop()
         usbListener = nil
-        guard state != .disconnected else { return }
+        guard state != .disconnected else {
+            endBackgroundGoodbye()
+            return
+        }
         resumeOnForeground = true
-        record(.info, "ctrl", "App backgrounded — sent BYE and disconnected")
-        // The goodbye is still queued in Network.framework when this returns.
-        // Ask for time to send it; a prompt suspension would strand it.
-        let application = UIApplication.shared
-        let goodbye = application.beginBackgroundTask(withName: "EternalMonitor goodbye")
+        record(.info, "ctrl", "App backgrounded — sending BYE and disconnecting")
+        let goodbye = backgroundGoodbyeTask
         disconnect(reason: .appBackground)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { application.endBackgroundTask(goodbye) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.backgroundGoodbyeTask == goodbye else { return }
+            self.endBackgroundGoodbye()
+        }
     }
 
     /// Resume the session that backgrounding interrupted (opt-out toggle).
     func handleAppForegrounded() {
+        endBackgroundGoodbye()
         isForeground = true
         usbPaused = false
         refreshUSBAvailability()
@@ -863,6 +889,7 @@ final class ConnectionManager: ObservableObject {
     }
 
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
+        E2E.emit("E2E_DIAGNOSTIC category=\(category) message=\(message)")
         diagnostics.append(DiagnosticEntry(level: level, category: category, message: message))
         if diagnostics.count > 80 {
             diagnostics.removeFirst(diagnostics.count - 80)
