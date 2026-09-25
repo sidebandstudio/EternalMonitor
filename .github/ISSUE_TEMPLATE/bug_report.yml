@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Thanks for testing EternalMonitor. Please check the troubleshooting table in the
-        [setup guide](https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong) first.
+        [setup guide](https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong) first.
   - type: textarea
     id: what-happened
     attributes:

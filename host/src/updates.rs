@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 const CHECK_INTERVAL: u64 = 24 * 60 * 60;
-const LATEST_URL: &str = "https://api.github.com/repos/whoisaldo/EternalMonitor/releases/latest";
+const LATEST_URL: &str = "https://api.github.com/repos/sidebandstudio/EternalMonitor/releases/latest";
 static CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 pub type AvailableUpdate = Arc<Mutex<Option<String>>>;
 

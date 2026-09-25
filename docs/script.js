@@ -69,7 +69,7 @@
   }
 
   // Keep the Windows download paired with the TestFlight build shown in the HTML.
-  fetch('https://api.github.com/repos/whoisaldo/EternalMonitor/releases/tags/v0.3.0', {
+  fetch('https://api.github.com/repos/sidebandstudio/EternalMonitor/releases/tags/v0.3.0', {
     headers: { 'Accept': 'application/vnd.github.v3+json' }
   })
     .then(function (res) {

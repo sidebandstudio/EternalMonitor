@@ -7,8 +7,8 @@
 Mirror or extend your Windows desktop onto an iPad over Wi-Fi or USB,<br>
 and control the PC with touch, a keyboard or Apple Pencil.
 
-[![Release](https://img.shields.io/github/v/release/whoisaldo/EternalMonitor?include_prereleases&label=release&labelColor=111&color=e8ff47)](https://github.com/whoisaldo/EternalMonitor/releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/whoisaldo/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sidebandstudio/EternalMonitor?include_prereleases&label=release&labelColor=111&color=e8ff47)](https://github.com/sidebandstudio/EternalMonitor/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/sidebandstudio/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e8ff47?labelColor=111)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
@@ -59,7 +59,7 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.3.0) (v0.3.0 current stable) |
+| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0) (v0.3.0 current stable) |
 | **iPad** | iPadOS 17 or later | [TestFlight v0.3.0, build 143](https://testflight.apple.com/join/ppc9QfXc). External installation opens after Apple approves the build. |
 
 Install both apps from the same version. The older v0.1 releases use a different
@@ -67,7 +67,7 @@ protocol and cannot connect to the v0.3 iPad app.
 
 The installer is not code-signed yet, so Windows SmartScreen asks before it runs.
 Choose **More info**, then **Run anyway**, only after checking that the file's
-SHA-256 matches the one on the [release page](https://github.com/whoisaldo/EternalMonitor/releases).
+SHA-256 matches the one on the [release page](https://github.com/sidebandstudio/EternalMonitor/releases).
 
 For USB you also need Apple's free [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k)
 app, open while you stream. Windows can only reach an iPad over a cable through
@@ -245,7 +245,7 @@ Contributions are welcome, from transport and encoders to rendering and docs.
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. To talk an
 idea through first, message `aldobenches285` on Discord.
 
-Found a bug? [Open an issue](https://github.com/whoisaldo/EternalMonitor/issues/new/choose)
+Found a bug? [Open an issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)
 with both app versions and the host log. Report security problems privately as
 described in [SECURITY.md](SECURITY.md).
 

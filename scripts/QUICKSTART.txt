@@ -5,7 +5,7 @@ You need matching Windows and iPad builds. The candidate is still being
 verified; use the installer and TestFlight invite supplied together.
 The latest older public installer does not include every feature below.
 Step-by-step guide with every screen explained:
-https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md
+https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
 
 What you need
 -------------

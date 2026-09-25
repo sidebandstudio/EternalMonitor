@@ -118,7 +118,7 @@ impl AnalyzerApp {
                             ui,
                             "View release",
                             &format!(
-                                "https://github.com/whoisaldo/EternalMonitor/releases/tag/v{version}"
+                                "https://github.com/sidebandstudio/EternalMonitor/releases/tag/v{version}"
                             ),
                         );
                     },

@@ -119,7 +119,7 @@ jobs:
           # newest stable build instead of advertising an RC to everyone.
           $isPrerelease = $tag -match "-"
           $lines = @(
-              "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/whoisaldo/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
+              "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
               "",
               "**The Windows host and the iPad app must be from the same release.** Protocol v2 is a clean break: a v0.1.x app cannot stream from a v0.2.x host, or the reverse. Each side says so rather than showing broken video.",
               "",
