@@ -25,9 +25,8 @@ one, update the other.
 ## Step 1: Install EternalMonitor on your PC
 
 1. Go to [eternalmonitor.dev/download.html](https://eternalmonitor.dev/download.html).
-   Click **Download for Windows**. If you were asked to test a preview, use
-   **Download the preview for Windows** instead. Your browser saves
-   **EternalMonitor-Setup.exe**.
+   Click **Download for Windows** for v0.3.0, the current stable release.
+   Your browser saves **EternalMonitor-Setup.exe**.
 2. Open **EternalMonitor-Setup.exe**.
 3. If a blue **Windows protected your PC** window appears, click
    **More info**, then **Run anyway**. It appears because the installer is not
@@ -51,11 +50,13 @@ the Start menu. To have it open whenever you sign in to Windows, go to
 
 ## Step 2: Install EternalMonitor on your iPad
 
-The iPad app is in testing, so it installs through Apple's TestFlight app.
+The iPad app installs through Apple's TestFlight app. Use v0.3.0, build 143,
+with the current stable Windows release. External installation requires
+Apple's beta review approval.
 
 1. On the iPad, install **TestFlight** from the App Store.
-2. Open the EternalMonitor invite link you were given, then tap **Accept** and
-   **Install**. If you have no link, ask Ali for one.
+2. Open the [EternalMonitor TestFlight invite](https://testflight.apple.com/join/ppc9QfXc),
+   then tap **Accept** and **Install** once the build is available.
 3. Open **EternalMonitor** on the iPad.
 
 ## Step 3: Connect over Wi-Fi

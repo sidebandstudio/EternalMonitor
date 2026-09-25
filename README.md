@@ -59,8 +59,8 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.3.0-rc.1) (v0.3.0-rc.1) |
-| **iPad** | iPadOS 17 or later | TestFlight. Invites are on request until the public link opens; [ask for one](mailto:aliyounes@eternalreverse.com?subject=EternalMonitor%20TestFlight) |
+| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.3.0) (v0.3.0 current stable) |
+| **iPad** | iPadOS 17 or later | [TestFlight v0.3.0, build 143](https://testflight.apple.com/join/ppc9QfXc). External installation opens after Apple approves the build. |
 
 Install both apps from the same version. The older v0.1 releases use a different
 protocol and cannot connect to the v0.3 iPad app.
@@ -79,7 +79,8 @@ you will see.
 
 ## Status
 
-v0.3.0-rc.1 is a release candidate. On 2026-09-24 it passed the automated tests
+v0.3.0 is the current stable release, paired with iPad TestFlight build 143.
+Its Windows installer is unchanged from v0.3.0-rc.1. On 2026-09-24 it passed the automated tests
 on a reference PC with GeForce RTX 5080 and Radeon graphics and on a physical
 iPad Pro.
 Those included 30-minute runs at about 58 fps, one over Wi-Fi at 3440×1440 and

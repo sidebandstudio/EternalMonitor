@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes go into the latest 0.3 build, currently `v0.3.0-rc.1`. The 0.1
+Security fixes go into the latest 0.3 build, currently `v0.3.0`. The 0.1
 releases are no longer maintained; please update both apps.
 
 ## Reporting a vulnerability

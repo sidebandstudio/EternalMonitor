@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Download EternalMonitor</title>
-  <meta name="description" content="Download EternalMonitor for Windows and get the matching iPad app. Free and open source.">
+  <meta name="description" content="Download EternalMonitor v0.3.0, the current stable Windows release, with the matching iPad TestFlight build 143.">
   <meta property="og:title" content="Download EternalMonitor">
   <meta property="og:description" content="Your iPad as a second screen for Windows. Free and open source.">
   <meta property="og:url" content="https://eternalmonitor.dev/download.html">
@@ -47,7 +47,7 @@
     <section class="download-hero">
       <div class="container">
         <h1>Download EternalMonitor</h1>
-        <p>Install the Windows app on your PC and the iPad app on your iPad. Both need the same version.</p>
+        <p>v0.3.0 is the current stable release. Install it on Windows with iPad v0.3.0, TestFlight build 143.</p>
         <p>New to EternalMonitor? The <a href="https://github.com/whoisaldo/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> walks through every step, including USB with Apple Devices.</p>
       </div>
     </section>
@@ -59,21 +59,22 @@
           <div class="download-card-header">
             <span class="platform-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
             <h2>Windows</h2>
-            <span class="badge badge-accent" id="release-version">latest</span>
+            <span class="badge badge-accent" id="release-version">v0.3.0</span>
           </div>
-          <p>Runs on your PC. It captures your screen, encodes it on the GPU and streams it to the iPad. The download below is the latest published release. It predates the v0.3 candidate, whose USB, PC audio and pairing are still in testing.</p>
+          <p>Current stable. Stream your desktop over Wi-Fi or USB with PC audio, pairing, keyboard control and Apple Pencil drawing through Windows Ink.</p>
           <ul class="spec-list" aria-label="Requirements">
             <li>Windows 10 version 1809 or later, or Windows 11, 64-bit</li>
             <li>NVIDIA, AMD or Intel GPU</li>
           </ul>
           <div class="download-btn-wrap">
-            <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="download-btn" class="btn btn-primary btn-block" target="_blank" rel="noopener">Download for Windows</a>
-            <p class="download-meta" id="release-meta">Checking for the latest release…</p>
+            <a href="https://github.com/whoisaldo/EternalMonitor/releases/download/v0.3.0/EternalMonitor-Setup.exe" id="download-btn" class="btn btn-primary btn-block" target="_blank" rel="noopener">Download for Windows</a>
+            <p class="download-meta" id="release-meta">EternalMonitor-Setup.exe · 59.4 MB</p>
           </div>
           <div class="sha256">
             <span class="sha256-label">SHA-256</span>
-            <code id="sha256-value">Listed on the release page</code>
+            <code id="sha256-value">70bd59be737423d636a53b27d7e0fbe9b9e8563ecc104d79f153b139be904a12</code>
           </div>
+          <p class="download-note"><a href="https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.3.0" target="_blank" rel="noopener">Release notes and known issues</a></p>
         </article>
 
         <!-- iPad -->
@@ -83,38 +84,16 @@
             <h2>iPad</h2>
             <span class="badge badge-muted">TestFlight</span>
           </div>
-          <p>Shows your PC's screen and sends touch, Apple Pencil and keyboard input back. Install the build that matches your Windows version.</p>
+          <p>v0.3.0, build 143. Shows your PC's screen and sends touch, Apple Pencil pressure and tilt, and keyboard input back. Use Drawing mode for Pencil input with palm rejection.</p>
           <ul class="spec-list" aria-label="Requirements">
             <li>iPadOS 17 or later</li>
           </ul>
           <div class="download-btn-wrap">
-            <p id="testflight-status" class="testflight-status">TestFlight invites are by request for now. Ask Ali for one.</p>
-            <a id="testflight-link" class="btn btn-primary btn-block" target="_blank" rel="noopener" hidden>Join the TestFlight</a>
+            <p id="testflight-status" class="testflight-status">Build 143 is awaiting Apple's beta review. External installation opens after approval.</p>
+            <a href="https://testflight.apple.com/join/ppc9QfXc" id="testflight-link" class="btn btn-primary btn-block" target="_blank" rel="noopener">Open TestFlight invite</a>
           </div>
           <p class="download-note">Developers can also <a href="https://github.com/whoisaldo/EternalMonitor/tree/main/ios" target="_blank" rel="noopener">build it from source</a>.</p>
         </article>
-      </div>
-    </section>
-
-    <!-- Preview build (shown only when a pre-release exists) -->
-    <section class="preview-section" id="preview-section" hidden>
-      <div class="container">
-        <div class="preview-card card">
-          <div class="preview-head">
-            <span class="badge badge-warning" id="preview-version">preview</span>
-            <h2>Preview build for testers</h2>
-          </div>
-          <p><strong>This is a test build, not a release.</strong> It lets testers try new hardware paths before they are signed off. Expect rough edges, and please report what breaks.</p>
-          <p>The Windows app and the iPad app must both come from this same preview. Mixing builds is not a supported setup: v0.1 and v2 builds can't stream together, and newer v2 builds negotiate the features they share. Install the matching iPad build through TestFlight; ask for an invite.</p>
-          <div class="download-btn-wrap">
-            <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="preview-btn" class="btn btn-secondary btn-block" target="_blank" rel="noopener">Download the preview for Windows</a>
-            <p class="download-meta" id="preview-meta"></p>
-          </div>
-          <div class="sha256">
-            <span class="sha256-label">SHA-256</span>
-            <code id="preview-sha256">Listed on the release page</code>
-          </div>
-        </div>
       </div>
     </section>
 

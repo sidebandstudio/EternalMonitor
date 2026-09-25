@@ -112,8 +112,9 @@ shell. Neither path switches the developer account used by this workspace.
 5. Once approved, enable the group's public link and send that to your
    tester. Anyone with the link can install; you can cap the number of
    testers on the same screen. Paste the resulting `https://testflight.apple.com/join/...`
-   link into `docs/script.js` as `TESTFLIGHT_URL`. Until then the site says
-   "TestFlight invite: ask Ali".
+   link into `docs/download.html` as the `testflight-link` href. Keep the
+   review status beside it accurate. The current link is
+   `https://testflight.apple.com/join/ppc9QfXc`.
 
 Internal testers skip review entirely and get builds immediately, but they
 must be users on your App Store Connect team, so that route only makes sense
@@ -123,15 +124,14 @@ for people you want inside the developer account.
 
 Two links, and they must match:
 
-- The Windows installer for the same version. While a build is still in
-  testing it is published as a GitHub pre-release and appears on
-  eternalmonitor.dev/download.html under "Preview build for testers",
-  marked as a test build.
-- The TestFlight public link for the matching iPad build.
+- The v0.3.0 Windows installer, shown as the current stable release on
+  eternalmonitor.dev/download.html. Its bytes are unchanged from v0.3.0-rc.1.
+- The TestFlight public link for iPad v0.3.0, build 143. External installation
+  requires Apple's beta review approval.
 
-Use the matching candidate pair. v0.1 and v2 builds cannot stream together.
-v0.3 keeps the v2 prefix and negotiates new features, but mixing candidate and
-older builds is not a supported beta-test configuration.
+Use the matching release pair. v0.1 and v2 builds cannot stream together.
+v0.3 keeps the v2 prefix and negotiates new features, but mixing older builds
+is not a supported beta-test configuration.
 
 ## Extended display vs mirror
 
@@ -144,9 +144,9 @@ Windows Display settings before connecting. If the extended display can't start,
 amber "Extended display unavailable" banner and mirrors the primary screen — re-run the installer
 so its display task is registered.
 
-## Build parity and candidate status
+## Build parity and release status
 
-Hand out the Windows installer and iPad app from the same candidate, and record
+Hand out the Windows installer and iPad app from the same release, and record
 both versions and the TestFlight build number. v0.3.0-rc.1 passed the automated
 gates on the reference PC and a physical iPad on 2026-09-24; see
 `docs/hardware-verification.md`. The checks there that need a person are what testers

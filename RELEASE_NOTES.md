@@ -1,9 +1,9 @@
 ## EternalMonitor v0.3.0
 
-v0.3.0-rc.1 is the release candidate for testers. Install the Windows preview
-and the matching iPad build from TestFlight together. It passed the automated
-tests on the reference PC and a physical iPad; the hands-on checks below remain.
-New users can follow SETUP.md.
+v0.3.0 is the current stable release. Install the Windows app with iPad
+v0.3.0, TestFlight build 143. The Windows installer is unchanged from
+v0.3.0-rc.1. It passed the automated tests on the reference PC and a physical
+iPad; the hands-on checks below remain. New users can follow SETUP.md.
 
 ### What changed
 
@@ -32,7 +32,7 @@ New users can follow SETUP.md.
   the AMD encoder does not accept BGRA; BGRA input is opt-in.
 - The host shows client, USB and audio status, rotates its session log, and can
   check for updates. The Windows installer configures its firewall rules and VDD
-  task permissions. These Windows runtime checks remain part of the RC gate.
+  task permissions. Continue checking these Windows behaviors on your hardware.
 
 ### Please exercise on a physical iPad
 
