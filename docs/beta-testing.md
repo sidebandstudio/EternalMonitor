@@ -42,8 +42,12 @@ Use an App Manager or Admin team API key with access to this app and signing.
 Automatic signing first uses Xcode's cloud-managed distribution path. If the
 team refuses cloud signing, add `IOS_DIST_P12_BASE64` and
 `IOS_DIST_P12_PASSWORD` for an exported Apple Distribution certificate and its
-private key. The script imports that fallback into a temporary keychain and
-restores the original search list before removing it on exit. The API key is
+private key, plus `IOS_PROVISION_PROFILE_BASE64` containing the base64-encoded
+App Store distribution profile for that certificate and `com.eternal.monitor`.
+The archive keeps automatic development signing; export uses the distribution
+certificate and profile explicitly. The script imports the certificate into a
+temporary keychain, validates and installs the profile, then removes both and
+restores the original keychain search list on exit. The API key is
 still needed for provisioning and upload. [Apple's cloud signing guide](https://developer.apple.com/help/account/certificates/cloud-managed-certificates/)
 and [GitHub's certificate guide](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications)
 describe the two paths.

@@ -24,6 +24,8 @@ PY
 )
 TF_PRIVATE=""
 TF_KEYCHAIN=""
+TF_PROFILE=""
+EXPORT_OPTIONS="$ROOT/ios/exportOptions.plist"
 TF_OLD_KEYCHAINS=()
 cleanup() {
     status=$?
@@ -32,6 +34,7 @@ cleanup() {
         security list-keychains -d user -s "${TF_OLD_KEYCHAINS[@]}"
         security delete-keychain "$TF_KEYCHAIN" || status=1
     fi
+    if [ -n "$TF_PROFILE" ]; then rm -f "$TF_PROFILE"; fi
     if [ -n "$TF_PRIVATE" ]; then rm -rf "$TF_PRIVATE"; fi
     exit "$status"
 }
@@ -86,7 +89,37 @@ PY
         security import "$TF_PRIVATE/distribution.p12" -P "$IOS_DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$TF_KEYCHAIN"
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TF_KEYCHAIN_PASSWORD" "$TF_KEYCHAIN" >/dev/null
         security list-keychains -d user -s "$TF_KEYCHAIN" "${TF_OLD_KEYCHAINS[@]}"
-        ARCHIVE_ARGS+=("CODE_SIGN_IDENTITY=Apple Distribution")
+        security find-identity -v -p codesigning "$TF_KEYCHAIN"
+        # Automatic archives use development signing. The imported distribution
+        # identity is selected during export, when the app is signed for upload.
+    fi
+    if [ -n "${IOS_PROVISION_PROFILE_BASE64:-}" ]; then
+        : "${IOS_DIST_P12_BASE64:?A provisioning profile requires a distribution certificate}"
+        python3 - "$TF_PRIVATE/profile.mobileprovision" <<'PYPROFILE'
+import base64,os,pathlib,sys
+pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(''.join(os.environ['IOS_PROVISION_PROFILE_BASE64'].split()),validate=True))
+PYPROFILE
+        security cms -D -i "$TF_PRIVATE/profile.mobileprovision" > "$TF_PRIVATE/profile.plist"
+        TF_PROFILE=$(python3 - "$TF_PRIVATE/profile.plist" "$TF_PRIVATE/profile.mobileprovision" "$EXPORT_OPTIONS" "$TF_PRIVATE/exportOptions.plist" <<'PYPROFILE'
+import pathlib,plistlib,shutil,sys
+profile=plistlib.loads(pathlib.Path(sys.argv[1]).read_bytes())
+options=plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
+team=options['teamID']; bundle='com.eternal.monitor'
+assert profile['TeamIdentifier']==[team], 'Wrong profile team'
+assert profile['Entitlements']['application-identifier']==team+'.'+bundle, 'Wrong profile app'
+assert not profile['Entitlements']['get-task-allow'], 'Distribution profile required'
+# A unique installed filename allows cleanup without removing existing profiles.
+folder=pathlib.Path.home()/'Library/Developer/Xcode/UserData/Provisioning Profiles'
+folder.mkdir(parents=True,exist_ok=True)
+import uuid
+installed=folder/('eternal-testflight-'+str(uuid.uuid4())+'.mobileprovision')
+shutil.copyfile(sys.argv[2],installed)
+options.update(signingStyle='manual',signingCertificate='Apple Distribution',provisioningProfiles={bundle:profile['UUID']})
+pathlib.Path(sys.argv[4]).write_bytes(plistlib.dumps(options))
+print(installed)
+PYPROFILE
+)
+        EXPORT_OPTIONS="$TF_PRIVATE/exportOptions.plist"
     fi
 fi
 echo "Archiving EternalMonitor $VERSION build $BUILD, mode=$MODE"
@@ -103,7 +136,7 @@ print(f'Archive verified: {sys.argv[2]} ({sys.argv[3]})')
 PY
 if [ "$MODE" = upload ]; then
     xcodebuild -exportArchive -archivePath "$OUT/EternalMonitor.xcarchive" \
-        -exportOptionsPlist "$ROOT/ios/exportOptions.plist" -exportPath "$OUT/export" \
+        -exportOptionsPlist "$EXPORT_OPTIONS" -exportPath "$OUT/export" \
         "${AUTH[@]}" > "$OUT/export.log" 2>&1 || { tail -70 "$OUT/export.log"; exit 1; }
     echo "Uploaded EternalMonitor $VERSION build $BUILD to App Store Connect"
 else
