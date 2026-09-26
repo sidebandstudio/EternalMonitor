@@ -3,10 +3,12 @@
 (function () {
   'use strict';
 
+  var reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var nav = document.querySelector('.nav');
+
   /* --- macOS Notice --- */
   // iPadOS reports platform 'MacIntel' too, so require a non-touch device.
   var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
-  var nav = document.querySelector('.nav');
   if (isMac && nav && sessionStorage.getItem('mac-notice-dismissed') !== '1') {
     var notice = document.createElement('aside');
     notice.className = 'mac-notice';
@@ -23,6 +25,45 @@
       notice.remove();
     });
     nav.insertAdjacentElement('afterend', notice);
+  }
+
+  /* --- Nav: solid once the page scrolls, and the section in view --- */
+  if (nav) {
+    var navTick = false;
+    var updateNav = function () {
+      nav.classList.toggle('scrolled', window.scrollY > 8);
+      navTick = false;
+    };
+    window.addEventListener('scroll', function () {
+      if (!navTick) {
+        navTick = true;
+        window.requestAnimationFrame(updateNav);
+      }
+    }, { passive: true });
+    updateNav();
+  }
+
+  var sectionLinks = Array.prototype.slice.call(document.querySelectorAll('.nav-link[href^="#"]'));
+  if (sectionLinks.length && 'IntersectionObserver' in window) {
+    var linkFor = {};
+    sectionLinks.forEach(function (link) { linkFor[link.getAttribute('href').slice(1)] = link; });
+    // A thin band just above the middle of the viewport decides which
+    // section is "current".
+    var sectionObserver = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        var link = linkFor[entry.target.id];
+        if (entry.isIntersecting) {
+          sectionLinks.forEach(function (l) { l.classList.remove('active'); });
+          link.classList.add('active');
+        } else {
+          link.classList.remove('active');
+        }
+      });
+    }, { rootMargin: '-45% 0px -50% 0px' });
+    Object.keys(linkFor).forEach(function (id) {
+      var section = document.getElementById(id);
+      if (section) sectionObserver.observe(section);
+    });
   }
 
   /* --- Scroll Reveal (IntersectionObserver) --- */
@@ -43,13 +84,39 @@
     reveals.forEach(function (el) { el.classList.add('visible'); });
   }
 
+  /* --- Launch film: one lime button, native controls once it runs --- */
+  var launch = document.getElementById('launch-video');
+  var launchPlay = document.getElementById('launch-play');
+  if (launch && launchPlay) {
+    launch.removeAttribute('controls');
+    launchPlay.hidden = false;
+    launchPlay.addEventListener('click', function () {
+      launch.setAttribute('controls', '');
+      var playing = launch.play();
+      if (playing && playing.catch) playing.catch(function () {});
+    });
+    launch.addEventListener('play', function () { launchPlay.hidden = true; });
+    launch.addEventListener('ended', function () { launchPlay.hidden = false; });
+  }
+
+  /* --- Card spotlight follows the pointer --- */
+  if (window.matchMedia('(hover: hover)').matches) {
+    document.querySelectorAll('.feature, .step, .req-card, .download-card').forEach(function (card) {
+      card.addEventListener('pointermove', function (e) {
+        var rect = card.getBoundingClientRect();
+        card.style.setProperty('--mx', (e.clientX - rect.left) + 'px');
+        card.style.setProperty('--my', (e.clientY - rect.top) + 'px');
+      });
+    });
+  }
+
   /* --- Smooth Scroll for Anchor Links --- */
   document.querySelectorAll('a[href^="#"]').forEach(function (link) {
     link.addEventListener('click', function (e) {
       var target = document.querySelector(this.getAttribute('href'));
       if (target) {
         e.preventDefault();
-        target.scrollIntoView({ behavior: 'smooth' });
+        target.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth' });
       }
     });
   });

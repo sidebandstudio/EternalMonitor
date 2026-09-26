@@ -218,16 +218,37 @@ struct LogoMark: View {
     }
 }
 
-/// A steady status light with a soft halo.
+/// A status light with a soft halo. With `pulses` on, a ring breathes out
+/// of the halo every couple of seconds: something is live.
 struct StatusDot: View {
     var color: Color = Theme.accent
     var size: CGFloat = 8
+    var pulses = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Circle()
             .fill(color)
             .frame(width: size, height: size)
-            .background(Circle().fill(color.opacity(0.22)).frame(width: size * 2.2, height: size * 2.2))
+            .background(halo)
+    }
+
+    @ViewBuilder
+    private var halo: some View {
+        if pulses && !reduceMotion {
+            TimelineView(.animation(minimumInterval: 1 / 20)) { context in
+                let phase = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2.4) / 2.4
+                ZStack {
+                    Circle().fill(color.opacity(0.22))
+                    Circle()
+                        .stroke(color.opacity(0.5 * (1 - phase)), lineWidth: 1)
+                        .scaleEffect(1 + phase * 1.2)
+                }
+                .frame(width: size * 2.2, height: size * 2.2)
+            }
+        } else {
+            Circle().fill(color.opacity(0.22)).frame(width: size * 2.2, height: size * 2.2)
+        }
     }
 }
 
@@ -250,8 +271,8 @@ struct PrimaryButtonStyle: ButtonStyle {
                     .strokeBorder(isEnabled ? Color.clear : Theme.border, lineWidth: 1)
             )
             .opacity(configuration.isPressed ? 0.82 : 1)
-            .scaleEffect(configuration.isPressed ? 0.985 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(Motion.press, value: configuration.isPressed)
             .animation(.easeOut(duration: 0.15), value: isEnabled)
     }
 }
@@ -274,7 +295,8 @@ struct SecondaryButtonStyle: ButtonStyle {
                     .strokeBorder(Theme.borderStrong, lineWidth: 1)
             )
             .opacity(isEnabled ? 1 : 0.4)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(Motion.press, value: configuration.isPressed)
     }
 }
 
@@ -291,6 +313,94 @@ struct PillButtonStyle: ButtonStyle {
             .frame(minHeight: 40)
             .background(Capsule().fill(fill))
             .opacity(configuration.isPressed ? 0.7 : 1)
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .animation(Motion.press, value: configuration.isPressed)
             .contentShape(Capsule())
+    }
+}
+
+/// List row: a faint highlight while pressed.
+struct RowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color.white.opacity(0.05) : Color.clear)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Motion
+//
+// Shared timings, so every surface moves the same way. Continuous effects
+// stop under Reduce Motion; state changes still animate briefly.
+
+enum Motion {
+    /// Button presses and other small state changes.
+    static let press = Animation.spring(response: 0.28, dampingFraction: 0.7)
+    /// Cards and sections entering or leaving.
+    static let gentle = Animation.spring(response: 0.5, dampingFraction: 0.86)
+    /// Colour and opacity changes.
+    static let fade = Animation.easeInOut(duration: 0.22)
+}
+
+/// Rises and fades in once `shown` turns true, `delay` seconds later. Used
+/// to stagger the connect screen on launch.
+struct Entrance: ViewModifier {
+    var shown: Bool
+    var delay: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .offset(y: shown || reduceMotion ? 0 : 14)
+            .animation(reduceMotion ? nil : Motion.gentle.delay(delay), value: shown)
+    }
+}
+
+extension View {
+    func entrance(_ shown: Bool, delay: Double = 0) -> some View {
+        modifier(Entrance(shown: shown, delay: delay))
+    }
+}
+
+/// Rings that expand and fade from a dot while the app waits for the PC.
+/// A still ring under Reduce Motion.
+struct PulseRings: View {
+    var color: Color = Theme.accent
+    var size: CGFloat = 44
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            if reduceMotion {
+                Circle().stroke(color.opacity(0.3), lineWidth: 1.5)
+            } else {
+                TimelineView(.animation(minimumInterval: 1 / 24)) { context in
+                    let now = context.date.timeIntervalSinceReferenceDate
+                    ForEach(0..<3, id: \.self) { ring in
+                        let phase = (now / 2.4 + Double(ring) / 3).truncatingRemainder(dividingBy: 1)
+                        Circle()
+                            .stroke(color.opacity(0.55 * (1 - phase)), lineWidth: 1.5)
+                            .scaleEffect(0.3 + phase * 0.7)
+                    }
+                }
+            }
+            Circle()
+                .fill(color)
+                .frame(width: size * 0.2, height: size * 0.2)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Nudges a view sideways a few times as `animatableData` moves to the next
+/// whole number: the pairing code was wrong.
+struct Shake: GeometryEffect {
+    var amount: CGFloat = 7
+    var animatableData: CGFloat
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        ProjectionTransform(CGAffineTransform(translationX: amount * sin(animatableData * .pi * 3), y: 0))
     }
 }
