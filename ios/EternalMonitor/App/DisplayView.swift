@@ -10,6 +10,9 @@ struct DisplayView: View {
     @State private var showQualityPopover = false
     @State private var showSettings = false
     @State private var showKeyboard = false
+    // The picture fades in once the view is on screen.
+    @State private var appeared = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack {
@@ -21,12 +24,14 @@ struct DisplayView: View {
                 // PC; a three-finger tap (via the relay layer) drives the HUD.
                 MetalView()
                     .ignoresSafeArea()
+                    .opacity(appeared ? 1 : 0)
                 TouchRelayView(keyboardVisible: $showKeyboard, active: !showSettings && !connectionManager.signalLost, onToggleHUD: { toggleHUD() })
                     .ignoresSafeArea()
             } else {
                 // One gesture, one meaning: tap toggles the HUD.
                 MetalView()
                     .ignoresSafeArea()
+                    .opacity(appeared ? 1 : 0)
                     .onTapGesture { toggleHUD() }
             }
 
@@ -88,7 +93,9 @@ struct DisplayView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
+            appeared = true
             scheduleHUDDismiss()
             #if DEBUG
             if UIPreview.opensQuality { showQualityPopover = true }
@@ -116,6 +123,12 @@ struct DisplayView: View {
         .onChange(of: connectionManager.signalLost) { _, lost in
             if lost { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
+        }
+        // A cable taking over (or coming out) and a quick reconnect can
+        // reuse this view, so show the pill again with the new link.
+        .onChange(of: connectionManager.transportMode) { _, _ in scheduleHUDDismiss() }
+        .onChange(of: connectionManager.state) { _, state in
+            if state == .connected { scheduleHUDDismiss() }
         }
     }
 
