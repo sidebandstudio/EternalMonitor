@@ -692,6 +692,99 @@ code {
   animation: beacon 2.8s var(--ease-out) 2.2s infinite;
 }
 
+/* --- Launch film ------------------------------------------------------------ */
+
+.section--watch {
+  padding-top: 32px;
+}
+
+.launch {
+  max-width: 1040px;
+  margin: 0 auto;
+}
+
+.launch-frame {
+  position: relative;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  border-radius: 16px;
+  background: #0e0e10;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 40px 120px -30px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(0, 0, 0, 0.6);
+}
+
+.launch-frame video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* One lime button over the poster; script.js swaps in the native controls
+   once the film runs. */
+.launch-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  border: 0;
+  background: rgba(10, 10, 11, 0.16);
+  color: var(--on-accent);
+  cursor: pointer;
+  transition: background 0.3s var(--ease);
+}
+
+.launch-play[hidden] {
+  display: none;
+}
+
+.launch-play::before,
+.launch-play::after {
+  content: '';
+  position: absolute;
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+}
+
+.launch-play::before {
+  background: var(--accent);
+  box-shadow: 0 0 0 12px rgba(var(--accent-rgb), 0.14), 0 24px 60px -20px rgba(var(--accent-rgb), 0.7);
+  transition: transform 0.3s var(--ease-out), box-shadow 0.3s var(--ease);
+}
+
+.launch-play::after {
+  border: 1.5px solid var(--accent);
+  opacity: 0;
+  animation: ping 2.8s var(--ease-out) infinite;
+}
+
+.launch-play svg {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  margin-left: 5px;
+}
+
+.launch-play:hover {
+  background: rgba(10, 10, 11, 0.06);
+}
+
+.launch-play:hover::before {
+  transform: scale(1.06);
+  box-shadow: 0 0 0 16px rgba(var(--accent-rgb), 0.16), 0 24px 60px -16px rgba(var(--accent-rgb), 0.8);
+}
+
+.launch-play:focus-visible {
+  outline: none;
+}
+
+.launch-play:focus-visible::before {
+  outline: 2px solid rgba(var(--accent-rgb), 0.8);
+  outline-offset: 6px;
+}
+
 /* --- Features -------------------------------------------------------------- */
 
 .features-grid {

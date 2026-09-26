@@ -84,6 +84,21 @@
     reveals.forEach(function (el) { el.classList.add('visible'); });
   }
 
+  /* --- Launch film: one lime button, native controls once it runs --- */
+  var launch = document.getElementById('launch-video');
+  var launchPlay = document.getElementById('launch-play');
+  if (launch && launchPlay) {
+    launch.removeAttribute('controls');
+    launchPlay.hidden = false;
+    launchPlay.addEventListener('click', function () {
+      launch.setAttribute('controls', '');
+      var playing = launch.play();
+      if (playing && playing.catch) playing.catch(function () {});
+    });
+    launch.addEventListener('play', function () { launchPlay.hidden = true; });
+    launch.addEventListener('ended', function () { launchPlay.hidden = false; });
+  }
+
   /* --- Card spotlight follows the pointer --- */
   if (window.matchMedia('(hover: hover)').matches) {
     document.querySelectorAll('.feature, .step, .req-card, .download-card').forEach(function (card) {
