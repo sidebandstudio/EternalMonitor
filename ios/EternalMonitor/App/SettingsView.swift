@@ -173,7 +173,7 @@ struct SettingsView: View {
                     .padding(.vertical, 4)
                     creditLink("Developer", "github.com/whoisaldo", symbol: "person", url: "https://github.com/whoisaldo")
                     creditLink("Source code", "EternalMonitor", symbol: "chevron.left.forwardslash.chevron.right", url: "https://github.com/sidebandstudio/EternalMonitor")
-                    creditLink("Contact", "aliyounes@eternalreverse.com", symbol: "envelope", url: "mailto:aliyounes@eternalreverse.com")
+                    creditLink("Contact", "hello@sideband.studio", symbol: "envelope", url: "mailto:hello@sideband.studio")
                 } header: {
                     sectionHeader("About")
                 } footer: {
