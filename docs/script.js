@@ -121,6 +121,86 @@
     });
   });
 
+  /* --- Feedback form: opens the visitor's mail app with the report filled in --- */
+  var feedbackForm = document.getElementById('feedback-form');
+  if (feedbackForm) {
+    var FEEDBACK_TO = 'hello@sideband.studio';
+    var stepsField = document.getElementById('fb-steps-field');
+    var fallback = document.getElementById('feedback-fallback');
+    var preview = document.getElementById('feedback-preview');
+    var copyBtn = document.getElementById('feedback-copy');
+    var copied = document.getElementById('feedback-copied');
+
+    var feedbackKind = function () {
+      var checked = feedbackForm.querySelector('input[name="kind"]:checked');
+      return checked ? checked.value : 'Bug';
+    };
+    var fieldValue = function (id) {
+      var el = document.getElementById(id);
+      return el ? el.value.trim() : '';
+    };
+
+    // Steps only make sense for a bug.
+    var syncKind = function () {
+      if (stepsField) stepsField.hidden = feedbackKind() !== 'Bug';
+    };
+    Array.prototype.forEach.call(feedbackForm.querySelectorAll('input[name="kind"]'), function (radio) {
+      radio.addEventListener('change', syncKind);
+    });
+    syncKind();
+
+    var composeBody = function () {
+      var lines = [fieldValue('fb-message'), ''];
+      if (feedbackKind() === 'Bug' && fieldValue('fb-steps')) {
+        lines.push('Steps to reproduce:', fieldValue('fb-steps'), '');
+      }
+      lines.push(
+        'iPad: ' + (fieldValue('fb-ipad') || 'not given'),
+        'PC: ' + (fieldValue('fb-pc') || 'not given'),
+        'Connection: ' + (fieldValue('fb-connection') || 'not sure'),
+        'Release: ' + (feedbackForm.getAttribute('data-release') || ''),
+        'Sent from eternalmonitor.dev/download.html'
+      );
+      return lines.join('\n');
+    };
+
+    feedbackForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      if (!feedbackForm.reportValidity()) return;
+      var kind = feedbackKind() === 'Bug' ? 'bug' : 'feedback';
+      var firstLine = fieldValue('fb-message').split('\n')[0].slice(0, 70);
+      var subject = '[EternalMonitor ' + kind + '] ' + firstLine;
+      var body = composeBody();
+      if (preview) preview.textContent = 'To: ' + FEEDBACK_TO + '\nSubject: ' + subject + '\n\n' + body;
+      if (fallback) fallback.hidden = false;
+      window.location.href = 'mailto:' + FEEDBACK_TO +
+        '?subject=' + encodeURIComponent(subject) +
+        '&body=' + encodeURIComponent(body);
+    });
+
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function () {
+        var text = preview ? preview.textContent : '';
+        var done = function () {
+          if (!copied) return;
+          copied.hidden = false;
+          setTimeout(function () { copied.hidden = true; }, 2000);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () {});
+        } else if (preview) {
+          var range = document.createRange();
+          range.selectNodeContents(preview);
+          var selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          try { if (document.execCommand('copy')) done(); } catch (err) {}
+          selection.removeAllRanges();
+        }
+      });
+    }
+  }
+
   /* --- GitHub Releases API Fetch --- */
   var downloadBtn = document.getElementById('download-btn');
   var versionEl = document.getElementById('release-version');

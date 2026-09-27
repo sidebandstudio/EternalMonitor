@@ -60,10 +60,13 @@ the MIT license, and needs no account.
 | | Requirements | Get it |
 | --- | --- | --- |
 | **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0) (v0.3.0 current stable) |
-| **iPad** | iPadOS 17 or later | [TestFlight v0.3.0, build 143](https://testflight.apple.com/join/ppc9QfXc). External installation opens after Apple approves the build. |
+| **iPad** | iPadOS 17 or later | [TestFlight v0.3.0, build 143](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
 Install both apps from the same version. The older v0.1 releases use a different
 protocol and cannot connect to the v0.3 iPad app.
+
+Testing it? Send bugs and feedback through the [form on the download page](https://eternalmonitor.dev/download.html#feedback),
+which emails hello@sideband.studio, or open a [GitHub issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose).
 
 The installer is not code-signed yet, so Windows SmartScreen asks before it runs.
 Choose **More info**, then **Run anyway**, only after checking that the file's

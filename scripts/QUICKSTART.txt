@@ -26,8 +26,9 @@ and its tasks, plus TCP/UDP firewall rules. Start EternalMonitor.
 
 Install Apple's TestFlight app, then open the EternalMonitor invite:
 https://testflight.apple.com/join/ppc9QfXc
-Install v0.3.0, build 143. External installation opens after Apple approves
-the build; the download page above shows its availability.
+Install v0.3.0, build 143. The beta is open to anyone with the link.
+Send bugs and feedback through the form on the download page above, which
+emails hello@sideband.studio.
 
 2. Connect and pair over WiFi
 ----------------------------

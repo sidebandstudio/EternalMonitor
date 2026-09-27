@@ -1555,6 +1555,291 @@ code {
   line-height: 1.7;
 }
 
+/* --- TestFlight open, install steps and feedback --------------------------- */
+
+.testflight-status--open {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border-style: solid;
+  border-color: rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--accent-rgb), 0.06);
+  color: var(--text);
+}
+
+.testflight-status--open .eyebrow-dot {
+  flex-shrink: 0;
+  margin-top: 8px;
+}
+
+.install-steps {
+  display: grid;
+  gap: 8px;
+  padding-left: 22px;
+  color: var(--muted);
+  font-size: 0.925rem;
+}
+
+.install-steps strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.feedback-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  font-size: 0.925rem;
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+.feedback-callout:hover {
+  border-color: rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.05);
+}
+
+.feedback-callout svg {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.feedback-callout strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.feedback-section {
+  padding: 16px 0 0;
+}
+
+.feedback-card {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 40px;
+  padding: 40px;
+}
+
+.feedback-kicker {
+  display: block;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.feedback-intro h2 {
+  margin-top: 14px;
+  font-size: clamp(1.5rem, 2.6vw, 2rem);
+}
+
+.feedback-intro p {
+  margin-top: 14px;
+  color: var(--muted);
+}
+
+.feedback-intro p strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.feedback-intro a,
+.feedback-fallback a {
+  color: var(--accent);
+}
+
+.feedback-form {
+  display: grid;
+  gap: 18px;
+  align-content: start;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.field[hidden] {
+  display: none;
+}
+
+.field--choice {
+  border: 0;
+  min-width: 0;
+}
+
+.field label,
+.field legend {
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.field legend {
+  padding: 0;
+  margin-bottom: 8px;
+}
+
+.field .optional {
+  margin-left: 6px;
+  color: var(--faint);
+  font-weight: 400;
+}
+
+.field input,
+.field textarea,
+.field select {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+
+.field textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 40px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23a1a1aa' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  background-size: 16px;
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--faint);
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible,
+.field select:focus-visible {
+  outline: none;
+  border-color: rgba(var(--accent-rgb), 0.6);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16);
+}
+
+.choice-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice {
+  position: relative;
+}
+
+.choice input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.choice span {
+  display: inline-flex;
+  align-items: center;
+  height: 40px;
+  padding: 0 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 0.925rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), border-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.choice input:checked + span {
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--accent-rgb), 0.4);
+  color: var(--accent);
+}
+
+.choice input:focus-visible + span {
+  outline: 2px solid rgba(var(--accent-rgb), 0.8);
+  outline-offset: 3px;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.field-row .field:last-child {
+  grid-column: 1 / -1;
+}
+
+.feedback-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.feedback-fallback {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1px solid rgba(var(--accent-rgb), 0.28);
+  color: var(--muted);
+  font-size: 0.925rem;
+}
+
+.feedback-fallback[hidden] {
+  display: none;
+}
+
+.feedback-fallback strong {
+  color: var(--text);
+}
+
+.feedback-fallback pre {
+  overflow-x: auto;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.feedback-fallback pre code {
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+.feedback-fallback-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 /* --- Motion ---------------------------------------------------------------- */
 /* script.js swaps the html class from no-js to js and adds .visible when a
    .reveal element scrolls into view. Without JavaScript nothing is hidden. */
@@ -1724,6 +2009,11 @@ code {
   .download-grid {
     grid-template-columns: 1fr;
   }
+
+  .feedback-card {
+    grid-template-columns: 1fr;
+    gap: 28px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1777,6 +2067,14 @@ code {
     padding: 24px 20px;
   }
 
+  .feedback-card {
+    padding: 28px 22px;
+  }
+
+  .field-row {
+    grid-template-columns: 1fr;
+  }
+
   .build-details {
     padding: 0 20px;
   }
@@ -1792,7 +2090,8 @@ code {
     padding: 0 18px;
   }
 
-  .hero-actions .btn {
+  .hero-actions .btn,
+  .feedback-actions .btn {
     width: 100%;
   }
 
