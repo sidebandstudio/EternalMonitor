@@ -23,11 +23,12 @@ https://testflight.apple.com/join/ppc9QfXc
 
 The App Store Connect app and CI signing credentials are already configured
 for `sidebandstudio/EternalMonitor`. iPad v0.3.0, build 143, was uploaded and
-submitted for external beta review on September 25, 2026. It belongs to the
+submitted for external beta review on September 25, 2026, and Apple approved it
+on September 26, 2026. It belongs to the
 `FriendsExternal` group, whose public link and automatic tester notification
 are enabled. The feedback and review contact email is `Whois.younes@gmail.com`.
 
-External installation opens after Apple approves the build. Pair it with the
+External installation is open. Pair it with the
 [current stable Windows release](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0).
 The setup instructions below are for maintaining or replacing that configuration.
 
@@ -139,8 +140,13 @@ Two links, and they must match:
 
 - The v0.3.0 Windows installer, shown as the current stable release on
   eternalmonitor.dev/download.html. Its bytes are unchanged from v0.3.0-rc.1.
-- The TestFlight public link for iPad v0.3.0, build 143. External installation
-  requires Apple's beta review approval.
+- The TestFlight public link for iPad v0.3.0, build 143. Apple approved it for
+  external testing on September 26, 2026.
+
+Tell them where feedback goes: the form at
+https://eternalmonitor.dev/download.html#feedback (it opens their mail app
+addressed to hello@sideband.studio), TestFlight's Send Beta Feedback, or a
+GitHub issue.
 
 Use the matching release pair. v0.1 and v2 builds cannot stream together.
 v0.3 keeps the v2 prefix and negotiates new features, but mixing older builds
