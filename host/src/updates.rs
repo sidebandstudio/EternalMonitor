@@ -1031,12 +1031,27 @@ pub fn clear_mismatch() {
     MISMATCH.clear();
 }
 
-/// Title and body for the PC's mismatch banner.
-pub fn mismatch_text(side: OlderSide) -> (&'static str, &'static str) {
+/// The button on the PC's mismatch banner: install the update once one is
+/// found, look for it until then.
+pub fn mismatch_button(update_found: bool) -> &'static str {
+    if update_found {
+        "Update now"
+    } else {
+        "Check for updates"
+    }
+}
+
+/// Title and body for the PC's mismatch banner. The body names the button
+/// [`mismatch_button`] shows.
+pub fn mismatch_text(side: OlderSide, update_found: bool) -> (&'static str, &'static str) {
     match side {
-        OlderSide::Pc => (
+        OlderSide::Pc if update_found => (
             "Update this PC to connect your iPad",
             "The iPad app is newer than EternalMonitor on this PC, so they can't connect. Click Update now.",
+        ),
+        OlderSide::Pc => (
+            "Update this PC to connect your iPad",
+            "The iPad app is newer than EternalMonitor on this PC, so they can't connect. Click Check for updates, then Update now.",
         ),
         OlderSide::Ipad => (
             "Update the iPad app to connect",

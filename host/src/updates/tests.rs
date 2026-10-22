@@ -935,15 +935,31 @@ fn the_helper_is_copied_out_and_held_unchanged() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The PC's mismatch banner says to click the button it shows: Check for
+/// updates until an update is found, then Update now.
+#[test]
+fn the_mismatch_text_names_the_button_the_banner_shows() {
+    for update_found in [false, true] {
+        let (_, body) = mismatch_text(OlderSide::Pc, update_found);
+        let button = mismatch_button(update_found);
+        assert!(
+            body.contains(&format!("Click {button}")),
+            "{body:?} does not name {button:?}"
+        );
+    }
+    assert_eq!(mismatch_button(false), "Check for updates");
+    assert_eq!(mismatch_button(true), "Update now");
+}
+
 #[test]
 fn mismatch_names_the_older_side() {
     assert_eq!(older_side(2, 2), None);
     assert_eq!(older_side(1, 3), None);
     assert_eq!(older_side(3, 4), Some(OlderSide::Pc));
     assert_eq!(older_side(1, 1), Some(OlderSide::Ipad));
-    let (title, body) = mismatch_text(OlderSide::Pc);
+    let (title, body) = mismatch_text(OlderSide::Pc, true);
     assert!(title.contains("this PC") && body.contains("Update now"));
-    let (title, body) = mismatch_text(OlderSide::Ipad);
+    let (title, body) = mismatch_text(OlderSide::Ipad, false);
     assert!(title.contains("iPad") && body.contains("TestFlight"));
 
     let log = MismatchLog::default();

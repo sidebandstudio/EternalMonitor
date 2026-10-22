@@ -144,18 +144,14 @@ impl AnalyzerApp {
     }
 
     fn mismatch_banner(&mut self, ui: &mut Ui, side: OlderSide) {
-        let (title, body) = crate::updates::mismatch_text(side);
+        let available = self.updates.available_version().is_some();
+        let (title, body) = crate::updates::mismatch_text(side, available);
         let mut action = None;
         match side {
             OlderSide::Pc => {
-                let available = self.updates.available_version().is_some();
                 widgets::banner(ui, WARNING, Icon::Warning, title, body, 300.0, |ui| {
                     widgets::link(ui, "Download from the website", WEBSITE_DOWNLOAD);
-                    let label = if available {
-                        "Update now"
-                    } else {
-                        "Check for updates"
-                    };
+                    let label = crate::updates::mismatch_button(available);
                     if widgets::button(ui, Tone::Primary, None, label).clicked() {
                         action = Some(available);
                     }
