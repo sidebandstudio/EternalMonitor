@@ -134,6 +134,16 @@ final class SupportDiagnostics: @unchecked Sendable {
             withTemplate: "$1$2[REDACTED]")
     }
 
+    /// Why the PC asked this iPad for its code, for the support log. It says
+    /// what the iPad sent, never the code or the saved pairing.
+    static func pairingRefusal(_ status: HelloStatus, codeSent: Bool, savedPairing: Bool)
+        -> (level: DiagnosticLevel, message: String) {
+        if status == .rateLimited { return (.warning, "Pairing refused: too many wrong codes, wait 60 seconds") }
+        if codeSent { return (.warning, "Pairing refused: wrong pairing code") }
+        if savedPairing { return (.warning, "Pairing refused: saved pairing no longer matches the PC") }
+        return (.info, "Pairing refused: pairing code needed")
+    }
+
     @MainActor
     func recordDeviceSnapshot() {
         let process = ProcessInfo.processInfo

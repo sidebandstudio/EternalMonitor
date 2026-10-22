@@ -53,4 +53,38 @@ final class SupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(files.count, 3)
         for file in files { XCTAssertLessThanOrEqual(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, 1024) }
     }
+
+    /// The support log says why the PC asked for its code: the iPad sent
+    /// nothing yet, a wrong code, or a saved pairing the PC no longer has.
+    @MainActor func testPairingRefusalsSayWhatTheIPadSent() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let refused = await Task.detached { host.acceptSession(status: .unauthorized) }.value
+        XCTAssertTrue(refused, "the iPad never sent HELLO2")
+        for _ in 0..<500 where manager.pairingPrompt == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        manager.pairingPrompt?.code = "123456"
+        manager.submitPairing()
+        let again = await Task.detached { host.acceptSession(status: .unauthorized) }.value
+        XCTAssertTrue(again, "the code was never sent")
+        func pairing() -> [String] { manager.diagnostics.filter { $0.category == "pairing" }.map(\.message) }
+        for _ in 0..<500 where pairing().count < 2 { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(pairing(), ["Pairing refused: pairing code needed", "Pairing refused: wrong pairing code"])
+        XCTAssertEqual(manager.diagnostics.last { $0.category == "pairing" }?.level, .warning)
+    }
+
+    func testPairingRefusalMessages() {
+        let cases: [(HelloStatus, Bool, Bool, DiagnosticLevel, String)] = [
+            (.unauthorized, false, false, .info, "Pairing refused: pairing code needed"),
+            (.unauthorized, false, true, .warning, "Pairing refused: saved pairing no longer matches the PC"),
+            (.unauthorized, true, false, .warning, "Pairing refused: wrong pairing code"),
+            (.rateLimited, true, false, .warning, "Pairing refused: too many wrong codes, wait 60 seconds"),
+        ]
+        for (status, codeSent, savedPairing, level, message) in cases {
+            let refusal = SupportDiagnostics.pairingRefusal(status, codeSent: codeSent, savedPairing: savedPairing)
+            XCTAssertEqual(refusal.level, level)
+            XCTAssertEqual(refusal.message, message)
+        }
+    }
 }
