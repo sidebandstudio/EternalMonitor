@@ -274,6 +274,9 @@ pub async fn start_sender(
                                             &config,
                                             Instant::now(),
                                         );
+                                        if let Some(status) = actions.hello.take() {
+                                            note_hello(src, status);
+                                        }
                                         if actions.new_target.is_some() || actions.client_lost {
                                             input_relay.reset();
                                             retransmit_ring.clear();
@@ -632,6 +635,14 @@ async fn repair_while_pacing(
             }
         }
     }
+}
+
+/// Every HELLO2 the host answered, over Wi-Fi or the cable, with how: the
+/// one place the diagnostics signal records connection attempts. Accepted,
+/// pairing, busy and version outcomes are already logged where they're
+/// decided; this keeps a trace of each answer for local debugging.
+fn note_hello(peer: PeerId, status: eternal_wire::v2::control::HelloStatus) {
+    debug!(%peer, ?status, "Answered a HELLO");
 }
 
 async fn execute_actions(
