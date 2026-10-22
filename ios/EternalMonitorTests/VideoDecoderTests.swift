@@ -202,90 +202,6 @@ final class VideoDecoderTests: XCTestCase {
         wait(for: [frames], timeout: 10)
     }
 
-    func testFrameAfterALostReferenceIsHeldUntilTheNextKeyframe() throws {
-        // The reassembler dropped the frame before seq 2. Decoding seq 2
-        // would draw it against the wrong reference (smeared blocks) or make
-        // VideoToolbox fail with -12909, as 0.3.1 iPads reported.
-        let gop = try gopFixture()
-        let decoder = VideoDecoder()
-        defer { decoder.shutdown() }
-        let shown = OSAllocatedUnfairLock(initialState: [UInt64]())
-        let errors = OSAllocatedUnfairLock(initialState: 0)
-        let first = expectation(description: "first keyframe")
-        let resumed = expectation(description: "frames after the next keyframe")
-        resumed.expectedFulfillmentCount = 2
-        decoder.onFrameDecoded = { _, timestamp in
-            shown.withLock { $0.append(timestamp / 16_667) }
-            if timestamp == 16_667 { first.fulfill() }
-            if timestamp >= 3 * 16_667 { resumed.fulfill() }
-        }
-        decoder.onEvent = { message in
-            if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") {
-                errors.withLock { $0 += 1 }
-            }
-        }
-        decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
-        wait(for: [first], timeout: 10)
-
-        decoder.referenceLost()
-        decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
-        decoder.decode(packet: packet(seq: 3, data: gop.idr, keyframe: true))
-        decoder.decode(packet: packet(seq: 4, data: gop.p, keyframe: false))
-        wait(for: [resumed], timeout: 10)
-
-        XCTAssertEqual(shown.withLock { $0 }, [1, 3, 4], "the frame after the loss must not be shown")
-        XCTAssertEqual(errors.withLock { $0 }, 0)
-        XCTAssertNil(decoder.keyframeWaitUs, "a keyframe ends the wait")
-    }
-
-    func testHeldPictureAsksAgainForAKeyframeOncePerSecond() throws {
-        // The reassembler's request, or the host's keyframe, can be lost too.
-        // Before this the decoder dropped every dependent frame silently and
-        // the picture stayed frozen until the host's next periodic keyframe.
-        let gop = try gopFixture()
-        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
-        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
-        defer { decoder.shutdown() }
-        let requests = OSAllocatedUnfairLock(initialState: 0)
-        let events = OSAllocatedUnfairLock(initialState: [String]())
-        decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
-        decoder.onEvent = { message in events.withLock { $0.append(message) } }
-        let first = expectation(description: "first keyframe")
-        let restored = expectation(description: "keyframe after the wait")
-        decoder.onFrameDecoded = { _, timestamp in
-            if timestamp == 16_667 { first.fulfill() }
-            if timestamp == 9 * 16_667 { restored.fulfill() }
-        }
-        decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
-        wait(for: [first], timeout: 10)
-
-        decoder.referenceLost()
-        let holding = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs != nil }, evaluatedWith: nil)
-        wait(for: [holding], timeout: 5)
-
-        func dependentFrame(at seconds: Double, seq: UInt32) {
-            clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) }
-            decoder.decode(packet: packet(seq: seq, data: gop.p, keyframe: false))
-        }
-        func waitForRequests(_ count: Int) {
-            let met = expectation(for: NSPredicate { _, _ in requests.withLock { $0 } >= count }, evaluatedWith: nil)
-            wait(for: [met], timeout: 5)
-        }
-        dependentFrame(at: 0.5, seq: 2)
-        dependentFrame(at: 1.1, seq: 3)
-        waitForRequests(1)
-        dependentFrame(at: 1.5, seq: 4)
-        dependentFrame(at: 2.2, seq: 5)
-        waitForRequests(2)
-        XCTAssertEqual(decoder.keyframeWaitUs, 2_200_000)
-
-        decoder.decode(packet: packet(seq: 9, data: gop.idr, keyframe: true))
-        wait(for: [restored], timeout: 10)
-        XCTAssertEqual(requests.withLock { $0 }, 2)
-        XCTAssertNil(decoder.keyframeWaitUs)
-        XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
-    }
-
     private func fixture(_ name: String, _ ext: String) throws -> Data {
         let url = try XCTUnwrap(Bundle(for: VideoDecoderTests.self).url(forResource: name, withExtension: ext, subdirectory: "Fixtures"),
                                 "\(name).\(ext) fixture missing from the test bundle")
@@ -348,5 +264,184 @@ final class VideoDecoderTests: XCTestCase {
         decoder.decode(packet: packet(seq: 3, data: gop.idr, keyframe: true))
         wait(for: [asked, shown], timeout: 10)
         XCTAssertEqual(requests.withLock { $0 }, 1, "one request, not one per frame")
+    }
+
+    // MARK: - Reference loss, from the bitstream
+
+    /// Eight access units, IDR P P P IDR P P P, as an encoder sends them.
+    private func twoGOPs(_ ext: String) throws -> [Data] {
+        let data = try fixture("gop2_64x64", ext)
+        var starts: [(offset: Int, payload: Int)] = []
+        var i = 0
+        while i + 3 <= data.count {
+            if data[i] == 0, data[i + 1] == 0, data[i + 2] == 1 {
+                starts.append((i > 0 && data[i - 1] == 0 ? i - 1 : i, i + 3)); i += 3
+            } else { i += 1 }
+        }
+        var units: [Data] = []
+        var pending = Data()
+        for (n, start) in starts.enumerated() {
+            let end = n + 1 < starts.count ? starts[n + 1].offset : data.count
+            let nal = data[start.offset..<end]
+            let header = data[start.payload]
+            let isSlice = ext == "h264" ? [1, 5].contains(header & 0x1F) : (header >> 1) & 0x3F <= 31
+            pending.append(nal)
+            if isSlice { units.append(pending); pending = Data() }
+        }
+        XCTAssertEqual(units.count, 8)
+        return units
+    }
+
+    private struct Run {
+        var shown: [UInt32] = []
+        var requests = 0
+        var errors = 0
+        var events: [String] = []
+    }
+
+    /// Decodes (seq, access unit index) pairs and reports which seqs were shown.
+    private func run(_ ext: String, _ frames: [(UInt32, Int)], decoder: VideoDecoder = VideoDecoder()) throws -> (Run, VideoDecoder) {
+        let units = try twoGOPs(ext)
+        let state = OSAllocatedUnfairLock(initialState: Run())
+        decoder.onFrameDecoded = { _, timestamp in state.withLock { $0.shown.append(UInt32(timestamp / 16_667)) } }
+        decoder.onNeedsKeyframe = { state.withLock { $0.requests += 1 } }
+        decoder.onEvent = { message in
+            state.withLock {
+                $0.events.append(message)
+                if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") { $0.errors += 1 }
+            }
+        }
+        for (seq, index) in frames {
+            decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
+        }
+        let drained = expectation(description: "decode queue drained")
+        decoder.shutdown { drained.fulfill() }
+        wait(for: [drained], timeout: 10)
+        return (state.withLock { $0 }, decoder)
+    }
+
+    func testFrameAfterAWholeLostFrameIsHeldUntilTheNextKeyframe() throws {
+        // seq 3 never reached the iPad, not even one fragment, so the
+        // reassembler counted nothing. Decoding seq 4 would draw it against
+        // the wrong reference: smeared blocks or -12909.
+        for ext in ["h264", "h265"] {
+            let (result, _) = try run(ext, [(1, 0), (2, 1), (4, 3), (5, 4), (6, 5)])
+            XCTAssertEqual(result.shown, [1, 2, 5, 6], ext)
+            XCTAssertEqual(result.requests, 1, "\(ext): a lost frame asks for a keyframe at once")
+            XCTAssertEqual(result.errors, 0, ext)
+        }
+    }
+
+    func testHostSkippingFrameNumbersIsNotALoss() throws {
+        // The host numbers frames as captured and drops captured frames its
+        // encoder had no time for, so frame_seq skips with nothing lost.
+        for ext in ["h264", "h265"] {
+            let (result, decoder) = try run(ext, [(1, 0), (2, 1), (5, 2), (9, 3), (10, 4), (14, 5), (15, 6)])
+            XCTAssertEqual(result.shown, [1, 2, 5, 9, 10, 14, 15], ext)
+            XCTAssertEqual(result.requests, 0, ext)
+            XCTAssertNil(decoder.keyframeWaitUs, ext)
+        }
+    }
+
+    func testLosslessStreamIsNeverHeld() throws {
+        // USB is a TCP tunnel: every frame arrives, in order.
+        for ext in ["h264", "h265"] {
+            let (result, _) = try run(ext, (0..<8).map { (UInt32($0 + 1), $0) })
+            XCTAssertEqual(result.shown, Array(1...8), ext)
+            XCTAssertEqual(result.requests, 0, ext)
+        }
+    }
+
+    func testLostKeyframeHoldsTheFramesThatFollowIt() throws {
+        // The replacement keyframe (seq 3) was dropped unfinished; seq 4
+        // depends on it, not on seq 2.
+        for ext in ["h264", "h265"] {
+            let (result, _) = try run(ext, [(1, 0), (2, 1), (4, 5), (5, 6), (6, 4), (7, 5)])
+            XCTAssertEqual(result.shown, [1, 2, 6, 7], ext)
+            XCTAssertEqual(result.errors, 0, ext)
+        }
+    }
+
+    func testStreamRestartWithoutItsKeyframeIsHeld() throws {
+        // A new stream epoch numbers from 1 again; its first keyframe was lost.
+        for ext in ["h264", "h265"] {
+            let (result, _) = try run(ext, [(7, 0), (8, 1), (1, 1), (2, 2), (3, 4), (4, 5)])
+            XCTAssertEqual(result.shown, [7, 8, 3, 4], ext)
+        }
+    }
+
+    func testRecoveredPictureIsNotHeldByALossCountedLater() throws {
+        // Sol's sequence: keyframe 1, frame 2 arrives partly, the replacement
+        // keyframe 3, then frame 4. Without repair (USB, older PCs) the
+        // reassembler delivers 3 as soon as it completes and only then counts
+        // 2 as dropped, after 3 has already restored the picture. The first
+        // counter-based detector then held 4: [1, 3] and a frozen picture.
+        for ext in ["h264", "h265"] {
+            let units = try twoGOPs(ext)
+            let assembler = FrameAssembler()
+            let decoder = VideoDecoder()
+            let shown = OSAllocatedUnfairLock(initialState: [UInt32]())
+            decoder.onFrameDecoded = { _, timestamp in shown.withLock { $0.append(UInt32(timestamp / 16_667)) } }
+            // The same hand-off as ConnectionManager's.
+            assembler.onFrameAssembled = { data, seq, _, isKeyframe in
+                decoder.decode(packet: self.packet(seq: seq, data: data, keyframe: isKeyframe))
+            }
+            func send(_ seq: UInt32, _ data: Data, keyframe: Bool, fragments: [Int]? = nil) {
+                let size = max(1, (data.count + 1) / 2)
+                let count = (data.count + size - 1) / size
+                for index in fragments ?? Array(0..<count) {
+                    let chunk = data[data.startIndex + index * size..<min(data.startIndex + (index + 1) * size, data.endIndex)]
+                    assembler.addFragment(seq: seq, index: UInt16(index), count: UInt16(count), epoch: 1,
+                                          isKeyframe: keyframe, captureTimestampUs: 0, payload: Data(chunk))
+                }
+            }
+            send(1, units[0], keyframe: true)
+            send(2, units[1], keyframe: false, fragments: [1])
+            send(3, units[4], keyframe: true)
+            send(4, units[5], keyframe: false)
+            let drained = expectation(description: "decoded")
+            decoder.shutdown { drained.fulfill() }
+            wait(for: [drained], timeout: 10)
+            XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1, ext)
+            XCTAssertEqual(shown.withLock { $0 }, [1, 3, 4], ext)
+        }
+    }
+
+    func testHeldPictureAsksAgainForAKeyframeOncePerSecond() throws {
+        // The first request, or the host's keyframe, can be lost too.
+        let units = try twoGOPs("h264")
+        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
+        defer { decoder.shutdown() }
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let restored = expectation(description: "keyframe after the wait")
+        decoder.onFrameDecoded = { _, timestamp in if timestamp == 20 * 16_667 { restored.fulfill() } }
+        func frame(_ seq: UInt32, _ index: Int, at seconds: Double) {
+            clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) }
+            decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
+        }
+        func waitFor(_ count: Int) {
+            let met = expectation(for: NSPredicate { _, _ in requests.withLock { $0 } >= count }, evaluatedWith: nil)
+            wait(for: [met], timeout: 10)
+        }
+        frame(1, 0, at: 0)
+        frame(2, 1, at: 0)
+        frame(4, 3, at: 0)      // seq 3 lost: hold, and ask at once
+        waitFor(1)
+        frame(5, 3, at: 0.5)
+        frame(6, 3, at: 1.1)
+        waitFor(2)
+        frame(7, 3, at: 1.5)
+        frame(8, 3, at: 2.2)
+        waitFor(3)
+        XCTAssertEqual(decoder.keyframeWaitUs, 2_200_000)
+        frame(20, 4, at: 2.2)
+        wait(for: [restored], timeout: 10)
+        XCTAssertEqual(requests.withLock { $0 }, 3)
+        XCTAssertNil(decoder.keyframeWaitUs)
+        XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
     }
 }

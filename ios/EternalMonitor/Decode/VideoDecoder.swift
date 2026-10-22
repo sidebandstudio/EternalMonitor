@@ -58,6 +58,8 @@ final class VideoDecoder {
     /// decoding normally and before the first keyframe of a session.
     private let keyframeWaitStart = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
     private let nowUs: () -> UInt64
+    /// Whether each picture follows a lost reference picture.
+    private var continuity = ReferenceContinuity()
 
     /// A request can be lost on Wi-Fi as easily as the frame it replaces, so
     /// one is sent again this often while dependent frames keep arriving.
@@ -95,20 +97,6 @@ final class VideoDecoder {
         }
     }
 
-    /// A frame before the next one was lost, so frames until the next keyframe
-    /// would decode against a missing reference: smeared blocks, or a
-    /// VideoToolbox error. Hold the current picture until a keyframe instead.
-    /// Queued behind the frames already assembled, ahead of later ones.
-    func referenceLost() {
-        decodeQueue.async { [weak self] in
-            guard let self, !self.isShutdown, self.decompressionSession != nil,
-                  !self.waitingForSyncSample else { return }
-            self.beginWaitingForKeyframe()
-            // The reassembler has just asked the host for one.
-            self.lastKeyframeRequestUs = self.nowUs()
-        }
-    }
-
     private func beginWaitingForKeyframe() {
         guard !waitingForSyncSample else { return }
         waitingForSyncSample = true
@@ -140,6 +128,7 @@ final class VideoDecoder {
             self.pps = nil
             self.waitingForSyncSample = true
             self.keyframeWaitStart.withLock { $0 = nil }
+            self.continuity = ReferenceContinuity()
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
             self.hasLoggedEmptyPayload = false
@@ -203,9 +192,10 @@ final class VideoDecoder {
             sps = nil
             pps = nil
             waitingForSyncSample = true
+            continuity = ReferenceContinuity()
         }
         if codec == .hevc {
-            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs)
+            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs, seq: packet.seq)
             return
         }
 
@@ -241,7 +231,10 @@ final class VideoDecoder {
         // Adopt the access unit's parameter sets together. One at a time, a
         // new SPS met the old PPS first: a format that never existed, which
         // could rebuild the session or be accepted by it in place.
-        if sawParameterSets { tryCreateFormatDescription() }
+        if sawParameterSets {
+            tryCreateFormatDescription()
+            continuity.adoptH264(sps: sps)
+        }
 
         if hasSliceNAL {
             let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
@@ -252,7 +245,7 @@ final class VideoDecoder {
                     "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
                 )
             }
-            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
+            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample, seq: packet.seq)
         }
     }
 
@@ -273,7 +266,7 @@ final class VideoDecoder {
         return nil
     }
 
-    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64) {
+    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64, seq: UInt32) {
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
         var isSyncSample = false
@@ -305,9 +298,12 @@ final class VideoDecoder {
             }
         }
         // VPS, SPS and PPS together, as for H.264.
-        if sawParameterSets { tryCreateHEVCFormatDescription() }
+        if sawParameterSets {
+            tryCreateHEVCFormatDescription()
+            continuity.adoptHEVC(sps: sps, pps: pps)
+        }
         if hasSliceNAL {
-            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample)
+            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample, seq: seq)
         }
     }
 
@@ -528,7 +524,7 @@ final class VideoDecoder {
 
     // MARK: - Decode an access unit
 
-    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool) {
+    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32) {
         guard let session = decompressionSession, let formatDescription else {
             requestKeyframeIfOverdue()
             let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
@@ -541,6 +537,14 @@ final class VideoDecoder {
         let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
         if waitingForSyncSample && !isSyncSample {
             requestKeyframeIfOverdue()
+            return
+        }
+        if !admitted(nalUnits, isSyncSample: isSyncSample, seq: seq) {
+            // A reference picture before this one never arrived (lost whole,
+            // or dropped unfinished). Hold and ask for a keyframe now.
+            beginWaitingForKeyframe()
+            lastKeyframeRequestUs = nowUs()
+            onNeedsKeyframe?()
             return
         }
         if isSyncSample {
@@ -677,6 +681,17 @@ final class VideoDecoder {
         if status != noErr || infoFlags.contains(.frameDropped) { finish() }
         if status != noErr {
             recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame", onSyncSample: isSyncSample)
+        }
+    }
+
+    private func admitted(_ nalUnits: [Data], isSyncSample: Bool, seq: UInt32) -> Bool {
+        switch codec {
+        case .h264:
+            guard let slice = nalUnits.first(where: { [1, 5].contains($0[$0.startIndex] & 0x1F) }) else { return true }
+            return continuity.admitH264(firstSlice: slice, isKeyframe: isSyncSample, seq: seq)
+        case .hevc:
+            guard let slice = nalUnits.first(where: { ($0[$0.startIndex] >> 1) & 0x3F <= 31 }) else { return true }
+            return continuity.admitHEVC(firstSlice: slice, isKeyframe: isSyncSample, seq: seq)
         }
     }
 
@@ -842,7 +857,8 @@ private enum H264SliceKind {
     }
 }
 
-private struct H264BitReader {
+/// Exp-Golomb bit reader for H.264 and HEVC headers (RBSP bytes).
+struct H264BitReader {
     let bytes: [UInt8]
     var bitOffset = 0
 
@@ -881,6 +897,19 @@ private struct H264BitReader {
         }
 
         return ((UInt32(1) << UInt32(leadingZeroBits)) - 1) + suffix
+    }
+
+    mutating func readSE() -> Int32? {
+        guard let code = readUE() else { return nil }
+        let magnitude = Int32(bitPattern: (code &+ 1) / 2)
+        return code % 2 == 1 ? magnitude : -magnitude
+    }
+
+    /// Skips `count` bits; false if fewer remain.
+    mutating func skip(_ count: Int) -> Bool {
+        guard bitOffset + count <= bytes.count * 8 else { return false }
+        bitOffset += count
+        return true
     }
 }
 

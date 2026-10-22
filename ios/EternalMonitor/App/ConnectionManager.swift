@@ -432,13 +432,8 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        // Only the receive queue delivers frames, so it alone uses this.
-        var lossDetector = ReferenceLossDetector()
-        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-            if let counters = assembler?.counters.withLock({ $0 }), lossDetector.lostSincePreviousFrame(counters) {
-                decoder?.referenceLost()
-            }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(
