@@ -30,9 +30,9 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -223,8 +223,15 @@ pub fn run_capture_loop(
     let output1: IDXGIOutput1 = output.cast()?;
     // `None` only between releasing a lost duplication and creating its
     // replacement inside the ACCESS_LOST handler.
-    let mut duplication: Option<IDXGIOutputDuplication> =
-        Some(unsafe { output1.DuplicateOutput(&device) }.map_err(blocked_or_error)?);
+    let mut duplication: Option<IDXGIOutputDuplication> = Some(
+        unsafe { output1.DuplicateOutput(&device) }
+            .inspect_err(|error| {
+                if error.code() == DXGI_ERROR_UNSUPPORTED {
+                    offer_gpu_switch(&output1, &adapter, &shared);
+                }
+            })
+            .map_err(blocked_or_error)?,
+    );
     info!("Desktop duplication active");
 
     // --- Query desktop dimensions from duplication ---
@@ -695,6 +702,23 @@ fn resend_last_frame(
         height,
     });
     *last_send = now;
+}
+
+/// The adapter this process runs on cannot duplicate `output` (a hybrid PC
+/// running EternalMonitor on the other GPU). Works out which graphics card
+/// setting would fix it, once per process, for the notice to offer.
+fn offer_gpu_switch(output: &IDXGIOutput1, adapter: &IDXGIAdapter1, shared: &SharedControl) {
+    if shared.gpu_switch.lock().is_some() {
+        return;
+    }
+    let (Ok(output_desc), Ok(adapter_desc)) =
+        (unsafe { output.GetDesc() }, unsafe { adapter.GetDesc1() })
+    else {
+        return;
+    };
+    let device_name = utf16_to_string(&output_desc.DeviceName);
+    *shared.gpu_switch.lock() =
+        crate::gpu_preference::suggest_switch(&device_name, adapter_desc.AdapterLuid);
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which

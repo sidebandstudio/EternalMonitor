@@ -116,7 +116,31 @@ impl AnalyzerApp {
         if let Some((icon, title, body)) =
             capture_block_notice(capture_block, snap.pipeline_running)
         {
-            widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            let switch = (capture_block == Some(CaptureBlock::UnsupportedOnThisGpu))
+                .then(|| self.control.shared.gpu_switch.lock().clone())
+                .flatten();
+            match switch {
+                Some(switch) => {
+                    let mut clicked = false;
+                    widgets::banner(
+                        ui,
+                        WARNING,
+                        icon,
+                        title,
+                        &gpu_switch_body(&switch.adapter_name),
+                        200.0,
+                        |ui| {
+                            clicked =
+                                widgets::button(ui, Tone::Primary, None, "Switch graphics card")
+                                    .clicked();
+                        },
+                    );
+                    if clicked {
+                        self.switch_graphics_card(ui, &switch);
+                    }
+                }
+                None => widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {}),
+            }
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
@@ -589,6 +613,14 @@ enum HeaderAction {
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 const NVIDIA_DRIVERS_URL: &str = "https://www.nvidia.com/en-us/drivers/";
+
+/// The notice body when EternalMonitor can move itself to the graphics card
+/// the screen is wired to.
+pub(super) fn gpu_switch_body(adapter_name: &str) -> String {
+    format!(
+        "Your screen is connected to the {adapter_name}. Click Switch graphics card and EternalMonitor reopens on it. You can change this later in Settings > System > Display > Graphics."
+    )
+}
 
 /// What the CPU fallback notice says: undo custom settings first, name the
 /// NVIDIA driver version when that is what the graphics card refused, or

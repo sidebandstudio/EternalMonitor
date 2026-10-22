@@ -497,6 +497,14 @@ fn review_screens() {
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
         save(&mut h, &format!("problem-{name}"));
     }
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_switch.lock() = Some(eternal_host::gpu_preference::GpuSwitch {
+        preference: 1,
+        adapter_name: "AMD Radeon(TM) Graphics".to_string(),
+    });
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_switch.lock() = None;
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);

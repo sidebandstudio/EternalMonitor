@@ -1,6 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
-    usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, gpu_switch_body, second_screen_notice,
+    software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -287,6 +287,21 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         software_fallback_body(true, false)
     );
     assert!(!software_fallback_body(false, false).contains("570"));
+}
+
+#[test]
+fn the_graphics_card_switch_names_the_card_and_how_to_undo_it() {
+    let body = gpu_switch_body("AMD Radeon(TM) Graphics");
+    assert!(
+        body.contains("connected to the AMD Radeon(TM) Graphics"),
+        "{body}"
+    );
+    assert!(body.contains("Switch graphics card"), "{body}");
+    assert!(body.contains("reopens"), "{body}");
+    assert!(
+        body.contains("Settings > System > Display > Graphics"),
+        "{body}"
+    );
 }
 
 #[test]

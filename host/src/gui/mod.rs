@@ -652,6 +652,26 @@ impl AnalyzerApp {
         self.control.request_restart();
     }
 
+    /// Saves EternalMonitor's graphics card choice and reopens the app, which
+    /// is the only way Windows applies it. If saving fails, the notice falls
+    /// back to the steps in Windows Settings.
+    fn switch_graphics_card(&mut self, ui: &egui::Ui, switch: &crate::gpu_preference::GpuSwitch) {
+        #[cfg(windows)]
+        let result = crate::gpu_preference::switch_and_reopen(switch);
+        #[cfg(not(windows))]
+        let result: Result<(), String> = Err(format!(
+            "switching to {} needs Windows",
+            switch.adapter_name
+        ));
+        match result {
+            Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(error) => {
+                warn!(%error, "Could not switch EternalMonitor's graphics card");
+                *self.control.shared.gpu_switch.lock() = None;
+            }
+        }
+    }
+
     fn copy(&mut self, ctx: &egui::Context, what: Copied, text: String) {
         ctx.copy_text(text);
         self.copied = Some((what, Instant::now()));

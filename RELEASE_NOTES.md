@@ -121,6 +121,11 @@ Windows changes.
   links to NVIDIA's driver page.
 - On PCs that encode with Intel Quick Sync, the last change on a still screen
   reaches the iPad right away. Previously it could arrive up to 3 seconds late.
+- On a laptop with two graphics cards, when Windows runs EternalMonitor on the
+  card the screen isn't connected to, the notice names the right card and
+  offers **Switch graphics card**. EternalMonitor then saves its own choice in
+  Windows graphics settings and reopens on that card. Nothing changes until
+  you click.
 
 ### What to test
 
