@@ -108,6 +108,61 @@ final class AudioPlayerTests: XCTestCase {
         }
     }
 
+    private final class FailingOutput: AudioOutputDevice {
+        let failures: Int
+        let starts = OSAllocatedUnfairLock(initialState: 0)
+        init(failures: Int) { self.failures = failures }
+        func start(pcm: AudioPCMBuffer) throws {
+            let start = starts.withLock { value -> Int in value += 1; return value }
+            if start <= failures { throw NSError(domain: "AudioOutputTests", code: start) }
+        }
+        func stop(deactivate: Bool) {}
+    }
+
+    private func feed(_ player: AudioPlayer, seconds: Double, from seq: inout UInt32, until done: () -> Bool = { false }) throws {
+        let opus = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "tone_1khz_20ms",
+            withExtension: "opus", subdirectory: "Fixtures")))
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !done() {
+            seq += 1
+            player.receive(header: AudioHeader(sessionId: 7, streamEpoch: 1, audioSeq: seq,
+                captureTimestampUs: UInt64(seq) * 20_000, discontinuity: seq == 1), opus: opus)
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
+    func testResetRetriesAnAudioStartThatFailed() throws {
+        // Sol: a start that failed latched the player off, and the reset that
+        // could have fixed it never cleared the latch.
+        for name in [AVAudioSession.mediaServicesWereResetNotification, .AVAudioEngineConfigurationChange] {
+            let output = FailingOutput(failures: 1)
+            let player = AudioPlayer(output: output)
+            defer { player.stop() }
+            var seq: UInt32 = 0
+            try feed(player, seconds: 2, from: &seq) { player.stats.error != nil }
+            XCTAssertNotNil(player.stats.error, "\(name.rawValue): the first start fails")
+            NotificationCenter.default.post(name: name,
+                object: name == .AVAudioEngineConfigurationChange ? nil : AVAudioSession.sharedInstance())
+            try feed(player, seconds: 2, from: &seq) { player.stats.playing }
+            XCTAssertTrue(player.stats.playing, "\(name.rawValue): audio must come back after the reset")
+            XCTAssertNil(player.stats.error)
+            XCTAssertEqual(output.starts.withLock { $0 }, 2)
+        }
+    }
+
+    func testResetRetriesAFailedStartOnlyOnce() throws {
+        let output = FailingOutput(failures: .max)
+        let player = AudioPlayer(output: output)
+        defer { player.stop() }
+        var seq: UInt32 = 0
+        try feed(player, seconds: 2, from: &seq) { player.stats.error != nil }
+        NotificationCenter.default.post(name: AVAudioSession.mediaServicesWereResetNotification,
+                                        object: AVAudioSession.sharedInstance())
+        try feed(player, seconds: 1, from: &seq)
+        XCTAssertEqual(output.starts.withLock { $0 }, 2, "one retry per notification, no loop")
+        XCTAssertNotNil(player.stats.error)
+    }
+
     func testStopWaitsForPendingOutputToCloseBeforeReturning() throws {
         let output = BlockingOutput(entered: expectation(description: "output startup entered"))
         let player = AudioPlayer(output: output)
