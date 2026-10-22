@@ -103,7 +103,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     func record(level: String, category: String, message: String, timestamp: Date) {
         guard configured, enabled else { return }
         guard capacity.wait(timeout: .now()) == .success else { lossLock.lock(); dropped += 1; lossLock.unlock(); return }
-        let message = SupportDiagnostics.redact(String(decoding: message.utf8.prefix(8192), as: UTF8.self))
+        let message = Self.redactForUpload(String(decoding: message.utf8.prefix(8192), as: UTF8.self))
         queue.async {
             defer { self.capacity.signal() }
             guard self.enabled else { return }
@@ -113,6 +113,19 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
             self.persistPending()
         }
     }
+    /// The PC's name, which the HELLO_ACK carries into these lines, is often
+    /// its owner's. Uploads leave it out; the local log and "Copy logs" keep it.
+    private static let pcNamePatterns = [
+        (try! NSRegularExpression(pattern: #"^(Session \d+ established with ).+$"#), "$1[PC-NAME]"),
+        (try! NSRegularExpression(pattern: #"^(Connected to ).+?( session_id=)"#), "$1[PC-NAME]$2"),
+    ]
+
+    static func redactForUpload(_ text: String) -> String {
+        pcNamePatterns.reduce(SupportDiagnostics.redact(text)) { text, rule in
+            rule.0.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: rule.1)
+        }
+    }
+
     private func files() -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
             .filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }

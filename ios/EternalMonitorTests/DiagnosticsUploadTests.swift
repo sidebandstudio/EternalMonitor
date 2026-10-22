@@ -91,6 +91,33 @@ final class DiagnosticsUploadTests: XCTestCase {
         }
         XCTAssertEqual(count, 33)
     }
+
+    /// The PC's name is often its owner's. Uploads leave it out; the local
+    /// log and "Copy logs" keep it.
+    func testUploadsLeaveOutThePCNameAndTheLocalLogKeepsIt() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
+        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
+        defer { upload.shutdown() }
+        let messages = ["Session 41 established with MARIA-LAPTOP",
+                        "Connected to Maria's PC session_id=41 host_caps=31 liveness_ms=3000"]
+        for message in messages {
+            upload.record(level: "info", category: "ctrl", message: message, timestamp: Date())
+        }
+        _ = await upload.status()
+        let uploaded = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+            .flatMap { try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: $0)).events.map(\.message) }
+        XCTAssertEqual(uploaded.sorted(), ["Connected to [PC-NAME] session_id=41 host_caps=31 liveness_ms=3000",
+                                           "Session 41 established with [PC-NAME]"])
+        let local = SupportDiagnostics(directory: directory.appendingPathComponent("log", isDirectory: true))
+        for message in messages { local.record("info", "ctrl", message) }
+        let report = await local.report()
+        for message in messages { XCTAssertTrue(report.contains(message), report) }
+    }
 }
 
 
