@@ -256,6 +256,39 @@ pub fn set_display_mode(device: &str, mode: crate::vdd_settings::VddMode) -> boo
     })
 }
 
+/// The sizes Windows offers for the display `device`.
+#[cfg(windows)]
+pub fn offered_modes(device: &str) -> Vec<(u32, u32)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplaySettingsW, DEVMODEW, ENUM_DISPLAY_SETTINGS_MODE,
+    };
+    let name: Vec<u16> = device.encode_utf16().chain(Some(0)).collect();
+    let mut sizes = Vec::new();
+    for index in 0..1024 {
+        let mut devmode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        if !unsafe {
+            EnumDisplaySettingsW(
+                PCWSTR(name.as_ptr()),
+                ENUM_DISPLAY_SETTINGS_MODE(index),
+                &mut devmode,
+            )
+        }
+        .as_bool()
+        {
+            break;
+        }
+        let size = (devmode.dmPelsWidth, devmode.dmPelsHeight);
+        if !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    sizes
+}
+
 #[cfg(not(windows))]
 pub fn query() -> DeviceState {
     DeviceState::Missing

@@ -457,7 +457,24 @@ fn settle_vdd_mode(
         );
         return chosen;
     };
-    let set = crate::vdd_device::set_display_mode(&chosen.device_name, mode);
+    let mut set = crate::vdd_device::set_display_mode(&chosen.device_name, mode);
+    let mut fallback = None;
+    if !set {
+        // The driver does not offer the iPad's mode: take the sharpest that fits.
+        let offered = crate::vdd_device::offered_modes(&chosen.device_name);
+        if let Some((width, height)) = crate::vdd_settings::best_offered(mode, &offered)
+            .filter(|&size| size != (chosen.width, chosen.height))
+        {
+            let size = crate::vdd_settings::VddMode {
+                width,
+                height,
+                ..mode
+            };
+            set = crate::vdd_device::set_display_mode(&chosen.device_name, size);
+            fallback = Some(size);
+        }
+    }
+    let target = fallback.unwrap_or(mode);
     let mut now = chosen.clone();
     // Windows applies the change asynchronously to DXGI's view of the output.
     for _ in 0..30 {
@@ -468,7 +485,7 @@ fn settle_vdd_mode(
         {
             now = output;
         }
-        if !set || (now.width, now.height) == (mode.width, mode.height) {
+        if !set || (now.width, now.height) == (target.width, target.height) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -477,6 +494,7 @@ fn settle_vdd_mode(
         mode = %format!("{}x{}", now.width, now.height),
         requested = %mode,
         attached = %attached,
+        fallback = %fallback.map_or("none".to_string(), |m| m.to_string()),
         set,
         "Second screen mode"
     );

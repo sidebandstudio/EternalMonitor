@@ -88,6 +88,17 @@ pub fn mode_to_set(requested: Option<VddMode>, attached: (u32, u32)) -> Option<V
     requested.filter(|mode| (mode.width, mode.height) != attached)
 }
 
+/// When the requested mode cannot be set (the driver offers only its own
+/// list), the largest offered size that fits inside it, so the screen is
+/// as sharp as it can be instead of staying at 800x600.
+pub fn best_offered(requested: VddMode, offered: &[(u32, u32)]) -> Option<(u32, u32)> {
+    offered
+        .iter()
+        .copied()
+        .filter(|&(w, h)| w <= requested.width && h <= requested.height)
+        .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
+}
+
 /// Render the settings document. Pure so tests can assert the exact bytes.
 /// `gpu` is the DXGI adapter description the driver matches its render
 /// adapter by; without it the driver chooses.
@@ -434,6 +445,26 @@ mod tests {
                 refresh_hz: 60
             }]
         );
+    }
+
+    #[test]
+    fn without_the_ipads_mode_the_largest_size_that_fits_is_used() {
+        // The driver's own list, as its installer leaves it.
+        let vendor = [
+            (800, 600),
+            (1366, 768),
+            (1920, 1080),
+            (2560, 1440),
+            (3840, 2160),
+        ];
+        let ipad = |w, h| VddMode {
+            width: w,
+            height: h,
+            refresh_hz: 60,
+        };
+        assert_eq!(best_offered(ipad(2048, 1536), &vendor), Some((1920, 1080)));
+        assert_eq!(best_offered(ipad(2752, 2064), &vendor), Some((2560, 1440)));
+        assert_eq!(best_offered(ipad(640, 480), &vendor), None);
     }
 
     #[test]
