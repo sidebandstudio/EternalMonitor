@@ -109,6 +109,18 @@ Windows changes.
   chose the card with the most memory, which on laptops with Intel and NVIDIA
   graphics drives no screen; in 0.3.1 diagnostics none of those laptops got the
   second screen. When two cards have the same name, the driver still chooses.
+- The second screen comes up at the iPad's resolution. Windows restores the
+  size it last saved for the second screen, and in 0.3.1 diagnostics 4 of the 5
+  PCs whose second screen appeared got a tiny, blurry 800×600 one. EternalMonitor
+  now sets the second screen's size itself, and only that display's: the
+  iPad's size, the sharpest size that fits when the driver doesn't offer it, or
+  1920×1080 while the iPad's size isn't known. The log records the size once.
+- A PC set to **Mirror my screen** shows the first picture without waiting for
+  the virtual display to be turned off at startup. A slow or stuck display task
+  held it for up to 19 s in 0.3.1, and about 2 s on a healthy PC.
+- Settings says that **Match the iPad's resolution** applies the next time the
+  second screen starts, when the iPad connects again. Before, changing it
+  seemed to do nothing.
 - Running EternalMonitor-Setup.exe again repairs a virtual display driver that
   Setup installed when none of its devices works, for example after the device
   was removed in Device Manager. Working devices are never removed, and a
