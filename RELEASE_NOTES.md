@@ -100,8 +100,9 @@ Windows changes.
   off it, the page says to choose Extend with Windows key + P or in Display
   settings, and the next try waits 30 seconds for it. EternalMonitor does not
   change the display layout itself. The display task no longer reports success
-  when the display cannot appear, and the device state is in the support
-  diagnostics. In 0.3.1 every case read "no display appeared in time".
+  when the display cannot appear. The support diagnostics and **Copy logs**
+  then hold the device state, the graphics cards and the display paths Windows
+  reports, without the PC's or the user's name. In 0.3.1 every case read "no display appeared in time".
 - The second screen is drawn by the graphics card that drives the main screen,
   whether or not **Match the iPad's resolution** is on. Before, the driver
   chose the card with the most memory, which on laptops with Intel and NVIDIA
