@@ -93,6 +93,9 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var stats = StreamStats()
     /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
     @Published private(set) var signalLost = false
+    /// Frames still arrive, but the picture has been held for over a second
+    /// waiting for the keyframe that replaces a lost frame.
+    @Published var pictureRestoring = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
     /// Decoded video dimensions in pixels — the touch relay maps gestures
@@ -432,8 +435,13 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
+        // Only the receive queue delivers frames, so it alone uses this.
+        var lossDetector = ReferenceLossDetector()
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            if let counters = assembler?.counters.withLock({ $0 }), lossDetector.lostSincePreviousFrame(counters) {
+                decoder?.referenceLost()
+            }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(
@@ -797,6 +805,9 @@ final class ConnectionManager: ObservableObject {
         }
         next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
         stats = next
+        let restoring = state == .connected
+            && (videoDecoder?.keyframeWaitUs ?? 0) >= VideoDecoder.keyframeRetryUs
+        if restoring != pictureRestoring { pictureRestoring = restoring }
 
         // --- Liveness watchdog (host heartbeats stopped => stale picture) ---
         guard state == .connected else { return }
@@ -1059,6 +1070,7 @@ final class ConnectionManager: ObservableObject {
         lagMs = 0
         stats = StreamStats()
         signalLost = false
+        pictureRestoring = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil

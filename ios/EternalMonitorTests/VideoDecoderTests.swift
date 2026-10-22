@@ -20,6 +20,18 @@ final class VideoDecoderTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    /// A keyframe and one frame that depends on it, from the same encode.
+    private func gopFixture() throws -> (idr: Data, p: Data) {
+        func load(_ name: String) throws -> Data {
+            let url = try XCTUnwrap(
+                Bundle(for: VideoDecoderTests.self).url(forResource: name, withExtension: "h264", subdirectory: "Fixtures"),
+                "\(name).h264 fixture missing from the test bundle"
+            )
+            return try Data(contentsOf: url)
+        }
+        return (try load("gop_idr_64x64"), try load("gop_p_64x64"))
+    }
+
     private func packet(seq: UInt32, data: Data, keyframe: Bool) -> FramePacket {
         FramePacket(
             seq: seq,
@@ -175,5 +187,123 @@ final class VideoDecoderTests: XCTestCase {
         decoder.decode(packet: packet(seq: 20, data: data, keyframe: true))
         wait(for: [recovered], timeout: 10)
         XCTAssertEqual(sessionEvents.withLock { $0 }, 2, "a failed keyframe must rebuild the session")
+    }
+
+    func testDependentFrameDecodesNormally() throws {
+        // Control for the test below: without a loss the P-frame is shown.
+        let gop = try gopFixture()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let frames = expectation(description: "keyframe and P-frame decoded")
+        frames.expectedFulfillmentCount = 2
+        decoder.onFrameDecoded = { _, _ in frames.fulfill() }
+        decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
+        decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
+        wait(for: [frames], timeout: 10)
+    }
+
+    func testFrameAfterALostReferenceIsHeldUntilTheNextKeyframe() throws {
+        // The reassembler dropped the frame before seq 2. Decoding seq 2
+        // would draw it against the wrong reference (smeared blocks) or make
+        // VideoToolbox fail with -12909, as 0.3.1 iPads reported.
+        let gop = try gopFixture()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let shown = OSAllocatedUnfairLock(initialState: [UInt64]())
+        let errors = OSAllocatedUnfairLock(initialState: 0)
+        let first = expectation(description: "first keyframe")
+        let resumed = expectation(description: "frames after the next keyframe")
+        resumed.expectedFulfillmentCount = 2
+        decoder.onFrameDecoded = { _, timestamp in
+            shown.withLock { $0.append(timestamp / 16_667) }
+            if timestamp == 16_667 { first.fulfill() }
+            if timestamp >= 3 * 16_667 { resumed.fulfill() }
+        }
+        decoder.onEvent = { message in
+            if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") {
+                errors.withLock { $0 += 1 }
+            }
+        }
+        decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
+        wait(for: [first], timeout: 10)
+
+        decoder.referenceLost()
+        decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
+        decoder.decode(packet: packet(seq: 3, data: gop.idr, keyframe: true))
+        decoder.decode(packet: packet(seq: 4, data: gop.p, keyframe: false))
+        wait(for: [resumed], timeout: 10)
+
+        XCTAssertEqual(shown.withLock { $0 }, [1, 3, 4], "the frame after the loss must not be shown")
+        XCTAssertEqual(errors.withLock { $0 }, 0)
+        XCTAssertNil(decoder.keyframeWaitUs, "a keyframe ends the wait")
+    }
+
+    func testHeldPictureAsksAgainForAKeyframeOncePerSecond() throws {
+        // The reassembler's request, or the host's keyframe, can be lost too.
+        // Before this the decoder dropped every dependent frame silently and
+        // the picture stayed frozen until the host's next periodic keyframe.
+        let gop = try gopFixture()
+        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
+        defer { decoder.shutdown() }
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let first = expectation(description: "first keyframe")
+        let restored = expectation(description: "keyframe after the wait")
+        decoder.onFrameDecoded = { _, timestamp in
+            if timestamp == 16_667 { first.fulfill() }
+            if timestamp == 9 * 16_667 { restored.fulfill() }
+        }
+        decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
+        wait(for: [first], timeout: 10)
+
+        decoder.referenceLost()
+        let holding = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs != nil }, evaluatedWith: nil)
+        wait(for: [holding], timeout: 5)
+
+        func dependentFrame(at seconds: Double, seq: UInt32) {
+            clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) }
+            decoder.decode(packet: packet(seq: seq, data: gop.p, keyframe: false))
+        }
+        func waitForRequests(_ count: Int) {
+            let met = expectation(for: NSPredicate { _, _ in requests.withLock { $0 } >= count }, evaluatedWith: nil)
+            wait(for: [met], timeout: 5)
+        }
+        dependentFrame(at: 0.5, seq: 2)
+        dependentFrame(at: 1.1, seq: 3)
+        waitForRequests(1)
+        dependentFrame(at: 1.5, seq: 4)
+        dependentFrame(at: 2.2, seq: 5)
+        waitForRequests(2)
+        XCTAssertEqual(decoder.keyframeWaitUs, 2_200_000)
+
+        decoder.decode(packet: packet(seq: 9, data: gop.idr, keyframe: true))
+        wait(for: [restored], timeout: 10)
+        XCTAssertEqual(requests.withLock { $0 }, 2)
+        XCTAssertNil(decoder.keyframeWaitUs)
+        XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
+    }
+
+    func testDependentFrameBeforeTheFirstKeyframeAsksForOne() throws {
+        // The host's first keyframe was lost on Wi-Fi: one 0.3.1 iPad dropped
+        // two seconds of frames "because decoder is not ready" and never asked.
+        let gop = try gopFixture()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        let asked = expectation(description: "keyframe requested")
+        decoder.onNeedsKeyframe = {
+            requests.withLock { $0 += 1 }
+            asked.fulfill()
+        }
+        let shown = expectation(description: "keyframe decoded")
+        decoder.onFrameDecoded = { _, timestamp in if timestamp == 3 * 16_667 { shown.fulfill() } }
+        decoder.decode(packet: packet(seq: 1, data: gop.p, keyframe: false))
+        decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
+        decoder.decode(packet: packet(seq: 3, data: gop.idr, keyframe: true))
+        wait(for: [asked, shown], timeout: 10)
+        XCTAssertEqual(requests.withLock { $0 }, 1, "one request, not one per frame")
     }
 }

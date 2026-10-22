@@ -52,6 +52,25 @@ final class VideoDecoder {
     private var recoveryGeneration: UInt64 = 0
     private var isShutdown = false
     private var packetLogCounter: UInt64 = 0
+    /// When the decoder last asked for a keyframe while holding the picture.
+    private var lastKeyframeRequestUs: UInt64 = 0
+    /// When the picture started waiting for a keyframe mid-stream; `nil` while
+    /// decoding normally and before the first keyframe of a session.
+    private let keyframeWaitStart = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
+    private let nowUs: () -> UInt64
+
+    /// A request can be lost on Wi-Fi as easily as the frame it replaces, so
+    /// one is sent again this often while dependent frames keep arriving.
+    static let keyframeRetryUs: UInt64 = 1_000_000
+
+    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs) {
+        self.nowUs = nowUs
+    }
+
+    /// How long the picture has been held waiting for a keyframe, if it is.
+    var keyframeWaitUs: UInt64? {
+        keyframeWaitStart.withLock { $0 }.map { start in nowUs() &- start }
+    }
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
     private let queued = OSAllocatedUnfairLock<Int>(initialState: 0)
@@ -76,6 +95,37 @@ final class VideoDecoder {
         }
     }
 
+    /// A frame before the next one was lost, so frames until the next keyframe
+    /// would decode against a missing reference: smeared blocks, or a
+    /// VideoToolbox error. Hold the current picture until a keyframe instead.
+    /// Queued behind the frames already assembled, ahead of later ones.
+    func referenceLost() {
+        decodeQueue.async { [weak self] in
+            guard let self, !self.isShutdown, self.decompressionSession != nil,
+                  !self.waitingForSyncSample else { return }
+            self.beginWaitingForKeyframe()
+            // The reassembler has just asked the host for one.
+            self.lastKeyframeRequestUs = self.nowUs()
+        }
+    }
+
+    private func beginWaitingForKeyframe() {
+        guard !waitingForSyncSample else { return }
+        waitingForSyncSample = true
+        let now = nowUs()
+        keyframeWaitStart.withLock { $0 = now }
+    }
+
+    /// Ask (again) for a keyframe the host has not sent: a frame arrived that
+    /// cannot be decoded without one. At the start of a session this means
+    /// the host's first keyframe was lost.
+    private func requestKeyframeIfOverdue() {
+        let now = nowUs()
+        guard lastKeyframeRequestUs == 0 || now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
+        lastKeyframeRequestUs = now
+        onNeedsKeyframe?()
+    }
+
     /// Tear down on the decode queue, provably after any in-flight decode call.
     /// Captures `self` strongly so the session cannot be freed under a live callback;
     /// `isShutdown` makes any decode enqueued after this a no-op.
@@ -89,6 +139,7 @@ final class VideoDecoder {
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
+            self.keyframeWaitStart.withLock { $0 = nil }
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
             self.hasLoggedEmptyPayload = false
@@ -458,7 +509,7 @@ final class VideoDecoder {
         let hardwareKind = hardwareStatus == noErr ? (hardware ? "hardware" : "software") : "unknown"
         decompressionSession = session
         recoveryGeneration &+= 1
-        waitingForSyncSample = true
+        beginWaitingForKeyframe()
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
         onEvent?("VideoToolbox session ready (\(hardwareKind) decoder) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
         if E2E.enabled {
@@ -470,6 +521,7 @@ final class VideoDecoder {
 
     private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool) {
         guard let session = decompressionSession, let formatDescription else {
+            requestKeyframeIfOverdue()
             let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
             onEvent?(
                 "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
@@ -479,11 +531,18 @@ final class VideoDecoder {
 
         let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
         if waitingForSyncSample && !isSyncSample {
+            requestKeyframeIfOverdue()
             return
         }
         if isSyncSample {
             recoveryGeneration &+= 1
             waitingForSyncSample = false
+            if let start = keyframeWaitStart.withLock({ value -> UInt64? in
+                defer { value = nil }
+                return value
+            }), nowUs() &- start >= Self.keyframeRetryUs {
+                onEvent?("Picture held \((nowUs() &- start) / 1000) ms waiting for a keyframe")
+            }
         }
         let generation = recoveryGeneration
 
@@ -618,7 +677,8 @@ final class VideoDecoder {
     private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String,
                                           onSyncSample: Bool) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
-        waitingForSyncSample = true
+        beginWaitingForKeyframe()
+        lastKeyframeRequestUs = nowUs()
         reportFailure("\(source) status=\(status) codec=\(codec) depth=\(decodeDepth) generation=\(generation) sync=\(onSyncSample); waiting for a keyframe")
         if status == kVTInvalidSessionErr || onSyncSample {
             // The session died underneath us (typical after app backgrounding),
