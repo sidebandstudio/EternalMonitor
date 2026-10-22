@@ -60,13 +60,31 @@ final class VideoDecoder {
     private let nowUs: () -> UInt64
     /// Whether each picture follows a lost reference picture.
     private var continuity = ReferenceContinuity()
+    /// Session creation attempts that failed since a session last opened.
+    private var failedSessionAttempts = 0
+    private var loggedNotReady = false
+
+    typealias SessionFactory = (CMVideoFormatDescription, CFDictionary, CFDictionary) -> (OSStatus, VTDecompressionSession?)
+    private let makeSession: SessionFactory
 
     /// A request can be lost on Wi-Fi as easily as the frame it replaces, so
     /// one is sent again this often while dependent frames keep arriving.
     static let keyframeRetryUs: UInt64 = 1_000_000
 
-    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs) {
+    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs, makeSession: SessionFactory? = nil) {
         self.nowUs = nowUs
+        self.makeSession = makeSession ?? { format, specification, attributes in
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                formatDescription: format,
+                decoderSpecification: specification,
+                imageBufferAttributes: attributes,
+                outputCallback: nil,
+                decompressionSessionOut: &session
+            )
+            return (status, session)
+        }
     }
 
     /// How long the picture has been held waiting for a keyframe, if it is.
@@ -480,23 +498,26 @@ final class VideoDecoder {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
 
-        var session: VTDecompressionSession?
-        let status = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            formatDescription: formatDescription,
-            decoderSpecification: [
+        let (status, created) = makeSession(
+            formatDescription,
+            [
                 // Enable (not Require): hardware on device, silent software fallback in
                 // the simulator — which is what makes the automated E2E possible at all.
                 kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true
             ] as CFDictionary,
-            imageBufferAttributes: outputAttributes as CFDictionary,
-            outputCallback: nil,
-            decompressionSessionOut: &session
+            outputAttributes as CFDictionary
         )
 
-        guard status == noErr, let session else {
-            print("[VideoDecoder] Failed to create decompression session: \(status)")
-            reportFailure("Failed to create VideoToolbox session status=\(status)")
+        guard status == noErr, let session = created else {
+            // Forget the format, so the next keyframe's parameter sets (and
+            // only those) try again instead of matching it and being ignored.
+            // Until then the last picture stays, with keyframe requests.
+            self.formatDescription = nil
+            beginWaitingForKeyframe()
+            failedSessionAttempts += 1
+            if failedSessionAttempts == 1 {
+                reportFailure("Failed to create VideoToolbox session status=\(status); retrying on the next keyframe")
+            }
             return
         }
 
@@ -515,8 +536,11 @@ final class VideoDecoder {
         decompressionSession = session
         recoveryGeneration &+= 1
         beginWaitingForKeyframe()
+        loggedNotReady = false
+        let retried = failedSessionAttempts > 0 ? " after \(failedSessionAttempts) failed attempts" : ""
+        failedSessionAttempts = 0
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
-        onEvent?("VideoToolbox session ready (\(hardwareKind) decoder) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
+        onEvent?("VideoToolbox session ready (\(hardwareKind) decoder)\(retried) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
         if E2E.enabled {
             E2E.emit("E2E_DECODER kind=\(hardwareStatus == noErr ? (hardware ? "hw" : "sw") : "unknown")")
         }
@@ -527,10 +551,13 @@ final class VideoDecoder {
     private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32) {
         guard let session = decompressionSession, let formatDescription else {
             requestKeyframeIfOverdue()
-            let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
-            onEvent?(
-                "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
-            )
+            if !loggedNotReady {
+                loggedNotReady = true
+                let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
+                onEvent?(
+                    "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
+                )
+            }
             return
         }
 

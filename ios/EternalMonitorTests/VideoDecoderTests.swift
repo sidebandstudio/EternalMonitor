@@ -1,5 +1,6 @@
 import XCTest
 import CoreVideo
+import VideoToolbox
 import os
 @testable import EternalMonitor
 
@@ -443,5 +444,73 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertEqual(requests.withLock { $0 }, 3)
         XCTAssertNil(decoder.keyframeWaitUs)
         XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
+    }
+
+    // MARK: - A session that fails to open
+
+    private func failingSessions(_ failures: Int) -> (VideoDecoder.SessionFactory, OSAllocatedUnfairLock<Int>) {
+        let attempts = OSAllocatedUnfairLock(initialState: 0)
+        let factory: VideoDecoder.SessionFactory = { format, specification, attributes in
+            let attempt = attempts.withLock { value -> Int in value += 1; return value }
+            if attempt <= failures { return (kVTVideoDecoderMalfunctionErr, nil) }
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format,
+                decoderSpecification: specification, imageBufferAttributes: attributes,
+                outputCallback: nil, decompressionSessionOut: &session)
+            return (status, session)
+        }
+        return (factory, attempts)
+    }
+
+    func testFailedSessionIsRetriedOnTheNextKeyframe() throws {
+        // Sol injected one failure, then four valid keyframes: one attempt
+        // and no picture, because the failed format stayed cached.
+        let (factory, attempts) = failingSessions(3)
+        let (result, _) = try run("h264", [(1, 0), (2, 1), (3, 4), (4, 0), (5, 4), (6, 5)],
+                                  decoder: VideoDecoder(makeSession: factory))
+        XCTAssertEqual(attempts.withLock { $0 }, 4, "one attempt per keyframe, none per dependent frame")
+        XCTAssertEqual(result.shown, [5, 6])
+        XCTAssertEqual(result.events.filter { $0.hasPrefix("Failed to create VideoToolbox session") }.count, 1,
+                       "the outage is logged once")
+        XCTAssertTrue(result.events.contains { $0.contains("after 3 failed attempts") })
+        XCTAssertEqual(result.events.filter { $0.hasPrefix("Dropped access unit") }.count, 1)
+    }
+
+    func testSessionThatFailsMidStreamHoldsThePictureAndAsksForAKeyframe() throws {
+        // A resolution change whose new session will not open: the last
+        // picture stays, "Restoring the picture" shows, and the iPad keeps
+        // asking until a keyframe opens a session.
+        let first = try gopFixture()
+        let bigger = try fixture("idr_96x64", "h264")
+        let attempts = OSAllocatedUnfairLock(initialState: 0)
+        let decoder = VideoDecoder(makeSession: { format, specification, attributes in
+            let attempt = attempts.withLock { value -> Int in value += 1; return value }
+            if attempt == 2 { return (kVTVideoDecoderMalfunctionErr, nil) }
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format,
+                decoderSpecification: specification, imageBufferAttributes: attributes,
+                outputCallback: nil, decompressionSessionOut: &session)
+            return (status, session)
+        })
+        defer { decoder.shutdown() }
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
+        let shown = expectation(description: "first picture")
+        let resized = expectation(description: "picture after the retry")
+        decoder.onFrameDecoded = { buffer, timestamp in
+            if timestamp == 16_667 { shown.fulfill() }
+            if timestamp == 9 * 16_667, CVPixelBufferGetWidth(buffer) == 96 { resized.fulfill() }
+        }
+        decoder.decode(packet: packet(seq: 1, data: first.idr, keyframe: true))
+        wait(for: [shown], timeout: 10)
+        decoder.decode(packet: packet(seq: 2, data: bigger, keyframe: true))
+        decoder.decode(packet: packet(seq: 3, data: first.p, keyframe: false))
+        let holding = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs != nil && requests.withLock { $0 } >= 1 },
+                                  evaluatedWith: nil)
+        wait(for: [holding], timeout: 10)
+        decoder.decode(packet: packet(seq: 9, data: bigger, keyframe: true))
+        wait(for: [resized], timeout: 10)
+        XCTAssertEqual(attempts.withLock { $0 }, 3)
+        XCTAssertNil(decoder.keyframeWaitUs)
     }
 }
