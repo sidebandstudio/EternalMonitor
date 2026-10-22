@@ -350,6 +350,19 @@ mod tests {
         assert_eq!(DeviceState::Ready.problem(), NotExtended);
     }
 
+    /// Reads this PC's driver device through Configuration Manager:
+    /// `EM_EXPECT_VDD=problem_22 cargo test -p eternal-host --lib native_device_state -- --ignored`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "reads the virtual display device of this PC"]
+    fn native_device_state() {
+        let state = query();
+        println!("vdd_device={state} problem={:?}", state.problem());
+        if let Ok(expected) = std::env::var("EM_EXPECT_VDD") {
+            assert_eq!(state.to_string(), expected);
+        }
+    }
+
     #[test]
     fn log_names_carry_no_instance_details() {
         assert_eq!(DeviceState::Problem(43).to_string(), "problem_43");
