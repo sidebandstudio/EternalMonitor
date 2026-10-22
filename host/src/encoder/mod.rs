@@ -28,6 +28,11 @@ const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
+/// Largest picture side the encoders take. H.264 on NVENC, AMF and Quick Sync
+/// stops at 4096 pixels ("Width 5120 exceeds 4096"), which sent 5120-wide
+/// displays to the CPU encoder. No iPad screen is that wide, so a larger
+/// desktop is scaled down to fit instead.
+const MAX_ENCODE_SIDE: u32 = 4096;
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -540,6 +545,9 @@ struct EncoderState {
     /// Last applied bitrate. Hardware encoders reopen when this changes.
     opened_bitrate: u32,
     opened_fps: u32,
+    /// The captured size this session takes. The encoded picture is smaller
+    /// when the desktop is larger than `MAX_ENCODE_SIDE`.
+    source_size: (u32, u32),
     /// Frames sent to this session. Its first frame is always an IDR.
     frames_submitted: u64,
     /// First frame's capture instant — the PTS epoch for this session.
@@ -601,6 +609,17 @@ impl EncoderState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
+        let (encode_width, encode_height) = encode_size(width, height);
+        if (encode_width, encode_height) != (width, height) {
+            info!(
+                encoder = encoder_name,
+                width,
+                height,
+                encode_width,
+                encode_height,
+                "Scaling the desktop down to the largest size the encoder takes"
+            );
+        }
         let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
@@ -620,8 +639,8 @@ impl EncoderState {
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
 
-        encoder.set_width(width);
-        encoder.set_height(height);
+        encoder.set_width(encode_width);
+        encoder.set_height(encode_height);
         encoder.set_format(pixel_format);
         if legacy_pts {
             encoder.set_time_base(ffmpeg_next::Rational(1, 60));
@@ -656,12 +675,12 @@ impl EncoderState {
 
         let encoder = encoder.open_with(opts).map_err(|error| {
             let code: i32 = error.into();
-            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
+            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {encode_width}x{encode_height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
         })?;
         log_encoder_configuration(encoder_name, &encoder);
         info!(
-            width,
-            height,
+            width = encode_width,
+            height = encode_height,
             bitrate = bitrate_bps,
             fps = target_fps,
             encoder = encoder_name,
@@ -671,7 +690,11 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = input::conversion_context(pixel_format, width, height)?;
+        let scaler = input::conversion_context(
+            pixel_format,
+            (width, height),
+            (encode_width, encode_height),
+        )?;
         let needs_conversion = scaler.is_some();
         if scaler.is_some() {
             info!(output = ?pixel_format, "swscale BGRA conversion context created");
@@ -679,7 +702,9 @@ impl EncoderState {
 
         Ok(Self {
             #[cfg(target_os = "macos")]
-            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P
+                && (encode_width, encode_height) == (width, height)
+            {
                 match vimage::Converter::new() {
                     Ok(converter) => {
                         info!("Accelerate BGRA->YUV420P converter ready");
@@ -698,7 +723,7 @@ impl EncoderState {
             bgra_frame: needs_conversion.then(|| {
                 ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height)
             }),
-            frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
+            frame: ffmpeg_next::frame::Video::new(pixel_format, encode_width, encode_height),
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
@@ -706,6 +731,7 @@ impl EncoderState {
             opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
             opened_fps: target_fps,
+            source_size: (width, height),
             frames_submitted: 0,
             pts_epoch: None,
             last_pts: -1,
@@ -748,7 +774,7 @@ impl EncoderState {
     }
 
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
-        self.frame.width() == width && self.frame.height() == height
+        self.source_size == (width, height)
     }
 
     fn observe_amf_diagnostics(
@@ -823,6 +849,21 @@ fn open_remaining_encoders<T>(
     }
     warn!("No hardware encoder opened; falling back to libx264 (software)");
     open("libx264").map(|state| ("libx264", state))
+}
+
+/// The picture size to encode a `width` x `height` desktop at: the same size,
+/// or scaled down with its shape kept until both sides fit `MAX_ENCODE_SIDE`.
+/// Sides stay even for 4:2:0 chroma.
+fn encode_size(width: u32, height: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest <= MAX_ENCODE_SIDE {
+        return (width, height);
+    }
+    let scale = |side: u32| {
+        let scaled = (u64::from(side) * u64::from(MAX_ENCODE_SIDE) / u64::from(longest)) as u32;
+        (scaled & !1).max(2)
+    };
+    (scale(width), scale(height))
 }
 
 /// The H.265 sibling of an H.264 encoder name, if one exists.
@@ -1635,6 +1676,51 @@ mod tests {
             state.opened_encoder = name.to_string();
             assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
         }
+    }
+
+    #[test]
+    fn desktops_larger_than_the_encoders_take_are_scaled_with_their_shape() {
+        assert_eq!(encode_size(3840, 2160), (3840, 2160));
+        assert_eq!(encode_size(4096, 2160), (4096, 2160));
+        assert_eq!(encode_size(5120, 1440), (4096, 1152));
+        assert_eq!(encode_size(5120, 2880), (4096, 2304));
+        assert_eq!(encode_size(7680, 2160), (4096, 1152));
+        assert_eq!(encode_size(1440, 5120), (1152, 4096));
+        // Odd results round down to even sides for 4:2:0.
+        assert_eq!(encode_size(5000, 1001), (4096, 820));
+    }
+
+    #[test]
+    fn a_wide_desktop_opens_the_encoder_at_a_size_it_takes() {
+        let _ = ffmpeg_next::init();
+        let mut state = EncoderState::new(
+            "libx264",
+            5120,
+            1440,
+            8_000_000,
+            30,
+            EncoderInput::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (state.encoder.width(), state.encoder.height()),
+            (4096, 1152)
+        );
+        assert!(state.accepts_frame(5120, 1440));
+        assert!(!state.accepts_frame(4096, 1152));
+        let bgra = state.bgra_frame.as_mut().expect("the capture is scaled");
+        assert_eq!((bgra.width(), bgra.height()), (5120, 1440));
+        bgra.data_mut(0).fill(128);
+        let (scaler, bgra) = (
+            state.scaler.as_mut().unwrap(),
+            state.bgra_frame.as_ref().unwrap(),
+        );
+        scaler.run(bgra, &mut state.frame).unwrap();
+        state.frame.set_pts(Some(0));
+        state.send_frame(0, Instant::now(), 1).unwrap();
+        state.encoder.send_eof().unwrap();
+        state.encoder.receive_packet(&mut state.packet).unwrap();
+        assert!(state.packet.is_key());
     }
 
     #[test]

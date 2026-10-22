@@ -53,22 +53,32 @@ pub(super) fn select_input(
     Err("The selected encoder does not accept 8-bit YUV420P/NV12 input")
 }
 
+/// The swscale context that turns a captured BGRA frame of `source` size into
+/// the encoder's `format` at `output` size, or `None` when the capture can be
+/// copied in as it is.
 pub(super) fn conversion_context(
     format: Pixel,
-    width: u32,
-    height: u32,
+    source: (u32, u32),
+    output: (u32, u32),
 ) -> Result<Option<ffmpeg_next::software::scaling::Context>, ffmpeg_next::Error> {
-    if !matches!(format, Pixel::YUV420P | Pixel::NV12) {
+    if !matches!(format, Pixel::YUV420P | Pixel::NV12) && source == output {
         return Ok(None);
     }
+    // Bilinear rather than the fast variant once scaling: text on a scaled
+    // desktop stays readable.
+    let flags = if source == output {
+        ffmpeg_next::software::scaling::Flags::FAST_BILINEAR
+    } else {
+        ffmpeg_next::software::scaling::Flags::BILINEAR
+    };
     ffmpeg_next::software::scaling::Context::get(
         Pixel::BGRA,
-        width,
-        height,
+        source.0,
+        source.1,
         format,
-        width,
-        height,
-        ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
+        output.0,
+        output.1,
+        flags,
     )
     .map(Some)
 }
@@ -142,7 +152,7 @@ mod tests {
         let mut planar = ffmpeg_next::frame::Video::new(Pixel::YUV420P, width, height);
         let mut nv12 = ffmpeg_next::frame::Video::new(Pixel::NV12, width, height);
         for output in [&mut planar, &mut nv12] {
-            conversion_context(output.format(), width, height)
+            conversion_context(output.format(), (width, height), (width, height))
                 .unwrap()
                 .unwrap()
                 .run(&bgra, output)
@@ -172,11 +182,29 @@ mod tests {
                 );
             }
         }
-        assert!(conversion_context(Pixel::BGRA, width, height)
+        assert!(
+            conversion_context(Pixel::BGRA, (width, height), (width, height))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            conversion_context(Pixel::BGRZ, (width, height), (width, height))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_bgra_input_still_scales_a_desktop_that_is_too_large() {
+        let _ = ffmpeg_next::init();
+        let mut scaler = conversion_context(Pixel::BGRA, (64, 16), (32, 8))
             .unwrap()
-            .is_none());
-        assert!(conversion_context(Pixel::BGRZ, width, height)
-            .unwrap()
-            .is_none());
+            .expect("a smaller output needs swscale even for BGRA");
+        let mut bgra = ffmpeg_next::frame::Video::new(Pixel::BGRA, 64, 16);
+        bgra.data_mut(0).fill(200);
+        let mut output = ffmpeg_next::frame::Video::new(Pixel::BGRA, 32, 8);
+        scaler.run(&bgra, &mut output).unwrap();
+        assert_eq!((output.width(), output.height()), (32, 8));
+        assert_eq!(output.data(0)[0], 200);
     }
 }

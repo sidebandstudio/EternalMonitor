@@ -108,6 +108,10 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- Displays wider or taller than 4096 pixels, such as 5120 x 1440 ultrawides,
+  are encoded on the graphics card at up to 4096 pixels, the most an iPad
+  screen can use. Previously the graphics card refused them and the PC
+  encoded on the processor, which lagged and stalled.
 
 ### What to test
 
