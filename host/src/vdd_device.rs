@@ -219,6 +219,43 @@ pub fn query() -> DeviceState {
     DeviceState::best(states)
 }
 
+/// Set the mode of the virtual display `device` (a GDI name like
+/// `\\.\DISPLAY5`), and save it for this set of displays. Only that
+/// display changes. Tried with the refresh rate first, then without it.
+#[cfg(windows)]
+pub fn set_display_mode(device: &str, mode: crate::vdd_settings::VddMode) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        ChangeDisplaySettingsExW, CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+        DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+    };
+    let name: Vec<u16> = device.encode_utf16().chain(Some(0)).collect();
+    [
+        DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+        DM_PELSWIDTH | DM_PELSHEIGHT,
+    ]
+    .into_iter()
+    .any(|fields| {
+        let devmode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            dmFields: fields,
+            dmPelsWidth: mode.width,
+            dmPelsHeight: mode.height,
+            dmDisplayFrequency: mode.refresh_hz,
+            ..Default::default()
+        };
+        (unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(name.as_ptr()),
+                Some(&devmode),
+                None,
+                CDS_UPDATEREGISTRY,
+                None,
+            )
+        }) == DISP_CHANGE_SUCCESSFUL
+    })
+}
+
 #[cfg(not(windows))]
 pub fn query() -> DeviceState {
     DeviceState::Missing

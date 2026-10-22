@@ -348,17 +348,24 @@ const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 
+/// What the host asked the driver for before an enable: the graphics card
+/// (or why none), and the mode the second screen should come up in (none
+/// when the user keeps the driver's modes).
+#[cfg(windows)]
+struct VddRequest {
+    pin: Result<String, &'static str>,
+    mode: Option<crate::vdd_settings::VddMode>,
+}
+
 /// Before each enable: name the main screen's graphics card for the driver
-/// to render on, and, when the user wants it, the iPad's modes. Without a
+/// to render on, and, when the user wants it, the iPad's modes, or a
+/// 1920x1080 default while the iPad's size is not known. Without a
 /// name the driver renders on the card with the most memory. In 0.3.1
 /// diagnostics no Intel + NVIDIA laptop got the second screen; that card
 /// choice is a suspect, not a confirmed cause. Failure is non-fatal — the
 /// driver's built-in choices apply. Returns the card asked for, or why none.
 #[cfg(windows)]
-fn prepare_vdd_settings(
-    shared: &SharedControl,
-    outputs: &[OutputInfo],
-) -> Result<String, &'static str> {
+fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRequest {
     let main_screen = outputs
         .iter()
         .find(|output| output.is_primary)
@@ -376,29 +383,36 @@ fn prepare_vdd_settings(
         );
     }
     let gpu = pin.ok();
-    let client = crate::settings::SettingsFile::load()
-        .vdd_match_resolution
-        .then(|| shared.session.lock().client_info())
-        .flatten();
+    let matching = crate::settings::SettingsFile::load().vdd_match_resolution;
     let path = std::path::Path::new(VDD_SETTINGS_PATH);
-    if let Some(info) = client {
-        let modes = crate::vdd_settings::modes_for_client(
-            info.screen_px.0,
-            info.screen_px.1,
-            info.refresh_hz,
-        );
+    let mut mode = None;
+    if matching {
+        let client = shared.session.lock().client_info();
+        let modes = client.map_or_else(crate::vdd_settings::default_modes, |info| {
+            crate::vdd_settings::modes_for_client(
+                info.screen_px.0,
+                info.screen_px.1,
+                info.refresh_hz,
+            )
+        });
         match crate::vdd_settings::write_to(path, &modes, gpu) {
-            Ok(()) => info!(
-                ?modes,
-                gpu = gpu.unwrap_or("chosen by the driver"),
-                "Wrote virtual display mode list for the connected client"
-            ),
+            Ok(()) => {
+                info!(
+                    ?modes,
+                    gpu = gpu.unwrap_or("chosen by the driver"),
+                    "Wrote virtual display mode list for the connected client"
+                );
+                mode = modes.first().copied();
+            }
             Err(error) => {
                 warn!(
                     %error,
                     "Could not write vdd_settings.xml — driver default modes apply"
                 );
-                return Err("the settings file could not be written");
+                return VddRequest {
+                    pin: Err("the settings file could not be written"),
+                    mode,
+                };
             }
         }
     } else if let Some(gpu) = gpu {
@@ -411,11 +425,62 @@ fn prepare_vdd_settings(
             Ok(false) => {}
             Err(error) => {
                 warn!(%error, gpu, "Left vdd_settings.xml as it is; the driver chooses the graphics card");
-                return Err("the settings file was left as it is");
+                return VddRequest {
+                    pin: Err("the settings file was left as it is"),
+                    mode,
+                };
             }
         }
     }
-    pin.map(str::to_string)
+    VddRequest {
+        pin: pin.map(str::to_string),
+        mode,
+    }
+}
+
+/// Bring a freshly attached second screen to the mode asked for, when
+/// Windows restored another one for this set of displays, and log the mode
+/// it ends up in, once per attach. Only the virtual display changes.
+#[cfg(windows)]
+fn settle_vdd_mode(
+    chosen: OutputInfo,
+    requested: Option<crate::vdd_settings::VddMode>,
+    mut heartbeat: impl FnMut(),
+) -> OutputInfo {
+    let attached = format!("{}x{}", chosen.width, chosen.height);
+    let Some(mode) = crate::vdd_settings::mode_to_set(requested, (chosen.width, chosen.height))
+    else {
+        info!(
+            mode = %attached,
+            requested = %requested.map_or("the driver's modes".to_string(), |m| m.to_string()),
+            "Second screen mode"
+        );
+        return chosen;
+    };
+    let set = crate::vdd_device::set_display_mode(&chosen.device_name, mode);
+    let mut now = chosen.clone();
+    // Windows applies the change asynchronously to DXGI's view of the output.
+    for _ in 0..30 {
+        heartbeat();
+        if let Some(output) = enumerate_outputs()
+            .into_iter()
+            .find(|output| output.device_name == chosen.device_name)
+        {
+            now = output;
+        }
+        if !set || (now.width, now.height) == (mode.width, mode.height) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    info!(
+        mode = %format!("{}x{}", now.width, now.height),
+        requested = %mode,
+        attached = %attached,
+        set,
+        "Second screen mode"
+    );
+    now
 }
 
 /// Log how Windows sees the displays, before the Disable task removes the
@@ -550,7 +615,8 @@ pub(crate) fn reconcile_virtual_display(
             }
             *shared.vdd_output.lock() = None;
 
-            let pin = prepare_vdd_settings(shared, &outputs);
+            let request = prepare_vdd_settings(shared, &outputs);
+            let pin = request.pin;
 
             let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
             if !capture_is_current(shared, generation) {
@@ -605,6 +671,9 @@ pub(crate) fn reconcile_virtual_display(
             match result {
                 AttachResult::Cancelled => return None,
                 AttachResult::Attached(chosen) => {
+                    let chosen = settle_vdd_mode(chosen, request.mode, || {
+                        startup_heartbeat(shared, crate::clock::host_now_us() / 1000)
+                    });
                     info!(
                         device = %chosen.device_name,
                         width = chosen.width,

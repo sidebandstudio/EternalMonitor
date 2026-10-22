@@ -25,6 +25,12 @@ pub struct VddMode {
     pub refresh_hz: u32,
 }
 
+impl std::fmt::Display for VddMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}@{}", self.width, self.height, self.refresh_hz)
+    }
+}
+
 /// The modes to advertise for a client with the given native panel, best
 /// first. The iPad reports portrait-native pixels; the desktop wants
 /// landscape, so the long edge becomes the width. Odd dimensions are rounded
@@ -62,6 +68,24 @@ pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> V
         refresh_hz: 60,
     });
     modes
+}
+
+/// The modes to offer when the iPad's screen size is not known yet.
+pub fn default_modes() -> Vec<VddMode> {
+    vec![VddMode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    }]
+}
+
+/// The mode to set on the virtual display after it attached, when Windows
+/// picked another one. The driver offers the iPad's mode first, but Windows
+/// restores the mode it last saved for these displays: 800x600 when the
+/// driver's own settings were in place the first time, which is how the
+/// vendor installer leaves them.
+pub fn mode_to_set(requested: Option<VddMode>, attached: (u32, u32)) -> Option<VddMode> {
+    requested.filter(|mode| (mode.width, mode.height) != attached)
 }
 
 /// Render the settings document. Pure so tests can assert the exact bytes.
@@ -391,6 +415,24 @@ mod tests {
                 height: 1080,
                 refresh_hz: 60
             }
+        );
+    }
+
+    #[test]
+    fn a_second_screen_at_another_size_is_set_to_the_requested_mode() {
+        let ipad = modes_for_client(1668, 2420, 120)[0];
+        // Windows restored the 800x600 it saved the first time.
+        assert_eq!(mode_to_set(Some(ipad), (800, 600)), Some(ipad));
+        assert_eq!(mode_to_set(Some(ipad), (2420, 1668)), None);
+        // Matching is off: the size is the user's.
+        assert_eq!(mode_to_set(None, (800, 600)), None);
+        assert_eq!(
+            default_modes(),
+            [VddMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60
+            }]
         );
     }
 
