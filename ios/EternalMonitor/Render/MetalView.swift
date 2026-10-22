@@ -54,6 +54,7 @@ struct MetalView: UIViewRepresentable {
         var frameSlot: FrameSlot?
 
         private weak var view: MTKView?
+        private var memoryWarning: NSObjectProtocol?
         /// Coalesces redraw requests: many decoded frames between two main-loop
         /// turns become one setNeedsDisplay.
         private let redrawPending = OSAllocatedUnfairLock(initialState: false)
@@ -63,11 +64,21 @@ struct MetalView: UIViewRepresentable {
             frameSlot?.onFrameStored = { [weak self] in
                 self?.scheduleRedraw()
             }
+            // The next decoded frame redraws within a frame period, or the
+            // PC's idle keepalive; the screen keeps showing the last one.
+            memoryWarning = NotificationCenter.default.addObserver(
+                // UIKit posts this on the main thread, where draws run.
+                forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.renderer?.releaseCachedFrame()
+            }
         }
 
         func detach() {
             frameSlot?.onFrameStored = nil
             view = nil
+            if let memoryWarning { NotificationCenter.default.removeObserver(memoryWarning) }
+            memoryWarning = nil
         }
 
         /// Called from the VideoToolbox callback thread on every stored frame.
@@ -207,6 +218,18 @@ final class MetalRenderer {
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    /// Whether a decoded frame is held for redraws (resize, rotation).
+    var holdsFrame: Bool { currentFrame != nil }
+
+    /// Memory warning: drop the held frame and the texture cache's recycled
+    /// textures. At 1440p and up each held frame is several megabytes.
+    func releaseCachedFrame() {
+        currentFrame = nil
+        if let cache = textureCache {
+            CVMetalTextureCacheFlush(cache, 0)
+        }
     }
 
     /// Scale that fits `video` inside `drawable` preserving aspect ratio
