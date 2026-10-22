@@ -9,10 +9,16 @@
 //! the window is confirmed working. A marker whose process has exited means
 //! that launch never got there, so that backend is avoided on that GPU and
 //! driver, and tried again after some clean launches or a driver change.
+//!
+//! A device lost while the window runs (a driver reset, 0x887A0005) is
+//! recorded the same way, and the window is rebuilt with a new device.
+//! egui-wgpu keeps drawing with the device it was given, and panics on the
+//! next frame once that device is gone, so a lost device stops the window's
+//! drawing first and closes it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,6 +32,10 @@ use crate::startup::ProcessId;
 
 /// Clean launches, per recorded failure, before an avoided backend is retried.
 const RETRY_AFTER: u32 = 5;
+/// A window rebuilt this many times within [`REBUILD_WINDOW`] is given up,
+/// and the failure is reported.
+const MAX_REBUILDS: usize = 3;
+const REBUILD_WINDOW: Duration = Duration::from_secs(10 * 60);
 const HISTORY_FILE: &str = "history.json";
 /// Held while one instance reads, changes and saves the history.
 const HISTORY_LOCK: &str = "history.lock";
@@ -40,6 +50,24 @@ static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
 static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+/// Set when the window's device is lost, until the window is rebuilt.
+static LOST: AtomicBool = AtomicBool::new(false);
+/// The window's device, for the simulated loss.
+static DEVICE: Mutex<Option<wgpu::Device>> = Mutex::new(None);
+/// What the window draws with. Unlike [`STARTED`], kept once the window
+/// works, so a later loss is recorded against it.
+static IN_USE: Mutex<Option<Marker>> = Mutex::new(None);
+/// Where the window was when it closed for a rebuild.
+static PLACEMENT: Mutex<Option<Placement>> = Mutex::new(None);
+static REBUILDS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+/// The lost window's position and size, so the new one opens in its place.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    outer: Option<egui::Rect>,
+    inner: Option<egui::Rect>,
+    maximized: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
@@ -85,17 +113,68 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
     let default = config.on_surface_status.clone();
     config.on_surface_status = Arc::new(move |status| {
         FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
+        // What egui-wgpu gets once the device is gone (seen before both
+        // field panics); its next frame would panic.
+        if matches!(status, wgpu::CurrentSurfaceTexture::Validation) {
+            lose("the window surface reported a validation error");
+        }
         default(status)
     });
 }
 
-/// Called at the start of each UI pass; clears this launch's marker once the
-/// window has kept drawing without a surface error.
-pub(super) fn frame_started(ctx: &egui::Context) {
+/// Watch the window's new device: its loss, or an error wgpu would panic
+/// on, marks the window for a rebuild instead.
+pub(super) fn watch(device: &wgpu::Device) {
+    device.set_device_lost_callback(|reason, message| {
+        lose(&format!("the device was lost ({reason:?}) {message}"))
+    });
+    device.on_uncaptured_error(Arc::new(|error| lose(&error.to_string())));
+    if let Ok(mut current) = DEVICE.lock() {
+        *current = Some(device.clone());
+    }
+}
+
+/// Whether the window's device is lost. A real loss reports itself inside
+/// the wgpu call that found it, before egui-wgpu can panic on it.
+pub(crate) fn device_lost() -> bool {
+    LOST.load(Ordering::SeqCst)
+}
+
+fn lose(reason: &str) {
+    if !LOST.swap(true, Ordering::SeqCst) {
+        let in_use = IN_USE.lock().ok().and_then(|marker| marker.clone());
+        warn!(
+            reason,
+            gpu = in_use.as_ref().map(|m| m.gpu.as_str()),
+            backend = in_use.as_ref().map(|m| m.backend.as_str()),
+            "The window's graphics device was lost; rebuilding the window"
+        );
+    }
+}
+
+/// Called at the start of each UI pass. Clears this launch's marker once the
+/// window has kept drawing without a surface error. False when the device is
+/// lost: the pass must draw nothing, since egui-wgpu panics on a lost device
+/// with anything to upload, and the window closes to be rebuilt.
+pub(super) fn frame_started(ctx: &egui::Context) -> bool {
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
+    let simulated = PRESENT
+        .lock()
+        .ok()
+        .and_then(|tracker| crate::startup::simulate_device_loss(tracker.drawing_for()));
+    if simulated == Some(false) {
+        destroy_device(false);
+    }
+    if device_lost() {
+        close_for_rebuild(ctx);
+        return false;
+    }
+    if simulated == Some(true) {
+        destroy_device(true);
+    }
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
     let Ok(mut tracker) = PRESENT.lock() else {
-        return;
+        return true;
     };
     let now_drawing = tracker.observe(
         ctx.cumulative_frame_nr(),
@@ -112,12 +191,124 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     if drawing {
         clear_marker(true);
     }
+    true
+}
+
+/// The simulated loss. Between frames, the loss is delivered as wgpu does
+/// after `destroy`. Inside a paint, it is marked the way a driver reset
+/// reports itself inside the failing call, and egui-wgpu panics on it.
+fn destroy_device(in_paint: bool) {
+    let Some(device) = DEVICE.lock().ok().and_then(|device| device.clone()) else {
+        return;
+    };
+    warn!(
+        in_paint,
+        "Simulating the loss of the window's graphics device"
+    );
+    device.destroy();
+    if in_paint {
+        lose("simulated inside a paint");
+    } else {
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(2)),
+        });
+    }
+}
+
+/// Close the window once, keeping where it was.
+fn close_for_rebuild(ctx: &egui::Context) {
+    let Ok(mut placement) = PLACEMENT.lock() else {
+        return;
+    };
+    if placement.is_some() {
+        return;
+    }
+    *placement = Some(ctx.input(|input| {
+        let viewport = input.viewport();
+        Placement {
+            outer: viewport.outer_rect,
+            inner: viewport.inner_rect,
+            maximized: viewport.maximized == Some(true),
+        }
+    }));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+/// Open a rebuilt window where the lost one was.
+pub(super) fn place(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    let Some(placement) = PLACEMENT.lock().ok().and_then(|mut p| p.take()) else {
+        return viewport;
+    };
+    let mut viewport = viewport.with_maximized(placement.maximized);
+    if let Some(outer) = placement.outer {
+        viewport = viewport.with_position(outer.min);
+    }
+    if let Some(inner) = placement.inner {
+        viewport = viewport.with_inner_size(inner.size());
+    }
+    viewport
+}
+
+/// After the window's event loop ends: whether its device was lost, so a new
+/// window should open. Records the loss against the backend in use, so the
+/// new window, and the next launches, try another. An error when the window
+/// keeps losing its device.
+pub(super) fn rebuild_after_loss() -> Result<bool, String> {
+    if !LOST.swap(false, Ordering::SeqCst) {
+        return Ok(false);
+    }
+    if let Ok(mut device) = DEVICE.lock() {
+        device.take();
+    }
+    let marker = IN_USE.lock().ok().and_then(|mut marker| marker.take());
+    if let (Some(directory), Some(marker)) = (STATE_DIR.get(), marker) {
+        record_loss(directory, &marker, ProcessId::current());
+    }
+    if let Ok(mut started) = STARTED.lock() {
+        started.take();
+    }
+    if let Ok(mut tracker) = PRESENT.lock() {
+        *tracker = PresentTracker::new();
+    }
+    let mut rebuilds = REBUILDS.lock().map_err(|error| error.to_string())?;
+    allow_rebuild(&mut rebuilds, Instant::now())
+}
+
+fn allow_rebuild(rebuilds: &mut Vec<Instant>, now: Instant) -> Result<bool, String> {
+    rebuilds.retain(|at| now.duration_since(*at) < REBUILD_WINDOW);
+    if rebuilds.len() >= MAX_REBUILDS {
+        return Err(format!(
+            "The window's graphics device was lost {} times in {} minutes",
+            rebuilds.len() + 1,
+            REBUILD_WINDOW.as_secs() / 60
+        ));
+    }
+    rebuilds.push(now);
+    Ok(true)
+}
+
+/// A device lost mid-run counts as a failed start of its backend. The
+/// history may be busy with an instance starting; this waits for it briefly,
+/// since no window is open meanwhile.
+fn record_loss(directory: &Path, marker: &Marker, owner: ProcessId) {
+    for _ in 0..20 {
+        if update_history(directory, |history| record_failure(history, marker)).is_some() {
+            let _ = fs::remove_file(marker_path(directory, owner));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    warn!("Could not record the lost graphics device in the renderer history");
 }
 
 /// The window closed normally. A launch that quits before its window is
 /// confirmed did not fail, so its marker goes without counting either way.
 pub(super) fn window_closed() {
     clear_marker(false);
+    if let Ok(mut device) = DEVICE.lock() {
+        device.take();
+    }
 }
 
 /// Clear this launch's marker, after recording that its backend drew when
@@ -151,6 +342,7 @@ fn finish_launch(directory: &Path, marker: &Marker, owner: ProcessId, drew: bool
 struct PresentTracker {
     span: Option<Span>,
     confirmed: bool,
+    confirmed_at: Option<Instant>,
 }
 
 /// Visible frames since the last surface error.
@@ -166,7 +358,13 @@ impl PresentTracker {
         Self {
             span: None,
             confirmed: false,
+            confirmed_at: None,
         }
+    }
+
+    /// How long the window has worked.
+    fn drawing_for(&self) -> Option<Duration> {
+        self.confirmed_at.map(|at| at.elapsed())
     }
 
     /// True once: after [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible
@@ -182,6 +380,7 @@ impl PresentTracker {
                     && now.duration_since(span.since) >= CONFIRM_AFTER
                 {
                     self.confirmed = true;
+                    self.confirmed_at = Some(now);
                     return true;
                 }
             }
@@ -240,6 +439,9 @@ fn select(
         if let Ok(json) = serde_json::to_vec(&marker) {
             let _ = fs::write(marker_path(directory, ProcessId::current()), json);
         }
+    }
+    if let Ok(mut in_use) = IN_USE.lock() {
+        *in_use = Some(marker.clone());
     }
     if let Ok(mut started) = STARTED.lock() {
         *started = Some(marker);
@@ -721,6 +923,162 @@ mod tests {
         assert!(!run(&mut tracker, start, 4..15, 1));
         let mut tracker = PresentTracker::new();
         assert!(run(&mut tracker, start, 0..20, 0));
+    }
+
+    /// Serializes the tests that share this module's lost-device state.
+    static DEVICE_TESTS: Mutex<()> = Mutex::new(());
+
+    /// A device without a window, or `None` on a machine without an adapter.
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let device = runtime.block_on(async {
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .ok()?;
+            adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .ok()
+        });
+        if device.is_none() {
+            eprintln!("No graphics adapter here; skipping");
+        }
+        device
+    }
+
+    /// One frame as eframe runs it: the UI pass, then egui-wgpu uploading
+    /// what it drew. True when the pass asked the window to close.
+    fn frame(
+        ctx: &egui::Context,
+        renderer: &mut eframe::egui_wgpu::Renderer,
+        (device, queue): &(wgpu::Device, wgpu::Queue),
+        guarded: bool,
+    ) -> bool {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if guarded && !frame_started(ui.ctx()) {
+                return;
+            }
+            ui.label("EternalMonitor is ready for your iPad");
+        });
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut textures = output.textures_delta;
+        for (id, deltas) in &textures.set {
+            for delta in deltas {
+                renderer.update_texture(device, queue, *id, delta);
+            }
+        }
+        textures.clear();
+        renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            &primitives,
+            &eframe::egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [1000, 640],
+                pixels_per_point: 1.0,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close)
+    }
+
+    /// Draws one frame, loses the device as a driver reset does, and draws
+    /// the next.
+    fn lose_device_between_frames(guarded: bool) -> Option<std::thread::Result<bool>> {
+        let gpu = headless_device()?;
+        watch(&gpu.0);
+        let ctx = egui::Context::default();
+        let mut renderer = eframe::egui_wgpu::Renderer::new(
+            &gpu.0,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Default::default(),
+        );
+        assert!(!frame(&ctx, &mut renderer, &gpu, guarded));
+        gpu.0.destroy();
+        let _ = gpu.0.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(5)),
+        });
+        assert!(device_lost(), "the lost callback reports the loss");
+        Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || frame(&ctx, &mut renderer, &gpu, guarded),
+        )))
+    }
+
+    /// The field crash (problem 9): after the device is lost, egui-wgpu
+    /// panics on the next frame that has anything to draw.
+    #[test]
+    fn drawing_on_a_lost_device_panics_in_egui_wgpu() {
+        let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(next) = lose_device_between_frames(false) else {
+            return;
+        };
+        let panic = next.expect_err("egui-wgpu draws on the lost device");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("Failed to create staging buffer"),
+            "{message}"
+        );
+        assert_eq!(rebuild_after_loss(), Ok(true));
+        let _ = place(egui::ViewportBuilder::default());
+        REBUILDS.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_lost_device_closes_the_window_for_a_rebuild_without_drawing() {
+        let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(next) = lose_device_between_frames(true) else {
+            return;
+        };
+        assert!(next.expect("no panic on the lost device"), "asks to close");
+        assert!(PLACEMENT.lock().unwrap().is_some(), "keeps where it was");
+        assert_eq!(rebuild_after_loss(), Ok(true));
+        assert!(!device_lost(), "the new window starts clean");
+        assert!(!PRESENT.lock().unwrap().confirmed, "and must prove itself");
+        let _ = place(egui::ViewportBuilder::default());
+        // A normal close afterwards opens nothing.
+        assert_eq!(rebuild_after_loss(), Ok(false));
+        REBUILDS.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_device_lost_mid_run_is_avoided_next_time() {
+        let directory = temp_dir("renderer-lost");
+        let launch = ProcessId::current();
+        let vulkan = marker("10de:28e0 32.0.15.6094", "vulkan");
+        fs::write(
+            marker_path(&directory, launch),
+            serde_json::to_vec(&vulkan).unwrap(),
+        )
+        .unwrap();
+        // The launch had drawn, so the marker was already cleared once.
+        record_loss(&directory, &vulkan, launch);
+        let history = read_history(&directory);
+        assert!(avoided(&history, &vulkan.gpu, "vulkan"));
+        assert!(!avoided(&history, &vulkan.gpu, "dx12"));
+        assert!(!marker_path(&directory, launch).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_window_that_keeps_losing_its_device_is_given_up() {
+        let start = Instant::now();
+        let mut rebuilds = Vec::new();
+        for minute in 0..MAX_REBUILDS as u64 {
+            let at = start + Duration::from_secs(60 * minute);
+            assert_eq!(allow_rebuild(&mut rebuilds, at), Ok(true));
+        }
+        let at = start + Duration::from_secs(60 * MAX_REBUILDS as u64);
+        assert!(allow_rebuild(&mut rebuilds, at).is_err());
+        // Losses far apart are each recovered.
+        assert_eq!(allow_rebuild(&mut rebuilds, at + REBUILD_WINDOW), Ok(true));
     }
 
     #[test]
