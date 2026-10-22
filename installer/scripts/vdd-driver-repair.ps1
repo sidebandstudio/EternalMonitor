@@ -38,6 +38,15 @@ function Invoke-PnpUtil([string[]]$Arguments) {
     }
 }
 
+# pnputil can report success, 259 or a pending restart and leave the device in
+# place, so a removal counts only once the device is gone.
+function Remove-Device([string]$Id) {
+    Invoke-PnpUtil @('/remove-device', $Id)
+    if (@(Get-VddDevices | Where-Object { $_.InstanceId -eq $Id }).Count -gt 0) {
+        throw "Windows did not remove the Virtual Display Driver device $Id."
+    }
+}
+
 try {
     if (@(Get-Working).Count -gt 0) {
         Write-Output 'Virtual Display Driver device is installed.'
@@ -77,18 +86,18 @@ try {
         -ArgumentList "--create-device-node --hardware-id $hardwareId --class-name Display --class-guid $classGuid"
     $added = @(Get-VddDevices | Where-Object { $broken -notcontains $_.InstanceId })
     if ($process.ExitCode -ne 0 -or $added.Count -ne 1) {
-        foreach ($device in $added) { Invoke-PnpUtil @('/remove-device', $device.InstanceId) }
+        foreach ($device in $added) { Remove-Device $device.InstanceId }
         throw "Could not add a Virtual Display Driver device: nefconw exited $($process.ExitCode)."
     }
     $new = $added[0].InstanceId
     # A failure here is judged by the device's state below, which undoes the new device.
     try { Invoke-PnpUtil @('/add-driver', $inf, '/install') } catch {}
     if (@(Get-Working | Where-Object { $_.InstanceId -eq $new }).Count -eq 0) {
-        Invoke-PnpUtil @('/remove-device', $new)
+        Remove-Device $new
         throw 'Windows did not start the new Virtual Display Driver device.'
     }
     # The new device works: only now remove the broken ones, by instance.
-    foreach ($id in $broken) { Invoke-PnpUtil @('/remove-device', $id) }
+    foreach ($id in $broken) { Remove-Device $id }
     Write-Output "Repaired the Virtual Display Driver device: $new"
     exit 0
 } catch {

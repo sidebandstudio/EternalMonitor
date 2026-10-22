@@ -24,6 +24,8 @@ function Reset-Fixture {
         InStore = $true; StageExit = 0
         # Whether a device the package binds to then starts.
         NewStarts = $true
+        # pnputil reports removing a device that stays (259 or a pending restart).
+        RemoveSticks = $false
         Devices = @([pscustomobject]@{InstanceId='PCI\GPU';HardwareIds=@('PCI\GPU');Inf='oem1.inf';Problem=0})
     }
 }
@@ -67,6 +69,7 @@ function global:pnputil.exe {
         }
         '/remove-device' {
             $id = $args[1]
+            if ($global:EMRepair.RemoveSticks) { $global:LASTEXITCODE = 259; return }
             $global:EMRepair.Devices = @($global:EMRepair.Devices | Where-Object { $_.InstanceId -ne $id })
             $global:LASTEXITCODE = 0
         }
@@ -147,6 +150,13 @@ try {
     Reset-Fixture; $old = Add-Vdd 'oem33.inf' 43; $global:EMRepair.NewStarts = $false
     Expect 'replacement fails' 1 "$stage, nefconw --create-device-node, $stage, pnputil /remove-device ROOT\DISPLAY\0002" {
         @(Get-Vdd).Count -eq 1 -and @(Get-Vdd)[0].InstanceId -eq $old -and @(Get-Vdd)[0].Problem -eq 43 }
+    # pnputil reports removing a broken device that stays: not a success.
+    Reset-Fixture; $old = Add-Vdd 'oem33.inf' 43; $global:EMRepair.RemoveSticks = $true
+    Expect 'broken device not removed' 1 "$stage, nefconw --create-device-node, $stage, pnputil /remove-device $old" {
+        @(Get-Vdd).Count -eq 2 -and @(Working).Count -eq 1 }
+    # The same when undoing a replacement that did not start.
+    Reset-Fixture; $old = Add-Vdd 'oem33.inf' 43; $global:EMRepair.NewStarts = $false; $global:EMRepair.RemoveSticks = $true
+    Expect 'failed replacement not removed' 1 "$stage, nefconw --create-device-node, $stage, pnputil /remove-device ROOT\DISPLAY\0002"
     # Windows rejects the package: nothing else happens.
     Reset-Fixture; $old = Add-Vdd 'oem33.inf' 52; $global:EMRepair.StageExit = 5
     Expect 'package rejected' 1 $stage { @(Get-Vdd).Count -eq 1 -and @(Get-Vdd)[0].Problem -eq 52 }
@@ -170,7 +180,7 @@ try {
         $failures += 'Setup does not report each repair failure'
     }
     if ($failures) { throw "Repair checks failed:`n  " + ($failures -join "`n  ") }
-    Write-Output 'PASS: working, working beside broken, not owned, changed, unregistered, files missing, driverless with package gone, missing device, driver error, failed replacement, rejected package, restart, rerun, Setup wiring'
+    Write-Output 'PASS: working, working beside broken, not owned, changed, unregistered, files missing, driverless with package gone, missing device, driver error, failed replacement, removal not done, rejected package, restart, rerun, Setup wiring'
 } finally {
     Remove-Item $root -Recurse -Force
     Remove-Item function:global:pnputil.exe -ErrorAction SilentlyContinue
