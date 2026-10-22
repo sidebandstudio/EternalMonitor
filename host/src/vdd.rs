@@ -190,6 +190,10 @@ pub fn recheck_tasks() {
 struct DriverTasks {
     serial: parking_lot::Mutex<()>,
     gate: parking_lot::Mutex<TaskGate>,
+    /// Disables running or waiting for their turn. A pipeline's own Disable
+    /// does not queue behind one: the display ends up off either way, and
+    /// a Mirror stream need not wait for it to show its first frame.
+    disabling: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
@@ -198,6 +202,7 @@ impl DriverTasks {
         Self {
             serial: parking_lot::Mutex::new(()),
             gate: parking_lot::Mutex::new(TaskGate::new()),
+            disabling: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -205,19 +210,51 @@ impl DriverTasks {
         self.gate.lock().health
     }
 
+    #[cfg(test)]
     fn set_enabled(
         &self,
         enabled: bool,
         purpose: Purpose,
-        mut progress: impl FnMut(),
+        progress: impl FnMut(),
         run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
     ) -> bool {
+        self.set_enabled_on_turn(enabled, purpose, progress, || {}, run)
+    }
+
+    /// As `set_enabled`, calling `on_turn` once this request holds the turn:
+    /// every request made after that queues behind it.
+    fn set_enabled_on_turn(
+        &self,
+        enabled: bool,
+        purpose: Purpose,
+        mut progress: impl FnMut(),
+        on_turn: impl FnOnce(),
+        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
+    ) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Pending<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                if let Some(count) = self.0 {
+                    count.fetch_sub(1, SeqCst);
+                }
+            }
+        }
+        if !enabled {
+            if purpose == Purpose::Attempt && self.disabling.load(SeqCst) > 0 {
+                tracing::debug!("A Disable is already pending; not waiting for it");
+                return true;
+            }
+            self.disabling.fetch_add(1, SeqCst);
+        }
+        let _pending = Pending((!enabled).then_some(&self.disabling));
         let _serial = loop {
             if let Some(guard) = self.serial.try_lock_for(Duration::from_millis(50)) {
                 break guard;
             }
             progress();
         };
+        on_turn();
         // The gate guard ends with this statement. Logging below reads the
         // health through the same mutex, which deadlocked when the guard
         // lived through the whole match.
@@ -384,9 +421,19 @@ fn request(
     progress: impl FnMut(),
     ran: &mut Option<TaskOutcome>,
 ) -> bool {
+    request_on_turn(enabled, purpose, progress, || {}, ran)
+}
+
+fn request_on_turn(
+    enabled: bool,
+    purpose: Purpose,
+    progress: impl FnMut(),
+    on_turn: impl FnOnce(),
+    ran: &mut Option<TaskOutcome>,
+) -> bool {
     #[cfg(windows)]
     {
-        TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
+        TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed(None);
             crate::startup::display::change(enabled, || {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
@@ -399,6 +446,7 @@ fn request(
     #[cfg(not(windows))]
     {
         let _ = (enabled, purpose, progress, ran);
+        on_turn();
         false
     }
 }
@@ -409,6 +457,30 @@ fn request(
 /// True when the display is known to be off.
 pub fn disable() -> bool {
     request(false, Purpose::Cleanup, || {}, &mut None)
+}
+
+/// `disable` at startup, without holding up the first frame: the Disable
+/// runs on its own thread, and this returns once it holds the turn, so
+/// every later request (an Enable, the quit's Disable) still runs after it.
+/// A hung task no longer keeps a Mirror stream black for up to 30 s.
+pub fn disable_in_background() {
+    let (held, turn) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("vdd-startup-off".into())
+        .spawn(move || {
+            let on_turn = move || {
+                let _ = held.send(());
+            };
+            request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None)
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = turn.recv();
+        }
+        Err(_) => {
+            disable();
+        }
+    }
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
@@ -712,6 +784,85 @@ mod tests {
             Err("display task not responding")
         );
         assert_eq!(refused(VddTaskHealth::Ok), Err("display task not run"));
+    }
+
+    /// Runs `set_enabled` on a thread; `None` if it has not returned in 2 s.
+    fn returns_within(
+        tasks: &std::sync::Arc<DriverTasks>,
+        enabled: bool,
+        purpose: Purpose,
+        runs: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    ) -> Option<bool> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let tasks = std::sync::Arc::clone(tasks);
+        std::thread::spawn(move || {
+            let ran = tasks.set_enabled(
+                enabled,
+                purpose,
+                || {},
+                |e, _| {
+                    runs.lock().unwrap().push(e);
+                    TaskOutcome::Done
+                },
+            );
+            let _ = done_tx.send(ran);
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    #[test]
+    fn a_mirror_start_does_not_wait_behind_the_startup_disable() {
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+        let tasks = Arc::new(DriverTasks::new());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        // The startup Disable holds the turn: its task is hung.
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let startup = {
+            let tasks = Arc::clone(&tasks);
+            std::thread::spawn(move || {
+                tasks.set_enabled(
+                    false,
+                    Purpose::Cleanup,
+                    || {},
+                    |_, _| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        TaskOutcome::Done
+                    },
+                )
+            })
+        };
+        started_rx.recv().unwrap();
+        // The Mirror pipeline's Disable returns at once and runs nothing.
+        assert_eq!(
+            returns_within(&tasks, false, Purpose::Attempt, Arc::clone(&runs)),
+            Some(true),
+            "the pipeline waited behind the startup Disable"
+        );
+        // An Enable still waits its turn, then runs after the Disable.
+        let (enable_tx, enable_rx) = channel();
+        {
+            let (tasks, runs) = (Arc::clone(&tasks), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                let _ = enable_tx.send(returns_within(&tasks, true, Purpose::Attempt, runs));
+            });
+        }
+        assert!(
+            enable_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the Enable did not wait"
+        );
+        release_tx.send(()).unwrap();
+        assert!(startup.join().unwrap());
+        assert_eq!(enable_rx.recv().unwrap(), Some(true));
+        assert_eq!(*runs.lock().unwrap(), vec![true]);
+        // With nothing pending, a pipeline Disable runs again.
+        assert_eq!(
+            returns_within(&tasks, false, Purpose::Attempt, Arc::clone(&runs)),
+            Some(true)
+        );
+        assert_eq!(*runs.lock().unwrap(), vec![true, false]);
     }
 
     #[test]

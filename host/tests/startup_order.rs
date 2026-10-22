@@ -18,7 +18,8 @@ fn helpers_then_single_instance_then_the_display_reset() {
         // host's session log or start a second uploader on its outbox.
         "logging::MemoryLogWriter::start()",
         "eternal_host::telemetry::UploadGuard::start()",
-        "vdd::disable();",
+        // Beside startup, holding the turn before anything else can ask.
+        "vdd::disable_in_background();",
         "eternal_host::startup::install_failure_hooks();",
     ];
     let positions: Vec<usize> = steps.iter().map(|step| at(step)).collect();
@@ -30,5 +31,10 @@ fn helpers_then_single_instance_then_the_display_reset() {
     assert!(
         main[..positions[0]].find("vdd::").is_none(),
         "main touches the virtual display before dispatching helper modes"
+    );
+    // The display reset no longer holds up startup.
+    assert!(
+        !main.contains("    vdd::disable();\n"),
+        "main waits for the startup Disable again"
     );
 }
