@@ -29,6 +29,9 @@ const KEYFRAME_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const KEYFRAME_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// This long without a lost frame, and the next request is immediate again.
 const KEYFRAME_BACKOFF_RESET: Duration = Duration::from_secs(5);
+/// A write that waited this long means the tunnel stood still, not that it
+/// is slow: a datagram drains in milliseconds even through a slow usbmuxd.
+const STALL: Duration = Duration::from_millis(100);
 const CONTROL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -239,6 +242,22 @@ impl VideoQueue {
         self.keyframes.lost(now);
     }
 
+    /// The tunnel stood still, so everything queued is stale. Returns frames
+    /// dropped. A fresh keyframe is requested at once: a stall is not a slow
+    /// link, and a keyframe requested during it would be stale too.
+    fn stalled(&mut self, now: Instant) -> u64 {
+        let dropped = self.frames.len() as u64;
+        if let Some(frame) = self.frames.back().filter(|frame| !frame.complete()) {
+            self.discarded = Some((frame.epoch, frame.seq));
+        }
+        self.frames.clear();
+        self.bytes = 0;
+        self.awaiting_keyframe = true;
+        self.keyframes = KeyframeBackoff::default();
+        self.keyframes.lost(now);
+        dropped
+    }
+
     fn pop(&mut self) -> Option<Frame> {
         if !self.frames.front().is_some_and(Frame::complete) {
             return None;
@@ -376,6 +395,19 @@ impl WriterState {
         if control {
             self.controls_written.send_modify(|written| *written += 1);
         }
+    }
+
+    /// After a write that started at `started`: whether the tunnel stood
+    /// still, in which case queued video and `in_flight` frames are dropped.
+    fn check_stall(&self, started: Instant, in_flight: u64) -> bool {
+        let now = Instant::now();
+        if now.saturating_duration_since(started) < STALL {
+            return false;
+        }
+        let mut queue = self.queue.lock();
+        let dropped = queue.video.stalled(now) + in_flight;
+        self.record_drops(&mut queue.video, dropped, now);
+        true
     }
 
     fn record_drops(&self, video: &mut VideoQueue, dropped: u64, now: Instant) {
@@ -607,31 +639,41 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             None => (None, state.queue.lock().video.pop()),
         };
         if let Some((packet, control)) = priority {
+            let started = Instant::now();
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
                 sent = write_datagram(&mut writer, &packet) => sent?,
             }
             state.wrote(control);
+            state.check_stall(started, 0);
         } else if let Some(frame) = frame {
-            // A frame that has started is always finished: the iPad cannot
-            // use part of one, and over a lossless tunnel would count the
-            // rest as lost.
-            for packet in frame.datagrams {
+            // A frame that has started is finished: the iPad cannot use part
+            // of one, and over a lossless tunnel would count the rest as lost.
+            // Only after a stall is the rest stale and abandoned.
+            let count = frame.datagrams.len();
+            for (index, packet) in frame.datagrams.into_iter().enumerate() {
+                let started = Instant::now();
                 tokio::select! {
                     biased;
                     _ = closed.changed() => return Ok(()),
                     sent = write_datagram(&mut writer, &packet) => sent?,
                 }
+                let mut stalled = state.check_stall(started, u64::from(index + 1 < count));
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
                 while let Some((priority, control)) = state.take_priority() {
+                    let started = Instant::now();
                     tokio::select! {
                         biased;
                         _ = closed.changed() => return Ok(()),
                         sent = write_datagram(&mut writer, &priority) => sent?,
                     }
                     state.wrote(control);
+                    stalled |= state.check_stall(started, u64::from(!stalled && index + 1 < count));
+                }
+                if stalled {
+                    break;
                 }
             }
         } else {
@@ -958,6 +1000,49 @@ mod tests {
             force_idr.load(Ordering::SeqCst),
             "the deferred request is sent"
         );
+    }
+
+    /// A tunnel that stands still leaves only stale video behind. When it
+    /// moves again, the rest of the frame in flight and everything queued is
+    /// dropped and a keyframe requested at once, although the backoff would
+    /// otherwise make the request wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tunnel_drops_stale_video_and_asks_for_a_keyframe_at_once() {
+        let (host, mut client) = tokio::io::duplex(64);
+        let force_idr = Arc::new(AtomicBool::new(false));
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::clone(&force_idr))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        for index in 0..4 {
+            link.send(peer, &packet(1, true, index, 4, 1400))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        for seq in 2..10 {
+            link.send(peer, &packet(seq, false, 0, 1, 1400))
+                .await
+                .unwrap();
+        }
+        assert!(force_idr.swap(false, Ordering::SeqCst));
+        let dropped = link.stats().frames_dropped.load(Ordering::Relaxed);
+        tokio::time::sleep(STALL * 3).await;
+        let first = read_datagram(&mut client).await.unwrap();
+        assert_eq!(MediaHeader::decode(&first).unwrap().0.frame_seq, 1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            force_idr.load(Ordering::SeqCst),
+            "asked at once after the stall"
+        );
+        assert!(link.stats().frames_dropped.load(Ordering::Relaxed) > dropped);
+        link.send(peer, &packet(10, true, 0, 1, 100)).await.unwrap();
+        let next = read_datagram(&mut client).await.unwrap();
+        let header = MediaHeader::decode(&next).unwrap().0;
+        assert_eq!((header.frame_seq, header.is_keyframe), (10, true));
     }
 
     /// A last message is written before the link goes, and a peer that
