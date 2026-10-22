@@ -79,4 +79,23 @@ final class ClockEstimatorTests: XCTestCase {
         estimator.reset()
         XCTAssertNil(estimator.offsetUs)
     }
+
+    func testExchangeWithAnImpossibleHostClockIsDroppedNotATrap() {
+        // A PONG for this session with host times near Int64.max made the
+        // offset sum overflow and killed the app.
+        var estimator = ClockEstimator()
+        for i in UInt64(1)...3 {
+            estimator.addExchange(t1: 0, t2: 0x7FFF_FFFF_FFFF_FFFF, t3: 0x7FFF_FFFF_FFFF_FFFF, t4: i * 1_000)
+        }
+        XCTAssertNil(estimator.offsetUs)
+    }
+
+    func testLatencyOfAFrameStampTooFarFromTheClocksIsSkipped() {
+        XCTAssertNil(ConnectionManager.latencyMs(captureUs: 0x8000_0000_0000_0000, offsetUs: 5_000_000, nowUs: 1_000_000))
+        XCTAssertNil(ConnectionManager.latencyMs(captureUs: 0x8000_0000_0000_0000, offsetUs: -5_000_000, nowUs: 0x7FFF_FFFF_FFFF_FFF0))
+        XCTAssertNil(ConnectionManager.latencyMs(captureUs: 0, offsetUs: 0, nowUs: 1_000_000), "unstamped frame")
+        // Host clock 5 s ahead; captured 20 ms before now.
+        XCTAssertEqual(ConnectionManager.latencyMs(captureUs: 5_980_000, offsetUs: 5_000_000, nowUs: 1_000_000), 20)
+        XCTAssertEqual(ConnectionManager.latencyMs(captureUs: 6_100_000, offsetUs: 5_000_000, nowUs: 1_000_000), 0)
+    }
 }

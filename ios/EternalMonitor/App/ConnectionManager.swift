@@ -411,12 +411,9 @@ final class ConnectionManager: ObservableObject {
                 if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
                     self.videoSize = CGSize(width: frameWidth, height: frameHeight)
                 }
-                if ts > 0,
-                   let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }) {
-                    let nowUs = ControlChannel.clientNowUs()
-                    let captureClient = Int64(bitPattern: ts) - offset
-                    let latencyUs = Int64(bitPattern: nowUs) - captureClient
-                    self.lagMs = latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
+                if let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }),
+                   let lag = Self.latencyMs(captureUs: ts, offsetUs: offset, nowUs: ControlChannel.clientNowUs()) {
+                    self.lagMs = lag
                 }
             }
         }
@@ -1076,6 +1073,17 @@ final class ConnectionManager: ObservableObject {
         hostInfo = nil
         hostStreamConfig = nil
         UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    /// Capture-to-decode latency of a frame stamped `captureUs` on the host
+    /// clock. Nil for an unstamped frame or a stamp too far from either clock
+    /// to subtract, which a broken or hostile host could send.
+    nonisolated static func latencyMs(captureUs: UInt64, offsetUs: Int64, nowUs: UInt64) -> Double? {
+        guard captureUs > 0 else { return nil }
+        let (captureClient, captureOverflow) = Int64(bitPattern: captureUs).subtractingReportingOverflow(offsetUs)
+        let (latencyUs, latencyOverflow) = Int64(bitPattern: nowUs).subtractingReportingOverflow(captureClient)
+        guard !captureOverflow, !latencyOverflow else { return nil }
+        return latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
     }
 
     private func recordStreamSummary(reason: String) {

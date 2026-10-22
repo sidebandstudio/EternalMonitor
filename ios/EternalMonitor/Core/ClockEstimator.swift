@@ -26,7 +26,10 @@ struct ClockEstimator {
     mutating func addExchange(t1: UInt64, t2: UInt64, t3: UInt64, t4: UInt64) {
         guard t4 >= t1, t3 >= t2 else { return } // clock nonsense — drop
         let rtt = (t4 - t1) - min(t3 - t2, t4 - t1)
-        let offset = (Int64(bitPattern: t2 &- t1) + Int64(bitPattern: t3 &- t4)) / 2
+        // A host clock this far from ours is nonsense too, and the sum would trap.
+        let (sum, overflow) = Int64(bitPattern: t2 &- t1).addingReportingOverflow(Int64(bitPattern: t3 &- t4))
+        guard !overflow else { return }
+        let offset = sum / 2
         samples.append(Sample(offsetUs: offset, rttUs: rtt, at: t4))
         samples.removeAll { t4 - $0.at > Self.windowUs }
         // Bound memory even under ping floods.
