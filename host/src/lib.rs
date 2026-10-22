@@ -25,6 +25,7 @@ pub mod updates;
 pub mod vdd;
 pub mod vdd_device;
 pub mod vdd_settings;
+pub mod vdd_snapshot;
 
 #[cfg(windows)]
 pub mod gpu;

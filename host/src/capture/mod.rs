@@ -350,25 +350,27 @@ const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 
 /// Before each enable: name the main screen's graphics card for the driver
 /// to render on, and, when the user wants it, the iPad's modes. Without a
-/// name the driver renders on the card with the most memory, which on
-/// Intel + NVIDIA laptops drives no screen. Failure is non-fatal — the
-/// driver's built-in choices apply.
+/// name the driver renders on the card with the most memory. In 0.3.1
+/// diagnostics no Intel + NVIDIA laptop got the second screen; that card
+/// choice is a suspect, not a confirmed cause. Failure is non-fatal — the
+/// driver's built-in choices apply. Returns the card asked for, or why none.
 #[cfg(windows)]
-fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) {
+fn prepare_vdd_settings(
+    shared: &SharedControl,
+    outputs: &[OutputInfo],
+) -> Result<String, &'static str> {
     let main_screen = outputs
         .iter()
         .find(|output| output.is_primary)
         .map(|output| output.adapter_name.as_str());
-    let gpu = match crate::vdd_settings::gpu_to_pin(main_screen, &dxgi::adapter_names()) {
-        Ok(gpu) => Some(gpu),
-        Err(reason) => {
-            info!(
-                reason,
-                main_screen, "Leaving the virtual display's graphics card to the driver"
-            );
-            None
-        }
-    };
+    let pin = crate::vdd_settings::gpu_to_pin(main_screen, &dxgi::adapter_names());
+    if let Err(reason) = pin {
+        info!(
+            reason,
+            main_screen, "Leaving the virtual display's graphics card to the driver"
+        );
+    }
+    let gpu = pin.ok();
     let client = crate::settings::SettingsFile::load()
         .vdd_match_resolution
         .then(|| shared.session.lock().client_info())
@@ -386,10 +388,13 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) {
                 gpu = gpu.unwrap_or("chosen by the driver"),
                 "Wrote virtual display mode list for the connected client"
             ),
-            Err(error) => warn!(
-                %error,
-                "Could not write vdd_settings.xml — driver default modes apply"
-            ),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Could not write vdd_settings.xml — driver default modes apply"
+                );
+                return Err("the settings file could not be written");
+            }
         }
     } else if let Some(gpu) = gpu {
         // The modes in the file are the user's: change only the card.
@@ -400,10 +405,36 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) {
             ),
             Ok(false) => {}
             Err(error) => {
-                warn!(%error, gpu, "Could not name the graphics card in vdd_settings.xml")
+                warn!(%error, gpu, "Left vdd_settings.xml as it is; the driver chooses the graphics card");
+                return Err("the settings file was left as it is");
             }
         }
     }
+    pin.map(str::to_string)
+}
+
+/// Log how Windows sees the displays, before the Disable task removes the
+/// virtual one. One record per failure; see `vdd_snapshot`.
+#[cfg(windows)]
+fn log_failure_snapshot(device: DeviceState, pin: &Result<String, &'static str>) {
+    let snapshot = crate::vdd_snapshot::collect(device, pin.clone());
+    warn!(
+        "Virtual display failure snapshot {}",
+        crate::vdd_snapshot::line(&snapshot)
+    );
+}
+
+/// Debug builds only, to check the failure path on a PC whose virtual
+/// display works: `ETERNAL_SIMULATE_ATTACH_TIMEOUT=1` treats it as not
+/// attached after the normal wait.
+#[cfg(all(windows, debug_assertions))]
+fn simulated_attach_timeout() -> bool {
+    std::env::var_os("ETERNAL_SIMULATE_ATTACH_TIMEOUT").is_some()
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+const fn simulated_attach_timeout() -> bool {
+    false
 }
 
 /// Say why the second screen did not appear: on the Stream page each time,
@@ -514,7 +545,7 @@ pub(crate) fn reconcile_virtual_display(
             }
             *shared.vdd_output.lock() = None;
 
-            prepare_vdd_settings(shared, &outputs);
+            let pin = prepare_vdd_settings(shared, &outputs);
 
             let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
             if !capture_is_current(shared, generation) {
@@ -537,6 +568,7 @@ pub(crate) fn reconcile_virtual_display(
                 );
                 if let Some(device) = device {
                     report_device(shared, device);
+                    log_failure_snapshot(device, &pin);
                     // The task enabled a device that cannot show a display.
                     if device != DeviceState::Missing {
                         crate::vdd::set_enabled(false, progress);
@@ -552,8 +584,11 @@ pub(crate) fn reconcile_virtual_display(
                 startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
                 Some(enumerate_outputs())
             };
-            let result =
+            let mut result =
                 wait_for_virtual_output(&before, timeout, poll, Instant::now, std::thread::sleep);
+            if simulated_attach_timeout() && matches!(result, AttachResult::Attached(_)) {
+                result = AttachResult::TimedOut;
+            }
             // A device that is ready with its monitor means Windows left the
             // desktop off it. The display layout stays the user's to change.
             let device = matches!(result, AttachResult::TimedOut).then(crate::vdd_device::query);
@@ -578,6 +613,7 @@ pub(crate) fn reconcile_virtual_display(
             warn!("Virtual display did not attach in time — capturing the primary display instead");
             if let Some(device) = device {
                 report_device(shared, device);
+                log_failure_snapshot(device, &pin);
             }
             // enable() succeeded but nothing attached: turn it back off so we don't strand a
             // half-enabled device as a phantom monitor.

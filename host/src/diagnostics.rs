@@ -161,7 +161,7 @@ fn windows_name(product: &str, build: &str) -> String {
 }
 
 #[cfg(windows)]
-fn registry_string(key: &str, name: &str) -> String {
+pub(crate) fn registry_string(key: &str, name: &str) -> String {
     use windows::{
         core::PCWSTR,
         Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
@@ -190,7 +190,7 @@ fn registry_string(key: &str, name: &str) -> String {
 }
 
 #[cfg(windows)]
-fn registry_dword(key: &str, name: &str) -> String {
+pub(crate) fn registry_dword(key: &str, name: &str) -> String {
     use windows::{
         core::PCWSTR,
         Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},

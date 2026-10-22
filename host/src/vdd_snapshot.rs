@@ -1,0 +1,402 @@
+//! One log record of how Windows sees the displays when the second screen
+//! did not appear, written before the Disable task removes the virtual
+//! display. It goes into the session log, so "Copy logs" and the support
+//! diagnostics carry it.
+//!
+//! It holds graphics card names and IDs, display path numbers and flags,
+//! and a few settings. Monitor device paths are read only to tell which
+//! paths belong to the virtual display and are never written, and nothing
+//! names the machine or the user. The record is bounded in size.
+
+use crate::vdd_device::DeviceState;
+
+const MAX_LINE: usize = 1800;
+const MAX_ADAPTERS: usize = 8;
+const MAX_TARGETS: usize = 16;
+const MAX_NAME: usize = 48;
+
+/// The virtual display's monitor reports the driver's EDID ID in its path.
+const VDD_MONITOR: &str = "MTT1337";
+
+/// A DXGI adapter.
+#[derive(Debug, Clone)]
+pub struct Adapter {
+    pub luid: u64,
+    pub description: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub driver: String,
+    pub outputs: u32,
+}
+
+/// One display target from `QueryDisplayConfig(QDC_ALL_PATHS)`.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub adapter: u64,
+    pub id: u32,
+    /// Source adapter and id, for an active path.
+    pub source: Option<(u64, u32)>,
+    pub available: bool,
+    pub technology: i32,
+    /// Only to tell the virtual display's monitor; never logged.
+    pub monitor_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub device: DeviceState,
+    /// The graphics card the host asked the driver for, or why it asked for none.
+    pub pin: Result<String, &'static str>,
+    /// `HwSchMode`: 2 hardware-accelerated GPU scheduling on, 1 off.
+    pub hags: Option<u32>,
+    /// Whether the driver reads its settings from `C:\VirtualDisplayDriver`.
+    pub default_settings_path: Option<bool>,
+    pub adapters: Vec<Adapter>,
+    pub targets: Vec<Target>,
+}
+
+/// Printable, without the separators this record uses, and short.
+fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && !matches!(c, '"' | '|' | '[' | ']' | '='))
+        .take(MAX_NAME)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn luid(value: u64) -> String {
+    format!("{:x}", value)
+}
+
+/// The record's text, from data already read.
+pub fn line(snapshot: &Snapshot) -> String {
+    let mut out = format!("device={}", snapshot.device);
+    match &snapshot.pin {
+        Ok(name) => {
+            let matched = snapshot.adapters.iter().any(|a| &a.description == name);
+            out += &format!(" pin=\"{}\" pin_matched={matched}", clean(name));
+        }
+        Err(reason) => out += &format!(" pin=none pin_reason=\"{}\"", clean(reason)),
+    }
+    out += match snapshot.hags {
+        Some(2) => " hags=on",
+        Some(1) => " hags=off",
+        Some(_) => " hags=other",
+        None => " hags=unset",
+    };
+    out += match snapshot.default_settings_path {
+        Some(true) => " settings_path=default",
+        Some(false) => " settings_path=other",
+        None => " settings_path=unknown",
+    };
+
+    let adapters: Vec<String> = snapshot
+        .adapters
+        .iter()
+        .take(MAX_ADAPTERS)
+        .map(|a| {
+            format!(
+                "{} \"{}\" {:04x}:{:04x} driver={} outputs={}",
+                luid(a.luid),
+                clean(&a.description),
+                a.vendor_id,
+                a.device_id,
+                clean(&a.driver),
+                a.outputs
+            )
+        })
+        .collect();
+    out += &format!(" adapters=[{}", adapters.join(" | "));
+    if snapshot.adapters.len() > MAX_ADAPTERS {
+        out += &format!(" | +{} more", snapshot.adapters.len() - MAX_ADAPTERS);
+    }
+    out += "]";
+
+    let targets: Vec<String> = snapshot
+        .targets
+        .iter()
+        .take(MAX_TARGETS)
+        .map(|t| {
+            let vdd = t.monitor_path.to_ascii_uppercase().contains(VDD_MONITOR);
+            let state = match t.source {
+                Some((adapter, id)) => format!("active src={}/{id}", luid(adapter)),
+                None if t.available => "inactive available".to_string(),
+                None => "inactive unavailable".to_string(),
+            };
+            format!(
+                "{state} tgt={}/{} tech={} vdd={}",
+                luid(t.adapter),
+                t.id,
+                t.technology,
+                if vdd { "yes" } else { "no" }
+            )
+        })
+        .collect();
+    out += &format!(" paths=[{}", targets.join(" | "));
+    if snapshot.targets.len() > MAX_TARGETS {
+        out += &format!(" | +{} more", snapshot.targets.len() - MAX_TARGETS);
+    }
+    out += "]";
+
+    if out.len() > MAX_LINE {
+        let mut end = MAX_LINE;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out += " ...";
+    }
+    out
+}
+
+/// Read the adapters, display paths and settings now.
+#[cfg(windows)]
+pub fn collect(device: DeviceState, pin: Result<String, &'static str>) -> Snapshot {
+    let settings_key = r"SOFTWARE\MikeTheTech\VirtualDisplayDriver";
+    let path = crate::diagnostics::registry_string(settings_key, "VDDPATH");
+    Snapshot {
+        device,
+        pin,
+        hags: crate::diagnostics::registry_dword(
+            r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+            "HwSchMode",
+        )
+        .parse()
+        .ok(),
+        default_settings_path: (!path.starts_with("unavailable")).then(|| {
+            path.trim_end_matches('\\')
+                .eq_ignore_ascii_case(r"C:\VirtualDisplayDriver")
+        }),
+        adapters: windows_impl::adapters(),
+        targets: windows_impl::targets(),
+    }
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use super::{Adapter, Target};
+    use windows::core::Interface;
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ALL_PATHS,
+    };
+    use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+
+    /// `DISPLAYCONFIG_PATH_ACTIVE`.
+    const PATH_ACTIVE: u32 = 1;
+
+    fn value(luid: LUID) -> u64 {
+        ((luid.HighPart as u32 as u64) << 32) | luid.LowPart as u64
+    }
+
+    fn text(wide: &[u16]) -> String {
+        String::from_utf16_lossy(&wide[..wide.iter().position(|&c| c == 0).unwrap_or(wide.len())])
+    }
+
+    pub fn adapters() -> Vec<Adapter> {
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            return Vec::new();
+        };
+        (0..)
+            .map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok())
+            .filter_map(|adapter| {
+                let desc = unsafe { adapter.GetDesc1() }.ok()?;
+                let driver = match unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) } {
+                    Ok(version) => {
+                        let v = version as u64;
+                        format!(
+                            "{}.{}.{}.{}",
+                            v >> 48,
+                            (v >> 32) & 0xffff,
+                            (v >> 16) & 0xffff,
+                            v & 0xffff
+                        )
+                    }
+                    Err(_) => "unknown".to_string(),
+                };
+                let outputs = (0..)
+                    .take_while(|&index| unsafe { adapter.EnumOutputs(index) }.is_ok())
+                    .count() as u32;
+                Some(Adapter {
+                    luid: value(desc.AdapterLuid),
+                    description: text(&desc.Description),
+                    vendor_id: desc.VendorId,
+                    device_id: desc.DeviceId,
+                    driver,
+                    outputs,
+                })
+            })
+            .collect()
+    }
+
+    /// Every active path, then each available target no active path uses.
+    pub fn targets() -> Vec<Target> {
+        let (mut paths, mut modes) = (0u32, 0u32);
+        if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut paths, &mut modes) }
+            != ERROR_SUCCESS
+        {
+            return Vec::new();
+        }
+        let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+        let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+        if unsafe {
+            QueryDisplayConfig(
+                QDC_ALL_PATHS,
+                &mut paths,
+                path_info.as_mut_ptr(),
+                &mut modes,
+                mode_info.as_mut_ptr(),
+                None,
+            )
+        } != ERROR_SUCCESS
+        {
+            return Vec::new();
+        }
+        path_info.truncate(paths as usize);
+        let monitor_path = |path: &DISPLAYCONFIG_PATH_INFO| {
+            let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+            name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+            name.header.adapterId = path.targetInfo.adapterId;
+            name.header.id = path.targetInfo.id;
+            if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0 {
+                text(&name.monitorDevicePath)
+            } else {
+                String::new()
+            }
+        };
+        let mut targets: Vec<Target> = Vec::new();
+        let (active, inactive): (Vec<&DISPLAYCONFIG_PATH_INFO>, Vec<_>) = path_info
+            .iter()
+            .partition(|path| path.flags & PATH_ACTIVE != 0);
+        for path in active {
+            targets.push(Target {
+                adapter: value(path.targetInfo.adapterId),
+                id: path.targetInfo.id,
+                source: Some((value(path.sourceInfo.adapterId), path.sourceInfo.id)),
+                available: path.targetInfo.targetAvailable.as_bool(),
+                technology: path.targetInfo.outputTechnology.0,
+                monitor_path: monitor_path(path),
+            });
+        }
+        for path in inactive {
+            let (adapter, id) = (value(path.targetInfo.adapterId), path.targetInfo.id);
+            if !path.targetInfo.targetAvailable.as_bool()
+                || targets.iter().any(|t| t.adapter == adapter && t.id == id)
+            {
+                continue;
+            }
+            targets.push(Target {
+                adapter,
+                id,
+                source: None,
+                available: true,
+                technology: path.targetInfo.outputTechnology.0,
+                monitor_path: monitor_path(path),
+            });
+        }
+        targets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            device: DeviceState::NoMonitor,
+            pin: Ok("Intel(R) Iris(R) Xe Graphics".into()),
+            hags: Some(2),
+            default_settings_path: Some(true),
+            adapters: vec![
+                Adapter {
+                    luid: 0xd2c1,
+                    description: "Intel(R) Iris(R) Xe Graphics".into(),
+                    vendor_id: 0x8086,
+                    device_id: 0x46a6,
+                    driver: "32.0.101.7092".into(),
+                    outputs: 1,
+                },
+                Adapter {
+                    luid: 0x1_0000_e5f0,
+                    description: "NVIDIA GeForce RTX 3050 Ti Laptop GPU".into(),
+                    vendor_id: 0x10de,
+                    device_id: 0x25a0,
+                    driver: "32.0.16.1742".into(),
+                    outputs: 0,
+                },
+            ],
+            targets: vec![
+                Target {
+                    adapter: 0xd2c1,
+                    id: 4352,
+                    source: Some((0xd2c1, 0)),
+                    available: true,
+                    technology: i32::MIN,
+                    monitor_path: r"\\?\DISPLAY#BOE0A1C#4&2b5bd9a1&0&UID8388688#{e6f07b5f}".into(),
+                },
+                Target {
+                    adapter: 0x2_0000_0101,
+                    id: 256,
+                    source: None,
+                    available: true,
+                    technology: 5,
+                    monitor_path: r"\\?\DISPLAY#MTT1337#1&28a6823a&3&UID256#{e6f07b5f}".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_snapshot_is_one_line_with_each_part() {
+        assert_eq!(
+            line(&snapshot()),
+            "device=no_monitor pin=\"Intel(R) Iris(R) Xe Graphics\" pin_matched=true hags=on \
+             settings_path=default adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
+             driver=32.0.101.7092 outputs=1 | 10000e5f0 \"NVIDIA GeForce RTX 3050 Ti Laptop GPU\" \
+             10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 \
+             tech=-2147483648 vdd=no | inactive available tgt=200000101/256 tech=5 vdd=yes]"
+        );
+        let mut unpinned = snapshot();
+        unpinned.pin = Err("two graphics cards have the same name");
+        unpinned.hags = None;
+        unpinned.adapters.truncate(1);
+        let text = line(&unpinned);
+        assert!(
+            text.contains(" pin=none pin_reason=\"two graphics cards have the same name\""),
+            "{text}"
+        );
+        assert!(text.contains(" hags=unset"));
+        let mut unmatched = snapshot();
+        unmatched.pin = Ok("Intel(R) UHD Graphics".into());
+        assert!(line(&unmatched).contains("pin_matched=false"));
+    }
+
+    #[test]
+    fn monitor_paths_and_odd_names_stay_out_and_the_line_is_bounded() {
+        let mut odd = snapshot();
+        odd.adapters[0].description =
+            "Card \"one\"\n| [x]=y with a very long name that keeps going and going".into();
+        let text = line(&odd);
+        // Paths hold monitor serial-style instance IDs.
+        for secret in ["UID256", "UID8388688", "BOE0A1C", "28a6823a", "#", "\\\\?"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(!text.contains('\n'));
+        assert!(
+            text.contains("\"Card one xy with a very long name that keeps goi\""),
+            "{text}"
+        );
+
+        let mut many = snapshot();
+        many.adapters = vec![many.adapters[1].clone(); 40];
+        many.targets = vec![many.targets[1].clone(); 200];
+        let text = line(&many);
+        assert!(text.len() <= MAX_LINE + 4, "{}", text.len());
+        assert!(text.contains("| +32 more]"), "{text}");
+    }
+}
