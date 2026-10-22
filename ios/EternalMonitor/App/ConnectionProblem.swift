@@ -12,7 +12,9 @@ enum ConnectionProblem: Equatable {
     /// network carries its announcements, so something on the PC (a firewall,
     /// security software, the stream being stopped) drops the connection.
     case noReplyFound
-    /// The address is on a different home network than this iPad's Wi-Fi.
+    /// Nothing answered at a private address outside this iPad's Wi-Fi
+    /// network. Routed home networks and VPNs use such addresses too, so it
+    /// is only a likely cause.
     case otherNetwork
     /// The PC answered, but no picture could be shown.
     case noPicture
@@ -67,7 +69,7 @@ enum ConnectionProblem: Equatable {
         case .noReply(usb: false): return "Your PC didn't answer"
         case .noReply(usb: true): return "Your PC didn't answer over the cable"
         case .noReplyFound: return "Your PC is on this network but didn't answer"
-        case .otherNetwork: return "Your PC is on a different network"
+        case .otherNetwork: return "Your iPad and PC may be on different networks"
         case .noPicture: return "Your PC answered, but no picture arrived"
         case .receiverNotReady: return "This iPad couldn't start the connection"
         case .badAddress: return "That address doesn't look right"
@@ -102,8 +104,9 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor on the PC says Ready for your iPad. If it shows a Windows Firewall message, click Allow there. "
                 + "Security software on the PC may also be blocking EternalMonitor: allow it there, run the PC installer again, or connect with a USB cable."
         case .otherNetwork:
-            return "This iPad's Wi-Fi and that address are on different networks. Join the same Wi-Fi as the PC (not a guest network), "
-                + "or tap the PC under Found on this network, or connect with a USB cable."
+            return "That address isn't on this iPad's Wi-Fi network, and nothing answered there. Join the same Wi-Fi as the PC "
+                + "(not a guest network), or check that EternalMonitor on the PC is open and says Ready for your iPad. "
+                + "A USB cable works too."
         case .noPicture:
             return "EternalMonitor on the PC couldn't send its screen. Look there for a message and follow it, click Restart, then try again. "
                 + "If it keeps happening, send us Settings, Diagnostics from this iPad and Performance, Copy logs from the PC."
@@ -294,9 +297,10 @@ enum LocalNetwork {
         ip >> 24 == 10 || ip >> 20 == 0xAC1 || ip >> 16 == 0xC0A8
     }
 
-    /// A private address outside every private network this iPad is on. Only
-    /// then is "different network" certain: a VPN or Tailscale address, or an
-    /// iPad without Wi-Fi, says nothing either way.
+    /// A private address outside every private network this iPad is on, so
+    /// "maybe another network" is worth saying. Not a verdict: routed LANs and
+    /// VPNs use such addresses. A Tailscale or public address, or an iPad
+    /// without Wi-Fi, says nothing either way.
     static func isOtherHomeNetwork(_ host: String, local: [Subnet]) -> Bool {
         guard let ip = ipv4(host), isPrivate(ip) else { return false }
         let home = local.filter { isPrivate($0.address) }

@@ -59,7 +59,11 @@ final class ConnectionProblemTests: XCTestCase {
                                                  datagramsReceived: 0, isUSB: true, host: "USB", pcFound: true, local: home),
                        .noReply(usb: true))
         XCTAssertTrue(ConnectionProblem.noReplyFound.detail.contains("Allow"))
+        // Routed LANs and VPNs use such addresses too: a possibility, with
+        // both steps, not a verdict.
+        XCTAssertEqual(ConnectionProblem.otherNetwork.title, "Your iPad and PC may be on different networks")
         XCTAssertTrue(ConnectionProblem.otherNetwork.detail.contains("same Wi-Fi"))
+        XCTAssertTrue(ConnectionProblem.otherNetwork.detail.contains("Ready for your iPad"))
         XCTAssertEqual(ConnectionProblem.otherNetwork.actions, [.retry])
     }
 
