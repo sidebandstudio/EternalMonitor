@@ -487,6 +487,7 @@ fn review_screens() {
         ("unsupported-gpu", CaptureBlock::UnsupportedOnThisGpu),
         ("too-many-capture-apps", CaptureBlock::TooManyCaptureApps),
         ("session-disconnected", CaptureBlock::SessionDisconnected),
+        ("gpu-reset", CaptureBlock::GpuReset),
     ] {
         *shared.capture_block.lock() = Some(block);
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);

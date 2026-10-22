@@ -112,6 +112,10 @@ Windows changes.
   are encoded on the graphics card at up to 4096 pixels, the most an iPad
   screen can use. Previously the graphics card refused them and the PC
   encoded on the processor, which lagged and stalled.
+- When Windows restarts the graphics driver, the PC keeps the iPad connected,
+  shows "The graphics driver restarted" and picks the picture up again by
+  itself. Previously the stream restarted every few seconds and stopped for
+  good after six tries.
 
 ### What to test
 

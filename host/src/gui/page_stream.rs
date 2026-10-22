@@ -603,6 +603,7 @@ fn simulate_problem(
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "gpu-reset" => *block = Some(CaptureBlock::GpuReset),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -693,6 +694,11 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::GpuReset => (
+            Icon::Display,
+            "The graphics driver restarted",
+            "Windows restarts it during a driver update or after a driver problem. The picture comes back by itself in a few seconds. If it doesn't, restart the PC.",
         ),
     })
 }

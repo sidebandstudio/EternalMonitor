@@ -210,7 +210,8 @@ pub fn run_capture_loop(
             Some(&mut device),
             None,
             None,
-        )?;
+        )
+        .map_err(blocked_or_error)?;
     }
     let device = device.expect("D3D11CreateDevice succeeded but returned no device");
     info!("D3D11 device created");
@@ -438,13 +439,9 @@ pub fn run_capture_loop(
                             // Map staging texture for CPU read
                             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                             unsafe {
-                                device_context.Map(
-                                    &staging_texture,
-                                    0,
-                                    D3D11_MAP_READ,
-                                    0,
-                                    Some(&mut mapped),
-                                )?;
+                                device_context
+                                    .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                                    .map_err(blocked_or_error)?;
                             }
 
                             // Copy row-by-row (pitch may differ from width*4)
@@ -657,7 +654,7 @@ pub fn run_capture_loop(
             }
             Err(e) => {
                 error!(error = %e, "AcquireNextFrame failed");
-                return Err(e.into());
+                return Err(blocked_or_error(e));
             }
         }
 

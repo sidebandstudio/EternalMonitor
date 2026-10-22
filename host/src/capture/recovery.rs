@@ -28,6 +28,11 @@ pub enum CaptureBlock {
     TooManyCaptureApps,
     /// The Windows session is disconnected or remote.
     SessionDisconnected,
+    /// Windows removed or reset the graphics device (a driver update, a crash
+    /// the driver recovered from, or a hybrid laptop powering its GPU down).
+    /// A fresh device on the next retry picks up whichever adapter now drives
+    /// the display.
+    GpuReset,
 }
 
 impl CaptureBlock {
@@ -40,6 +45,8 @@ impl CaptureBlock {
             0x887A_0004 => Some(Self::UnsupportedOnThisGpu), // DXGI_ERROR_UNSUPPORTED
             0x887A_0022 => Some(Self::TooManyCaptureApps), // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
             0x887A_0028 => Some(Self::SessionDisconnected), // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0005 => Some(Self::GpuReset),      // DXGI_ERROR_DEVICE_REMOVED
+            0x887A_0007 => Some(Self::GpuReset),      // DXGI_ERROR_DEVICE_RESET
             _ => None,
         }
     }
@@ -245,6 +252,15 @@ mod tests {
         assert_eq!(
             CaptureBlock::from_hresult(code(0x887A_0026)),
             Some(CaptureBlock::DisplayChanging)
+        );
+        // 0.3.1 restarted the pipeline for these until it gave up.
+        assert_eq!(
+            CaptureBlock::from_hresult(code(0x887A_0005)),
+            Some(CaptureBlock::GpuReset)
+        );
+        assert_eq!(
+            CaptureBlock::from_hresult(code(0x887A_0007)),
+            Some(CaptureBlock::GpuReset)
         );
         assert_eq!(CaptureBlock::from_hresult(code(0x8007_000E)), None);
     }
