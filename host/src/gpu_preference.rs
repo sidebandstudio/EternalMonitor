@@ -22,21 +22,29 @@ pub struct GpuSwitch {
 pub type AdapterId = (i32, u32);
 
 /// The preference that selects `display`, the adapter the screen is wired
-/// to, given the first adapter Windows hands out for each preference. `None`
-/// when neither preference reaches it, or when the process already runs on
-/// it (`current`), so switching would change nothing.
+/// to, among the hardware `adapters` and their dedicated video memory.
+/// Windows calls the adapter with the most memory high performance and the
+/// one with the least power saving. (`EnumAdapterByGpuPreference` cannot
+/// tell: inside a process with a per-app preference it returns that
+/// preference's adapter for both.) `None` when the process already runs on
+/// the display's adapter, or when the display hangs off an adapter in
+/// between that neither preference selects.
 pub fn preference_for(
     display: AdapterId,
     current: AdapterId,
-    power_saving: AdapterId,
-    high_performance: AdapterId,
+    adapters: &[(AdapterId, u64)],
 ) -> Option<u32> {
-    if display == current {
+    if display == current || adapters.len() < 2 {
+        return None;
+    }
+    let most = adapters.iter().max_by_key(|(_, memory)| *memory)?;
+    let least = adapters.iter().min_by_key(|(_, memory)| *memory)?;
+    if most.1 == least.1 {
         None
-    } else if display == power_saving {
-        Some(1)
-    } else if display == high_performance {
+    } else if display == most.0 {
         Some(2)
+    } else if display == least.0 {
+        Some(1)
     } else {
         None
     }
@@ -114,8 +122,7 @@ mod windows_impl {
     };
     use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, LUID};
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_GPU_PREFERENCE,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
     };
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -140,11 +147,19 @@ mod windows_impl {
     /// adapter DXGI listed the display under.
     pub fn suggest_switch(device_name: &str, current: LUID) -> Option<GpuSwitch> {
         let wired = display_adapter(device_name)?;
-        let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1::<IDXGIFactory6>() }.ok()?;
-        let first = |preference: DXGI_GPU_PREFERENCE| -> Option<(AdapterId, String)> {
-            let adapter: IDXGIAdapter1 =
-                unsafe { factory.EnumAdapterByGpuPreference(0, preference) }.ok()?;
-            let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+        let mut adapters = Vec::new();
+        let mut names = Vec::new();
+        for index in 0.. {
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+                break;
+            };
+            let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
             let name = String::from_utf16_lossy(
                 &desc
                     .Description
@@ -153,28 +168,26 @@ mod windows_impl {
                     .take_while(|&c| c != 0)
                     .collect::<Vec<_>>(),
             );
-            Some((id(desc.AdapterLuid), name))
-        };
-        let (power_saving, power_saving_name) = first(DXGI_GPU_PREFERENCE_MINIMUM_POWER)?;
-        let (high_performance, high_performance_name) =
-            first(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
-        let preference = preference_for(wired, id(current), power_saving, high_performance);
+            adapters.push((id(desc.AdapterLuid), desc.DedicatedVideoMemory as u64));
+            names.push((id(desc.AdapterLuid), name));
+        }
+        let preference = preference_for(wired, id(current), &adapters);
+        let adapter_name = names
+            .iter()
+            .find(|(luid, _)| *luid == wired)
+            .map(|(_, name)| name.clone());
         info!(
             device = device_name,
             display_adapter = ?wired,
+            display_adapter_name = adapter_name.as_deref().unwrap_or("unknown"),
             running_on = ?id(current),
-            power_saving = %power_saving_name,
-            high_performance = %high_performance_name,
+            adapters = ?adapters,
             preference,
             "Checked which graphics card drives the screen"
         );
-        let adapter_name = match preference? {
-            1 => power_saving_name,
-            _ => high_performance_name,
-        };
         Some(GpuSwitch {
             preference: preference?,
-            adapter_name,
+            adapter_name: adapter_name?,
         })
     }
 
@@ -336,15 +349,22 @@ mod tests {
 
     #[test]
     fn the_switch_targets_the_adapter_the_screen_is_wired_to() {
+        let laptop = [(IGPU, 512), (DGPU, 8192)];
         // A laptop running on its NVIDIA GPU with the panel on the iGPU: the
         // 0.3.1 field case.
-        assert_eq!(preference_for(IGPU, DGPU, IGPU, DGPU), Some(1));
+        assert_eq!(preference_for(IGPU, DGPU, &laptop), Some(1));
         // mainpc forced to power saving with its monitors on the RTX card.
-        assert_eq!(preference_for(DGPU, IGPU, IGPU, DGPU), Some(2));
+        assert_eq!(preference_for(DGPU, IGPU, &laptop), Some(2));
         // Already on the right adapter: switching cannot help.
-        assert_eq!(preference_for(IGPU, IGPU, IGPU, DGPU), None);
-        // A third adapter (a dock or eGPU) that no preference selects.
-        assert_eq!(preference_for((0, 0x3333), DGPU, IGPU, DGPU), None);
+        assert_eq!(preference_for(IGPU, IGPU, &laptop), None);
+        // The middle card of three (RTX 4090 + RTX 3080 + Radeon iGPU) is
+        // neither preference.
+        let three = [(DGPU, 24138), ((0, 0x3333), 10051), (IGPU, 2021)];
+        assert_eq!(preference_for((0, 0x3333), IGPU, &three), None);
+        assert_eq!(preference_for(DGPU, IGPU, &three), Some(2));
+        // One adapter, or two that look alike: no way to choose.
+        assert_eq!(preference_for(DGPU, IGPU, &[(DGPU, 1)]), None);
+        assert_eq!(preference_for(DGPU, IGPU, &[(DGPU, 1), (IGPU, 1)]), None);
     }
 
     #[test]
