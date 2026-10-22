@@ -62,14 +62,22 @@ final class AudioPlayer {
                 self.retireTimeline()
             }
         })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
-            object: AVAudioSession.sharedInstance(), queue: nil) { [weak self] _ in
+        let rebuild: (Notification) -> Void = { [weak self] _ in
             self?.queue.async { [weak self] in
                 // Rebuild the output on the next packet after headphones,
                 // speakers or the hardware sample rate changes.
                 self?.closeOutput(deactivate: false)
             }
-        })
+        }
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil, using: rebuild))
+        // A media services reset and an engine configuration change both stop
+        // the engine for good; without a rebuild the PC stays silent until
+        // the next connection.
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil, using: rebuild))
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange,
+            object: nil, queue: nil, using: rebuild))
     }
 
     deinit {

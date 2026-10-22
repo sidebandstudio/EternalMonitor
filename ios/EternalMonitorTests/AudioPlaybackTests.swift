@@ -1,4 +1,5 @@
 import AVFoundation
+import os
 import XCTest
 @testable import EternalMonitor
 
@@ -73,6 +74,38 @@ final class AudioPlayerTests: XCTestCase {
         wait(for: [failed], timeout: 0.1)
         XCTAssertNil(player.stats.error)
         XCTAssertFalse(player.stats.playing)
+    }
+
+    private final class CountingOutput: AudioOutputDevice {
+        let counts = OSAllocatedUnfairLock(initialState: (starts: 0, stops: 0))
+        func start(pcm: AudioPCMBuffer) throws { counts.withLock { $0.starts += 1 } }
+        func stop(deactivate: Bool) { counts.withLock { $0.stops += 1 } }
+    }
+
+    func testOutputIsRebuiltAfterTheEngineIsStoppedUnderneathIt() throws {
+        let opus = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "tone_1khz_20ms",
+            withExtension: "opus", subdirectory: "Fixtures")))
+        for name in [AVAudioSession.mediaServicesWereResetNotification, .AVAudioEngineConfigurationChange] {
+            let output = CountingOutput()
+            let player = AudioPlayer(output: output)
+            defer { player.stop() }
+            var seq: UInt32 = 0
+            func playUntilStarted(_ starts: Int) -> Bool {
+                let deadline = Date().addingTimeInterval(2)
+                while output.counts.withLock({ $0.starts }) < starts || !player.stats.playing, Date() < deadline {
+                    seq += 1
+                    player.receive(header: AudioHeader(sessionId: 7, streamEpoch: 1, audioSeq: seq,
+                        captureTimestampUs: UInt64(seq) * 20_000, discontinuity: seq == 1), opus: opus)
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                return output.counts.withLock { $0.starts } == starts && player.stats.playing
+            }
+            XCTAssertTrue(playUntilStarted(1), "\(name.rawValue): first output")
+            NotificationCenter.default.post(name: name,
+                object: name == .AVAudioEngineConfigurationChange ? nil : AVAudioSession.sharedInstance())
+            XCTAssertTrue(playUntilStarted(2), "\(name.rawValue): audio must come back without reconnecting")
+            XCTAssertEqual(output.counts.withLock { $0.stops }, 1)
+        }
     }
 
     func testStopWaitsForPendingOutputToCloseBeforeReturning() throws {
