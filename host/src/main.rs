@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host it watches and must never be turned away as a second instance,
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
+    // The elevated firewall repair the GUI starts: a short helper, not a host.
+    eternal_host::network::run_repair_if_requested();
 
     // Before any DXGI query or window: monitor rects and injected input must
     // be physical pixels from the start, not only once the GUI's event loop
@@ -114,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Capture: {}", capture_summary);
     info!("  Listen:  0.0.0.0:{}", listen_port);
     info!("══════════════════════════════════");
+    eternal_host::network::start_check();
 
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.

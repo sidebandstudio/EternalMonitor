@@ -1224,25 +1224,34 @@ fn value_or_unknown(value: &str) -> &str {
 }
 
 pub fn detect_local_ip(listen_port: u16) -> String {
-    // Primary: ask the OS which local interface would route toward a public address. This is the
-    // happy path on any machine with a normal default route.
-    if let Ok(addr) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
-        s.connect("8.8.8.8:80")?;
-        s.local_addr()
-    }) {
-        let ip = addr.ip();
-        if !ip.is_unspecified() && !ip.is_loopback() {
-            return format!("{}:{}", ip, listen_port);
-        }
+    let lan = crate::network::refresh_addresses();
+    // Ask the OS which local interface would route toward a public address.
+    let route = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .ok()
+        .map(|addr| addr.ip());
+    match pick_address(&lan, route, first_lan_ipv4) {
+        Some(ip) => format!("{ip}:{listen_port}"),
+        None => format!("unknown:{listen_port}"),
     }
+}
 
-    // Fallback: no default route (isolated LAN / no internet / blocked) — enumerate local
-    // adapters and use the first real LAN IPv4 so the displayed address and QR still work.
-    if let Some(ip) = first_lan_ipv4() {
-        return format!("{}:{}", ip, listen_port);
-    }
-
-    format!("unknown:{listen_port}")
+/// The address to show and encode in the QR code. The home network's Wi-Fi
+/// or Ethernet comes first: a VPN or a Hyper-V/WSL switch can own the default
+/// route, and an iPad can't reach those addresses. Then the default route,
+/// then (no default route: isolated LAN, no internet) the first adapter's.
+fn pick_address(
+    lan: &[std::net::Ipv4Addr],
+    route: Option<std::net::IpAddr>,
+    first_adapter: impl FnOnce() -> Option<std::net::Ipv4Addr>,
+) -> Option<std::net::IpAddr> {
+    lan.first()
+        .map(|ip| std::net::IpAddr::V4(*ip))
+        .or(route.filter(|ip| !ip.is_unspecified() && !ip.is_loopback()))
+        .or_else(|| first_adapter().map(std::net::IpAddr::V4))
 }
 
 /// Launch the GUI window. Blocks the calling thread.
