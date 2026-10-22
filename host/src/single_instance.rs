@@ -8,6 +8,9 @@
 //! from open handles to their final paths, so a short (8.3) name, a junction
 //! or a `\\?\` spelling of the same install reaches the same key. The mutex
 //! is per Windows session.
+//!
+//! A host run as administrator creates a mutex a normal launch may not open.
+//! Being refused it still means a host from this install is running.
 use std::path::Path;
 
 /// `Local\EternalMonitor-<hash>` for this executable and settings folder.
@@ -98,7 +101,7 @@ impl Guard {
 #[cfg(windows)]
 pub fn acquire_named(name: &str) -> Option<Guard> {
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
     match unsafe { CreateMutexW(None, false, &HSTRING::from(name)) } {
         Ok(handle) if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS => {
@@ -111,6 +114,8 @@ pub fn acquire_named(name: &str) -> Option<Guard> {
             _handle: handle,
             problem: None,
         }),
+        // An elevated host holds it.
+        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => None,
         // Never refuse to start because the check itself failed.
         Err(error) => Some(Guard {
             problem: Some(error.to_string()),
@@ -322,5 +327,39 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(guard.is_some(), "after the first exits");
+    }
+
+    /// A host run as administrator holds a mutex whose default security a
+    /// normal launch may not open. An empty DACL refuses this process the
+    /// same way.
+    #[cfg(windows)]
+    #[test]
+    fn a_mutex_this_launch_may_not_open_still_means_a_host_is_running() {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Security::{
+            InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        };
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let name = format!(r"Local\EternalMonitor-test-elevated-{}", std::process::id());
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let pointer = PSECURITY_DESCRIPTOR(&mut descriptor as *mut _ as *mut _);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: pointer.0,
+            bInheritHandle: false.into(),
+        };
+        let first = unsafe {
+            // Revision 1; a present, empty DACL grants nobody access.
+            InitializeSecurityDescriptor(pointer, 1).unwrap();
+            SetSecurityDescriptorDacl(pointer, true, None, false).unwrap();
+            CreateMutexW(Some(&attributes), false, &HSTRING::from(name.as_str())).unwrap()
+        };
+        assert!(acquire_named(&name).is_none(), "refused means running");
+        unsafe {
+            let _ = CloseHandle(first);
+        }
     }
 }
