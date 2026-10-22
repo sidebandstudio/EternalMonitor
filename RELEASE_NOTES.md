@@ -108,6 +108,16 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- On Wi-Fi, a lost frame no longer smears the iPad picture or triggers a
+  decoder error. The iPad keeps the last good picture until the PC sends a
+  fresh one, asks again if that takes a second, and shows **Restoring the
+  picture…** if it takes longer.
+- When the PC's resolution changes mid-stream, for example as a second screen
+  starts, the iPad switches to the new size in one step instead of glitching.
+- PC audio comes back by itself after iPadOS restarts its audio services,
+  instead of staying silent until you reconnect.
+- The iPad app frees its held video frame when iPadOS runs low on memory.
+- The iPad app no longer crashes on impossible clock readings from a PC.
 
 ### What to test
 
