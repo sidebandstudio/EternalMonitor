@@ -236,6 +236,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Before the stream starts: while another program holds the port, the
+    // Stream page names it, and the stream starts once the port is free.
+    {
+        let gui_control = gui_control.clone();
+        eternal_host::startup::port::check_at_startup(listen_port, move || {
+            gui_control.request_start()
+        });
+    }
+
     let supervisor_thread = std::thread::spawn(move || {
         eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });

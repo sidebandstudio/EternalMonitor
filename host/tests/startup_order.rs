@@ -32,3 +32,20 @@ fn helpers_then_single_instance_then_the_display_reset() {
         "main touches the virtual display before dispatching helper modes"
     );
 }
+
+/// The stream port is checked before the supervisor starts the stream, so a
+/// port another program holds is found, not mistaken for the stream's own.
+#[test]
+fn the_stream_port_is_checked_before_the_stream_starts() {
+    let main = include_str!("../src/main.rs");
+    let check = main
+        .find("eternal_host::startup::port::check_at_startup(listen_port")
+        .expect("main.rs checks the stream port");
+    let stream = main
+        .find("eternal_host::supervisor::run(")
+        .expect("main.rs starts the supervisor");
+    assert!(
+        check < stream,
+        "the port check must come before the stream starts"
+    );
+}

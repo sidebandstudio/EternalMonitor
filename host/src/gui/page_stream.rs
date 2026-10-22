@@ -51,6 +51,7 @@ impl AnalyzerApp {
 
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        self.port_notice(ui);
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
