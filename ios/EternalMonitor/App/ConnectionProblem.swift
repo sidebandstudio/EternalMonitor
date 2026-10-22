@@ -32,6 +32,8 @@ enum ConnectionProblem: Equatable {
     /// A live session stopped: heartbeats ran out or the cable came out.
     case lost(LostReason)
     case reconnecting(attempt: Int, of: Int)
+    /// Reconnecting waits for this iPad's Wi-Fi to come back.
+    case waitingForNetwork
     case reconnectFailed
     case pcEndedSession
     /// The PC is streaming to another device, or still to this iPad's cable.
@@ -79,6 +81,7 @@ enum ConnectionProblem: Equatable {
         case .lost(.cableUnplugged): return "The USB cable was disconnected"
         case .lost(.usbTurnedOff): return "USB connections were turned off"
         case .reconnecting: return "Reconnecting to your PC…"
+        case .waitingForNetwork: return "Waiting for Wi-Fi…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
         case .pcEndedSession: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
@@ -128,6 +131,8 @@ enum ConnectionProblem: Equatable {
             return "Plug the cable back in. This iPad reconnects by itself."
         case .lost(.usbTurnedOff):
             return "Turn on Allow USB connections in Settings to use the cable again."
+        case .waitingForNetwork:
+            return "This iPad lost its network connection. It reconnects to your PC as soon as Wi-Fi is back."
         case .reconnecting(let attempt, let total):
             return "Attempt \(attempt) of \(total). Keep EternalMonitor open on the PC."
         case .reconnectFailed:
@@ -148,7 +153,7 @@ enum ConnectionProblem: Equatable {
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]
-        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
+        case .reconnecting, .waitingForNetwork, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
         default: return [.retry]
         }
     }

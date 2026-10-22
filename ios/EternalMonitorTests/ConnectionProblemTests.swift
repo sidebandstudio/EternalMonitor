@@ -151,7 +151,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy, .pairingCodeAsAddress, .routerAddress, .noReplyFound, .otherNetwork,
+            .pcBusy, .pairingCodeAsAddress, .routerAddress, .noReplyFound, .otherNetwork, .waitingForNetwork,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
         ]
         for problem in all {

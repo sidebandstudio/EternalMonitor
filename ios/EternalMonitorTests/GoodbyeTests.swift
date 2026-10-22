@@ -77,12 +77,13 @@ final class GoodbyeTests: XCTestCase {
     }
 
     /// A streaming session on `host`, with automatic reconnecting on.
-    private func streaming(_ host: FakeUDPHost) async throws -> ConnectionManager {
+    private func streaming(_ host: FakeUDPHost, networkUp: @escaping () -> Bool = { true }) async throws -> ConnectionManager {
         let previous = UserDefaults.standard.object(forKey: "autoReconnect")
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
         let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
-            connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 }))
+            connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 },
+            networkUp: networkUp))
         host.sendKeyframe(try FakeUDPHost.keyframe())
         try await until("streaming") { manager.state == .connected }
         return manager
@@ -103,6 +104,31 @@ final class GoodbyeTests: XCTestCase {
         try await until("streaming again") { manager.state == .connected }
         XCTAssertNil(manager.problem)
         XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// The connection drops while this iPad's Wi-Fi is down (asleep, out of
+    /// range). Reconnecting waits for the network instead of spending its
+    /// attempts on a dead link, then reconnects as soon as it's back.
+    func testReconnectingWaitsForThisIPadsNetwork() async throws {
+        final class Network { var up = true }
+        let network = Network()
+        let host = FakeUDPHost()
+        let manager = try await streaming(host, networkUp: { network.up })
+        defer { manager.cancel() }
+        network.up = false
+        host.sendBye(.hostShuttingDown)
+        try await until("waiting for the network") { manager.problem == .waitingForNetwork }
+        let early = await Task.detached { host.helloAttempts(within: 1.5) }.value
+        XCTAssertEqual(early, 0, "no attempt while the iPad has no network")
+        XCTAssertEqual(manager.reconnectAttempt, 1)
+        XCTAssertEqual(manager.problem?.title, "Waiting for Wi-Fi…")
+        network.up = true
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never tried the PC once the network was back")
+        try await until("handshake") { manager.hostInfo != nil }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming again") { manager.state == .connected }
+        XCTAssertNil(manager.problem)
     }
 
     /// Stop and update on the PC: the iPad tries again while the PC turns it
