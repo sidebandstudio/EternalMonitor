@@ -37,8 +37,11 @@ final class FrameAssembler {
     /// the same bound. WiFi reorders fragments by a few milliseconds and
     /// releases stalled frames in bursts, so a tighter bound evicted frames
     /// just before their last fragment arrived. The repair deadline, not the
-    /// frame count, limits how long a gap may delay newer frames.
-    static let maxPendingFrames = 8
+    /// frame count, limits how long a gap may delay newer frames, so the bound
+    /// covers the longest deadline (25 ms plus the 100 ms stall allowance) at
+    /// 120 fps twice over. Eight frames lasted 67 ms on a 120 Hz iPad and
+    /// evicted frames whose repair was still on its way.
+    static let maxPendingFrames = 32
     /// Hard ceiling on buffered fragment bytes across all partial frames.
     static let maxPendingBytes = 8 * 1024 * 1024
     /// WiFi can hold traffic in either direction for about 100 ms and then
@@ -49,6 +52,14 @@ final class FrameAssembler {
     /// by up to this much per frame. A frame that is truly lost is dropped
     /// after at most its deadline plus this allowance.
     static let maxStallAllowanceUs: UInt64 = 100_000
+    /// A frame with nothing newer behind it waits this long at most for its
+    /// repair; see `hold(_:now:)`.
+    static let maxHoldUs: UInt64 = 1_000_000
+    /// Longest wait between repeated requests for a held frame.
+    static let maxHoldRetryUs: UInt64 = 200_000
+    /// Without repair, a partial frame is dropped when no fragment of it has
+    /// arrived for this long.
+    static let staleFrameUs: UInt64 = 100_000
 
     /// Cumulative per-connection loss accounting, safe to read from any
     /// thread (feeds receiver reports and the HUD).
@@ -108,6 +119,7 @@ final class FrameAssembler {
         var fragments: [UInt16: Data]
         var byteCount: Int
         let createdAt: UInt64  // monotonic microseconds
+        var lastFragmentAt: UInt64 = 0
         var contiguous: UInt16 = 0
         var highestIndex: UInt16 = 0
         var repaired: UInt64 = 0
@@ -123,6 +135,8 @@ final class FrameAssembler {
         var requested = Set<UInt16>()
         var retried = false
         var keyframeRequested = false
+        /// The wait before the next request while held; 0 when not held.
+        var holdRetryUs: UInt64 = 0
 
         var isComplete: Bool {
             fragments.count == Int(fragmentCount)
@@ -229,11 +243,21 @@ final class FrameAssembler {
                 if seq <= retiredSeq { return }
             }
         }
+        let isNewest = pending.keys.allSatisfy { $0 < seq }
         var frame = pending.removeValue(forKey: seq) ?? PendingFrame(
             fragmentCount: count, isKeyframe: isKeyframe, captureTimestampUs: captureTimestampUs,
             fragments: [:], byteCount: 0, createdAt: now
         )
+        if repairEnabled && frame.fragments.isEmpty && isNewest {
+            // A held frame now delays a newer one: one more repair window.
+            let latest = now + repairWindow()
+            for held in pending.keys where pending[held]?.holdRetryUs ?? 0 > 0 {
+                let deadline = min(pending[held]?.deadline ?? latest, latest)
+                pending[held]?.deadline = deadline
+            }
+        }
         frame.fragments[index] = payload
+        frame.lastFragmentAt = now
         frame.byteCount += payload.count
         frame.highestIndex = max(frame.highestIndex, index)
         while frame.contiguous < count && frame.fragments[frame.contiguous] != nil {
@@ -274,7 +298,11 @@ final class FrameAssembler {
             drainReady(at: now)
         } else if frame.isComplete {
             deliver(seq)
-            for stale in pending.keys where stale <= seq { dropPending(stale) }
+            for stale in pending.keys where stale <= seq {
+                // A delivered keyframe already replaces the lost references.
+                if isKeyframe { pending[stale]?.keyframeRequested = true }
+                dropPending(stale)
+            }
         }
         updateDepth()
     }
@@ -303,9 +331,13 @@ final class FrameAssembler {
                     // Retire in sequence order. Expiring a later partial
                     // first must not make an older repair look stale.
                     if pending.keys.min() == seq {
-                        dropPending(seq)
-                        retiredSeq = max(retiredSeq, seq)
-                        drainReady(at: now)
+                        if pending.count == 1, let gap = frame.gapAt, now < gap + Self.maxHoldUs {
+                            hold(seq, now: now)
+                        } else {
+                            dropPending(seq)
+                            retiredSeq = max(retiredSeq, seq)
+                            drainReady(at: now)
+                        }
                     }
                 } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
                     beginGap(seq, through: frame.fragmentCount - 1, now: now)
@@ -313,7 +345,9 @@ final class FrameAssembler {
                     pending[seq]?.retried = true
                     request(seq, through: frame.fragmentCount - 1, again: true, now: now)
                 }
-            } else if now >= frame.createdAt + 100_000 {
+            } else if now >= frame.lastFragmentAt + Self.staleFrameUs {
+                // Timed from the latest fragment: over a slow USB tunnel a
+                // big keyframe is still arriving long after its first one.
                 dropPending(seq)
             }
         }
@@ -356,13 +390,33 @@ final class FrameAssembler {
     private func beginGap(_ seq: UInt32, through index: UInt16, now: UInt64) {
         guard let frame = pending[seq] else { return }
         if frame.gapAt == nil {
-            let rtt = min(rttUs(), 1_000_000)
-            let window = max(8_000, min(25_000, 2 * rtt + framePeriodUs * 3 / 2))
             pending[seq]?.gapAt = now
-            pending[seq]?.deadline = now + window
-            pending[seq]?.retryAt = now + rtt + 5_000
+            pending[seq]?.deadline = now + repairWindow()
+            pending[seq]?.retryAt = now + min(rttUs(), 1_000_000) + 5_000
         }
         request(seq, through: index, again: false, now: now)
+    }
+
+    private func repairWindow() -> UInt64 {
+        max(8_000, min(25_000, 2 * min(rttUs(), 1_000_000) + framePeriodUs * 3 / 2))
+    }
+
+    /// Nothing newer waits behind this frame, so dropping it gains nothing:
+    /// the next frame would need it, and the keyframe asked for in its place
+    /// arrives later than a repair. A still desktop sends a frame every few
+    /// hundred milliseconds, and WiFi power saving can hold a repair that
+    /// long; dropping at the deadline asked one iPad for 500 keyframes in an
+    /// afternoon. Ask again, less often each time, until a newer frame
+    /// arrives or the frame has waited `maxHoldUs`.
+    private func hold(_ seq: UInt32, now: UInt64) {
+        guard let frame = pending[seq] else { return }
+        let wait = frame.holdRetryUs == 0
+            ? repairWindow() : min(frame.holdRetryUs * 2, Self.maxHoldRetryUs)
+        pending[seq]?.holdRetryUs = wait
+        pending[seq]?.deadline = now + wait
+        pending[seq]?.stallAllowanceUsed = Self.maxStallAllowanceUs
+        pending[seq]?.retried = true
+        request(seq, through: frame.fragmentCount - 1, again: true, now: now)
     }
 
     /// A NACK names at most 64 fragments, so a wider gap takes several. A

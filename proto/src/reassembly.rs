@@ -19,10 +19,14 @@ pub const STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 pub const EPOCH_RESYNC_THRESHOLD: u32 = 512;
 /// Also bounds frames held behind an incomplete one in repair mode; the
 /// repair deadline limits the wait (see `FrameAssembler.maxPendingFrames`).
-pub const MAX_PENDING_FRAMES: usize = 8;
+pub const MAX_PENDING_FRAMES: usize = 32;
 /// How far a stall can move one frame's repair deadline (see
 /// `FrameAssembler.maxStallAllowanceUs`).
 pub const MAX_STALL_ALLOWANCE: Duration = Duration::from_millis(100);
+/// How long a frame with nothing newer behind it waits for its repair (see
+/// `FrameAssembler.hold(_:now:)`).
+pub const MAX_HOLD: Duration = Duration::from_secs(1);
+pub const MAX_HOLD_RETRY: Duration = Duration::from_millis(200);
 pub const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,7 @@ struct PendingFrame {
     fragments: HashMap<u16, Vec<u8>>,
     bytes: usize,
     created_at: Instant,
+    last_fragment_at: Instant,
     contiguous: u16,
     highest_index: u16,
     repaired: u64,
@@ -74,6 +79,8 @@ struct PendingFrame {
     requested: HashSet<u16>,
     retried: bool,
     keyframe_requested: bool,
+    /// The wait before the next request while held; zero when not held.
+    hold_retry: Duration,
 }
 
 impl PendingFrame {
@@ -290,11 +297,21 @@ impl Reassembler {
                 }
             }
         }
+        if self.repair_enabled && self.pending.keys().all(|&s| s < seq) {
+            // A held frame now delays a newer one: one more repair window.
+            let window = self.repair_window();
+            for frame in self.pending.values_mut() {
+                if !frame.hold_retry.is_zero() {
+                    frame.deadline = frame.deadline.map(|deadline| deadline.min(now + window));
+                }
+            }
+        }
         let frame = self.pending.entry(seq).or_insert_with(|| PendingFrame {
             header,
             fragments: HashMap::new(),
             bytes: 0,
             created_at: now,
+            last_fragment_at: now,
             contiguous: 0,
             highest_index: 0,
             repaired: 0,
@@ -308,8 +325,10 @@ impl Reassembler {
             requested: HashSet::new(),
             retried: false,
             keyframe_requested: false,
+            hold_retry: Duration::ZERO,
         });
         frame.fragments.insert(index, payload.to_vec());
+        frame.last_fragment_at = now;
         frame.bytes += payload.len();
         frame.highest_index = frame.highest_index.max(index);
         while frame.contiguous < count && frame.fragments.contains_key(&frame.contiguous) {
@@ -353,9 +372,16 @@ impl Reassembler {
             }
             self.drain_ready(now);
         } else if complete {
+            let keyframe = header.is_keyframe;
             self.deliver(seq);
             let stale: Vec<_> = self.pending.range(..=seq).map(|(&s, _)| s).collect();
             for s in stale {
+                // A delivered keyframe already replaces the lost references.
+                if keyframe {
+                    if let Some(frame) = self.pending.get_mut(&s) {
+                        frame.keyframe_requested = true;
+                    }
+                }
                 self.drop_pending(s);
             }
         }
@@ -383,9 +409,15 @@ impl Reassembler {
                     .is_some_and(|deadline| now >= deadline + self.stall(frame, now))
                 {
                     if self.pending.first_key_value().map(|(&s, _)| s) == Some(seq) {
-                        self.drop_pending(seq);
-                        self.retired_seq = self.retired_seq.max(seq);
-                        self.drain_ready(now);
+                        if self.pending.len() == 1
+                            && frame.gap_at.is_some_and(|gap| now < gap + MAX_HOLD)
+                        {
+                            self.hold(seq, now);
+                        } else {
+                            self.drop_pending(seq);
+                            self.retired_seq = self.retired_seq.max(seq);
+                            self.drain_ready(now);
+                        }
                     }
                 } else if frame.deadline.is_none()
                     && now.saturating_duration_since(frame.created_at) >= self.frame_period
@@ -399,7 +431,9 @@ impl Reassembler {
                     }
                     self.request(seq, through, true, now);
                 }
-            } else if now.saturating_duration_since(frame.created_at) >= STALE_FRAME_TIMEOUT {
+            } else if now.saturating_duration_since(frame.last_fragment_at) >= STALE_FRAME_TIMEOUT {
+                // Timed from the latest fragment: over a slow USB tunnel a
+                // big keyframe is still arriving long after its first one.
                 self.drop_pending(seq);
             }
         }
@@ -417,13 +451,40 @@ impl Reassembler {
             return;
         };
         if frame.deadline.is_none() {
-            let window_us = (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2)
-                .clamp(8_000, 25_000);
             frame.gap_at = Some(now);
-            frame.deadline = Some(now + Duration::from_micros(window_us as u64));
             frame.retry_at = Some(now + self.rtt + Duration::from_millis(5));
+            let window = self.repair_window();
+            if let Some(frame) = self.pending.get_mut(&seq) {
+                frame.deadline = Some(now + window);
+            }
         }
         self.request(seq, through, false, now);
+    }
+
+    fn repair_window(&self) -> Duration {
+        let window_us =
+            (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2).clamp(8_000, 25_000);
+        Duration::from_micros(window_us as u64)
+    }
+
+    /// Nothing newer waits behind this frame, so dropping it gains nothing
+    /// (see `FrameAssembler.hold(_:now:)`): ask again, less often each time.
+    fn hold(&mut self, seq: u32, now: Instant) {
+        let window = self.repair_window();
+        let Some(frame) = self.pending.get_mut(&seq) else {
+            return;
+        };
+        let wait = if frame.hold_retry.is_zero() {
+            window
+        } else {
+            (frame.hold_retry * 2).min(MAX_HOLD_RETRY)
+        };
+        frame.hold_retry = wait;
+        frame.deadline = Some(now + wait);
+        frame.stall_used = MAX_STALL_ALLOWANCE;
+        frame.retried = true;
+        let through = frame.header.frag_count - 1;
+        self.request(seq, through, true, now);
     }
 
     /// How long this waiting frame has been stalled, not yet counted, within
@@ -949,6 +1010,68 @@ mod tests {
             "stale frame must be evicted by the periodic cleanup"
         );
         assert!(r.counters().frames_dropped >= 1);
+    }
+
+    fn media(seq: u32, index: u16, count: u16, keyframe: bool) -> MediaHeader {
+        MediaHeader {
+            session_id: 1,
+            stream_epoch: 1,
+            frame_seq: seq,
+            frag_index: index,
+            frag_count: count,
+            is_keyframe: keyframe,
+            is_retransmit: false,
+            capture_ts_us: 0,
+            payload_len: 1,
+        }
+    }
+
+    /// Over a slow USB tunnel a big keyframe arrives over hundreds of
+    /// milliseconds, every fragment in order. It is still arriving, not lost.
+    #[test]
+    fn a_frame_that_keeps_arriving_is_not_dropped_without_repair() {
+        let start = Instant::now();
+        let mut r = Reassembler::new();
+        let mut completed = false;
+        for index in 0..10 {
+            let at = start + Duration::from_millis(30 * u64::from(index));
+            r.tick(at);
+            completed = matches!(
+                r.add_media(media(1, index, 10, true), &[1], at),
+                AddOutcome::Completed(_)
+            );
+        }
+        assert!(completed, "the slow keyframe completes");
+        assert_eq!(r.counters().frames_dropped, 0);
+        assert!(r.take_keyframe_request().is_none());
+        // A frame whose fragments stop is still dropped 100 ms later.
+        let later = start + Duration::from_millis(400);
+        r.add_media(media(2, 0, 2, false), &[1], later);
+        r.tick(later + STALE_FRAME_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(r.counters().frames_dropped, 0);
+        r.tick(later + STALE_FRAME_TIMEOUT);
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert!(r.take_keyframe_request().is_some());
+    }
+
+    /// The host sends a keyframe after a frame it could not finish. Once the
+    /// keyframe is decoded the partial frame is no reason for another one.
+    #[test]
+    fn a_delivered_keyframe_drops_older_partials_without_another_request() {
+        let now = Instant::now();
+        let mut r = Reassembler::new();
+        r.add_media(media(1, 0, 3, true), &[1], now);
+        assert!(matches!(
+            r.add_media(media(2, 0, 1, true), &[2], now),
+            AddOutcome::Completed(_)
+        ));
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert!(r.take_keyframe_request().is_none());
+        // A delta frame does not replace the lost reference.
+        r.add_media(media(3, 0, 2, false), &[3], now);
+        r.add_media(media(4, 0, 1, false), &[4], now);
+        assert_eq!(r.counters().frames_dropped, 2);
+        assert!(r.take_keyframe_request().is_some());
     }
 
     #[test]

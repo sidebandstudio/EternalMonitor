@@ -143,6 +143,8 @@ final class FrameAssemblerTests: XCTestCase {
 
         enableRepair()
         add(seq: 1, index: 1, count: 2, byte: 2)
+        now = 1_000
+        add(seq: 2, index: 0, count: 1, byte: 3)
         assembler.tick(at: 124_999)
         XCTAssertEqual(keyframes, 0)
         assembler.tick(at: 125_000)
@@ -161,8 +163,10 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(nacks.count, 2)
         assembler.tick(at: 60_000)
         XCTAssertEqual(nacks.count, 2, "one retry, even while the repair path is silent")
+        // Nothing newer waits, so at its deadline the frame is asked for again.
         assembler.tick(at: 125_000)
-        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(nacks.count, 3)
+        XCTAssertEqual(keyframes, 0)
     }
 
     func testMissingTailIsDetectedWithoutAnotherDatagram() {
@@ -172,22 +176,93 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertTrue(nacks.isEmpty)
         assembler.tick(at: 16_667)
         XCTAssertEqual(nacks.first?.missing, [1])
-        // Nothing else arrives, so the frame uses its stall allowance.
+        // Nothing else arrives, so the frame uses its stall allowance, and
+        // then is held rather than dropped: nothing newer waits behind it.
         assembler.tick(at: 141_666)
-        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(nacks.count, 2)
         assembler.tick(at: 141_667)
+        XCTAssertEqual(nacks.count, 3)
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+    }
+
+    /// A still desktop sends a frame every few hundred milliseconds, and WiFi
+    /// power saving can hold a repair as long. One iPad asked for 500
+    /// keyframes in an afternoon, nearly all while its desktop was still.
+    func testStillDesktopWaitsForALateRepairInsteadOfAKeyframe() {
+        enableRepair()
+        var seq: UInt32 = 1
+        for frameStart in stride(from: UInt64(0), to: 2_000_000, by: 250_000) {
+            now = frameStart
+            add(seq: seq, index: 0, count: 2, byte: 1)
+            // The tail is lost; its repair arrives 150 ms after the request.
+            for at in stride(from: frameStart, to: frameStart + 167_000, by: 1_000) {
+                assembler.tick(at: at)
+            }
+            now = frameStart + 167_000
+            add(seq: seq, index: 1, count: 2, byte: 2, retransmit: true)
+            seq += 1
+        }
+        XCTAssertEqual(completed.count, 8)
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+    }
+
+    func testRepairHoldsAtMostThirtyTwoFrames() {
+        enableRepair()
+        let bound = UInt32(FrameAssembler.maxPendingFrames)
+        XCTAssertEqual(bound, 32)
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        for seq in UInt32(2)...bound { add(seq: seq, index: 0, count: 1, byte: UInt8(seq)) }
+        XCTAssertTrue(completed.isEmpty)
+        add(seq: bound + 1, index: 0, count: 1, byte: UInt8(bound + 1))
+        XCTAssertEqual(completed, (2...(bound + 1)).map { Data([UInt8($0)]) })
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    private func enableClockWithoutRepair() {
+        now = 0
+        keyframes = 0
+        assembler = FrameAssembler(nowUs: { [weak self] in self?.now ?? 0 })
+        assembler.onFrameAssembled = { [weak self] data, _, _, _ in self?.completed.append(data) }
+        assembler.onNeedsKeyframe = { [weak self] _, _ in self?.keyframes += 1 }
+    }
+
+    /// Over a slow USB tunnel a big keyframe arrives over hundreds of
+    /// milliseconds, every fragment in order. Dropping it 100 ms after its
+    /// first fragment asked for another keyframe, just as slow.
+    func testWithoutRepairAFrameThatKeepsArrivingIsNotDropped() {
+        enableClockWithoutRepair()
+        for index in UInt16(0)..<10 {
+            now = UInt64(index) * 30_000
+            assembler.tick(at: now)
+            add(seq: 1, index: index, count: 10, byte: UInt8(index), keyframe: true)
+        }
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(keyframes, 0)
+        // A frame whose fragments stop is still dropped 100 ms later.
+        now = 400_000
+        add(seq: 2, index: 0, count: 2, byte: 1)
+        assembler.tick(at: 499_999)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 500_000)
         XCTAssertEqual(keyframes, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
     }
 
-    func testRepairHoldsAtMostEightFrames() {
-        enableRepair()
-        add(seq: 1, index: 0, count: 2, byte: 1)
-        for seq in UInt32(2)...8 { add(seq: seq, index: 0, count: 1, byte: UInt8(seq)) }
-        XCTAssertTrue(completed.isEmpty)
-        add(seq: 9, index: 0, count: 1, byte: 9)
-        XCTAssertEqual(completed, (2...9).map { Data([UInt8($0)]) })
+    /// The host sends a keyframe after a frame it could not finish. Once the
+    /// keyframe is decoded, the partial frame is no reason for another.
+    func testWithoutRepairADeliveredKeyframeDropsOlderPartialsWithoutAnotherRequest() {
+        enableClockWithoutRepair()
+        add(seq: 1, index: 0, count: 3, byte: 1, keyframe: true)
+        add(seq: 2, index: 0, count: 1, byte: 2, keyframe: true)
+        XCTAssertEqual(completed.count, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 0)
+        // A delta frame does not replace the lost reference.
+        add(seq: 3, index: 0, count: 2, byte: 3)
+        add(seq: 4, index: 0, count: 1, byte: 4)
         XCTAssertEqual(keyframes, 1)
     }
 
@@ -212,6 +287,8 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(nacks.map(\.missing), [Array(0..<64), [64]])
         XCTAssertTrue(nacks.allSatisfy(\.isValid))
         XCTAssertEqual(keyframes, 0)
+        now = 1_000
+        add(seq: 2, index: 0, count: 1, byte: 2)
         assembler.tick(at: 125_000)
         XCTAssertEqual(keyframes, 1)
         XCTAssertEqual(assembler.counters.withLock { $0.fragsLost }, 65)

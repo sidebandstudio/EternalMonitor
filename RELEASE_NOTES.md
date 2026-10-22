@@ -108,6 +108,9 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- On WiFi, a frame whose repair is late is waited for instead of replaced by
+  a whole new picture, so a still desktop flashes and smears less. 120 Hz
+  iPads keep frames whose repair is still on its way.
 
 ### What to test
 
