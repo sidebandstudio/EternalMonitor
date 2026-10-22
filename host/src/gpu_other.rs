@@ -33,6 +33,9 @@ pub struct GpuInfo {
     pub dedicated_vram_mb: u64,
     pub encoder_name: String,
     pub codec_display_name: String,
+    /// Vendors of every hardware adapter found. The encoder fallback skips
+    /// encoders whose vendor is absent. Empty when unknown: try them all.
+    pub vendors_present: Vec<GpuVendor>,
 }
 
 impl GpuInfo {
@@ -53,6 +56,7 @@ impl GpuInfo {
                     dedicated_vram_mb: 0,
                     encoder_name: name.to_string(),
                     codec_display_name: display_name.to_string(),
+                    vendors_present: Vec::new(),
                 };
             }
             info!(encoder = name, "Encoder not available, trying next");
@@ -70,6 +74,7 @@ impl GpuInfo {
             dedicated_vram_mb: 0,
             encoder_name: "libx264".to_string(),
             codec_display_name: "H.264 (x264)".to_string(),
+            vendors_present: Vec::new(),
         }
     }
 }
