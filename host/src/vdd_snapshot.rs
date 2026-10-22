@@ -44,7 +44,8 @@ pub struct Target {
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    pub device: DeviceState,
+    /// The device state, or why there is none.
+    pub device: Result<DeviceState, &'static str>,
     /// The graphics card the host asked the driver for, or why it asked for none.
     pub pin: Result<String, &'static str>,
     /// `HwSchMode`: 2 hardware-accelerated GPU scheduling on, 1 off.
@@ -71,7 +72,10 @@ fn luid(value: u64) -> String {
 
 /// The record's text, from data already read.
 pub fn line(snapshot: &Snapshot) -> String {
-    let mut out = format!("device={}", snapshot.device);
+    let mut out = match snapshot.device {
+        Ok(device) => format!("device={device}"),
+        Err(reason) => format!("device=unknown({})", clean(reason)),
+    };
     match &snapshot.pin {
         Ok(name) => {
             let matched = snapshot.adapters.iter().any(|a| &a.description == name);
@@ -152,7 +156,10 @@ pub fn line(snapshot: &Snapshot) -> String {
 
 /// Read the adapters, display paths and settings now.
 #[cfg(windows)]
-pub fn collect(device: DeviceState, pin: Result<String, &'static str>) -> Snapshot {
+pub fn collect(
+    device: Result<DeviceState, &'static str>,
+    pin: Result<String, &'static str>,
+) -> Snapshot {
     let settings_key = r"SOFTWARE\MikeTheTech\VirtualDisplayDriver";
     let path = crate::diagnostics::registry_string(settings_key, "VDDPATH");
     Snapshot {
@@ -308,7 +315,7 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         Snapshot {
-            device: DeviceState::NoMonitor,
+            device: Ok(DeviceState::NoMonitor),
             pin: Ok("Intel(R) Iris(R) Xe Graphics".into()),
             hags: Some(2),
             default_settings_path: Some(true),
@@ -371,6 +378,14 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(" hags=unset"));
+        // An Enable that failed without a device state says why.
+        let mut unknown = snapshot();
+        unknown.device = Err("display tasks missing");
+        assert!(
+            line(&unknown).starts_with("device=unknown(display tasks missing) pin="),
+            "{}",
+            line(&unknown)
+        );
         let mut unmatched = snapshot();
         unmatched.pin = Ok("Intel(R) UHD Graphics".into());
         assert!(line(&unmatched).contains("pin_matched=false"));

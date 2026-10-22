@@ -63,8 +63,23 @@ enum TaskOutcome {
     Failed(Option<crate::vdd_device::DeviceState>),
 }
 
+/// What a failed Enable can tell about the device: the state the task
+/// found, or why there is none.
+pub(crate) type EnableReport = Result<crate::vdd_device::DeviceState, &'static str>;
+
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
 impl TaskOutcome {
+    /// For an Enable task that ran and did not succeed.
+    fn report(self) -> EnableReport {
+        match self {
+            Self::Failed(Some(state)) => Ok(state),
+            Self::Failed(None) => Err("display task failed"),
+            Self::TimedOut => Err("display task timed out"),
+            Self::Missing => Err("display tasks missing"),
+            Self::Done => Err("display task finished"),
+        }
+    }
+
     fn from_stderr(stderr: &str) -> Self {
         if stderr.contains("timed out") {
             Self::TimedOut
@@ -231,6 +246,11 @@ pub const TASK_DISABLE: &str = "EternalMonitor VDD Disable";
 #[cfg(windows)]
 fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
     use std::os::windows::process::CommandExt;
+    #[cfg(debug_assertions)]
+    if let Some(outcome) = simulated_enable_failure(task) {
+        warn!(task, ?outcome, "Simulating a failed VDD task");
+        return outcome;
+    }
     let started = Instant::now();
     // An Enable that timed out here can still be running in Task Scheduler;
     // each direction waits for the other first, so the last request wins.
@@ -311,21 +331,50 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
     }
 }
 
+/// Debug builds only, to check the failure paths on a PC whose tasks work:
+/// `ETERNAL_SIMULATE_ENABLE_FAILURE=missing|timeout|failed` makes the Enable
+/// task report that without running.
+#[cfg(all(windows, debug_assertions))]
+fn simulated_enable_failure(task: &str) -> Option<TaskOutcome> {
+    if task != TASK_ENABLE {
+        return None;
+    }
+    match std::env::var("ETERNAL_SIMULATE_ENABLE_FAILURE")
+        .ok()?
+        .as_str()
+    {
+        "missing" => Some(TaskOutcome::Missing),
+        "timeout" => Some(TaskOutcome::TimedOut),
+        "failed" => Some(TaskOutcome::Failed(None)),
+        _ => None,
+    }
+}
+
 /// Complete one installer-owned driver action while capture reports startup progress.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     request(enabled, Purpose::Attempt, progress, &mut None)
 }
 
-/// Turn the virtual display on. On failure, what the Enable task found
-/// wrong with the device, when it ran and said.
+/// Why an Enable the gate did not run failed.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
-pub(crate) fn enable(progress: impl FnMut()) -> Result<(), Option<crate::vdd_device::DeviceState>> {
-    let mut device = None;
-    if request(true, Purpose::Attempt, progress, &mut device) {
+fn refused(health: VddTaskHealth) -> EnableReport {
+    Err(match health {
+        VddTaskHealth::TasksMissing => "display tasks missing",
+        VddTaskHealth::NotResponding => "display task not responding",
+        VddTaskHealth::Ok => "display task not run",
+    })
+}
+
+/// Turn the virtual display on. On failure, what the Enable task found
+/// wrong with the device, or why it could not say.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+pub(crate) fn enable(progress: impl FnMut()) -> Result<(), EnableReport> {
+    let mut ran = None;
+    if request(true, Purpose::Attempt, progress, &mut ran) {
         Ok(())
     } else {
-        Err(device)
+        Err(ran.map_or_else(|| refused(task_health()), TaskOutcome::report))
     }
 }
 
@@ -333,7 +382,7 @@ fn request(
     enabled: bool,
     purpose: Purpose,
     progress: impl FnMut(),
-    device: &mut Option<crate::vdd_device::DeviceState>,
+    ran: &mut Option<TaskOutcome>,
 ) -> bool {
     #[cfg(windows)]
     {
@@ -343,15 +392,13 @@ fn request(
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
                 outcome == TaskOutcome::Done
             });
-            if let TaskOutcome::Failed(state) = outcome {
-                *device = state;
-            }
+            *ran = Some(outcome);
             outcome
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = (enabled, purpose, progress, device);
+        let _ = (enabled, purpose, progress, ran);
         false
     }
 }
@@ -637,6 +684,34 @@ mod tests {
         assert!(disable.join().unwrap());
         assert_eq!(*runs.lock().unwrap(), vec![false, true, false]);
         assert_eq!(tasks.gate.lock().known_enabled, Some(false));
+    }
+
+    #[test]
+    fn enable_failures_without_a_device_state_say_why() {
+        use crate::vdd_device::DeviceState;
+        assert_eq!(
+            TaskOutcome::Failed(Some(DeviceState::Problem(43))).report(),
+            Ok(DeviceState::Problem(43))
+        );
+        assert_eq!(
+            TaskOutcome::Failed(None).report(),
+            Err("display task failed")
+        );
+        assert_eq!(
+            TaskOutcome::TimedOut.report(),
+            Err("display task timed out")
+        );
+        assert_eq!(TaskOutcome::Missing.report(), Err("display tasks missing"));
+        // The gate refused to run the task at all.
+        assert_eq!(
+            refused(VddTaskHealth::TasksMissing),
+            Err("display tasks missing")
+        );
+        assert_eq!(
+            refused(VddTaskHealth::NotResponding),
+            Err("display task not responding")
+        );
+        assert_eq!(refused(VddTaskHealth::Ok), Err("display task not run"));
     }
 
     #[test]

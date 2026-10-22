@@ -416,7 +416,7 @@ fn prepare_vdd_settings(
 /// Log how Windows sees the displays, before the Disable task removes the
 /// virtual one. One record per failure; see `vdd_snapshot`.
 #[cfg(windows)]
-fn log_failure_snapshot(device: DeviceState, pin: &Result<String, &'static str>) {
+fn log_failure_snapshot(device: crate::vdd::EnableReport, pin: &Result<String, &'static str>) {
     let snapshot = crate::vdd_snapshot::collect(device, pin.clone());
     warn!(
         "Virtual display failure snapshot {}",
@@ -558,7 +558,7 @@ pub(crate) fn reconcile_virtual_display(
                 Some(VddProblem::NotExtended) => VDD_EXTEND_TIMEOUT,
                 _ => vdd_attach_timeout(),
             };
-            if let Err(device) = crate::vdd::enable(progress) {
+            if let Err(report) = crate::vdd::enable(progress) {
                 if !capture_is_current(shared, generation) {
                     return None;
                 }
@@ -566,13 +566,15 @@ pub(crate) fn reconcile_virtual_display(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
                 );
-                if let Some(device) = device {
+                if let Ok(device) = report {
                     report_device(shared, device);
-                    log_failure_snapshot(device, &pin);
-                    // The task enabled a device that cannot show a display.
-                    if device != DeviceState::Missing {
-                        crate::vdd::set_enabled(false, progress);
-                    }
+                }
+                // Every failed Enable, with or without a device state, and
+                // before the Disable below.
+                log_failure_snapshot(report, &pin);
+                // The task enabled a device that cannot show a display.
+                if report.is_ok_and(|device| device != DeviceState::Missing) {
+                    crate::vdd::set_enabled(false, progress);
                 }
                 *shared.vdd_status.lock() = VddStatus::TaskFailed;
                 return Some(CaptureTarget::PrimaryAuto);
@@ -613,7 +615,7 @@ pub(crate) fn reconcile_virtual_display(
             warn!("Virtual display did not attach in time — capturing the primary display instead");
             if let Some(device) = device {
                 report_device(shared, device);
-                log_failure_snapshot(device, &pin);
+                log_failure_snapshot(Ok(device), &pin);
             }
             // enable() succeeded but nothing attached: turn it back off so we don't strand a
             // half-enabled device as a phantom monitor.
