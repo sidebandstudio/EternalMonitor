@@ -96,15 +96,21 @@ Windows changes.
   what to do: the display driver isn't installed (run Setup again), Windows
   couldn't verify the driver's signature, the driver stopped with an error
   (with the Windows code: restart, then run Setup again), or the driver ran but
-  Windows added no screen. The display task no longer reports success when the
-  display cannot appear, and the device state is in the support diagnostics.
-  In 0.3.1 every case read "no display appeared in time".
-- On laptops with Intel and NVIDIA graphics, the second screen is drawn by the
-  graphics card that drives the main screen. In 0.3.1 diagnostics none of these
-  laptops got the second screen. If Windows adds the screen but keeps the
-  desktop off it, EternalMonitor switches the layout to Extend.
-- Running EternalMonitor-Setup.exe again repairs the virtual display driver
-  when its device was removed in Device Manager or shows a driver error. In
+  Windows added no screen. When Windows adds the screen but keeps the desktop
+  off it, the page says to choose Extend with Windows key + P or in Display
+  settings, and the next try waits 30 seconds for it. EternalMonitor does not
+  change the display layout itself. The display task no longer reports success
+  when the display cannot appear, and the device state is in the support
+  diagnostics. In 0.3.1 every case read "no display appeared in time".
+- The second screen is drawn by the graphics card that drives the main screen,
+  whether or not **Match the iPad's resolution** is on. Before, the driver
+  chose the card with the most memory, which on laptops with Intel and NVIDIA
+  graphics drives no screen; in 0.3.1 diagnostics none of those laptops got the
+  second screen. When two cards have the same name, the driver still chooses.
+- Running EternalMonitor-Setup.exe again repairs a virtual display driver that
+  Setup installed when none of its devices works, for example after the device
+  was removed in Device Manager. Working devices are never removed, and a
+  driver another app installed is left alone with a message saying so. In
   0.3.1 Setup kept the existing driver and stopped with "Windows did not finish
   installing the virtual display driver".
 - Support diagnostics name Windows 11 from the build number. Windows 11 keeps
