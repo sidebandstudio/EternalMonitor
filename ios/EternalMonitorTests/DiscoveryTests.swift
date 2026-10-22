@@ -45,6 +45,18 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertEqual(DiscoveredHost.resolved(name: "PC", port: 0, addresses: [ipv4("10.0.0.5")]).port, 9876)
     }
 
+    /// A PC with WSL, Hyper-V or a VPN answers with those adapters'
+    /// addresses too. The iPad must pick the one on its own network.
+    func testTheAddressOnThisIPadsNetworkIsChosen() {
+        let home = [LocalNetwork.Subnet("192.168.1.34", mask: "255.255.255.0")!]
+        let answers = [ipv4("172.21.0.1"), ipv4("100.80.1.2"), ipv4("192.168.1.20")]
+        XCTAssertEqual(DiscoveredHost.resolved(name: "PC", port: 9876, addresses: answers, local: home).address, "192.168.1.20")
+        // Not on this iPad's network: a private address before others.
+        XCTAssertEqual(DiscoveredHost.resolved(name: "PC", port: 9876,
+            addresses: [ipv4("100.80.1.2"), ipv4("10.0.0.5")], local: home).address, "10.0.0.5")
+        XCTAssertEqual(DiscoveredHost.resolved(name: "PC", port: 9876, addresses: [ipv4("100.80.1.2")], local: []).address, "100.80.1.2")
+    }
+
     func testAPCStillBeingFoundNeverReplacesOneWithAnAddress() {
         let scanner = NetworkScanner()
         scanner.merge(DiscoveredHost.resolved(name: "PC", port: 9876, addresses: [ipv6("fe80::1")]))

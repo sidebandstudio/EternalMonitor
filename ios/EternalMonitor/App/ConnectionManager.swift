@@ -106,6 +106,11 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
     @Published private(set) var hostInfo: ControlChannel.SessionInfo?
+    /// What the Connecting card says about the running attempt.
+    @Published private(set) var connectingStatus: ConnectingStatus = .reaching
+    /// Addresses this iPad's searches found a PC at. A PC that was found but
+    /// doesn't answer is on this network and blocked, not on another one.
+    private(set) var discoveredAddresses: Set<String> = []
     /// The host's live stream parameters — from the ACK, then refreshed by
     /// every heartbeat (so ABR bitrate changes and codec switches show up).
     @Published private(set) var hostStreamConfig: StreamConfig?
@@ -278,7 +283,9 @@ final class ConnectionManager: ObservableObject {
         if case .udp(let host, _) = target, let typed = ConnectionProblem.typedAddress(host) {
             connectionError = nil
             problem = typed
-            record(.warning, "connection", "Not connecting: the typed address looks like the pairing code")
+            record(.warning, "connection", typed == .pairingCodeAsAddress
+                ? "Not connecting: the typed address looks like the pairing code"
+                : "Not connecting: the typed address is not a valid IPv4 address")
             return
         }
         startAttempt(target)
@@ -336,6 +343,7 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
+        connectingStatus = .reaching
         record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
 
         let decoder = VideoDecoder()
@@ -471,6 +479,7 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.helloAttempts = attempt
+                self.connectingStatus = .of(helloAttempts: attempt, handshakeDone: self.hostInfo != nil, isUSB: isUSB)
                 self.record(.info, "ctrl", "HELLO2 attempt \(attempt)/\(total) to \(normalizedHost):\(port)")
             }
         }
@@ -488,6 +497,7 @@ final class ConnectionManager: ObservableObject {
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                self.connectingStatus = .answered
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -897,10 +907,29 @@ final class ConnectionManager: ObservableObject {
                 self.problem = .timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
-                    isUSB: self.transportMode == "USB", host: debug.host)
+                    isUSB: self.transportMode == "USB", host: debug.host,
+                    pcFound: self.discoveredAddresses.contains(debug.host), local: LocalNetwork.current())
                 self.disconnect()
             }
         }
+    }
+
+    /// PCs a search found so far, so a failed attempt knows the PC was there.
+    func noteFound(_ hosts: [DiscoveredHost]) {
+        discoveredAddresses.formUnion(hosts.compactMap(\.address))
+    }
+
+    /// One finished search for PCs, for the support log. It names no PC and
+    /// no address: only how many were found.
+    func noteSearch(hosts: [DiscoveredHost], blocked: Bool) {
+        let addresses = hosts.compactMap(\.address)
+        discoveredAddresses.formUnion(addresses)
+        // Support log only: the Connect screen's list is for attempts.
+        let (level, message): (DiagnosticLevel, String) = blocked
+            ? (.warning, "PC search refused: Local Network access is off")
+            : hosts.isEmpty ? (.info, "PC search found no PCs")
+            : (.info, "PC search found \(hosts.count) PC(s), \(addresses.count) with an IPv4 address")
+        SupportDiagnostics.shared.record(String(describing: level), "discovery", message)
     }
 
     func cancel() {

@@ -19,11 +19,14 @@ struct DiscoveredHost: Identifiable, Equatable {
         self.finding = finding
     }
 
-    /// The service as far as it has resolved: its first IPv4 address, or a
-    /// PC still being found when only IPv6 (or nothing usable) came back.
-    static func resolved(name: String, port: Int, addresses: [Data]) -> DiscoveredHost {
+    /// The service as far as it has resolved: its IPv4 address on this
+    /// iPad's network, or a PC still being found when only IPv6 (or nothing
+    /// usable) came back. A PC with Hyper-V, WSL or a VPN can answer with
+    /// those adapters' addresses too, and an iPad can't reach them.
+    static func resolved(name: String, port: Int, addresses: [Data],
+                         local: [LocalNetwork.Subnet] = LocalNetwork.current()) -> DiscoveredHost {
         let port = port > 0 ? UInt16(clamping: port) : 9876
-        let ipv4 = addresses.lazy.compactMap { NetworkScanner.ipAddress(from: $0, family: AF_INET) }.first
+        let ipv4 = LocalNetwork.best(addresses.compactMap { NetworkScanner.ipAddress(from: $0, family: AF_INET) }, local: local)
         return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil)
     }
 }
