@@ -135,18 +135,59 @@ enum GpuSlot {
     Insert(usize, &'static str),
 }
 
+/// A character XML 1.0 allows in a document.
+fn xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && !matches!(c, '\u{fffe}' | '\u{ffff}'))
+}
+
+/// An XML name, loosely: what the driver's parser and Expat accept.
+fn xml_name(name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-' | '.'))
+}
+
+/// The tag's name and every attribute are well-formed: quoted, unique,
+/// with known entities and allowed characters.
+fn check_tag(tag: &quick_xml::events::BytesStart) -> Result<(), &'static str> {
+    if !xml_name(tag.name().as_ref()) {
+        return Err("an element name is not valid XML");
+    }
+    for attribute in tag.attributes() {
+        let attribute = attribute.map_err(|_| "an attribute is not valid XML")?;
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|_| "an attribute is not valid XML")?;
+        if !xml_name(attribute.key.as_ref()) || !value.chars().all(xml_char) {
+            return Err("an attribute is not valid XML");
+        }
+    }
+    Ok(())
+}
+
 /// Find the render adapter's place by parsing `xml`. Anything the driver
 /// could read differently from this host is refused: a name outside
 /// `<gpu>`, a second name or `<gpu>`, markup inside the name, text or
-/// elements outside the `<vdd_settings>` root, or a document that does not
-/// parse. The driver matches `friendlyname` by local name anywhere.
+/// elements outside the `<vdd_settings>` root, or a document that is not
+/// well-formed XML 1.0 (bad attributes, misplaced declarations, characters
+/// XML does not allow, unknown entities). The driver matches
+/// `friendlyname` by local name anywhere.
 fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
     use quick_xml::events::Event;
+    if !xml.chars().all(xml_char) {
+        return Err("the file has characters XML does not allow");
+    }
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut open: Vec<Vec<u8>> = Vec::new();
     let (mut root, mut closed, mut slot) = (None, false, None);
     let (mut gpus, mut names, mut name_start) = (0, 0, 0);
+    let mut doctype = false;
     loop {
         let before = reader.buffer_position() as usize;
         let event = reader
@@ -163,6 +204,7 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
                 return Err("the graphics card name contains markup")
             }
             Event::Start(ref tag) | Event::Empty(ref tag) => {
+                check_tag(tag)?;
                 let empty = matches!(event, Event::Empty(_));
                 let name = tag.local_name().as_ref().to_vec();
                 match (open.len(), name.as_slice()) {
@@ -203,6 +245,34 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
             }
             Event::CData(_) | Event::GeneralRef(_) if outside => {
                 return Err("there is text outside the root element")
+            }
+            // Only the very first thing in the file may be the declaration,
+            // and a DOCTYPE only once, before the root.
+            Event::Decl(_) if before != 0 => return Err("an XML declaration is out of place"),
+            Event::DocType(_) if doctype || root.is_some() => {
+                return Err("a DOCTYPE is out of place")
+            }
+            Event::DocType(_) => doctype = true,
+            Event::GeneralRef(ref reference) => {
+                let known = if reference.is_char_ref() {
+                    matches!(reference.resolve_char_ref(), Ok(Some(c)) if xml_char(c))
+                } else {
+                    matches!(
+                        reference.as_ref(),
+                        b"lt" | b"gt" | b"amp" | b"apos" | b"quot"
+                    )
+                };
+                if !known {
+                    return Err("the file uses an entity XML does not define");
+                }
+            }
+            Event::Text(ref text) if text.windows(3).any(|w| w == b"]]>") => {
+                return Err("the file is not well-formed XML")
+            }
+            Event::Comment(ref text)
+                if text.windows(2).any(|w| w == b"--") || text.ends_with(b"-") =>
+            {
+                return Err("a comment is not well-formed XML")
             }
             Event::Eof => break,
             _ => {}
@@ -483,6 +553,47 @@ mod tests {
             assert!(pin_gpu_in(&path, "X").is_err(), "{document}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), document, "changed: {document}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn documents_expat_rejects_are_left_alone() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdd_settings.xml");
+        let name = "<gpu><friendlyname>default</friendlyname></gpu>";
+        for document in [
+            // Sol's four: each was rewritten, and Expat rejected the result.
+            format!("<vdd_settings version=2>{name}</vdd_settings>\n"),
+            format!("<vdd_settings a=\"1\" a=\"2\">{name}</vdd_settings>\n"),
+            format!("<vdd_settings>{name}</vdd_settings>\n<!DOCTYPE vdd_settings>\n"),
+            format!("<vdd_settings>{name}<count>\u{1}</count></vdd_settings>\n"),
+            // More of the same kind.
+            format!("<vdd_settings>\n<?xml version=\"1.0\"?>{name}</vdd_settings>"),
+            format!("<!DOCTYPE a><!DOCTYPE b><vdd_settings>{name}</vdd_settings>"),
+            format!("<vdd_settings>{name}<count>&nbsp;</count></vdd_settings>"),
+            format!("<vdd_settings>{name}<count>&#1;</count></vdd_settings>"),
+            format!("<vdd_settings x=\"&bogus;\">{name}</vdd_settings>"),
+            format!("<vdd_settings>{name}<!-- a -- b --></vdd_settings>"),
+            format!("<vdd_settings>{name}<count>]]></count></vdd_settings>"),
+            format!("<vdd_settings>{name}<1count/></vdd_settings>"),
+        ] {
+            assert_eq!(with_gpu(&document, "X"), None, "{document:?}");
+            std::fs::write(&path, &document).unwrap();
+            assert!(pin_gpu_in(&path, "X").is_err(), "{document:?}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                document,
+                "changed: {document:?}"
+            );
+        }
+        // A name that is not valid XML is not written either.
+        let vendor = with_gpu(VENDOR, "Bad\u{1}Card");
+        assert_eq!(vendor, None);
+        // A DOCTYPE in the prolog and references XML defines are fine.
+        let fine = format!("<?xml version=\"1.0\"?>\n<!DOCTYPE vdd_settings>\n<vdd_settings a=\"&amp;\">{name}<count>&#65;&lt;</count></vdd_settings>\n");
+        assert_eq!(with_gpu(&fine, "X"), Some(fine.replace(">default<", ">X<")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
