@@ -309,8 +309,10 @@ pub async fn start_sender(
                                             // down changes the label and nothing
                                             // else for the life of the pipeline.
                                             let clamped = abr.set_ceiling(ceiling);
+                                            let tunnel_drops = (shared.target_addr.lock().link != LinkId::Udp)
+                                                .then(|| PIPELINE_STATS.lock().usb_frames_dropped);
                                             let reported =
-                                                abr.on_report(&report, Instant::now());
+                                                abr.on_report(&report, tunnel_drops, Instant::now());
                                             let decision = abr::AbrDecision {
                                                 target_bps: reported.target_bps,
                                                 changed: clamped.changed || reported.changed,
