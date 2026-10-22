@@ -92,6 +92,23 @@ Windows changes.
 - Turning on the extended display no longer triggers repeated stream restarts
   while Windows runs the display task. When that task hangs or is missing, the
   host mirrors the main screen immediately instead of waiting for it each time.
+- When the second screen doesn't appear, the Windows Stream page says why and
+  what to do: the display driver isn't installed (run Setup again), Windows
+  couldn't verify the driver's signature, the driver stopped with an error
+  (with the Windows code: restart, then run Setup again), or the driver ran but
+  Windows added no screen. The display task no longer reports success when the
+  display cannot appear, and the device state is in the support diagnostics.
+  In 0.3.1 every case read "no display appeared in time".
+- On laptops with Intel and NVIDIA graphics, the second screen is drawn by the
+  graphics card that drives the main screen. In 0.3.1 diagnostics none of these
+  laptops got the second screen. If Windows adds the screen but keeps the
+  desktop off it, EternalMonitor switches the layout to Extend.
+- Running EternalMonitor-Setup.exe again repairs the virtual display driver
+  when its device was removed in Device Manager or shows a driver error. In
+  0.3.1 Setup kept the existing driver and stopped with "Windows did not finish
+  installing the virtual display driver".
+- Support diagnostics name Windows 11 from the build number. Windows 11 keeps
+  "Windows 10" in the registry, which 0.3.1 reported as the system.
 - With no iPad connected, the PC no longer encodes its screen. It reads the
   screen at most once a second, so an iPad that connects still sees the
   current desktop.
