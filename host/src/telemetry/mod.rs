@@ -427,7 +427,50 @@ fn event(line: &str, level: &str) -> Event {
             .as_millis() as u64,
         level: level.into(),
         category: "host".into(),
-        message: crate::logging::redact_support_text(line),
+        message: redact_upload(&crate::logging::redact_support_text(line), PC_NAME.as_ref()),
+    }
+}
+
+/// This PC's name, as the mDNS advertisement and HELLO_ACK carry it.
+static PC_NAME: once_cell::sync::Lazy<Option<regex::Regex>> = once_cell::sync::Lazy::new(|| {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .as_deref()
+        .and_then(pc_name_pattern)
+});
+
+fn pc_name_pattern(name: &str) -> Option<regex::Regex> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))).ok()
+}
+
+/// Uploads leave out the PC's name, which is often its owner's, and the
+/// user name in profile paths. Support identifies a PC by its installation
+/// id. The session log and "Copy logs" keep both names.
+fn redact_upload(text: &str, pc_name: Option<&regex::Regex>) -> String {
+    // A Windows user name may contain spaces but no path separator, so a
+    // segment that ends at one is taken whole; at the end of a path, only up
+    // to the next space.
+    static PROFILE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r#"(?i)(\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:Users|home)/)(?:[^\\/\r\n"'<>|:*?=]+([\\/])|[^\\/\s"'<>|:*?=]+)"#,
+        )
+        .expect("profile path pattern")
+    });
+    let text = PROFILE.replace_all(text, |captures: &regex::Captures| {
+        format!(
+            "{}[USER]{}",
+            &captures[1],
+            captures.get(2).map_or("", |separator| separator.as_str())
+        )
+    });
+    match pc_name {
+        Some(pattern) => pattern.replace_all(&text, "[PC-NAME]").into_owned(),
+        None => text.into_owned(),
     }
 }
 fn batch(events: Vec<Event>) -> std::io::Result<Batch> {
@@ -821,6 +864,67 @@ mod tests {
         assert!(messages.iter().any(|m| m == other));
         assert_eq!(messages.len(), 2);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uploads_leave_out_the_windows_user_name_and_keep_it_locally() {
+        let line = r"2026-10-22T15:56:27.075652Z  INFO Session log file initialized path=C:\Users\Maria Rossi\AppData\Roaming\EternalMonitor\logs\eternal-host-session.log";
+        assert_eq!(
+            event(line, "info").message,
+            r"2026-10-22T15:56:27.075652Z  INFO Session log file initialized path=C:\Users\[USER]\AppData\Roaming\EternalMonitor\logs\eternal-host-session.log"
+        );
+        // The session log and "Copy logs" keep the full path.
+        assert_eq!(crate::logging::redact_support_text(line), line);
+    }
+
+    #[test]
+    fn every_profile_path_form_loses_its_user_name() {
+        for (text, uploaded) in [
+            (
+                r"Host panic panic=panicked at C:\Users\bob\.cargo\registry\src\renderer.rs:984:17:",
+                r"Host panic panic=panicked at C:\Users\[USER]\.cargo\registry\src\renderer.rs:984:17:",
+            ),
+            (
+                r"profile=c:/users/Bob Smith/Desktop next=1",
+                r"profile=c:/users/[USER]/Desktop next=1",
+            ),
+            (r"home=C:\Users\Bob Smith", r"home=C:\Users\[USER] Smith"),
+            (r"home=C:\Users\bob next=1", r"home=C:\Users\[USER] next=1"),
+            (
+                "panicked at /Users/bob/src/main.rs:1:1",
+                "panicked at /Users/[USER]/src/main.rs:1:1",
+            ),
+            ("dir=/home/bob/.config", "dir=/home/[USER]/.config"),
+            (
+                r"path=C:\Program Files\EternalMonitor",
+                r"path=C:\Program Files\EternalMonitor",
+            ),
+        ] {
+            assert_eq!(redact_upload(text, None), uploaded);
+        }
+    }
+
+    #[test]
+    fn uploads_leave_out_the_pc_name() {
+        let pc = pc_name_pattern("MARIA-LAPTOP");
+        let line =
+            "2026-10-22T18:04:26.445159Z  INFO mDNS service registering \u{2014} advertising \
+                    on all non-loopback addresses service_type=\"_eternaldisplay._udp.local.\" \
+                    port=9876 host=MARIA-LAPTOP instance=EternalMonitor (MARIA-LAPTOP) addrs=[]";
+        assert_eq!(
+            redact_upload(line, pc.as_ref()),
+            "2026-10-22T18:04:26.445159Z  INFO mDNS service registering \u{2014} advertising \
+             on all non-loopback addresses service_type=\"_eternaldisplay._udp.local.\" \
+             port=9876 host=[PC-NAME] instance=EternalMonitor ([PC-NAME]) addrs=[]"
+        );
+        // Only the name as Windows reports it, as a whole word: a short name
+        // must not eat ordinary words that contain it.
+        let short = pc_name_pattern("HOST");
+        assert_eq!(
+            redact_upload("Host panic at HOSTS host=HOST", short.as_ref()),
+            "Host panic at HOSTS host=[PC-NAME]"
+        );
+        assert!(pc_name_pattern("  ").is_none());
     }
 
     #[test]
