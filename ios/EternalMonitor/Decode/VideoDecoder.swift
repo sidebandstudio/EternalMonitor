@@ -211,6 +211,7 @@ final class VideoDecoder {
 
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
+        var sawParameterSets = false
         var nalTypesInPacket: [UInt8] = []
         for nal in nalUnits {
             let nalType = nal[0] & 0x1F
@@ -224,11 +225,11 @@ final class VideoDecoder {
                 // re-creation. They carry no decode info.
                 continue
             case 7: // SPS
+                sawParameterSets = true
                 sps = nal
-                tryCreateFormatDescription()
             case 8: // PPS
+                sawParameterSets = true
                 pps = nal
-                tryCreateFormatDescription()
             case 1, 5: // Non-IDR slice, IDR slice
                 hasSliceNAL = true
                 accessUnitNALs.append(nal)
@@ -236,6 +237,11 @@ final class VideoDecoder {
                 accessUnitNALs.append(nal)
             }
         }
+
+        // Adopt the access unit's parameter sets together. One at a time, a
+        // new SPS met the old PPS first: a format that never existed, which
+        // could rebuild the session or be accepted by it in place.
+        if sawParameterSets { tryCreateFormatDescription() }
 
         if hasSliceNAL {
             let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
@@ -271,19 +277,20 @@ final class VideoDecoder {
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
         var isSyncSample = false
+        var sawParameterSets = false
         for nal in nalUnits {
             guard let first = nal.first else { continue }
             let nalType = (first >> 1) & 0x3F
             switch nalType {
             case 32:
+                sawParameterSets = true
                 vps = nal
-                tryCreateHEVCFormatDescription()
             case 33:
+                sawParameterSets = true
                 sps = nal
-                tryCreateHEVCFormatDescription()
             case 34:
+                sawParameterSets = true
                 pps = nal
-                tryCreateHEVCFormatDescription()
             case 35, 39, 40:
                 // AUD and SEI — same VideoToolbox hygiene as the H.264 path.
                 continue
@@ -297,6 +304,8 @@ final class VideoDecoder {
                 accessUnitNALs.append(nal)
             }
         }
+        // VPS, SPS and PPS together, as for H.264.
+        if sawParameterSets { tryCreateHEVCFormatDescription() }
         if hasSliceNAL {
             decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample)
         }

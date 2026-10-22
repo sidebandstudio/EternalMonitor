@@ -286,6 +286,49 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
     }
 
+    private func fixture(_ name: String, _ ext: String) throws -> Data {
+        let url = try XCTUnwrap(Bundle(for: VideoDecoderTests.self).url(forResource: name, withExtension: ext, subdirectory: "Fixtures"),
+                                "\(name).\(ext) fixture missing from the test bundle")
+        return try Data(contentsOf: url)
+    }
+
+    /// A keyframe whose parameter sets all differ must become one new format.
+    /// Adopting each parameter set as it was parsed paired the new SPS with
+    /// the old PPS (and, for HEVC, the new VPS with the old SPS and PPS).
+    /// On 0.3.1 an iPad switching 800x600 to 2560x1440 logged the new size
+    /// "accepted by the live session" of the 800x600 decoder, then glitched.
+    private func assertResolutionChangeIsOneFormat(first: Data, second: Data, file: StaticString = #filePath, line: UInt = #line) {
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let firstFrame = expectation(description: "first size")
+        let secondFrame = expectation(description: "second size")
+        decoder.onFrameDecoded = { buffer, timestamp in
+            if timestamp == 16_667 { firstFrame.fulfill() }
+            if timestamp == 2 * 16_667, CVPixelBufferGetWidth(buffer) == 96 { secondFrame.fulfill() }
+        }
+        decoder.decode(packet: packet(seq: 1, data: first, keyframe: true))
+        wait(for: [firstFrame], timeout: 10)
+        let before = events.withLock { $0.count }
+        decoder.decode(packet: packet(seq: 2, data: second, keyframe: true))
+        wait(for: [secondFrame], timeout: 10)
+        let change = events.withLock { Array($0[before...]) }
+        let formats = change.filter { $0.hasPrefix("Updated format description") }
+        XCTAssertEqual(formats.count, 1, "one keyframe, one format: \(formats)", file: file, line: line)
+        XCTAssertTrue(formats.first?.contains("size=96x64") == true, file: file, line: line)
+        XCTAssertFalse(change.contains { $0.hasPrefix("Format change accepted") }, "a new size needs a new session", file: file, line: line)
+        XCTAssertEqual(change.filter { $0.hasPrefix("VideoToolbox session ready") }.count, 1, file: file, line: line)
+    }
+
+    func testH264ResolutionChangeAdoptsSPSAndPPSTogether() throws {
+        assertResolutionChangeIsOneFormat(first: try gopFixture().idr, second: try fixture("idr_96x64", "h264"))
+    }
+
+    func testHEVCResolutionChangeAdoptsVPSSPSAndPPSTogether() throws {
+        assertResolutionChangeIsOneFormat(first: try fixture("single_irap_64x64", "h265"), second: try fixture("irap_96x64", "h265"))
+    }
+
     func testDependentFrameBeforeTheFirstKeyframeAsksForOne() throws {
         // The host's first keyframe was lost on Wi-Fi: one 0.3.1 iPad dropped
         // two seconds of frames "because decoder is not ready" and never asked.
