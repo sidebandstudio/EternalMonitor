@@ -27,6 +27,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
+/// The uploader's summary window, for fatal reports.
+static PERIODIC: OnceLock<std::sync::Arc<Mutex<Periodic>>> = OnceLock::new();
 // Shared by the upload thread and fatal reports, so events never reuse a number.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -306,6 +308,7 @@ impl UploadGuard {
         let _ = IDENTITY.set(identity);
         let _ = OUTBOX.set(directory.clone());
         let (sender, uploader) = Uploader::spawn(config, directory);
+        let _ = PERIODIC.set(uploader.periodic.clone());
         let _ = SENDER.set(sender);
         Self {
             _uploader: Some(uploader),
@@ -335,9 +338,10 @@ pub fn record(line: &str) {
         }
     }
 }
-/// Queue one event (`level` is `error` or `info`) on disk now. The upload
-/// thread sends it, or the next launch does if this process ends first. Ok
-/// when the event is saved or uploads are off.
+/// Queue one event (`level` is `error` or `info`) on disk now, after the
+/// open periodic summary. The upload thread sends them, or the next launch
+/// does if this process ends first. Ok when the event is saved or uploads
+/// are off.
 pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
     if !enabled() {
         return Ok(());
@@ -345,14 +349,25 @@ pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
     let Some(directory) = OUTBOX.get() else {
         return Ok(());
     };
-    let queued = queue_into(directory, message, level);
+    let queued = queue_into(directory, PERIODIC.get().map(|x| &**x), message, level);
     if queued.is_err() {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
     queued
 }
-fn queue_into(directory: &Path, message: &str, level: &str) -> std::io::Result<()> {
-    persist(directory, &batch(vec![event(message, level)])?)
+/// The open summary window goes first, in the same batch: a crash after
+/// this skips the uploader's shutdown, which would otherwise write it.
+fn queue_into(
+    directory: &Path,
+    periodic: Option<&Mutex<Periodic>>,
+    message: &str,
+    level: &str,
+) -> std::io::Result<()> {
+    let mut events: Vec<Event> = periodic.map_or_else(Vec::new, |periodic| {
+        events_of(lock(periodic).flush()).collect()
+    });
+    events.push(event(message, level));
+    persist(directory, &batch(events)?)
 }
 /// Queue an event for another launch of this installation, from the failure
 /// reporter process. `index` keeps several such events distinct. Ok when the
@@ -927,6 +942,64 @@ mod tests {
         assert!(pc_name_pattern("  ").is_none());
     }
 
+    /// A crash ends the process without the uploader's shutdown: the fatal
+    /// report carries the open summary window, in order before it.
+    #[test]
+    fn a_fatal_report_carries_the_open_summary_window() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        for line in streaming_lines(5) {
+            sender.send(Queued::Line(line)).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock(&uploader.periodic).is_open() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no line reached the window"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the thread take the rest of the lines too.
+        std::thread::sleep(Duration::from_millis(300));
+        let fatal = "EternalMonitor stopped unexpectedly: Host panic";
+        queue_into(&directory, Some(&uploader.periodic), fatal, "error").unwrap();
+        let batches: Vec<Batch> = files(&directory)
+            .unwrap()
+            .iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        let with_fatal = batches
+            .iter()
+            .find(|b| b.events.iter().any(|e| e.message == fatal))
+            .expect("fatal event saved");
+        let messages: Vec<_> = with_fatal
+            .events
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[0].contains("INFO Periodic stats summary"),
+            "{messages:?}"
+        );
+        assert!(messages[0].contains(" rr_lines=10 "), "{messages:?}");
+        assert_eq!(messages[1], fatal);
+        drop(uploader);
+        let summaries = outbox_messages(&directory)
+            .iter()
+            .filter(|m| m.contains("Periodic stats summary"))
+            .count();
+        assert_eq!(summaries, 1, "the window is not uploaded twice");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn quitting_stops_between_slow_uploads_and_keeps_the_rest() {
         let (waited, directory, _) = quit_waits(Duration::from_millis(1500));
@@ -1153,11 +1226,18 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         queue_into(
             &directory,
+            None,
             "EternalMonitor could not start: token=abc",
             "error",
         )
         .unwrap();
-        queue_into(&directory, "EternalMonitor could not start: again", "error").unwrap();
+        queue_into(
+            &directory,
+            None,
+            "EternalMonitor could not start: again",
+            "error",
+        )
+        .unwrap();
         let saved: Vec<Batch> = files(&directory)
             .unwrap()
             .iter()

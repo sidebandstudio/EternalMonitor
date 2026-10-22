@@ -4,6 +4,11 @@
 //! of the backend's rows and pushed everything else out of its retention.
 //! The upload gets one `Periodic stats summary` per session per [`WINDOW`]
 //! instead; the session log and "Copy logs" keep every line.
+//!
+//! Quitting and in-process fatal reports write the open window. A native
+//! crash skips both, and the failure reporter uploads only its own event, so
+//! up to one window (60 s) of periodic stats before it is not uploaded; the
+//! session log keeps those lines.
 
 use std::time::{Duration, Instant};
 
@@ -266,6 +271,12 @@ impl Periodic {
         }
         self.session = None;
         out
+    }
+
+    /// Whether a window holds lines not yet summarized.
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.started.is_some()
     }
 
     /// The summary of the open window, for a session start and shutdown.
