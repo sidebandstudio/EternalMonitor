@@ -638,16 +638,20 @@ fn run_elevated_repair() -> Result<u32, String> {
     Ok(code)
 }
 
-#[cfg(not(windows))]
 fn query_firewall() -> Option<Firewall> {
+    query_firewall_for(&std::env::current_exe().ok()?)
+}
+
+#[cfg(not(windows))]
+pub fn query_firewall_for(_exe: &std::path::Path) -> Option<Firewall> {
     None
 }
 
+/// The firewall as it applies to `exe`.
 #[cfg(windows)]
-fn query_firewall() -> Option<Firewall> {
+pub fn query_firewall_for(exe: &std::path::Path) -> Option<Firewall> {
     use std::os::windows::process::CommandExt;
-    let exe = std::env::current_exe().ok()?;
-    let exe = crate::single_instance::canonical(&exe);
+    let exe = crate::single_instance::canonical(exe);
     let script = format!(
         "& {{ $exe = {}; {} }}",
         ps_quote(&exe.display().to_string()),
@@ -1004,6 +1008,28 @@ mod tests {
              profile=domain,private,public enable=yes"
         );
         assert!(commands[3].contains(&"protocol=TCP".to_string()));
+    }
+
+    /// On a real PC: the startup summary, and the firewall verdict for
+    /// `ETERNAL_FIREWALL_EXE` (default: this test binary). Run with
+    /// `cargo test -p eternal-host --lib native_network -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn native_network_summary_and_firewall() {
+        let exe = std::env::var_os("ETERNAL_FIREWALL_EXE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().unwrap());
+        let firewall = query_firewall_for(&exe).expect("firewall settings");
+        let adapters = adapters();
+        println!("NATIVE adapters={}", adapters.len());
+        println!("NATIVE lan_addresses={}", lan_addresses(&adapters).len());
+        println!("NATIVE summary: {}", summary(&adapters, Some(&firewall)));
+        println!(
+            "NATIVE verdict={:?} rules={:?}",
+            verdict(&firewall),
+            firewall.rules
+        );
     }
 
     #[test]
