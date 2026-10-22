@@ -642,7 +642,14 @@ impl EncoderState {
                 (*encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
             };
         }
-        encoder.set_gop(30);
+        // ETERNAL_GOP_FRAMES lets tests turn off the periodic IDR, so only
+        // keyframe requests can repair a broken reference chain.
+        let gop = std::env::var("ETERNAL_GOP_FRAMES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|&frames| frames > 0)
+            .unwrap_or(30);
+        encoder.set_gop(gop);
         configure_encoder_flags(&mut encoder, encoder_name);
 
         let opts = encoder_options(encoder_name);
