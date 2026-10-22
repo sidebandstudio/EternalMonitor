@@ -28,9 +28,11 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
@@ -218,6 +220,8 @@ pub fn run_capture_loop(
 
     // --- Get immediate device context ---
     let device_context: ID3D11DeviceContext = unsafe { device.GetImmediateContext()? };
+
+    log_output_color(&output);
 
     // --- Duplicate the output ---
     let output1: IDXGIOutput1 = output.cast()?;
@@ -702,6 +706,26 @@ fn resend_last_frame(
         height,
     });
     *last_send = now;
+}
+
+/// Records whether the captured display runs in HDR and how it is rotated.
+/// Support questions about washed-out pictures and sideways portrait screens
+/// could not be answered from 0.3.1 diagnostics, which logged neither.
+fn log_output_color(output: &IDXGIOutput) {
+    let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+        return;
+    };
+    let Ok(desc) = (unsafe { output6.GetDesc1() }) else {
+        return;
+    };
+    info!(
+        hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        color_space = desc.ColorSpace.0,
+        bits_per_color = desc.BitsPerColor,
+        max_luminance = desc.MaxLuminance,
+        rotation = desc.Rotation.0,
+        "Display colour and rotation"
+    );
 }
 
 /// The adapter this process runs on cannot duplicate `output` (a hybrid PC
