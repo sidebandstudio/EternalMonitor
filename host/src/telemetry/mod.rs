@@ -442,49 +442,131 @@ fn event(line: &str, level: &str) -> Event {
             .as_millis() as u64,
         level: level.into(),
         category: "host".into(),
-        message: redact_upload(&crate::logging::redact_support_text(line), PC_NAME.as_ref()),
+        message: redact_upload(&crate::logging::redact_support_text(line), &NAMES),
     }
 }
 
-/// This PC's name, as the mDNS advertisement and HELLO_ACK carry it.
-static PC_NAME: once_cell::sync::Lazy<Option<regex::Regex>> = once_cell::sync::Lazy::new(|| {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .as_deref()
-        .and_then(pc_name_pattern)
+/// What uploads leave out: the user's profile folder, which is their user
+/// name, and the PC's name, which is often its owner's.
+struct Names {
+    profile: Option<regex::Regex>,
+    /// Lowercase, for a whole-token match in any case.
+    pc: Option<String>,
+}
+impl Names {
+    fn new(profile: Option<&str>, pc: Option<&str>) -> Self {
+        Self {
+            profile: profile.and_then(profile_pattern),
+            pc: pc
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_lowercase),
+        }
+    }
+}
+static NAMES: once_cell::sync::Lazy<Names> = once_cell::sync::Lazy::new(|| {
+    let profile = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"));
+    let pc = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME"));
+    Names::new(profile.ok().as_deref(), pc.ok().as_deref())
 });
 
-fn pc_name_pattern(name: &str) -> Option<regex::Regex> {
-    let name = name.trim();
-    if name.is_empty() {
+/// This profile's path, in any case and with either separator, when the
+/// folder name ends there.
+fn profile_pattern(path: &str) -> Option<regex::Regex> {
+    let path = path.trim().trim_end_matches(['\\', '/']);
+    let (parent, folder) = path.rsplit_once(['\\', '/'])?;
+    if folder.is_empty() {
         return None;
     }
-    regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))).ok()
+    let parent: Vec<_> = parent.split(['\\', '/']).map(regex::escape).collect();
+    regex::Regex::new(&format!(
+        r#"(?i)({}[\\/]+){}([\\/\s"'=,;)\]]|$)"#,
+        parent.join(r"[\\/]+"),
+        regex::escape(folder)
+    ))
+    .ok()
 }
 
-/// Uploads leave out the PC's name, which is often its owner's, and the
-/// user name in profile paths. Support identifies a PC by its installation
-/// id. The session log and "Copy logs" keep both names.
-fn redact_upload(text: &str, pc_name: Option<&regex::Regex>) -> String {
-    // A Windows user name may contain spaces but no path separator, so a
-    // segment that ends at one is taken whole; at the end of a path, only up
-    // to the next space.
+/// Lines whose `device=` is the PC's audio output. Its name can be the
+/// owner's ("Maria's AirPods"); the WASAPI line also logs the form factor and
+/// bus, which uploads keep.
+const AUDIO_DEVICE_LINES: [&str; 3] = [
+    "WASAPI loopback active",
+    "PC audio session started",
+    "Audio stream stats",
+];
+
+fn redact_audio_device(text: &str) -> std::borrow::Cow<'_, str> {
+    static DEVICE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r" device=.*?( [a-z][a-z0-9_]*=|$)").expect("device field pattern")
+    });
+    let message = crate::log_repeat::split_stamp(text)
+        .and_then(|(_, rest)| rest.trim_start().split_once(' '))
+        .map(|(_, message)| message);
+    if message.is_some_and(|m| AUDIO_DEVICE_LINES.iter().any(|line| m.starts_with(line))) {
+        DEVICE.replace(text, " device=[AUDIO-DEVICE]$1")
+    } else {
+        text.into()
+    }
+}
+
+/// The PC's name where the host logs it: the mDNS registration's `host=` and
+/// instance name, and mDNS host names (`NAME.local.`). Only a whole token
+/// equal to the name, in any case, so a PC named `Desktop` or `INFO` leaves
+/// "Desktop duplication" and the level alone.
+fn redact_pc_name<'a>(text: &'a str, pc: &str) -> std::borrow::Cow<'a, str> {
+    static CARRIERS: once_cell::sync::Lazy<[regex::Regex; 2]> = once_cell::sync::Lazy::new(|| {
+        [
+            regex::Regex::new(r"(\bhost=|\bEternalMonitor \()([^\s()]+)()"),
+            regex::Regex::new(r"()\b([A-Za-z0-9_-]+)(\.local\b)"),
+        ]
+        .map(|pattern| pattern.expect("PC name pattern"))
+    });
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for carrier in CARRIERS.iter() {
+        let replaced = carrier.replace_all(&text, |captures: &regex::Captures| {
+            let token = &captures[2];
+            let token = if token.to_lowercase() == pc {
+                "[PC-NAME]"
+            } else {
+                token
+            };
+            format!("{}{token}{}", &captures[1], &captures[3])
+        });
+        if let std::borrow::Cow::Owned(replaced) = replaced {
+            text = replaced.into();
+        }
+    }
+    text
+}
+
+/// Uploads leave out the names in [`Names`] and audio device names. Support
+/// identifies a PC by its installation id. The session log and "Copy logs"
+/// keep them all.
+fn redact_upload(text: &str, names: &Names) -> String {
+    let text = redact_audio_device(text);
+    let text = match &names.profile {
+        Some(profile) => profile.replace_all(&text, "${1}[USER]${2}").into_owned(),
+        None => text.into_owned(),
+    };
+    // Any other profile path. A Windows user name may contain spaces but no
+    // path separator, so a segment that ends at one is taken whole; at the end
+    // of a path, only up to the next space.
     static PROFILE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(
-            r#"(?i)(\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:Users|home)/)(?:[^\\/\r\n"'<>|:*?=]+([\\/])|[^\\/\s"'<>|:*?=]+)"#,
+            r#"(?i)(\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:Users|home)/)(?:[^\\/\r\n"'<>|:*?=\[]+([\\/])|[^\\/\s"'<>|:*?=\[]+)"#,
         )
         .expect("profile path pattern")
     });
-    let text = PROFILE.replace_all(text, |captures: &regex::Captures| {
+    let text = PROFILE.replace_all(&text, |captures: &regex::Captures| {
         format!(
             "{}[USER]{}",
             &captures[1],
             captures.get(2).map_or("", |separator| separator.as_str())
         )
     });
-    match pc_name {
-        Some(pattern) => pattern.replace_all(&text, "[PC-NAME]").into_owned(),
+    match &names.pc {
+        Some(pc) => redact_pc_name(&text, pc).into_owned(),
         None => text.into_owned(),
     }
 }
@@ -915,31 +997,89 @@ mod tests {
                 r"path=C:\Program Files\EternalMonitor",
             ),
         ] {
-            assert_eq!(redact_upload(text, None), uploaded);
+            assert_eq!(redact_upload(text, &Names::new(None, None)), uploaded);
         }
     }
 
     #[test]
-    fn uploads_leave_out_the_pc_name() {
-        let pc = pc_name_pattern("MARIA-LAPTOP");
-        let line =
-            "2026-10-22T18:04:26.445159Z  INFO mDNS service registering \u{2014} advertising \
-                    on all non-loopback addresses service_type=\"_eternaldisplay._udp.local.\" \
-                    port=9876 host=MARIA-LAPTOP instance=EternalMonitor (MARIA-LAPTOP) addrs=[]";
-        assert_eq!(
-            redact_upload(line, pc.as_ref()),
-            "2026-10-22T18:04:26.445159Z  INFO mDNS service registering \u{2014} advertising \
-             on all non-loopback addresses service_type=\"_eternaldisplay._udp.local.\" \
-             port=9876 host=[PC-NAME] instance=EternalMonitor ([PC-NAME]) addrs=[]"
-        );
-        // Only the name as Windows reports it, as a whole word: a short name
-        // must not eat ordinary words that contain it.
-        let short = pc_name_pattern("HOST");
-        assert_eq!(
-            redact_upload("Host panic at HOSTS host=HOST", short.as_ref()),
-            "Host panic at HOSTS host=[PC-NAME]"
-        );
-        assert!(pc_name_pattern("  ").is_none());
+    fn uploads_leave_out_the_pc_name_only_where_it_is_carried() {
+        let mdns = |name: &str| {
+            format!(
+                "2026-10-22T18:04:26.445159Z  INFO mDNS service registering \u{2014} advertising \
+                 on all non-loopback addresses service_type=\"_eternaldisplay._udp.local.\" \
+                 port=9876 host={name} instance=EternalMonitor ({name}) addrs=[]"
+            )
+        };
+        // A name that is also a word or a level marker leaves the rest alone.
+        for (name, line) in [
+            ("Desktop", "2026-10-22T18:04:26.445159Z  WARN Desktop duplication access lost \u{2014} reinitializing"),
+            ("INFO", "2026-10-22T18:04:26.445159Z  INFO Encoder opened codec=h264_nvenc"),
+            ("INFO", "2026-10-22T18:04:26.445159Z  INFO Client session established device=INFO"),
+        ] {
+            assert_eq!(redact_upload(line, &Names::new(None, Some(name))), line);
+        }
+        let redacted = mdns("[PC-NAME]");
+        for name in ["MARIA-LAPTOP", "Desktop", "INFO"] {
+            let names = Names::new(None, Some(name));
+            assert_eq!(redact_upload(&mdns(name), &names), redacted, "{name}");
+            // A lowercase copy, as in an mDNS host name, is the same name.
+            assert_eq!(
+                redact_upload(
+                    &format!("Announce {}.local. on 192.0.2.1", name.to_lowercase()),
+                    &names
+                ),
+                "Announce [PC-NAME].local. on 192.0.2.1",
+                "{name}"
+            );
+        }
+        assert!(Names::new(None, Some("  ")).pc.is_none());
+    }
+
+    #[test]
+    fn uploads_leave_out_the_whole_profile_folder() {
+        let names = Names::new(Some(r"C:\Users\Name Smith"), None);
+        for (text, uploaded) in [
+            (r"home=C:\Users\Name Smith", r"home=C:\Users\[USER]"),
+            (
+                r"path=C:\Users\Name Smith\AppData\Roaming\EternalMonitor\settings.json",
+                r"path=C:\Users\[USER]\AppData\Roaming\EternalMonitor\settings.json",
+            ),
+            (
+                r"dir=c:/users/name smith/Desktop next=1",
+                r"dir=c:/users/[USER]/Desktop next=1",
+            ),
+        ] {
+            assert_eq!(redact_upload(text, &names), uploaded);
+        }
+    }
+
+    #[test]
+    fn uploads_name_no_audio_device_but_keep_its_kind() {
+        for (line, uploaded) in [
+            (
+                "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=Headphones (Maria's AirPods) \
+                 form_factor=headphones bus=BTHENUM rate=48000 channels=2",
+                "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=[AUDIO-DEVICE] \
+                 form_factor=headphones bus=BTHENUM rate=48000 channels=2",
+            ),
+            (
+                "2026-10-22T18:00:00.000000Z  INFO PC audio session started (Opus, 48 kHz stereo, 20 ms) \
+                 session_id=5 device=Headphones (Maria's AirPods) bitrate=96000",
+                "2026-10-22T18:00:00.000000Z  INFO PC audio session started (Opus, 48 kHz stereo, 20 ms) \
+                 session_id=5 device=[AUDIO-DEVICE] bitrate=96000",
+            ),
+            (
+                "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=Maria's AirPods",
+                "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=[AUDIO-DEVICE]",
+            ),
+            // Other lines' device fields are not audio devices.
+            (
+                "2026-10-22T18:00:00.000000Z  INFO Client session established session_id=5 device=iPad",
+                "2026-10-22T18:00:00.000000Z  INFO Client session established session_id=5 device=iPad",
+            ),
+        ] {
+            assert_eq!(event(line, "info").message, uploaded);
+        }
     }
 
     /// A crash ends the process without the uploader's shutdown: the fatal
