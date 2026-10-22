@@ -363,7 +363,12 @@ fn prepare_vdd_settings(
         .iter()
         .find(|output| output.is_primary)
         .map(|output| output.adapter_name.as_str());
-    let pin = crate::vdd_settings::gpu_to_pin(main_screen, &dxgi::adapter_names());
+    // The virtual display's own adapter, listed while it is on, is not a card.
+    let names = crate::vdd_snapshot::render_adapter_names(
+        &crate::vdd_snapshot::adapters(),
+        &crate::vdd_snapshot::targets(),
+    );
+    let pin = crate::vdd_settings::gpu_to_pin(main_screen, &names);
     if let Err(reason) = pin {
         info!(
             reason,

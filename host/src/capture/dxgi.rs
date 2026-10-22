@@ -59,19 +59,6 @@ pub fn enumerate_outputs() -> Vec<OutputInfo> {
     enumerate_factory_outputs(&factory)
 }
 
-/// The description of every DXGI adapter, as the virtual display driver
-/// matches its configured render adapter against them.
-pub fn adapter_names() -> Vec<String> {
-    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return Vec::new();
-    };
-    (0..)
-        .map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok())
-        .filter_map(|adapter| unsafe { adapter.GetDesc1() }.ok())
-        .map(|desc| utf16_to_string(&desc.Description))
-        .collect()
-}
-
 fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
     let mut outputs = Vec::new();
 

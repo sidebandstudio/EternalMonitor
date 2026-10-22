@@ -42,6 +42,29 @@ pub struct Target {
     pub monitor_path: String,
 }
 
+impl Target {
+    fn is_vdd(&self) -> bool {
+        self.monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
+    }
+}
+
+/// The adapter names the driver can be pinned to, without the virtual
+/// display's own adapter. While the virtual display is on, DXGI lists that
+/// adapter under the name of the card rendering it, which would otherwise
+/// read as two cards with one name.
+pub fn render_adapter_names(adapters: &[Adapter], targets: &[Target]) -> Vec<String> {
+    let vdd: Vec<u64> = targets
+        .iter()
+        .filter(|t| t.is_vdd())
+        .flat_map(|t| std::iter::once(t.adapter).chain(t.source.map(|(adapter, _)| adapter)))
+        .collect();
+    adapters
+        .iter()
+        .filter(|a| !vdd.contains(&a.luid))
+        .map(|a| a.description.clone())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// The device state, or why there is none.
@@ -122,7 +145,7 @@ pub fn line(snapshot: &Snapshot) -> String {
         .iter()
         .take(MAX_TARGETS)
         .map(|t| {
-            let vdd = t.monitor_path.to_ascii_uppercase().contains(VDD_MONITOR);
+            let vdd = t.is_vdd();
             let state = match t.source {
                 Some((adapter, id)) => format!("active src={}/{id}", luid(adapter)),
                 None if t.available => "inactive available".to_string(),
@@ -175,10 +198,13 @@ pub fn collect(
             path.trim_end_matches('\\')
                 .eq_ignore_ascii_case(r"C:\VirtualDisplayDriver")
         }),
-        adapters: windows_impl::adapters(),
-        targets: windows_impl::targets(),
+        adapters: adapters(),
+        targets: targets(),
     }
 }
+
+#[cfg(windows)]
+pub use windows_impl::{adapters, targets};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -389,6 +415,44 @@ mod tests {
         let mut unmatched = snapshot();
         unmatched.pin = Ok("Intel(R) UHD Graphics".into());
         assert!(line(&unmatched).contains("pin_matched=false"));
+    }
+
+    #[test]
+    fn the_virtual_displays_own_adapter_is_not_a_second_card() {
+        // mainpc with the virtual display on: DXGI lists its adapter under
+        // the RTX 5080's name, and its path runs on that adapter.
+        let card = |luid, name: &str| Adapter {
+            luid,
+            description: name.into(),
+            vendor_id: 0,
+            device_id: 0,
+            driver: String::new(),
+            outputs: 0,
+        };
+        let adapters = [
+            card(0x11e00, "NVIDIA GeForce RTX 5080"),
+            card(0x13c3b, "AMD Radeon(TM) Graphics"),
+            card(0x66f8f4a0, "NVIDIA GeForce RTX 5080"),
+        ];
+        let mut vdd = snapshot().targets[1].clone();
+        (vdd.adapter, vdd.source) = (0x66f8f4a0, Some((0x66f8f4a0, 0)));
+        let monitor = Target {
+            adapter: 0x11e00,
+            source: Some((0x11e00, 0)),
+            ..snapshot().targets[0].clone()
+        };
+        let names = render_adapter_names(&adapters, &[monitor.clone(), vdd]);
+        assert_eq!(
+            names,
+            ["NVIDIA GeForce RTX 5080", "AMD Radeon(TM) Graphics"]
+        );
+        assert_eq!(
+            crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &names),
+            Ok("NVIDIA GeForce RTX 5080")
+        );
+        // Two real cards with one name still are not pinned.
+        let twins = render_adapter_names(&adapters, &[monitor]);
+        assert!(crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &twins).is_err());
     }
 
     #[test]
