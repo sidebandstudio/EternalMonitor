@@ -806,6 +806,12 @@ mod tests {
         let mut lines = Vec::new();
         for half in 0..seconds * 2 {
             let stamp = format!("2026-10-22T17:46:{:02}.{}00000Z", half / 2, half % 2 * 5);
+            if half % 20 == 0 {
+                lines.push(format!(
+                    "{stamp}  INFO Support stream summary session_id=Some(7) running=true \
+                     captured={half} capture_fps=60.0"
+                ));
+            }
             lines.push(format!(
                 "{stamp}  INFO Receiver report epoch=1 complete={half} dropped=0 repaired=0 \
                  nacks=0 jitter_us=190 decode_fps_x10=558 decode_depth=0 retransmits=0"
@@ -814,12 +820,6 @@ mod tests {
                 lines.push(format!(
                     "{stamp}  INFO Audio stream stats device=Speakers kbps=96.0 \
                      packets_per_sec=50.0 quiet_packets=0 dropped=0"
-                ));
-            }
-            if half % 20 == 0 {
-                lines.push(format!(
-                    "{stamp}  INFO Support stream summary session_id=Some(7) running=true \
-                     captured={half} capture_fps=60.0"
                 ));
             }
         }

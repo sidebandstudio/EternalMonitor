@@ -179,7 +179,7 @@ impl Periodic {
             return out;
         };
         if message.starts_with(SESSION_START) {
-            out.extend(self.flush());
+            out.extend(self.end_session());
             self.session = fields(message)
                 .into_iter()
                 .find_map(|(name, value)| (name == "session_id").then(|| session_value(value)))
@@ -197,10 +197,9 @@ impl Periodic {
         let fields = fields(text);
         if let Some((_, value)) = fields.iter().find(|(name, _)| *name == "session_id") {
             let session = session_value(value);
-            if session.is_some() && self.session.is_some() && session != self.session {
-                out.extend(self.flush());
-            }
-            if session.is_some() {
+            // A disconnect (`None`) ends the session too.
+            if session != self.session {
+                out.extend(self.end_session());
                 self.session = session;
             }
         }
@@ -256,6 +255,17 @@ impl Periodic {
             Some(started) if now.duration_since(started) >= WINDOW => self.flush_at(now),
             _ => Vec::new(),
         }
+    }
+
+    /// Closes the window and forgets the session and its counters, so the
+    /// next session's first report is its own baseline.
+    fn end_session(&mut self) -> Vec<String> {
+        let out = self.flush();
+        for kind in &mut self.kinds {
+            kind.previous.clear();
+        }
+        self.session = None;
+        out
     }
 
     /// The summary of the open window, for a session start and shutdown.
@@ -345,17 +355,17 @@ mod tests {
     fn a_window_of_reports_becomes_one_line_with_min_avg_max() {
         let mut periodic = Periodic::default();
         let start = Instant::now();
-        let mut out = Vec::new();
+        let mut out = periodic.push(&summary(7, 0), start);
         for (i, (complete, dropped, jitter)) in [(10, 0, 100), (40, 2, 300), (70, 2, 200)]
             .into_iter()
             .enumerate()
         {
+            let second = i as u64 + 1;
             out.extend(periodic.push(
-                &report(i as u64, complete, dropped, jitter),
-                start + Duration::from_secs(i as u64),
+                &report(second, complete, dropped, jitter),
+                start + Duration::from_secs(second),
             ));
         }
-        out.extend(periodic.push(&summary(7, 3), start + Duration::from_secs(3)));
         assert!(out.is_empty(), "{out:?}");
         let closed = periodic.flush_due(start + WINDOW);
         assert_eq!(closed.len(), 1);
@@ -442,6 +452,9 @@ mod tests {
             let now = start + Duration::from_millis(tenth * 100);
             let second = tenth / 10;
             let mut lines = Vec::new();
+            if tenth % 100 == 0 {
+                lines.push(summary(7, second));
+            }
             if tenth % 5 == 0 {
                 lines.push(report(second, tenth as u32, 0, 200));
             }
@@ -454,9 +467,6 @@ mod tests {
                     stamp(second)
                 ));
             }
-            if tenth % 100 == 0 {
-                lines.push(summary(7, second));
-            }
             for line in lines {
                 logged += 1;
                 uploaded += periodic.push(&line, now).len();
@@ -466,5 +476,40 @@ mod tests {
         uploaded += periodic.flush().len();
         assert_eq!(logged, 7200 + 3600 + 360);
         assert_eq!(uploaded, 60);
+    }
+
+    /// A new session's counters start from its own values.
+    #[test]
+    fn counters_start_again_with_each_session() {
+        let start = Instant::now();
+        let established = format!("{}  INFO Client session established session_id=2", stamp(1));
+        for boundary in [established, summary(2, 1)] {
+            let mut periodic = Periodic::default();
+            periodic.push(&summary(1, 0), start);
+            periodic.push(&report(0, 100, 0, 1), start);
+            periodic.push(&boundary, start + Duration::from_secs(1));
+            periodic.push(&report(2, 150, 0, 1), start + Duration::from_secs(2));
+            let line = periodic.flush().remove(0);
+            assert!(line.contains(" session_id=2 "), "{line}");
+            assert!(line.contains(" rr_complete=150(+0) "), "{line}");
+        }
+    }
+
+    /// Time between sessions carries no session id, and its counters do not
+    /// continue the session before.
+    #[test]
+    fn a_disconnect_ends_the_session() {
+        let mut periodic = Periodic::default();
+        let start = Instant::now();
+        periodic.push(&summary(7, 0), start);
+        periodic.push(&report(0, 100, 0, 1), start);
+        let idle = summary(7, 10).replace("session_id=Some(7)", "session_id=None");
+        let out = periodic.push(&idle, start + Duration::from_secs(10));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(" session_id=7 rr_lines=1 "), "{}", out[0]);
+        periodic.push(&report(11, 120, 0, 1), start + Duration::from_secs(11));
+        let line = periodic.flush().remove(0);
+        assert!(line.contains(" session_id=None rr_lines=1 "), "{line}");
+        assert!(line.contains(" rr_complete=120(+0) "), "{line}");
     }
 }
