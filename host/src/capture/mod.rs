@@ -346,6 +346,84 @@ fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
 const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(windows)]
+const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
+
+/// Before each enable: name the main screen's graphics card for the driver
+/// to render on, and, when the user wants it, the iPad's modes. Without a
+/// name the driver renders on the card with the most memory, which on
+/// Intel + NVIDIA laptops drives no screen. Failure is non-fatal — the
+/// driver's built-in choices apply.
+#[cfg(windows)]
+fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) {
+    let main_screen = outputs
+        .iter()
+        .find(|output| output.is_primary)
+        .map(|output| output.adapter_name.as_str());
+    let gpu = match crate::vdd_settings::gpu_to_pin(main_screen, &dxgi::adapter_names()) {
+        Ok(gpu) => Some(gpu),
+        Err(reason) => {
+            info!(
+                reason,
+                main_screen, "Leaving the virtual display's graphics card to the driver"
+            );
+            None
+        }
+    };
+    let client = crate::settings::SettingsFile::load()
+        .vdd_match_resolution
+        .then(|| shared.session.lock().client_info())
+        .flatten();
+    let path = std::path::Path::new(VDD_SETTINGS_PATH);
+    if let Some(info) = client {
+        let modes = crate::vdd_settings::modes_for_client(
+            info.screen_px.0,
+            info.screen_px.1,
+            info.refresh_hz,
+        );
+        match crate::vdd_settings::write_to(path, &modes, gpu) {
+            Ok(()) => info!(
+                ?modes,
+                gpu = gpu.unwrap_or("chosen by the driver"),
+                "Wrote virtual display mode list for the connected client"
+            ),
+            Err(error) => warn!(
+                %error,
+                "Could not write vdd_settings.xml — driver default modes apply"
+            ),
+        }
+    } else if let Some(gpu) = gpu {
+        // The modes in the file are the user's: change only the card.
+        match crate::vdd_settings::pin_gpu_in(path, gpu) {
+            Ok(true) => info!(
+                gpu,
+                "Pointed the virtual display at the main screen's graphics card"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%error, gpu, "Could not name the graphics card in vdd_settings.xml")
+            }
+        }
+    }
+}
+
+/// Say why the second screen did not appear: on the Stream page each time,
+/// and in the log once per iPad session for each state, so diagnostics show
+/// it without repeating every retry.
+#[cfg(windows)]
+fn report_device(shared: &SharedControl, device: DeviceState) {
+    static LOGGED: Mutex<Vec<(Option<u32>, DeviceState)>> = Mutex::new(Vec::new());
+    let problem = device.problem();
+    *shared.vdd_problem.lock() = Some(problem);
+    let key = (shared.session.lock().session_id(), device);
+    let mut logged = LOGGED.lock();
+    logged.retain(|(session, _)| *session == key.0);
+    if !logged.contains(&key) {
+        logged.push(key);
+        warn!(vdd_device = %device, ?problem, "Virtual display device state");
+    }
+}
+
+#[cfg(windows)]
 fn vdd_attach_timeout() -> Duration {
     std::env::var("ETERNAL_VDD_TIMEOUT_SECS")
         .ok()
@@ -436,36 +514,7 @@ pub(crate) fn reconcile_virtual_display(
             }
             *shared.vdd_output.lock() = None;
 
-            // Best effort: match the virtual display's mode list to the
-            // connected iPad's panel BEFORE enabling the driver (it reads
-            // vdd_settings.xml at enable time). Failure is non-fatal — the
-            // driver's built-in modes apply. NEEDS_WINDOWS_VERIFY (M10).
-            if crate::settings::SettingsFile::load().vdd_match_resolution {
-                let gpu = outputs
-                    .iter()
-                    .find(|output| output.is_primary)
-                    .map(|output| output.adapter_name.as_str())
-                    .filter(|name| !name.is_empty());
-                if let Some(info) = shared.session.lock().client_info() {
-                    let modes = crate::vdd_settings::modes_for_client(
-                        info.screen_px.0,
-                        info.screen_px.1,
-                        info.refresh_hz,
-                    );
-                    let path = std::path::Path::new(r"C:\VirtualDisplayDriver\vdd_settings.xml");
-                    match crate::vdd_settings::write_to(path, &modes, gpu) {
-                        Ok(()) => info!(
-                            ?modes,
-                            gpu = gpu.unwrap_or("chosen by the driver"),
-                            "Wrote virtual display mode list for the connected client"
-                        ),
-                        Err(error) => warn!(
-                            %error,
-                            "Could not write vdd_settings.xml — driver default modes apply"
-                        ),
-                    }
-                }
-            }
+            prepare_vdd_settings(shared, &outputs);
 
             let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
             if !capture_is_current(shared, generation) {
