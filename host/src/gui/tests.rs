@@ -323,26 +323,90 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
             VddTaskHealth::NotResponding,
             VddTaskHealth::TasksMissing,
         ] {
-            assert_eq!(second_screen_notice(status, health), None);
+            assert_eq!(second_screen_notice(status, health, None), None);
         }
     }
     for status in [VddStatus::Failed, VddStatus::TaskFailed] {
         // A hung driver needs a Windows restart; trying again cannot help.
-        let hung = second_screen_notice(status, VddTaskHealth::NotResponding).unwrap();
+        let hung = second_screen_notice(status, VddTaskHealth::NotResponding, None).unwrap();
         assert!(hung.body.contains("Restart the PC"), "{}", hung.body);
         assert!(!hung.retry && !hung.installer);
         // Missing driver tasks need the installer.
-        let missing = second_screen_notice(status, VddTaskHealth::TasksMissing).unwrap();
+        let missing = second_screen_notice(status, VddTaskHealth::TasksMissing, None).unwrap();
         assert!(missing.body.contains("isn't installed"), "{}", missing.body);
         assert!(missing.retry && missing.installer);
     }
     // Without a known driver problem the earlier wording stays.
-    let task = second_screen_notice(VddStatus::TaskFailed, VddTaskHealth::Ok).unwrap();
+    let task = second_screen_notice(VddStatus::TaskFailed, VddTaskHealth::Ok, None).unwrap();
     assert!(task.body.starts_with("Part of the EternalMonitor install"));
     assert!(task.installer);
-    let slow = second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok).unwrap();
+    let slow = second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None).unwrap();
     assert!(slow
         .body
         .starts_with("Windows didn't add the second screen in time"));
     assert!(slow.retry && !slow.installer);
+}
+
+#[test]
+fn the_second_screen_notice_says_what_to_do_about_the_driver_device() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    let notice = |status, problem| {
+        second_screen_notice(status, VddTaskHealth::Ok, Some(problem))
+            .unwrap_or_else(|| panic!("no notice for {status:?} {problem:?}"))
+    };
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        let missing = notice(status, VddProblem::NotInstalled);
+        assert!(missing.body.contains("isn't installed"), "{}", missing.body);
+        assert!(missing.body.contains("EternalMonitor-Setup.exe"));
+        assert!(missing.retry && missing.installer);
+
+        // Code 52 says what Windows blocked, and that Secure Boot can stay on.
+        let signature = notice(status, VddProblem::SignatureBlocked);
+        assert!(signature.body.contains("signature"), "{}", signature.body);
+        assert!(signature.body.contains("code 52"));
+        assert!(signature
+            .body
+            .contains("don't need to turn off Secure Boot"));
+        assert!(signature.installer);
+
+        let error = notice(status, VddProblem::DriverError(Some(43)));
+        assert!(error.body.contains("(Windows code 43)"), "{}", error.body);
+        assert!(error
+            .body
+            .contains("Restart the PC, then run EternalMonitor-Setup.exe again"));
+        assert!(error.installer);
+        let unstarted = notice(status, VddProblem::DriverError(None));
+        assert!(!unstarted.body.contains("code"), "{}", unstarted.body);
+
+        let none = notice(status, VddProblem::NoDisplay);
+        assert!(
+            none.body.contains("didn't add the second screen"),
+            "{}",
+            none.body
+        );
+        assert!(none.retry && !none.installer);
+        let off_desktop = notice(status, VddProblem::NotExtended);
+        assert!(
+            off_desktop.body.contains("extend your desktop"),
+            "{}",
+            off_desktop.body
+        );
+    }
+    // A hung or missing task still says so first: its fix comes before the device's.
+    let hung = second_screen_notice(
+        VddStatus::TaskFailed,
+        VddTaskHealth::NotResponding,
+        Some(VddProblem::NoDisplay),
+    )
+    .unwrap();
+    assert!(hung.body.contains("Restart the PC"), "{}", hung.body);
+    // Nothing failed: no notice, whatever was last reported.
+    for status in [VddStatus::Inactive, VddStatus::Active, VddStatus::Attaching] {
+        assert_eq!(
+            second_screen_notice(status, VddTaskHealth::Ok, Some(VddProblem::NoDisplay)),
+            None
+        );
+    }
 }

@@ -23,6 +23,7 @@ pub mod supervisor;
 pub mod transport;
 pub mod updates;
 pub mod vdd;
+pub mod vdd_device;
 pub mod vdd_settings;
 
 #[cfg(windows)]

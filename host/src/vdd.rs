@@ -59,7 +59,8 @@ enum TaskOutcome {
     Done,
     TimedOut,
     Missing,
-    Failed,
+    /// With the device state the Enable task found, when it said.
+    Failed(Option<crate::vdd_device::DeviceState>),
 }
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
@@ -70,7 +71,7 @@ impl TaskOutcome {
         } else if stderr.contains("0x80070002") {
             Self::Missing
         } else {
-            Self::Failed
+            Self::Failed(crate::vdd_device::from_task_stderr(stderr))
         }
     }
 }
@@ -151,7 +152,7 @@ impl TaskGate {
                 self.stuck_at = Some(now);
             }
             TaskOutcome::Missing => self.health = VddTaskHealth::TasksMissing,
-            TaskOutcome::Failed => {}
+            TaskOutcome::Failed(_) => {}
         }
     }
 }
@@ -261,7 +262,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
         Ok(child) => child,
         Err(error) => {
             warn!(task, %error, "Failed to invoke the VDD task");
-            return TaskOutcome::Failed;
+            return TaskOutcome::Failed(None);
         }
     };
     // vdd_task.ps1 waits up to 10 s for an earlier instance and 15 s for its own.
@@ -305,7 +306,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
         }
         Err(error) => {
             warn!(task, error = %error, "Failed to read the VDD task result");
-            TaskOutcome::Failed
+            TaskOutcome::Failed(None)
         }
     }
 }
@@ -313,24 +314,44 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
 /// Complete one installer-owned driver action while capture reports startup progress.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
-    request(enabled, Purpose::Attempt, progress)
+    request(enabled, Purpose::Attempt, progress, &mut None)
 }
 
-fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
+/// Turn the virtual display on. On failure, what the Enable task found
+/// wrong with the device, when it ran and said.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+pub(crate) fn enable(progress: impl FnMut()) -> Result<(), Option<crate::vdd_device::DeviceState>> {
+    let mut device = None;
+    if request(true, Purpose::Attempt, progress, &mut device) {
+        Ok(())
+    } else {
+        Err(device)
+    }
+}
+
+fn request(
+    enabled: bool,
+    purpose: Purpose,
+    progress: impl FnMut(),
+    device: &mut Option<crate::vdd_device::DeviceState>,
+) -> bool {
     #[cfg(windows)]
     {
         TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
-            let mut outcome = TaskOutcome::Failed;
+            let mut outcome = TaskOutcome::Failed(None);
             crate::startup::display::change(enabled, || {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
                 outcome == TaskOutcome::Done
             });
+            if let TaskOutcome::Failed(state) = outcome {
+                *device = state;
+            }
             outcome
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = (enabled, purpose, progress);
+        let _ = (enabled, purpose, progress, device);
         false
     }
 }
@@ -340,7 +361,7 @@ fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
 /// it, and it waits for an Enable still running, within the task's bounds.
 /// True when the display is known to be off.
 pub fn disable() -> bool {
-    request(false, Purpose::Cleanup, || {})
+    request(false, Purpose::Cleanup, || {}, &mut None)
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
@@ -402,7 +423,7 @@ mod tests {
         let mut gate = TaskGate::new();
         let now = Instant::now();
         gate.after(false, TaskOutcome::Done, now);
-        gate.after(true, TaskOutcome::Failed, now);
+        gate.after(true, TaskOutcome::Failed(None), now);
         // A failed task leaves the device state unknown, so disable runs again.
         assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
         gate.after(false, TaskOutcome::Missing, now);
@@ -463,7 +484,7 @@ mod tests {
         // A failed Disable leaves the state unknown, so quit tries again.
         let mut gate = TaskGate::new();
         gate.after(true, TaskOutcome::Done, now);
-        gate.after(false, TaskOutcome::Failed, now);
+        gate.after(false, TaskOutcome::Failed(None), now);
         assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Run);
     }
 
@@ -632,7 +653,12 @@ mod tests {
         );
         assert_eq!(
             TaskOutcome::from_stderr("VDD task failed: x, result=1"),
-            TaskOutcome::Failed
+            TaskOutcome::Failed(None)
+        );
+        // The Enable task says what it found wrong with the device.
+        assert_eq!(
+            TaskOutcome::from_stderr("VDD task failed: EternalMonitor VDD Enable, result=5"),
+            TaskOutcome::Failed(Some(crate::vdd_device::DeviceState::NoMonitor))
         );
     }
 }

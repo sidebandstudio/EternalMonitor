@@ -12,6 +12,7 @@ use super::{
 use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
 use crate::vdd::VddTaskHealth;
+use crate::vdd_device::VddProblem;
 
 impl AnalyzerApp {
     pub(super) fn stream_page(
@@ -100,13 +101,19 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
         }
         #[allow(unused_mut)] // Debug builds may simulate a problem below.
-        let (mut capture_block, mut vdd_status, mut vdd_health) = (
+        let (mut capture_block, mut vdd_status, mut vdd_health, mut vdd_problem) = (
             *self.control.shared.capture_block.lock(),
             *self.control.shared.vdd_status.lock(),
             crate::vdd::task_health(),
+            *self.control.shared.vdd_problem.lock(),
         );
         #[cfg(debug_assertions)]
-        simulate_problem(&mut capture_block, &mut vdd_status, &mut vdd_health);
+        simulate_problem(
+            &mut capture_block,
+            &mut vdd_status,
+            &mut vdd_health,
+            &mut vdd_problem,
+        );
         if let Some((icon, title, body)) =
             capture_block_notice(capture_block, snap.pipeline_running)
         {
@@ -115,7 +122,7 @@ impl AnalyzerApp {
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
-        if let Some(notice) = second_screen_notice(vdd_status, vdd_health) {
+        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem) {
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -123,7 +130,7 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SECOND_SCREEN_FAILED_TITLE,
-                notice.body,
+                &notice.body,
                 110.0 * (1 + notice.retry as u8 + notice.installer as u8) as f32,
                 |ui| {
                     copy_logs =
@@ -593,6 +600,7 @@ fn simulate_problem(
     block: &mut Option<CaptureBlock>,
     vdd: &mut VddStatus,
     health: &mut VddTaskHealth,
+    problem: &mut Option<VddProblem>,
 ) {
     let Ok(name) = std::env::var("ETERNAL_SIMULATE_PROBLEM") else {
         return;
@@ -609,6 +617,24 @@ fn simulate_problem(
         "driver-tasks-missing" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::TasksMissing)
         }
+        "driver-not-installed" => {
+            (*vdd, *problem) = (VddStatus::TaskFailed, Some(VddProblem::NotInstalled))
+        }
+        "driver-signature" => {
+            (*vdd, *problem) = (VddStatus::TaskFailed, Some(VddProblem::SignatureBlocked))
+        }
+        "driver-error" => {
+            (*vdd, *problem) = (
+                VddStatus::TaskFailed,
+                Some(VddProblem::DriverError(Some(43))),
+            )
+        }
+        "display-did-not-appear" => {
+            (*vdd, *problem) = (VddStatus::TaskFailed, Some(VddProblem::NoDisplay))
+        }
+        "display-not-extended" => {
+            (*vdd, *problem) = (VddStatus::Failed, Some(VddProblem::NotExtended))
+        }
         _ => {}
     }
 }
@@ -616,41 +642,71 @@ fn simulate_problem(
 /// What the second screen notice says and offers.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SecondScreenNotice {
-    pub body: &'static str,
+    pub body: String,
     pub retry: bool,
     pub installer: bool,
 }
 
 /// The notice for a second screen that could not start, by what the display
-/// driver tasks report. `None` unless the second screen failed.
+/// driver tasks and its device report. `None` unless the second screen failed.
 pub(super) fn second_screen_notice(
     status: VddStatus,
     health: VddTaskHealth,
+    problem: Option<VddProblem>,
 ) -> Option<SecondScreenNotice> {
-    let notice = |body, retry, installer| {
+    use VddStatus::{Failed, TaskFailed};
+    let notice = |body: &str, retry, installer| {
         Some(SecondScreenNotice {
-            body,
+            body: body.to_string(),
             retry,
             installer,
         })
     };
-    match (status, health) {
-        (VddStatus::Failed | VddStatus::TaskFailed, VddTaskHealth::NotResponding) => notice(
+    match (status, health, problem) {
+        (Failed | TaskFailed, VddTaskHealth::NotResponding, _) => notice(
             "Windows' display driver stopped responding. Restart the PC to use the second screen.",
             false,
             false,
         ),
-        (VddStatus::Failed | VddStatus::TaskFailed, VddTaskHealth::TasksMissing) => notice(
+        (Failed | TaskFailed, VddTaskHealth::TasksMissing, _) => notice(
             "The second screen isn't installed. Download EternalMonitor-Setup.exe and run it again to add it, then click Try again.",
             true,
             true,
         ),
-        (VddStatus::TaskFailed, VddTaskHealth::Ok) => notice(
+        (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::NotInstalled)) => notice(
+            "The second screen's display driver isn't installed. Download EternalMonitor-Setup.exe and run it again to reinstall it, then click Try again.",
+            true,
+            true,
+        ),
+        (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::SignatureBlocked)) => notice(
+            "Windows couldn't verify the display driver's signature, so it won't start it (Windows code 52). Run EternalMonitor-Setup.exe again while connected to the internet to reinstall the driver, then click Try again. You don't need to turn off Secure Boot or Memory Integrity.",
+            true,
+            true,
+        ),
+        (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::DriverError(code))) => {
+            let code = code.map_or(String::new(), |code| format!(" (Windows code {code})"));
+            notice(
+                &format!("The second screen's display driver stopped with an error{code}. Restart the PC, then run EternalMonitor-Setup.exe again to repair it."),
+                true,
+                true,
+            )
+        }
+        (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::NoDisplay)) => notice(
+            "The display driver is running, but Windows didn't add the second screen. Click Try again. If it keeps happening, restart the PC.",
+            true,
+            false,
+        ),
+        (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::NotExtended)) => notice(
+            "Windows added the second screen but wouldn't extend your desktop onto it. Click Try again. If it keeps happening, restart the PC.",
+            true,
+            false,
+        ),
+        (TaskFailed, VddTaskHealth::Ok, None) => notice(
             "Part of the EternalMonitor install is missing or blocked. Download EternalMonitor-Setup.exe and run it again to repair it, then click Try again.",
             true,
             true,
         ),
-        (VddStatus::Failed, VddTaskHealth::Ok) => notice(
+        (Failed, VddTaskHealth::Ok, None) => notice(
             "Windows didn't add the second screen in time. Click Try again. If it keeps happening, run EternalMonitor-Setup.exe again to repair the display driver.",
             true,
             false,
