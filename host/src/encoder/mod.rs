@@ -1005,6 +1005,10 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("preset", "veryfast");
             opts.set("profile", "baseline");
             opts.set("look_ahead", "0");
+            // Quick Sync queues 4 frames by default. On a still desktop the
+            // keepalive sends a frame every 750 ms, so the last change reached
+            // the iPad 3 s late and tripped the encoder watchdog.
+            opts.set("async_depth", "1");
         }
         "libx264" => {
             opts.set("preset", "ultrafast");
@@ -1031,6 +1035,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         }
         "hevc_qsv" => {
             opts.set("preset", "veryfast");
+            opts.set("async_depth", "1");
         }
         "hevc_videotoolbox" => {
             opts.set("realtime", "1");
@@ -1080,7 +1085,17 @@ fn prepare_frame_for_encode(
         } else {
             "period"
         };
-        if is_amf {
+        if is_amf && !force_hit {
+            // Twice a second for every AMF stream: 8,522 of 11 hours' 0.3.1
+            // telemetry lines from 7 PCs. Requests are still logged below.
+            debug!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else if is_amf {
             info!(
                 encoder = encoder_name,
                 frame = frame_number,
@@ -1844,6 +1859,17 @@ mod tests {
             ("rc", "cbr"),
         ] {
             assert_eq!(hevc.get(key), Some(value), "hevc_amf {key}");
+        }
+    }
+
+    #[test]
+    fn quick_sync_returns_each_frame_before_taking_the_next() {
+        for name in ["h264_qsv", "hevc_qsv"] {
+            assert_eq!(
+                encoder_options(name).get("async_depth"),
+                Some("1"),
+                "{name}"
+            );
         }
     }
 

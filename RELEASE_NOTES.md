@@ -119,6 +119,8 @@ Windows changes.
 - When an NVIDIA graphics card can't encode video because its driver is too
   old, the processor notice says to install NVIDIA driver 570 or newer and
   links to NVIDIA's driver page.
+- On PCs that encode with Intel Quick Sync, the last change on a still screen
+  reaches the iPad right away. Previously it could arrive up to 3 seconds late.
 
 ### What to test
 
