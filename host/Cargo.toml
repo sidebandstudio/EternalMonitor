@@ -25,6 +25,7 @@ qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 plist = "1"
+quick-xml = "0.41"
 semver = "1"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 # SHA-256 of downloaded updates (already used by rustls)

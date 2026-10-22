@@ -14,6 +14,7 @@
 //! screen, and in 0.3.1 diagnostics none of those laptops got the display.
 
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 /// A display mode for the virtual display's mode list.
@@ -123,35 +124,142 @@ pub fn gpu_to_pin<'a>(
     Ok(name)
 }
 
-/// `xml` naming `gpu` as the render adapter, everything else as it was:
-/// the existing name is replaced, or a `<gpu>` element added at the top.
-/// `None` when the document has no `<vdd_settings>` element to add it to.
-pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
-    const OPEN: &str = "<friendlyname>";
-    const CLOSE: &str = "</friendlyname>";
-    if let Some(start) = xml.find(OPEN).map(|at| at + OPEN.len()) {
-        let end = start + xml[start..].find(CLOSE)?;
-        return Some(format!("{}{}{}", &xml[..start], escape(gpu), &xml[end..]));
+/// Where a parsed settings document names its render adapter, and how to
+/// make it name another one.
+enum GpuSlot {
+    /// The text of the one `<friendlyname>`, as a byte range.
+    Name(Range<usize>),
+    /// A self-closing `<friendlyname/>` or `<gpu/>`, to be written out.
+    Empty(Range<usize>, &'static str),
+    /// Right after the start tag of `<gpu>` without a name, or of the root.
+    Insert(usize, &'static str),
+}
+
+/// Find the render adapter's place by parsing `xml`. Anything the driver
+/// could read differently from this host is refused: a name outside
+/// `<gpu>`, a second name or `<gpu>`, markup inside the name, text or
+/// elements outside the `<vdd_settings>` root, or a document that does not
+/// parse. The driver matches `friendlyname` by local name anywhere.
+fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut open: Vec<Vec<u8>> = Vec::new();
+    let (mut root, mut closed, mut slot) = (None, false, None);
+    let (mut gpus, mut names, mut name_start) = (0, 0, 0);
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader
+            .read_event()
+            .map_err(|_| "the file is not well-formed XML")?;
+        let after = reader.buffer_position() as usize;
+        let in_name = open.last().is_some_and(|name| name == b"friendlyname");
+        let outside = open.is_empty();
+        match event {
+            Event::Start(_) | Event::Empty(_) if closed => {
+                return Err("there is markup after the root element")
+            }
+            Event::Start(_) | Event::Empty(_) | Event::CData(_) if in_name => {
+                return Err("the graphics card name contains markup")
+            }
+            Event::Start(ref tag) | Event::Empty(ref tag) => {
+                let empty = matches!(event, Event::Empty(_));
+                let name = tag.local_name().as_ref().to_vec();
+                match (open.len(), name.as_slice()) {
+                    (0, b"vdd_settings") if !empty => root = Some(after),
+                    (0, _) => return Err("the root element is not <vdd_settings>"),
+                    (1, b"gpu") => {
+                        gpus += 1;
+                        slot = Some(if empty {
+                            GpuSlot::Empty(before..after, "gpu")
+                        } else {
+                            GpuSlot::Insert(after, "gpu")
+                        });
+                    }
+                    (2, b"friendlyname") if open[1] == b"gpu" => {
+                        names += 1;
+                        name_start = after;
+                        if empty {
+                            slot = Some(GpuSlot::Empty(before..after, "friendlyname"));
+                        }
+                    }
+                    (_, b"friendlyname") => return Err("a graphics card name is outside <gpu>"),
+                    (_, b"gpu") => return Err("a <gpu> element is not directly in the root"),
+                    _ => {}
+                }
+                if !empty {
+                    open.push(name);
+                }
+            }
+            Event::End(_) => {
+                if in_name {
+                    slot = Some(GpuSlot::Name(name_start..before));
+                }
+                open.pop();
+                closed = open.is_empty();
+            }
+            Event::Text(text) if outside && !text.iter().all(u8::is_ascii_whitespace) => {
+                return Err("there is text outside the root element")
+            }
+            Event::CData(_) | Event::GeneralRef(_) if outside => {
+                return Err("there is text outside the root element")
+            }
+            Event::Eof => break,
+            _ => {}
+        }
     }
-    let root = xml.find("<vdd_settings>")? + "<vdd_settings>".len();
-    let line_end = xml[root..].find('\n').map_or(root, |at| root + at + 1);
-    let separator = if line_end == root { "\n" } else { "" };
-    Some(format!(
-        "{}{separator}{}{}",
-        &xml[..line_end],
-        gpu_element(gpu),
-        &xml[line_end..]
-    ))
+    let root = root
+        .filter(|_| closed)
+        .ok_or("there is no complete <vdd_settings> element")?;
+    if gpus > 1 || names > 1 {
+        return Err("it names more than one graphics card");
+    }
+    Ok(slot.unwrap_or(GpuSlot::Insert(root, "vdd_settings")))
+}
+
+/// `xml` naming `gpu` as the render adapter, everything else byte for byte
+/// as it was. The edit is checked by parsing the result. `Err` says why the
+/// document was left alone.
+fn gpu_edit(xml: &str, gpu: &str) -> Result<String, &'static str> {
+    let (bom, body) = match xml.strip_prefix('\u{feff}') {
+        Some(body) => ("\u{feff}", body),
+        None => ("", xml),
+    };
+    let nl = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    let name = escape(gpu);
+    let element = format!("<friendlyname>{name}</friendlyname>");
+    let (range, text) = match gpu_slot(body)? {
+        GpuSlot::Name(range) => (range, name.clone()),
+        GpuSlot::Empty(range, "gpu") => (range, format!("<gpu>{element}</gpu>")),
+        GpuSlot::Empty(range, _) => (range, element),
+        GpuSlot::Insert(at, "gpu") => (at..at, format!("{nl}        {element}")),
+        GpuSlot::Insert(at, _) => (
+            at..at,
+            format!("{nl}    <gpu>{nl}        {element}{nl}    </gpu>"),
+        ),
+    };
+    let edited = format!("{}{text}{}", &body[..range.start], &body[range.end..]);
+    match gpu_slot(&edited) {
+        Ok(GpuSlot::Name(range)) if edited[range.clone()] == name => Ok(format!("{bom}{edited}")),
+        _ => Err("the edited file did not parse as intended"),
+    }
+}
+
+/// `xml` naming `gpu` as the render adapter, everything else as it was;
+/// `None` when the document is not one this can edit safely.
+pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
+    gpu_edit(xml, gpu).ok()
 }
 
 /// Point the settings file the host does not otherwise write at `gpu`.
 /// True when it changed. A missing file stays missing: without one the
 /// driver offers its built-in modes, and a document holding only a GPU
-/// would leave it none.
+/// would leave it none. A file that does not parse as expected is left
+/// alone, and the error says why.
 pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
     let current = std::fs::read_to_string(path)?;
-    let updated = with_gpu(&current, gpu)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no <vdd_settings> element"))?;
+    let updated = gpu_edit(&current, gpu)
+        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
     if updated == current {
         return Ok(false);
     }
@@ -169,9 +277,15 @@ pub fn write_to(path: &Path, modes: &[VddMode], gpu: Option<&str>) -> io::Result
     replace(path, &render(modes, gpu))
 }
 
+/// The new contents reach the disk before they replace the file, so an
+/// interrupted write leaves the old file whole.
 fn replace(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("xml.tmp");
-    std::fs::write(&tmp, contents)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)
 }
 
@@ -299,6 +413,77 @@ mod tests {
             "<vdd_settings>\n    <gpu>\n        <friendlyname>A&amp;B</friendlyname>\n    </gpu>\n    <monitors>\n        <count>1</count>\n    </monitors>\n</vdd_settings>\n"
         );
         assert_eq!(with_gpu("<other/>", "x"), None);
+    }
+
+    #[test]
+    fn the_card_goes_inside_a_compact_root() {
+        // Sol's case: no newline inside the root, one after it.
+        let compact = "<vdd_settings><monitors><count>1</count></monitors></vdd_settings>\n";
+        assert_eq!(
+            with_gpu(compact, "X").as_deref(),
+            Some("<vdd_settings>\n    <gpu>\n        <friendlyname>X</friendlyname>\n    </gpu><monitors><count>1</count></monitors></vdd_settings>\n")
+        );
+    }
+
+    #[test]
+    fn a_gpu_element_without_a_name_gets_one() {
+        assert_eq!(
+            with_gpu("<vdd_settings>\n    <gpu>\n    </gpu>\n</vdd_settings>\n", "X").as_deref(),
+            Some("<vdd_settings>\n    <gpu>\n        <friendlyname>X</friendlyname>\n    </gpu>\n</vdd_settings>\n")
+        );
+        assert_eq!(
+            with_gpu("<vdd_settings><gpu/></vdd_settings>", "X").as_deref(),
+            Some("<vdd_settings><gpu><friendlyname>X</friendlyname></gpu></vdd_settings>")
+        );
+        assert_eq!(
+            with_gpu(
+                "<vdd_settings><gpu><friendlyname/></gpu></vdd_settings>",
+                "X"
+            )
+            .as_deref(),
+            Some("<vdd_settings><gpu><friendlyname>X</friendlyname></gpu></vdd_settings>")
+        );
+    }
+
+    #[test]
+    fn comments_attributes_line_endings_and_bom_are_kept() {
+        let commented = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- e.g. <friendlyname>NVIDIA</friendlyname> -->\n<vdd_settings version=\"2\">\n    <gpu enabled=\"yes\">\n        <friendlyname note=\"x\">A&amp;B</friendlyname> <!-- the card -->\n    </gpu>\n</vdd_settings>\n";
+        assert_eq!(
+            with_gpu(commented, "Intel(R) Iris(R) Xe Graphics"),
+            Some(commented.replace(">A&amp;B<", ">Intel(R) Iris(R) Xe Graphics<"))
+        );
+        let crlf = "<vdd_settings>\r\n\t<monitors>\r\n\t</monitors>\r\n</vdd_settings>\r\n";
+        assert_eq!(
+            with_gpu(crlf, "X").as_deref(),
+            Some("<vdd_settings>\r\n    <gpu>\r\n        <friendlyname>X</friendlyname>\r\n    </gpu>\r\n\t<monitors>\r\n\t</monitors>\r\n</vdd_settings>\r\n")
+        );
+        let bom = format!("\u{feff}{VENDOR}");
+        assert_eq!(with_gpu(&bom, "X"), Some(bom.replace(">default<", ">X<")));
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_as_expected_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdd_settings.xml");
+        for document in [
+            "<vdd_settings><monitors></vdd_settings>",
+            "<vdd_settings><count>1</count>",
+            "<vdd_settings></vdd_settings>\n<gpu><friendlyname>x</friendlyname></gpu>\n",
+            "<vdd_settings></vdd_settings>junk",
+            "<vdd_settings><friendlyname>x</friendlyname></vdd_settings>",
+            "<vdd_settings><gpu><friendlyname>a</friendlyname></gpu><gpu><friendlyname>b</friendlyname></gpu></vdd_settings>",
+            "<vdd_settings><gpu><friendlyname>a<b/></friendlyname></gpu></vdd_settings>",
+            "<other><gpu><friendlyname>a</friendlyname></gpu></other>",
+            "",
+        ] {
+            assert_eq!(with_gpu(document, "X"), None, "{document}");
+            std::fs::write(&path, document).unwrap();
+            assert!(pin_gpu_in(&path, "X").is_err(), "{document}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), document, "changed: {document}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
