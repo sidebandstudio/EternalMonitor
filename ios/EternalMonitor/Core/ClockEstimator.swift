@@ -55,8 +55,10 @@ struct ClockEstimator {
     func endToEndLatencyUs(hostCaptureUs: UInt64, clientNowUs: UInt64) -> UInt64? {
         guard let offset = offsetUs else { return nil }
         // capture time in CLIENT clock = hostCaptureUs - offset.
-        let captureClient = Int64(bitPattern: hostCaptureUs) - offset
-        let latency = Int64(bitPattern: clientNowUs) - captureClient
+        let (captureClient, captureOverflow) = Int64(bitPattern: hostCaptureUs).subtractingReportingOverflow(offset)
+        let (latency, latencyOverflow) = Int64(bitPattern: clientNowUs).subtractingReportingOverflow(captureClient)
+        // A stamp too far from either clock to subtract is no measurement.
+        guard !captureOverflow, !latencyOverflow else { return nil }
         return latency > 0 ? UInt64(latency) : 0
     }
 

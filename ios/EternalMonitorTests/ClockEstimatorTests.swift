@@ -98,4 +98,16 @@ final class ClockEstimatorTests: XCTestCase {
         XCTAssertEqual(ConnectionManager.latencyMs(captureUs: 5_980_000, offsetUs: 5_000_000, nowUs: 1_000_000), 20)
         XCTAssertEqual(ConnectionManager.latencyMs(captureUs: 6_100_000, offsetUs: 5_000_000, nowUs: 1_000_000), 0)
     }
+
+    func testEndToEndLatencyOfAStampTooFarFromTheClocksIsNil() {
+        var estimator = ClockEstimator()
+        for i in 0..<3 {
+            let e = symmetricExchange(at: UInt64(1_000_000 * (i + 1)), offset: 5_000_000, legUs: 1_000)
+            estimator.addExchange(t1: e.t1, t2: e.t2, t3: e.t3, t4: e.t4)
+        }
+        XCTAssertNil(estimator.endToEndLatencyUs(hostCaptureUs: 0x8000_0000_0000_0000, clientNowUs: 4_000_000))
+        let offset = try! XCTUnwrap(estimator.offsetUs)
+        let capture = UInt64(4_000_000 - 20_000 + offset)
+        XCTAssertEqual(estimator.endToEndLatencyUs(hostCaptureUs: capture, clientNowUs: 4_000_000), 20_000)
+    }
 }
