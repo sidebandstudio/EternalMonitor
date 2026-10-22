@@ -111,13 +111,15 @@ Windows changes.
 - The PC's Address and QR code use its Wi-Fi or Ethernet address. With a VPN,
   WSL or Hyper-V running, the PC could show an address the iPad can't reach.
   A PC on both Wi-Fi and Ethernet lists the other address too.
-- When Windows Firewall has no rule letting EternalMonitor in on the current
-  network, or a rule blocks it, the Stream page says so and **Allow** adds the
-  rules after you approve the Windows prompt. Windows drops the iPad's
-  connection without asking in that case.
+- When nothing in Windows Firewall lets EternalMonitor in on the current
+  network, or a rule for EternalMonitor blocks it, the Stream page says so.
+  **Allow** removes that block and adds Setup's rules after you approve the
+  Windows prompt. A block set by the PC's administrator or security software
+  is named as such, with no **Allow** button. Rules the check can't fully
+  read never raise the message.
 - The iPad says more about a PC that didn't answer: when it found the PC on
-  the network (something on the PC is blocking it), when the address is on a
-  different home network than the iPad's Wi-Fi, and when the typed address has
+  the network (something on the PC is blocking it), when the address may be
+  on a different network than the iPad's Wi-Fi, and when the typed address has
   a dot missing. It picks the found PC's address on its own network.
 - While connecting, the iPad says what is happening, says when nothing has
   answered yet, and keeps trying for the whole wait instead of only the first

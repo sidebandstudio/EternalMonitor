@@ -397,16 +397,39 @@ fn the_firewall_notice_appears_only_when_windows_would_drop_the_ipad() {
         FirewallCheck::Checked(Verdict::Allowed),
         FirewallCheck::Checked(Verdict::Off),
         FirewallCheck::Checked(Verdict::NoNetwork),
+        FirewallCheck::Checked(Verdict::Unknown),
     ] {
         assert_eq!(firewall_notice(quiet, true), None, "{quiet:?}");
     }
-    let (title, body) = firewall_notice(FirewallCheck::Checked(Verdict::Missing), true).unwrap();
+    let (title, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::Missing), true).unwrap();
     assert_eq!(title, "Windows Firewall is blocking your iPad");
     assert!(
         body.contains("Click Allow") && body.contains("USB cable"),
         "{body}"
     );
-    let (_, body) = firewall_notice(FirewallCheck::Checked(Verdict::Blocked), false).unwrap();
-    assert!(body.contains("EternalMonitor-Setup.exe"), "{body}");
+    assert!(allow);
+    let (_, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::Blocked), false).unwrap();
+    assert!(
+        body.contains("EternalMonitor-Setup.exe") && !allow,
+        "{body}"
+    );
     assert!(firewall_notice(FirewallCheck::Repairing, true).is_some());
+}
+
+/// A block for any program, a port, or from group policy: the repair must not
+/// touch it, so there is no Allow button and the notice says who set it.
+#[test]
+fn a_block_the_repair_may_not_change_gets_no_allow_button() {
+    use super::page_stream::firewall_notice;
+    use crate::network::{FirewallCheck, Verdict};
+    let (title, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::BlockedByAdmin), true).unwrap();
+    assert!(!allow);
+    assert_eq!(title, "A firewall setting is blocking your iPad");
+    assert!(
+        body.contains("administrator or security software") && !body.contains("Click Allow"),
+        "{body}"
+    );
 }

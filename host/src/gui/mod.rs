@@ -193,6 +193,8 @@ const CAPTURE_VIRTUAL_LABEL: &str = "Second screen";
 // The settings sentinel for the managed virtual display lives in control.rs
 // (shared with the startup preload).
 use crate::control::CAPTURE_VIRTUAL_SENTINEL;
+#[cfg(all(windows, test))]
+pub(crate) use page_stream::firewall_notice;
 
 /// Menu label for an enumerated output, e.g. `DISPLAY2 · 1920 × 1080 · primary`.
 fn format_output_label(o: &OutputInfo) -> String {

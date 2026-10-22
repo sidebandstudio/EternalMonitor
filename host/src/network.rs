@@ -200,15 +200,60 @@ pub const PROFILE_PRIVATE: u8 = 2;
 pub const PROFILE_PUBLIC: u8 = 4;
 const PROFILE_ALL: u8 = PROFILE_DOMAIN | PROFILE_PRIVATE | PROFILE_PUBLIC;
 
-/// One inbound or outbound rule that names this executable.
+/// One enabled or disabled inbound rule that could apply to this host's UDP
+/// port: it names this executable, or any program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub enabled: bool,
-    pub inbound: bool,
     pub allow: bool,
     pub profiles: u8,
     /// Covers UDP: the protocol is UDP or Any.
     pub udp: bool,
+    /// `None`: any program. Otherwise the program as Windows stores it.
+    pub program: Option<String>,
+    pub ports: Ports,
+    /// Scoped by something this check doesn't evaluate: remote or local
+    /// address, service, interface type, owner or app package.
+    pub scoped: bool,
+    /// In the PC's own (local) store, so the elevated repair may change it.
+    /// Group policy and other stores are left alone.
+    pub local: bool,
+}
+
+/// A rule's local ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ports {
+    Any,
+    /// Single ports and inclusive ranges.
+    List(Vec<(u16, u16)>),
+    /// A keyword such as RPC or Teredo, which this check doesn't evaluate.
+    Unknown,
+}
+
+impl Ports {
+    fn parse(values: &[String]) -> Ports {
+        if values.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case("any")) {
+            return Ports::Any;
+        }
+        let mut list = Vec::new();
+        for value in values {
+            for part in value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+            {
+                let range = match part.split_once('-') {
+                    Some((low, high)) => low.trim().parse().ok().zip(high.trim().parse().ok()),
+                    None => part.parse().ok().map(|port| (port, port)),
+                };
+                match range {
+                    Some(range) => list.push(range),
+                    None => return Ports::Unknown,
+                }
+            }
+        }
+        Ports::List(list)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -217,6 +262,10 @@ pub struct Firewall {
     pub active: u8,
     /// Profiles where Windows Firewall is on.
     pub enabled: u8,
+    /// This host's executable, normalized with [`normalize_path`].
+    pub exe: String,
+    /// The UDP port the host listens on.
+    pub port: u16,
     pub rules: Vec<Rule>,
     /// Security products registered as the PC's firewall, other than Windows'.
     pub products: Vec<String>,
@@ -224,18 +273,24 @@ pub struct Firewall {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// An enabled inbound rule allows UDP on every current network.
+    /// An enabled inbound rule allows the port on a current network.
     Allowed,
     /// Windows Firewall is off on the current networks.
     Off,
     /// No network is connected, so there is nothing to check.
     NoNetwork,
+    /// Rules this check can't evaluate may decide it. Never a notice: a
+    /// wrong "blocked" message is worse than none.
+    Unknown,
     /// Nothing allows EternalMonitor in on a current network: Windows drops
     /// the iPad's packets without asking.
     Missing,
-    /// A rule blocks EternalMonitor on a current network. Block wins over
-    /// allow in Windows Firewall.
+    /// A local rule for this executable blocks it, as when someone dismissed
+    /// Windows' prompt. Block wins over allow; the repair removes it.
     Blocked,
+    /// A block the repair must not change: one for any program or a port,
+    /// or one set by group policy (the PC's administrator).
+    BlockedByAdmin,
 }
 
 impl Verdict {
@@ -244,8 +299,10 @@ impl Verdict {
             Verdict::Allowed => "allowed",
             Verdict::Off => "firewall-off",
             Verdict::NoNetwork => "no-network",
+            Verdict::Unknown => "unknown",
             Verdict::Missing => "missing",
             Verdict::Blocked => "blocked",
+            Verdict::BlockedByAdmin => "blocked-by-policy",
         }
     }
 
@@ -255,7 +312,43 @@ impl Verdict {
     }
 }
 
-/// Whether an iPad's UDP packets get through Windows Firewall to this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applies {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Whether `rule` decides inbound UDP to `port` for `exe` on the `on`
+/// profiles. Anything it can't evaluate is `Unknown`.
+fn applies(rule: &Rule, exe: &str, port: u16, on: u8) -> Applies {
+    if !rule.enabled || !rule.udp || rule.profiles & on == 0 {
+        return Applies::No;
+    }
+    if let Some(program) = &rule.program {
+        if normalize_path(program) != exe {
+            return Applies::No;
+        }
+    }
+    match &rule.ports {
+        Ports::Any => {}
+        Ports::List(list)
+            if list
+                .iter()
+                .any(|(low, high)| (*low..=*high).contains(&port)) => {}
+        Ports::List(_) => return Applies::No,
+        Ports::Unknown => return Applies::Unknown,
+    }
+    if rule.scoped {
+        Applies::Unknown
+    } else {
+        Applies::Yes
+    }
+}
+
+/// Whether an iPad's UDP packets get through Windows Firewall to this host,
+/// told only when certain: an applicable enabled block, or no allow at all
+/// that could apply.
 pub fn verdict(firewall: &Firewall) -> Verdict {
     if firewall.active == 0 {
         return Verdict::NoNetwork;
@@ -264,23 +357,89 @@ pub fn verdict(firewall: &Firewall) -> Verdict {
     if on == 0 {
         return Verdict::Off;
     }
-    let udp_in = || {
+    let decided = |allow: bool, answer: Applies| {
         firewall
             .rules
             .iter()
-            .filter(|rule| rule.enabled && rule.inbound && rule.udp)
+            .filter(move |rule| rule.allow == allow)
+            .filter(move |rule| applies(rule, &firewall.exe, firewall.port, on) == answer)
     };
-    if udp_in().any(|rule| !rule.allow && rule.profiles & on != 0) {
-        return Verdict::Blocked;
+    let mut blocks = decided(false, Applies::Yes).peekable();
+    if blocks.peek().is_some() {
+        let ours = |rule: &Rule| rule.program.is_some() && rule.local;
+        return if blocks.all(ours) {
+            Verdict::Blocked
+        } else {
+            Verdict::BlockedByAdmin
+        };
     }
-    let allowed = udp_in()
-        .filter(|rule| rule.allow)
-        .fold(0, |mask, rule| mask | rule.profiles);
-    if allowed & on == on {
+    if decided(true, Applies::Yes).next().is_some() {
         Verdict::Allowed
+    } else if decided(true, Applies::Unknown).next().is_some()
+        || decided(false, Applies::Unknown).next().is_some()
+    {
+        Verdict::Unknown
     } else {
         Verdict::Missing
     }
+}
+
+/// A program path as Windows Firewall compares it: no `\\?\` or `\??\`
+/// prefix, environment variables expanded, short (8.3) names made long
+/// when the file exists, and lowercase.
+pub fn normalize_path(raw: &str) -> String {
+    let mut path = raw.trim().replace('/', "\\");
+    for prefix in [r"\\?\UNC\", r"\??\UNC\"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            path = format!(r"\\{rest}");
+        }
+    }
+    for prefix in [r"\\?\", r"\??\"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            path = rest.to_string();
+        }
+    }
+    let expanded = expand_env(&path);
+    long_path(&expanded).unwrap_or(expanded).to_lowercase()
+}
+
+/// `%NAME%` replaced by the variable's value; unknown names stay as written.
+fn expand_env(path: &str) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('%') {
+        let Some(len) = rest[start + 1..].find('%') else {
+            break;
+        };
+        let name = &rest[start + 1..start + 1 + len];
+        out.push_str(&rest[..start]);
+        match std::env::var(name) {
+            Ok(value) if !name.is_empty() => out.push_str(&value),
+            _ => out.push_str(&rest[start..start + len + 2]),
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(not(windows))]
+fn long_path(_path: &str) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn long_path(path: &str) -> Option<String> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide = HSTRING::from(path);
+    let needed = unsafe { GetLongPathNameW(&wide, None) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; needed as usize];
+    let len = unsafe { GetLongPathNameW(&wide, Some(&mut buffer)) } as usize;
+    (len > 0 && len < buffer.len()).then(|| String::from_utf16_lossy(&buffer[..len]))
 }
 
 fn profile_mask(text: &str) -> u8 {
@@ -330,17 +489,40 @@ struct RawProfile {
     enabled: String,
 }
 
+/// One rule from [`FIREWALL_QUERY`]. Filters this check doesn't read are
+/// reported only as "is it Any".
 #[derive(Deserialize)]
 struct RawRule {
     enabled: String,
-    direction: String,
     action: String,
     profile: String,
     protocol: String,
+    #[serde(default)]
+    program: String,
+    #[serde(default)]
+    localport: Vec<String>,
+    #[serde(default)]
+    remote: Vec<String>,
+    #[serde(default)]
+    localaddress: Vec<String>,
+    #[serde(default)]
+    service: String,
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    package: String,
+    #[serde(default)]
+    store: String,
 }
 
-/// Reads [`FIREWALL_QUERY`]'s output.
-pub fn parse_firewall(json: &str) -> Option<Firewall> {
+fn any_or_empty(text: &str) -> bool {
+    text.is_empty() || text.eq_ignore_ascii_case("any") || text == "*"
+}
+
+/// Reads [`FIREWALL_QUERY`]'s output for `exe` listening on UDP `port`.
+pub fn parse_firewall(json: &str, exe: &str, port: u16) -> Option<Firewall> {
     let raw: RawFirewall = serde_json::from_str(json.trim()).ok()?;
     let truthy = |text: &str| text.eq_ignore_ascii_case("true");
     Some(Firewall {
@@ -353,17 +535,27 @@ pub fn parse_firewall(json: &str) -> Option<Firewall> {
             .iter()
             .filter(|profile| truthy(&profile.enabled))
             .fold(0, |mask, profile| mask | profile_mask(&profile.name)),
+        exe: normalize_path(exe),
+        port,
         rules: raw
             .rules
             .iter()
             .map(|rule| Rule {
                 enabled: truthy(&rule.enabled),
-                inbound: rule.direction.eq_ignore_ascii_case("inbound"),
                 allow: rule.action.eq_ignore_ascii_case("allow"),
                 profiles: profile_mask(&rule.profile),
                 udp: rule.protocol.eq_ignore_ascii_case("udp")
                     || rule.protocol.eq_ignore_ascii_case("any")
                     || rule.protocol == "17",
+                program: (!any_or_empty(&rule.program)).then(|| rule.program.clone()),
+                ports: Ports::parse(&rule.localport),
+                scoped: !rule.remote.iter().all(|value| any_or_empty(value))
+                    || !rule.localaddress.iter().all(|value| any_or_empty(value))
+                    || !any_or_empty(&rule.service)
+                    || !any_or_empty(&rule.interface)
+                    || !rule.owner.is_empty()
+                    || !rule.package.is_empty(),
+                local: rule.store.is_empty() || rule.store.eq_ignore_ascii_case("local"),
             })
             .collect(),
         products: raw
@@ -374,28 +566,79 @@ pub fn parse_firewall(json: &str) -> Option<Firewall> {
     })
 }
 
-/// Lists the connected networks' categories, the firewall profiles, the rules
-/// naming `$exe` (in any spelling Windows stores) and third-party firewalls,
-/// as one line of JSON. Never the network or rule names.
+/// Lists the connected networks' categories, the firewall profiles, every
+/// inbound UDP rule for any program or for a program named like this host
+/// (or written as a short name), and third-party firewalls, as one line of
+/// JSON. The executable comes in `ETERNAL_FW_EXE`, never in the script text.
+/// Rule names are left out.
 pub const FIREWALL_QUERY: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
-$exe = [IO.Path]::GetFullPath($exe)
+$leaf = [IO.Path]::GetFileName($env:ETERNAL_FW_EXE)
 $profiles = @(Get-NetConnectionProfile | ForEach-Object { [string]$_.NetworkCategory })
 $firewall = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object { @{ name = [string]$_.Name; enabled = [string]$_.Enabled } })
-$rules = @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore |
-    Where-Object { $_.Program -and $_.Program -ne 'Any' -and [Environment]::ExpandEnvironmentVariables($_.Program) -ieq $exe } |
-    Get-NetFirewallRule | ForEach-Object {
-        $port = $_ | Get-NetFirewallPortFilter
-        @{ enabled = [string]$_.Enabled; direction = [string]$_.Direction; action = [string]$_.Action; profile = [string]$_.Profile; protocol = [string]$port.Protocol }
-    })
+$apps = @{}; Get-NetFirewallApplicationFilter -PolicyStore ActiveStore | ForEach-Object { $apps[$_.InstanceID] = $_ }
+$ports = @{}; Get-NetFirewallPortFilter -PolicyStore ActiveStore | ForEach-Object { $ports[$_.InstanceID] = $_ }
+$addresses = @{}; Get-NetFirewallAddressFilter -PolicyStore ActiveStore | ForEach-Object { $addresses[$_.InstanceID] = $_ }
+$services = @{}; Get-NetFirewallServiceFilter -PolicyStore ActiveStore | ForEach-Object { $services[$_.InstanceID] = $_ }
+$interfaces = @{}; Get-NetFirewallInterfaceTypeFilter -PolicyStore ActiveStore | ForEach-Object { $interfaces[$_.InstanceID] = $_ }
+$rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound | ForEach-Object {
+    $id = $_.InstanceID; $app = $apps[$id]; $port = $ports[$id]
+    $program = [string]$app.Program
+    $anyProgram = $program -eq '' -or $program -eq 'Any'
+    $named = -not $anyProgram -and ([IO.Path]::GetFileName([Environment]::ExpandEnvironmentVariables($program)) -ieq $leaf -or $program -like '*~*')
+    $udp = @('UDP', 'Any', '17') -contains [string]$port.Protocol
+    if ($udp -and (($anyProgram -and [string]$_.Enabled -eq 'True') -or $named)) {
+        @{ enabled = [string]$_.Enabled; action = [string]$_.Action; profile = [string]$_.Profile; protocol = [string]$port.Protocol
+           program = $program; localport = @($port.LocalPort | ForEach-Object { [string]$_ })
+           remote = @($addresses[$id].RemoteAddress | ForEach-Object { [string]$_ }); localaddress = @($addresses[$id].LocalAddress | ForEach-Object { [string]$_ })
+           service = [string]$services[$id].Service; interface = [string]$interfaces[$id].InterfaceType
+           owner = [string]$_.Owner; package = [string]$app.Package; store = [string]$_.PolicyStoreSourceType }
+    }
+})
 $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct | ForEach-Object { [string]$_.displayName })
 @{ profiles = $profiles; firewall = $firewall; rules = $rules; products = $products } | ConvertTo-Json -Depth 4 -Compress
 "#;
 
-/// A PowerShell single-quoted string.
-#[cfg(any(windows, test))]
-fn ps_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+/// Lists inbound Block rules in the PC's own store that name a program, with
+/// their ids, for the elevated repair.
+pub const LOCAL_BLOCKS_QUERY: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$found = @(Get-NetFirewallRule -PolicyStore PersistentStore -Direction Inbound -Action Block | ForEach-Object {
+    $program = [string]($_ | Get-NetFirewallApplicationFilter).Program
+    if ($program -and $program -ne 'Any') { @{ id = [string]$_.Name; program = $program } }
+})
+ConvertTo-Json -InputObject $found -Compress
+"#;
+
+/// Removes the rules whose ids come in `ETERNAL_FW_RULE_IDS`, one per line,
+/// from the PC's own store only.
+pub const REMOVE_RULES: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ids = @($env:ETERNAL_FW_RULE_IDS -split "`n" | Where-Object { $_ })
+if ($ids.Count -gt 0) { Remove-NetFirewallRule -PolicyStore PersistentStore -Name $ids }
+"#;
+
+#[derive(Debug, Deserialize)]
+pub struct LocalBlock {
+    pub id: String,
+    pub program: String,
+}
+
+/// The ids of local Block rules for exactly this executable: what dismissing
+/// Windows' prompt leaves. Rules for any program, or another program, stay.
+pub fn blocks_to_remove(blocks: &[LocalBlock], exe: &str) -> Vec<String> {
+    let exe = normalize_path(exe);
+    blocks
+        .iter()
+        .filter(|block| !block.id.is_empty() && !block.id.contains(['\n', '\r']))
+        .filter(|block| normalize_path(&block.program) == exe)
+        .map(|block| block.id.clone())
+        .collect()
+}
+
+/// Rule names the elevated repair writes: Setup's, or a test's own.
+fn repair_name_allowed(name: &str) -> bool {
+    name == RULE_NAME || (name.starts_with("EM-TEST ") && !name.contains(['\n', '\r', '"']))
 }
 
 /// The netsh arguments that replace this host's inbound rules, exactly as
@@ -494,7 +737,8 @@ pub fn summary(adapters: &[Adapter], firewall: Option<&Firewall>) -> String {
 
 /// Logs the network summary and checks the firewall in the background, so a
 /// slow PowerShell never delays the window.
-pub fn start_check() {
+pub fn start_check(port: u16) {
+    PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     std::thread::Builder::new()
         .name("network-check".into())
         .spawn(|| {
@@ -519,6 +763,9 @@ fn record(firewall: Option<&Firewall>) {
         FirewallCheck::Checked(Verdict::Blocked) => {
             warn!("A Windows Firewall rule blocks iPads from reaching EternalMonitor")
         }
+        FirewallCheck::Checked(Verdict::BlockedByAdmin) => warn!(
+            "A firewall rule EternalMonitor may not change (policy, port or any-program) blocks iPads"
+        ),
         _ => {}
     }
     *FIREWALL.lock() = check;
@@ -568,6 +815,9 @@ pub fn run_repair_if_requested() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some(ALLOW_FIREWALL_ARG) {
         let name = args.get(2).map_or(RULE_NAME, String::as_str);
+        if !repair_name_allowed(name) {
+            std::process::exit(2);
+        }
         std::process::exit(allow_through_firewall(name));
     }
 }
@@ -577,15 +827,36 @@ fn allow_through_firewall(_name: &str) -> i32 {
     1
 }
 
+/// The elevated repair. It reads nothing from the network: the rule name is
+/// Setup's (or a test's `EM-TEST` name), the executable is this one, and the
+/// rules it removes are local Block rules for exactly this executable.
 #[cfg(windows)]
 fn allow_through_firewall(name: &str) -> i32 {
     use std::os::windows::process::CommandExt;
     let Ok(exe) = std::env::current_exe() else {
         return 2;
     };
-    let exe = crate::single_instance::canonical(&exe);
+    let exe = crate::single_instance::canonical(&exe)
+        .display()
+        .to_string();
     let mut code = 0;
-    for args in allow_commands(name, &exe.display().to_string()) {
+    // A block wins over Setup's allow, so this executable's own blocks go
+    // first: what dismissing Windows' "allow access" prompt leaves behind.
+    let blocks: Vec<LocalBlock> = powershell(LOCAL_BLOCKS_QUERY, &[])
+        .ok()
+        .and_then(|output| {
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).ok()
+        })
+        .unwrap_or_default();
+    let ids = blocks_to_remove(&blocks, &exe);
+    if !ids.is_empty() {
+        let removed = powershell(REMOVE_RULES, &[("ETERNAL_FW_RULE_IDS", &ids.join("\n"))]);
+        if !removed.is_ok_and(|output| output.status.success()) {
+            code = 1;
+        }
+    }
+    println!("removed_blocks={}", ids.len());
+    for args in allow_commands(name, &exe) {
         let add = args.get(2).map(String::as_str) == Some("add");
         let status = std::process::Command::new("netsh.exe")
             .args(&args)
@@ -638,39 +909,47 @@ fn run_elevated_repair() -> Result<u32, String> {
     Ok(code)
 }
 
+/// The UDP port this host listens on, for the firewall check.
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(9876);
+
 fn query_firewall() -> Option<Firewall> {
-    query_firewall_for(&std::env::current_exe().ok()?)
+    query_firewall_for(
+        &std::env::current_exe().ok()?,
+        PORT.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
-#[cfg(not(windows))]
-pub fn query_firewall_for(_exe: &std::path::Path) -> Option<Firewall> {
-    None
-}
-
-/// The firewall as it applies to `exe`.
+/// Runs one of this module's fixed scripts. Values reach it only through
+/// environment variables, never through the script text.
 #[cfg(windows)]
-pub fn query_firewall_for(exe: &std::path::Path) -> Option<Firewall> {
+fn powershell(script: &str, env: &[(&str, &str)]) -> std::io::Result<std::process::Output> {
     use std::os::windows::process::CommandExt;
-    let exe = crate::single_instance::canonical(exe);
-    let script = format!(
-        "& {{ $exe = {}; {} }}",
-        ps_quote(&exe.display().to_string()),
-        FIREWALL_QUERY
-    );
-    let output = std::process::Command::new("powershell.exe")
+    std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            &script,
+            script,
         ])
+        .envs(env.iter().copied())
         .creation_flags(0x0800_0000)
-        .output();
-    match output {
+        .output()
+}
+
+#[cfg(not(windows))]
+pub fn query_firewall_for(_exe: &std::path::Path, _port: u16) -> Option<Firewall> {
+    None
+}
+
+/// The firewall as it applies to `exe` listening on UDP `port`.
+#[cfg(windows)]
+pub fn query_firewall_for(exe: &std::path::Path, port: u16) -> Option<Firewall> {
+    let exe = crate::single_instance::canonical(exe).display().to_string();
+    match powershell(FIREWALL_QUERY, &[("ETERNAL_FW_EXE", &exe)]) {
         Ok(output) => {
-            let parsed = parse_firewall(&String::from_utf8_lossy(&output.stdout));
+            let parsed = parse_firewall(&String::from_utf8_lossy(&output.stdout), &exe, port);
             if parsed.is_none() {
                 warn!(
                     code = ?output.status.code(),
@@ -863,22 +1142,43 @@ mod tests {
         assert!(lan_addresses(&adapters).is_empty());
     }
 
+    const EXE: &str = r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe";
+
     fn firewall(active: u8, enabled: u8, rules: Vec<Rule>) -> Firewall {
         Firewall {
             active,
             enabled,
+            exe: normalize_path(EXE),
+            port: 9876,
             rules,
             products: Vec::new(),
         }
     }
 
+    /// Setup's rule shape: this executable, every port.
     fn rule(allow: bool, profiles: u8, udp: bool) -> Rule {
         Rule {
             enabled: true,
-            inbound: true,
             allow,
             profiles,
             udp,
+            program: Some(EXE.to_string()),
+            ports: Ports::Any,
+            scoped: false,
+            local: true,
+        }
+    }
+
+    fn any_program(allow: bool, ports: &[&str]) -> Rule {
+        Rule {
+            program: None,
+            ports: Ports::parse(
+                &ports
+                    .iter()
+                    .map(|port| port.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            ..rule(allow, PROFILE_ALL, true)
         }
     }
 
@@ -897,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_partial_rules_are_found() {
+    fn missing_rules_and_this_programs_blocks_are_found() {
         assert_eq!(
             verdict(&firewall(PROFILE_PUBLIC, PROFILE_ALL, vec![])),
             Verdict::Missing
@@ -930,6 +1230,192 @@ mod tests {
             verdict(&firewall(PROFILE_PRIVATE, PROFILE_ALL, vec![disabled])),
             Verdict::Missing
         );
+        // Another program's rules never count.
+        let mut other = rule(false, PROFILE_ALL, true);
+        other.program = Some(r"C:\Games\game.exe".into());
+        assert_eq!(
+            verdict(&firewall(
+                PROFILE_PRIVATE,
+                PROFILE_ALL,
+                vec![rule(true, PROFILE_ALL, true), other]
+            )),
+            Verdict::Allowed
+        );
+    }
+
+    /// Sol #2: an allow for any program on the port lets the iPad in.
+    #[test]
+    fn an_any_program_allow_on_the_port_is_no_reason_for_a_notice() {
+        for ports in [&["9876"][..], &["9000-9999"], &["80", "9876"], &["Any"]] {
+            let check = firewall(PROFILE_PUBLIC, PROFILE_ALL, vec![any_program(true, ports)]);
+            assert_eq!(verdict(&check), Verdict::Allowed, "{ports:?}");
+            assert!(!verdict(&check).needs_repair());
+        }
+        // On other ports only: still nothing lets the iPad in.
+        let other = firewall(
+            PROFILE_PUBLIC,
+            PROFILE_ALL,
+            vec![any_program(true, &["53", "10000-10010"])],
+        );
+        assert_eq!(verdict(&other), Verdict::Missing);
+    }
+
+    /// Sol #3: a rule for this program on another port doesn't apply.
+    #[test]
+    fn a_rule_for_another_port_does_not_apply() {
+        let mut elsewhere = rule(true, PROFILE_ALL, true);
+        elsewhere.ports = Ports::parse(&["9999".to_string()]);
+        let check = firewall(PROFILE_PRIVATE, PROFILE_ALL, vec![elsewhere.clone()]);
+        assert_eq!(verdict(&check), Verdict::Missing);
+        assert!(verdict(&check).needs_repair());
+        // And a block on another port blocks nothing here.
+        let mut block = elsewhere;
+        block.allow = false;
+        assert_eq!(
+            verdict(&firewall(
+                PROFILE_PRIVATE,
+                PROFILE_ALL,
+                vec![block, rule(true, PROFILE_ALL, true)]
+            )),
+            Verdict::Allowed
+        );
+    }
+
+    /// Restrictions this check doesn't evaluate never produce a notice.
+    #[test]
+    fn rules_it_cannot_evaluate_never_raise_a_notice() {
+        let mut scoped = rule(true, PROFILE_ALL, true);
+        scoped.scoped = true;
+        assert_eq!(
+            verdict(&firewall(
+                PROFILE_PRIVATE,
+                PROFILE_ALL,
+                vec![scoped.clone()]
+            )),
+            Verdict::Unknown
+        );
+        let mut scoped_block = scoped.clone();
+        scoped_block.allow = false;
+        assert_eq!(
+            verdict(&firewall(
+                PROFILE_PRIVATE,
+                PROFILE_ALL,
+                vec![scoped_block, rule(true, PROFILE_ALL, true)]
+            )),
+            Verdict::Allowed
+        );
+        let keyword = any_program(true, &["RPC"]);
+        assert_eq!(keyword.ports, Ports::Unknown);
+        assert_eq!(
+            verdict(&firewall(PROFILE_PRIVATE, PROFILE_ALL, vec![keyword])),
+            Verdict::Unknown
+        );
+        assert!(!Verdict::Unknown.needs_repair());
+    }
+
+    /// Sol #1: a block the repair may not change is told apart.
+    #[test]
+    fn blocks_the_repair_may_not_change_are_told_apart() {
+        let setup = rule(true, PROFILE_ALL, true);
+        let check = |block: Rule| {
+            verdict(&firewall(
+                PROFILE_PRIVATE,
+                PROFILE_ALL,
+                vec![setup.clone(), block],
+            ))
+        };
+        assert_eq!(check(rule(false, PROFILE_ALL, true)), Verdict::Blocked);
+        assert_eq!(
+            check(any_program(false, &["9876"])),
+            Verdict::BlockedByAdmin
+        );
+        assert_eq!(check(any_program(false, &["Any"])), Verdict::BlockedByAdmin);
+        let mut policy = rule(false, PROFILE_ALL, true);
+        policy.local = false;
+        assert_eq!(check(policy), Verdict::BlockedByAdmin);
+        assert!(!Verdict::BlockedByAdmin.needs_repair());
+    }
+
+    /// Sol #4: the spellings Windows stores reach the same program.
+    #[test]
+    fn program_paths_are_compared_as_windows_does() {
+        let exe = normalize_path(EXE);
+        assert_eq!(normalize_path(&format!(r"\\?\{EXE}")), exe);
+        assert_eq!(normalize_path(&format!(r"\??\{EXE}")), exe);
+        assert_eq!(normalize_path(&EXE.to_uppercase()), exe);
+        assert_eq!(
+            normalize_path(r"\\?\UNC\server\share\a.exe"),
+            r"\\server\share\a.exe"
+        );
+        std::env::set_var("ETERNAL_TEST_PROGRAM_FILES", r"C:\Program Files");
+        assert_eq!(
+            normalize_path(r"%ETERNAL_TEST_PROGRAM_FILES%\EternalMonitor\EternalMonitor-host.exe"),
+            exe
+        );
+        assert_eq!(
+            normalize_path("%NO_SUCH_VAR_HERE%\\a.exe"),
+            "%no_such_var_here%\\a.exe"
+        );
+        let mut written = rule(true, PROFILE_ALL, true);
+        written.program = Some(format!(r"\\?\{}", EXE.to_uppercase()));
+        assert_eq!(
+            verdict(&firewall(PROFILE_PUBLIC, PROFILE_ALL, vec![written])),
+            Verdict::Allowed
+        );
+    }
+
+    /// A short (8.3) name on a real Windows volume reaches the long one.
+    #[cfg(windows)]
+    #[test]
+    fn short_names_are_made_long() {
+        let long = normalize_path(r"C:\Program Files");
+        let short = normalize_path(r"C:\PROGRA~1");
+        if short.contains('~') {
+            eprintln!("8.3 names are off on C:, nothing to compare");
+            return;
+        }
+        assert_eq!(short, long);
+    }
+
+    /// Sol #1: Allow removes this program's own local blocks and nothing else.
+    #[test]
+    fn the_repair_removes_only_this_programs_blocks() {
+        let blocks = [
+            LocalBlock {
+                id: "{A}".into(),
+                program: format!(r"\\?\{}", EXE.to_lowercase()),
+            },
+            LocalBlock {
+                id: "{B}".into(),
+                program: r"C:\Games\game.exe".into(),
+            },
+            LocalBlock {
+                id: "TCP Query User{C}".into(),
+                program: EXE.into(),
+            },
+            LocalBlock {
+                id: "bad\nid".into(),
+                program: EXE.into(),
+            },
+            LocalBlock {
+                id: String::new(),
+                program: EXE.into(),
+            },
+        ];
+        assert_eq!(
+            blocks_to_remove(&blocks, EXE),
+            vec!["{A}", "TCP Query User{C}"]
+        );
+        assert!(repair_name_allowed(RULE_NAME));
+        assert!(repair_name_allowed("EM-TEST connect-funnel"));
+        for name in [
+            "Other",
+            "EM-TEST a\" dir=out",
+            "EM-TEST a\nb",
+            "EternalMonitor Host X",
+        ] {
+            assert!(!repair_name_allowed(name), "{name}");
+        }
     }
 
     #[test]
@@ -946,21 +1432,24 @@ mod tests {
 
     #[test]
     fn powershell_output_is_read() {
-        let json = r#"{"profiles":["Public"],"firewall":[{"name":"Domain","enabled":"True"},{"name":"Private","enabled":"True"},{"name":"Public","enabled":"True"}],"rules":[{"enabled":"True","direction":"Inbound","action":"Allow","profile":"Domain, Private, Public","protocol":"UDP"},{"enabled":"True","direction":"Inbound","action":"Block","profile":"Public","protocol":"TCP"}],"products":["Windows Defender Firewall","Norton Firewall"]}"#;
-        let parsed = parse_firewall(json).expect("parsed");
+        let json = r#"{"profiles":["Public"],"firewall":[{"name":"Domain","enabled":"True"},{"name":"Private","enabled":"True"},{"name":"Public","enabled":"True"}],"rules":[{"enabled":"True","action":"Allow","profile":"Domain, Private, Public","protocol":"UDP","program":"C:\\PROGRAM FILES\\EternalMonitor\\EternalMonitor-host.exe","localport":["Any"],"remote":["Any"],"localaddress":["Any"],"service":"Any","interface":"Any","owner":"","package":"","store":"Local"},{"enabled":"True","action":"Block","profile":"Public","protocol":"UDP","program":"Any","localport":["9876"],"remote":["LocalSubnet"],"localaddress":["Any"],"service":"Any","interface":"Any","owner":"","package":"","store":"GroupPolicy"}],"products":["Windows Defender Firewall","Norton Firewall"]}"#;
+        let parsed = parse_firewall(json, EXE, 9876).expect("parsed");
         assert_eq!(parsed.active, PROFILE_PUBLIC);
         assert_eq!(parsed.enabled, PROFILE_ALL);
         assert_eq!(parsed.rules.len(), 2);
-        assert!(parsed.rules[0].udp && parsed.rules[0].allow);
-        assert!(!parsed.rules[1].udp && !parsed.rules[1].allow);
+        assert!(parsed.rules[0].udp && parsed.rules[0].allow && !parsed.rules[0].scoped);
+        assert_eq!(parsed.rules[1].program, None);
+        assert!(parsed.rules[1].scoped && !parsed.rules[1].local);
+        assert_eq!(parsed.rules[1].ports, Ports::List(vec![(9876, 9876)]));
         assert_eq!(parsed.products, vec!["Norton Firewall".to_string()]);
+        // The scoped block may or may not apply: no notice.
         assert_eq!(verdict(&parsed), Verdict::Allowed);
 
         let empty = r#"{"profiles":["DomainAuthenticated","Private"],"firewall":[],"rules":[],"products":[]}"#;
-        let parsed = parse_firewall(empty).expect("parsed");
+        let parsed = parse_firewall(empty, EXE, 9876).expect("parsed");
         assert_eq!(parsed.active, PROFILE_DOMAIN | PROFILE_PRIVATE);
         assert_eq!(verdict(&parsed), Verdict::Off);
-        assert!(parse_firewall("").is_none());
+        assert!(parse_firewall("", EXE, 9876).is_none());
     }
 
     #[test]
@@ -970,10 +1459,8 @@ mod tests {
             adapter(Kind::Vpn, true, [10, 41, 107, 216]),
         ];
         let firewall = Firewall {
-            active: PROFILE_PUBLIC,
-            enabled: PROFILE_ALL,
-            rules: vec![],
             products: vec!["Norton Firewall".into()],
+            ..firewall(PROFILE_PUBLIC, PROFILE_ALL, vec![])
         };
         let line = summary(&adapters, Some(&firewall));
         assert_eq!(
@@ -1020,7 +1507,11 @@ mod tests {
         let exe = std::env::var_os("ETERNAL_FIREWALL_EXE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::env::current_exe().unwrap());
-        let firewall = query_firewall_for(&exe).expect("firewall settings");
+        let port = std::env::var("ETERNAL_FIREWALL_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(9876);
+        let firewall = query_firewall_for(&exe, port).expect("firewall settings");
         let adapters = adapters();
         println!("NATIVE adapters={}", adapters.len());
         println!("NATIVE lan_addresses={}", lan_addresses(&adapters).len());
@@ -1030,10 +1521,10 @@ mod tests {
             verdict(&firewall),
             firewall.rules
         );
-    }
-
-    #[test]
-    fn powershell_strings_are_quoted() {
-        assert_eq!(ps_quote(r"C:\O'Neil\a.exe"), r"'C:\O''Neil\a.exe'");
+        let notice = crate::gui::firewall_notice(FirewallCheck::Checked(verdict(&firewall)), true);
+        println!(
+            "NATIVE notice={:?}",
+            notice.map(|(title, _, allow)| (title, allow))
+        );
     }
 }
