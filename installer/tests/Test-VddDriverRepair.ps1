@@ -1,25 +1,38 @@
-# Pure script checks for the Setup step that repairs a preserved Virtual Display Driver.
-# PnP, the registry and the vendor's nefconw are replaced in this process; nothing is installed.
+# Pure script checks for the Setup step that repairs a Virtual Display Driver EternalMonitor
+# installed. PnP, the registry, pnputil and the vendor's nefconw are replaced in this process,
+# and the script runs from a scratch copy; nothing is installed or removed.
+param([string]$RepairPath)
 $ErrorActionPreference = 'Stop'
-$script = Join-Path $PSScriptRoot '..\scripts\vdd-driver-repair.ps1'
+$source = if ($RepairPath) { $RepairPath } else { Join-Path $PSScriptRoot '..\scripts\vdd-driver-repair.ps1' }
 $iss = Get-Content -Raw (Join-Path $PSScriptRoot '..\EternalMonitor.iss')
 $root = Join-Path $env:TEMP ('em-driver-repair-test-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force $root | Out-Null
-$nefcon = Join-Path $root 'nefconw.exe'
-$inf = Join-Path $root 'MttVDD.inf'
-[IO.File]::WriteAllText($nefcon, 'test fixture; never executed')
-[IO.File]::WriteAllText($inf, 'test fixture')
+New-Item -ItemType Directory -Force "$root\scripts", "$root\driver", "$root\vendor" | Out-Null
+$script = "$root\scripts\vdd-driver-repair.ps1"
+Copy-Item $source $script
+$vendor = "$root\vendor"
+$nefcon = "$vendor\nefconw.exe"
+$inf = "$vendor\MttVDD.inf"
+$marker = "$root\driver\installed-by-eternalmonitor.txt"
 
 function Reset-Fixture {
+    foreach ($file in $nefcon, $inf) { [IO.File]::WriteAllText($file, 'test fixture; never executed') }
+    [IO.File]::WriteAllText($marker, "$vendor\unins000.exe`r`n25.05.03")
     $global:EMRepair = @{
-        Registration = [pscustomobject]@{InstallLocation=$root; DisplayVersion='25.05.03'}
-        Calls = @(); Exit = 0; Accept = $true
+        Registration = [pscustomobject]@{InstallLocation=$vendor; DisplayVersion='25.05.03'}
+        Calls = @(); Next = 1
+        # The driver package in the Windows driver store, which binds to new devices.
+        InStore = $true; StageExit = 0
+        # Whether a device the package binds to then starts.
+        NewStarts = $true
         Devices = @([pscustomobject]@{InstanceId='PCI\GPU';HardwareIds=@('PCI\GPU');Inf='oem1.inf';Problem=0})
     }
 }
 function Add-Vdd([string]$Inf, [int]$Problem) {
-    $global:EMRepair.Devices += [pscustomobject]@{InstanceId='ROOT\DISPLAY\0000';HardwareIds=@('Root\MttVDD');Inf=$Inf;Problem=$Problem}
+    $id = 'ROOT\DISPLAY\{0:D4}' -f ($global:EMRepair.Next++)
+    $global:EMRepair.Devices += [pscustomobject]@{InstanceId=$id;HardwareIds=@('Root\MttVDD');Inf=$(if ($Inf) { $Inf } else { $null });Problem=$Problem}
+    $id
 }
+function Get-Vdd { @($global:EMRepair.Devices | Where-Object { $_.HardwareIds -contains 'Root\MttVDD' }) }
 function Get-PnpDevice {
     [CmdletBinding()] param([string]$Class,[switch]$PresentOnly)
     if ($Class -ne 'Display' -or !$PresentOnly) { throw 'Must query present display devices' }
@@ -36,94 +49,131 @@ function Get-PnpDeviceProperty {
     [pscustomobject]@{Data=$value}
 }
 function Get-ItemProperty { [CmdletBinding()] param([string[]]$Path) $global:EMRepair.Registration }
-# Plays the vendor tool: removes, creates and binds the device as nefconw would.
+# Binds the staged package to every driverless device, as Windows does.
+function Bind-Driverless {
+    foreach ($device in Get-Vdd | Where-Object { !$_.Inf }) {
+        $device.Inf = 'oem40.inf'
+        $device.Problem = if ($global:EMRepair.NewStarts) { 0 } else { 43 }
+    }
+}
+function global:pnputil.exe {
+    $verb = $args[0]
+    $global:EMRepair.Calls += "pnputil $verb $(if ($verb -eq '/remove-device') { $args[1] })".Trim()
+    switch ($verb) {
+        '/add-driver' {
+            if ($args[1] -ne $inf -or $args[2] -ne '/install') { throw "Bad add-driver: $args" }
+            $global:LASTEXITCODE = $global:EMRepair.StageExit
+            if ($global:EMRepair.StageExit -in @(0, 3010)) { $global:EMRepair.InStore = $true; Bind-Driverless }
+        }
+        '/remove-device' {
+            $id = $args[1]
+            $global:EMRepair.Devices = @($global:EMRepair.Devices | Where-Object { $_.InstanceId -ne $id })
+            $global:LASTEXITCODE = 0
+        }
+        default { throw "Unexpected pnputil $verb" }
+    }
+}
+# nefconw 1.10.0. --remove-device-node looks up a compatible driver before it removes
+# anything, so it fails while a device has no driver and the store has no package.
 function Start-Process {
     [CmdletBinding()] param([string]$FilePath,[string]$ArgumentList,[switch]$Wait,[switch]$PassThru,[string]$WindowStyle)
     if ($FilePath -ne $nefcon -or !$Wait -or !$PassThru) { throw "Unexpected process $FilePath" }
     $verb = $ArgumentList.Split(' ')[0]
-    $global:EMRepair.Calls += $verb
-    if ($global:EMRepair.Exit -notin @(0, 3010)) { return [pscustomobject]@{ExitCode=$global:EMRepair.Exit} }
+    $global:EMRepair.Calls += "nefconw $verb"
+    $exit = 0
     switch ($verb) {
-        '--remove-device-node' {
-            if ($ArgumentList -notmatch 'Root\\MttVDD' -or $ArgumentList -notmatch '4D36E968-E325-11CE-BFC1-08002BE10318') { throw "Bad remove: $ArgumentList" }
-            $global:EMRepair.Devices = @($global:EMRepair.Devices | Where-Object { $_.HardwareIds -notcontains 'Root\MttVDD' })
-        }
         '--create-device-node' {
             if ($ArgumentList -notmatch '--hardware-id Root\\MttVDD --class-name Display --class-guid 4D36E968') { throw "Bad create: $ArgumentList" }
-            Add-Vdd $null 28
+            Add-Vdd $null 28 | Out-Null
         }
-        '--install-driver' {
-            if ($ArgumentList -notmatch [regex]::Escape("--inf-path `"$inf`"")) { throw "Bad install: $ArgumentList" }
-            if ($global:EMRepair.Accept) {
-                $vdd = $global:EMRepair.Devices | Where-Object { $_.HardwareIds -contains 'Root\MttVDD' }
-                $vdd.Inf = 'oem40.inf'; $vdd.Problem = 0
-            }
+        '--remove-device-node' {
+            if (!$global:EMRepair.InStore -and (Get-Vdd | Where-Object { !$_.Inf })) { $exit = 1 }
+            else { $global:EMRepair.Devices = @($global:EMRepair.Devices | Where-Object { $_.HardwareIds -notcontains 'Root\MttVDD' }) }
         }
+        '--install-driver' { $global:EMRepair.InStore = $true; Bind-Driverless }
         default { throw "Unexpected nefconw verb $verb" }
     }
-    [pscustomobject]@{ExitCode=$global:EMRepair.Exit}
+    [pscustomobject]@{ExitCode=$exit}
 }
-function Expect-Calls([string]$Expected, [string]$Case) {
-    $actual = $global:EMRepair.Calls -join ','
-    if ($actual -ne $Expected) { throw "$Case`: expected nefconw [$Expected], ran [$actual]" }
+function Invoke-Repair {
+    $global:LASTEXITCODE = 0
+    try { & $script 2>$null | Out-Null } catch { $global:LASTEXITCODE = "threw: $($_.Exception.Message)" }
+    $LASTEXITCODE
 }
-function Expect-Failure([string]$Message, [string]$Case) {
-    $failure = $null
-    try { & $script | Out-Null } catch { $failure = $_.Exception.Message }
-    if (!$failure -or $failure -notlike "*$Message*") { throw "$Case`: expected '$Message', got '$failure'" }
+$failures = @()
+function Expect([string]$Case, $Code, [string]$Calls, [scriptblock]$State = { $true }) {
+    $actual = Invoke-Repair
+    $ran = $global:EMRepair.Calls -join ', '
+    if ("$actual" -ne "$Code" -or $ran -ne $Calls -or !(& $State)) {
+        $script:failures += "$Case`: exit $actual (want $Code), ran [$ran] (want [$Calls]), devices $((Get-Vdd | ForEach-Object { "$($_.InstanceId):$($_.Inf):$($_.Problem)" }) -join ' ')"
+    }
 }
-$repair = '--remove-device-node,--create-device-node,--install-driver'
+function Working { @(Get-Vdd | Where-Object { $_.Inf -and $_.Problem -in @(0, 22) }) }
+$stage = 'pnputil /add-driver'
 try {
     # Between streams the device is off with code 22; running is fine too.
     foreach ($problem in 22, 0) {
-        Reset-Fixture; Add-Vdd 'oem33.inf' $problem
-        & $script | Out-Null
-        Expect-Calls '' "healthy device, code $problem"
+        Reset-Fixture; Add-Vdd 'oem33.inf' $problem | Out-Null
+        Expect "working device, code $problem" 0 ''
     }
+    # A working device next to a broken one: nothing is touched.
+    Reset-Fixture; $good = Add-Vdd 'oem33.inf' 22; Add-Vdd 'oem33.inf' 43 | Out-Null
+    Expect 'working and broken devices' 0 '' { @(Get-Vdd).Count -eq 2 }
 
-    # Removed in Device Manager: created again and bound to the driver.
-    Reset-Fixture
-    & $script | Out-Null
-    Expect-Calls '--create-device-node,--install-driver' 'missing device'
-
-    # A driver error, a signature block, or no driver: replaced as the vendor install does.
-    foreach ($case in @(@{Inf='oem33.inf';Problem=43}, @{Inf='oem33.inf';Problem=52}, @{Inf=$null;Problem=28}, @{Inf=$null;Problem=0})) {
-        Reset-Fixture; Add-Vdd $case.Inf $case.Problem
-        & $script | Out-Null
-        Expect-Calls $repair "device with inf '$($case.Inf)' and code $($case.Problem)"
-    }
-
-    # A restart-required result still counts, once the device is bound.
-    Reset-Fixture; $global:EMRepair.Exit = 3010
-    & $script | Out-Null
-    Expect-Calls '--create-device-node,--install-driver' 'restart required'
-
-    Reset-Fixture; $global:EMRepair.Exit = 5
-    Expect-Failure 'nefconw --create-device-node exited 5' 'vendor tool failure'
-
-    Reset-Fixture; $global:EMRepair.Accept = $false
-    Expect-Failure 'did not accept' 'driver not bound after repair'
-
-    # Without the vendor's files there is nothing to repair from: say how to reinstall.
+    # A driver another app installed is never changed.
+    Reset-Fixture; Remove-Item $marker; Add-Vdd 'oem33.inf' 43 | Out-Null
+    Expect 'no ownership marker' 10 '' { @(Get-Vdd).Count -eq 1 }
+    Reset-Fixture; [IO.File]::WriteAllText($marker, "$vendor\unins000.exe`r`n24.12.24")
+    Expect 'vendor install changed since Setup recorded it' 10 ''
     Reset-Fixture; $global:EMRepair.Registration = $null
-    Expect-Failure 'Uninstall Virtual Display Driver' 'no registration'
-    Expect-Calls '' 'no registration'
+    Expect 'no vendor registration' 10 ''
     Reset-Fixture; Remove-Item $nefcon
-    Expect-Failure 'Uninstall Virtual Display Driver' 'missing vendor tool'
-    [IO.File]::WriteAllText($nefcon, 'test fixture; never executed')
+    Expect 'vendor files missing' 11 ''
 
-    # Setup ships the step and runs it before the tasks disable the device, also when the
-    # existing driver is preserved.
-    if ($iss -notmatch 'Source: "scripts\\vdd-driver-repair\.ps1"') { throw 'Setup does not install the repair script' }
+    # Driverless device and the package gone from the driver store: staging the package
+    # binds it, and nothing is removed. nefconw's remove fails in this state.
+    Reset-Fixture; $global:EMRepair.InStore = $false; $kept = Add-Vdd $null 28
+    Expect 'driverless device, package missing' 0 $stage { (Working).InstanceId -eq $kept }
+    # Removed in Device Manager, with or without its package.
+    foreach ($inStore in $true, $false) {
+        Reset-Fixture; $global:EMRepair.InStore = $inStore
+        Expect "missing device, package in store=$inStore" 0 "$stage, nefconw --create-device-node, $stage" { @(Working).Count -eq 1 }
+    }
+    # A device with a driver error is replaced, and removed only once the new one works.
+    Reset-Fixture; $old = Add-Vdd 'oem33.inf' 43
+    Expect 'driver error' 0 "$stage, nefconw --create-device-node, $stage, pnputil /remove-device $old" {
+        @(Get-Vdd).Count -eq 1 -and (Working).InstanceId -ne $old }
+    # The replacement fails too: only the device this run added is removed.
+    Reset-Fixture; $old = Add-Vdd 'oem33.inf' 43; $global:EMRepair.NewStarts = $false
+    Expect 'replacement fails' 1 "$stage, nefconw --create-device-node, $stage, pnputil /remove-device ROOT\DISPLAY\0002" {
+        @(Get-Vdd).Count -eq 1 -and @(Get-Vdd)[0].InstanceId -eq $old -and @(Get-Vdd)[0].Problem -eq 43 }
+    # Windows rejects the package: nothing else happens.
+    Reset-Fixture; $old = Add-Vdd 'oem33.inf' 52; $global:EMRepair.StageExit = 5
+    Expect 'package rejected' 1 $stage { @(Get-Vdd).Count -eq 1 -and @(Get-Vdd)[0].Problem -eq 52 }
+    # A restart-required result still counts once the device works.
+    Reset-Fixture; $global:EMRepair.StageExit = 3010
+    Expect 'restart required' 0 "$stage, nefconw --create-device-node, $stage"
+    # A rerun after a repair changes nothing.
+    $global:EMRepair.Calls = @(); $global:EMRepair.StageExit = 0
+    Expect 'rerun' 0 ''
+
+    # Setup ships the step, runs it before the tasks disable the device, also when the
+    # existing driver is preserved, and names each outcome.
+    if ($iss -notmatch 'Source: "scripts\\vdd-driver-repair\.ps1"') { $failures += 'Setup does not install the repair script' }
     $tasks = ($iss -split "`n") | Where-Object { $_ -match 'vdd-tasks-setup\.ps1' -and $_ -match '^Filename:' }
     if ($tasks -notmatch 'BeforeInstall: RepairVddDriver' -or $tasks -match 'Check: NeedsVddInstall') {
-        throw 'Setup does not repair a preserved driver before registering the tasks'
+        $failures += 'Setup does not repair a preserved driver before registering the tasks'
     }
-    if ($iss -notmatch "(?s)procedure RepairVddDriver;.*vdd-driver-repair\.ps1.*ExitCode <> 0.*RaiseException") {
-        throw 'Setup ignores a failed repair'
+    $code = [regex]::Match($iss, '(?s)procedure RepairVddDriver;.*?\nend;').Value
+    if ($code -notmatch 'vdd-driver-repair\.ps1' -or $code -notmatch "10: Message := 'Another app installed" -or
+        $code -notmatch '11: Message' -or $code -notmatch 'VddInstallFailed := True' -or $code -notmatch 'RaiseException') {
+        $failures += 'Setup does not report each repair failure'
     }
-    Write-Output 'PASS: healthy, missing, driver error, signature, unbound, restart, tool failure, rejected, no vendor files, Setup wiring'
+    if ($failures) { throw "Repair checks failed:`n  " + ($failures -join "`n  ") }
+    Write-Output 'PASS: working, working beside broken, not owned, changed, unregistered, files missing, driverless with package gone, missing device, driver error, failed replacement, rejected package, restart, rerun, Setup wiring'
 } finally {
     Remove-Item $root -Recurse -Force
+    Remove-Item function:global:pnputil.exe -ErrorAction SilentlyContinue
     Remove-Variable EMRepair -Scope Global -ErrorAction SilentlyContinue
+    $global:LASTEXITCODE = 0
 }

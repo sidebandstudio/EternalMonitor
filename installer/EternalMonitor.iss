@@ -180,15 +180,25 @@ end;
 procedure RepairVddDriver;
 var
   ExitCode: Integer;
+  Message: String;
 begin
-  { Setup keeps an existing driver instead of running its setup again. Put
-    back a device that was removed in Device Manager or lost its driver. }
+  { Setup keeps an existing driver instead of running its setup again. When
+    Setup installed it and no device works, put one back (exit codes in the
+    script). A driver another app installed is left alone. }
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\vdd-driver-repair.ps1') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
-    VddInstallFailed := True;
-    RaiseException('Setup could not repair the virtual display driver. Uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.');
+      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    ExitCode := -1;
+  if ExitCode = 0 then
+    exit;
+  case ExitCode of
+    10: Message := 'Another app installed the virtual display driver, and none of its displays works. EternalMonitor does not change another app''s driver. Repair it in that app, or uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
+    11: Message := 'The virtual display driver''s files are missing. Uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
+  else
+    Message := 'Setup could not repair the virtual display driver. Restart the PC and run this setup again. If it still fails, uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
   end;
+  VddInstallFailed := True;
+  RaiseException(Message);
 end;
 
 procedure RecordVddOwnership;
