@@ -349,6 +349,18 @@ mod tests {
     fn native_device_state() {
         let state = query();
         println!("vdd_device={state} problem={:?}", state.problem());
+        // DXGI lists a virtual display under the adapter that renders it.
+        for output in crate::capture::enumerate_outputs() {
+            println!(
+                "output {} {}x{} at {},{} on {}",
+                output.device_name,
+                output.width,
+                output.height,
+                output.left,
+                output.top,
+                output.adapter_name
+            );
+        }
         if let Ok(expected) = std::env::var("EM_EXPECT_VDD") {
             assert_eq!(state.to_string(), expected);
         }
