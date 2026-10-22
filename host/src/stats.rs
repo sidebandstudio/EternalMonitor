@@ -36,6 +36,10 @@ pub struct PipelineStats {
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
+    /// NVENC refused to open because the NVIDIA driver is older than the
+    /// linked FFmpeg's NVENC API needs. The fallback notice then names the
+    /// driver to install.
+    pub nvidia_driver_outdated: bool,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -97,6 +101,7 @@ impl PipelineStats {
             bitrate_bps: 0,
             codec_name: String::new(),
             using_software_fallback: false,
+            nvidia_driver_outdated: false,
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -137,6 +142,7 @@ impl PipelineStats {
         self.bitrate_bps = previous.bitrate_bps;
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
+        self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }

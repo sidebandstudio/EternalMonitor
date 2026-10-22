@@ -115,6 +115,7 @@ fn run_encode_loop(
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
         // libx264 override is not a fallback, so it intentionally leaves this false.
         stats.set_software_fallback(false);
+        stats.nvidia_driver_outdated = false;
     }
 
     let mut encoder_state: Option<EncoderState> = None;
@@ -674,6 +675,13 @@ impl EncoderState {
         let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts).map_err(|error| {
+            if nvidia_driver_outdated(encoder_name, error) {
+                warn!(
+                    encoder = encoder_name,
+                    "The NVIDIA driver is too old for NVENC; it needs {NVENC_MIN_DRIVER} or newer"
+                );
+                PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+            }
             let code: i32 = error.into();
             format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {encode_width}x{encode_height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
         })?;
@@ -849,6 +857,19 @@ fn open_remaining_encoders<T>(
     }
     warn!("No hardware encoder opened; falling back to libx264 (software)");
     open("libx264").map(|state| ("libx264", state))
+}
+
+/// The oldest NVIDIA driver the linked FFmpeg 7.1.1 build's NVENC (API 13.0)
+/// opens with. Older drivers fail with "Driver does not support the required
+/// nvenc API version", and FFmpeg 7.1 prints the minimum as "(unknown)".
+pub const NVENC_MIN_DRIVER: &str = "570";
+
+/// Whether an encoder open failed only because the NVIDIA driver is too old.
+/// FFmpeg's NVENC returns ENOSYS for exactly that check; a missing driver or
+/// device fails with other codes.
+fn nvidia_driver_outdated(encoder_name: &str, error: ffmpeg_next::Error) -> bool {
+    encoder_name.ends_with("_nvenc")
+        && matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
 }
 
 /// The picture size to encode a `width` x `height` desktop at: the same size,
@@ -1676,6 +1697,23 @@ mod tests {
             state.opened_encoder = name.to_string();
             assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
         }
+    }
+
+    #[test]
+    fn only_nvencs_api_version_refusal_means_an_outdated_driver() {
+        let enosys = ffmpeg_next::Error::Other {
+            errno: libc::ENOSYS,
+        };
+        let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
+        assert!(nvidia_driver_outdated("h264_nvenc", enosys));
+        assert!(nvidia_driver_outdated("hevc_nvenc", enosys));
+        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
+        assert!(!nvidia_driver_outdated("h264_nvenc", eperm));
+        assert!(!nvidia_driver_outdated(
+            "h264_nvenc",
+            ffmpeg_next::Error::External
+        ));
+        assert!(!nvidia_driver_outdated("h264_amf", enosys));
     }
 
     #[test]

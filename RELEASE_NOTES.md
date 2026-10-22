@@ -116,6 +116,9 @@ Windows changes.
   shows "The graphics driver restarted" and picks the picture up again by
   itself. Previously the stream restarted every few seconds and stopped for
   good after six tries.
+- When an NVIDIA graphics card can't encode video because its driver is too
+  old, the processor notice says to install NVIDIA driver 570 or newer and
+  links to NVIDIA's driver page.
 
 ### What to test
 

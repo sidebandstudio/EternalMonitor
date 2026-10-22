@@ -68,17 +68,20 @@ impl AnalyzerApp {
                 || self.settings_encoder_input != crate::encoder::input::EncoderInput::default();
             let mut reset = false;
             let mut restart = false;
+            let nvidia = !customized && snap.nvidia_driver_outdated;
             widgets::banner(
                 ui,
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
+                &software_fallback_body(customized, snap.nvidia_driver_outdated),
                 if customized {
-                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
+                    230.0
+                } else if nvidia {
+                    290.0
                 } else {
-                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
+                    110.0
                 },
-                if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
                         reset =
@@ -88,6 +91,9 @@ impl AnalyzerApp {
                         restart =
                             widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
                                 .clicked();
+                        if nvidia {
+                            widgets::link(ui, "Get the NVIDIA driver", NVIDIA_DRIVERS_URL);
+                        }
                     }
                 },
             );
@@ -582,6 +588,23 @@ enum HeaderAction {
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
+const NVIDIA_DRIVERS_URL: &str = "https://www.nvidia.com/en-us/drivers/";
+
+/// What the CPU fallback notice says: undo custom settings first, name the
+/// NVIDIA driver version when that is what the graphics card refused, or
+/// suggest a driver update.
+pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
+    if customized {
+        "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
+    } else if nvidia_driver_outdated {
+        format!(
+            "The picture may lag and the PC may run hot, because the NVIDIA graphics driver on this PC is too old. Install NVIDIA driver {} or newer from NVIDIA's website, then click Restart.",
+            crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else {
+        "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
+    }
+}
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
