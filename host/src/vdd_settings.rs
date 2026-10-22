@@ -7,6 +7,11 @@
 //! document: one monitor, a global refresh rate, and a resolution list led by
 //! the client's native landscape mode. NEEDS_WINDOWS_VERIFY: the driver's
 //! acceptance of these exact modes is a hardware-runbook item.
+//!
+//! It also names the graphics card the driver renders on: the one driving the
+//! main screen. Left unnamed, the driver picks the card with the most video
+//! memory. On Intel + NVIDIA laptops that is the NVIDIA card, which drives no
+//! screen, and in 0.3.1 diagnostics none of those laptops got the display.
 
 use std::io;
 use std::path::Path;
@@ -59,12 +64,23 @@ pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> V
 }
 
 /// Render the settings document. Pure so tests can assert the exact bytes.
-pub fn render(modes: &[VddMode]) -> String {
+/// `gpu` is the DXGI adapter description the driver matches its render
+/// adapter by; without it the driver chooses.
+pub fn render(modes: &[VddMode], gpu: Option<&str>) -> String {
     let global_refresh = modes.first().map_or(60, |m| m.refresh_hz);
     let mut xml = String::with_capacity(512);
     xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     xml.push_str("<vdd_settings>\n");
     xml.push_str("    <monitors>\n        <count>1</count>\n    </monitors>\n");
+    if let Some(gpu) = gpu {
+        let gpu = gpu
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        xml.push_str(&format!(
+            "    <gpu>\n        <friendlyname>{gpu}</friendlyname>\n    </gpu>\n"
+        ));
+    }
     xml.push_str("    <global>\n");
     xml.push_str(&format!(
         "        <g_refresh_rate>{global_refresh}</g_refresh_rate>\n"
@@ -86,13 +102,13 @@ pub fn render(modes: &[VddMode]) -> String {
 
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
 /// Creates the directory if the driver hasn't made it yet.
-pub fn write_to(path: &Path, modes: &[VddMode]) -> io::Result<()> {
+pub fn write_to(path: &Path, modes: &[VddMode], gpu: Option<&str>) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
     })?;
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("xml.tmp");
-    std::fs::write(&tmp, render(modes))?;
+    std::fs::write(&tmp, render(modes, gpu))?;
     std::fs::rename(&tmp, path)
 }
 
@@ -153,7 +169,8 @@ mod tests {
 
     #[test]
     fn render_produces_the_driver_schema() {
-        let xml = render(&modes_for_client(1668, 2420, 120));
+        let xml = render(&modes_for_client(1668, 2420, 120), None);
+        assert!(!xml.contains("<gpu>"), "the driver chooses without a name");
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>"));
         assert!(xml.contains("<vdd_settings>"));
         assert!(xml.contains("<count>1</count>"));
@@ -166,11 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn render_names_the_main_screens_graphics_card() {
+        let xml = render(
+            &modes_for_client(1668, 2420, 120),
+            Some("Intel(R) Iris(R) Xe Graphics"),
+        );
+        assert!(xml.contains(
+            "    <gpu>\n        <friendlyname>Intel(R) Iris(R) Xe Graphics</friendlyname>\n    </gpu>\n"
+        ));
+        // Before the modes, as in the driver's own file.
+        assert!(xml.find("<gpu>") < xml.find("<resolutions>"));
+        let xml = render(&modes_for_client(1668, 2420, 60), Some("A&B <GPU>"));
+        assert!(xml.contains("<friendlyname>A&amp;B &lt;GPU&gt;</friendlyname>"));
+    }
+
+    #[test]
     fn write_is_atomic_and_creates_the_directory() {
         let dir = std::env::temp_dir().join(format!("vdd-settings-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nested").join("vdd_settings.xml");
-        write_to(&path, &modes_for_client(1668, 2420, 120)).expect("write settings");
+        write_to(&path, &modes_for_client(1668, 2420, 120), None).expect("write settings");
         let written = std::fs::read_to_string(&path).expect("read back");
         assert!(written.contains("<width>2420</width>"));
         assert!(!path.with_extension("xml.tmp").exists(), "tmp cleaned up");

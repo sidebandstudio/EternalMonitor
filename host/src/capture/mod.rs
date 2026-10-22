@@ -457,6 +457,11 @@ pub(crate) fn reconcile_virtual_display(
             // vdd_settings.xml at enable time). Failure is non-fatal — the
             // driver's built-in modes apply. NEEDS_WINDOWS_VERIFY (M10).
             if crate::settings::SettingsFile::load().vdd_match_resolution {
+                let gpu = outputs
+                    .iter()
+                    .find(|output| output.is_primary)
+                    .map(|output| output.adapter_name.as_str())
+                    .filter(|name| !name.is_empty());
                 if let Some(info) = shared.session.lock().client_info() {
                     let modes = crate::vdd_settings::modes_for_client(
                         info.screen_px.0,
@@ -464,9 +469,10 @@ pub(crate) fn reconcile_virtual_display(
                         info.refresh_hz,
                     );
                     let path = std::path::Path::new(r"C:\VirtualDisplayDriver\vdd_settings.xml");
-                    match crate::vdd_settings::write_to(path, &modes) {
+                    match crate::vdd_settings::write_to(path, &modes, gpu) {
                         Ok(()) => info!(
                             ?modes,
+                            gpu = gpu.unwrap_or("chosen by the driver"),
                             "Wrote virtual display mode list for the connected client"
                         ),
                         Err(error) => warn!(
