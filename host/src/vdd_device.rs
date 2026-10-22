@@ -224,15 +224,6 @@ pub fn query() -> DeviceState {
     DeviceState::Missing
 }
 
-/// Ask Windows to extend the desktop across every connected display, as
-/// Windows+P > Extend does. Windows remembers the choice for this set of
-/// displays, which includes the virtual one, so it applies only while it is on.
-#[cfg(windows)]
-pub fn extend_desktop() -> bool {
-    use windows::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND};
-    unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND) == 0 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

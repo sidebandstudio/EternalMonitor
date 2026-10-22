@@ -387,12 +387,20 @@ fn the_second_screen_notice_says_what_to_do_about_the_driver_device() {
             none.body
         );
         assert!(none.retry && !none.installer);
+        // The user changes the layout; EternalMonitor never does.
         let off_desktop = notice(status, VddProblem::NotExtended);
         assert!(
-            off_desktop.body.contains("extend your desktop"),
+            off_desktop.body.contains("kept your desktop off it"),
             "{}",
             off_desktop.body
         );
+        assert!(off_desktop
+            .body
+            .contains("Windows key + P and choose Extend"));
+        assert!(off_desktop
+            .body
+            .contains("Extend these displays in Settings > System > Display"));
+        assert!(off_desktop.retry && !off_desktop.installer);
     }
     // A hung or missing task still says so first: its fix comes before the device's.
     let hung = second_screen_notice(

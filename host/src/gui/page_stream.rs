@@ -697,7 +697,7 @@ pub(super) fn second_screen_notice(
             false,
         ),
         (Failed | TaskFailed, VddTaskHealth::Ok, Some(VddProblem::NotExtended)) => notice(
-            "Windows added the second screen but wouldn't extend your desktop onto it. Click Try again. If it keeps happening, restart the PC.",
+            "Windows added the second screen but kept your desktop off it. Click Try again, and while the second screen turns on, press Windows key + P and choose Extend, or choose Extend these displays in Settings > System > Display. EternalMonitor waits 30 seconds, and Windows remembers the choice.",
             true,
             false,
         ),

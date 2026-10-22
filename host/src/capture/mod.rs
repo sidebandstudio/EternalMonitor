@@ -18,7 +18,7 @@ use crate::control::SharedControl;
 #[cfg(windows)]
 use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
-use crate::vdd_device::DeviceState;
+use crate::vdd_device::{DeviceState, VddProblem};
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -340,26 +340,10 @@ fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
         && crate::supervisor::generation_is_current(generation)
 }
 
-/// How long to wait for the display after asking Windows to extend onto it.
+/// How long the attempt after "kept your desktop off it" waits, while the
+/// user picks Extend with Windows key + P or in Settings.
 #[cfg(windows)]
-const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Say why the second screen did not appear: on the Stream page each time,
-/// and in the log once per iPad session for each state, so diagnostics show
-/// it without repeating every retry.
-#[cfg(windows)]
-fn report_device(shared: &SharedControl, device: DeviceState) {
-    static LOGGED: Mutex<Vec<(Option<u32>, DeviceState)>> = Mutex::new(Vec::new());
-    let problem = device.problem();
-    *shared.vdd_problem.lock() = Some(problem);
-    let key = (shared.session.lock().session_id(), device);
-    let mut logged = LOGGED.lock();
-    logged.retain(|(session, _)| *session == key.0);
-    if !logged.contains(&key) {
-        logged.push(key);
-        warn!(vdd_device = %device, ?problem, "Virtual display device state");
-    }
-}
+const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(windows)]
 fn vdd_attach_timeout() -> Duration {
@@ -488,7 +472,12 @@ pub(crate) fn reconcile_virtual_display(
                 return None;
             }
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
-            *shared.vdd_problem.lock() = None;
+            // After "kept your desktop off it" the user switches Windows to
+            // Extend while this attempt waits, so give them time to.
+            let timeout = match shared.vdd_problem.lock().take() {
+                Some(VddProblem::NotExtended) => VDD_EXTEND_TIMEOUT,
+                _ => vdd_attach_timeout(),
+            };
             if let Err(device) = crate::vdd::enable(progress) {
                 if !capture_is_current(shared, generation) {
                     return None;
@@ -514,23 +503,11 @@ pub(crate) fn reconcile_virtual_display(
                 startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
                 Some(enumerate_outputs())
             };
-            let wait = |timeout| {
-                wait_for_virtual_output(&before, timeout, poll, Instant::now, std::thread::sleep)
-            };
-            let mut result = wait(vdd_attach_timeout());
-            let mut device = None;
-            if matches!(result, AttachResult::TimedOut) {
-                let state = crate::vdd_device::query();
-                device = Some(state);
-                // The monitor arrived, but Windows did not put the desktop on
-                // it: the saved layout for these displays mirrors or leaves
-                // it out. The user asked for an extra screen.
-                if state == DeviceState::Ready && crate::vdd_device::extend_desktop() {
-                    info!("Virtual display was off the desktop — asked Windows to extend onto it");
-                    result = wait(VDD_EXTEND_TIMEOUT);
-                    device = Some(crate::vdd_device::query());
-                }
-            }
+            let result =
+                wait_for_virtual_output(&before, timeout, poll, Instant::now, std::thread::sleep);
+            // A device that is ready with its monitor means Windows left the
+            // desktop off it. The display layout stays the user's to change.
+            let device = matches!(result, AttachResult::TimedOut).then(crate::vdd_device::query);
             if !capture_is_current(shared, generation) {
                 return None;
             }
