@@ -106,6 +106,20 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 
+    /// A connect attempt that times out is logged as a timeout. It was logged
+    /// as the user disconnecting, which made support data read as people
+    /// giving up while connecting.
+    func testATimeoutIsNotLoggedAsTheUserGivingUp() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager(timing: ConnectionManager.Timing(connectTimeoutSeconds: 1))
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        try await until("timed out", seconds: 5) { manager.state == .disconnected && manager.problem != nil }
+        let lines = manager.diagnostics.map(\.message)
+        XCTAssertTrue(lines.contains("Disconnect state=connecting reason=timeout"), lines.joined(separator: "\n"))
+        XCTAssertFalse(lines.contains { $0.contains("reason=userDisconnect") }, lines.joined(separator: "\n"))
+    }
+
     /// The connection drops while this iPad's Wi-Fi is down (asleep, out of
     /// range). Reconnecting waits for the network instead of spending its
     /// attempts on a dead link, then reconnects as soon as it's back.

@@ -682,7 +682,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect()
+                    self.disconnect(cause: "linkFailure")
                     self.problem = failure
                     return
                 }
@@ -847,7 +847,7 @@ final class ConnectionManager: ObservableObject {
         case .usbTurnedOff: logged = "USB connections turned off"
         }
         record(.warning, "ctrl", "Connection lost (\(logged))")
-        disconnect()
+        disconnect(cause: "connectionLost")
         guard auto, let target else {
             problem = (failure ?? .lost(reason)).withoutReconnecting
             return
@@ -928,7 +928,7 @@ final class ConnectionManager: ObservableObject {
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: self.transportMode == "USB", host: debug.host,
                     pcFound: self.discoveredAddresses.contains(debug.host), local: LocalNetwork.current())
-                self.disconnect()
+                self.disconnect(cause: "timeout")
             }
         }
     }
@@ -1068,10 +1068,14 @@ final class ConnectionManager: ObservableObject {
         connect(host: target.host, port: target.port)
     }
 
-    func disconnect(reason: ByeReason = .userDisconnect) {
+    /// `reason` goes to the PC in the goodbye. `cause` names a teardown the
+    /// app started itself (a timeout, a failed link) in the support log, so
+    /// it isn't counted as the user giving up.
+    func disconnect(reason: ByeReason = .userDisconnect, cause: String? = nil) {
         if state != .disconnected {
-            recordStreamSummary(reason: "disconnect=\(reason)")
-            record(.info, "connection", "Disconnect state=\(state) reason=\(reason)")
+            let logged = cause ?? "\(reason)"
+            recordStreamSummary(reason: "disconnect=\(logged)")
+            record(.info, "connection", "Disconnect state=\(state) reason=\(logged)")
         }
         awaitingPairing = false
         pairingPrompt = nil
