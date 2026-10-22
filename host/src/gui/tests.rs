@@ -418,3 +418,16 @@ fn the_second_screen_notice_says_what_to_do_about_the_driver_device() {
         );
     }
 }
+
+#[test]
+fn the_resolution_match_says_when_a_change_applies() {
+    use super::page_settings::vdd_match_description;
+    for extending in [true, false] {
+        let text = vdd_match_description(extending);
+        assert!(
+            text.contains("applies the next time the second screen starts"),
+            "{text}"
+        );
+    }
+    assert!(vdd_match_description(true).contains("when the iPad connects again"));
+}
