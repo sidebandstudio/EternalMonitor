@@ -2557,4 +2557,70 @@ mod tests {
             assert!(!device.slot.api.button);
         }
     }
+
+    #[test]
+    fn a_lasting_refusal_costs_no_device_and_nothing_is_replayed_after_it() {
+        // Windows refuses every native frame and SendInput inserts nothing,
+        // for five seconds of 240 Hz strokes, hovers and ticks.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        device.slot.api.answer = Outcome::Rejected;
+        device.slot.api.mouse_limit = 0;
+        let start = Instant::now();
+        let mut now = start;
+        let mut strokes = 0;
+        let mut longest_queue = 0;
+        while now < start + Duration::from_secs(5) {
+            strokes += 1;
+            deliver_one(&mut device, pen_xy(PenPhase::Hover, 10, 1), now);
+            deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+            for step in 0..120 {
+                now += Duration::from_micros(4_167);
+                deliver_one(&mut device, pen_xy(PenPhase::Move, 10 + step, 1), now);
+                if step % 12 == 0 {
+                    flush_one(&mut device, now);
+                }
+                longest_queue = longest_queue.max(device.mouse.waiting.len());
+            }
+            deliver_one(&mut device, pen_xy(PenPhase::Up, 130, 1), now);
+            now += Duration::from_millis(200);
+            flush_one(&mut device, now);
+        }
+        // The device is kept: refusals are not a lost or stuck device.
+        assert_eq!(device.slot.api.created, 1);
+        assert!(device.slot.api.destroyed.is_empty());
+        assert!(
+            device.slot.reported.is_empty(),
+            "{:?}",
+            device.slot.reported
+        );
+        // Native input is tried where strokes and hovers start, not per sample.
+        assert!(
+            device.slot.api.frames.len() <= strokes * 4,
+            "{} frames for {strokes} strokes",
+            device.slot.api.frames.len()
+        );
+        // Refused mouse input waits about a second at most.
+        assert!(longest_queue <= 2 * 250, "{longest_queue}");
+        // The app closes: nothing from before is inserted, the button is not
+        // left held, and the next stroke is native again.
+        device.slot.api.answer = Outcome::Injected;
+        device.slot.api.mouse_limit = usize::MAX;
+        device.slot.api.frames.clear();
+        now += INPUT_STALE;
+        flush_one(&mut device, now);
+        assert!(
+            device.slot.api.mouse.is_empty(),
+            "{:?}",
+            device.slot.api.mouse
+        );
+        assert!(!device.slot.api.button);
+        for phase in [PenPhase::Down, PenPhase::Move, PenPhase::Up] {
+            deliver_one(&mut device, pen_xy(phase, 50, 1), now);
+        }
+        assert!(device.slot.api.mouse.is_empty());
+        assert_eq!(
+            device.slot.api.frames,
+            [(1, PenPhase::Down), (1, PenPhase::Move), (1, PenPhase::Up)]
+        );
+    }
 }

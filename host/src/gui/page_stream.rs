@@ -11,6 +11,7 @@ use super::{
 };
 use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
+use crate::input::privilege::ElevatedApp;
 use crate::vdd::VddTaskHealth;
 
 impl AnalyzerApp {
@@ -111,6 +112,18 @@ impl AnalyzerApp {
             capture_block_notice(capture_block, snap.pipeline_running)
         {
             widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            ui.add_space(GAP - 10.0);
+        }
+        #[allow(unused_mut)] // Debug builds may simulate it below.
+        let mut elevated = crate::input::privilege::blocked_by();
+        #[cfg(debug_assertions)]
+        if std::env::var("ETERNAL_SIMULATE_PROBLEM").as_deref() == Ok("elevated-app") {
+            elevated = Some(ElevatedApp {
+                name: Some("CLIPStudioPaint".into()),
+            });
+        }
+        if let Some((title, body)) = elevated_app_notice(elevated.as_ref(), snap.pipeline_running) {
+            widgets::banner(ui, WARNING, Icon::Lock, &title, &body, 0.0, |_| {});
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
@@ -693,6 +706,28 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+    })
+}
+
+/// The notice while Windows keeps input from an app running as
+/// administrator. It goes away when Windows accepts input again or the
+/// stream stops.
+pub(super) fn elevated_app_notice(
+    app: Option<&ElevatedApp>,
+    running: bool,
+) -> Option<(String, String)> {
+    if !running {
+        return None;
+    }
+    Some(match app?.name.as_deref() {
+        Some(name) => (
+            format!("Pencil, touch and keyboard can't reach {name}"),
+            format!("{name} is running as administrator, and Windows blocks input from apps that aren't. Open {name} normally, or quit EternalMonitor and open it as administrator too."),
+        ),
+        None => (
+            "Pencil, touch and keyboard can't reach an app running as administrator".into(),
+            "Windows blocks input from apps that aren't running as administrator. Open that app normally, or quit EternalMonitor and open it as administrator too.".into(),
         ),
     })
 }

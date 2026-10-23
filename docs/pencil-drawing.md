@@ -15,7 +15,9 @@ Windows may promote pen input to mouse messages for applications that request it
    USB but respects the host's limit. Wi-Fi keeps the selected iPad preference.
 4. In CSP, open **Preferences > Tablet > Using tablet service** and choose
    **Tablet PC**. This integration uses Windows Ink; it does not install a
-   WinTab driver. Keep CSP and the host at the same Windows privilege level.
+   WinTab driver. Open CSP and EternalMonitor the same way: Windows blocks
+   input to an app running as administrator from one that isn't, and the
+   Stream page then names the app.
 5. Open **File > Pen Pressure Settings**, draw several light and heavy strokes,
    and select a brush that responds to pressure. Tilt also needs a brush with
    tilt enabled for one of its properties.
@@ -156,6 +158,18 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   Windows taking a down for a contact it still holds. Windows stamps each
   frame itself: setting `PerformanceCount` ourselves made it refuse ten
   times as many.
+- Windows keeps a lower privilege level from controlling a higher one (User
+  Interface Privilege Isolation), so neither native pen input nor
+  `SendInput` reaches an app running as administrator while EternalMonitor
+  is not. Windows does not say so: on the reference PC, with an
+  administrator window in front and under the pen, both reported success
+  and the window received nothing. The host therefore checks the integrity
+  level of the foreground app whenever the foreground window changes, logs
+  its program name once, and the Stream page says to open both apps the
+  same way while it is in front. A pen stroke over an administrator window
+  that is not in front is not detected. `E_ACCESSDENIED` (0x80070005) from
+  native pen injection is most likely the secure desktop (the lock screen or
+  a permission prompt), which the capture notice explains.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
   reject calls spaced less than its 0.1 ms timestamp resolution. If a frame
   is still refused after that, Windows' input queue is stuck: later frames

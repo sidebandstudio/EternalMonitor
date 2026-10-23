@@ -1,8 +1,17 @@
 //! Windows mouse/keyboard and native Windows Ink pen injection.
 
 use tracing::{debug, warn};
-use windows::Win32::Foundation::{ERROR_NOT_READY, POINT, RECT};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_READY, HANDLE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_NONE, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
@@ -35,6 +44,7 @@ use super::pen_contact::{
     pointer_flag, FramePacer, NotReadyRetry, Outcome, PointerFrame, PointerKind,
 };
 use super::pen_device::PenApi;
+use super::privilege::{self, ElevatedApp};
 use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
 // Frames are built, and tested, without the SDK.
@@ -188,8 +198,10 @@ fn inject_frame(
         }
     };
     if count == 10u64.pow(count.ilog10()) {
-        // E_ACCESSDENIED: the secure desktop or an elevated window has focus;
-        // SendInput is blocked there too, so there is no useful fallback.
+        // E_ACCESSDENIED: most likely the secure desktop (the lock screen or
+        // a permission prompt); SendInput is blocked there too. An app
+        // running as administrator does not cause it: Windows accepts input
+        // for it and drops it, see `privilege.rs`.
         // Other codes point at the frame, its starting state or the geometry.
         let output = context.output.unwrap_or(CaptureGeometry {
             left: 0,
@@ -312,6 +324,8 @@ pub(crate) fn inject(
         warn!("Input probe guard rejected an injection batch");
         return;
     }
+    let foreground = unsafe { GetForegroundWindow() };
+    privilege::input_for(foreground.0 as isize, || elevated_app(foreground));
     let screen = virtual_screen();
     let now = std::time::Instant::now();
     let mut inputs: Vec<INPUT> = Vec::with_capacity(injections.len() * 2);
@@ -405,6 +419,57 @@ fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
         Injection::HWheel { delta } => mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, delta),
     };
     inputs.push(input);
+}
+
+/// The app that owns `window`, if it runs at a higher integrity level than
+/// this process (UIPI): Windows drops our input for it.
+fn elevated_app(window: HWND) -> Option<ElevatedApp> {
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let higher = integrity_level(process)
+            .zip(integrity_level(GetCurrentProcess()))
+            .is_some_and(|(theirs, ours)| theirs > ours);
+        let name = higher.then(|| image_name(process)).flatten();
+        let _ = CloseHandle(process);
+        higher.then_some(ElevatedApp { name })
+    }
+}
+
+/// The mandatory integrity level (the RID of its label) of `process`.
+unsafe fn integrity_level(process: HANDLE) -> Option<u32> {
+    let mut token = HANDLE::default();
+    OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+    // TOKEN_MANDATORY_LABEL and the SID it points to; a SID is at most 68 bytes.
+    let mut buffer = [0u64; 16];
+    let mut length = 0;
+    let read = GetTokenInformation(
+        token,
+        TokenIntegrityLevel,
+        Some(buffer.as_mut_ptr().cast()),
+        std::mem::size_of_val(&buffer) as u32,
+        &mut length,
+    );
+    let _ = CloseHandle(token);
+    read.ok()?;
+    let sid = (*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+    let count = *GetSidSubAuthorityCount(sid);
+    (count > 0).then(|| *GetSidSubAuthority(sid, u32::from(count) - 1))
+}
+
+/// `process`'s program name for the notice.
+unsafe fn image_name(process: HANDLE) -> Option<String> {
+    let mut path = [0u16; 1024];
+    let mut length = path.len() as u32;
+    QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_WIN32,
+        PWSTR(path.as_mut_ptr()),
+        &mut length,
+    )
+    .ok()?;
+    privilege::program_name(&String::from_utf16_lossy(&path[..length as usize]))
 }
 
 fn probe_guard_allows(injections: &[Injection]) -> bool {

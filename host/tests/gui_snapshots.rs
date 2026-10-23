@@ -495,6 +495,11 @@ fn review_screens() {
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);
+    // Windows keeping input from an app running as administrator.
+    std::env::set_var("ETERNAL_SIMULATE_PROBLEM", "elevated-app");
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-elevated-app");
+    std::env::remove_var("ETERNAL_SIMULATE_PROBLEM");
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "streaming");
     h.get_by_role_and_label(Role::Button, "QR code").click();
