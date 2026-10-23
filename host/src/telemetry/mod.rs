@@ -644,6 +644,20 @@ mod tests {
         (started.elapsed(), directory)
     }
 
+    /// Whether `check` holds within 10 s. A bounded quit can return while its
+    /// last write or cleanup is still running on another thread, and a slow
+    /// runner can take longer than the quit's allowance.
+    fn eventually(check: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !check() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
     fn outbox_messages(directory: &Path) -> Vec<String> {
         files(directory)
             .unwrap()
@@ -665,24 +679,14 @@ mod tests {
             waited < Duration::from_millis(2500),
             "quit waited {waited:?}"
         );
-        // A slow runner can still be writing when the bounded quit returns.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let messages = loop {
-            let messages = outbox_messages(&directory);
-            let shutdown = messages
-                .iter()
-                .any(|m| m.ends_with("EternalMonitor shutting down"));
-            if shutdown || std::time::Instant::now() >= deadline {
-                break messages;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
         assert!(
-            messages
+            eventually(|| outbox_messages(&directory)
                 .iter()
-                .any(|m| m.ends_with("EternalMonitor shutting down")),
-            "{messages:?}"
+                .any(|m| m.ends_with("EternalMonitor shutting down"))),
+            "{:?}",
+            outbox_messages(&directory)
         );
+        let messages = outbox_messages(&directory);
         // At most the request in flight was sent; the rest wait for next launch.
         assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
         fs::remove_dir_all(directory).unwrap();
@@ -833,7 +837,7 @@ mod tests {
         drop(uploader);
         ENABLED.store(true, Ordering::Relaxed);
         assert!(
-            files(&directory).unwrap().is_empty(),
+            eventually(|| files(&directory).unwrap().is_empty()),
             "{:?}",
             outbox_messages(&directory)
         );
@@ -872,10 +876,14 @@ mod tests {
             waited < SHUTDOWN_WAIT + Duration::from_millis(600),
             "quit waited {waited:?}"
         );
+        assert!(
+            eventually(|| outbox_messages(&directory)
+                .iter()
+                .any(|m| m.ends_with("EternalMonitor shutting down"))),
+            "{:?}",
+            outbox_messages(&directory)
+        );
         let messages = outbox_messages(&directory);
-        assert!(messages
-            .iter()
-            .any(|m| m.ends_with("EternalMonitor shutting down")));
         assert_eq!(messages.iter().filter(|m| *m == "queued").count(), 8);
         let _ = fs::remove_dir_all(directory);
     }
