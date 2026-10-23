@@ -20,6 +20,7 @@ use crate::control::{CaptureTarget, VddStatus};
 
 #[cfg(windows)]
 pub mod dxgi;
+pub mod recovery;
 pub mod synthetic;
 pub(crate) mod timing;
 
@@ -32,8 +33,77 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
+
+/// With nobody connected the cached picture is refreshed this often, so a new
+/// viewer's first frame is at most this old even on a static desktop.
+#[cfg(any(windows, test))]
+pub(crate) const IDLE_REFRESH: Duration = Duration::from_secs(1);
+
+/// What the capture loop does with a frame it acquired.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FrameUse {
+    /// Read it back and hand it to the encoder.
+    Publish,
+    /// Read it back into the cache without encoding it.
+    Cache,
+}
+
+/// 0.3.1 captured and encoded at up to 60 fps whenever the desktop changed,
+/// connected or not: 29 of 35 PCs in the field encoded about 30 fps for
+/// nobody, on battery-powered laptops too. With nobody watching, the loop
+/// now waits before acquiring instead of acquiring and dropping frames:
+/// DXGI reports a change only once, so a dropped frame left the cache stale
+/// until the desktop changed again. Every acquired frame is read back. The
+/// first one is published so the encoder opens before an iPad arrives.
+#[cfg(any(windows, test))]
+pub(crate) struct IdleGate {
+    published_once: bool,
+    last_refresh: Option<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl IdleGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            published_once: false,
+            last_refresh: None,
+        }
+    }
+
+    /// How long to wait before the next acquire. Changes made meanwhile stay
+    /// pending in DXGI, so the next acquire returns the latest desktop.
+    pub(crate) fn wait_before_acquire(&self, watching: bool, now: Instant) -> Duration {
+        match self.last_refresh {
+            Some(at) if !watching && self.published_once => {
+                (at + IDLE_REFRESH).saturating_duration_since(now)
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn on_frame(&mut self, watching: bool, now: Instant) -> FrameUse {
+        self.last_refresh = Some(now);
+        if watching || !self.published_once {
+            self.published_once = true;
+            FrameUse::Publish
+        } else {
+            FrameUse::Cache
+        }
+    }
+}
+
+/// Whether an acquired frame's desktop surface can be read back. A frame with
+/// no desktop update (`LastPresentTime == 0`) only moves or reshapes the
+/// pointer. Until the duplication has delivered one real image its surface is
+/// blank: on Windows 11 the first frame after DuplicateOutput read back as
+/// black, then became the encoder's startup keyframe and the idle cache.
+#[cfg(any(windows, test))]
+pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool {
+    last_present_time != 0 || seen_image
+}
 
 pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
     let fps = target_fps.max(1) as u64;
@@ -234,6 +304,34 @@ fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
     shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
 }
 
+/// Nobody is watching, so nothing is captured or encoded on purpose. The
+/// frame and encode timestamps must stay current anyway: the watchdog read
+/// the idle time as a wedge the moment a viewer arrived ("no captured frame
+/// for 17458ms with a client connected", or "encoder silent while capture
+/// advances" right after the first keepalive) and restarted the pipeline
+/// under the new viewer. 0.3.1 had the same race on a static desktop.
+#[cfg(any(windows, test))]
+pub(crate) fn idle_heartbeat(shared: &SharedControl, now_ms: u64) {
+    startup_heartbeat(shared, now_ms);
+}
+
+/// One poll while waiting to re-create a lost duplication. Returns whether
+/// the viewer's last picture is due to be resent. With nobody watching the
+/// idle heartbeats continue: recovery can take seconds, and a viewer that
+/// arrived between polls was otherwise taken for a wedge ("no captured frame
+/// for 6000ms with a client connected").
+#[cfg(any(windows, test))]
+pub(crate) fn recovery_poll(shared: &SharedControl, now_ms: u64, since_send: Duration) -> bool {
+    if !shared.client_connected() {
+        idle_heartbeat(shared, now_ms);
+        return false;
+    }
+    shared
+        .hb_capture_loop_ms
+        .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    since_send >= IDLE_KEEPALIVE
+}
+
 #[cfg(windows)]
 fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
     shared.running.load(std::sync::atomic::Ordering::SeqCst)
@@ -268,17 +366,28 @@ pub(crate) fn reconcile_virtual_display(
     shared: &SharedControl,
     generation: u64,
 ) -> Option<CaptureTarget> {
-    // A previous capture thread may still be leaving its attach poll when the
-    // supervisor starts the next generation. Only one may trigger driver tasks.
-    let _lifecycle = shared.vdd_lifecycle.lock();
-    if !capture_is_current(shared, generation) {
-        return None;
-    }
     let progress = || {
         if capture_is_current(shared, generation) {
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
         }
     };
+    // A previous capture thread may still be leaving its attach poll or a
+    // driver task (up to 30 s) when the supervisor starts the next generation.
+    // Only one may trigger driver tasks. Waiting here without heartbeats read
+    // as a wedged capture loop after 3 s, and each forced restart queued
+    // another generation behind the same lock.
+    let _lifecycle = loop {
+        if let Some(guard) = shared.vdd_lifecycle.try_lock_for(Duration::from_millis(50)) {
+            break guard;
+        }
+        if !capture_is_current(shared, generation) {
+            return None;
+        }
+        progress();
+    };
+    if !capture_is_current(shared, generation) {
+        return None;
+    }
     match target {
         CaptureTarget::VirtualExtended => {
             // Defer enabling the VDD until an iPad actually connects. The transport restarts the
@@ -351,6 +460,9 @@ pub(crate) fn reconcile_virtual_display(
             }
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
             if !crate::vdd::set_enabled(true, progress) {
+                if !capture_is_current(shared, generation) {
+                    return None;
+                }
                 warn!(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
@@ -421,11 +533,46 @@ pub fn run_capture_stage(
         }
     }
     let guard = CloseOnExit(slot.handle());
-    let result = run_platform_loop(&guard.0, shared, adapter_index, generation);
+    let result = recovery::run_until_unblocked(
+        &shared,
+        |frame_number| {
+            run_platform_loop(
+                &guard.0,
+                shared.clone(),
+                adapter_index,
+                generation,
+                frame_number,
+            )
+        },
+        |delay| wait_while_blocked(&shared, generation, delay),
+    );
     if let Err(ref e) = result {
         error!(error = %e, "Capture loop exited with error");
     }
     result
+}
+
+/// Sleeps between blocked-capture retries. The watchdog has nothing to fix
+/// while Windows withholds the desktop, so the stage keeps its heartbeats.
+fn wait_while_blocked(shared: &SharedControl, generation: u64, delay: Duration) -> bool {
+    use std::sync::atomic::Ordering;
+    let deadline = Instant::now() + delay;
+    loop {
+        if !shared.running.load(Ordering::SeqCst)
+            || !crate::supervisor::generation_is_current(generation)
+        {
+            return false;
+        }
+        let now_ms = crate::clock::host_now_us() / 1000;
+        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
 }
 
 /// A producer/consumer pair for the capture→encoder handoff.
@@ -441,13 +588,14 @@ fn run_platform_loop(
     shared: SharedControl,
     adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested {
-        synthetic::run_capture_loop(slot, shared, generation)
+        synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
-        dxgi::run_capture_loop(slot, shared, adapter_index, generation)
+        dxgi::run_capture_loop(slot, shared, adapter_index, generation, frame_number)
     }
 }
 
@@ -457,8 +605,9 @@ fn run_platform_loop(
     shared: SharedControl,
     _adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    synthetic::run_capture_loop(slot, shared, generation)
+    synthetic::run_capture_loop(slot, shared, generation, frame_number)
 }
 
 /// Choose the freshly-attached virtual output: the first non-primary output whose device name was
@@ -474,6 +623,190 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pointer_only_frames_are_not_read_back_before_the_first_image() {
+        assert!(!frame_has_image(0, false), "blank first frame");
+        assert!(frame_has_image(756_304_210_358, false));
+        // Once an image exists the surface holds it; pointer moves still render.
+        assert!(frame_has_image(0, true));
+    }
+
+    fn connect_viewer(shared: &SharedControl) {
+        use crate::transport::link::PeerId;
+        use crate::transport::session::ConfigSource;
+        use eternal_wire::v2::control::{ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264};
+        struct Config;
+        impl ConfigSource for Config {
+            fn stream_config(&self) -> StreamConfig {
+                StreamConfig {
+                    stream_epoch: 1,
+                    width: 640,
+                    height: 360,
+                    fps: 60,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 15_000_000,
+                }
+            }
+            fn host_name(&self) -> String {
+                "TEST".into()
+            }
+        }
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 50000,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 60,
+            device_name: "viewer".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let peer = PeerId::udp(std::net::SocketAddr::from(([10, 0, 0, 2], 50000)));
+        shared
+            .session
+            .lock()
+            .handle_control(peer, 0, hello, &Config, Instant::now());
+        assert!(shared.client_connected());
+    }
+
+    #[test]
+    fn a_viewer_arriving_after_idle_is_not_taken_for_a_wedge() {
+        use crate::supervisor::{wedge_reason_at, Machine};
+        use std::sync::atomic::Ordering;
+        let machine = Machine::new(1);
+        let start_ms = 1_000_000;
+        let arrival_ms = start_ms + 17_458;
+
+        // Without idle heartbeats (the previous loop): only the loop stamp
+        // advanced while nobody watched.
+        let stale = SharedControl::new(0, 1);
+        startup_heartbeat(&stale, start_ms);
+        stale
+            .hb_capture_loop_ms
+            .store(arrival_ms, Ordering::Relaxed);
+        connect_viewer(&stale);
+        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        assert!(reason.starts_with("no captured frame"), "{reason}");
+        // The first keepalive refreshes the frame stamp before the encoder
+        // has output anything.
+        stale
+            .hb_capture_frame_ms
+            .store(arrival_ms, Ordering::Relaxed);
+        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        assert!(reason.starts_with("encoder silent"), "{reason}");
+
+        // With idle heartbeats the arrival is healthy at every step.
+        let idle = SharedControl::new(0, 1);
+        startup_heartbeat(&idle, start_ms);
+        let mut now = start_ms;
+        while now < arrival_ms {
+            now += 50;
+            idle_heartbeat(&idle, now);
+        }
+        connect_viewer(&idle);
+        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms), None);
+        idle.hb_capture_frame_ms
+            .store(arrival_ms + 10, Ordering::Relaxed);
+        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms + 10), None);
+    }
+
+    #[test]
+    fn a_viewer_arriving_during_access_lost_recovery_is_not_taken_for_a_wedge() {
+        use crate::supervisor::{wedge_reason_at, Machine};
+        let machine = Machine::new(1);
+        let shared = SharedControl::new(0, 1);
+        let start_ms = 1_000_000;
+        startup_heartbeat(&shared, start_ms);
+        // Six seconds of 50 ms polls between DuplicateOutput retries.
+        let mut now = start_ms;
+        while now < start_ms + 6_000 {
+            now += 50;
+            assert!(!recovery_poll(&shared, now, Duration::from_secs(6)));
+        }
+        // A viewer registers 30 ms after a poll, before the next one.
+        connect_viewer(&shared);
+        assert_eq!(wedge_reason_at(&shared, &machine, now + 30), None);
+        // The next poll resends the last picture to it.
+        assert!(recovery_poll(&shared, now + 50, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn an_unwatched_desktop_is_acquired_once_a_second_and_never_encoded() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut gate = IdleGate::new();
+        // The first frame opens the encoder even with nobody connected.
+        assert_eq!(gate.wait_before_acquire(false, start), Duration::ZERO);
+        assert_eq!(gate.on_frame(false, start), FrameUse::Publish);
+        assert_eq!(gate.wait_before_acquire(false, start + ms(400)), ms(600));
+        assert_eq!(
+            gate.wait_before_acquire(false, start + IDLE_REFRESH),
+            Duration::ZERO
+        );
+        assert_eq!(gate.on_frame(false, start + IDLE_REFRESH), FrameUse::Cache);
+        // A viewer is served at once.
+        assert_eq!(
+            gate.wait_before_acquire(true, start + IDLE_REFRESH),
+            Duration::ZERO
+        );
+        assert_eq!(gate.on_frame(true, start + IDLE_REFRESH), FrameUse::Publish);
+    }
+
+    /// DXGI semantics: a desktop change is reported by exactly one
+    /// AcquireNextFrame; later acquires time out until the next change. The
+    /// loop below mirrors the capture loop's use of the gate, with the idle
+    /// keepalive resending the cache when an acquire times out.
+    #[test]
+    fn a_new_viewer_gets_the_current_desktop_after_an_idle_change() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let (mut image, mut pending) = (1u32, true);
+        let mut cache = 0u32;
+        let mut first_sent = None;
+        let mut gate = IdleGate::new();
+        let mut t = 0u64;
+        while t < 6_000 && first_sent.is_none() {
+            // A change lands right after the 2 s refresh, then the desktop
+            // stays still until a viewer connects at 5 s.
+            if t >= 2_000 && image == 1 {
+                image = 2;
+                pending = true;
+            }
+            if t >= 2_100 && image == 2 {
+                image = 3;
+                pending = true;
+            }
+            let watching = t >= 5_000;
+            let wait = gate.wait_before_acquire(watching, at(t));
+            if !wait.is_zero() {
+                // The loop wakes early when a viewer arrives.
+                t = (t + wait.as_millis() as u64).min(t.max(5_000));
+                continue;
+            }
+            if pending {
+                pending = false;
+                cache = image;
+                if gate.on_frame(watching, at(t)) == FrameUse::Publish && watching {
+                    first_sent = Some(image);
+                }
+            } else if watching {
+                first_sent = Some(cache);
+            }
+            t += 8;
+        }
+        assert_eq!(first_sent, Some(3));
+    }
+
     use super::*;
     use crate::control::CaptureTarget;
     use std::cell::Cell;

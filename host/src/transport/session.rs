@@ -514,6 +514,16 @@ impl Session {
         actions
     }
 
+    /// A new pipeline generation is listening again. The client's heartbeats
+    /// and reports during the restart gap went unheard, so the gap must not
+    /// count against it: 0.3.1 expired live iPads the moment a slow restart
+    /// finished and made them reconnect.
+    pub fn transport_resumed(&mut self, now: Instant) {
+        if let Some(session) = self.active.as_mut() {
+            session.liveness_deadline = session.liveness_deadline.max(now + LIVENESS_TIMEOUT);
+        }
+    }
+
     /// Periodic tick: expire the session when the client has been silent past
     /// the liveness window. Returns the heartbeat to send (if a session is
     /// active and `send_heartbeat` is true).
@@ -1077,6 +1087,22 @@ mod tests {
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
+    }
+
+    #[test]
+    fn a_pipeline_restart_gap_does_not_expire_the_client() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        // The transport was down for 11 s (a capture restart with backoff).
+        let resumed = now + Duration::from_secs(11);
+        session.transport_resumed(resumed);
+        assert!(!session.tick(&TestConfig, false, resumed).client_lost);
+        assert!(session.is_active());
+        // A client that stays silent after the restart still expires.
+        let expired = session.tick(&TestConfig, false, resumed + LIVENESS_TIMEOUT);
+        assert!(expired.client_lost);
     }
 
     #[test]

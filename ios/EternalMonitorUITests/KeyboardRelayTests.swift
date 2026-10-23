@@ -33,6 +33,13 @@ final class KeyboardRelayTests: XCTestCase {
         app.keyboards.buttons["Hide keyboard"].tap()
         verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         capture("keyboard-dismissed", app: app)
+        // A slow screenshot can use up the HUD's 5 s timer (CI took 2.3 s
+        // here while the simulator's decoder stalled), and the button can
+        // vanish mid-tap. Let the HUD hide, reveal it, and tap at once.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
+        waitForExpectations(timeout: 6)
+        app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         keyboard.tap()
         XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
         app.buttons["keyboard.done"].tap()

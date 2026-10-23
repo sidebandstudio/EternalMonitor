@@ -93,6 +93,15 @@ impl Source {
     }
 }
 
+/// Constrained VBR usually keeps 20 ms packets under 548 bytes, but field
+/// logs show 550-576 byte packets on four PCs, and the old 548-byte encoder
+/// limit turned each one into "PC audio unavailable" for the rest of the
+/// session. Packets are now bounded by what the wire format accepts. The
+/// transport drops (and counts) any packet over the link's datagram size,
+/// the limit video uses on the same path.
+const MAX_OPUS_PAYLOAD: usize =
+    eternal_wire::v2::MAX_DGRAM_SIZE - eternal_wire::v2::audio::AUDIO_HEADER_SIZE;
+
 struct CaptureSession {
     id: u32,
     source: Source,
@@ -108,7 +117,7 @@ impl CaptureSession {
             id,
             source: Source::open()?,
             resampler: None,
-            encoder: OpusEncoder::new(576 - eternal_wire::v2::audio::AUDIO_HEADER_SIZE)?,
+            encoder: OpusEncoder::new(MAX_OPUS_PAYLOAD)?,
             mark_discontinuity: true,
             next_input_us: None,
         })
@@ -273,6 +282,26 @@ pub fn run_audio_stage(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn opus_packets_seen_in_the_field_are_sent_not_fatal() {
+        use eternal_wire::v2::audio::AudioHeader;
+        let field_packet = vec![0x55; 576];
+        assert!(MAX_OPUS_PAYLOAD >= field_packet.len());
+        let header = AudioHeader {
+            session_id: 1,
+            stream_epoch: 1,
+            audio_seq: 1,
+            capture_ts_us: 0,
+            discontinuity: false,
+        };
+        // 0.3.1 iPads decode it: the receiver accepts the whole wire range.
+        let datagram = header.encode(&field_packet).unwrap();
+        let (decoded, payload) = AudioHeader::decode(&datagram).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(payload, field_packet.as_slice());
+    }
+
     use super::*;
 
     #[test]

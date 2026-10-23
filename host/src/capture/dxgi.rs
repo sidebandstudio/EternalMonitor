@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
+use super::recovery::{
+    note_capture_resumed, CaptureBlock, CaptureUnavailable, LossRecovery, LossStep, LOSS_GIVE_UP,
+};
 use super::{
-    client_connected, frame_budget_for, heartbeat, reconcile_virtual_display, resolve_target,
-    FrameSlot, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
+    client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
+    reconcile_virtual_display, recovery_poll, resolve_target, FrameSlot, FrameUse, IdleGate,
+    OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
 };
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -105,6 +109,7 @@ pub fn run_capture_loop(
     shared: SharedControl,
     adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The capture adapter FOLLOWS the chosen output (which may differ from the
     // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
@@ -216,13 +221,16 @@ pub fn run_capture_loop(
 
     // --- Duplicate the output ---
     let output1: IDXGIOutput1 = output.cast()?;
-    let mut duplication: IDXGIOutputDuplication = unsafe { output1.DuplicateOutput(&device)? };
+    // `None` only between releasing a lost duplication and creating its
+    // replacement inside the ACCESS_LOST handler.
+    let mut duplication: Option<IDXGIOutputDuplication> =
+        Some(unsafe { output1.DuplicateOutput(&device) }.map_err(blocked_or_error)?);
     info!("Desktop duplication active");
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
     // handler re-reads the geometry and rebuilds the staging texture / CPU buffer below.
-    let dupl_desc = unsafe { duplication.GetDesc() };
+    let dupl_desc = unsafe { duplication.as_ref().expect("just created").GetDesc() };
     let mut tex_width = dupl_desc.ModeDesc.Width;
     let mut tex_height = dupl_desc.ModeDesc.Height;
     info!(
@@ -264,7 +272,6 @@ pub fn run_capture_loop(
     let mut last_frame: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_bytes]);
 
     // --- Capture loop state ---
-    let mut frame_number: u64 = 0;
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
     // Time of the last frame handed downstream — drives the idle keepalive (T1d).
@@ -277,6 +284,11 @@ pub fn run_capture_loop(
     let mut cursor_visible = false;
     let mut cursor_x: i32 = 0;
     let mut cursor_y: i32 = 0;
+    let mut recovery = LossRecovery::default();
+    let mut resumed = false;
+    let mut idle = IdleGate::new();
+    // Set once this duplication has delivered a real desktop image.
+    let mut seen_image = false;
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -286,6 +298,26 @@ pub fn run_capture_loop(
             break;
         }
         heartbeat(&shared.hb_capture_loop_ms);
+
+        let wait = idle.wait_before_acquire(client_connected(&shared), Instant::now());
+        if !wait.is_zero() {
+            // Nobody is watching. Waiting (instead of acquiring and dropping
+            // frames) keeps desktop changes pending for the next acquire.
+            let deadline = Instant::now() + wait;
+            while Instant::now() < deadline
+                && !client_connected(&shared)
+                && shared.running.load(Ordering::SeqCst)
+                && crate::supervisor::generation_is_current(generation)
+            {
+                idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50)),
+                );
+            }
+            continue;
+        }
 
         let frame_start = Instant::now();
         let frame_budget = frame_budget_for(shared.effective_fps());
@@ -299,14 +331,36 @@ pub fn run_capture_loop(
         let mut desktop_resource: Option<IDXGIResource> = None;
 
         let acquire_start = Instant::now();
+        let dupl = duplication
+            .as_ref()
+            .expect("the ACCESS_LOST handler re-creates the duplication before continuing");
         let hr = unsafe {
-            duplication.AcquireNextFrame(acquire_timeout_ms, &mut frame_info, &mut desktop_resource)
+            dupl.AcquireNextFrame(acquire_timeout_ms, &mut frame_info, &mut desktop_resource)
         };
         let acquire_us = acquire_start.elapsed().as_micros();
+        if hr.is_ok()
+            || hr
+                .as_ref()
+                .is_err_and(|e| e.code() == DXGI_ERROR_WAIT_TIMEOUT)
+        {
+            // A frame or an idle timeout proves the duplication works.
+            if let Some((losses, took)) = recovery.healthy(acquire_start) {
+                info!(
+                    losses,
+                    took_ms = took.as_millis() as u64,
+                    "Desktop duplication recovered"
+                );
+                resumed = false;
+            }
+            if !resumed {
+                note_capture_resumed(&shared);
+                resumed = true;
+            }
+        }
 
         match hr {
             Ok(()) => {
-                frame_number += 1;
+                *frame_number += 1;
 
                 // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
                 if frame_info.LastMouseUpdateTime != 0 {
@@ -315,12 +369,11 @@ pub fn run_capture_loop(
                     cursor_y = frame_info.PointerPosition.Position.y;
                 }
                 if frame_info.PointerShapeBufferSize > 0 {
-                    cursor.update_shape(&duplication, frame_info.PointerShapeBufferSize);
+                    cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
                 }
 
                 // --- Get dirty rect count ---
-                let dirty_count =
-                    get_dirty_rect_count(&duplication, &frame_info, &mut dirty_rect_buf);
+                let dirty_count = get_dirty_rect_count(dupl, &frame_info, &mut dirty_rect_buf);
 
                 // --- Rolling FPS (60-frame window) ---
                 let now = Instant::now();
@@ -344,8 +397,10 @@ pub fn run_capture_loop(
                 };
 
                 debug!(
-                    frame = frame_number,
+                    frame = *frame_number,
                     dirty_rects = dirty_count,
+                    last_present = frame_info.LastPresentTime,
+                    accumulated = frame_info.AccumulatedFrames,
                     acquire_us = acquire_us,
                     fps = format!("{rolling_fps:.1}"),
                     "Frame acquired"
@@ -353,6 +408,14 @@ pub fn run_capture_loop(
 
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
+                if !frame_has_image(frame_info.LastPresentTime, seen_image) {
+                    unsafe {
+                        dupl.ReleaseFrame()?;
+                    }
+                    continue;
+                }
+                seen_image = true;
+
                 let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
                 {
                     match resource.cast::<ID3D11Texture2D>() {
@@ -363,7 +426,7 @@ pub fn run_capture_loop(
 
                             // Release acquired frame — staging texture has its own copy
                             unsafe {
-                                duplication.ReleaseFrame()?;
+                                dupl.ReleaseFrame()?;
                             }
 
                             let mut pixel_buf =
@@ -421,35 +484,38 @@ pub fn run_capture_loop(
                         Err(e) => {
                             warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
                             unsafe {
-                                duplication.ReleaseFrame()?;
+                                dupl.ReleaseFrame()?;
                             }
                             None
                         }
                     }
                 } else {
                     unsafe {
-                        duplication.ReleaseFrame()?;
+                        dupl.ReleaseFrame()?;
                     }
                     None
                 };
 
                 if let Some(data) = frame_data {
-                    // Record stats
-                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
-                    heartbeat(&shared.hb_capture_frame_ms);
+                    if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
+                        PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                        heartbeat(&shared.hb_capture_frame_ms);
 
-                    slot.publish(RawFrame {
-                        frame_number,
-                        timestamp: now,
-                        data: Arc::clone(&data),
-                        width: tex_width,
-                        height: tex_height,
-                    });
+                        slot.publish(RawFrame {
+                            frame_number: *frame_number,
+                            timestamp: now,
+                            data: Arc::clone(&data),
+                            width: tex_width,
+                            height: tex_height,
+                        });
+                        last_send = now;
+                    } else {
+                        idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
+                    }
                     // The displaced spare (if any) plus last_frame keep at most
                     // two buffers alive; steady state recycles them.
                     spare = Some(Arc::clone(&last_frame));
                     last_frame = data;
-                    last_send = now;
                 }
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -467,18 +533,14 @@ pub fn run_capture_loop(
                 // and the stream stays alive. pixel_buf holds the last composited frame (zeroed
                 // black before the first real frame, which is still a valid keyframe).
                 if client_connected(&shared) && last_send.elapsed() >= IDLE_KEEPALIVE {
-                    frame_number += 1;
-                    let now = Instant::now();
-                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
-                    heartbeat(&shared.hb_capture_frame_ms);
-                    slot.publish(RawFrame {
+                    resend_last_frame(
+                        slot,
+                        &shared,
                         frame_number,
-                        timestamp: now,
-                        data: Arc::clone(&last_frame),
-                        width: tex_width,
-                        height: tex_height,
-                    });
-                    last_send = now;
+                        &mut last_send,
+                        &last_frame,
+                        (tex_width, tex_height),
+                    );
                 } else if !client_connected(&shared)
                     && last_send.elapsed() >= Duration::from_secs(2)
                 {
@@ -488,52 +550,81 @@ pub fn run_capture_loop(
                     // restarts the pipeline for virtual-display targets).
                     // The 250 ms naps stay far under the supervisor's 3 s
                     // loop-heartbeat wedge threshold.
+                    idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                warn!("Desktop duplication access lost — reinitializing");
-                // Transient E_ACCESSDENIED is normal during UAC prompts,
-                // Ctrl+Alt+Del, fullscreen transitions, and driver resets:
-                // retry with backoff instead of dying on the first failure.
-                let mut reinit = None;
-                let delays_ms = [100u64, 250, 500, 1000, 2000];
-                for attempt in 0..15 {
-                    if !shared.running.load(Ordering::SeqCst)
-                        || !crate::supervisor::generation_is_current(generation)
-                    {
-                        break;
-                    }
-                    // Keep the watchdog quiet: this wait IS the recovery.
-                    heartbeat(&shared.hb_capture_loop_ms);
-                    match unsafe { output1.DuplicateOutput(&device) } {
-                        Ok(d) => {
-                            reinit = Some(d);
+                // Normal during UAC prompts, the lock screen, mode changes and
+                // full-screen transitions. A duplication re-created too early is
+                // lost again at once, so the retries back off instead of spinning.
+                if !recovery.in_episode() {
+                    warn!("Desktop duplication access lost — reinitializing");
+                }
+                // Release the lost duplication before asking for a new one:
+                // Windows refuses a second duplication of the same output.
+                duplication = None;
+                let mut last_code = e.code();
+                while duplication.is_none() {
+                    let delay = match recovery.lost(Instant::now()) {
+                        LossStep::Retry(delay) => delay,
+                        LossStep::GiveUp => {
+                            return Err(Box::new(CaptureUnavailable {
+                                block: CaptureBlock::from_hresult(last_code.0)
+                                    .unwrap_or(CaptureBlock::DisplayChanging),
+                                detail: format!(
+                                    "desktop duplication not reacquired within {}s (last error {:#010x})",
+                                    LOSS_GIVE_UP.as_secs(),
+                                    last_code.0 as u32
+                                ),
+                            }));
+                        }
+                    };
+                    // Keep the iPad's session and last picture alive meanwhile.
+                    let deadline = Instant::now() + delay;
+                    loop {
+                        if !shared.running.load(Ordering::SeqCst)
+                            || !crate::supervisor::generation_is_current(generation)
+                        {
+                            return Ok(());
+                        }
+                        let now_ms = crate::clock::host_now_us() / 1000;
+                        if recovery_poll(&shared, now_ms, last_send.elapsed()) {
+                            resend_last_frame(
+                                slot,
+                                &shared,
+                                frame_number,
+                                &mut last_send,
+                                &last_frame,
+                                (tex_width, tex_height),
+                            );
+                        }
+                        let now = Instant::now();
+                        if now >= deadline {
                             break;
                         }
+                        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+                    }
+                    match unsafe { output1.DuplicateOutput(&device) } {
+                        Ok(d) => {
+                            duplication = Some(d);
+                            seen_image = false;
+                        }
                         Err(retry_error) => {
-                            let delay = delays_ms[attempt.min(delays_ms.len() - 1)];
-                            debug!(
-                                attempt,
-                                error = %retry_error,
-                                delay_ms = delay,
-                                "DuplicateOutput retry failed"
-                            );
-                            std::thread::sleep(Duration::from_millis(delay));
+                            debug!(error = %retry_error, "DuplicateOutput retry failed");
+                            last_code = retry_error.code();
+                            // Tell the GUI why while the retries continue.
+                            if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
+                                *shared.capture_block.lock() = Some(block);
+                            }
                         }
                     }
                 }
-                let Some(new_duplication) = reinit else {
-                    return Err(
-                        "desktop duplication could not be reacquired after ~20s of retries".into(),
-                    );
-                };
-                duplication = new_duplication;
                 // A resolution/topology change also surfaces as ACCESS_LOST. Re-read the
                 // duplication geometry and rebuild the staging texture + CPU buffer if it changed,
                 // otherwise CopyResource silently no-ops on a size mismatch and the iPad freezes.
-                let new_desc = unsafe { duplication.GetDesc() };
+                let new_desc = unsafe { duplication.as_ref().expect("re-created above").GetDesc() };
                 let (new_w, new_h) = (new_desc.ModeDesc.Width, new_desc.ModeDesc.Height);
                 if new_w != 0 && new_h != 0 && (new_w != tex_width || new_h != tex_height) {
                     info!(
@@ -583,6 +674,42 @@ pub fn run_capture_loop(
     }
 
     Ok(())
+}
+
+/// Hand the last captured image downstream again, so the encoder emits a
+/// frame (and any pending IDR) while the desktop itself delivers none.
+fn resend_last_frame(
+    slot: &FrameSlot,
+    shared: &SharedControl,
+    frame_number: &mut u64,
+    last_send: &mut Instant,
+    last_frame: &Arc<Vec<u8>>,
+    (width, height): (u32, u32),
+) {
+    *frame_number += 1;
+    let now = Instant::now();
+    PIPELINE_STATS.lock().record_capture(width, height);
+    heartbeat(&shared.hb_capture_frame_ms);
+    slot.publish(RawFrame {
+        frame_number: *frame_number,
+        timestamp: now,
+        data: Arc::clone(last_frame),
+        width,
+        height,
+    });
+    *last_send = now;
+}
+
+/// Windows states that block duplication become [`CaptureUnavailable`], which
+/// the stage retries; anything else fails the stage as before.
+fn blocked_or_error(error: windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    match CaptureBlock::from_hresult(error.code().0) {
+        Some(block) => Box::new(CaptureUnavailable {
+            block,
+            detail: error.to_string(),
+        }),
+        None => Box::new(error),
+    }
 }
 
 /// Build the BGRA staging-texture descriptor for CPU readback at the given dimensions. Factored

@@ -9,6 +9,7 @@ use super::{
     friendly_codec, value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot,
     StreamState, CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL,
 };
+use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
 
 impl AnalyzerApp {
@@ -49,6 +50,11 @@ impl AnalyzerApp {
 
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        let capture_block = *self.control.shared.capture_block.lock();
+        if let Some((title, body)) = capture_block_notice(capture_block, snap.pipeline_running) {
+            widgets::banner(ui, WARNING, Icon::Warning, title, body, 0.0, |_| {});
+            ui.add_space(GAP - 10.0);
+        }
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
@@ -179,6 +185,10 @@ impl AnalyzerApp {
                 parts.push(friendly_codec(&snap.codec_name));
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
+            StreamState::Paused => (
+                format!("Streaming to {device} is paused"),
+                "Windows stopped screen capture. See the message above.".to_string(),
+            ),
         };
 
         widgets::card().show(ui, |ui| {
@@ -686,6 +696,40 @@ pub(super) fn usb_cable_notice(
             "Your iPad is plugged in, but Apple Devices is not installed",
             "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. WiFi works without it.",
         )
+    })
+}
+
+/// The Stream page notice while Windows withholds the screen: what is going
+/// on and what to do. Capture keeps retrying meanwhile. A stopped stream
+/// retries nothing, so it shows none.
+pub(super) fn capture_block_notice(
+    block: Option<CaptureBlock>,
+    running: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !running {
+        return None;
+    }
+    Some(match block? {
+        CaptureBlock::SecureDesktop => (
+            "Windows is showing the lock screen or a permission prompt",
+            "Windows hides the screen from other apps while it does. Unlock the PC or answer the prompt, and the picture comes back by itself.",
+        ),
+        CaptureBlock::DisplayChanging => (
+            "Windows is changing the display",
+            "A display setting changed or a full-screen app took over the screen. The picture comes back by itself when Windows finishes. If it doesn't, close the full-screen app or click Restart.",
+        ),
+        CaptureBlock::UnsupportedOnThisGpu => (
+            "Windows can't capture this screen from the graphics card in use",
+            "This happens on laptops with two graphics cards. In Windows Settings, open System, then Display, then Graphics, and set EternalMonitor to Power saving. Then quit and reopen EternalMonitor.",
+        ),
+        CaptureBlock::TooManyCaptureApps => (
+            "Too many apps are capturing the screen",
+            "Windows lets only a few apps capture the screen at once. Close screen recording or sharing apps you aren't using, and the picture comes back by itself.",
+        ),
+        CaptureBlock::SessionDisconnected => (
+            "This Windows session is disconnected",
+            "Windows stops screen capture while the session is disconnected, for example during Remote Desktop or after switching users. Sign in to this account at the PC itself, and the picture comes back by itself.",
+        ),
     })
 }
 

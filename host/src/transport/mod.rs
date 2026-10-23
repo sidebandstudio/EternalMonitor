@@ -210,6 +210,7 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+    shared.session.lock().transport_resumed(Instant::now());
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -369,10 +370,15 @@ pub async fn start_sender(
                     awaiting_keyframe = true;
                 }
                 if awaiting_keyframe {
-                    if !nal.is_keyframe {
-                        continue; // stale pre-session frame — the forced IDR is coming
+                    let started = shared.session.lock().client_info().map(|info| info.connected_at);
+                    match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
+                        FirstFrame::Send => awaiting_keyframe = false,
+                        FirstFrame::Skip => continue, // the forced IDR is coming
+                        FirstFrame::SkipAndRequestKeyframe => {
+                            shared.force_next_idr.store(true, Ordering::SeqCst);
+                            continue;
+                        }
                     }
-                    awaiting_keyframe = false;
                 }
 
                 let send_start = Instant::now();
@@ -481,6 +487,32 @@ pub async fn start_sender(
 
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FirstFrame {
+    Send,
+    Skip,
+    SkipAndRequestKeyframe,
+}
+
+/// A session's first frame must be a keyframe captured after it started. An
+/// encoder can hold a frame for a long time when nothing is being encoded:
+/// NVENC kept the host's startup frame while the PC sat idle, and the next
+/// viewer received that old, blank keyframe as its first picture. A stale
+/// keyframe is skipped and a fresh one requested.
+fn first_frame_gate(
+    is_keyframe: bool,
+    captured: Instant,
+    session_start: Option<Instant>,
+) -> FirstFrame {
+    if !is_keyframe {
+        FirstFrame::Skip
+    } else if session_start.is_some_and(|start| captured < start) {
+        FirstFrame::SkipAndRequestKeyframe
+    } else {
+        FirstFrame::Send
+    }
 }
 
 type DeferredControl = VecDeque<LinkEvent>;
@@ -639,6 +671,25 @@ async fn execute_actions(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_session_starts_with_a_keyframe_captured_after_it_began() {
+        let start = Instant::now();
+        let before = start - Duration::from_secs(17);
+        let after = start + Duration::from_millis(10);
+        assert_eq!(
+            first_frame_gate(false, after, Some(start)),
+            FirstFrame::Skip
+        );
+        // The encoder's leftover startup IDR must not open the session.
+        assert_eq!(
+            first_frame_gate(true, before, Some(start)),
+            FirstFrame::SkipAndRequestKeyframe
+        );
+        assert_eq!(first_frame_gate(true, after, Some(start)), FirstFrame::Send);
+        assert_eq!(first_frame_gate(true, start, Some(start)), FirstFrame::Send);
+    }
+
     use super::*;
     use eternal_wire::v2::control::{
         encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,

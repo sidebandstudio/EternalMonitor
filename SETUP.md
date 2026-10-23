@@ -193,6 +193,12 @@ or in the controls while streaming.
 | The picture stutters or freezes on Wi-Fi | Move closer to the router, or use a 5 GHz network. Connect the PC to the router with a network cable, or use USB. |
 | **Hardware encoder unavailable** on the PC | In **Settings**, select **Auto** for the encoder and **YUV420** for encoder input, then restart the stream. Update the driver from your GPU manufacturer. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Support → Diagnostics**. Some GPUs have no supported hardware encoder. |
 | **Extended display unavailable** on the PC | Run EternalMonitor-Setup.exe again to repair the install, then restart the stream. |
+| **Streaming to** your iPad **is paused** on the PC | Windows stopped screen capture, and the message above it says why. The iPad keeps its last picture until capture comes back. |
+| **Windows is showing the lock screen or a permission prompt** on the PC | Unlock the PC or answer the prompt. The picture comes back by itself. |
+| **Windows is changing the display** on the PC | Wait a moment. If the picture doesn't come back, close any full-screen app and click **Restart**. |
+| **Windows can't capture this screen from the graphics card in use** on the PC | This happens on laptops with two graphics cards. In Windows **Settings**, open **System**, then **Display**, then **Graphics**, and set EternalMonitor to **Power saving**. Then quit and reopen EternalMonitor. |
+| **Too many apps are capturing the screen** on the PC | Close screen recording or sharing apps you aren't using. The picture comes back by itself. |
+| **This Windows session is disconnected** on the PC | End the Remote Desktop session, or switch back to this account at the PC. The picture comes back by itself. |
 
 **Using a VPN such as Tailscale?** In the PC window, open **Settings** and set
 **Packet size** to **1200**.

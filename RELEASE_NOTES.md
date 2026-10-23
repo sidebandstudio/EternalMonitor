@@ -1,3 +1,37 @@
+## Unreleased
+
+Windows reliability fixes from 0.3.1 support diagnostics. iPads on 0.3.1 work
+with these changes.
+
+### What changed
+
+- A USB cable connection now stays up when the PC restarts its stream, for
+  example after a settings change or when the extended display turns on. In
+  0.3.1 each restart dropped the cable connection, and with **Extended display
+  (iPad)** selected the iPad could keep reconnecting without ever showing a
+  picture.
+- When Windows blocks screen capture (lock screen, UAC prompt, display mode
+  change, or a laptop GPU it will not capture from), the host keeps retrying
+  by itself instead of stopping the stream until someone clicks Start. A
+  connected iPad keeps the last picture meanwhile. The retries back off
+  instead of running in a tight loop that filled the logs.
+- Turning on the extended display no longer triggers repeated stream restarts
+  while Windows runs the display task. When that task hangs or is missing, the
+  host mirrors the main screen immediately instead of waiting for it each time.
+- With no iPad connected, the PC no longer encodes its screen. It reads the
+  screen at most once a second, so an iPad that connects still sees the
+  current desktop.
+- PC audio no longer turns off for the rest of a session after a single large
+  sound packet.
+- The installer also allows display traffic on domain (work or school)
+  networks.
+- A log line repeated many times in a row is written once, followed by a
+  line with the repeat count and the first and last times. The count appears
+  about 30 seconds after the burst starts, or when the app quits, so logs and
+  support reports keep the lines that explain a problem.
+- Quitting waits at most two seconds for support uploads; the rest are sent
+  on the next launch.
+
 ## EternalMonitor v0.3.1
 
 Install the Windows and iPad 0.3.1 updates together. This release includes Intel

@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod encoder;
 pub mod gui;
 pub mod input;
+pub mod log_repeat;
 pub mod logging;
 pub mod pairing;
 pub mod pipeline;

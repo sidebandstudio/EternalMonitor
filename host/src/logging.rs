@@ -14,6 +14,8 @@ use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuar
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::log_repeat::RepeatCollapser;
+
 const LOG_BUFFER_LIMIT: usize = 500;
 const LOG_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const LOG_LINE_LIMIT: usize = 16 * 1024;
@@ -28,6 +30,10 @@ static OUTPUT_ERRORS: Lazy<Mutex<Option<tracing_appender::non_blocking::ErrorCou
 static STORAGE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_STORAGE_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static SESSION_LOG_PATH: Lazy<PathBuf> = Lazy::new(resolve_session_log_path);
+static REPEATS: Lazy<Arc<Mutex<RepeatCollapser>>> = Lazy::new(Default::default);
+/// The production writer, kept so repeat summaries can be written on a timer
+/// and at shutdown when no other log line arrives to carry them.
+static SUMMARY_WRITER: std::sync::OnceLock<Mutex<MemoryLogWriter>> = std::sync::OnceLock::new();
 fn open_session_log() -> Option<RollingLogFile> {
     let path = SESSION_LOG_PATH.clone();
     if let Some(parent) = path.parent() {
@@ -166,10 +172,30 @@ pub struct MemoryLogWriter {
     shared: Arc<Mutex<VecDeque<String>>>,
     session_file: Option<NonBlocking>,
     current_line: Vec<u8>,
+    repeats: Option<Arc<Mutex<RepeatCollapser>>>,
+}
+
+/// Keeps the session log open. Dropping it writes pending repeat summaries
+/// first, so a burst that was still being counted at exit keeps its count;
+/// the inner guard then drains the log file.
+pub struct SessionLogGuard(#[allow(dead_code)] Option<WorkerGuard>);
+
+impl Drop for SessionLogGuard {
+    fn drop(&mut self) {
+        flush_repeat_summaries();
+    }
+}
+
+/// Writes the summaries of every burst still being counted. Called at
+/// shutdown (before support uploads stop, and before the session log closes).
+pub fn flush_repeat_summaries() {
+    if let Some(writer) = SUMMARY_WRITER.get() {
+        writer.lock().emit_repeat_summaries(None);
+    }
 }
 
 impl MemoryLogWriter {
-    pub fn start() -> (Self, Option<WorkerGuard>) {
+    pub fn start() -> (Self, SessionLogGuard) {
         let (session_file, guard) = match open_session_log() {
             Some(file) => {
                 let (writer, guard) = non_blocking_output(file);
@@ -178,14 +204,42 @@ impl MemoryLogWriter {
             }
             None => (None, None),
         };
-        (
-            Self {
-                shared: LOG_BUFFER.clone(),
-                session_file,
-                current_line: Vec::new(),
-            },
-            guard,
-        )
+        let writer = Self {
+            shared: LOG_BUFFER.clone(),
+            session_file,
+            current_line: Vec::new(),
+            repeats: Some(REPEATS.clone()),
+        };
+        if SUMMARY_WRITER.set(Mutex::new(writer.clone())).is_ok() {
+            // A burst's summary is due 30 s after it began. Without this tick
+            // it waited for the next log line, which may never come.
+            let _ = std::thread::Builder::new()
+                .name("log-repeats".into())
+                .spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Some(writer) = SUMMARY_WRITER.get() {
+                        writer
+                            .lock()
+                            .emit_repeat_summaries(Some(std::time::Instant::now()));
+                    }
+                });
+        }
+        (writer, SessionLogGuard(guard))
+    }
+
+    /// Writes summaries of bursts whose window ended by `due`, or of every
+    /// open burst when `due` is `None`.
+    fn emit_repeat_summaries(&mut self, due: Option<std::time::Instant>) {
+        let Some(repeats) = self.repeats.clone() else {
+            return;
+        };
+        let lines = match due {
+            Some(now) => repeats.lock().flush_due(now),
+            None => repeats.lock().flush_all(),
+        };
+        for line in lines {
+            self.emit(line);
+        }
     }
 
     fn push_line(&mut self) {
@@ -198,6 +252,17 @@ impl MemoryLogWriter {
             .to_string();
         self.current_line.clear();
         let line = redact_support_text(&line);
+        if let Some(repeats) = self.repeats.clone() {
+            let lines = repeats.lock().push(&line, std::time::Instant::now());
+            for line in lines {
+                self.emit(line);
+            }
+        } else {
+            self.emit(line);
+        }
+    }
+
+    fn emit(&mut self, line: String) {
         crate::telemetry::record(&line);
 
         if line.is_empty() {
@@ -314,6 +379,17 @@ pub fn session_log_text() -> Option<String> {
 
 pub fn session_log_path() -> PathBuf {
     SESSION_LOG_PATH.clone()
+}
+
+/// Release the log and upload guards in the order a normal quit needs. A
+/// session-log guard may emit final lines, such as repeat summaries, while it
+/// drops; those reach support only while the upload guard still queues lines.
+/// The upload guard then writes what is queued to the outbox, within its
+/// bound, and console output goes last.
+pub fn flush_before_exit<S, U, C>(session_log: S, uploads: U, console: C) {
+    drop(session_log);
+    drop(uploads);
+    drop(console);
 }
 
 fn resolve_session_log_path() -> PathBuf {
@@ -473,6 +549,7 @@ mod tests {
             shared: shared.clone(),
             session_file: None,
             current_line: Vec::new(),
+            repeats: None,
         };
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -522,12 +599,56 @@ mod tests {
     }
 
     #[test]
+    fn quit_drops_session_log_guards_while_uploads_still_queue() {
+        struct Guard(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.lock().push(self.0);
+            }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        flush_before_exit(
+            Guard("session log", order.clone()),
+            Guard("uploads", order.clone()),
+            Guard("console", order.clone()),
+        );
+        assert_eq!(*order.lock(), ["session log", "uploads", "console"]);
+    }
+
+    #[test]
+    fn a_burst_summary_is_written_when_its_window_ends_without_more_traffic() {
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+            repeats: Some(Default::default()),
+        };
+        for _ in 0..20 {
+            writer
+                .write_all(b"2026-10-21T03:10:19.347613Z  WARN access lost\n")
+                .unwrap();
+        }
+        assert_eq!(shared.lock().len(), 1);
+        // The ticker's call before the window ends writes nothing.
+        writer.emit_repeat_summaries(Some(std::time::Instant::now()));
+        assert_eq!(shared.lock().len(), 1);
+        writer.emit_repeat_summaries(Some(
+            std::time::Instant::now() + crate::log_repeat::REPEAT_WINDOW,
+        ));
+        let lines: Vec<_> = shared.lock().iter().cloned().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("access lost [repeated 19 more times"));
+    }
+
+    #[test]
     fn oversized_line_is_bounded_and_does_not_leak_credential_tail() {
         let shared = Arc::new(Mutex::new(VecDeque::new()));
         let mut writer = MemoryLogWriter {
             shared: shared.clone(),
             session_file: None,
             current_line: Vec::new(),
+            repeats: None,
         };
         writer
             .write_all(
@@ -629,6 +750,7 @@ mod tests {
             shared: shared.clone(),
             session_file: None,
             current_line: Vec::new(),
+            repeats: None,
         };
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -689,6 +811,7 @@ mod tests {
             shared: shared.clone(),
             session_file: Some(output),
             current_line: Vec::new(),
+            repeats: None,
         };
         writer.write_all(b"first\n").unwrap();
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
