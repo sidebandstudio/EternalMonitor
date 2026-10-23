@@ -115,7 +115,8 @@ Windows changes.
   quality now drops only while the cable keeps falling behind.
 - On Wi-Fi, a frame whose repair is late is waited for instead of replaced by
   a whole new picture, so a still desktop flashes and smears less. 120 Hz
-  iPads keep frames whose repair is still on its way.
+  iPads keep frames whose repair is still on its way. The picture no longer
+  pauses briefly after each screen update the PC skipped.
 - The Quick Start guide installed with EternalMonitor matches this version's
   buttons and messages, and no longer names an old release.
 - A new Known issues page lists the problems we know about, each with what to
