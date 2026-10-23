@@ -34,6 +34,9 @@ struct Scenario {
     late_uplink: f64,
     stall_every_s: u64,
     seconds: u64,
+    /// Number frames as 0.3.1 did, by capture: one number in seven skipped,
+    /// as the encoder mailbox skipped 14% of captured frames in the field.
+    capture_skips: bool,
 }
 
 #[derive(Debug, Default)]
@@ -176,6 +179,7 @@ fn simulate(s: Scenario) -> Outcome {
     let mut decodes_from = None::<u32>;
     let mut latencies = Vec::new();
     let mut resends: HashMap<(u32, u16), u64> = HashMap::new();
+    let mut previous_sent: HashMap<u32, u32> = HashMap::new();
     let mut nacks_sent: HashMap<u32, u64> = HashMap::new();
 
     while let Some(((now, _), event)) = events.pop_first() {
@@ -184,8 +188,12 @@ fn simulate(s: Scenario) -> Outcome {
         }
         match event {
             Event::SendFrame => {
+                let previous = seq;
                 seq += 1;
-                let keyframe = u64::from(seq - 1).is_multiple_of(GOP) || keyframe_pending;
+                if s.capture_skips && outcome.frames % 7 == 6 {
+                    seq += 1;
+                }
+                let keyframe = outcome.frames.is_multiple_of(GOP) || keyframe_pending;
                 keyframe_pending = false;
                 outcome.keyframes_sent += u64::from(keyframe);
                 let count = if keyframe {
@@ -194,6 +202,7 @@ fn simulate(s: Scenario) -> Outcome {
                     s.delta_fragments
                 };
                 sent_at.insert(seq, (now, count, keyframe));
+                previous_sent.insert(seq, previous);
                 for index in 0..count {
                     let header = header(seq, index, count, keyframe, false);
                     let key = [1, u64::from(seq), u64::from(index)];
@@ -254,8 +263,10 @@ fn simulate(s: Scenario) -> Outcome {
             }
         }
         for frame in r.take_ready() {
-            // A delta frame decodes only right after a frame that decoded.
-            let decodes = frame.is_keyframe || decodes_from == Some(frame.seq - 1);
+            // A delta frame decodes only right after the frame sent before it,
+            // if that one decoded.
+            let decodes =
+                frame.is_keyframe || decodes_from == previous_sent.get(&frame.seq).copied();
             decodes_from = decodes.then_some(frame.seq);
             if decodes {
                 outcome.decodable += 1;
@@ -301,6 +312,7 @@ const STILL: Scenario = Scenario {
     late_uplink: 0.3,
     stall_every_s: 0,
     seconds: 600,
+    capture_skips: false,
 };
 const MOVING: Scenario = Scenario {
     name: "moving, 60 fps",
@@ -311,6 +323,7 @@ const MOVING: Scenario = Scenario {
     late_uplink: 0.3,
     stall_every_s: 5,
     seconds: 120,
+    capture_skips: false,
 };
 const PROMOTION: Scenario = Scenario {
     name: "moving, 120 fps",
@@ -321,6 +334,7 @@ const PROMOTION: Scenario = Scenario {
     late_uplink: 0.3,
     stall_every_s: 5,
     seconds: 120,
+    capture_skips: false,
 };
 
 /// A still desktop was where one iPad dropped 503 of its 525 frames and asked
@@ -338,11 +352,22 @@ fn a_still_desktop_waits_for_late_repairs_instead_of_keyframes() {
     assert!(outcome.dropped * 200 <= outcome.frames, "{outcome:?}");
 }
 
-/// Prints the measurement table used in the release report.
+/// Prints the measurement table used in the release report, with frames
+/// numbered contiguously and as 0.3.1 numbered them.
 #[test]
 fn wifi_repair_table() {
     for scenario in [STILL, MOVING, PROMOTION] {
-        let outcome = simulate(scenario);
-        eprintln!("WIFI_SIM {} {outcome:?}", scenario.name);
+        for capture_skips in [false, true] {
+            let outcome = simulate(Scenario {
+                capture_skips,
+                ..scenario
+            });
+            let numbering = if capture_skips {
+                "capture"
+            } else {
+                "contiguous"
+            };
+            eprintln!("WIFI_SIM {} {numbering} {outcome:?}", scenario.name);
+        }
     }
 }

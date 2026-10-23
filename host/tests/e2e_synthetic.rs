@@ -204,6 +204,7 @@ fn usb_framed_stream_end_to_end() {
         let mut recovery_ms = 0;
         let mut highest_seq = 0;
         let mut epoch = ack.stream_config.stream_epoch;
+        let mut last_counter: Option<u64> = None;
         while after_recovery < 30 || heartbeats == 0 {
             assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
             if decoded >= 30 && resumed.is_none() {
@@ -239,8 +240,11 @@ fn usb_framed_stream_end_to_end() {
                             }
                         }
                         let frames = decoder.decode(&frame);
-                        for counter in &frames {
-                            assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
+                        // The wire numbers frames contiguously; the picture
+                        // carries the capture number, which may skip.
+                        for &counter in &frames {
+                            assert!(last_counter.is_none_or(|last| counter > last), "pictures go back: {counter}");
+                            last_counter = Some(counter);
                         }
                         decoded += frames.len() as u32;
                         if recovered && !frames.is_empty() {
@@ -1107,14 +1111,9 @@ fn synthetic_stream_end_to_end_v2() {
                     }
                 }
 
-                for counter in decoder.decode(&frame_bytes) {
-                    assert_eq!(
-                        counter,
-                        header.frame_seq as u64 & 0xFF_FFFF,
-                        "decoded frame counter must match the wire sequence number"
-                    );
-                    decoded_counters.push(counter);
-                }
+                // The picture carries the capture number, which skips frames
+                // the encoder never took; the wire numbers frames without gaps.
+                decoded_counters.extend(decoder.decode(&frame_bytes));
             }
             other => panic!("unexpected datagram from host: {other:?}"),
         }
@@ -1687,14 +1686,7 @@ fn hevc_stream_negotiates_and_decodes() {
                     }
                 }
 
-                for counter in decoder.decode(&frame_bytes) {
-                    assert_eq!(
-                        counter,
-                        header.frame_seq as u64 & 0xFF_FFFF,
-                        "decoded HEVC frame counter must match the wire sequence"
-                    );
-                    decoded_hevc.push(counter);
-                }
+                decoded_hevc.extend(decoder.decode(&frame_bytes));
             }
             _ => {}
         }
