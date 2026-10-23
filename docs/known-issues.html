@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="UTF-8">
+  <script>document.documentElement.className = 'js';</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Known issues | EternalMonitor</title>
+  <meta name="description" content="Problems we know about in EternalMonitor, and what you can do about each one.">
+  <meta property="og:title" content="Known issues | EternalMonitor">
+  <meta property="og:description" content="Problems we know about in EternalMonitor, and what you can do about each one.">
+  <meta property="og:url" content="https://eternalmonitor.dev/known-issues.html">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Known issues | EternalMonitor">
+  <meta name="twitter:description" content="Problems we know about in EternalMonitor, and what you can do about each one.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
+  <link rel="canonical" href="https://eternalmonitor.dev/known-issues.html">
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <nav class="nav" aria-label="Main">
+    <div class="container nav-inner">
+      <a href="index.html" class="nav-brand" aria-label="EternalMonitor home">
+        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html#features" class="nav-link hide-sm">Features</a>
+        <a href="index.html#faq" class="nav-link hide-sm">FAQ</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener" class="nav-link" aria-label="GitHub repository">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span class="nav-link-label">GitHub</span>
+        </a>
+        <a href="download.html" class="btn btn-primary btn-sm">Download</a>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">
+    <section class="download-hero">
+      <div class="container">
+        <h1>Known issues</h1>
+        <p>These are the problems we know about in the current EternalMonitor release, and what you can do about each one.</p>
+        <p>If the iPad or the PC shows a message, look it up in the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">setup guide's troubleshooting tables</a>. Found a problem that isn't listed? <a href="download.html#feedback">Tell us</a>.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="container issues">
+        <h2 id="safety-and-installing">Safety and installing</h2>
+
+        <article class="issue" id="not-encrypted">
+          <h3>The stream is not encrypted</h3>
+          <p>Pairing stops other people's devices from connecting, but the picture, sound and what you type travel over the network as they are.</p>
+          <p><strong>What to do:</strong> use EternalMonitor at home or on another network you trust, not on public Wi-Fi. Over a USB cable nothing goes over the network. A private network such as Tailscale also works: in the PC window open <strong>Settings</strong>, then <strong>Advanced</strong>, and set <strong>Packet size</strong> to <strong>1200</strong>.</p>
+        </article>
+
+        <article class="issue" id="smartscreen">
+          <h3>Windows warns before the installer runs</h3>
+          <p>The installer is not code-signed yet, so a blue <strong>Windows protected your PC</strong> window appears.</p>
+          <p><strong>What to do:</strong> only for a file you downloaded from <a href="download.html">eternalmonitor.dev</a>, click <strong>More info</strong>, then <strong>Run anyway</strong>. To be extra careful, check that the file's SHA-256 matches the one on the download page.</p>
+        </article>
+
+        <article class="issue" id="windows-only">
+          <h3>Only Windows PCs are supported</h3>
+          <p>The PC app does not run on a Mac. It has not been tested on Windows PCs with Arm processors, such as Snapdragon laptops.</p>
+          <p><strong>What to do:</strong> on a Mac, use Apple's <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> instead.</p>
+        </article>
+
+        <h2 id="connecting">Connecting</h2>
+
+        <article class="issue" id="usb-windows-version">
+          <h3>USB needs a newer Windows than Wi-Fi</h3>
+          <p>EternalMonitor runs on Windows 10 version 1809 or later. A USB cable also needs Apple's Apple Devices app, and that needs Windows 10 version 22H2 (build 19045) or Windows 11.</p>
+          <p><strong>What to do:</strong> on older Windows 10, connect over Wi-Fi, or update Windows in <strong>Settings</strong>, <strong>Windows Update</strong>. To see your version, open <strong>Settings</strong>, <strong>System</strong>, <strong>About</strong>.</p>
+        </article>
+
+        <article class="issue" id="wrong-address">
+          <h3>The address shown on the PC can be the wrong one</h3>
+          <p>If the PC also runs a VPN or a virtual network (for example Tailscale, Hyper-V or WSL), the <strong>Address</strong> in the PC window can belong to that instead of your Wi-Fi or Ethernet. The QR code carries the same address, so scanning it doesn't help. The iPad then says <strong>Your PC didn't answer</strong>.</p>
+          <p><strong>What to do:</strong> on the iPad, tap your PC under <strong>Found on this network</strong>; that finds the right address by itself. If your PC isn't listed, type its Wi-Fi or Ethernet address instead. Find it in Windows <strong>Settings</strong>, <strong>Network &amp; internet</strong>, under your Wi-Fi or Ethernet connection. It usually starts with 192.168. or 10.</p>
+        </article>
+
+        <article class="issue" id="networks-keep-devices-apart">
+          <h3>Some networks keep devices apart</h3>
+          <p>Guest networks, some office networks and some mesh Wi-Fi systems stop the iPad from reaching the PC, even on the same Wi-Fi name. The iPad then finds no PCs, or says <strong>Your PC didn't answer</strong>.</p>
+          <p><strong>What to do:</strong> use a USB cable, or use your main home network rather than a guest network.</p>
+        </article>
+
+        <article class="issue" id="run-as-administrator">
+          <h3>Running EternalMonitor as administrator can start it twice</h3>
+          <p>If you once opened it with <strong>Run as administrator</strong>, opening it again normally can start a second copy. The two copies get in each other's way and the iPad may not connect.</p>
+          <p><strong>What to do:</strong> close every EternalMonitor window, then open it once, the normal way. You don't need to run it as administrator.</p>
+        </article>
+
+        <h2 id="picture-and-sound">Picture and sound</h2>
+
+        <article class="issue" id="second-screen-small">
+          <h3>The second screen can appear small and blurry</h3>
+          <p>On some PCs the second screen starts at 800 × 600 instead of the iPad's size.</p>
+          <p><strong>What to do:</strong> in Windows <strong>Settings</strong>, open <strong>System</strong>, then <strong>Display</strong>, select the iPad's screen and pick a larger <strong>Display resolution</strong> if one is listed. If none is, use <strong>Mirror my screen</strong> for now.</p>
+        </article>
+
+        <article class="issue" id="second-screen-fails">
+          <h3>The second screen doesn't start on some PCs</h3>
+          <p>The PC window then says <strong>The second screen couldn't start, so your main screen is mirrored</strong>, and a second line says why.</p>
+          <p><strong>What to do:</strong> if it says Windows' display driver stopped responding, restart the PC; there's no button for this one. If it says the second screen isn't installed, or part of the install is missing or blocked, click <strong>Download installer</strong>, run EternalMonitor-Setup.exe, then click <strong>Try again</strong>. Otherwise click <strong>Try again</strong>. Mirroring keeps working in the meantime.</p>
+        </article>
+
+        <article class="issue" id="usb-stutter">
+          <h3>Over a USB cable, older or slower PCs can stutter</h3>
+          <p>The picture can smear, go grey or keep jumping back to a sharp frame, and then the connection drops.</p>
+          <p><strong>What to do:</strong> in the PC window's <strong>Settings</strong>, set <strong>Frame rate</strong> to <strong>30</strong>. If it still stutters, use Wi-Fi on a 5 GHz network instead.</p>
+        </article>
+
+        <article class="issue" id="wifi-flashes">
+          <h3>On Wi-Fi the picture sometimes flashes or smears for a moment</h3>
+          <p>This happens when the Wi-Fi loses data, and it is worse far from the router.</p>
+          <p><strong>What to do:</strong> move closer to the router, use a 5 GHz network, connect the PC to the router with a network cable, or use a USB cable.</p>
+        </article>
+
+        <article class="issue" id="wide-screens">
+          <h3>Very wide screens use the processor</h3>
+          <p>On screens wider than 4096 pixels, such as 5K monitors, NVIDIA graphics cards cannot encode the standard video format. The PC window says <strong>Video is using the processor instead of the graphics card</strong> and the picture may lag.</p>
+          <p><strong>What to do:</strong> use <strong>Second screen</strong> instead of mirroring that monitor, or mirror a smaller monitor in <strong>Settings</strong>, under <strong>How the iPad shows your PC</strong>.</p>
+        </article>
+
+        <article class="issue" id="driver-reset">
+          <h3>The PC window can close if the graphics driver resets</h3>
+          <p>Rarely, when Windows restarts the graphics driver during a stream, EternalMonitor closes and says <strong>EternalMonitor stopped unexpectedly</strong>.</p>
+          <p><strong>What to do:</strong> open EternalMonitor again and reconnect. Update the graphics driver from NVIDIA, AMD or Intel. If it keeps happening, send us the log file the message names.</p>
+        </article>
+
+        <article class="issue" id="nvidia-crash">
+          <h3>One NVIDIA driver crash was seen once</h3>
+          <p>On one test PC with NVIDIA driver 591.86, Windows stopped with an error about two seconds after a USB connection switched to the second screen. We could not make it happen again.</p>
+          <p><strong>What to do:</strong> keep your NVIDIA driver up to date. If it happens to you, tell us your driver version and the time it happened.</p>
+        </article>
+
+        <article class="issue" id="hevc">
+          <h3>The sharper video format (HEVC) is experimental</h3>
+          <p>On some iPads and graphics cards it can glitch or go black for a moment.</p>
+          <p><strong>What to do:</strong> leave <strong>Sharper video format (HEVC)</strong> off in <strong>Settings</strong>, under <strong>Advanced</strong>. If you changed other options there, click <strong>Use recommended settings</strong> when the PC offers it.</p>
+        </article>
+
+        <article class="issue" id="fps-120">
+          <h3>120 frames per second is not confirmed yet</h3>
+          <p>The setting exists, but we have not yet confirmed that iPads with 120 Hz screens really show 120.</p>
+          <p><strong>What to do:</strong> use <strong>60</strong> if 120 looks no smoother or stutters.</p>
+        </article>
+
+        <h2 id="apple-pencil-and-drawing">Apple Pencil and drawing</h2>
+
+        <article class="issue" id="pencil-usb-c">
+          <h3>Apple Pencil (USB-C) can't vary line width</h3>
+          <p>It has no pressure sensor.</p>
+          <p><strong>What to do:</strong> use Apple Pencil (1st or 2nd generation) or Apple Pencil Pro for pressure.</p>
+        </article>
+
+        <article class="issue" id="pencil-administrator">
+          <h3>Apple Pencil doesn't draw in apps opened as administrator</h3>
+          <p>Windows blocks pen input into an app running as administrator unless EternalMonitor runs that way too.</p>
+          <p><strong>What to do:</strong> open your drawing app normally, not with <strong>Run as administrator</strong>.</p>
+        </article>
+
+        <article class="issue" id="clip-studio-paint">
+          <h3>Clip Studio Paint needs one setting</h3>
+          <p>Without it, pressure doesn't work.</p>
+          <p><strong>What to do:</strong> in Clip Studio Paint choose <strong>Preferences</strong>, then <strong>Tablet</strong>, then <strong>Tablet PC</strong>. The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" target="_blank" rel="noopener">drawing guide</a> has the details.</p>
+        </article>
+
+        <article class="issue" id="stroke-stops">
+          <h3>A stroke can occasionally stop partway</h3>
+          <p>Rarely, Windows refuses one pen movement and the line breaks.</p>
+          <p><strong>What to do:</strong> lift the Pencil and continue the line. If it happens often, tell us your graphics card and how your monitors are arranged.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <a href="index.html" class="footer-brand">
+        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
+        EternalMonitor
+      </a>
+      <p class="footer-copy">Built by whoisaldo · Open source under MIT</p>
+      <div class="footer-links">
+        <a href="index.html">Home</a>
+        <a href="download.html">Download</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="mailto:hello@sideband.studio">Contact</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

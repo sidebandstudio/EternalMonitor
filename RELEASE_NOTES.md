@@ -113,9 +113,16 @@ Windows changes.
   short and asked for another, again and again, until the picture froze or
   turned grey; it also lowered the quality as if the cable lost data. The
   quality now drops only while the cable keeps falling behind.
-- On WiFi, a frame whose repair is late is waited for instead of replaced by
+- On Wi-Fi, a frame whose repair is late is waited for instead of replaced by
   a whole new picture, so a still desktop flashes and smears less. 120 Hz
   iPads keep frames whose repair is still on its way.
+- The Quick Start guide installed with EternalMonitor matches this version's
+  buttons and messages, and no longer names an old release.
+- A new Known issues page lists the problems we know about, each with what to
+  do. The setup guide's troubleshooting tables give every message both apps
+  show, what it means and what to do.
+- On Windows older than Windows 10 version 1809, the installer says which
+  Windows version EternalMonitor needs, in plain words.
 
 ### What to test
 

@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Security fixes go into the latest 0.3 build, currently `v0.3.0`. The 0.1
-releases are no longer maintained; please update both apps.
+Security fixes go into the latest release, the one on the
+[download page](https://eternalmonitor.dev/download.html). Older releases are
+not maintained; please update both apps.
 
 ## Reporting a vulnerability
 

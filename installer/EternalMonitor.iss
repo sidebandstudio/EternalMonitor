@@ -53,6 +53,11 @@ SetupLogging=yes
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; The same requirements the website, README and SETUP.md list.
+WinVersionTooLowError=EternalMonitor needs Windows 10 version 1809 or later, or Windows 11. Update Windows, then run this installer again.
+OnlyOnTheseArchitectures=EternalMonitor needs a 64-bit PC with Windows 10 version 1809 or later, or Windows 11.
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 ; Autostart is handled inside the app (Settings -> "Start with Windows",

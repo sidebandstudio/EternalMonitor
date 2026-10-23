@@ -1,4 +1,4 @@
-# Host settings in v0.3.0
+# Host settings
 
 The host offers 30, 60, 90 and 120 fps. An iPad requesting 30, 60 or 120 fps caps the host at the lower of the two settings. Disconnecting clears the client cap without changing the host preference. The iPad's Frame Rate setting applies on the next connection.
 
