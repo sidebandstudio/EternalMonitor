@@ -359,7 +359,14 @@ impl Reassembler {
                 let through = frame.highest_index;
                 self.begin_gap(seq, through, now);
             }
-            if complete {
+            if complete && header.is_keyframe {
+                // A complete keyframe needs no earlier frame (see
+                // `FrameAssembler.addFragment`): retire everything older.
+                let older: Vec<_> = self.pending.range(..seq).map(|(&s, _)| s).collect();
+                for s in older {
+                    self.drop_pending(s);
+                }
+            } else if complete {
                 let older: Vec<_> = self
                     .pending
                     .range(..seq)

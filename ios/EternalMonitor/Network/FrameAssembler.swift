@@ -286,7 +286,13 @@ final class FrameAssembler {
             if !frame.isComplete && frame.contiguous < frame.highestIndex {
                 beginGap(seq, through: frame.highestIndex, now: now)
             }
-            if frame.isComplete {
+            if frame.isComplete && isKeyframe {
+                // A complete keyframe needs no earlier frame. It is shown at
+                // once, and everything older, held, partial or waiting behind
+                // a gap, is retired without asking for another keyframe; it
+                // used to wait out a held frame's repair window first.
+                for older in pending.keys.sorted() where older < seq { dropPending(older) }
+            } else if frame.isComplete {
                 // Completion of a newer frame also proves older trailing
                 // fragments are absent, even if no later index exposed them.
                 for older in pending.keys.sorted() where older < seq {

@@ -208,6 +208,23 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
     }
 
+    /// A complete keyframe needs no earlier frame. Received at 320 ms behind a
+    /// held frame, it used to wait out that frame's repair window until 345 ms.
+    func testCompleteKeyframeIsShownAtOnceAndRetiresAHeldFrame() {
+        enableRepair()
+        add(seq: 1, index: 0, count: 2, byte: 1)
+        for at in stride(from: UInt64(0), through: 316_667, by: 1_000) { assembler.tick(at: at) }
+        XCTAssertTrue(completed.isEmpty)
+        now = 320_000
+        add(seq: 2, index: 0, count: 1, byte: 2, keyframe: true)
+        XCTAssertEqual(completed, [Data([2])], "shown at once")
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 0, "the keyframe already replaces the held frame")
+        now = 321_000
+        add(seq: 1, index: 1, count: 2, byte: 3, retransmit: true)
+        XCTAssertEqual(completed.count, 1, "a late repair for a retired frame is ignored")
+    }
+
     func testRepairHoldsAtMostThirtyTwoFrames() {
         enableRepair()
         let bound = UInt32(FrameAssembler.maxPendingFrames)
