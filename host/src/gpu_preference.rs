@@ -121,32 +121,60 @@ pub fn with_gpu_preference(existing: Option<&str>, preference: u32) -> String {
 /// The argument a reopened copy gets: wait for this process to exit before
 /// the single-instance check, which would otherwise send it away.
 pub const AFTER_EXIT_ARG: &str = "--after-exit-of";
+/// With [`AFTER_EXIT_ARG`]: once the old process is gone, save this
+/// `GpuPreference` and start the app again. Windows reads the preference
+/// only when a process starts, and writing it while EternalMonitor still
+/// used the GPU hung that process's next Desktop Duplication call (mainpc).
+pub const GPU_PREFERENCE_ARG: &str = "--set-gpu-preference";
 
-/// The arguments for a reopened copy: this process's own, without a wait
-/// left from an earlier reopen, then the wait for `pid`.
-pub fn reopen_args(args: impl IntoIterator<Item = String>, pid: u32) -> Vec<String> {
+/// The user's own arguments (a custom port is the first one), without the
+/// ones a reopen adds.
+pub fn own_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut kept = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == AFTER_EXIT_ARG {
+        if arg == AFTER_EXIT_ARG || arg == GPU_PREFERENCE_ARG {
             args.next();
         } else {
             kept.push(arg);
         }
     }
-    kept.extend([AFTER_EXIT_ARG.to_string(), pid.to_string()]);
     kept
 }
 
-/// The process id a reopened copy must wait for, from its arguments.
-pub fn waited_for_pid(args: impl IntoIterator<Item = String>) -> Option<u32> {
+/// The arguments for a copy that waits for `pid` to exit and, with a
+/// `preference`, saves it before starting the app again.
+pub fn reopen_args(
+    args: impl IntoIterator<Item = String>,
+    pid: u32,
+    preference: Option<u32>,
+) -> Vec<String> {
+    let mut kept = own_args(args);
+    kept.extend([AFTER_EXIT_ARG.to_string(), pid.to_string()]);
+    if let Some(preference) = preference {
+        kept.extend([GPU_PREFERENCE_ARG.to_string(), preference.to_string()]);
+    }
+    kept
+}
+
+fn arg_value(args: impl IntoIterator<Item = String>, name: &str) -> Option<u32> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == AFTER_EXIT_ARG {
+        if arg == name {
             return args.next()?.parse().ok();
         }
     }
     None
+}
+
+/// The process id a reopened copy must wait for, from its arguments.
+pub fn waited_for_pid(args: impl IntoIterator<Item = String>) -> Option<u32> {
+    arg_value(args, AFTER_EXIT_ARG)
+}
+
+/// The `GpuPreference` a reopened copy must save, from its arguments.
+pub fn requested_preference(args: impl IntoIterator<Item = String>) -> Option<u32> {
+    arg_value(args, GPU_PREFERENCE_ARG).filter(|value| matches!(value, 1 | 2))
 }
 
 #[cfg(windows)]
@@ -161,7 +189,7 @@ mod windows_impl {
     use std::time::Duration;
 
     use std::ffi::c_void;
-    use tracing::{info, warn};
+    use tracing::info;
 
     use windows::core::{s, w, Interface, GUID, HRESULT, PCWSTR};
     use windows::Win32::Devices::Display::{
@@ -350,10 +378,34 @@ mod windows_impl {
         })
     }
 
-    /// Writes EternalMonitor's own per-app graphics preference and starts a
-    /// copy that waits for this process to exit. The caller then quits.
-    /// Only for a switch with a certain preference.
+    /// Starts a copy that waits for this process to exit, saves the
+    /// preference, and opens the app again. The caller then quits. Only for a
+    /// switch with a certain preference. This process never writes the
+    /// preference itself: it still uses the GPU until it exits.
     pub fn switch_and_reopen(switch: &GpuSwitch) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let preference = switch
+            .preference
+            .ok_or("no graphics card setting is certain to select this card")?;
+        info!(
+            preference,
+            adapter = %switch.adapter_name,
+            "Reopening EternalMonitor to switch its graphics card"
+        );
+        std::process::Command::new(&exe)
+            .args(super::reopen_args(
+                std::env::args().skip(1),
+                std::process::id(),
+                Some(preference),
+            ))
+            .spawn()
+            .map_err(|error| format!("Could not reopen EternalMonitor: {error}"))?;
+        Ok(())
+    }
+
+    /// Saves `preference` in EternalMonitor's own `UserGpuPreferences`
+    /// value, keeping its other settings. Returns the value before and after.
+    fn save_preference(preference: u32) -> Result<(Option<String>, String), String> {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let name: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
         let mut key = HKEY::default();
@@ -374,9 +426,6 @@ mod windows_impl {
             return Err(format!("Could not open the graphics settings: {status:?}"));
         }
         let existing = read_string(key, PCWSTR(name.as_ptr()));
-        let preference = switch
-            .preference
-            .ok_or("no graphics card setting is certain to select this card")?;
         let value = with_gpu_preference(existing.as_deref(), preference);
         let bytes: Vec<u8> = value
             .encode_utf16()
@@ -390,21 +439,7 @@ mod windows_impl {
         if status != ERROR_SUCCESS {
             return Err(format!("Could not save the graphics setting: {status:?}"));
         }
-        info!(
-            before = existing.as_deref().unwrap_or("(none)"),
-            after = %value,
-            adapter = %switch.adapter_name,
-            "Saved EternalMonitor's graphics card choice; reopening"
-        );
-        // Keep the user's own arguments (a custom port is the first one).
-        std::process::Command::new(&exe)
-            .args(super::reopen_args(
-                std::env::args().skip(1),
-                std::process::id(),
-            ))
-            .spawn()
-            .map_err(|error| format!("Could not reopen EternalMonitor: {error}"))?;
-        Ok(())
+        Ok((existing, value))
     }
 
     fn read_string(key: HKEY, name: PCWSTR) -> Option<String> {
@@ -433,21 +468,42 @@ mod windows_impl {
     }
 
     /// In a copy started by [`switch_and_reopen`], waits for the previous
-    /// process to exit so the single-instance check lets this one run.
+    /// process to exit so the single-instance check lets this one run. With a
+    /// preference to save, saves it and starts the app again, which is when
+    /// Windows applies it, then exits. Runs before logging starts.
     pub fn wait_for_previous_if_requested() {
-        let Some(pid) = super::waited_for_pid(std::env::args().skip(1)) else {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let Some(pid) = super::waited_for_pid(args.clone()) else {
             return;
         };
-        let Ok(process) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
-            return; // Already gone.
+        if let Ok(process) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+            let waited =
+                unsafe { WaitForSingleObject(process, WAIT_FOR_PREVIOUS.as_millis() as u32) };
+            unsafe {
+                let _ = CloseHandle(process);
+            }
+            if waited.0 != 0 {
+                eprintln!("The previous EternalMonitor (pid {pid}) did not exit in time");
+            }
+        }
+        let Some(preference) = super::requested_preference(args.clone()) else {
+            return;
         };
-        let waited = unsafe { WaitForSingleObject(process, WAIT_FOR_PREVIOUS.as_millis() as u32) };
-        unsafe {
-            let _ = CloseHandle(process);
+        match save_preference(preference) {
+            Ok((before, after)) => eprintln!("Saved GpuPreference {before:?} -> {after:?}"),
+            Err(error) => eprintln!("{error}"),
         }
-        if waited.0 != 0 {
-            warn!(pid, "The previous EternalMonitor did not exit in time");
+        // If saving failed, the app opens as before: the saved switch marker
+        // then makes the notice explain Windows Settings instead.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Err(error) = std::process::Command::new(exe)
+                .args(super::own_args(args))
+                .spawn()
+            {
+                eprintln!("Could not reopen EternalMonitor: {error}");
+            }
         }
+        std::process::exit(0);
     }
 }
 
@@ -557,9 +613,22 @@ mod tests {
         assert_eq!(waited_for_pid(args(&["--minimized"])), None);
         assert_eq!(waited_for_pid(args(&[AFTER_EXIT_ARG])), None);
         assert_eq!(waited_for_pid(args(&[AFTER_EXIT_ARG, "x"])), None);
-        // The port stays first and an earlier wait is dropped.
-        let reopened = reopen_args(args(&["19876", AFTER_EXIT_ARG, "7"]), 4242);
-        assert_eq!(reopened, args(&["19876", AFTER_EXIT_ARG, "4242"]));
-        assert_eq!(waited_for_pid(reopened), Some(4242));
+        // The port stays first and an earlier reopen's arguments are dropped.
+        let reopened = reopen_args(
+            args(&["19876", AFTER_EXIT_ARG, "7", GPU_PREFERENCE_ARG, "1"]),
+            4242,
+            Some(2),
+        );
+        assert_eq!(
+            reopened,
+            args(&["19876", AFTER_EXIT_ARG, "4242", GPU_PREFERENCE_ARG, "2"])
+        );
+        assert_eq!(waited_for_pid(reopened.clone()), Some(4242));
+        assert_eq!(requested_preference(reopened.clone()), Some(2));
+        // The app the helper starts gets only the user's own arguments.
+        assert_eq!(own_args(reopened), args(&["19876"]));
+        assert_eq!(requested_preference(args(&[GPU_PREFERENCE_ARG, "3"])), None);
+        let plain = reopen_args(args(&[]), 9, None);
+        assert_eq!(requested_preference(plain), None);
     }
 }
