@@ -665,10 +665,24 @@ mod tests {
             waited < Duration::from_millis(2500),
             "quit waited {waited:?}"
         );
-        let messages = outbox_messages(&directory);
-        assert!(messages
-            .iter()
-            .any(|m| m.ends_with("EternalMonitor shutting down")));
+        // A slow runner can still be writing when the bounded quit returns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let messages = loop {
+            let messages = outbox_messages(&directory);
+            let shutdown = messages
+                .iter()
+                .any(|m| m.ends_with("EternalMonitor shutting down"));
+            if shutdown || std::time::Instant::now() >= deadline {
+                break messages;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.ends_with("EternalMonitor shutting down")),
+            "{messages:?}"
+        );
         // At most the request in flight was sent; the rest wait for next launch.
         assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
         fs::remove_dir_all(directory).unwrap();
