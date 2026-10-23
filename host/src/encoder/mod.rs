@@ -16,7 +16,7 @@ use eternal_wire::h264::{
 
 use crate::capture::FrameSlot;
 use crate::control::SharedControl;
-use crate::gpu::GpuInfo;
+use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
 
 pub mod input;
@@ -28,6 +28,11 @@ const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
+/// Largest picture side the encoders take. H.264 on NVENC, AMF and Quick Sync
+/// stops at 4096 pixels ("Width 5120 exceeds 4096"), which sent 5120-wide
+/// displays to the CPU encoder. No iPad screen is that wide, so a larger
+/// desktop is scaled down to fit instead.
+const MAX_ENCODE_SIDE: u32 = 4096;
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -110,6 +115,7 @@ fn run_encode_loop(
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
         // libx264 override is not a fallback, so it intentionally leaves this false.
         stats.set_software_fallback(false);
+        stats.nvidia_driver_outdated = false;
     }
 
     let mut encoder_state: Option<EncoderState> = None;
@@ -252,16 +258,20 @@ fn run_encode_loop(
                         error = %e,
                         "Preferred encoder failed to open; trying remaining encoders"
                     );
-                    let (name, state) = open_remaining_encoders(&encoder_name, |name| {
-                        EncoderState::new(
-                            name,
-                            raw_frame.width,
-                            raw_frame.height,
-                            desired_bitrate,
-                            target_fps,
-                            input_mode,
-                        )
-                    })?;
+                    let (name, state) = open_remaining_encoders(
+                        &encoder_name,
+                        crate::gpu::vendors_present,
+                        |name| {
+                            EncoderState::new(
+                                name,
+                                raw_frame.width,
+                                raw_frame.height,
+                                desired_bitrate,
+                                target_fps,
+                                input_mode,
+                            )
+                        },
+                    )?;
                     encoder_name = name.to_string();
                     encoder_state = Some(state);
                     PIPELINE_STATS
@@ -540,6 +550,9 @@ struct EncoderState {
     /// Last applied bitrate. Hardware encoders reopen when this changes.
     opened_bitrate: u32,
     opened_fps: u32,
+    /// The captured size this session takes. The encoded picture is smaller
+    /// when the desktop is larger than `MAX_ENCODE_SIDE`.
+    source_size: (u32, u32),
     /// Frames sent to this session. Its first frame is always an IDR.
     frames_submitted: u64,
     /// First frame's capture instant — the PTS epoch for this session.
@@ -601,6 +614,17 @@ impl EncoderState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
+        let (encode_width, encode_height) = encode_size(width, height);
+        if (encode_width, encode_height) != (width, height) {
+            info!(
+                encoder = encoder_name,
+                width,
+                height,
+                encode_width,
+                encode_height,
+                "Scaling the desktop down to the largest size the encoder takes"
+            );
+        }
         let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
@@ -620,8 +644,8 @@ impl EncoderState {
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
 
-        encoder.set_width(width);
-        encoder.set_height(height);
+        encoder.set_width(encode_width);
+        encoder.set_height(encode_height);
         encoder.set_format(pixel_format);
         if legacy_pts {
             encoder.set_time_base(ffmpeg_next::Rational(1, 60));
@@ -642,19 +666,34 @@ impl EncoderState {
                 (*encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
             };
         }
-        encoder.set_gop(30);
+        // ETERNAL_GOP_FRAMES lets tests turn off the periodic IDR, so only
+        // keyframe requests can repair a broken reference chain.
+        let gop = std::env::var("ETERNAL_GOP_FRAMES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|&frames| frames > 0)
+            .unwrap_or(30);
+        encoder.set_gop(gop);
         configure_encoder_flags(&mut encoder, encoder_name);
 
         let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts).map_err(|error| {
+            if nvidia_driver_outdated(encoder_name, error, &crate::gpu::nvidia_driver_versions()) {
+                warn!(
+                    encoder = encoder_name,
+                    "The NVIDIA driver is too old for NVENC; it needs {NVENC_MIN_DRIVER} or newer"
+                );
+                PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+            }
             let code: i32 = error.into();
-            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
+            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {encode_width}x{encode_height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
         })?;
         log_encoder_configuration(encoder_name, &encoder);
+        PIPELINE_STATS.lock().encode_resolution = (encode_width, encode_height);
         info!(
-            width,
-            height,
+            width = encode_width,
+            height = encode_height,
             bitrate = bitrate_bps,
             fps = target_fps,
             encoder = encoder_name,
@@ -664,7 +703,11 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = input::conversion_context(pixel_format, width, height)?;
+        let scaler = input::conversion_context(
+            pixel_format,
+            (width, height),
+            (encode_width, encode_height),
+        )?;
         let needs_conversion = scaler.is_some();
         if scaler.is_some() {
             info!(output = ?pixel_format, "swscale BGRA conversion context created");
@@ -672,7 +715,9 @@ impl EncoderState {
 
         Ok(Self {
             #[cfg(target_os = "macos")]
-            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P
+                && (encode_width, encode_height) == (width, height)
+            {
                 match vimage::Converter::new() {
                     Ok(converter) => {
                         info!("Accelerate BGRA->YUV420P converter ready");
@@ -691,7 +736,7 @@ impl EncoderState {
             bgra_frame: needs_conversion.then(|| {
                 ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height)
             }),
-            frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
+            frame: ffmpeg_next::frame::Video::new(pixel_format, encode_width, encode_height),
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
@@ -699,6 +744,7 @@ impl EncoderState {
             opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
             opened_fps: target_fps,
+            source_size: (width, height),
             frames_submitted: 0,
             pts_epoch: None,
             last_pts: -1,
@@ -741,7 +787,7 @@ impl EncoderState {
     }
 
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
-        self.frame.width() == width && self.frame.height() == height
+        self.source_size == (width, height)
     }
 
     fn observe_amf_diagnostics(
@@ -798,15 +844,32 @@ impl InFlightFrames {
 
 fn open_remaining_encoders<T>(
     failed: &str,
+    vendors_present: impl FnOnce() -> Vec<GpuVendor>,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
-    let hardware: &[&str] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
-        &["h264_nvenc", "h264_amf", "h264_qsv"]
+    let hardware: &[(&str, GpuVendor)] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv")
+    {
+        &[
+            ("h264_nvenc", GpuVendor::Nvidia),
+            ("h264_amf", GpuVendor::Amd),
+            ("h264_qsv", GpuVendor::Intel),
+        ]
     } else {
         &[]
     };
-    for &name in hardware {
+    let vendors_present = if hardware.is_empty() {
+        Vec::new()
+    } else {
+        vendors_present()
+    };
+    for &(name, vendor) in hardware {
         if name == failed {
+            continue;
+        }
+        // AMF on a PC without an AMD card only logs "DLL amfrt64.dll failed
+        // to open" (4 PCs in 0.3.1 diagnostics); skip what cannot work.
+        if !vendors_present.is_empty() && !vendors_present.contains(&vendor) {
+            info!(encoder = name, %vendor, "No graphics card from this vendor; not trying it");
             continue;
         }
         match open(name) {
@@ -816,6 +879,55 @@ fn open_remaining_encoders<T>(
     }
     warn!("No hardware encoder opened; falling back to libx264 (software)");
     open("libx264").map(|state| ("libx264", state))
+}
+
+/// The oldest NVIDIA driver the linked FFmpeg 7.1.1 build's NVENC (API 13.0)
+/// opens with. Older drivers fail with "Driver does not support the required
+/// nvenc API version", and FFmpeg 7.1 prints the minimum as "(unknown)".
+pub const NVENC_MIN_DRIVER: &str = "570";
+/// [`NVENC_MIN_DRIVER`] in hundredths, as [`nvidia_release`] returns it.
+const NVENC_MIN_RELEASE: u32 = 57_000;
+
+/// NVIDIA's driver number in hundredths (56607 for 566.07) from the Windows
+/// driver version packed as DXGI reports it (32.0.15.6607): the last digit
+/// of the third part followed by the four digits of the fourth.
+fn nvidia_release(windows_version: u64) -> u32 {
+    let third = ((windows_version >> 16) & 0xffff) as u32;
+    let fourth = (windows_version & 0xffff) as u32;
+    (third % 10) * 10_000 + fourth
+}
+
+/// Whether an NVENC open failed because the NVIDIA driver is too old: FFmpeg
+/// returned ENOSYS, and every NVIDIA driver on the PC is older than NVENC
+/// needs. ENOSYS alone is not enough: FFmpeg also uses it for parameters the
+/// encoder does not support. `driver_versions` are the NVIDIA adapters'
+/// Windows driver versions; none known means not outdated.
+fn nvidia_driver_outdated(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: &[u64],
+) -> bool {
+    encoder_name.ends_with("_nvenc")
+        && matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
+        && !driver_versions.is_empty()
+        && driver_versions
+            .iter()
+            .all(|&version| nvidia_release(version) < NVENC_MIN_RELEASE)
+}
+
+/// The picture size to encode a `width` x `height` desktop at: the same size,
+/// or scaled down with its shape kept until both sides fit `MAX_ENCODE_SIDE`.
+/// Sides stay even for 4:2:0 chroma.
+fn encode_size(width: u32, height: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest <= MAX_ENCODE_SIDE {
+        return (width, height);
+    }
+    let scale = |side: u32| {
+        let scaled = (u64::from(side) * u64::from(MAX_ENCODE_SIDE) / u64::from(longest)) as u32;
+        (scaled & !1).max(2)
+    };
+    (scale(width), scale(height))
 }
 
 /// The H.265 sibling of an H.264 encoder name, if one exists.
@@ -936,6 +1048,10 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("preset", "veryfast");
             opts.set("profile", "baseline");
             opts.set("look_ahead", "0");
+            // Quick Sync queues 4 frames by default. On a still desktop the
+            // keepalive sends a frame every 750 ms, so the last change reached
+            // the iPad 3 s late and tripped the encoder watchdog.
+            opts.set("async_depth", "1");
         }
         "libx264" => {
             opts.set("preset", "ultrafast");
@@ -962,6 +1078,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         }
         "hevc_qsv" => {
             opts.set("preset", "veryfast");
+            opts.set("async_depth", "1");
         }
         "hevc_videotoolbox" => {
             opts.set("realtime", "1");
@@ -1011,7 +1128,17 @@ fn prepare_frame_for_encode(
         } else {
             "period"
         };
-        if is_amf {
+        if is_amf && !force_hit {
+            // Twice a second for every AMF stream: 8,522 of 11 hours' 0.3.1
+            // telemetry lines from 7 PCs. Requests are still logged below.
+            debug!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else if is_amf {
             info!(
                 encoder = encoder_name,
                 frame = frame_number,
@@ -1507,7 +1634,7 @@ mod tests {
     #[test]
     fn startup_tries_other_hardware_before_software() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", Vec::new, |name| {
             attempts.push(name.to_string());
             match name {
                 "h264_qsv" => Ok(()),
@@ -1520,10 +1647,58 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_skips_encoders_for_graphics_cards_the_pc_lacks() {
+        // The 0.3.1 RTX 4090 + Radeon iGPU PC: NVENC failed, then AMF, then
+        // Quick Sync on a PC with no Intel graphics.
+        let mut attempts = Vec::new();
+        let (selected, ()) = open_remaining_encoders(
+            "h264_nvenc",
+            || vec![GpuVendor::Nvidia, GpuVendor::Amd, GpuVendor::Unknown],
+            |name| {
+                attempts.push(name.to_string());
+                match name {
+                    "libx264" => Ok(()),
+                    _ => Err("device unavailable".into()),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, ["h264_amf", "libx264"]);
+        assert_eq!(selected, "libx264");
+    }
+
+    #[test]
+    fn each_pipeline_start_sees_the_graphics_cards_present_then() {
+        // NVIDIA only at the first start; an AMD eGPU connected before the
+        // second. The adapters are read at each fallback, not at launch.
+        let mut present = vec![
+            vec![GpuVendor::Nvidia],
+            vec![GpuVendor::Nvidia, GpuVendor::Amd],
+        ]
+        .into_iter();
+        let mut start = || {
+            let vendors = present.next().unwrap();
+            let mut attempts = Vec::new();
+            open_remaining_encoders(
+                "h264_nvenc",
+                || vendors,
+                |name| {
+                    attempts.push(name.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            attempts
+        };
+        assert_eq!(start(), ["libx264"]);
+        assert_eq!(start(), ["h264_amf"]);
+    }
+
+    #[test]
     fn startup_uses_software_only_after_all_other_hardware_fails() {
         for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
             let mut attempts = Vec::new();
-            let (selected, ()) = open_remaining_encoders(failed, |name| {
+            let (selected, ()) = open_remaining_encoders(failed, Vec::new, |name| {
                 attempts.push(name.to_string());
                 if name == "libx264" {
                     Ok(())
@@ -1537,7 +1712,7 @@ mod tests {
             assert!(!attempts.iter().any(|name| name == failed));
             assert_eq!(attempts.last().unwrap(), "libx264");
         }
-        assert!(open_remaining_encoders::<()>("h264_amf", |_| {
+        assert!(open_remaining_encoders::<()>("h264_amf", Vec::new, |_| {
             Err("no encoder can open".into())
         })
         .is_err());
@@ -1546,7 +1721,7 @@ mod tests {
     #[test]
     fn non_windows_backends_keep_their_software_fallback() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", |name| {
+        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", Vec::new, |name| {
             attempts.push(name.to_string());
             Ok(())
         })
@@ -1628,6 +1803,88 @@ mod tests {
             state.opened_encoder = name.to_string();
             assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
         }
+    }
+
+    #[test]
+    fn only_nvencs_api_version_refusal_means_an_outdated_driver() {
+        let version = |a: u64, b: u64, c: u64, d: u64| a << 48 | b << 32 | c << 16 | d;
+        // Field drivers: GTX 1650 on 517.18, RTX 4060 laptop on 566.07.
+        let old = [version(31, 0, 15, 1718)];
+        let laptop = [version(32, 0, 15, 6607)];
+        let current = [version(32, 0, 16, 2101)];
+        assert_eq!(nvidia_release(old[0]), 51_718);
+        assert_eq!(nvidia_release(laptop[0]), 56_607);
+        assert_eq!(nvidia_release(current[0]), 62_101);
+        assert_eq!(nvidia_release(version(21, 21, 13, 7654)), 37_654);
+
+        let enosys = ffmpeg_next::Error::Other {
+            errno: libc::ENOSYS,
+        };
+        let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
+        assert!(nvidia_driver_outdated("h264_nvenc", enosys, &old));
+        assert!(nvidia_driver_outdated("hevc_nvenc", enosys, &laptop));
+        // ENOSYS with a driver new enough is an unsupported parameter.
+        assert!(!nvidia_driver_outdated("h264_nvenc", enosys, &current));
+        assert!(!nvidia_driver_outdated(
+            "h264_nvenc",
+            enosys,
+            &[old[0], current[0]]
+        ));
+        // No NVIDIA driver version known.
+        assert!(!nvidia_driver_outdated("h264_nvenc", enosys, &[]));
+        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
+        assert!(!nvidia_driver_outdated("h264_nvenc", eperm, &old));
+        assert!(!nvidia_driver_outdated(
+            "h264_nvenc",
+            ffmpeg_next::Error::External,
+            &old
+        ));
+        assert!(!nvidia_driver_outdated("h264_amf", enosys, &old));
+    }
+
+    #[test]
+    fn desktops_larger_than_the_encoders_take_are_scaled_with_their_shape() {
+        assert_eq!(encode_size(3840, 2160), (3840, 2160));
+        assert_eq!(encode_size(4096, 2160), (4096, 2160));
+        assert_eq!(encode_size(5120, 1440), (4096, 1152));
+        assert_eq!(encode_size(5120, 2880), (4096, 2304));
+        assert_eq!(encode_size(7680, 2160), (4096, 1152));
+        assert_eq!(encode_size(1440, 5120), (1152, 4096));
+        // Odd results round down to even sides for 4:2:0.
+        assert_eq!(encode_size(5000, 1001), (4096, 820));
+    }
+
+    #[test]
+    fn a_wide_desktop_opens_the_encoder_at_a_size_it_takes() {
+        let _ = ffmpeg_next::init();
+        let mut state = EncoderState::new(
+            "libx264",
+            5120,
+            1440,
+            8_000_000,
+            30,
+            EncoderInput::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (state.encoder.width(), state.encoder.height()),
+            (4096, 1152)
+        );
+        assert!(state.accepts_frame(5120, 1440));
+        assert!(!state.accepts_frame(4096, 1152));
+        let bgra = state.bgra_frame.as_mut().expect("the capture is scaled");
+        assert_eq!((bgra.width(), bgra.height()), (5120, 1440));
+        bgra.data_mut(0).fill(128);
+        let (scaler, bgra) = (
+            state.scaler.as_mut().unwrap(),
+            state.bgra_frame.as_ref().unwrap(),
+        );
+        scaler.run(bgra, &mut state.frame).unwrap();
+        state.frame.set_pts(Some(0));
+        state.send_frame(0, Instant::now(), 1).unwrap();
+        state.encoder.send_eof().unwrap();
+        state.encoder.receive_packet(&mut state.packet).unwrap();
+        assert!(state.packet.is_key());
     }
 
     #[test]
@@ -1713,6 +1970,17 @@ mod tests {
             ("rc", "cbr"),
         ] {
             assert_eq!(hevc.get(key), Some(value), "hevc_amf {key}");
+        }
+    }
+
+    #[test]
+    fn quick_sync_returns_each_frame_before_taking_the_next() {
+        for name in ["h264_qsv", "hevc_qsv"] {
+            assert_eq!(
+                encoder_options(name).get("async_depth"),
+                Some("1"),
+                "{name}"
+            );
         }
     }
 

@@ -28,11 +28,13 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -211,7 +213,8 @@ pub fn run_capture_loop(
             Some(&mut device),
             None,
             None,
-        )?;
+        )
+        .map_err(blocked_or_error)?;
     }
     let device = device.expect("D3D11CreateDevice succeeded but returned no device");
     info!("D3D11 device created");
@@ -219,13 +222,25 @@ pub fn run_capture_loop(
     // --- Get immediate device context ---
     let device_context: ID3D11DeviceContext = unsafe { device.GetImmediateContext()? };
 
+    log_output_color(&output);
+
     // --- Duplicate the output ---
     let output1: IDXGIOutput1 = output.cast()?;
     // `None` only between releasing a lost duplication and creating its
     // replacement inside the ACCESS_LOST handler.
-    let mut duplication: Option<IDXGIOutputDuplication> =
-        Some(unsafe { output1.DuplicateOutput(&device) }.map_err(blocked_or_error)?);
+    let mut duplication: Option<IDXGIOutputDuplication> = Some(
+        unsafe { output1.DuplicateOutput(&device) }
+            .inspect_err(|error| {
+                if error.code() == DXGI_ERROR_UNSUPPORTED {
+                    offer_gpu_switch(&output1, &adapter, &shared);
+                }
+            })
+            .map_err(blocked_or_error)?,
+    );
     info!("Desktop duplication active");
+    if shared.gpu_switch_made.swap(false, Ordering::SeqCst) {
+        info!("Capturing after the graphics card switch");
+    }
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
@@ -438,13 +453,9 @@ pub fn run_capture_loop(
                             // Map staging texture for CPU read
                             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                             unsafe {
-                                device_context.Map(
-                                    &staging_texture,
-                                    0,
-                                    D3D11_MAP_READ,
-                                    0,
-                                    Some(&mut mapped),
-                                )?;
+                                device_context
+                                    .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                                    .map_err(blocked_or_error)?;
                             }
 
                             // Copy row-by-row (pitch may differ from width*4)
@@ -657,7 +668,7 @@ pub fn run_capture_loop(
             }
             Err(e) => {
                 error!(error = %e, "AcquireNextFrame failed");
-                return Err(e.into());
+                return Err(blocked_or_error(e));
             }
         }
 
@@ -698,6 +709,50 @@ fn resend_last_frame(
         height,
     });
     *last_send = now;
+}
+
+/// Records whether the captured display runs in HDR and how it is rotated.
+/// Support questions about washed-out pictures and sideways portrait screens
+/// could not be answered from 0.3.1 diagnostics, which logged neither.
+fn log_output_color(output: &IDXGIOutput) {
+    let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+        return;
+    };
+    let Ok(desc) = (unsafe { output6.GetDesc1() }) else {
+        return;
+    };
+    info!(
+        hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        color_space = desc.ColorSpace.0,
+        bits_per_color = desc.BitsPerColor,
+        max_luminance = desc.MaxLuminance,
+        rotation = desc.Rotation.0,
+        "Display colour and rotation"
+    );
+}
+
+/// The adapter this process runs on cannot duplicate `output` (a hybrid PC
+/// running EternalMonitor on the other GPU). Works out which graphics card
+/// setting would fix it, once per process, for the notice to offer.
+fn offer_gpu_switch(output: &IDXGIOutput1, adapter: &IDXGIAdapter1, shared: &SharedControl) {
+    if shared.gpu_switch.lock().is_some() {
+        return;
+    }
+    let (Ok(output_desc), Ok(adapter_desc)) =
+        (unsafe { output.GetDesc() }, unsafe { adapter.GetDesc1() })
+    else {
+        return;
+    };
+    let device_name = utf16_to_string(&output_desc.DeviceName);
+    let made = shared.gpu_switch_made.load(Ordering::SeqCst);
+    let switch = crate::gpu_preference::offered(
+        crate::gpu_preference::suggest_switch(&device_name, adapter_desc.AdapterLuid),
+        made,
+    );
+    if made {
+        warn!("The graphics card switch EternalMonitor made did not let it capture the screen");
+    }
+    *shared.gpu_switch.lock() = switch;
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which

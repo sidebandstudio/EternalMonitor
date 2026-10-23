@@ -48,6 +48,9 @@ pub enum StageOutcome {
     Completed,
     /// The stage died with an error while the pipeline was supposed to run.
     Failed(String),
+    /// The stage cannot recover by restarting (the graphics device is gone).
+    /// The pipeline stops until the user tries again.
+    GaveUp(String),
 }
 
 #[derive(Debug)]
@@ -178,6 +181,16 @@ impl Machine {
         match outcome {
             StageOutcome::Completed => Effect::None,
             StageOutcome::Failed(reason) => self.auto_restart(stage, reason, now),
+            StageOutcome::GaveUp(reason) => {
+                error!(
+                    ?stage,
+                    reason, "Pipeline stopped until the user tries again"
+                );
+                self.state = SupervisorState::Failed {
+                    reason: reason.clone(),
+                };
+                Effect::StopPipeline
+            }
         }
     }
 
@@ -643,6 +656,26 @@ mod tests {
 
         // Ticks do nothing in Failed; a manual Start recovers.
         assert_eq!(machine.on_tick(t0 + Duration::from_secs(600)), Effect::None);
+        assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+    }
+
+    #[test]
+    fn a_stage_that_gave_up_stops_at_once_and_a_start_recovers() {
+        let mut machine = Machine::new(1);
+        let now = Instant::now();
+        let effect = machine.on_stage_exit(
+            1,
+            Stage::Capture,
+            &StageOutcome::GaveUp("graphics driver gone".into()),
+            now,
+        );
+        assert_eq!(effect, Effect::StopPipeline);
+        assert!(matches!(machine.state, SupervisorState::Failed { .. }));
+        // No automatic restart follows.
+        assert_eq!(
+            machine.on_tick(now + Duration::from_secs(120)),
+            Effect::None
+        );
         assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
     }
 

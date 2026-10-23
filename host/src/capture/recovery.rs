@@ -28,6 +28,14 @@ pub enum CaptureBlock {
     TooManyCaptureApps,
     /// The Windows session is disconnected or remote.
     SessionDisconnected,
+    /// Windows removed or reset the graphics device (a driver update, a crash
+    /// the driver recovered from, or a hybrid laptop powering its GPU down).
+    /// A fresh device on the next retry picks up whichever adapter now drives
+    /// the display.
+    GpuReset,
+    /// The graphics device stayed removed for `GPU_RESET_GIVE_UP`. Capture
+    /// stopped retrying; the user restarts the PC, then tries again.
+    GpuStopped,
 }
 
 impl CaptureBlock {
@@ -40,6 +48,8 @@ impl CaptureBlock {
             0x887A_0004 => Some(Self::UnsupportedOnThisGpu), // DXGI_ERROR_UNSUPPORTED
             0x887A_0022 => Some(Self::TooManyCaptureApps), // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
             0x887A_0028 => Some(Self::SessionDisconnected), // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0005 => Some(Self::GpuReset),      // DXGI_ERROR_DEVICE_REMOVED
+            0x887A_0007 => Some(Self::GpuReset),      // DXGI_ERROR_DEVICE_RESET
             _ => None,
         }
     }
@@ -60,6 +70,32 @@ impl std::fmt::Display for CaptureUnavailable {
 }
 
 impl std::error::Error for CaptureUnavailable {}
+
+/// How long a removed or reset graphics device may keep the screen away. A
+/// driver update or a recovered driver crash is back within seconds; one
+/// still gone after this needs the PC restarted, and retrying forever kept
+/// the watchdog fed while nothing could ever recover.
+pub const GPU_RESET_GIVE_UP: Duration = Duration::from_secs(30);
+
+/// The graphics device stayed removed past [`GPU_RESET_GIVE_UP`]. The
+/// supervisor stops the pipeline for good instead of restarting it.
+#[derive(Debug)]
+pub struct GpuGone {
+    pub detail: String,
+}
+
+impl std::fmt::Display for GpuGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the graphics driver did not come back within {}s: {}",
+            GPU_RESET_GIVE_UP.as_secs(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for GpuGone {}
 
 /// Delays between duplication re-creations after ACCESS_LOST. The first retry
 /// is immediate, as before; a duplication that is lost again right after it
@@ -138,7 +174,9 @@ impl BlockedRetry {
 /// While blocked, the stage keeps its heartbeats: restarting the pipeline
 /// cannot unlock the PC, and a restart would drop the iPad's session.
 /// `wait` sleeps in short slices and returns false once this generation
-/// should stop.
+/// should stop. A removed graphics device gets `GPU_RESET_GIVE_UP` of waiting,
+/// then the stage ends with [`GpuGone`]. Each attempt builds its device anew,
+/// so nothing from the removed one is held between attempts.
 ///
 /// Every attempt numbers its frames from where the last one stopped. Frame
 /// numbers become the stream's sequence, and a retry keeps the transport's
@@ -150,6 +188,7 @@ pub fn run_until_unblocked(
     mut wait: impl FnMut(Duration) -> bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry = BlockedRetry::default();
+    let mut gpu_waited = Duration::ZERO;
     let mut frame_number = 0;
     loop {
         let error = match capture(&mut frame_number) {
@@ -159,8 +198,25 @@ pub fn run_until_unblocked(
         let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() else {
             return Err(error);
         };
+        // Frames flowed since the last block (note_capture_resumed cleared
+        // it): this is a new episode, with a fresh pace and GPU budget.
+        if shared.capture_block.lock().is_none() {
+            retry = BlockedRetry::default();
+            gpu_waited = Duration::ZERO;
+        }
         *shared.capture_block.lock() = Some(unavailable.block);
         let (delay, changed) = retry.blocked(unavailable.block);
+        if unavailable.block == CaptureBlock::GpuReset {
+            if gpu_waited + delay > GPU_RESET_GIVE_UP {
+                *shared.capture_block.lock() = Some(CaptureBlock::GpuStopped);
+                return Err(Box::new(GpuGone {
+                    detail: unavailable.detail.clone(),
+                }));
+            }
+            gpu_waited += delay;
+        } else {
+            gpu_waited = Duration::ZERO;
+        }
         if changed {
             warn!(
                 block = ?unavailable.block,
@@ -251,6 +307,15 @@ mod tests {
         assert_eq!(
             CaptureBlock::from_hresult(code(0x887A_0026)),
             Some(CaptureBlock::DisplayChanging)
+        );
+        // 0.3.1 restarted the pipeline for these until it gave up.
+        assert_eq!(
+            CaptureBlock::from_hresult(code(0x887A_0005)),
+            Some(CaptureBlock::GpuReset)
+        );
+        assert_eq!(
+            CaptureBlock::from_hresult(code(0x887A_0007)),
+            Some(CaptureBlock::GpuReset)
         );
         assert_eq!(CaptureBlock::from_hresult(code(0x8007_000E)), None);
     }
@@ -379,6 +444,73 @@ mod tests {
             |_| false,
         );
         assert!(result.is_ok(), "a stopped generation exits cleanly");
+    }
+
+    #[test]
+    fn a_gpu_that_stays_removed_stops_the_stage_within_the_bound() {
+        let shared = SharedControl::new(0, 1);
+        let attempts = RefCell::new(0u32);
+        let waited = RefCell::new(Duration::ZERO);
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                *attempts.borrow_mut() += 1;
+                assert!(*attempts.borrow() < 10_000, "retried without a bound");
+                Err(blocked(CaptureBlock::GpuReset))
+            },
+            |delay| {
+                *waited.borrow_mut() += delay;
+                true
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(error.is::<GpuGone>(), "{error}");
+        assert!(
+            *waited.borrow() <= GPU_RESET_GIVE_UP,
+            "{:?}",
+            waited.borrow()
+        );
+        assert!(*attempts.borrow() <= 10, "{} attempts", attempts.borrow());
+        assert_eq!(*shared.capture_block.lock(), Some(CaptureBlock::GpuStopped));
+    }
+
+    #[test]
+    fn a_gpu_that_comes_back_between_resets_gets_a_fresh_budget() {
+        let shared = SharedControl::new(0, 1);
+        let attempts = RefCell::new(0u32);
+        let sent = RefCell::new(Vec::new());
+        let result = run_until_unblocked(
+            &shared,
+            |frame_number| {
+                *attempts.borrow_mut() += 1;
+                let attempt = *attempts.borrow();
+                if attempt == 40 {
+                    return Ok(());
+                }
+                // Frames flow for a while before every fifth reset.
+                if attempt.is_multiple_of(5) {
+                    for _ in 0..3 {
+                        *frame_number += 1;
+                        sent.borrow_mut().push(*frame_number);
+                    }
+                    note_capture_resumed(&shared);
+                }
+                Err(blocked(CaptureBlock::GpuReset))
+            },
+            |_| {
+                // While the GPU is away the stage says so, not a generic block.
+                assert_eq!(*shared.capture_block.lock(), Some(CaptureBlock::GpuReset));
+                true
+            },
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        // Numbering continues across every in-stage GPU retry.
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 7 * 3);
+        assert!(
+            sent.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "{sent:?}"
+        );
     }
 
     #[test]

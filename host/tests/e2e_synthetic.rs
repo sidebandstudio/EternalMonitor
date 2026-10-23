@@ -1196,9 +1196,44 @@ fn lossy_stream_recovers_and_adapts() {
     );
 }
 
-/// Under injected fragment loss the system must keep delivering decodable
-/// video (keyframe requests beat the GOP) and the ABR must step the bitrate
-/// down from its 15 Mbps start.
+/// Tracks whether each completed frame decodes from an unbroken chain of
+/// frames back to an IDR. A missing frame breaks the chain; only the next
+/// IDR repairs it.
+#[derive(Default)]
+struct KeyframeChain {
+    last_seq: Option<u32>,
+    intact: bool,
+    intact_decoded: usize,
+    /// IDRs that repaired a broken chain.
+    recoveries: u32,
+}
+
+impl KeyframeChain {
+    /// Records a completed frame; returns whether its chain is intact.
+    fn completed(&mut self, seq: u32, keyframe: bool) -> bool {
+        if self
+            .last_seq
+            .is_some_and(|last| seq != last.wrapping_add(1))
+        {
+            self.intact = false;
+        }
+        if keyframe {
+            if !self.intact && self.last_seq.is_some() {
+                self.recoveries += 1;
+            }
+            self.intact = true;
+        }
+        self.last_seq = Some(seq);
+        self.intact
+    }
+}
+
+/// Under injected fragment loss a client without NACK support recovers only
+/// through keyframe requests, and the ABR must step the bitrate down from its
+/// 15 Mbps start. The periodic IDR is off, so every repair is the host's
+/// answer to a request. Only frames decoded from an intact chain since their
+/// IDR count: FFmpeg conceals a broken reference chain and still returns a
+/// picture, which used to let this test pass with requests ignored.
 #[test]
 fn lossy_legacy_stream_uses_keyframe_recovery() {
     let _env = test_env();
@@ -1207,7 +1242,8 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
-    std::env::set_var("ETERNAL_DROP", "0.05");
+    std::env::set_var("ETERNAL_DROP", "0.01");
+    std::env::set_var("ETERNAL_GOP_FRAMES", "100000");
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
@@ -1241,12 +1277,17 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
     let mut last_progress = Instant::now();
     let mut highest_seq = 0u32;
     let mut current_epoch = 0u32;
+    // The reference chain is intact from an IDR until a frame goes missing.
+    let mut chain = KeyframeChain::default();
 
-    while decoded < 40 || !abr_stepped_down {
+    while chain.intact_decoded < 40 || chain.recoveries < 3 || !abr_stepped_down {
         assert!(
             Instant::now() < deadline,
-            "timed out: decoded={decoded}, abr_stepped_down={abr_stepped_down}, \
-             keyframe_requests={keyframe_requests}, counters={:?}",
+            "timed out: intact_decoded={}, recoveries={}, decoded={decoded}, \
+             abr_stepped_down={abr_stepped_down}, keyframe_requests={keyframe_requests}, \
+             counters={:?}",
+            chain.intact_decoded,
+            chain.recoveries,
             reassembler.counters()
         );
 
@@ -1294,6 +1335,13 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
                 let Ok((header, payload)) = MediaHeader::decode(bytes) else {
                     continue;
                 };
+                if header.stream_epoch != current_epoch {
+                    chain = KeyframeChain {
+                        intact_decoded: chain.intact_decoded,
+                        recoveries: chain.recoveries,
+                        ..KeyframeChain::default()
+                    };
+                }
                 highest_seq = highest_seq.max(header.frame_seq);
                 current_epoch = header.stream_epoch;
                 if let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
@@ -1304,9 +1352,11 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
                     payload,
                     Instant::now(),
                 ) {
+                    let intact = chain.completed(header.frame_seq, header.is_keyframe);
                     let frames = decoder.decode(&frame_bytes);
-                    if !frames.is_empty() {
-                        decoded += frames.len();
+                    decoded += frames.len();
+                    if intact && !frames.is_empty() {
+                        chain.intact_decoded += frames.len();
                         last_progress = Instant::now();
                     }
                 }
@@ -1320,8 +1370,15 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
         counters.frags_lost > 0,
         "injected drop must surface as fragment loss"
     );
+    assert!(
+        keyframe_requests >= chain.recoveries,
+        "every recovery must answer a keyframe request: requests={keyframe_requests} \
+         recoveries={}",
+        chain.recoveries
+    );
 
     std::env::remove_var("ETERNAL_DROP");
+    std::env::remove_var("ETERNAL_GOP_FRAMES");
 
     shared.stop();
     supervisor_tx

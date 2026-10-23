@@ -61,6 +61,7 @@ struct StatsSnapshot {
     bitrate_bps: u32,
     codec_name: String,
     using_software_fallback: bool,
+    nvidia_driver_outdated: bool,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -98,6 +99,7 @@ impl StatsSnapshot {
             bitrate_bps: s.bitrate_bps,
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
+            nvidia_driver_outdated: s.nvidia_driver_outdated,
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -284,6 +286,9 @@ pub struct AnalyzerApp {
     /// pairing reset).
     settings_error: Option<String>,
     settings_start_on_boot: bool,
+    /// `gpu_switch_made` as last saved, to save the change when capture
+    /// clears it.
+    saved_gpu_switch_made: bool,
     settings_hevc_enabled: bool,
     settings_vdd_match: bool,
     /// Set when a high-frequency control (the bitrate slider) changed; the
@@ -407,6 +412,7 @@ impl AnalyzerApp {
             )
         };
         let encoder_input = *control.shared.encoder_input.lock();
+        let saved_gpu_switch_made = control.shared.gpu_switch_made.load(Ordering::SeqCst);
         Self {
             settings_encoder_input: encoder_input,
             settings_check_updates: persisted.check_for_updates,
@@ -418,6 +424,7 @@ impl AnalyzerApp {
             settings_fps_target: fps_target,
             settings_error: None,
             settings_start_on_boot: start_on_boot,
+            saved_gpu_switch_made,
             settings_hevc_enabled: persisted.hevc_enabled,
             settings_vdd_match: persisted.vdd_match_resolution,
             settings_dirty_at: None,
@@ -465,6 +472,7 @@ impl AnalyzerApp {
             stream_audio: self.control.shared.audio_enabled.load(Ordering::SeqCst),
             vdd_match_resolution: self.settings_vdd_match,
             start_on_boot: self.settings_start_on_boot,
+            gpu_switch_made: self.control.shared.gpu_switch_made.load(Ordering::SeqCst),
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
         };
@@ -660,6 +668,39 @@ impl AnalyzerApp {
         self.control.request_restart();
     }
 
+    /// Saves EternalMonitor's graphics card choice and reopens the app, which
+    /// is the only way Windows applies it. If saving fails, the notice falls
+    /// back to the steps in Windows Settings.
+    fn switch_graphics_card(&mut self, ui: &egui::Ui, switch: &crate::gpu_preference::GpuSwitch) {
+        // Saved first: the reopened app must know this switch was tried.
+        self.control
+            .shared
+            .gpu_switch_made
+            .store(true, Ordering::SeqCst);
+        self.saved_gpu_switch_made = true;
+        self.persist_settings();
+        #[cfg(windows)]
+        let result = crate::gpu_preference::switch_and_reopen(switch);
+        #[cfg(not(windows))]
+        let result: Result<(), String> = Err(format!(
+            "switching to {} needs Windows",
+            switch.adapter_name
+        ));
+        match result {
+            Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(error) => {
+                warn!(%error, "Could not switch EternalMonitor's graphics card");
+                self.control
+                    .shared
+                    .gpu_switch_made
+                    .store(false, Ordering::SeqCst);
+                self.saved_gpu_switch_made = false;
+                self.persist_settings();
+                *self.control.shared.gpu_switch.lock() = None;
+            }
+        }
+    }
+
     fn copy(&mut self, ctx: &egui::Context, what: Copied, text: String) {
         ctx.copy_text(text);
         self.copied = Some((what, Instant::now()));
@@ -702,6 +743,12 @@ impl eframe::App for AnalyzerApp {
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
+        // Capture cleared the graphics card switch marker: save that.
+        let switch_made = self.control.shared.gpu_switch_made.load(Ordering::SeqCst);
+        if switch_made != self.saved_gpu_switch_made {
+            self.saved_gpu_switch_made = switch_made;
+            self.persist_settings();
+        }
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;

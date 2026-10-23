@@ -468,6 +468,10 @@ fn review_screens() {
     PIPELINE_STATS.lock().using_software_fallback = true;
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
     save(&mut h, "problems-display-task-and-encoder");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problem-nvidia-driver-outdated");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = false;
     *shared.vdd_status.lock() = VddStatus::Failed;
     PIPELINE_STATS.lock().using_software_fallback = false;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
@@ -493,11 +497,27 @@ fn review_screens() {
         ("unsupported-gpu", CaptureBlock::UnsupportedOnThisGpu),
         ("too-many-capture-apps", CaptureBlock::TooManyCaptureApps),
         ("session-disconnected", CaptureBlock::SessionDisconnected),
+        ("gpu-reset", CaptureBlock::GpuReset),
+        ("gpu-stopped", CaptureBlock::GpuStopped),
     ] {
         *shared.capture_block.lock() = Some(block);
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
         save(&mut h, &format!("problem-{name}"));
     }
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_switch.lock() = Some(eternal_host::gpu_preference::GpuSwitch {
+        preference: Some(1),
+        adapter_name: "AMD Radeon(TM) Graphics".to_string(),
+    });
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_switch.lock() = Some(eternal_host::gpu_preference::GpuSwitch {
+        preference: None,
+        adapter_name: "NVIDIA GeForce RTX 4090".to_string(),
+    });
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-choice");
+    *shared.gpu_switch.lock() = None;
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);

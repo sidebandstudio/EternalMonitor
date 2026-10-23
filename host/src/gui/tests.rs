@@ -1,5 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, gpu_choice_body, gpu_switch_body, second_screen_notice,
+    software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -142,6 +143,16 @@ fn a_connected_ipad_without_a_picture_is_not_shown_as_streaming() {
     client.capture_block = None;
     assert!(StreamState::of(&snap, &client) == StreamState::Streaming);
     assert!(capture_block_notice(None, true).is_none());
+}
+
+#[test]
+fn a_gpu_reset_pauses_the_stream_with_its_own_reason() {
+    use super::page_stream::paused_detail;
+    let (_, title, _) = capture_block_notice(Some(CaptureBlock::GpuReset), true).unwrap();
+    assert_eq!(title, "The graphics driver restarted");
+    assert!(paused_detail(Some(CaptureBlock::GpuReset)).contains("graphics driver restarted"));
+    assert!(!paused_detail(Some(CaptureBlock::GpuReset)).contains("Windows stopped"));
+    assert!(paused_detail(Some(CaptureBlock::SecureDesktop)).contains("Windows stopped"));
 }
 
 #[test]
@@ -312,6 +323,49 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
 }
 
 #[test]
+fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
+    let body = software_fallback_body(false, true);
+    assert!(body.contains("NVIDIA driver 570 or newer"), "{body}");
+    assert!(body.contains("Restart"), "{body}");
+    for jargon in ["NVENC", "API", "libx264", "encoder"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // Custom settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(true, true),
+        software_fallback_body(true, false)
+    );
+    assert!(!software_fallback_body(false, false).contains("570"));
+}
+
+#[test]
+fn the_graphics_card_switch_names_the_card_and_how_to_undo_it() {
+    let body = gpu_switch_body("AMD Radeon(TM) Graphics");
+    assert!(
+        body.contains("connected to the AMD Radeon(TM) Graphics"),
+        "{body}"
+    );
+    assert!(body.contains("Switch graphics card"), "{body}");
+    assert!(body.contains("reopens"), "{body}");
+    assert!(
+        body.contains("Settings > System > Display > Graphics"),
+        "{body}"
+    );
+    // Without a certain switch the notice says how to pick the card instead.
+    let choice = gpu_choice_body("NVIDIA GeForce RTX 4090");
+    assert!(
+        choice.contains("connected to the NVIDIA GeForce RTX 4090"),
+        "{choice}"
+    );
+    assert!(
+        choice.contains("pick the NVIDIA GeForce RTX 4090"),
+        "{choice}"
+    );
+    assert!(choice.contains("open it again"), "{choice}");
+    assert!(!choice.contains("Switch graphics card"), "{choice}");
+}
+
+#[test]
 fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     use crate::capture::recovery::CaptureBlock;
     let blocks = [
@@ -320,12 +374,18 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
+        CaptureBlock::GpuReset,
+        CaptureBlock::GpuStopped,
     ];
     assert!(capture_block_notice(None, true).is_none());
     let mut titles = Vec::new();
     for block in blocks {
-        // Stopping the stream clears the notice with the condition.
-        assert!(capture_block_notice(Some(block), false).is_none());
+        // Stopping the stream clears the notice with the condition, except
+        // the one that stopped the stream itself.
+        assert_eq!(
+            capture_block_notice(Some(block), false).is_some(),
+            block == CaptureBlock::GpuStopped
+        );
         let (_, title, body) = capture_block_notice(Some(block), true).unwrap();
         for jargon in ["DXGI", "duplication", "capture", "HRESULT", "GPU"] {
             assert!(
@@ -343,6 +403,11 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         "{gpu}"
     );
     assert!(gpu.contains("open it again"), "{gpu}");
+    let (_, _, stopped) = capture_block_notice(Some(CaptureBlock::GpuStopped), false).unwrap();
+    assert!(
+        stopped.contains("Restart your PC, then click Try again"),
+        "{stopped}"
+    );
     let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
     assert!(lock.contains("lock screen"), "{lock}");
 }

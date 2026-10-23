@@ -37,6 +37,9 @@ const KEYFRAME_REQUEST_AT: u64 = 40;
 const KEYFRAME_WINDOW: u64 = 5;
 const SMALL: (u32, u32) = (640, 360);
 const LARGE: (u32, u32) = (1280, 720);
+/// A 32:9 display. H.264 on NVENC, AMF and Quick Sync refuses to open wider
+/// than 4096 pixels, so the stage must scale it to 4096x1152.
+const WIDE: (u32, u32) = (5120, 1440);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AmfExpectation {
@@ -338,6 +341,54 @@ fn software_encoder_honours_keyframe_requests() {
     assert_eq!(run.codec_name, "H.264 (x264)");
     assert_h264_keyframe(&run.packets[0], "the first packet");
     assert_keyframe_on_request(&run, Id::H264);
+}
+
+/// Every picture of a desktop wider than 4096 pixels decodes at 4096x1152.
+fn assert_wide_desktop_fits(run: &StageRun, codec: Id) {
+    let pictures = decode(codec, &run.packets.iter().collect::<Vec<_>>());
+    assert!(
+        pictures.len() as u64 >= FRAME_COUNT / 2,
+        "only {} pictures decoded",
+        pictures.len()
+    );
+    for &(width, height, _) in &pictures {
+        assert_eq!((width, height), (4096, 1152));
+    }
+}
+
+#[test]
+fn software_encoder_scales_a_desktop_wider_than_4096() {
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let run = run_stage("libx264", |_| WIDE, None);
+    assert_wide_desktop_fits(&run, Id::H264);
+}
+
+/// The 0.3.1 field case: an RTX 4090 on a 5120x1440 display fell back to
+/// libx264 ("Width 5120 exceeds 4096"). Skips on PCs where NVENC cannot open.
+#[cfg(windows)]
+#[test]
+fn nvenc_keeps_a_desktop_wider_than_4096_on_the_gpu() {
+    if !amf_opens("h264_nvenc") {
+        eprintln!("skipping: h264_nvenc does not open on this machine");
+        return;
+    }
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let run = run_stage("h264_nvenc", |_| WIDE, None);
+    assert!(!run.software_fallback, "NVENC fell back to libx264");
+    assert_eq!(run.codec_name, "H.264 (NVENC)");
+    assert_wide_desktop_fits(&run, Id::H264);
+}
+
+#[test]
+fn amf_keeps_a_desktop_wider_than_4096_on_the_gpu() {
+    if !amf_available("h264_amf") {
+        return;
+    }
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let run = run_stage("h264_amf", |_| WIDE, None);
+    assert!(!run.software_fallback, "AMF fell back to libx264");
+    assert_eq!(run.codec_name, "H.264 (AMF)");
+    assert_wide_desktop_fits(&run, Id::H264);
 }
 
 #[cfg(windows)]

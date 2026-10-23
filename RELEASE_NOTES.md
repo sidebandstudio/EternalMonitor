@@ -109,6 +109,29 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- Displays wider or taller than 4096 pixels, such as 5120 x 1440 ultrawides,
+  are encoded on the graphics card at up to 4096 pixels, the most an iPad
+  screen can use. Previously the graphics card refused them and the PC
+  encoded on the processor, which lagged and stalled.
+- When Windows restarts the graphics driver, the PC keeps the iPad connected,
+  shows "The graphics driver restarted" and picks the picture up again by
+  itself. Previously the stream restarted every few seconds and stopped for
+  good after six tries.
+  If the graphics card hasn't come back after 30 seconds, the stream stops
+  and says "The graphics driver stopped responding", with **Try again** for
+  after a restart of the PC.
+- When an NVIDIA graphics card can't encode video because its driver is too
+  old, the processor notice says to install NVIDIA driver 570 or newer and
+  links to NVIDIA's driver page.
+- On PCs that encode with Intel Quick Sync, the last change on a still screen
+  reaches the iPad right away. Previously it could arrive up to 3 seconds late.
+- On a laptop with two graphics cards, when Windows runs EternalMonitor on the
+  card the screen isn't connected to, the notice names the right card and
+  offers **Switch graphics card**. EternalMonitor then saves its own choice in
+  Windows graphics settings and reopens on that card. Nothing changes until
+  you click. When that setting can't be sure to pick the card, for example
+  with an external graphics card attached, or a switch didn't help, the notice
+  says how to pick the card in Windows Settings instead.
 - The Quick Start guide installed with EternalMonitor matches this version's
   buttons and messages, and no longer names an old release.
 - A new Known issues page lists the problems we know about, each with what to

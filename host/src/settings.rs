@@ -40,6 +40,10 @@ pub struct SettingsFile {
     #[serde(default = "default_true")]
     pub vdd_match_resolution: bool,
     pub start_on_boot: bool,
+    /// EternalMonitor switched its graphics card and reopened, and has not
+    /// captured the screen since. Stops it offering the same switch again.
+    #[serde(default)]
+    pub gpu_switch_made: bool,
 }
 
 fn default_true() -> bool {
@@ -67,6 +71,7 @@ impl Default for SettingsFile {
             auth_token_hex: String::new(),
             vdd_match_resolution: true,
             start_on_boot: false,
+            gpu_switch_made: false,
         }
     }
 }

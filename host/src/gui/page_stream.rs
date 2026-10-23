@@ -68,17 +68,20 @@ impl AnalyzerApp {
                 || self.settings_encoder_input != crate::encoder::input::EncoderInput::default();
             let mut reset = false;
             let mut restart = false;
+            let nvidia = !customized && snap.nvidia_driver_outdated;
             widgets::banner(
                 ui,
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
+                &software_fallback_body(customized, snap.nvidia_driver_outdated),
                 if customized {
-                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
+                    230.0
+                } else if nvidia {
+                    290.0
                 } else {
-                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
+                    110.0
                 },
-                if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
                         reset =
@@ -88,6 +91,9 @@ impl AnalyzerApp {
                         restart =
                             widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
                                 .clicked();
+                        if nvidia {
+                            widgets::link(ui, "Get the NVIDIA driver", NVIDIA_DRIVERS_URL);
+                        }
                     }
                 },
             );
@@ -110,7 +116,52 @@ impl AnalyzerApp {
         if let Some((icon, title, body)) =
             capture_block_notice(capture_block, snap.pipeline_running)
         {
-            widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            let switch = (capture_block == Some(CaptureBlock::UnsupportedOnThisGpu))
+                .then(|| self.control.shared.gpu_switch.lock().clone())
+                .flatten();
+            match switch {
+                _ if capture_block == Some(CaptureBlock::GpuStopped) => {
+                    let mut retry = false;
+                    widgets::banner(ui, WARNING, icon, title, body, 110.0, |ui| {
+                        retry =
+                            widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again")
+                                .clicked();
+                    });
+                    if retry {
+                        *self.control.shared.capture_block.lock() = None;
+                        self.control.request_start();
+                    }
+                }
+                Some(switch) if switch.preference.is_none() => widgets::banner(
+                    ui,
+                    WARNING,
+                    icon,
+                    title,
+                    &gpu_choice_body(&switch.adapter_name),
+                    0.0,
+                    |_| {},
+                ),
+                Some(switch) => {
+                    let mut clicked = false;
+                    widgets::banner(
+                        ui,
+                        WARNING,
+                        icon,
+                        title,
+                        &gpu_switch_body(&switch.adapter_name),
+                        200.0,
+                        |ui| {
+                            clicked =
+                                widgets::button(ui, Tone::Primary, None, "Switch graphics card")
+                                    .clicked();
+                        },
+                    );
+                    if clicked {
+                        self.switch_graphics_card(ui, &switch);
+                    }
+                }
+                None => widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {}),
+            }
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
@@ -211,7 +262,7 @@ impl AnalyzerApp {
             }
             StreamState::Paused => (
                 format!("Streaming to {device} is paused"),
-                "Windows stopped screen capture. See the message above.".to_string(),
+                paused_detail(client.capture_block).to_string(),
             ),
         };
 
@@ -586,6 +637,40 @@ enum HeaderAction {
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
+const NVIDIA_DRIVERS_URL: &str = "https://www.nvidia.com/en-us/drivers/";
+
+/// The notice body when EternalMonitor can move itself to the graphics card
+/// the screen is wired to.
+pub(super) fn gpu_switch_body(adapter_name: &str) -> String {
+    format!(
+        "Your screen is connected to the {adapter_name}. Click Switch graphics card and EternalMonitor reopens on it. You can change this later in Settings > System > Display > Graphics."
+    )
+}
+
+/// The notice body when no setting EternalMonitor could write is certain to
+/// pick the card the screen uses (an eGPU or a second card competes for it),
+/// or when a switch it made did not help.
+pub(super) fn gpu_choice_body(adapter_name: &str) -> String {
+    format!(
+        "Your screen is connected to the {adapter_name}. Open Settings > System > Display > Graphics, choose EternalMonitor, and pick the {adapter_name}. Then quit EternalMonitor and open it again."
+    )
+}
+
+/// What the CPU fallback notice says: undo custom settings first, name the
+/// NVIDIA driver version when that is what the graphics card refused, or
+/// suggest a driver update.
+pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
+    if customized {
+        "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
+    } else if nvidia_driver_outdated {
+        format!(
+            "The picture may lag and the PC may run hot, because the NVIDIA graphics driver on this PC is too old. Install NVIDIA driver {} or newer from NVIDIA's website, then click Restart.",
+            crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else {
+        "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
+    }
+}
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
@@ -607,6 +692,8 @@ fn simulate_problem(
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "gpu-reset" => *block = Some(CaptureBlock::GpuReset),
+        "gpu-stopped" => *block = Some(CaptureBlock::GpuStopped),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -663,13 +750,23 @@ pub(super) fn second_screen_notice(
     }
 }
 
+/// Why a paused stream is paused, under the header. A restarting graphics
+/// driver is not Windows withholding the screen.
+pub(super) fn paused_detail(block: Option<CaptureBlock>) -> &'static str {
+    match block {
+        Some(CaptureBlock::GpuReset) => "The graphics driver restarted. See the message above.",
+        _ => "Windows stopped screen capture. See the message above.",
+    }
+}
+
 /// The notice while Windows keeps the screen from EternalMonitor. It goes
-/// away when the picture comes back or the stream stops.
+/// away when the picture comes back or the stream stops, except after the
+/// graphics driver stopped responding: that one stopped the stream itself.
 pub(super) fn capture_block_notice(
     block: Option<CaptureBlock>,
     running: bool,
 ) -> Option<(Icon, &'static str, &'static str)> {
-    if !running {
+    if !running && block != Some(CaptureBlock::GpuStopped) {
         return None;
     }
     Some(match block? {
@@ -697,6 +794,16 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::GpuStopped => (
+            Icon::Warning,
+            "The graphics driver stopped responding",
+            "The stream stopped because Windows couldn't bring the graphics card back. Restart your PC, then click Try again.",
+        ),
+        CaptureBlock::GpuReset => (
+            Icon::Display,
+            "The graphics driver restarted",
+            "Windows restarts it during a driver update or after a driver problem. The picture comes back by itself in a few seconds. If it doesn't, restart the PC.",
         ),
     })
 }

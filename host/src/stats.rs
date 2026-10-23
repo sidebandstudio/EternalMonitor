@@ -19,6 +19,9 @@ pub struct PipelineStats {
     // Capture
     pub capture_fps: f64,
     pub capture_resolution: (u32, u32),
+    /// Picture size of the open encoder session. Smaller than the capture
+    /// when the desktop is wider or taller than the encoders take.
+    pub encode_resolution: (u32, u32),
     pub capture_frame_count: u64,
     pub gpu_name: String,
     /// Active capture source, e.g. `\\.\DISPLAY3 (2732x2048)`. Empty until capture starts.
@@ -36,6 +39,10 @@ pub struct PipelineStats {
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
+    /// NVENC refused to open because the NVIDIA driver is older than the
+    /// linked FFmpeg's NVENC API needs. The fallback notice then names the
+    /// driver to install.
+    pub nvidia_driver_outdated: bool,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -85,6 +92,7 @@ impl PipelineStats {
 
             capture_fps: 0.0,
             capture_resolution: (0, 0),
+            encode_resolution: (0, 0),
             capture_frame_count: 0,
             gpu_name: String::new(),
             capture_display: String::new(),
@@ -97,6 +105,7 @@ impl PipelineStats {
             bitrate_bps: 0,
             codec_name: String::new(),
             using_software_fallback: false,
+            nvidia_driver_outdated: false,
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -137,6 +146,7 @@ impl PipelineStats {
         self.bitrate_bps = previous.bitrate_bps;
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
+        self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }
@@ -192,6 +202,16 @@ impl PipelineStats {
 
     pub fn set_software_fallback(&mut self, using_software_fallback: bool) {
         self.using_software_fallback = using_software_fallback;
+    }
+
+    /// The picture size the iPad receives, for the stream configuration: the
+    /// encoded size once an encoder is open, else the captured size.
+    pub fn stream_resolution(&self) -> (u32, u32) {
+        if self.encode_resolution == (0, 0) {
+            self.capture_resolution
+        } else {
+            self.encode_resolution
+        }
     }
 
     pub fn record_capture(&mut self, width: u32, height: u32) {
@@ -278,6 +298,15 @@ impl PipelineStats {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_ipad_is_told_the_size_it_receives() {
+        let mut stats = super::PipelineStats::new();
+        stats.record_capture(5120, 1440);
+        assert_eq!(stats.stream_resolution(), (5120, 1440));
+        stats.encode_resolution = (4096, 1152);
+        assert_eq!(stats.stream_resolution(), (4096, 1152));
+    }
+
     use super::PipelineStats;
 
     #[test]
