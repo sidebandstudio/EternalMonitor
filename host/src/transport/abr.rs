@@ -26,6 +26,11 @@ const LOSS_DOWN_ONE: f64 = 0.02;
 const LOSS_DOWN_TWO: f64 = 0.10;
 const LOSS_CLEAN: f64 = 0.005;
 
+/// Over USB: step down when the tunnel dropped frames in this many of the
+/// last three reports.
+const TUNNEL_WINDOW_MASK: u8 = 0b111;
+const TUNNEL_DROPS_TO_STEP: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbrDecision {
     pub target_bps: u32,
@@ -42,7 +47,9 @@ pub struct AbrController {
     prev_cumulative: Option<ReceiverReport>,
     /// The USB tunnel's cumulative dropped frames at the previous report.
     prev_tunnel_drops: Option<u64>,
-    tunnel_dropped_last: bool,
+    /// Whether the tunnel dropped frames in each of the latest reports,
+    /// newest in bit 0.
+    tunnel_drop_history: u8,
 }
 
 impl AbrController {
@@ -65,7 +72,7 @@ impl AbrController {
             last_report_at: None,
             prev_cumulative: None,
             prev_tunnel_drops: None,
-            tunnel_dropped_last: false,
+            tunnel_drop_history: 0,
         }
     }
 
@@ -99,9 +106,10 @@ impl AbrController {
     /// The cable loses nothing, so over USB the iPad's loss, repair and
     /// partial-frame figures say nothing about the link: a partial frame is
     /// one still arriving. 0.3.1 read them as network loss and cut a slow
-    /// PC's bitrate two rungs at once. Over USB only a queue that keeps
-    /// dropping frames for two reports in a row, or rising jitter, steps
-    /// down, and one rung at a time.
+    /// PC's bitrate two rungs at once. Over USB only a queue that dropped
+    /// frames in at least two of the last three reports, or rising jitter,
+    /// steps down, and one rung at a time. A single burst does not; a link
+    /// that drops every other report does.
     pub fn on_report(
         &mut self,
         report: &ReceiverReport,
@@ -148,13 +156,14 @@ impl AbrController {
             Some(drops) => {
                 let dropped = self.prev_tunnel_drops.is_some_and(|prev| drops > prev);
                 self.prev_tunnel_drops = Some(drops);
-                let sustained = dropped && self.tunnel_dropped_last;
-                self.tunnel_dropped_last = dropped;
+                self.tunnel_drop_history =
+                    (self.tunnel_drop_history << 1 | u8::from(dropped)) & TUNNEL_WINDOW_MASK;
+                let sustained = self.tunnel_drop_history.count_ones() >= TUNNEL_DROPS_TO_STEP;
                 (0.0, 0.0, sustained, dropped)
             }
             None => {
                 self.prev_tunnel_drops = None;
-                self.tunnel_dropped_last = false;
+                self.tunnel_drop_history = 0;
                 let loss = if total == 0 {
                     0.0
                 } else {
@@ -505,8 +514,41 @@ mod tests {
         assert_eq!(wifi.on_report(&r, None, now).target_bps, 10_000_000);
     }
 
+    /// A tunnel that drops frames in every other report is overloaded
+    /// too. Requiring two reports in a row never stepped down: 1,200 frames
+    /// dropped over 120 s left the stream at 15 Mbps.
+    #[test]
+    fn usb_steps_down_when_drops_alternate_with_clean_reports() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let start = Instant::now();
+        let mut r = ReceiverReport::default();
+        let mut drops = 0;
+        let mut rungs = Vec::new();
+        for tick in 0..240u64 {
+            r.frags_received += 500;
+            if tick % 2 == 1 {
+                drops += 10;
+            }
+            let d = abr.on_report(&r, Some(drops), start + Duration::from_millis(500 * tick));
+            if d.changed {
+                rungs.push((500 * tick, d.target_bps));
+            }
+        }
+        assert_eq!(drops, 1_200);
+        assert_eq!(
+            rungs.first(),
+            Some(&(1_500, 12_000_000)),
+            "steps down within two seconds, one rung"
+        );
+        assert!(
+            rungs.windows(2).all(|pair| pair[0].1 > pair[1].1),
+            "never steps up while dropping: {rungs:?}"
+        );
+        assert_eq!(abr.current_bps(), 4_000_000);
+    }
+
     /// A tunnel that keeps dropping frames is too slow for the stream: one
-    /// rung down, but not for a single burst.
+    /// rung down, but not for a single burst or bursts far apart.
     #[test]
     fn usb_steps_down_one_rung_only_when_the_tunnel_keeps_dropping() {
         let mut abr = AbrController::new(20_000_000, true);
@@ -519,13 +561,17 @@ mod tests {
         assert!(!decide(0, 0).changed);
         assert!(!decide(3, 500).changed, "one burst is not a slow link");
         assert!(!decide(3, 1000).changed);
-        assert!(!decide(5, 1500).changed);
-        let down = decide(9, 2000);
-        assert!(down.changed);
+        assert!(!decide(3, 1500).changed);
+        assert!(
+            !decide(5, 2000).changed,
+            "bursts three reports apart neither"
+        );
+        let down = decide(9, 2500);
+        assert!(down.changed, "two of the last three reports dropped");
         assert_eq!(down.target_bps, 12_000_000, "one rung at a time");
-        assert!(!decide(12, 2500).changed, "cooldown");
+        assert!(!decide(12, 3000).changed, "cooldown");
         // Clean reports without drops let it recover after the clean window.
-        let mut ms = 3000;
+        let mut ms = 3500;
         let mut stepped_up = false;
         while ms < 40_000 && !stepped_up {
             stepped_up = decide(12, ms).changed;
