@@ -288,6 +288,9 @@ struct HelloAck: Equatable {
     static let hostCapUSB: UInt16 = 1 << 2
     static let hostCapKeyboard: UInt16 = 1 << 3
     static let hostCapPen: UInt16 = 1 << 4
+    /// Media frame_seq counts the frames sent in a stream epoch without gaps,
+    /// so a forward gap is a frame lost in transit. Older iPads ignore it.
+    static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32

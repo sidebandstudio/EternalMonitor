@@ -12,7 +12,7 @@ use eternal_host::control::SharedControl;
 use eternal_host::encoder::NALUnit;
 use eternal_wire::v2::control::{
     encode_control, parse_control, ControlMessage, Hello2, Nack, CAP_DECODE_H264,
-    FEATURE_SUPPORTS_NACK,
+    FEATURE_SUPPORTS_NACK, HOSTCAP_CONTIGUOUS_FRAME_SEQ,
 };
 use eternal_wire::v2::media::MediaHeader;
 
@@ -84,6 +84,8 @@ fn skipped_capture_frames_leave_no_gap_on_the_wire() {
         ipad.send_to(&hello, &host).unwrap();
         if let Ok(len) = ipad.recv(&mut buffer) {
             if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buffer[..len]) {
+                // The iPad may treat a gap as a lost frame only when told.
+                assert_ne!(ack.host_caps & HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0);
                 break ack.session_id;
             }
         }

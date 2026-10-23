@@ -77,12 +77,15 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn host_caps(&self) -> u16 {
+        // `start_sender` numbers sent frames contiguously per epoch.
+        let numbering = eternal_wire::v2::control::HOSTCAP_CONTIGUOUS_FRAME_SEQ;
         let usb = if PIPELINE_STATS.lock().usb_service_reachable {
             eternal_wire::v2::control::HOSTCAP_USB
         } else {
             0
         };
-        eternal_wire::v2::control::HOSTCAP_KEYBOARD
+        numbering
+            | eternal_wire::v2::control::HOSTCAP_KEYBOARD
             | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
