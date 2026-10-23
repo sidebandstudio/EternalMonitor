@@ -120,6 +120,18 @@ impl AnalyzerApp {
                 .then(|| self.control.shared.gpu_switch.lock().clone())
                 .flatten();
             match switch {
+                _ if capture_block == Some(CaptureBlock::GpuStopped) => {
+                    let mut retry = false;
+                    widgets::banner(ui, WARNING, icon, title, body, 110.0, |ui| {
+                        retry =
+                            widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again")
+                                .clicked();
+                    });
+                    if retry {
+                        *self.control.shared.capture_block.lock() = None;
+                        self.control.request_start();
+                    }
+                }
                 Some(switch) => {
                     let mut clicked = false;
                     widgets::banner(
@@ -659,6 +671,7 @@ fn simulate_problem(
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
         "gpu-reset" => *block = Some(CaptureBlock::GpuReset),
+        "gpu-stopped" => *block = Some(CaptureBlock::GpuStopped),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -716,12 +729,13 @@ pub(super) fn second_screen_notice(
 }
 
 /// The notice while Windows keeps the screen from EternalMonitor. It goes
-/// away when the picture comes back or the stream stops.
+/// away when the picture comes back or the stream stops, except after the
+/// graphics driver stopped responding: that one stopped the stream itself.
 pub(super) fn capture_block_notice(
     block: Option<CaptureBlock>,
     running: bool,
 ) -> Option<(Icon, &'static str, &'static str)> {
-    if !running {
+    if !running && block != Some(CaptureBlock::GpuStopped) {
         return None;
     }
     Some(match block? {
@@ -749,6 +763,11 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::GpuStopped => (
+            Icon::Warning,
+            "The graphics driver stopped responding",
+            "The stream stopped because Windows couldn't bring the graphics card back. Restart your PC, then click Try again.",
         ),
         CaptureBlock::GpuReset => (
             Icon::Display,

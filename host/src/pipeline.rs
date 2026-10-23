@@ -71,6 +71,9 @@ pub async fn run_pipeline_supervised(
                 generation,
             ) {
                 Ok(()) => StageOutcome::Completed,
+                Err(e) if e.is::<capture::recovery::GpuGone>() => {
+                    StageOutcome::GaveUp(e.to_string())
+                }
                 Err(e) => StageOutcome::Failed(e.to_string()),
             };
             capture_reporter.stage_exited(Stage::Capture, outcome);

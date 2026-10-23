@@ -314,12 +314,17 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
         CaptureBlock::GpuReset,
+        CaptureBlock::GpuStopped,
     ];
     assert!(capture_block_notice(None, true).is_none());
     let mut titles = Vec::new();
     for block in blocks {
-        // Stopping the stream clears the notice with the condition.
-        assert!(capture_block_notice(Some(block), false).is_none());
+        // Stopping the stream clears the notice with the condition, except
+        // the one that stopped the stream itself.
+        assert_eq!(
+            capture_block_notice(Some(block), false).is_some(),
+            block == CaptureBlock::GpuStopped
+        );
         let (_, title, body) = capture_block_notice(Some(block), true).unwrap();
         for jargon in ["DXGI", "duplication", "capture", "HRESULT", "GPU"] {
             assert!(
@@ -337,6 +342,11 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         "{gpu}"
     );
     assert!(gpu.contains("open it again"), "{gpu}");
+    let (_, _, stopped) = capture_block_notice(Some(CaptureBlock::GpuStopped), false).unwrap();
+    assert!(
+        stopped.contains("Restart your PC, then click Try again"),
+        "{stopped}"
+    );
     let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
     assert!(lock.contains("lock screen"), "{lock}");
 }
