@@ -54,7 +54,7 @@ impl ConfigSource for SharedConfigSource<'_> {
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
         let (width, height, software) = {
             let stats = PIPELINE_STATS.lock();
-            let (w, h) = stats.capture_resolution;
+            let (w, h) = stats.stream_resolution();
             (w, h, stats.using_software_fallback)
         };
         eternal_wire::v2::control::StreamConfig {

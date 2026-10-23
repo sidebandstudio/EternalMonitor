@@ -690,6 +690,7 @@ impl EncoderState {
             format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {encode_width}x{encode_height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
         })?;
         log_encoder_configuration(encoder_name, &encoder);
+        PIPELINE_STATS.lock().encode_resolution = (encode_width, encode_height);
         info!(
             width = encode_width,
             height = encode_height,

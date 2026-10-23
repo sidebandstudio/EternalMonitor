@@ -19,6 +19,9 @@ pub struct PipelineStats {
     // Capture
     pub capture_fps: f64,
     pub capture_resolution: (u32, u32),
+    /// Picture size of the open encoder session. Smaller than the capture
+    /// when the desktop is wider or taller than the encoders take.
+    pub encode_resolution: (u32, u32),
     pub capture_frame_count: u64,
     pub gpu_name: String,
     /// Active capture source, e.g. `\\.\DISPLAY3 (2732x2048)`. Empty until capture starts.
@@ -89,6 +92,7 @@ impl PipelineStats {
 
             capture_fps: 0.0,
             capture_resolution: (0, 0),
+            encode_resolution: (0, 0),
             capture_frame_count: 0,
             gpu_name: String::new(),
             capture_display: String::new(),
@@ -200,6 +204,16 @@ impl PipelineStats {
         self.using_software_fallback = using_software_fallback;
     }
 
+    /// The picture size the iPad receives, for the stream configuration: the
+    /// encoded size once an encoder is open, else the captured size.
+    pub fn stream_resolution(&self) -> (u32, u32) {
+        if self.encode_resolution == (0, 0) {
+            self.capture_resolution
+        } else {
+            self.encode_resolution
+        }
+    }
+
     pub fn record_capture(&mut self, width: u32, height: u32) {
         let now = Instant::now();
         self.capture_frame_count += 1;
@@ -284,6 +298,15 @@ impl PipelineStats {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_ipad_is_told_the_size_it_receives() {
+        let mut stats = super::PipelineStats::new();
+        stats.record_capture(5120, 1440);
+        assert_eq!(stats.stream_resolution(), (5120, 1440));
+        stats.encode_resolution = (4096, 1152);
+        assert_eq!(stats.stream_resolution(), (4096, 1152));
+    }
+
     use super::PipelineStats;
 
     #[test]
