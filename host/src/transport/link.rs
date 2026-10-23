@@ -174,6 +174,8 @@ struct VideoQueue {
     awaiting_keyframe: bool,
     discarded: Option<(u32, u32)>,
     keyframes: KeyframeBackoff,
+    /// The session and stream epoch of the latest frame.
+    stream: Option<(u32, u32)>,
 }
 
 impl VideoQueue {
@@ -183,18 +185,34 @@ impl VideoQueue {
     /// iPad partial keyframes, each of which asked for another keyframe, the
     /// biggest frame of all. Dependents of a lost frame are discarded until a
     /// keyframe, and a keyframe always passes, replacing what is still queued.
+    /// Replaced frames count as lost, or periodic keyframes would hide a
+    /// tunnel that never catches up. A tunnel that keeps up has nothing
+    /// queued when a keyframe comes: the socket buffers absorb jitter.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
         if self.discarded == Some(key) {
             return Ok(0);
         }
+        let mut dropped = 0;
         if header.frag_index == 0 {
             if self.frames.back().is_some_and(|frame| !frame.complete()) {
                 return Err(invalid("unfinished video access unit"));
             }
+            let stream = (header.session_id, header.stream_epoch);
+            if self
+                .stream
+                .replace(stream)
+                .is_some_and(|last| last != stream)
+            {
+                // A new stream on a reused tunnel owes nothing to the old
+                // one's losses: its first request must not wait out their
+                // backoff.
+                self.keyframes = KeyframeBackoff::default();
+            }
             if header.is_keyframe {
                 // Queued frames are older and the keyframe needs none of them.
+                dropped = self.frames.len() as u64;
                 self.frames.clear();
                 self.bytes = 0;
                 self.awaiting_keyframe = false;
@@ -228,12 +246,12 @@ impl VideoQueue {
             let frame = self.frames.pop_back().unwrap();
             self.bytes -= frame.bytes;
             self.lose(key, now);
-            return Ok(1);
+            return Ok(dropped + 1);
         }
         frame.bytes += bytes.len();
         frame.datagrams.push(bytes.to_vec());
         self.bytes += bytes.len();
-        Ok(0)
+        Ok(dropped)
     }
 
     fn lose(&mut self, key: (u32, u32), now: Instant) {
@@ -779,10 +797,10 @@ mod tests {
         assert_eq!(queue.frames.len(), FRAME_LIMIT, "queued frames stay");
         assert_eq!(queue.pop().unwrap().seq, 1);
         assert_eq!(queue.pop().unwrap().seq, 2);
-        // A keyframe replaces what is still queued.
+        // A keyframe replaces what is still queued, and those frames are lost.
         assert_eq!(
             queue.push(&packet(next + 2, true, 0, 1, 64), now).unwrap(),
-            0
+            FRAME_LIMIT as u64 - 2
         );
         assert_eq!(queue.pop().unwrap().seq, next + 2);
         assert!(queue.pop().is_none());
@@ -805,6 +823,80 @@ mod tests {
         assert_eq!(queue.bytes, 0);
         queue.push(&packet(2, true, 0, 1, 64), now).unwrap();
         assert_eq!(queue.pop().unwrap().seq, 2);
+    }
+
+    fn packet_in(stream: (u32, u32), seq: u32, keyframe: bool) -> Vec<u8> {
+        let mut bytes = packet(seq, keyframe, 0, 1, 64);
+        MediaHeader {
+            session_id: stream.0,
+            stream_epoch: stream.1,
+            ..MediaHeader::decode(&bytes).unwrap().0
+        }
+        .encode_into(&mut bytes);
+        bytes
+    }
+
+    /// Under a steady overload, periodic keyframes can clear the queue before
+    /// it ever overflows. The video they replace is lost, and must count, or
+    /// the bitrate never comes down.
+    #[test]
+    fn a_keyframe_counts_the_frames_it_replaces_as_dropped() {
+        let now = Instant::now();
+        let mut queue = VideoQueue::default();
+        queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
+        queue.pop().unwrap();
+        for seq in 2..=5 {
+            assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
+        }
+        assert_eq!(queue.push(&packet(6, true, 0, 1, 64), now).unwrap(), 4);
+        assert_eq!(queue.pop().unwrap().seq, 6);
+        // An empty queue loses nothing to a keyframe.
+        assert_eq!(queue.push(&packet(7, true, 0, 1, 64), now).unwrap(), 0);
+    }
+
+    /// A pipeline restart keeps the USB tunnel. Its new stream must not
+    /// inherit the old stream's backoff: at the longest wait, the new
+    /// stream's first request was deferred by almost two seconds.
+    #[test]
+    fn a_new_stream_on_the_same_tunnel_asks_for_a_keyframe_at_once() {
+        let start = Instant::now();
+        let mut queue = VideoQueue::default();
+        let overflow = |queue: &mut VideoQueue, stream, first: u32, now| {
+            queue.push(&packet_in(stream, first, true), now).unwrap();
+            for seq in first + 1..=first + FRAME_LIMIT as u32 + 1 {
+                queue.push(&packet_in(stream, seq, false), now).unwrap();
+            }
+            queue.keyframes.due(now)
+        };
+        // Overflow every 250 ms until the backoff reaches its longest wait.
+        let mut now = start;
+        let mut requests = Vec::new();
+        for round in 0..8 {
+            if overflow(&mut queue, (1, 1), round * 10 + 1, now) {
+                requests.push(now - start);
+            }
+            now += Duration::from_millis(250);
+        }
+        let ms = Duration::from_millis;
+        assert_eq!(requests, [ms(0), ms(250), ms(750), ms(1750)]);
+        assert!(!overflow(&mut queue, (1, 1), 100, now));
+        assert_eq!(
+            queue.keyframes.deadline(),
+            Some(start + ms(1750) + KEYFRAME_BACKOFF_MAX)
+        );
+        assert!(
+            overflow(&mut queue, (1, 2), 1, now),
+            "a new epoch asks at once"
+        );
+        now += Duration::from_millis(50);
+        assert!(
+            !overflow(&mut queue, (1, 2), 20, now),
+            "then backs off again"
+        );
+        assert!(
+            overflow(&mut queue, (2, 2), 1, now),
+            "and so does a new session"
+        );
     }
 
     #[test]

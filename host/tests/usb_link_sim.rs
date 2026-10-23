@@ -10,17 +10,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use eternal_host::transport::abr::AbrController;
 use eternal_host::transport::link::{read_datagram, read_preamble, FramedLink, Link, PeerId};
 use eternal_wire::reassembly::{AddOutcome, Reassembler};
+use eternal_wire::v2::control::ReceiverReport;
 use eternal_wire::v2::media::{MediaHeader, MEDIA_HEADER_SIZE};
 use tokio::time::Instant;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
-/// The pipeline's natural keyframe interval (`set_gop(30)`).
-const GOP: u64 = 30;
-const KEYFRAME_BYTES: usize = 60_000;
-const DELTA_BYTES: usize = 6_000;
 const DATAGRAM: usize = 1400;
+
+#[derive(Clone, Copy)]
+struct Stream {
+    gop: u64,
+    keyframe_bytes: usize,
+    delta_bytes: usize,
+}
+
+/// The pipeline's natural keyframe interval (`set_gop(30)`), with keyframes
+/// ten times the size of a delta frame.
+const DESKTOP: Stream = Stream {
+    gop: 30,
+    keyframe_bytes: 60_000,
+    delta_bytes: 6_000,
+};
 /// The host grants one client keyframe request per 500 ms, and the iPad
 /// asks at most that often.
 const REQUEST_INTERVAL: Duration = Duration::from_millis(500);
@@ -35,13 +48,15 @@ struct Outcome {
     ipad_frags_lost: u64,
     decodable: u64,
     longest_freeze_ms: u128,
+    /// Where ABR left the bitrate, fed the tunnel's drops every 500 ms.
+    final_bps: u32,
 }
 
-fn frame(seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
+fn frame(stream: Stream, seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
     let size = if keyframe {
-        KEYFRAME_BYTES
+        stream.keyframe_bytes
     } else {
-        DELTA_BYTES
+        stream.delta_bytes
     };
     let payload = DATAGRAM - MEDIA_HEADER_SIZE;
     let count = size.div_ceil(payload) as u16;
@@ -66,6 +81,10 @@ fn frame(seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
 }
 
 async fn simulate(bytes_per_sec: f64, run_for: Duration) -> Outcome {
+    simulate_stream(DESKTOP, bytes_per_sec, run_for).await
+}
+
+async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) -> Outcome {
     let (host, mut ipad) = tokio::io::duplex(64 * 1024);
     let force_idr = Arc::new(AtomicBool::new(false));
     let client_request = Arc::new(AtomicBool::new(false));
@@ -88,12 +107,12 @@ async fn simulate(bytes_per_sec: f64, run_for: Duration) -> Outcome {
             if granted {
                 last_grant = Some(now);
             }
-            let natural = encoded.is_multiple_of(GOP);
+            let natural = encoded.is_multiple_of(stream.gop);
             let requested = force_idr.swap(false, Ordering::SeqCst) || granted;
             if requested && !natural {
                 forced += 1;
             }
-            for datagram in frame(encoded as u32 + 1, natural || requested) {
+            for datagram in frame(stream, encoded as u32 + 1, natural || requested) {
                 link.send(peer, &datagram).await.unwrap();
             }
             encoded += 1;
@@ -132,11 +151,20 @@ async fn simulate(bytes_per_sec: f64, run_for: Duration) -> Outcome {
     let mut decoded_seq = None;
     let mut decoded_at = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(5));
+    let mut abr = AbrController::new(20_000_000, true);
+    let mut report = ReceiverReport::default();
+    let mut reports = tokio::time::interval(Duration::from_millis(500));
     while start.elapsed() < run_for {
         let bytes = tokio::select! {
             bytes = arrivals.recv() => bytes.unwrap(),
             _ = tick.tick() => {
                 reassembler.tick(clock(Instant::now()));
+                continue;
+            }
+            _ = reports.tick() => {
+                report.frags_received = reassembler.counters().frags_received as u32;
+                let drops = stats.frames_dropped.load(Ordering::Relaxed);
+                abr.on_report(&report, Some(drops), clock(Instant::now()));
                 continue;
             }
         };
@@ -169,6 +197,7 @@ async fn simulate(bytes_per_sec: f64, run_for: Duration) -> Outcome {
     outcome.ipad_dropped = counters.frames_dropped;
     outcome.ipad_frags_lost = counters.frags_lost;
     outcome.decodable = decoded_at.len() as u64;
+    outcome.final_bps = abr.current_bps();
     outcome.longest_freeze_ms = decoded_at
         .windows(2)
         .map(|pair| (pair[1] - pair[0]).as_millis())
@@ -197,6 +226,10 @@ async fn slow_tunnel_carries_keyframe_bursts_without_a_spiral() {
         "at least 95% of frames decode: {outcome:?}"
     );
     assert!(outcome.longest_freeze_ms <= 250, "{outcome:?}");
+    assert!(
+        outcome.final_bps >= 15_000_000,
+        "a tunnel that keeps up must not cut the bitrate: {outcome:?}"
+    );
 }
 
 /// A tunnel slower than the stream itself must lose frames, but only whole
@@ -219,4 +252,27 @@ async fn usb_tunnel_rates_table() {
         let outcome = simulate(rate, Duration::from_secs(20)).await;
         eprintln!("USB_SIM rate={rate} {outcome:?}");
     }
+}
+
+/// A stream a little faster than the tunnel, with frequent keyframes: each
+/// keyframe clears the backlog before the queue overflows, so nothing was
+/// ever counted as dropped and ABR raised the bitrate while a quarter of
+/// the frames never reached the iPad.
+#[tokio::test(start_paused = true)]
+async fn keyframes_that_clear_a_backlog_still_step_the_bitrate_down() {
+    let stream = Stream {
+        gop: 10,
+        keyframe_bytes: 30_000,
+        delta_bytes: 6_000,
+    };
+    let outcome = simulate_stream(stream, 450_000.0, Duration::from_secs(20)).await;
+    eprintln!("USB_SIM backlog {outcome:?}");
+    // Every frame that never arrived is counted, but for the few still in
+    // the queue and the tunnel's buffer when the run ends.
+    let missing = outcome.encoded - outcome.decodable;
+    assert!(
+        outcome.host_drops <= missing && missing - outcome.host_drops <= 16,
+        "{outcome:?}"
+    );
+    assert!(outcome.final_bps < 15_000_000, "{outcome:?}");
 }
