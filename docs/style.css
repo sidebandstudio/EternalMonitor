@@ -12,7 +12,9 @@
   --border-strong: rgba(255, 255, 255, 0.14);
   --text: #f4f4f5;
   --muted: #a1a1aa;
-  --faint: #71717a;
+  /* 4.5:1 or more on every background it sits on, including the card
+     spotlight under the pointer (#323426 at its brightest). */
+  --faint: #9a9aa3;
   --accent: #e8ff47;
   --accent-rgb: 232, 255, 71;
   --on-accent: #0c0d04;
@@ -1188,11 +1190,52 @@ code {
 }
 
 .faq details a,
+.issue a,
 .prose-link {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 3px;
   text-decoration-color: rgba(var(--accent-rgb), 0.4);
+}
+
+/* --- Known issues ------------------------------------------------------------ */
+
+.issues {
+  max-width: 820px;
+  margin: 0 auto;
+  padding-bottom: 96px;
+}
+
+.issues h2 {
+  margin: 64px 0 8px;
+  font-size: clamp(1.4rem, 2.6vw, 1.75rem);
+  scroll-margin-top: calc(var(--nav-height) + 16px);
+}
+
+.issues h2:first-child {
+  margin-top: 0;
+}
+
+.issue {
+  padding: 22px 4px;
+  border-bottom: 1px solid var(--border);
+  scroll-margin-top: calc(var(--nav-height) + 16px);
+}
+
+.issue h3 {
+  font-size: 1.075rem;
+  font-weight: 500;
+}
+
+.issue p {
+  max-width: 680px;
+  margin-top: 8px;
+  color: var(--muted);
+}
+
+.issue strong {
+  color: var(--text);
+  font-weight: 500;
 }
 
 /* --- Call to action --------------------------------------------------------- */
@@ -1253,7 +1296,8 @@ code {
 }
 
 .footer-copy {
-  color: var(--faint);
+  /* --muted: 7.7:1 on the page background; --faint was 4.1:1. */
+  color: var(--muted);
   font-size: 0.875rem;
 }
 
