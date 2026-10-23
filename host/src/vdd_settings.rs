@@ -187,31 +187,50 @@ fn xml_name(name: &[u8]) -> bool {
         && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-' | '.'))
 }
 
-/// The tag's name and every attribute are well-formed: quoted, unique,
-/// with known entities and allowed characters.
+/// Elements carry no attributes: neither this host nor the driver's own
+/// file writes any, so a file with one is not a file this host edits.
 fn check_tag(tag: &quick_xml::events::BytesStart) -> Result<(), &'static str> {
     if !xml_name(tag.name().as_ref()) {
         return Err("an element name is not valid XML");
     }
-    for attribute in tag.attributes() {
-        let attribute = attribute.map_err(|_| "an attribute is not valid XML")?;
-        let value = attribute
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map_err(|_| "an attribute is not valid XML")?;
-        if !xml_name(attribute.key.as_ref()) || !value.chars().all(xml_char) {
-            return Err("an attribute is not valid XML");
-        }
+    if !tag.attributes_raw().iter().all(u8::is_ascii_whitespace) {
+        return Err("an element has attributes, which this file never has");
     }
     Ok(())
 }
 
-/// Find the render adapter's place by parsing `xml`. Anything the driver
-/// could read differently from this host is refused: a name outside
-/// `<gpu>`, a second name or `<gpu>`, markup inside the name, text or
-/// elements outside the `<vdd_settings>` root, or a document that is not
-/// well-formed XML 1.0 (bad attributes, misplaced declarations, characters
-/// XML does not allow, unknown entities). The driver matches
-/// `friendlyname` by local name anywhere.
+/// The declaration this host writes or the driver ships:
+/// `<?xml version="1.0"( encoding="utf-8|UTF-8")?( standalone="yes|no")??>`,
+/// with either quote.
+fn xml_declaration(raw: &str) -> bool {
+    let attribute =
+        |name: &str, value: &str| [format!(" {name}=\"{value}\""), format!(" {name}='{value}'")];
+    let optional = |name: &str, values: &[&str]| {
+        std::iter::once(String::new())
+            .chain(values.iter().flat_map(|value| attribute(name, value)))
+            .collect::<Vec<_>>()
+    };
+    let encodings = optional("encoding", &["utf-8", "UTF-8"]);
+    let standalones = optional("standalone", &["yes", "no"]);
+    attribute("version", "1.0").iter().any(|version| {
+        encodings.iter().any(|encoding| {
+            standalones
+                .iter()
+                .any(|standalone| raw == format!("<?xml{version}{encoding}{standalone}?>"))
+        })
+    })
+}
+
+/// Find the render adapter's place by parsing `xml`. Only the shapes this
+/// host writes and the driver ships are edited: the declaration above at
+/// the start, comments, whitespace, elements without attributes, and text
+/// with only predefined entities and legal character references. Anything
+/// else is refused, including a DOCTYPE, processing instructions, CDATA and
+/// characters XML does not allow; so is anything the driver could read
+/// differently from this host: a name outside `<gpu>`, a second name or
+/// `<gpu>`, markup inside the name, or text or elements outside the
+/// `<vdd_settings>` root. The driver matches `friendlyname` by local name
+/// anywhere.
 fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
     use quick_xml::events::Event;
     if !xml.chars().all(xml_char) {
@@ -222,7 +241,6 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
     let mut open: Vec<Vec<u8>> = Vec::new();
     let (mut root, mut closed, mut slot) = (None, false, None);
     let (mut gpus, mut names, mut name_start) = (0, 0, 0);
-    let mut doctype = false;
     loop {
         let before = reader.buffer_position() as usize;
         let event = reader
@@ -235,7 +253,7 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
             Event::Start(_) | Event::Empty(_) if closed => {
                 return Err("there is markup after the root element")
             }
-            Event::Start(_) | Event::Empty(_) | Event::CData(_) if in_name => {
+            Event::Start(_) | Event::Empty(_) if in_name => {
                 return Err("the graphics card name contains markup")
             }
             Event::Start(ref tag) | Event::Empty(ref tag) => {
@@ -278,16 +296,14 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
             Event::Text(text) if outside && !text.iter().all(u8::is_ascii_whitespace) => {
                 return Err("there is text outside the root element")
             }
-            Event::CData(_) | Event::GeneralRef(_) if outside => {
+            Event::GeneralRef(_) if outside => {
                 return Err("there is text outside the root element")
             }
-            // Only the very first thing in the file may be the declaration,
-            // and a DOCTYPE only once, before the root.
-            Event::Decl(_) if before != 0 => return Err("an XML declaration is out of place"),
-            Event::DocType(_) if doctype || root.is_some() => {
-                return Err("a DOCTYPE is out of place")
+            // Only the very first thing in the file may be the declaration.
+            Event::Decl(_) if before != 0 || !xml_declaration(&xml[before..after]) => {
+                return Err("the XML declaration is not one this file has")
             }
-            Event::DocType(_) => doctype = true,
+            Event::Decl(_) => {}
             Event::GeneralRef(ref reference) => {
                 let known = if reference.is_char_ref() {
                     matches!(reference.resolve_char_ref(), Ok(Some(c)) if xml_char(c))
@@ -309,8 +325,10 @@ fn gpu_slot(xml: &str) -> Result<GpuSlot, &'static str> {
             {
                 return Err("a comment is not well-formed XML")
             }
+            Event::Text(_) | Event::Comment(_) => {}
             Event::Eof => break,
-            _ => {}
+            // A DOCTYPE, processing instructions, CDATA, or anything newer.
+            _ => return Err("the file uses XML this host does not edit"),
         }
     }
     let root = root
@@ -589,8 +607,8 @@ mod tests {
     }
 
     #[test]
-    fn comments_attributes_line_endings_and_bom_are_kept() {
-        let commented = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- e.g. <friendlyname>NVIDIA</friendlyname> -->\n<vdd_settings version=\"2\">\n    <gpu enabled=\"yes\">\n        <friendlyname note=\"x\">A&amp;B</friendlyname> <!-- the card -->\n    </gpu>\n</vdd_settings>\n";
+    fn comments_line_endings_and_bom_are_kept() {
+        let commented = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- e.g. <friendlyname>NVIDIA</friendlyname> -->\n<vdd_settings>\n    <gpu>\n        <friendlyname>A&amp;B</friendlyname> <!-- the card -->\n    </gpu>\n</vdd_settings>\n";
         assert_eq!(
             with_gpu(commented, "Intel(R) Iris(R) Xe Graphics"),
             Some(commented.replace(">A&amp;B<", ">Intel(R) Iris(R) Xe Graphics<"))
@@ -664,9 +682,84 @@ mod tests {
         // A name that is not valid XML is not written either.
         let vendor = with_gpu(VENDOR, "Bad\u{1}Card");
         assert_eq!(vendor, None);
-        // A DOCTYPE in the prolog and references XML defines are fine.
-        let fine = format!("<?xml version=\"1.0\"?>\n<!DOCTYPE vdd_settings>\n<vdd_settings a=\"&amp;\">{name}<count>&#65;&lt;</count></vdd_settings>\n");
+        // References XML defines are fine.
+        let fine = format!("<?xml version=\"1.0\"?>\n<vdd_settings>{name}<count>&#65;&lt;</count></vdd_settings>\n");
         assert_eq!(with_gpu(&fine, "X"), Some(fine.replace(">default<", ">X<")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The driver's own vdd_settings.xml from Virtual-Display-Driver 25.5.2
+    /// (MIT), byte for byte: single-quoted declaration, many comments.
+    const VENDOR_FILE: &str = include_str!("../tests/fixtures/vdd_settings-25.5.2.xml");
+
+    #[test]
+    fn only_the_shapes_this_host_and_the_driver_write_are_edited() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdd_settings.xml");
+        let name = "<gpu><friendlyname>default</friendlyname></gpu>";
+        for document in [
+            // Sol's four: each was rewritten.
+            format!("<vdd_settings a=\"<\">{name}</vdd_settings>\n"),
+            format!("<?xml?>\n<vdd_settings>{name}</vdd_settings>\n"),
+            format!("<!DOCTYPE vdd_settings [<!ENTITY>]>\n<vdd_settings>{name}</vdd_settings>\n"),
+            format!("<?1pi data?>\n<vdd_settings>{name}</vdd_settings>\n"),
+            // Everything outside the allow-list.
+            format!(
+                "<vdd_settings>\n<gpu enabled=\"yes\">{}</gpu></vdd_settings>",
+                "<friendlyname>default</friendlyname>"
+            ),
+            format!("<!DOCTYPE vdd_settings>\n<vdd_settings>{name}</vdd_settings>"),
+            format!("<?xml-stylesheet href=\"a.css\"?>\n<vdd_settings>{name}</vdd_settings>"),
+            format!("<vdd_settings>{name}<?pi x?></vdd_settings>"),
+            format!("<vdd_settings>{name}<count><![CDATA[1]]></count></vdd_settings>"),
+            format!("<?xml version=\"1.1\"?>\n<vdd_settings>{name}</vdd_settings>"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"latin1\"?>\n<vdd_settings>{name}</vdd_settings>"
+            ),
+            format!(
+                "<?xml version=\"1.0\"  encoding=\"utf-8\"?>\n<vdd_settings>{name}</vdd_settings>"
+            ),
+            format!("<?xml version=\"1.0' ?>\n<vdd_settings>{name}</vdd_settings>"),
+            format!(" <?xml version=\"1.0\"?>\n<vdd_settings>{name}</vdd_settings>"),
+        ] {
+            assert_eq!(with_gpu(&document, "X"), None, "{document:?}");
+            std::fs::write(&path, &document).unwrap();
+            assert!(pin_gpu_in(&path, "X").is_err(), "{document:?}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                document,
+                "changed: {document:?}"
+            );
+        }
+        // Every declaration shape the allow-list names, and none.
+        for declaration in [
+            "",
+            "<?xml version=\"1.0\"?>\n",
+            "<?xml version='1.0' encoding='utf-8'?>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+            "<?xml version=\"1.0\" standalone='no'?>\n",
+        ] {
+            let document = format!("{declaration}<vdd_settings>{name}</vdd_settings>\n");
+            assert_eq!(
+                with_gpu(&document, "X"),
+                Some(document.replace(">default<", ">X<")),
+                "{document:?}"
+            );
+        }
+        // The driver's own file is edited in place, and so is this host's.
+        assert_eq!(
+            with_gpu(VENDOR_FILE, "Intel(R) Iris(R) Xe Graphics"),
+            Some(VENDOR_FILE.replace(
+                "<friendlyname>default</friendlyname>",
+                "<friendlyname>Intel(R) Iris(R) Xe Graphics</friendlyname>"
+            ))
+        );
+        std::fs::write(&path, VENDOR_FILE).unwrap();
+        assert!(pin_gpu_in(&path, "X").unwrap());
+        let ours = render(&modes_for_client(1668, 2420, 120), Some("A"));
+        assert_eq!(with_gpu(&ours, "B"), Some(ours.replace(">A<", ">B<")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
