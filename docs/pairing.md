@@ -10,7 +10,7 @@ Five failed authorization attempts from one IP within 60 seconds block further c
 
 An exact retransmission of an accepted HELLO receives the original ACK, so a lost ACK does not invalidate a successful code entry. Changed credentials or handshake fields require fresh authorization. Failed and busy ACKs never contain the host token.
 
-Pairing authorizes a connection. Media and control packets are not encrypted in v0.3.0; use a trusted LAN or an encrypted network tunnel. Anyone with the QR code, saved host settings, or a captured token can authenticate until the token is regenerated. Keep these private.
+Pairing authorizes a connection. Media and control packets are not encrypted; use a trusted LAN or an encrypted network tunnel. Anyone with the QR code, saved host settings, or a captured token can authenticate until the token is regenerated. Keep these private.
 
 ## Verification
 

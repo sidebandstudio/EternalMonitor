@@ -130,6 +130,13 @@ Windows changes.
   firewall profile and rules, other firewall products, never addresses or
   names) and why an iPad was asked for the pairing code. The iPad logs how
   many PCs each search found.
+- The Quick Start guide installed with EternalMonitor matches this version's
+  buttons and messages, and no longer names an old release.
+- A new Known issues page lists the problems we know about, each with what to
+  do. The setup guide's troubleshooting tables give every message both apps
+  show, what it means and what to do.
+- On Windows older than Windows 10 version 1809, the installer says which
+  Windows version EternalMonitor needs, in plain words.
 
 ### What to test
 
