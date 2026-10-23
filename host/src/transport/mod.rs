@@ -6,11 +6,11 @@ pub mod link;
 pub mod pacer;
 pub mod retransmit;
 pub mod session;
+pub mod standby;
 pub mod usb;
 pub mod usbmuxd;
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -114,43 +114,9 @@ pub async fn start_sender(
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
-    let socket = {
-        let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-        // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
-        // hard budget doesn't smooth (best effort — some platforms clamp it).
-        let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_tos(0xB8);
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            use windows::Win32::Networking::WinSock::{
-                WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
-            };
-            let disabled = 0u32;
-            let mut returned = 0;
-            let result = unsafe {
-                WSAIoctl(
-                    SOCKET(raw.as_raw_socket() as usize),
-                    SIO_UDP_CONNRESET,
-                    Some((&disabled as *const u32).cast()),
-                    std::mem::size_of_val(&disabled) as u32,
-                    None,
-                    0,
-                    &mut returned,
-                    None,
-                    None,
-                )
-            };
-            if result != 0 {
-                warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
-            }
-        }
-        raw.set_nonblocking(true)?;
-        raw.bind(&bind_addr.into())?;
-        UdpSocket::from_std(raw.into())?
-    };
+    // The port stays bound across generations: between them the standby
+    // responder holds it and tells iPads why nothing is streaming.
+    let mut links = shared.links.claim(listen_port, &shared).await?;
 
     // Never 0 — the receiver treats epoch 0 as invalid. (Wrap after 2^32 runs is
     // harmless: a fresh session id accompanies any host relaunch.)
@@ -159,7 +125,7 @@ pub async fn start_sender(
         .wrapping_add(1)
         .max(1);
 
-    let local_addr = socket.local_addr()?;
+    let local_addr = links.udp.socket.local_addr()?;
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
     PIPELINE_STATS
         .lock()
@@ -209,7 +175,6 @@ pub async fn start_sender(
     let mut audio_sender = audio::AudioSender::default();
     let pacing_clock = PacingClock::new()?;
 
-    let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
     shared.session.lock().transport_resumed(Instant::now());
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];

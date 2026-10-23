@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 28,
+            Self.vectors.count, 31,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -50,6 +50,34 @@ final class WireProtocolGoldenTests: XCTestCase {
             XCTAssertEqual(ack.authToken, Data(repeating: 0, count: 16))
             XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
         }
+    }
+
+    /// 0.3.2: the PC answers while it isn't streaming, with its reason.
+    func testNotStreamingVectors() throws {
+        for (name, status, reason): (String, HelloStatus, String) in [
+            ("hello_ack_stopped", .stopped, ""), ("hello_ack_restarting", .restarting, ""),
+            ("hello_ack_failed", .failed, "Windows is changing the display")
+        ] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+            XCTAssertEqual(ack.status, status)
+            XCTAssertTrue(ack.status.pcNotStreaming)
+            XCTAssertEqual(ack.reason, reason)
+            XCTAssertEqual(ack.sessionId, 0)
+            XCTAssertEqual(ack.hostCaps, HelloAck.hostCapNack)
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    /// How 0.3.1 treats a status it doesn't know: the whole ACK is dropped,
+    /// as if it were lost. The PC sends 6-8 only to iPads that advertise
+    /// `featureStandbyStatus`.
+    func testAnUnknownStatusIsDroppedLikeALostAck() throws {
+        var data = try vector("hello_ack_busy")
+        data[16] = 9
+        XCTAssertNil(Wire.parseControl(data))
+        XCTAssertEqual(Hello2.featureStandbyStatus, 1 << 3)
     }
 
     func testNativePenVectorsAndTruncatedTilt() throws {

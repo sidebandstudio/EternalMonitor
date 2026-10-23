@@ -14,6 +14,7 @@ mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
+pub(crate) use page_stream::stream_failed_reason;
 mod renderer;
 mod theme;
 mod update_banner;

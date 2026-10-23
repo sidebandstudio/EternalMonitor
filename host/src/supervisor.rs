@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
-use crate::control::{SharedControl, SupervisorCommand};
+use crate::control::{SharedControl, StreamPhase, SupervisorCommand};
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
@@ -135,7 +135,10 @@ impl Machine {
                 _ => Effect::None,
             },
             SupervisorCommand::Start => match self.state {
-                SupervisorState::Stopped | SupervisorState::Failed { .. } => {
+                // Start during the pause before an automatic restart starts now.
+                SupervisorState::Stopped
+                | SupervisorState::Failed { .. }
+                | SupervisorState::BackingOff { .. } => {
                     self.attempt = 0;
                     self.restarts.clear();
                     Effect::Start
@@ -239,6 +242,16 @@ impl Machine {
     pub fn note_healthy(&mut self) {
         self.attempt = 0;
     }
+
+    /// What iPads and the Stream page are told about the stream.
+    pub fn phase(&self) -> StreamPhase {
+        match self.state {
+            SupervisorState::Running { .. } => StreamPhase::Running,
+            SupervisorState::BackingOff { .. } => StreamPhase::Restarting,
+            SupervisorState::Failed { .. } => StreamPhase::Failed,
+            SupervisorState::Stopped | SupervisorState::ShutDown => StreamPhase::Stopped,
+        }
+    }
 }
 
 /// Sends a stage-health report; safe to call from any thread. Reports from
@@ -284,8 +297,14 @@ pub fn run(
             .expect("spawn command forwarder");
     }
 
+    // Answers iPads whenever no generation holds the port.
+    let standby = crate::transport::standby::spawn(listen_port, shared.clone())
+        .inspect_err(|error| warn!(%error, "Could not start answering iPads between streams"))
+        .ok();
+
     let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let mut machine = Machine::new(generation);
+    shared.links.set_phase(&shared, machine.phase());
     let mut pipeline = Some(spawn_generation(
         generation,
         listen_port,
@@ -328,6 +347,9 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
+        // Before the effect: a stopped pipeline hands the port to the
+        // standby while it is still being joined.
+        shared.links.set_phase(&shared, machine.phase());
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
@@ -359,6 +381,11 @@ pub fn run(
                 break;
             }
         }
+        shared.links.set_phase(&shared, machine.phase());
+    }
+    shared.links.shut_down();
+    if let Some(standby) = standby {
+        let _ = standby.join();
     }
     info!("Supervisor loop ended");
 }
@@ -659,6 +686,29 @@ mod tests {
             machine.on_stage_exit(1, Stage::Capture, &failed("late"), Instant::now()),
             Effect::None
         );
+        assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+    }
+
+    /// What an iPad that asks meanwhile is told follows the machine.
+    #[test]
+    fn each_state_has_the_phase_ipads_are_told() {
+        let mut machine = Machine::new(1);
+        assert_eq!(machine.phase(), StreamPhase::Running);
+        machine.on_stage_exit(1, Stage::Capture, &failed("dxgi"), Instant::now());
+        assert_eq!(machine.phase(), StreamPhase::Restarting);
+        machine.on_command(&SupervisorCommand::Stop);
+        assert_eq!(machine.phase(), StreamPhase::Stopped);
+        machine.state = SupervisorState::Failed { reason: "x".into() };
+        assert_eq!(machine.phase(), StreamPhase::Failed);
+    }
+
+    /// The Stream page offers Start while a restart waits out its pause.
+    #[test]
+    fn start_during_the_restart_pause_starts_now() {
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        machine.on_stage_exit(1, Stage::Encoder, &failed("boom"), t0);
+        assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
         assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
     }
 

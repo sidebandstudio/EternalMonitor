@@ -87,6 +87,8 @@ final class ConnectionManager: ObservableObject {
     @Published var versionMismatch: VersionMismatch?
     @Published var pairingPrompt: PairingSheetModel?
     private var awaitingPairing = false
+    /// The PC answered that it isn't streaming; the attempt waits for it.
+    private var waitingForStream = false
     private var explicitPairingToken: Data?
     private let pairingStore = PairingStore.shared
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
@@ -339,6 +341,7 @@ final class ConnectionManager: ObservableObject {
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
+        waitingForStream = false
         videoSize = .zero
         let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
         sessionDrawingMode = drawing.enabled
@@ -503,6 +506,11 @@ final class ConnectionManager: ObservableObject {
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
                 self.connectingStatus = .answered
+                if self.waitingForStream {
+                    self.waitingForStream = false
+                    if case .pcNotStreaming = self.problem { self.problem = nil }
+                    self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
+                }
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -555,6 +563,21 @@ final class ConnectionManager: ObservableObject {
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
                 self.disconnect()
+            }
+        }
+        channel.onPCNotStreaming = { [weak self] status, reason in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }),
+                      let wait = ConnectionProblem.StreamWait(status, reason: reason) else { return }
+                if self.problem != .pcNotStreaming(wait) {
+                    self.record(.info, "ctrl", "PC isn't streaming (\(status)); waiting for it")
+                }
+                // No attempt is spent while the PC says why it isn't
+                // streaming. If it stops answering, the timeout says so.
+                self.waitingForStream = true
+                self.connectingStatus = .waitingForStream
+                self.problem = .pcNotStreaming(wait)
+                self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
             }
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
@@ -638,7 +661,8 @@ final class ConnectionManager: ObservableObject {
             refreshHz: UInt8(clamping: screen.maximumFramesPerSecond),
             decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
             featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
-                | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
+                | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack)
+                | Hello2.featureStandbyStatus,
             deviceId: DeviceIdentity.load(),
             preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),
             authToken: pairingToken
@@ -960,6 +984,8 @@ final class ConnectionManager: ObservableObject {
         }
         timeoutTask?.cancel()
         endReconnectCycle()
+        // The user stopped waiting for the PC to stream.
+        if case .pcNotStreaming = problem { problem = nil }
         disconnect()
     }
 
@@ -1078,6 +1104,7 @@ final class ConnectionManager: ObservableObject {
             record(.info, "connection", "Disconnect state=\(state) reason=\(logged)")
         }
         awaitingPairing = false
+        waitingForStream = false
         pairingPrompt = nil
         currentAttempt.withLock { $0 = nil }
         timeoutTask?.cancel()

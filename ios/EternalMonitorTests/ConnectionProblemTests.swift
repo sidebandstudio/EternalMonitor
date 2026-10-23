@@ -14,6 +14,29 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
+    /// The PC's not-streaming answers, in plain words. None offers Try
+    /// again: the iPad is already asking again by itself.
+    func testNotStreamingAnswersSayWhatToDo() {
+        XCTAssertEqual(ConnectionProblem.StreamWait(.stopped, reason: ""), .stopped)
+        XCTAssertEqual(ConnectionProblem.StreamWait(.restarting, reason: "ignored"), .restarting)
+        XCTAssertEqual(ConnectionProblem.StreamWait(.failed, reason: "Windows is changing the display"),
+                       .failed("Windows is changing the display"))
+        for status: HelloStatus in [.ok, .busy, .versionUnsupported, .error, .unauthorized, .rateLimited] {
+            XCTAssertNil(ConnectionProblem.StreamWait(status, reason: ""), "\(status)")
+            XCTAssertFalse(status.pcNotStreaming)
+        }
+        let stopped = ConnectionProblem.pcNotStreaming(.stopped)
+        XCTAssertTrue(stopped.detail.contains("Click Start streaming in EternalMonitor on the PC"))
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.restarting).detail, "This iPad connects as soon as it's back.")
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.failed("")).detail,
+            "Click Start streaming in EternalMonitor on the PC to try again. This iPad connects as soon as it starts.")
+        for wait: ConnectionProblem.StreamWait in [.stopped, .restarting, .failed("reason")] {
+            XCTAssertEqual(ConnectionProblem.pcNotStreaming(wait).actions, [])
+        }
+        XCTAssertEqual(ConnectingStatus.waitingForStream.detail(host: "192.168.1.20"),
+                       "Waiting for your PC to start streaming…")
+    }
+
     func testAPairingCodeTypedAsTheAddressIsCaughtBeforeConnecting() {
         for typed in ["390756", "390 756", " 390756 "] {
             XCTAssertEqual(ConnectionProblem.typedAddress(typed), .pairingCodeAsAddress, typed)
