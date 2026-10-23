@@ -13,18 +13,22 @@ import Foundation
 /// - HEVC has no such counter. Its POC advances by a fixed step per picture on
 ///   NVENC, AMF and x265 (checked against their streams, frames dropped before
 ///   encoding included). The step is learned only between two frames whose
-///   `frame_seq` is contiguous, which proves nothing vanished in between.
+///   `frame_seq` is contiguous, which proves nothing vanished in between. If a
+///   later contiguous pair disagrees, the stream's POC isn't constant, and
+///   whole-frame loss isn't read from it again until the stream restarts.
 ///
-/// A picture this cannot read (an unexpected stream) is never treated as a
-/// loss: holding by mistake freezes a good picture.
+/// A new stream epoch is a new encoder: its pictures can't follow the old
+/// stream's, so it starts again from its keyframe. A picture this cannot read
+/// (an unexpected or malformed stream) is never treated as a loss: holding by
+/// mistake freezes a good picture. Parsing never traps on any input.
 struct ReferenceContinuity {
-    private struct H264Parameters {
+    struct H264Parameters: Equatable {
         var log2MaxFrameNum: Int
         var separateColourPlane: Bool
         var gapsAllowed: Bool
     }
 
-    private struct HEVCParameters {
+    struct HEVCParameters: Equatable {
         var log2MaxPocLsb: Int
         var separateColourPlane: Bool
         var extraSliceHeaderBits: Int
@@ -38,24 +42,33 @@ struct ReferenceContinuity {
     /// HEVC: POC lsb of the latest picture, and the learned step between pictures.
     private var previousPoc: UInt32?
     private var pocStep: UInt32?
+    /// HEVC: a contiguous pair disagreed with the learned step, so this
+    /// stream's POC can't show a lost picture.
+    private(set) var pocUnreliable = false
     private var previousSeq: UInt32?
+    private var previousEpoch: UInt32?
 
     // MARK: - Parameter sets
 
+    /// New parameter sets start the count again; the access unit that carries
+    /// them is a keyframe.
     mutating func adoptH264(sps: Data?) {
-        h264 = sps.flatMap(Self.parseH264SPS)
+        let parsed = sps.flatMap(Self.parseH264SPS)
+        if parsed != h264 { previousReferenceFrameNum = nil }
+        h264 = parsed
     }
 
     mutating func adoptHEVC(sps: Data?, pps: Data?) {
-        guard let sps, let pps, let parsedSPS = Self.parseHEVCSPS(sps),
-              let parsedPPS = Self.parseHEVCPPS(pps) else {
-            hevc = nil
-            return
+        var parsed: HEVCParameters?
+        if let sps, let pps, let s = Self.parseHEVCSPS(sps), let p = Self.parseHEVCPPS(pps) {
+            parsed = HEVCParameters(log2MaxPocLsb: s.log2MaxPocLsb, separateColourPlane: s.separateColourPlane,
+                                    extraSliceHeaderBits: p.extraBits, outputFlagPresent: p.outputFlagPresent)
         }
-        hevc = HEVCParameters(log2MaxPocLsb: parsedSPS.log2MaxPocLsb,
-                              separateColourPlane: parsedSPS.separateColourPlane,
-                              extraSliceHeaderBits: parsedPPS.extraBits,
-                              outputFlagPresent: parsedPPS.outputFlagPresent)
+        if parsed != hevc {
+            previousPoc = nil
+            pocStep = nil
+        }
+        hevc = parsed
     }
 
     // MARK: - Pictures
@@ -63,9 +76,10 @@ struct ReferenceContinuity {
     /// Whether the decoder may show this picture. A keyframe always may, and
     /// restarts the count. Any other picture may unless it follows a lost
     /// reference; only shown pictures advance the count. `seq` is the wire's
-    /// frame number; a lower one means the host restarted its stream.
-    mutating func admitH264(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32) -> Bool {
-        let restarted = noteSeq(seq)
+    /// frame number, `epoch` its stream epoch; a lower `seq` or another epoch
+    /// means the host restarted its stream.
+    mutating func admitH264(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
+        let restarted = noteStream(seq: seq, epoch: epoch)
         guard let params = h264, let frameNum = Self.h264FrameNum(nal, params) else {
             previousReferenceFrameNum = nil
             return !restarted || isKeyframe
@@ -82,19 +96,19 @@ struct ReferenceContinuity {
         return true
     }
 
-    mutating func admitHEVC(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32) -> Bool {
+    mutating func admitHEVC(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
         let contiguous = previousSeq.map { seq == $0 &+ 1 } ?? false
-        let restarted = noteSeq(seq)
+        let restarted = noteStream(seq: seq, epoch: epoch)
         guard let params = hevc, let poc = Self.hevcPocLsb(nal, params) else {
             previousPoc = nil
             return !restarted || isKeyframe
         }
         if !isKeyframe {
             if restarted { return false }
-            if let previous = previousPoc {
+            if let previous = previousPoc, !pocUnreliable {
                 let delta = (poc &- previous) & ((UInt32(1) << params.log2MaxPocLsb) - 1)
                 if contiguous {
-                    pocStep = delta
+                    if pocStep == nil { pocStep = delta } else if delta != pocStep { pocUnreliable = true }
                 } else if let step = pocStep, delta != step {
                     return false
                 }
@@ -104,31 +118,42 @@ struct ReferenceContinuity {
         return true
     }
 
-    /// Records the wire frame number; true when it went backwards.
-    private mutating func noteSeq(_ seq: UInt32) -> Bool {
-        defer { previousSeq = seq }
-        guard let previous = previousSeq, seq < previous else { return false }
+    /// Records the wire frame number and epoch; true when the stream restarted.
+    /// Another epoch also forgets the step and whether POC was reliable.
+    private mutating func noteStream(seq: UInt32, epoch: UInt32) -> Bool {
+        defer { previousSeq = seq; previousEpoch = epoch }
+        let newEpoch = previousEpoch.map { $0 != epoch } ?? false
+        let backwards = previousSeq.map { seq < $0 } ?? false
+        guard newEpoch || backwards else { return false }
         previousReferenceFrameNum = nil
         previousPoc = nil
+        if newEpoch {
+            pocStep = nil
+            pocUnreliable = false
+        }
         return true
     }
 
     // MARK: - Parsing
+    //
+    // Every Exp-Golomb value is checked against the range H.264 (7.4.2) and
+    // HEVC (7.4.3) allow before it is used; anything else is "can't parse".
 
     private static let h264HighProfiles: Set<UInt32> = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]
 
-    private static func parseH264SPS(_ nal: Data) -> H264Parameters? {
+    static func parseH264SPS(_ nal: Data) -> H264Parameters? {
         var r = H264BitReader(bytes: rbsp(nal, headerBytes: 1))
-        guard let profile = r.readBits(8), r.readBits(16) != nil, r.readUE() != nil else { return nil }
+        guard let profile = r.readBits(8), r.readBits(16) != nil,
+              let spsID = r.readUE(), spsID <= 31 else { return nil }
         var separateColourPlane = false
         if h264HighProfiles.contains(profile) {
-            guard let chroma = r.readUE() else { return nil }
+            guard let chroma = r.readUE(), chroma <= 3 else { return nil }
             if chroma == 3 {
                 guard let flag = r.readBit() else { return nil }
                 separateColourPlane = flag == 1
             }
-            guard r.readUE() != nil, r.readUE() != nil, r.readBit() != nil,
-                  let scalingPresent = r.readBit() else { return nil }
+            guard let lumaDepth = r.readUE(), lumaDepth <= 6, let chromaDepth = r.readUE(), chromaDepth <= 6,
+                  r.readBit() != nil, let scalingPresent = r.readBit() else { return nil }
             if scalingPresent == 1 {
                 for list in 0..<(chroma == 3 ? 12 : 8) {
                     guard let present = r.readBit() else { return nil }
@@ -137,18 +162,21 @@ struct ReferenceContinuity {
             }
         }
         guard let log2MaxFrameNumMinus4 = r.readUE(), log2MaxFrameNumMinus4 <= 12,
-              let pocType = r.readUE() else { return nil }
+              let pocType = r.readUE(), pocType <= 2 else { return nil }
         switch pocType {
         case 0:
-            guard r.readUE() != nil else { return nil }
+            guard let log2MaxPocLsbMinus4 = r.readUE(), log2MaxPocLsbMinus4 <= 12 else { return nil }
         case 1:
+            // offset_for_non_ref_pic, offset_for_top_to_bottom_field and each
+            // offset_for_ref_frame lie in [-2^31 + 1, 2^31 - 1]; readSE can't
+            // return Int32.min, so only the cycle length needs a bound.
             guard r.readBit() != nil, r.readSE() != nil, r.readSE() != nil,
                   let cycle = r.readUE(), cycle <= 255 else { return nil }
             for _ in 0..<cycle { guard r.readSE() != nil else { return nil } }
         default:
             break
         }
-        guard r.readUE() != nil, let gaps = r.readBit() else { return nil }
+        guard let maxRefFrames = r.readUE(), maxRefFrames <= 16, let gaps = r.readBit() else { return nil }
         return H264Parameters(log2MaxFrameNum: Int(log2MaxFrameNumMinus4) + 4,
                               separateColourPlane: separateColourPlane, gapsAllowed: gaps == 1)
     }
@@ -158,7 +186,7 @@ struct ReferenceContinuity {
         var next: Int32 = 8
         for _ in 0..<size {
             if next != 0 {
-                guard let delta = r.readSE() else { return false }
+                guard let delta = r.readSE(), (-128...127).contains(delta) else { return false }
                 next = (last + delta + 256) % 256
             }
             if next != 0 { last = next }
@@ -166,16 +194,18 @@ struct ReferenceContinuity {
         return true
     }
 
-    private static func h264FrameNum(_ nal: Data, _ params: H264Parameters) -> UInt32? {
+    static func h264FrameNum(_ nal: Data, _ params: H264Parameters) -> UInt32? {
         var r = H264BitReader(bytes: rbsp(nal, headerBytes: 1))
-        guard r.readUE() != nil, r.readUE() != nil, r.readUE() != nil else { return nil }
+        guard r.readUE() != nil, let sliceType = r.readUE(), sliceType <= 9,
+              let ppsID = r.readUE(), ppsID <= 255 else { return nil }
         if params.separateColourPlane { guard r.readBits(2) != nil else { return nil } }
         return r.readBits(params.log2MaxFrameNum)
     }
 
-    private static func parseHEVCSPS(_ nal: Data) -> (log2MaxPocLsb: Int, separateColourPlane: Bool)? {
+    static func parseHEVCSPS(_ nal: Data) -> (log2MaxPocLsb: Int, separateColourPlane: Bool)? {
         var r = H264BitReader(bytes: rbsp(nal, headerBytes: 2))
-        guard r.readBits(4) != nil, let maxSubLayersMinus1 = r.readBits(3), r.readBit() != nil else { return nil }
+        guard r.readBits(4) != nil, let maxSubLayersMinus1 = r.readBits(3), maxSubLayersMinus1 <= 6,
+              r.readBit() != nil else { return nil }
         // profile_tier_level: 88 bits of general profile, 8 of general level.
         guard r.skip(96) else { return nil }
         var subLayerProfile: [Bool] = []
@@ -189,33 +219,35 @@ struct ReferenceContinuity {
         for i in 0..<Int(maxSubLayersMinus1) {
             guard r.skip((subLayerProfile[i] ? 88 : 0) + (subLayerLevel[i] ? 8 : 0)) else { return nil }
         }
-        guard r.readUE() != nil, let chroma = r.readUE() else { return nil }
+        guard let spsID = r.readUE(), spsID <= 15, let chroma = r.readUE(), chroma <= 3 else { return nil }
         var separateColourPlane = false
         if chroma == 3 {
             guard let flag = r.readBit() else { return nil }
             separateColourPlane = flag == 1
         }
-        guard r.readUE() != nil, r.readUE() != nil, let window = r.readBit() else { return nil }
+        guard let width = r.readUE(), width > 0, let height = r.readUE(), height > 0,
+              let window = r.readBit() else { return nil }
         if window == 1 { for _ in 0..<4 { guard r.readUE() != nil else { return nil } } }
-        guard r.readUE() != nil, r.readUE() != nil, let log2MaxPocLsbMinus4 = r.readUE(),
-              log2MaxPocLsbMinus4 <= 12 else { return nil }
+        guard let lumaDepth = r.readUE(), lumaDepth <= 8, let chromaDepth = r.readUE(), chromaDepth <= 8,
+              let log2MaxPocLsbMinus4 = r.readUE(), log2MaxPocLsbMinus4 <= 12 else { return nil }
         return (Int(log2MaxPocLsbMinus4) + 4, separateColourPlane)
     }
 
-    private static func parseHEVCPPS(_ nal: Data) -> (extraBits: Int, outputFlagPresent: Bool)? {
+    static func parseHEVCPPS(_ nal: Data) -> (extraBits: Int, outputFlagPresent: Bool)? {
         var r = H264BitReader(bytes: rbsp(nal, headerBytes: 2))
-        guard r.readUE() != nil, r.readUE() != nil, r.readBit() != nil,
+        guard let ppsID = r.readUE(), ppsID <= 63, let spsID = r.readUE(), spsID <= 15, r.readBit() != nil,
               let outputFlag = r.readBit(), let extraBits = r.readBits(3) else { return nil }
         return (Int(extraBits), outputFlag == 1)
     }
 
-    private static func hevcPocLsb(_ nal: Data, _ params: HEVCParameters) -> UInt32? {
+    static func hevcPocLsb(_ nal: Data, _ params: HEVCParameters) -> UInt32? {
         guard nal.count >= 2 else { return nil }
         let nalType = (nal[nal.startIndex] >> 1) & 0x3F
         var r = H264BitReader(bytes: rbsp(nal, headerBytes: 2))
         guard let firstSliceInPicture = r.readBit(), firstSliceInPicture == 1 else { return nil }
         if (16...23).contains(nalType) { guard r.readBit() != nil else { return nil } }
-        guard r.readUE() != nil, r.skip(params.extraSliceHeaderBits), r.readUE() != nil else { return nil }
+        guard let ppsID = r.readUE(), ppsID <= 63, r.skip(params.extraSliceHeaderBits),
+              let sliceType = r.readUE(), sliceType <= 2 else { return nil }
         if params.outputFlagPresent { guard r.readBit() != nil else { return nil } }
         if params.separateColourPlane { guard r.readBits(2) != nil else { return nil } }
         // IDR pictures carry no POC; it is zero.

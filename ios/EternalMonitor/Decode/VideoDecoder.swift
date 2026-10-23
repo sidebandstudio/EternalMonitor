@@ -213,7 +213,7 @@ final class VideoDecoder {
             continuity = ReferenceContinuity()
         }
         if codec == .hevc {
-            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs, seq: packet.seq)
+            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs, seq: packet.seq, epoch: packet.streamEpoch)
             return
         }
 
@@ -263,7 +263,8 @@ final class VideoDecoder {
                     "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
                 )
             }
-            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample, seq: packet.seq)
+            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample,
+                             seq: packet.seq, epoch: packet.streamEpoch)
         }
     }
 
@@ -284,7 +285,7 @@ final class VideoDecoder {
         return nil
     }
 
-    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64, seq: UInt32) {
+    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64, seq: UInt32, epoch: UInt32) {
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
         var isSyncSample = false
@@ -321,7 +322,7 @@ final class VideoDecoder {
             continuity.adoptHEVC(sps: sps, pps: pps)
         }
         if hasSliceNAL {
-            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample, seq: seq)
+            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample, seq: seq, epoch: epoch)
         }
     }
 
@@ -548,7 +549,7 @@ final class VideoDecoder {
 
     // MARK: - Decode an access unit
 
-    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32) {
+    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32, epoch: UInt32) {
         guard let session = decompressionSession, let formatDescription else {
             requestKeyframeIfOverdue()
             if !loggedNotReady {
@@ -566,7 +567,7 @@ final class VideoDecoder {
             requestKeyframeIfOverdue()
             return
         }
-        if !admitted(nalUnits, isSyncSample: isSyncSample, seq: seq) {
+        if !admitted(nalUnits, isSyncSample: isSyncSample, seq: seq, epoch: epoch) {
             // A reference picture before this one never arrived (lost whole,
             // or dropped unfinished). Hold and ask for a keyframe now.
             beginWaitingForKeyframe()
@@ -711,14 +712,19 @@ final class VideoDecoder {
         }
     }
 
-    private func admitted(_ nalUnits: [Data], isSyncSample: Bool, seq: UInt32) -> Bool {
+    private func admitted(_ nalUnits: [Data], isSyncSample: Bool, seq: UInt32, epoch: UInt32) -> Bool {
         switch codec {
         case .h264:
             guard let slice = nalUnits.first(where: { [1, 5].contains($0[$0.startIndex] & 0x1F) }) else { return true }
-            return continuity.admitH264(firstSlice: slice, isKeyframe: isSyncSample, seq: seq)
+            return continuity.admitH264(firstSlice: slice, isKeyframe: isSyncSample, seq: seq, epoch: epoch)
         case .hevc:
             guard let slice = nalUnits.first(where: { ($0[$0.startIndex] >> 1) & 0x3F <= 31 }) else { return true }
-            return continuity.admitHEVC(firstSlice: slice, isKeyframe: isSyncSample, seq: seq)
+            let wasReliable = !continuity.pocUnreliable
+            let admitted = continuity.admitHEVC(firstSlice: slice, isKeyframe: isSyncSample, seq: seq, epoch: epoch)
+            if wasReliable && continuity.pocUnreliable {
+                onEvent?("HEVC picture order is not constant on this stream; a frame lost whole is no longer detected until the stream restarts")
+            }
+            return admitted
         }
     }
 

@@ -33,14 +33,15 @@ final class VideoDecoderTests: XCTestCase {
         return (try load("gop_idr_64x64"), try load("gop_p_64x64"))
     }
 
-    private func packet(seq: UInt32, data: Data, keyframe: Bool) -> FramePacket {
+    private func packet(seq: UInt32, data: Data, keyframe: Bool, epoch: UInt32 = 0) -> FramePacket {
         FramePacket(
             seq: seq,
             timestampUs: UInt64(seq) * 16_667,
             data: data,
             width: 64,
             height: 64,
-            isKeyframe: keyframe
+            isKeyframe: keyframe,
+            streamEpoch: epoch
         )
     }
 
@@ -302,6 +303,11 @@ final class VideoDecoderTests: XCTestCase {
 
     /// Decodes (seq, access unit index) pairs and reports which seqs were shown.
     private func run(_ ext: String, _ frames: [(UInt32, Int)], decoder: VideoDecoder = VideoDecoder()) throws -> (Run, VideoDecoder) {
+        try run(ext, frames.map { ($0.0, $0.1, 0) }, decoder: decoder)
+    }
+
+    /// The same, with each frame's stream epoch.
+    private func run(_ ext: String, _ frames: [(UInt32, Int, UInt32)], decoder: VideoDecoder = VideoDecoder()) throws -> (Run, VideoDecoder) {
         let units = try twoGOPs(ext)
         let state = OSAllocatedUnfairLock(initialState: Run())
         decoder.onFrameDecoded = { _, timestamp in state.withLock { $0.shown.append(UInt32(timestamp / 16_667)) } }
@@ -312,8 +318,8 @@ final class VideoDecoderTests: XCTestCase {
                 if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") { $0.errors += 1 }
             }
         }
-        for (seq, index) in frames {
-            decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
+        for (seq, index, epoch) in frames {
+            decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0, epoch: epoch))
         }
         let drained = expectation(description: "decode queue drained")
         decoder.shutdown { drained.fulfill() }
@@ -405,6 +411,18 @@ final class VideoDecoderTests: XCTestCase {
             wait(for: [drained], timeout: 10)
             XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1, ext)
             XCTAssertEqual(shown.withLock { $0 }, [1, 3, 4], ext)
+        }
+    }
+
+    func testNewEpochWithoutItsKeyframeIsHeld() throws {
+        // Sol: epoch 1's keyframe is seq 1; the PC restarts its stream and
+        // epoch 2's keyframe is lost, so its first frame arrives as seq 2.
+        // Its numbers happen to follow on, but it references a picture of the
+        // new stream the iPad never had.
+        for ext in ["h264", "h265"] {
+            let (result, _) = try run(ext, [(1, 0, 1), (2, 5, 2), (3, 4, 2), (4, 5, 2)])
+            XCTAssertEqual(result.shown, [1, 3, 4], ext)
+            XCTAssertEqual(result.requests, 1, ext)
         }
     }
 

@@ -432,7 +432,7 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
@@ -442,7 +442,9 @@ final class ConnectionManager: ObservableObject {
                 data: data,
                 width: 0,
                 height: 0,
-                isKeyframe: isKeyframe
+                isKeyframe: isKeyframe,
+                // The reassembler only accepts the current epoch's fragments.
+                streamEpoch: assembler?.counters.withLock { $0.streamEpoch } ?? 0
             ))
         }
 
