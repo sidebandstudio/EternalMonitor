@@ -27,6 +27,9 @@ pub struct SharedControl {
     /// frame and forces an IDR, reopening AMF sessions because AMF ignores
     /// per-frame keyframe requests (see `encoder::ignores_forced_keyframes`).
     pub force_next_idr: Arc<AtomicBool>,
+    /// Set when the client asks to restart the stream: the encoder reopens its
+    /// session on the next frame (then forces an IDR), as for a bitrate change.
+    pub reopen_encoder: Arc<AtomicBool>,
     /// Encoder name override from the Settings tab, applied on next pipeline restart.
     /// `None` means use auto-detected encoder from GpuInfo.
     pub encoder_override: Arc<Mutex<Option<String>>>,
@@ -145,6 +148,7 @@ impl SharedControl {
                 listen_port,
             ))))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
+            reopen_encoder: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
