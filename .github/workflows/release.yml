@@ -35,6 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The installed Quick Start links to eternalmonitor.dev/known-issues.html
+      # and both apps read latest.json. Pages publishes them from main, so a
+      # final tag waits for that deploy and fails without it. Pre-release tags
+      # and dry runs only warn.
+      - name: Check the website serves this release's pages
+        shell: bash
+        run: |
+          strict=()
+          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REF_NAME" != *-* ]]; then
+            strict=(--strict)
+          fi
+          python scripts/check_published_site.py --tag "$GITHUB_REF_NAME" "${strict[@]}"
+
       - name: Cache FFmpeg 7.1.1 shared SDK
         id: ffmpeg-cache
         uses: actions/cache@v4

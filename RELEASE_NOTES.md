@@ -108,6 +108,13 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- The Quick Start guide installed with EternalMonitor matches this version's
+  buttons and messages, and no longer names an old release.
+- A new Known issues page lists the problems we know about, each with what to
+  do. The setup guide's troubleshooting tables give every message both apps
+  show, what it means and what to do.
+- On Windows older than Windows 10 version 1809, the installer says which
+  Windows version EternalMonitor needs, in plain words.
 - On Wi-Fi, a lost frame no longer smears the iPad picture or triggers a
   decoder error. The iPad keeps the last good picture until the PC sends a
   fresh one, asks again if that takes a second, and shows **Restoring the
