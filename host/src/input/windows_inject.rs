@@ -31,7 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::pen_contact::{pointer_flag, NotReadyRetry, Outcome, PointerFrame, PointerKind};
+use super::pen_contact::{
+    pointer_flag, FramePacer, NotReadyRetry, Outcome, PointerFrame, PointerKind,
+};
 use super::pen_device::PenApi;
 use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
@@ -50,9 +52,11 @@ const _: () = {
 /// The Win32 calls behind the native pen device.
 #[derive(Debug, Default)]
 pub(crate) struct Win32Pen {
-    /// Error codes already logged, so a repeated refusal logs once.
-    warned: Vec<windows::core::HRESULT>,
+    /// How often Windows refused a frame, by error code, so a repeated
+    /// refusal logs at its 1st, 10th, 100th... time rather than every time.
+    warned: Vec<(windows::core::HRESULT, u64)>,
     retry: NotReadyRetry,
+    pacer: FramePacer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,14 +91,12 @@ impl PenApi for Win32Pen {
         output: Option<CaptureGeometry>,
     ) -> Outcome {
         let context = FrameContext { screen, output };
-        inject_frame(
-            handle.0,
-            frame,
-            from,
-            context,
-            &mut self.warned,
-            &mut self.retry,
-        )
+        let Self {
+            warned,
+            retry,
+            pacer,
+        } = self;
+        pacer.call(|| inject_frame(handle.0, frame, from, context, warned, retry))
     }
 
     fn send_mouse(&mut self, injections: &[Injection]) -> usize {
@@ -137,7 +139,7 @@ fn inject_frame(
     frame: PenSample,
     from: PointerKind,
     context: FrameContext,
-    warned: &mut Vec<windows::core::HRESULT>,
+    warned: &mut Vec<(windows::core::HRESULT, u64)>,
     retry: &mut NotReadyRetry,
 ) -> Outcome {
     let screen = context.screen;
@@ -175,8 +177,17 @@ fn inject_frame(
         }
         Err(error) => error,
     };
-    if !warned.contains(&error.code()) {
-        warned.push(error.code());
+    let count = match warned.iter_mut().find(|(code, _)| *code == error.code()) {
+        Some((_, count)) => {
+            *count += 1;
+            *count
+        }
+        None => {
+            warned.push((error.code(), 1));
+            1
+        }
+    };
+    if count == 10u64.pow(count.ilog10()) {
         // E_ACCESSDENIED: the secure desktop or an elevated window has focus;
         // SendInput is blocked there too, so there is no useful fallback.
         // Other codes point at the frame, its starting state or the geometry.
@@ -188,6 +199,7 @@ fn inject_frame(
         });
         warn!(
             %error,
+            count,
             phase = ?frame.phase,
             from = ?from,
             pressure = frame.pressure,

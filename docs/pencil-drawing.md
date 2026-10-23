@@ -35,8 +35,9 @@ Older hosts continue to receive the existing mouse-style Pencil events outside
 drawing mode. A current host that cannot create the Windows pen device turns
 those Pencil events into mouse input at the same position. Drawing mode shows
 an unavailable message if the connected host does not advertise native pen
-support. The host logs failures to create or inject the Windows pen device once
-per error code, with the sample's position and the virtual screen.
+support. The host logs a failure to create the Windows pen device once, and a
+frame Windows refuses the 1st, 10th, 100th and so on time for each error code,
+with the count, the sample's position and the virtual screen.
 
 ## Stroke delivery and latency
 
@@ -142,6 +143,19 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
 - Each session logs `Input mapping geometry` once, and again when it changes:
   the captured display and virtual screen rectangles, the pen origin, the DPI
   awareness and whether Pencil uses the native pen or the mouse fallback.
+- Pen frames go to Windows at least 250 µs apart. Windows refuses a frame
+  with `E_INVALIDARG` (0x80070057) once a dozen or so come faster than about
+  one every 100 µs. On the reference PC, 64 samples sent back to back lost
+  about one frame in twenty from the 13th on, frames 50 µs apart about one
+  in eighty, and frames 100 µs or more apart none; a receiving app that
+  stopped reading input for 400 ms made no difference. Samples come that
+  fast only as a backlog, after Wi-Fi or the PC stalled, which is how
+  one-monitor PCs hit this; the Pencil's own samples are 4 ms apart. 0.3.1
+  lost each refused sample. The restart described above delivers it, and
+  the probe still received one down and one up per stroke, but it relies on
+  Windows taking a down for a contact it still holds. Windows stamps each
+  frame itself: setting `PerformanceCount` ourselves made it refuse ten
+  times as many.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
   reject calls spaced less than its 0.1 ms timestamp resolution. If a frame
   is still refused after that, Windows' input queue is stuck: later frames
