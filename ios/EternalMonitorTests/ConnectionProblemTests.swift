@@ -18,11 +18,65 @@ final class ConnectionProblemTests: XCTestCase {
         for typed in ["390756", "390 756", " 390756 "] {
             XCTAssertEqual(ConnectionProblem.typedAddress(typed), .pairingCodeAsAddress, typed)
         }
-        for address in ["192.168.1.20", "studio-pc", "39075", "3907561", "10.0.0.1", "fe80::1", "12345a"] {
+        for address in ["192.168.1.20", "studio-pc", "10.0.0.1", "fe80::1", "12345a", "studio.local", "255.255.255.255"] {
             XCTAssertNil(ConnectionProblem.typedAddress(address), address)
         }
         XCTAssertEqual(ConnectionProblem.pairingCodeAsAddress.actions, [])
         XCTAssertTrue(ConnectionProblem.pairingCodeAsAddress.detail.contains("192.168.1.20"))
+    }
+
+    /// Seen in the field: an address typed with dots missing. Network.framework
+    /// reads digits without dots as one 32-bit number, sends to it, and the
+    /// user was told the PC didn't answer.
+    func testAnAddressWithMissingOrExtraPartsIsCaughtBeforeConnecting() {
+        for typed in ["19216801", "192168120", "39075", "3907561", "192.168.1", "192.168.1.300", "192.168..20", "192.168.1.20.5", "1921.68.1.20"] {
+            XCTAssertEqual(ConnectionProblem.typedAddress(typed), .badAddress(typed), typed)
+        }
+        XCTAssertTrue(ConnectionProblem.badAddress("19216801").detail.contains("192.168.1.20"))
+    }
+
+    /// A PC this iPad found on the network but that didn't answer is blocked
+    /// on the PC; an address on another home network is a different Wi-Fi.
+    func testNoReplySaysWhetherThePCWasFoundOrIsOnAnotherNetwork() {
+        let home = [LocalNetwork.Subnet("192.168.1.34", mask: "255.255.255.0")!]
+        let noReply = { (host: String, found: Bool, local: [LocalNetwork.Subnet]) in
+            ConnectionProblem.timeout(listenerReady: true, helloAttempts: 15, handshakeDone: false,
+                                      datagramsReceived: 0, isUSB: false, host: host, pcFound: found, local: local)
+        }
+        XCTAssertEqual(noReply("192.168.1.20", true, home), .noReplyFound)
+        XCTAssertEqual(noReply("192.168.1.20", false, home), .noReply(usb: false))
+        XCTAssertEqual(noReply("10.0.0.5", false, home), .otherNetwork)
+        XCTAssertEqual(noReply("192.168.0.20", false, home), .otherNetwork)
+        XCTAssertEqual(noReply("172.21.0.7", false, home), .otherNetwork)
+        // Tailscale, a public address, or an iPad off Wi-Fi: no certainty.
+        XCTAssertEqual(noReply("100.80.149.7", false, home), .noReply(usb: false))
+        XCTAssertEqual(noReply("10.0.0.5", false, []), .noReply(usb: false))
+        XCTAssertEqual(noReply("10.0.0.5", false, [LocalNetwork.Subnet("100.64.1.2", mask: "255.192.0.0")!]), .noReply(usb: false))
+        // A wider mask covers the PC.
+        XCTAssertEqual(noReply("10.1.2.3", false, [LocalNetwork.Subnet("10.1.9.9", mask: "255.255.0.0")!]), .noReply(usb: false))
+        // The cable never gets Wi-Fi advice.
+        XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 15, handshakeDone: false,
+                                                 datagramsReceived: 0, isUSB: true, host: "USB", pcFound: true, local: home),
+                       .noReply(usb: true))
+        XCTAssertTrue(ConnectionProblem.noReplyFound.detail.contains("Allow"))
+        // Routed LANs and VPNs use such addresses too: a possibility, with
+        // both steps, not a verdict.
+        XCTAssertEqual(ConnectionProblem.otherNetwork.title, "Your iPad and PC may be on different networks")
+        XCTAssertTrue(ConnectionProblem.otherNetwork.detail.contains("same Wi-Fi"))
+        XCTAssertTrue(ConnectionProblem.otherNetwork.detail.contains("Ready for your iPad"))
+        XCTAssertEqual(ConnectionProblem.otherNetwork.actions, [.retry])
+    }
+
+    /// The Connecting card says what is happening instead of only spinning.
+    func testConnectingSaysWhatIsHappening() {
+        XCTAssertEqual(ConnectingStatus.of(helloAttempts: 3, handshakeDone: false, isUSB: false), .reaching)
+        XCTAssertEqual(ConnectingStatus.of(helloAttempts: 9, handshakeDone: false, isUSB: false), .noAnswerYet(usb: false))
+        XCTAssertEqual(ConnectingStatus.of(helloAttempts: 9, handshakeDone: true, isUSB: true), .answered)
+        XCTAssertEqual(ConnectingStatus.reaching.detail(host: "192.168.1.20"), "Reaching 192.168.1.20")
+        XCTAssertEqual(ConnectingStatus.reaching.detail(host: "USB"), "Waiting for your PC")
+        XCTAssertTrue(ConnectingStatus.noAnswerYet(usb: false).detail(host: "x").contains("Ready for your iPad"))
+        XCTAssertTrue(ConnectingStatus.noAnswerYet(usb: true).detail(host: "USB").contains("Apple Devices"))
+        XCTAssertTrue(ConnectingStatus.answered.detail(host: "x").contains("picture"))
     }
 
     func testNoReplyFromAHomeRoutersAddressSaysItIsTheRouter() {
@@ -101,7 +155,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy, .pairingCodeAsAddress, .routerAddress,
+            .pcBusy, .pairingCodeAsAddress, .routerAddress, .noReplyFound, .otherNetwork, .waitingForNetwork,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
         ]
         for problem in all {

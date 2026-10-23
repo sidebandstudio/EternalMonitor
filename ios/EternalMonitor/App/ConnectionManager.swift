@@ -1,4 +1,5 @@
 import Foundation
+import Network
 @preconcurrency import CoreVideo
 import QuartzCore
 import Combine
@@ -106,6 +107,11 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
     @Published private(set) var hostInfo: ControlChannel.SessionInfo?
+    /// What the Connecting card says about the running attempt.
+    @Published private(set) var connectingStatus: ConnectingStatus = .reaching
+    /// Addresses this iPad's searches found a PC at. A PC that was found but
+    /// doesn't answer is on this network and blocked, not on another one.
+    private(set) var discoveredAddresses: Set<String> = []
     /// The host's live stream parameters — from the ACK, then refreshed by
     /// every heartbeat (so ABR bitrate changes and codec switches show up).
     @Published private(set) var hostStreamConfig: StreamConfig?
@@ -162,6 +168,10 @@ final class ConnectionManager: ObservableObject {
         var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+        /// Whether this iPad has a network now. While it doesn't, the
+        /// reconnect cycle waits instead of spending its attempts.
+        var networkUp: () -> Bool = { NetworkPath.shared.isUp }
+        var networkWaitSeconds = 60.0
     }
     private let timing: Timing
 
@@ -278,7 +288,9 @@ final class ConnectionManager: ObservableObject {
         if case .udp(let host, _) = target, let typed = ConnectionProblem.typedAddress(host) {
             connectionError = nil
             problem = typed
-            record(.warning, "connection", "Not connecting: the typed address looks like the pairing code")
+            record(.warning, "connection", typed == .pairingCodeAsAddress
+                ? "Not connecting: the typed address looks like the pairing code"
+                : "Not connecting: the typed address is not a valid IPv4 address")
             return
         }
         startAttempt(target)
@@ -336,6 +348,7 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
+        connectingStatus = .reaching
         record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
 
         let decoder = VideoDecoder()
@@ -471,6 +484,7 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.helloAttempts = attempt
+                self.connectingStatus = .of(helloAttempts: attempt, handshakeDone: self.hostInfo != nil, isUSB: isUSB)
                 self.record(.info, "ctrl", "HELLO2 attempt \(attempt)/\(total) to \(normalizedHost):\(port)")
             }
         }
@@ -488,6 +502,7 @@ final class ConnectionManager: ObservableObject {
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                self.connectingStatus = .answered
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -667,7 +682,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect()
+                    self.disconnect(cause: "linkFailure")
                     self.problem = failure
                     return
                 }
@@ -832,7 +847,7 @@ final class ConnectionManager: ObservableObject {
         case .usbTurnedOff: logged = "USB connections turned off"
         }
         record(.warning, "ctrl", "Connection lost (\(logged))")
-        disconnect()
+        disconnect(cause: "connectionLost")
         guard auto, let target else {
             problem = (failure ?? .lost(reason)).withoutReconnecting
             return
@@ -854,8 +869,22 @@ final class ConnectionManager: ObservableObject {
             for attempt in 1...6 {
                 guard let self, self.reconnectCycleID == cycleID else { return }
                 self.reconnectAttempt = attempt
-                self.problem = .reconnecting(attempt: attempt, of: 6)
-                try? await Task.sleep(for: .seconds(self.timing.reconnectBackoffSeconds(attempt)))
+                if self.timing.networkUp() {
+                    self.problem = .reconnecting(attempt: attempt, of: 6)
+                    try? await Task.sleep(for: .seconds(self.timing.reconnectBackoffSeconds(attempt)))
+                } else {
+                    // Wi-Fi dropped or the iPad slept: every attempt would fail at
+                    // once and run the cycle out. Wait for the network, then try
+                    // straight away instead of after a long backoff.
+                    self.problem = .waitingForNetwork
+                    self.record(.info, "connection", "Waiting for this iPad's network before reconnecting")
+                    let deadline = Date().addingTimeInterval(self.timing.networkWaitSeconds)
+                    while self.reconnectCycleID == cycleID, !self.timing.networkUp(), Date() < deadline {
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                    guard self.reconnectCycleID == cycleID else { return }
+                    self.problem = .reconnecting(attempt: attempt, of: 6)
+                }
                 guard self.reconnectCycleID == cycleID else { return }
                 self.startAttempt(.udp(host: target.host, port: target.port))
                 // Give the attempt its connect-timeout window, and wait out a
@@ -897,10 +926,29 @@ final class ConnectionManager: ObservableObject {
                 self.problem = .timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
-                    isUSB: self.transportMode == "USB", host: debug.host)
-                self.disconnect()
+                    isUSB: self.transportMode == "USB", host: debug.host,
+                    pcFound: self.discoveredAddresses.contains(debug.host), local: LocalNetwork.current())
+                self.disconnect(cause: "timeout")
             }
         }
+    }
+
+    /// PCs a search found so far, so a failed attempt knows the PC was there.
+    func noteFound(_ hosts: [DiscoveredHost]) {
+        discoveredAddresses.formUnion(hosts.compactMap(\.address))
+    }
+
+    /// One finished search for PCs, for the support log. It names no PC and
+    /// no address: only how many were found.
+    func noteSearch(hosts: [DiscoveredHost], blocked: Bool) {
+        let addresses = hosts.compactMap(\.address)
+        discoveredAddresses.formUnion(addresses)
+        // Support log only: the Connect screen's list is for attempts.
+        let (level, message): (DiagnosticLevel, String) = blocked
+            ? (.warning, "PC search refused: Local Network access is off")
+            : hosts.isEmpty ? (.info, "PC search found no PCs")
+            : (.info, "PC search found \(hosts.count) PC(s), \(addresses.count) with an IPv4 address")
+        SupportDiagnostics.shared.record(String(describing: level), "discovery", message)
     }
 
     func cancel() {
@@ -1020,10 +1068,14 @@ final class ConnectionManager: ObservableObject {
         connect(host: target.host, port: target.port)
     }
 
-    func disconnect(reason: ByeReason = .userDisconnect) {
+    /// `reason` goes to the PC in the goodbye. `cause` names a teardown the
+    /// app started itself (a timeout, a failed link) in the support log, so
+    /// it isn't counted as the user giving up.
+    func disconnect(reason: ByeReason = .userDisconnect, cause: String? = nil) {
         if state != .disconnected {
-            recordStreamSummary(reason: "disconnect=\(reason)")
-            record(.info, "connection", "Disconnect state=\(state) reason=\(reason)")
+            let logged = cause ?? "\(reason)"
+            recordStreamSummary(reason: "disconnect=\(logged)")
+            record(.info, "connection", "Disconnect state=\(state) reason=\(logged)")
         }
         awaitingPairing = false
         pairingPrompt = nil
@@ -1100,6 +1152,20 @@ private extension DiagnosticLevel {
 // MARK: - Control channel box
 
 /// Thread-safe holder so non-MainActor closures can reach the live channel.
+/// Whether this iPad has any network path, kept current by the system.
+final class NetworkPath: @unchecked Sendable {
+    static let shared = NetworkPath()
+    private let monitor = NWPathMonitor()
+    private let up = OSAllocatedUnfairLock(initialState: true)
+
+    private init() {
+        monitor.pathUpdateHandler = { [up] path in up.withLock { $0 = path.status == .satisfied } }
+        monitor.start(queue: DispatchQueue(label: "com.eternal.monitor.network-path"))
+    }
+
+    var isUp: Bool { up.withLock { $0 } }
+}
+
 final class ControlChannelBox: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock<ControlChannel?>(initialState: nil)
     var value: ControlChannel? {

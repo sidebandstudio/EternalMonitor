@@ -160,7 +160,21 @@ impl Pairing {
                 return Err(HelloStatus::RateLimited);
             }
         }
+        info!(%peer, reason = refusal_reason(hello), "iPad asked for the pairing code");
         Err(HelloStatus::Unauthorized)
+    }
+}
+
+/// Why a Wi-Fi HELLO without this host's token was turned away. A saved
+/// pairing stops matching when the PC's pairing is reset or its settings are
+/// lost, and the iPad then asks for the code again.
+pub fn refusal_reason(hello: &Hello2) -> &'static str {
+    if hello.pairing_code != 0 {
+        "wrong pairing code"
+    } else if hello.auth_token != [0; 16] {
+        "saved pairing no longer matches"
+    } else {
+        "pairing code needed"
     }
 }
 
@@ -255,6 +269,35 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three ways a Wi-Fi iPad is asked for the code are told apart in
+    /// the log, so a saved pairing that stopped working shows up.
+    #[test]
+    fn the_log_says_why_an_ipad_was_asked_for_the_code() {
+        let mut hello = Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 50000,
+            decoder_caps: 0,
+            feature_caps: 0,
+            screen_px_w: 0,
+            screen_px_h: 0,
+            screen_pt_w: 0,
+            screen_pt_h: 0,
+            refresh_hz: 60,
+            device_name: "iPad".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        };
+        assert_eq!(refusal_reason(&hello), "pairing code needed");
+        hello.auth_token = [7; 16];
+        assert_eq!(refusal_reason(&hello), "saved pairing no longer matches");
+        hello.pairing_code = 123_456;
+        assert_eq!(refusal_reason(&hello), "wrong pairing code");
+    }
 
     fn guess(nonce: u32) -> FailedRequest {
         FailedRequest {

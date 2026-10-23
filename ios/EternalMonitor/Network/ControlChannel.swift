@@ -69,6 +69,11 @@ final class ControlChannel {
 
     private static let maxHelloAttempts = 8
     private static let helloRetryMs = 250
+    /// After the quick tries go unanswered, keep asking once a second for
+    /// the rest of the connect window: a PC whose stream is restarting, or
+    /// whose firewall the user just allowed, answers a few seconds later.
+    private static let slowHelloAttempts = 7
+    private static let slowHelloRetryMs = 1000
     private static let pingIntervalMs = 2000
     private static let pingBurstCount = 5
     private static let pingBurstSpacingMs = 200
@@ -155,9 +160,9 @@ final class ControlChannel {
         }
     }
 
-    private func startHelloTimer() {
+    private func startHelloTimer(after delayMs: Int = 0, everyMs: Int = helloRetryMs) {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(Self.helloRetryMs))
+        timer.schedule(deadline: .now() + .milliseconds(delayMs), repeating: .milliseconds(everyMs))
         timer.setEventHandler { [weak self] in self?.helloTick() }
         helloTimer?.cancel()
         helloTimer = timer
@@ -171,14 +176,18 @@ final class ControlChannel {
             return
         }
         helloAttempts += 1
-        if helloAttempts > Self.maxHelloAttempts {
-            helloTimer?.cancel()
-            helloTimer = nil
+        if helloAttempts == Self.maxHelloAttempts + 1 {
             onDiagnostic?("HELLO2 unanswered after \(Self.maxHelloAttempts) attempts")
             onHandshakeTimeout?()
+            startHelloTimer(after: Self.slowHelloRetryMs - Self.helloRetryMs, everyMs: Self.slowHelloRetryMs)
+        }
+        let total = Self.maxHelloAttempts + Self.slowHelloAttempts
+        if helloAttempts > total {
+            helloTimer?.cancel()
+            helloTimer = nil
             return
         }
-        onHelloAttempt?(helloAttempts, Self.maxHelloAttempts)
+        onHelloAttempt?(helloAttempts, total)
         send(helloBytes)
     }
 

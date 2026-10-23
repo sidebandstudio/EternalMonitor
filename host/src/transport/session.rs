@@ -51,6 +51,8 @@ pub struct Actions {
     /// An update stopped this client's stream: tell it, making sure the
     /// message leaves (see [`Session::begin_update`]).
     pub goodbye: Option<(PeerId, Vec<u8>)>,
+    /// How a HELLO2 was answered: the status of the ACK sent back.
+    pub hello: Option<HelloStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +255,11 @@ impl Session {
             }
         }
         match message {
-            ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Hello2(hello) => {
+                let mut actions = self.handle_hello(source, hello, config, now);
+                actions.hello = actions.replies.first().and_then(|(_, ack)| ack_status(ack));
+                actions
+            }
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
@@ -726,9 +732,46 @@ fn session_peer_matches(session: &ActiveSession, source: PeerId) -> bool {
         && session.peer.addr.map(|a| a.ip()) == source.addr.map(|a| a.ip())
 }
 
+/// The status in an ACK this session built.
+fn ack_status(ack: &[u8]) -> Option<HelloStatus> {
+    match eternal_wire::v2::control::parse_control(ack) {
+        Ok((_, ControlMessage::HelloAck(ack))) => Some(ack.status),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every HELLO reports how it was answered, for the diagnostics signal.
+    #[test]
+    fn each_hello_reports_its_outcome() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let peer = addr([192, 168, 1, 5], 50000);
+        let ControlMessage::Hello2(mut old) = hello(1, 50000) else {
+            unreachable!()
+        };
+        old.proto_max = 1;
+        old.proto_min = 1;
+        let actions =
+            session.handle_control(peer, 0, ControlMessage::Hello2(old), &TestConfig, now);
+        assert_eq!(actions.hello, Some(HelloStatus::VersionUnsupported));
+        let actions = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(actions.hello, Some(HelloStatus::Ok));
+        let other = addr([192, 168, 1, 6], 50000);
+        let actions = session.handle_control(other, 0, identified_hello(3, 9), &TestConfig, now);
+        assert_eq!(actions.hello, Some(HelloStatus::Busy));
+        let report = session.handle_control(
+            peer,
+            1,
+            ControlMessage::Bye(eternal_wire::v2::control::ByeReason::UserDisconnect),
+            &TestConfig,
+            now,
+        );
+        assert_eq!(report.hello, None);
+    }
     use eternal_wire::v2::control::{Hello2, KeyframeReason, CAP_DECODE_H264};
 
     struct TestConfig;

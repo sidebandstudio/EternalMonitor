@@ -102,6 +102,11 @@ What the iPad says, and what to do:
   iPad", the PC is awake, and both are on the same Wi-Fi, not a guest
   network. If so, a firewall is probably blocking EternalMonitor: run
   EternalMonitor-Setup.exe again, or use a USB cable.
+- "Your PC is on this network but didn't answer": if this window says
+  "Windows Firewall is blocking your iPad", click Allow. Otherwise allow
+  EternalMonitor in your security software, or use a USB cable.
+- "Your iPad and PC may be on different networks": join the PC's Wi-Fi, not
+  a guest network, or check that this window says "Ready for your iPad".
 - "Your PC answered, but no picture arrived": follow any message in this
   window, click Restart, then tap Try again on the iPad.
 - "Lost the connection to your PC": wake the PC, check EternalMonitor is
@@ -125,6 +130,10 @@ What the iPad says, and what to do:
   the website".
 
 What this window says, and what to do:
+- "Windows Firewall is blocking your iPad": click Allow, then Yes when
+  Windows asks.
+- "A firewall setting is blocking your iPad": ask whoever manages the PC to
+  allow EternalMonitor, or use a USB cable.
 - "The second screen couldn't start, so your main screen is mirrored":
   the line below says why.
   If it says Windows' display driver stopped responding, restart the PC.

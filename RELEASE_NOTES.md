@@ -108,6 +108,30 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- The PC's Address and QR code use its Wi-Fi or Ethernet address. With a VPN,
+  WSL or Hyper-V running, the PC could show an address the iPad can't reach.
+  A PC on both Wi-Fi and Ethernet lists the other address too.
+- When Windows Firewall certainly stops iPads reaching EternalMonitor on the
+  network the PC's Address is on, the Stream page says so. If the block is
+  the one Windows' own "allow access" prompt left, **Allow** removes it and
+  adds Setup's rules after you approve the Windows prompt. A block set by
+  the PC's administrator or security software, or "block all incoming
+  connections", is named as such, with no **Allow** button. Other networks,
+  such as a VPN, and rules the check can't fully read never raise the
+  message.
+- The iPad says more about a PC that didn't answer: when it found the PC on
+  the network (something on the PC is blocking it), when the address may be
+  on a different network than the iPad's Wi-Fi, and when the typed address has
+  a dot missing. It picks the found PC's address on its own network.
+- While connecting, the iPad says what is happening, says when nothing has
+  answered yet, and keeps trying for the whole wait instead of only the first
+  two seconds, so a PC whose stream is restarting still connects.
+- When the iPad's Wi-Fi drops during a session, reconnecting waits for it to
+  come back and then tries straight away, instead of running out of attempts.
+- The Windows host logs a short network summary at startup (adapter kinds,
+  firewall profile and rules, other firewall products, never addresses or
+  names) and why an iPad was asked for the pairing code. The iPad logs how
+  many PCs each search found.
 - The Quick Start guide installed with EternalMonitor matches this version's
   buttons and messages, and no longer names an old release.
 - A new Known issues page lists the problems we know about, each with what to
@@ -117,6 +141,12 @@ Windows changes.
   Windows version EternalMonitor needs, in plain words.
 
 ### What to test
+
+On a PC with a VPN, WSL or Hyper-V, check that the Address on the Stream page
+and in the QR code is the PC's Wi-Fi or Ethernet address, then connect from
+the iPad. Type an address with a dot missing on the iPad and check that it
+says the address doesn't look right. Connect to a PC that is switched off and
+check that the iPad says nothing has answered yet while it waits.
 
 On a PC where EternalMonitor 0.3.1 opened a console window that closed after a
 few seconds, install this build and open EternalMonitor. The window should

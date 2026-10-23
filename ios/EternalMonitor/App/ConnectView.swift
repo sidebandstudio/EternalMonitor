@@ -159,6 +159,14 @@ struct ConnectView: View {
                     scanner.startScan()
                 }
             }
+            .onChange(of: scanner.hosts) { _, hosts in
+                connectionManager.noteFound(hosts)
+            }
+            .onChange(of: scanner.isScanning) { _, scanning in
+                if !scanning {
+                    connectionManager.noteSearch(hosts: scanner.hosts, blocked: scanner.searchBlocked)
+                }
+            }
             .animation(.easeInOut(duration: 0.2), value: isConnecting)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.problem)
@@ -456,10 +464,12 @@ struct ConnectView: View {
                     Text("Connecting…")
                         .font(.app(18, .semibold, relativeTo: .headline))
                         .foregroundStyle(Theme.text)
-                    Text(normalizedHostIP.isEmpty ? "Waiting for your PC" : "Reaching \(normalizedHostIP)")
+                    Text(connectionManager.connectingStatus.detail(
+                        host: connectionManager.transportMode == "USB" ? "USB" : normalizedHostIP))
                         .font(.app(14, relativeTo: .callout))
                         .foregroundStyle(Theme.textMuted)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.connectingStatus")
                 }
                 Spacer(minLength: 0)
             }

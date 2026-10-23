@@ -71,6 +71,23 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "pairing-code-as-address"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    /// An address with a dot missing is caught at once, instead of being
+    /// read as one number that never answers.
+    func testMistypedAddressIsExplainedAtOnce() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "19216801", "-lastPort", "9876"]
+        app.launch()
+        XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
+        app.buttons["connect.button"].tap()
+        let title = app.staticTexts["connect.problemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 3), app.debugDescription)
+        XCTAssertEqual(title.label, "That address doesn't look right")
+        XCTAssertTrue(app.staticTexts["connect.problemDetail"].label.contains("192.168.1.20"))
+        XCTAssertFalse(app.buttons["Cancel"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "mistyped-address"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     /// An address where nothing answers ends in plain words and a retry,
     /// not a transport trace.
     func testUnreachablePCSaysWhatToDo() {
@@ -80,6 +97,14 @@ final class ConnectScreenTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
+        // While it keeps trying, the card says nothing has answered yet.
+        let status = app.staticTexts["connect.connectingStatus"]
+        XCTAssertTrue(status.waitForExistence(timeout: 5), app.debugDescription)
+        let noAnswer = NSPredicate(format: "label BEGINSWITH 'No answer yet'")
+        expectation(for: noAnswer, evaluatedWith: status)
+        waitForExpectations(timeout: 6)
+        let waiting = XCTAttachment(screenshot: app.screenshot())
+        waiting.name = "connecting-no-answer-yet"; waiting.lifetime = .keepAlways; add(waiting)
         let title = app.staticTexts["connect.problemTitle"]
         XCTAssertTrue(title.waitForExistence(timeout: 20), app.debugDescription)
         XCTAssertEqual(title.label, "Your PC didn't answer")

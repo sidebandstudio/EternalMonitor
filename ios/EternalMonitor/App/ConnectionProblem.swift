@@ -8,6 +8,14 @@ enum ConnectionProblem: Equatable {
     /// Nothing came back from the address (PC closed, asleep, other network,
     /// blocked by a firewall or the router).
     case noReply(usb: Bool)
+    /// This iPad found the PC on the network, but it didn't answer: the
+    /// network carries its announcements, so something on the PC (a firewall,
+    /// security software, the stream being stopped) drops the connection.
+    case noReplyFound
+    /// Nothing answered at a private address outside this iPad's Wi-Fi
+    /// network. Routed home networks and VPNs use such addresses too, so it
+    /// is only a likely cause.
+    case otherNetwork
     /// The PC answered, but no picture could be shown.
     case noPicture
     /// This iPad could not open its side of the connection.
@@ -26,6 +34,8 @@ enum ConnectionProblem: Equatable {
     /// A live session stopped: heartbeats ran out or the cable came out.
     case lost(LostReason)
     case reconnecting(attempt: Int, of: Int)
+    /// Reconnecting waits for this iPad's Wi-Fi to come back.
+    case waitingForNetwork
     case reconnectFailed
     case pcEndedSession
     /// The PC is streaming to another device, or still to this iPad's cable.
@@ -58,6 +68,8 @@ enum ConnectionProblem: Equatable {
         switch self {
         case .noReply(usb: false): return "Your PC didn't answer"
         case .noReply(usb: true): return "Your PC didn't answer over the cable"
+        case .noReplyFound: return "Your PC is on this network but didn't answer"
+        case .otherNetwork: return "Your iPad and PC may be on different networks"
         case .noPicture: return "Your PC answered, but no picture arrived"
         case .receiverNotReady: return "This iPad couldn't start the connection"
         case .badAddress: return "That address doesn't look right"
@@ -71,6 +83,7 @@ enum ConnectionProblem: Equatable {
         case .lost(.cableUnplugged): return "The USB cable was disconnected"
         case .lost(.usbTurnedOff): return "USB connections were turned off"
         case .reconnecting: return "Reconnecting to your PC…"
+        case .waitingForNetwork: return "Waiting for Wi-Fi…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
         case .pcEndedSession: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
@@ -87,6 +100,13 @@ enum ConnectionProblem: Equatable {
                 + "or security software on the PC may be blocking EternalMonitor: run the PC installer again, or connect with a USB cable."
         case .noReply(usb: true):
             return "Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again."
+        case .noReplyFound:
+            return "Check that EternalMonitor on the PC says Ready for your iPad. If it shows a Windows Firewall message, click Allow there. "
+                + "Security software on the PC may also be blocking EternalMonitor: allow it there, run the PC installer again, or connect with a USB cable."
+        case .otherNetwork:
+            return "That address isn't on this iPad's Wi-Fi network, and nothing answered there. Join the same Wi-Fi as the PC "
+                + "(not a guest network), or check that EternalMonitor on the PC is open and says Ready for your iPad. "
+                + "A USB cable works too."
         case .noPicture:
             return "EternalMonitor on the PC couldn't send its screen. Look there for a message and follow it, click Restart, then try again. "
                 + "If it keeps happening, send us Settings, Diagnostics from this iPad and Performance, Copy logs from the PC."
@@ -114,6 +134,8 @@ enum ConnectionProblem: Equatable {
             return "Plug the cable back in. This iPad reconnects by itself."
         case .lost(.usbTurnedOff):
             return "Turn on Allow USB connections in Settings to use the cable again."
+        case .waitingForNetwork:
+            return "This iPad lost its network connection. It reconnects to your PC as soon as Wi-Fi is back."
         case .reconnecting(let attempt, let total):
             return "Attempt \(attempt) of \(total). Keep EternalMonitor open on the PC."
         case .reconnectFailed:
@@ -134,7 +156,7 @@ enum ConnectionProblem: Equatable {
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]
-        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
+        case .reconnecting, .waitingForNetwork, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
         default: return [.retry]
         }
     }
@@ -142,20 +164,34 @@ enum ConnectionProblem: Equatable {
     /// Why a connect attempt timed out, from how far it got.
     /// A PC that accepted the handshake did answer: no picture after that is
     /// a problem on the PC (screen capture or video encoding), not the network.
+    /// `pcFound`: this iPad's search found a PC at `host`. `local` is this
+    /// iPad's own IPv4 networks.
     static func timeout(listenerReady: Bool, helloAttempts: Int, handshakeDone: Bool,
-                        datagramsReceived: Int, isUSB: Bool, host: String = "") -> ConnectionProblem {
+                        datagramsReceived: Int, isUSB: Bool, host: String = "",
+                        pcFound: Bool = false, local: [LocalNetwork.Subnet] = []) -> ConnectionProblem {
         if handshakeDone { return .noPicture }
         if !listenerReady || helloAttempts == 0 { return .receiverNotReady }
         if datagramsReceived > 0 { return .noPicture }
-        if !isUSB && isRouterAddress(host) { return .routerAddress }
-        return .noReply(usb: isUSB)
+        if isUSB { return .noReply(usb: true) }
+        if pcFound { return .noReplyFound }
+        if isRouterAddress(host) { return .routerAddress }
+        if LocalNetwork.isOtherHomeNetwork(host, local: local) { return .otherNetwork }
+        return .noReply(usb: false)
     }
 
     /// A problem with the typed address found before connecting. The pairing
-    /// code would otherwise be read as a numeric IPv4 address that never answers.
+    /// code would otherwise be read as a numeric IPv4 address that never
+    /// answers, and so would an address with a dot missing ("19216801").
     static func typedAddress(_ host: String) -> ConnectionProblem? {
         let text = host.filter { !$0.isWhitespace }
-        return text.count == 6 && text.allSatisfy({ ("0"..."9").contains($0) }) ? .pairingCodeAsAddress : nil
+        let digits = text.filter { $0 != "." }
+        guard !digits.isEmpty, digits.allSatisfy({ ("0"..."9").contains($0) }) else { return nil }
+        if text.count == 6 && digits.count == 6 { return .pairingCodeAsAddress }
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        let valid = parts.count == 4 && parts.allSatisfy { part in
+            !part.isEmpty && part.count <= 3 && (Int(part) ?? 256) <= 255
+        }
+        return valid ? nil : .badAddress(text)
     }
 
     /// A private IPv4 address ending in .1, where home routers sit. A PC can
@@ -182,7 +218,7 @@ enum ConnectionProblem: Equatable {
     /// PC updates it turns sessions away (Busy), then stops answering until
     /// the new version starts; neither replaces the update as the reason.
     static func kept(_ kept: ConnectionProblem?, after attempt: ConnectionProblem?) -> ConnectionProblem? {
-        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
+        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .noReplyFound, .pcEndedSession].contains(attempt) {
             return kept
         }
         return afterReconnecting(lastAttempt: attempt) != .reconnectFailed ? attempt : kept
@@ -227,6 +263,106 @@ enum ConnectionProblem: Equatable {
     }
 
     private static let offline: Set<POSIXErrorCode> = [.ENETDOWN, .ENETUNREACH, .EHOSTUNREACH]
+}
+
+/// This iPad's own IPv4 networks, to tell a PC on another network from one
+/// that doesn't answer.
+enum LocalNetwork {
+    struct Subnet: Equatable {
+        let address: UInt32
+        let mask: UInt32
+
+        init(address: UInt32, mask: UInt32) {
+            self.address = address
+            self.mask = mask
+        }
+
+        /// From dotted strings, for tests.
+        init?(_ address: String, mask: String) {
+            guard let address = LocalNetwork.ipv4(address), let mask = LocalNetwork.ipv4(mask) else { return nil }
+            self.init(address: address, mask: mask)
+        }
+
+        func contains(_ ip: UInt32) -> Bool { ip & mask == address & mask }
+    }
+
+    static func ipv4(_ text: String) -> UInt32? {
+        guard text.split(separator: ".").count == 4, let bytes = IPv4Address(text)?.rawValue, bytes.count == 4 else {
+            return nil
+        }
+        return bytes.reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    static func isPrivate(_ ip: UInt32) -> Bool {
+        ip >> 24 == 10 || ip >> 20 == 0xAC1 || ip >> 16 == 0xC0A8
+    }
+
+    /// A private address outside every private network this iPad is on, so
+    /// "maybe another network" is worth saying. Not a verdict: routed LANs and
+    /// VPNs use such addresses. A Tailscale or public address, or an iPad
+    /// without Wi-Fi, says nothing either way.
+    static func isOtherHomeNetwork(_ host: String, local: [Subnet]) -> Bool {
+        guard let ip = ipv4(host), isPrivate(ip) else { return false }
+        let home = local.filter { isPrivate($0.address) }
+        return !home.isEmpty && !home.contains { $0.contains(ip) }
+    }
+
+    /// The first address in `addresses` on one of `local`'s networks, else the
+    /// first private one, else the first.
+    static func best(_ addresses: [String], local: [Subnet]) -> String? {
+        let parsed = addresses.compactMap { text in ipv4(text).map { (text, $0) } }
+        return parsed.first { item in local.contains { $0.contains(item.1) } }?.0
+            ?? parsed.first { isPrivate($0.1) }?.0
+            ?? addresses.first
+    }
+
+    /// The Wi-Fi and Ethernet networks this iPad is on now.
+    static func current() -> [Subnet] {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return [] }
+        defer { freeifaddrs(list) }
+        var subnets: [Subnet] = []
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(entry.pointee.ifa_flags)
+            let name = String(cString: entry.pointee.ifa_name)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0, name.hasPrefix("en"),
+                  let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_INET),
+                  let mask = entry.pointee.ifa_netmask else { continue }
+            let ip = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+            let netmask = mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+            subnets.append(Subnet(address: ip, mask: netmask))
+        }
+        return subnets
+    }
+}
+
+/// What the Connecting card says while an attempt runs, so nobody stares at
+/// a spinner for ten seconds.
+enum ConnectingStatus: Equatable {
+    case reaching
+    /// A few tries went unanswered; still trying.
+    case noAnswerYet(usb: Bool)
+    case answered
+
+    /// HELLOs go out every quarter second at first: eight unanswered is two
+    /// seconds of silence.
+    static func of(helloAttempts: Int, handshakeDone: Bool, isUSB: Bool) -> ConnectingStatus {
+        if handshakeDone { return .answered }
+        return helloAttempts > 8 ? .noAnswerYet(usb: isUSB) : .reaching
+    }
+
+    func detail(host: String) -> String {
+        switch self {
+        case .reaching:
+            return host.isEmpty || host == "USB" ? "Waiting for your PC" : "Reaching \(host)"
+        case .noAnswerYet(usb: false):
+            return "No answer yet. Check that EternalMonitor is open on the PC and says Ready for your iPad. Still trying…"
+        case .noAnswerYet(usb: true):
+            return "No answer over the cable yet. Check that EternalMonitor and Apple Devices are open on the PC. Still trying…"
+        case .answered:
+            return "Your PC answered. Waiting for the picture…"
+        }
+    }
 }
 
 /// What the USB cable card says for each listener status.

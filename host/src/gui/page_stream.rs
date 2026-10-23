@@ -61,6 +61,29 @@ impl AnalyzerApp {
             });
             ui.add_space(GAP - 10.0);
         }
+        let firewall = crate::network::firewall_check();
+        let can_repair = crate::network::can_repair();
+        if let Some((title, body, offer_allow)) = firewall_notice(firewall, can_repair) {
+            let mut allow = false;
+            widgets::banner(ui, WARNING, Icon::Warning, title, body, 110.0, |ui| {
+                if offer_allow {
+                    let waiting = firewall == crate::network::FirewallCheck::Repairing;
+                    allow = widgets::button_ex(
+                        ui,
+                        Tone::Primary,
+                        None,
+                        if waiting { "Waiting…" } else { "Allow" },
+                        !waiting,
+                        0.0,
+                    )
+                    .clicked();
+                }
+            });
+            if allow {
+                crate::network::repair_firewall();
+            }
+            ui.add_space(GAP - 10.0);
+        }
         if snap.using_software_fallback {
             // Choices made while troubleshooting are the usual reason a
             // working graphics card is skipped, so offer to undo them first.
@@ -407,6 +430,9 @@ impl AnalyzerApp {
                 };
                 copy = widgets::icon_button(ui, icon, tip).clicked();
             });
+            if let Some(others) = other_addresses(&snap.listen_addr, &crate::network::addresses()) {
+                ui.add(egui::Label::new(muted(others).size(SMALL)).wrap());
+            }
         } else {
             ui.label(overline("Address"));
             widgets::paragraph(
@@ -875,6 +901,48 @@ pub(super) fn usb_cable_notice(
             "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. Wi-Fi works without it.",
         )
     })
+}
+
+/// The Stream page notice when Windows Firewall certainly drops an iPad's
+/// packets: nothing lets EternalMonitor in on the current network, or a rule
+/// blocks it. Windows doesn't ask in that case; the iPad just gets no answer.
+/// The last value says whether to offer Allow: never for a block that the
+/// PC's administrator or security software set.
+pub(crate) fn firewall_notice(
+    check: crate::network::FirewallCheck,
+    can_repair: bool,
+) -> Option<(&'static str, &'static str, bool)> {
+    use crate::network::{FirewallCheck, Verdict};
+    match check {
+        FirewallCheck::Checked(Verdict::BlockedByAdmin) => Some((
+            "A firewall setting is blocking your iPad",
+            "A firewall setting from this PC's administrator or security software blocks EternalMonitor, so an iPad on Wi-Fi can't reach this PC. Ask whoever manages the PC to allow EternalMonitor, or use a USB cable.",
+            false,
+        )),
+        FirewallCheck::Checked(verdict) if !verdict.needs_repair() => None,
+        FirewallCheck::Unknown => None,
+        FirewallCheck::Checked(_) | FirewallCheck::Repairing => Some((
+            "Windows Firewall is blocking your iPad",
+            if can_repair {
+                "EternalMonitor isn't allowed through Windows Firewall on this network, so an iPad on Wi-Fi can't reach this PC. Click Allow, then click Yes when Windows asks. A USB cable works either way."
+            } else {
+                "EternalMonitor isn't allowed through Windows Firewall on this network, so an iPad on Wi-Fi can't reach this PC. Run EternalMonitor-Setup.exe again to fix it. A USB cable works either way."
+            },
+            can_repair,
+        )),
+    }
+}
+
+/// Every other address the PC has on a home network, for the Address row.
+/// The first one is already shown; a PC on Wi-Fi and Ethernet has two.
+pub(super) fn other_addresses(shown: &str, all: &[std::net::Ipv4Addr]) -> Option<String> {
+    let shown_ip = shown.rsplit_once(':').map_or(shown, |(ip, _)| ip);
+    let others: Vec<String> = all
+        .iter()
+        .map(|ip| ip.to_string())
+        .filter(|ip| ip != shown_ip)
+        .collect();
+    (!others.is_empty()).then(|| format!("Also reachable at {}", others.join(", ")))
 }
 
 /// What the USB row says. The Apple Devices hint appears only when Apple's

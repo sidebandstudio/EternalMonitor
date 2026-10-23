@@ -346,3 +346,90 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
         .starts_with("Windows didn't add the second screen in time"));
     assert!(slow.retry && !slow.installer);
 }
+
+/// A VPN or a WSL switch owns the default route on many PCs. The Address and
+/// QR code must still be the one an iPad on the home Wi-Fi can reach.
+#[test]
+fn the_address_shown_is_the_home_networks_not_the_default_routes() {
+    use std::net::{IpAddr, Ipv4Addr};
+    let lan = [Ipv4Addr::new(192, 168, 1, 20)];
+    let vpn = Some(IpAddr::V4(Ipv4Addr::new(10, 41, 107, 216)));
+    let none = || None;
+    assert_eq!(
+        pick_address(&lan, vpn, none),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)))
+    );
+    // No home network found (or not Windows): the default route, as before.
+    assert_eq!(pick_address(&[], vpn, none), vpn);
+    // No default route either: the first adapter.
+    assert_eq!(
+        pick_address(&[], None, || Some(Ipv4Addr::new(192, 168, 2, 9))),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 9)))
+    );
+    assert_eq!(
+        pick_address(&[], Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), none),
+        None
+    );
+}
+
+#[test]
+fn every_other_reachable_address_is_listed_under_the_address() {
+    use super::page_stream::other_addresses;
+    use std::net::Ipv4Addr;
+    let both = [
+        Ipv4Addr::new(192, 168, 1, 20),
+        Ipv4Addr::new(192, 168, 1, 21),
+    ];
+    assert_eq!(
+        other_addresses("192.168.1.20:9876", &both).as_deref(),
+        Some("Also reachable at 192.168.1.21")
+    );
+    assert_eq!(other_addresses("192.168.1.20:9876", &both[..1]), None);
+    assert_eq!(other_addresses("unknown:9876", &[]), None);
+}
+
+#[test]
+fn the_firewall_notice_appears_only_when_windows_would_drop_the_ipad() {
+    use super::page_stream::firewall_notice;
+    use crate::network::{FirewallCheck, Verdict};
+    for quiet in [
+        FirewallCheck::Unknown,
+        FirewallCheck::Checked(Verdict::Allowed),
+        FirewallCheck::Checked(Verdict::Off),
+        FirewallCheck::Checked(Verdict::NoNetwork),
+        FirewallCheck::Checked(Verdict::Unknown),
+    ] {
+        assert_eq!(firewall_notice(quiet, true), None, "{quiet:?}");
+    }
+    let (title, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::Missing), true).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking your iPad");
+    assert!(
+        body.contains("Click Allow") && body.contains("USB cable"),
+        "{body}"
+    );
+    assert!(allow);
+    let (_, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::Blocked), false).unwrap();
+    assert!(
+        body.contains("EternalMonitor-Setup.exe") && !allow,
+        "{body}"
+    );
+    assert!(firewall_notice(FirewallCheck::Repairing, true).is_some());
+}
+
+/// A block for any program, a port, or from group policy: the repair must not
+/// touch it, so there is no Allow button and the notice says who set it.
+#[test]
+fn a_block_the_repair_may_not_change_gets_no_allow_button() {
+    use super::page_stream::firewall_notice;
+    use crate::network::{FirewallCheck, Verdict};
+    let (title, body, allow) =
+        firewall_notice(FirewallCheck::Checked(Verdict::BlockedByAdmin), true).unwrap();
+    assert!(!allow);
+    assert_eq!(title, "A firewall setting is blocking your iPad");
+    assert!(
+        body.contains("administrator or security software") && !body.contains("Click Allow"),
+        "{body}"
+    );
+}
