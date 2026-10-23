@@ -33,19 +33,22 @@ fn helpers_then_single_instance_then_the_display_reset() {
     );
 }
 
-/// The stream port is checked before the supervisor starts the stream, so a
-/// port another program holds is found, not mistaken for the stream's own.
+/// A port another program holds is reported from the stream's real bind,
+/// and the way to start the stream once it is free is installed before the
+/// supervisor first binds it.
 #[test]
-fn the_stream_port_is_checked_before_the_stream_starts() {
+fn the_stream_bind_reports_a_held_port() {
+    let transport = include_str!("../src/transport/mod.rs");
+    assert!(
+        transport.contains("crate::startup::port::watch_bind(listen_port, raw.bind("),
+        "the stream socket's bind goes through startup::port::watch_bind"
+    );
     let main = include_str!("../src/main.rs");
-    let check = main
-        .find("eternal_host::startup::port::check_at_startup(listen_port")
-        .expect("main.rs checks the stream port");
+    let starter = main
+        .find("eternal_host::startup::port::on_free(")
+        .expect("main.rs installs the start for a freed port");
     let stream = main
         .find("eternal_host::supervisor::run(")
         .expect("main.rs starts the supervisor");
-    assert!(
-        check < stream,
-        "the port check must come before the stream starts"
-    );
+    assert!(starter < stream, "installed before the stream starts");
 }

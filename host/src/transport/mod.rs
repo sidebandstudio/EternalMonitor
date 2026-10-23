@@ -148,7 +148,7 @@ pub async fn start_sender(
             }
         }
         raw.set_nonblocking(true)?;
-        raw.bind(&bind_addr.into())?;
+        crate::startup::port::watch_bind(listen_port, raw.bind(&bind_addr.into()))?;
         UdpSocket::from_std(raw.into())?
     };
 

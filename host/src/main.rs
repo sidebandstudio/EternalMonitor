@@ -236,12 +236,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Before the stream starts: while another program holds the port, the
-    // Stream page names it, and the stream starts once the port is free.
+    // While another program holds the stream port, the Stream page names it;
+    // once the port is free the stream starts again, unless the user stopped
+    // it meanwhile. Installed before the stream first binds the port.
     {
-        let gui_control = gui_control.clone();
-        eternal_host::startup::port::check_at_startup(listen_port, move || {
-            gui_control.request_start()
+        let supervisor_tx = supervisor_tx.clone();
+        eternal_host::startup::port::on_free(move || {
+            vdd::recheck_tasks();
+            let _ = supervisor_tx.send(eternal_host::control::SupervisorCommand::Start);
         });
     }
 
