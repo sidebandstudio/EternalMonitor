@@ -487,6 +487,52 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertTrue(calls.withLock { $0.events }.contains { $0.hasPrefix("Picture held 6000 ms") })
     }
 
+    func testFramesArrivingDuringAHoldStillEscalate() throws {
+        // Sol: a dependent frame every 600 ms used each retry slot (as
+        // decodeError) just before the timer ticked, so the 2 s rebuild and
+        // the restart request never happened and the iPad reconnected at 5 s.
+        // The test drives the timer, so each tick runs 50 ms after its frame.
+        let units = try twoGOPs("h264")
+        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } }, runsRecoveryTimer: false)
+        defer { decoder.shutdown() }
+        struct Calls { var requests = 0; var restarts = 0; var stalls = 0; var rebuilds = 0 }
+        let calls = OSAllocatedUnfairLock(initialState: Calls())
+        decoder.onNeedsKeyframe = { calls.withLock { $0.requests += 1 } }
+        decoder.onRestartStream = { calls.withLock { $0.restarts += 1 } }
+        decoder.onStalled = { calls.withLock { $0.stalls += 1 } }
+        decoder.onEvent = { message in
+            if message.contains("rebuilding the decoder") { calls.withLock { $0.rebuilds += 1 } }
+        }
+        func at(_ us: UInt64) { clock.withLock { $0 = 5_000_000 + us } }
+        func asked(_ count: Int) {
+            let met = expectation(for: NSPredicate { _, _ in calls.withLock { $0.requests + $0.restarts } == count },
+                                  evaluatedWith: nil)
+            wait(for: [met], timeout: 10)
+        }
+        func tick() {
+            let ticked = expectation(description: "tick")
+            decoder.runRecoveryTick { ticked.fulfill() }
+            wait(for: [ticked], timeout: 10)
+        }
+        for (seq, index) in [(1, 0), (2, 1), (4, 3)] {
+            decoder.decode(packet: packet(seq: UInt32(seq), data: units[index], keyframe: index == 0))
+        }
+        asked(1)                                         // the loss, at once
+        for k in 1...7 {                                 // 0.6 s ... 4.2 s
+            at(UInt64(k) * 600_000)
+            decoder.decode(packet: packet(seq: UInt32(4 + k), data: units[3], keyframe: false))
+            asked(1 + k)                                 // the frame takes the slot
+            at(UInt64(k) * 600_000 + 50_000)
+            tick()
+        }
+        let result = calls.withLock { $0 }
+        XCTAssertEqual(result.requests, 4, "decodeError before 2 s: \(result)")
+        XCTAssertEqual(result.restarts, 4, "restart requests from 2 s, whichever path: \(result)")
+        XCTAssertEqual(result.rebuilds, 1, "\(result)")
+        XCTAssertEqual(result.stalls, 0, "before 5 s: \(result)")
+    }
+
     func testKeyframeThatFailsToDecodeContinuesTheHold() throws {
         // Progress means a decoded picture. A keyframe VideoToolbox rejects
         // must not restart the 2 s and 5 s clock, or a stream of bad

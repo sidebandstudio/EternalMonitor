@@ -97,7 +97,9 @@ final class VideoDecoder {
     /// A hold this long shows Restoring the picture and is logged.
     static let showRestoringAfterUs: UInt64 = 1_000_000
 
-    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs, makeSession: SessionFactory? = nil) {
+    /// `runsRecoveryTimer` false: tests drive the timer with `runRecoveryTick`.
+    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs, makeSession: SessionFactory? = nil,
+         runsRecoveryTimer: Bool = true) {
         self.nowUs = nowUs
         self.makeSession = makeSession ?? { format, specification, attributes in
             var session: VTDecompressionSession?
@@ -111,6 +113,7 @@ final class VideoDecoder {
             )
             return (status, session)
         }
+        guard runsRecoveryTimer else { return }
         let timer = DispatchSource.makeTimerSource(queue: decodeQueue)
         timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(10))
         timer.setEventHandler { [weak self] in self?.recoveryTick() }
@@ -162,37 +165,29 @@ final class VideoDecoder {
         }
     }
 
-    /// Recovery while the picture is held, driven by time alone: ask again
-    /// every `keyframeRetryUs`; from `restartStreamAfterUs` each retry asks
-    /// the host to restart the stream instead; give the session up at
-    /// `reconnectAfterUs`. Every request takes a retry slot, because the
-    /// control channel coalesces keyframe requests less than 500 ms apart.
+    /// One timer tick, queued behind the frames already given to `decode`.
+    func runRecoveryTick(then done: @escaping () -> Void) {
+        decodeQueue.async { [weak self] in
+            self?.recoveryTick()
+            done()
+        }
+    }
+
+    /// Recovery while the picture is held, driven by time alone, so a silent
+    /// stream recovers too: ask again every `keyframeRetryUs`, rebuild at
+    /// `restartStreamAfterUs`, give the session up at `reconnectAfterUs`.
     private func recoveryTick() {
         guard !isShutdown, let current = hold.withLock({ $0 }) else { return }
         let now = nowUs()
-        let held = now &- current.start
-        if held >= Self.reconnectAfterUs {
+        if now &- current.start >= Self.reconnectAfterUs {
             guard !current.reportedStall else { return }
             hold.withLock { $0?.reportedStall = true }
             onStalled?()
             return
         }
+        rebuildIfHeldTooLong(at: now)
         guard now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
-        lastKeyframeRequestUs = now
-        guard held >= Self.restartStreamAfterUs else {
-            onNeedsKeyframe?()
-            return
-        }
-        if !current.restartedStream {
-            hold.withLock { $0?.restartedStream = true }
-            onEvent?("Picture held \(held / 1000) ms; rebuilding the decoder and asking the PC to restart the stream")
-            // A fresh session from the next keyframe's parameter sets, in case
-            // this one is what keeps rejecting them.
-            teardownSession(waitForFrames: false)
-            formatDescription = nil
-            waitingForSyncSample = true
-        }
-        onRestartStream?()
+        requestKeyframe(at: now)
     }
 
     /// Ask (again) for a keyframe the host has not sent: a frame arrived that
@@ -200,9 +195,35 @@ final class VideoDecoder {
     /// the host's first keyframe was lost.
     private func requestKeyframeIfOverdue() {
         let now = nowUs()
+        rebuildIfHeldTooLong(at: now)
         guard lastKeyframeRequestUs == 0 || now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
+        requestKeyframe(at: now)
+    }
+
+    /// Every keyframe request, from the timer, a held frame or a decode
+    /// error, takes its reason from the hold's age: from
+    /// `restartStreamAfterUs` it asks the host to restart the stream. Which
+    /// path happens to use a retry slot must not decide that.
+    private func requestKeyframe(at now: UInt64) {
         lastKeyframeRequestUs = now
-        onNeedsKeyframe?()
+        if let start = hold.withLock({ $0?.start }), now &- start >= Self.restartStreamAfterUs {
+            onRestartStream?()
+        } else {
+            onNeedsKeyframe?()
+        }
+    }
+
+    /// Once per hold, when it first reaches `restartStreamAfterUs`, whether
+    /// or not a request may go out yet: a fresh session from the next
+    /// keyframe's parameter sets, in case this one keeps rejecting them.
+    private func rebuildIfHeldTooLong(at now: UInt64) {
+        guard let current = hold.withLock({ $0 }), !current.restartedStream,
+              now &- current.start >= Self.restartStreamAfterUs else { return }
+        hold.withLock { $0?.restartedStream = true }
+        onEvent?("Picture held \((now &- current.start) / 1000) ms; rebuilding the decoder and asking the PC to restart the stream")
+        teardownSession(waitForFrames: false)
+        formatDescription = nil
+        waitingForSyncSample = true
     }
 
     /// Tear down on the decode queue, provably after any in-flight decode call.
@@ -647,8 +668,7 @@ final class VideoDecoder {
             // A reference picture before this one never arrived (lost whole,
             // or dropped unfinished). Hold and ask for a keyframe now.
             beginWaitingForKeyframe()
-            lastKeyframeRequestUs = nowUs()
-            onNeedsKeyframe?()
+            requestKeyframe(at: nowUs())
             return
         }
         if isSyncSample {
@@ -815,7 +835,6 @@ final class VideoDecoder {
                                           onSyncSample: Bool) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
         beginWaitingForKeyframe()
-        lastKeyframeRequestUs = nowUs()
         reportFailure("\(source) status=\(status) codec=\(codec) depth=\(decodeDepth) generation=\(generation) sync=\(onSyncSample); waiting for a keyframe")
         if status == kVTInvalidSessionErr || onSyncSample {
             // The session died underneath us (typical after app backgrounding),
@@ -824,7 +843,7 @@ final class VideoDecoder {
             // rebuild a healthy session.
             createDecompressionSession()
         }
-        onNeedsKeyframe?()
+        requestKeyframe(at: nowUs())
     }
 
     private func isRandomAccessAccessUnit(_ nalUnits: [Data]) -> Bool {
