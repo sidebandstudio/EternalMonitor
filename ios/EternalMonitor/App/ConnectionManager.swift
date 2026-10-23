@@ -93,6 +93,9 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var stats = StreamStats()
     /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
     @Published private(set) var signalLost = false
+    /// Frames still arrive, but the picture has been held for over a second
+    /// waiting for the keyframe that replaces a lost frame.
+    @Published var pictureRestoring = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
     /// Decoded video dimensions in pixels — the touch relay maps gestures
@@ -408,12 +411,9 @@ final class ConnectionManager: ObservableObject {
                 if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
                     self.videoSize = CGSize(width: frameWidth, height: frameHeight)
                 }
-                if ts > 0,
-                   let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }) {
-                    let nowUs = ControlChannel.clientNowUs()
-                    let captureClient = Int64(bitPattern: ts) - offset
-                    let latencyUs = Int64(bitPattern: nowUs) - captureClient
-                    self.lagMs = latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
+                if let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }),
+                   let lag = Self.latencyMs(captureUs: ts, offsetUs: offset, nowUs: ControlChannel.clientNowUs()) {
+                    self.lagMs = lag
                 }
             }
         }
@@ -424,6 +424,19 @@ final class ConnectionManager: ObservableObject {
                 streamEpoch: 0, lastCompleteSeq: 0, reason: .decodeError
             )
         }
+        // A picture held 2 s: the strongest request short of reconnecting.
+        decoder.onRestartStream = { [weak self, weak controlChannelBox] in
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            controlChannelBox?.value?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .resume)
+        }
+        // Held 5 s: reconnect, as for a PC that stopped responding.
+        decoder.onStalled = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connected else { return }
+                self.record(.warning, "decode", "Picture held 5 s without a keyframe — reconnecting")
+                self.beginReconnect(.pcStoppedResponding)
+            }
+        }
 
         decoder.onEvent = { [weak self] message in
             Task { @MainActor in
@@ -432,7 +445,7 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
@@ -442,7 +455,9 @@ final class ConnectionManager: ObservableObject {
                 data: data,
                 width: 0,
                 height: 0,
-                isKeyframe: isKeyframe
+                isKeyframe: isKeyframe,
+                // The reassembler only accepts the current epoch's fragments.
+                streamEpoch: assembler?.counters.withLock { $0.streamEpoch } ?? 0
             ))
         }
 
@@ -480,8 +495,9 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "ctrl", message)
             }
         }
-        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler] info in
+        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler, weak decoder] info in
             assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
+            decoder?.setFrameSeqContiguous(info.hostCaps & ReferenceContinuity.hostCapContiguousFrameSeq != 0)
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             Task { @MainActor in
@@ -797,6 +813,9 @@ final class ConnectionManager: ObservableObject {
         }
         next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
         stats = next
+        let restoring = state == .connected
+            && (videoDecoder?.keyframeWaitUs ?? 0) >= VideoDecoder.showRestoringAfterUs
+        if restoring != pictureRestoring { pictureRestoring = restoring }
 
         // --- Liveness watchdog (host heartbeats stopped => stale picture) ---
         guard state == .connected else { return }
@@ -1059,11 +1078,23 @@ final class ConnectionManager: ObservableObject {
         lagMs = 0
         stats = StreamStats()
         signalLost = false
+        pictureRestoring = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil
         hostStreamConfig = nil
         UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    /// Capture-to-decode latency of a frame stamped `captureUs` on the host
+    /// clock. Nil for an unstamped frame or a stamp too far from either clock
+    /// to subtract, which a broken or hostile host could send.
+    nonisolated static func latencyMs(captureUs: UInt64, offsetUs: Int64, nowUs: UInt64) -> Double? {
+        guard captureUs > 0 else { return nil }
+        let (captureClient, captureOverflow) = Int64(bitPattern: captureUs).subtractingReportingOverflow(offsetUs)
+        let (latencyUs, latencyOverflow) = Int64(bitPattern: nowUs).subtractingReportingOverflow(captureClient)
+        guard !captureOverflow, !latencyOverflow else { return nil }
+        return latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
     }
 
     private func recordStreamSummary(reason: String) {

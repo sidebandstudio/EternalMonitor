@@ -116,6 +116,21 @@ Windows changes.
   show, what it means and what to do.
 - On Windows older than Windows 10 version 1809, the installer says which
   Windows version EternalMonitor needs, in plain words.
+- On Wi-Fi, a lost frame no longer smears the iPad picture or triggers a
+  decoder error. The iPad keeps the last good picture until the PC sends a
+  fresh one, asks again if that takes a second, and shows **Restoring the
+  picture…** if it takes longer. Frames the PC skips on purpose don't cause
+  this. If the picture is still frozen after 2 seconds, the PC restarts its
+  video encoder; after 5 seconds the iPad reconnects by itself.
+- If the iPad's video decoder fails to start, the iPad tries again with the
+  next picture from the PC instead of freezing until you reconnect.
+- When the PC's resolution changes mid-stream, for example as a second screen
+  starts, the iPad switches to the new size in one step instead of glitching.
+- PC audio comes back by itself after iPadOS restarts its audio services,
+  including when audio had failed to start, instead of staying silent until
+  you reconnect.
+- The iPad app frees its held video frame when iPadOS runs low on memory.
+- The iPad app no longer crashes on impossible clock readings from a PC.
 
 ### What to test
 

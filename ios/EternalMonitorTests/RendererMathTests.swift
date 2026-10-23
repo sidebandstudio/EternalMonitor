@@ -1,4 +1,5 @@
 import XCTest
+import MetalKit
 @testable import EternalMonitor
 
 final class RendererMathTests: XCTestCase {
@@ -35,5 +36,41 @@ final class RendererMathTests: XCTestCase {
     func testDegenerateSizesAreSafe() {
         let scale = MetalRenderer.aspectFitScale(video: .zero, drawable: .zero)
         XCTAssertEqual(scale, SIMD2<Float>(1, 1))
+    }
+
+    private func rendererHoldingAFrame() throws -> (MetalRenderer, MTKView) {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: CGRect(x: 0, y: 0, width: 64, height: 64), device: device)
+        view.colorPixelFormat = .bgra8Unorm
+        let renderer = MetalRenderer(device: device, view: view)
+        renderer.draw(in: view, pixelBuffer: try XCTUnwrap(makeBuffer()))
+        XCTAssertTrue(renderer.holdsFrame)
+        return (renderer, view)
+    }
+
+    func testMemoryWarningReleasesTheHeldFrame() throws {
+        let (renderer, view) = try rendererHoldingAFrame()
+        let coordinator = MetalView.Coordinator()
+        coordinator.renderer = renderer
+        coordinator.attach(view: view)
+        defer { coordinator.detach() }
+        NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        XCTAssertFalse(renderer.holdsFrame, "a memory warning must not keep a multi-megabyte frame")
+        // A new frame is held again.
+        renderer.draw(in: view, pixelBuffer: try XCTUnwrap(makeBuffer()))
+        XCTAssertTrue(renderer.holdsFrame)
+    }
+
+    private func makeBuffer() -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+        ] as CFDictionary, &buffer)
+        return buffer
+    }
+
+    func testMemoryFootprintIsMeasured() {
+        XCTAssertGreaterThan(MemoryFootprint.megabytes() ?? 0, 0)
     }
 }
