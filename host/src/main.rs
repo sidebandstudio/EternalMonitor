@@ -236,6 +236,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // While another program holds the stream port, the Stream page names it;
+    // once the port is free the stream starts again, unless the user stopped
+    // it meanwhile. Installed before the stream first binds the port.
+    {
+        let supervisor_tx = supervisor_tx.clone();
+        eternal_host::startup::port::on_free(move || {
+            vdd::recheck_tasks();
+            let _ = supervisor_tx.send(eternal_host::control::SupervisorCommand::Start);
+        });
+    }
+
     let supervisor_thread = std::thread::spawn(move || {
         eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });

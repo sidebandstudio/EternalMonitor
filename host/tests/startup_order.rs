@@ -32,3 +32,23 @@ fn helpers_then_single_instance_then_the_display_reset() {
         "main touches the virtual display before dispatching helper modes"
     );
 }
+
+/// A port another program holds is reported from the stream's real bind,
+/// and the way to start the stream once it is free is installed before the
+/// supervisor first binds it.
+#[test]
+fn the_stream_bind_reports_a_held_port() {
+    let transport = include_str!("../src/transport/mod.rs");
+    assert!(
+        transport.contains("crate::startup::port::watch_bind(listen_port, raw.bind("),
+        "the stream socket's bind goes through startup::port::watch_bind"
+    );
+    let main = include_str!("../src/main.rs");
+    let starter = main
+        .find("eternal_host::startup::port::on_free(")
+        .expect("main.rs installs the start for a freed port");
+    let stream = main
+        .find("eternal_host::supervisor::run(")
+        .expect("main.rs starts the supervisor");
+    assert!(starter < stream, "installed before the stream starts");
+}

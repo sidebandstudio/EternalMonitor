@@ -14,6 +14,7 @@ mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
+mod port_notice;
 mod renderer;
 mod theme;
 mod update_banner;
@@ -674,7 +675,9 @@ impl eframe::App for AnalyzerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        renderer::frame_started(ui.ctx());
+        if !renderer::frame_started(ui.ctx()) {
+            return;
+        }
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(dirty_at) = self.settings_dirty_at {
@@ -1245,30 +1248,68 @@ pub fn detect_local_ip(listen_port: u16) -> String {
     format!("unknown:{listen_port}")
 }
 
-/// Launch the GUI window. Blocks the calling thread.
+/// Whether a panic at `file` on the GUI thread is the window's lost graphics
+/// device, which the GUI recovers from by opening a new window.
+pub(crate) fn panic_is_window_device_loss(file: &str) -> bool {
+    renderer::panic_is_device_loss(file)
+}
+
+/// Launch the GUI window. Blocks the calling thread. A window whose graphics
+/// device is lost, as in a driver reset, closes and opens again with a new
+/// device; the stream keeps running meanwhile.
 pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
-        .expect("embedded icon PNG is valid");
-
-    let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("EternalMonitor")
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([820.0, 560.0])
-            .with_icon(std::sync::Arc::new(icon)),
-        ..Default::default()
-    };
-    renderer::configure(&mut options.wgpu_options);
-
-    let result = eframe::run_native(
-        "EternalMonitor",
-        options,
-        Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
+    let icon = std::sync::Arc::new(
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
+            .expect("embedded icon PNG is valid"),
     );
-    if result.is_ok() {
-        renderer::window_closed();
+
+    loop {
+        let mut options = eframe::NativeOptions {
+            viewport: renderer::place(
+                egui::ViewportBuilder::default()
+                    .with_title("EternalMonitor")
+                    .with_inner_size([1000.0, 640.0])
+                    .with_min_inner_size([820.0, 560.0])
+                    .with_icon(icon.clone()),
+            ),
+            ..Default::default()
+        };
+        renderer::configure(&mut options.wgpu_options);
+
+        let control = control.clone();
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eframe::run_native(
+                "EternalMonitor",
+                options,
+                Box::new(|cc| {
+                    if let Some(render_state) = &cc.wgpu_render_state {
+                        renderer::watch(&render_state.device);
+                    }
+                    Ok(Box::new(AnalyzerApp::new(cc, control)))
+                }),
+            )
+        }));
+        // Only a panic on a lost device is caught; the failure hook reported
+        // any other one already.
+        let result = match run {
+            Ok(result) => result,
+            Err(_) if renderer::device_lost() => Ok(()),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        match renderer::rebuild_after_loss() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                return Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                    error,
+                ))))
+            }
+        }
+        if result.is_ok() {
+            renderer::window_closed();
+        }
+        return result;
     }
-    result
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
 
 pub(crate) mod display;
 pub(crate) mod lock;
+pub mod port;
 mod process;
 mod record;
 mod reporter;
@@ -33,7 +34,10 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 /// fail while the window renderer starts; `early-error` to fail right after the failure reporter
 /// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
 /// the window works; or `surface-error` to report a surface error on every
-/// frame of the first two seconds. A `-quiet` suffix skips the message box.
+/// frame of the first two seconds; `device-lost` to lose the window's
+/// graphics device 15 s after the window works, between frames, or
+/// `device-lost-in-paint` inside a paint, or `device-lost-repeat` to lose
+/// every rebuilt window's device as well. A `-quiet` suffix skips the message box.
 /// Only debug builds and builds with the `fault-injection` feature read it;
 /// a release build ignores it.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
@@ -60,6 +64,15 @@ fn crash_dir() -> Option<PathBuf> {
 pub fn install_failure_hooks() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let file = info.location().map_or("", |location| location.file());
+        if std::thread::current().name() == Some("main")
+            && crate::gui::panic_is_window_device_loss(file)
+        {
+            // egui-wgpu panics on the device it was drawing with; the GUI
+            // catches this and opens a new window. The stream keeps running.
+            tracing::warn!(panic = %info, "The window's graphics device was lost while drawing");
+            return;
+        }
         if std::thread::current().name() == Some("main") {
             in_report_order(
                 || save(&panic_detail(info)),
@@ -549,6 +562,23 @@ pub(crate) fn simulate_surface_error(failures: &std::sync::atomic::AtomicU64) {
     {
         failures.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// Whether to lose the window's graphics device now, once the window has
+/// worked for `drawing_for`: `Some(true)` inside the coming paint,
+/// `Some(false)` before it.
+pub(crate) fn simulate_device_loss(drawing_for: Option<Duration>) -> Option<bool> {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let (in_paint, repeat) = match simulated().as_str() {
+        "device-lost" => (false, false),
+        "device-lost-in-paint" => (true, false),
+        "device-lost-repeat" => (false, true),
+        _ => return None,
+    };
+    if drawing_for? < Duration::from_secs(15) || (!repeat && DONE.swap(true, Ordering::SeqCst)) {
+        return None;
+    }
+    Some(in_paint)
 }
 
 /// An access violation, as a faulting graphics driver raises.

@@ -74,6 +74,17 @@ Windows changes.
   The host prefers a fully supported graphics backend on the same GPU, usually
   DirectX 12 where the Vulkan driver is incomplete. If a launch still closes
   before its window appears, the next launch uses another backend.
+- If the graphics driver resets while EternalMonitor runs, the Windows window
+  closes and opens again in the same place, and the stream keeps going. In
+  0.3.1 the whole app closed. A backend that loses its device is avoided for
+  the next windows and launches.
+- When another program uses EternalMonitor's network port, the Stream page
+  names it and says to quit it, and the stream starts by itself once the port
+  is free, unless you clicked **Stop** meanwhile. In 0.3.1 the stream stopped
+  until someone clicked **Start**.
+- On a standard Windows account, opening EternalMonitor again no longer
+  starts a second copy that cannot stream when the running copy was started
+  as administrator with another account's password.
 - When the Windows host cannot start, or stops unexpectedly, it shows a message
   with the error and the path of the log file. The error is written to the log
   and queued for automatic support diagnostics before the process ends. A
