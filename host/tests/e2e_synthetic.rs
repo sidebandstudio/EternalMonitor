@@ -204,6 +204,7 @@ fn usb_framed_stream_end_to_end() {
         let mut recovery_ms = 0;
         let mut highest_seq = 0;
         let mut epoch = ack.stream_config.stream_epoch;
+        let mut last_counter: Option<u64> = None;
         while after_recovery < 30 || heartbeats == 0 {
             assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
             if decoded >= 30 && resumed.is_none() {
@@ -239,8 +240,11 @@ fn usb_framed_stream_end_to_end() {
                             }
                         }
                         let frames = decoder.decode(&frame);
-                        for counter in &frames {
-                            assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
+                        // The wire numbers frames contiguously; the picture
+                        // carries the capture number, which may skip.
+                        for &counter in &frames {
+                            assert!(last_counter.is_none_or(|last| counter > last), "pictures go back: {counter}");
+                            last_counter = Some(counter);
                         }
                         decoded += frames.len() as u32;
                         if recovered && !frames.is_empty() {
@@ -319,6 +323,239 @@ fn usb_framed_stream_end_to_end() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// What the fake iPad saw on a throttled USB tunnel.
+#[derive(Debug, Default)]
+struct SlowUsbRun {
+    decoded: usize,
+    keyframes: usize,
+    host_drops: u64,
+    ipad_dropped: u64,
+    ipad_frags_lost: u64,
+    gap_requests: u32,
+    longest_freeze_ms: u128,
+    decoded_last_5s: usize,
+    final_bitrate: u32,
+    tunnel_open: bool,
+}
+
+/// Streams for `run_for` through a tunnel that drains `bytes_per_sec`, like
+/// usbmuxd on a slow PC. The fake iPad reassembles as the app does over USB
+/// (no repair), sends its receiver reports, and asks for a keyframe whenever
+/// it drops a partial frame, at most once per 500 ms.
+fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
+    use eternal_host::stats::PIPELINE_STATS;
+    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    std::env::set_var("ETERNAL_USB_DIRECT", address.to_string());
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let drops_before = PIPELINE_STATS.lock().usb_frames_dropped;
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            stream.set_nodelay(true).unwrap();
+            socket2::SockRef::from(&stream)
+                .set_recv_buffer_size(32 * 1024)
+                .unwrap();
+            read_preamble(&mut stream).await.unwrap();
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 1,
+                listen_port: 0,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps: 0,
+                screen_px_w: SYNTH_W as u16,
+                screen_px_h: SYNTH_H as u16,
+                screen_pt_w: SYNTH_W as u16,
+                screen_pt_h: SYNTH_H as u16,
+                refresh_hz: 60,
+                device_name: "Slow USB iPad".into(),
+                device_id: 78,
+                preferred_fps: 60,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            write_datagram(&mut stream, &encode_control(0, 1, &hello))
+                .await
+                .unwrap();
+            let mut run = SlowUsbRun {
+                tunnel_open: true,
+                ..SlowUsbRun::default()
+            };
+            let mut session_id = 0;
+            let mut msg_seq = 1;
+            let mut reassembler = Reassembler::new();
+            let mut decoder = H264TestDecoder::new();
+            let mut decoded_at = Vec::new();
+            let mut last_report = Instant::now();
+            let mut last_request: Option<Instant> = None;
+            let mut drain_at = Instant::now();
+            let started = Instant::now();
+            while started.elapsed() < run_for {
+                let read =
+                    tokio::time::timeout(Duration::from_secs(3), read_datagram(&mut stream)).await;
+                let Ok(Ok(bytes)) = read else {
+                    run.tunnel_open = false;
+                    break;
+                };
+                // The tunnel drains at a fixed rate, with 20 ms of burst credit.
+                drain_at = drain_at.max(Instant::now() - Duration::from_millis(20))
+                    + Duration::from_secs_f64((bytes.len() + 2) as f64 / bytes_per_sec);
+                if drain_at > Instant::now() {
+                    tokio::time::sleep_until(drain_at.into()).await;
+                }
+                let now = Instant::now();
+                match classify(&bytes) {
+                    Classified::Control(_) => match parse_control(&bytes) {
+                        Ok((_, ControlMessage::HelloAck(ack))) => session_id = ack.session_id,
+                        Ok((_, ControlMessage::Heartbeat(heartbeat))) => {
+                            run.final_bitrate = heartbeat.stream_config.bitrate_bps;
+                        }
+                        Ok((_, ControlMessage::StreamConfig(config))) => {
+                            run.final_bitrate = config.bitrate_bps;
+                        }
+                        _ => {}
+                    },
+                    Classified::Media { .. } => {
+                        let (header, payload) = MediaHeader::decode(&bytes).unwrap();
+                        if let AddOutcome::Completed(frame) =
+                            reassembler.add_media(header, payload, now)
+                        {
+                            if header.is_keyframe {
+                                run.keyframes += 1;
+                            }
+                            let frames = decoder.decode(&frame).len();
+                            decoded_at.extend(std::iter::repeat_n(started.elapsed(), frames));
+                        }
+                    }
+                    _ => {}
+                }
+                reassembler.tick(now);
+                if let Some((epoch, seq)) = reassembler.take_keyframe_request() {
+                    if last_request.is_none_or(|at| now - at >= Duration::from_millis(500)) {
+                        last_request = Some(now);
+                        run.gap_requests += 1;
+                        msg_seq += 1;
+                        let request = ControlMessage::KeyframeRequest(KeyframeRequest {
+                            stream_epoch: epoch,
+                            last_complete_seq: seq,
+                            reason: KeyframeReason::GapLoss,
+                        });
+                        write_datagram(&mut stream, &encode_control(session_id, msg_seq, &request))
+                            .await
+                            .unwrap();
+                    }
+                }
+                if session_id != 0 && last_report.elapsed() >= Duration::from_millis(500) {
+                    last_report = Instant::now();
+                    let c = reassembler.counters();
+                    msg_seq += 1;
+                    let report = ControlMessage::ReceiverReport(ReceiverReport {
+                        stream_epoch: c.stream_epoch,
+                        highest_seq: c.highest_seq,
+                        frames_complete: c.frames_complete as u32,
+                        frames_dropped: c.frames_dropped as u32,
+                        frags_received: c.frags_received as u32,
+                        frags_lost: c.frags_lost as u32,
+                        assembler_depth: c.assembler_depth,
+                        jitter_us: c.jitter_us,
+                        decode_fps_x10: 600,
+                        ..ReceiverReport::default()
+                    });
+                    write_datagram(&mut stream, &encode_control(session_id, msg_seq, &report))
+                        .await
+                        .unwrap();
+                }
+            }
+            let counters = reassembler.counters();
+            run.ipad_dropped = counters.frames_dropped;
+            run.ipad_frags_lost = counters.frags_lost;
+            run.decoded = decoded_at.len();
+            let end = started.elapsed();
+            run.decoded_last_5s = decoded_at
+                .iter()
+                .filter(|at| end.saturating_sub(**at) <= Duration::from_secs(5))
+                .count();
+            // A freeze is the longest wait for a picture once the first one arrived.
+            run.longest_freeze_ms = decoded_at
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).as_millis())
+                .chain(decoded_at.last().map(|last| (end - *last).as_millis()))
+                .max()
+                .unwrap_or(end.as_millis());
+            run
+        })
+    }));
+    shared.stop();
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("slow USB host shutdown");
+    std::env::remove_var("ETERNAL_USB_DIRECT");
+    let mut run = match outcome {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    run.host_drops = PIPELINE_STATS.lock().usb_frames_dropped - drops_before;
+    run
+}
+
+/// Measures the real pipeline through a throttled tunnel, as usbmuxd behaves
+/// on a slow PC: `ETERNAL_TEST_USB_BYTES_PER_SEC` sets the rate. Timing on a
+/// busy machine changes the numbers, so this only reports them; the
+/// paused-clock simulation in `usb_link_sim.rs` holds the assertions.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn slow_usb_link_measurement() {
+    let _env = test_env();
+    let rate = std::env::var("ETERNAL_TEST_USB_BYTES_PER_SEC")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000_000.0);
+    let run = run_slow_usb(rate, Duration::from_secs(20));
+    eprintln!("SLOW_USB rate={rate} {run:?}");
+    assert!(run.tunnel_open, "the tunnel must stay open");
 }
 
 fn free_udp_port() -> u16 {
@@ -874,14 +1111,9 @@ fn synthetic_stream_end_to_end_v2() {
                     }
                 }
 
-                for counter in decoder.decode(&frame_bytes) {
-                    assert_eq!(
-                        counter,
-                        header.frame_seq as u64 & 0xFF_FFFF,
-                        "decoded frame counter must match the wire sequence number"
-                    );
-                    decoded_counters.push(counter);
-                }
+                // The picture carries the capture number, which skips frames
+                // the encoder never took; the wire numbers frames without gaps.
+                decoded_counters.extend(decoder.decode(&frame_bytes));
             }
             other => panic!("unexpected datagram from host: {other:?}"),
         }
@@ -1454,14 +1686,7 @@ fn hevc_stream_negotiates_and_decodes() {
                     }
                 }
 
-                for counter in decoder.decode(&frame_bytes) {
-                    assert_eq!(
-                        counter,
-                        header.frame_seq as u64 & 0xFF_FFFF,
-                        "decoded HEVC frame counter must match the wire sequence"
-                    );
-                    decoded_hevc.push(counter);
-                }
+                decoded_hevc.extend(decoder.decode(&frame_bytes));
             }
             _ => {}
         }

@@ -108,6 +108,15 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
+- Over USB on a slower PC, the picture keeps moving when Apple's device
+  service falls behind. 0.3.1 cut the large frame that restores the picture
+  short and asked for another, again and again, until the picture froze or
+  turned grey; it also lowered the quality as if the cable lost data. The
+  quality now drops only while the cable keeps falling behind.
+- On Wi-Fi, a frame whose repair is late is waited for instead of replaced by
+  a whole new picture, so a still desktop flashes and smears less. 120 Hz
+  iPads keep frames whose repair is still on its way. The picture no longer
+  pauses briefly after each screen update the PC skipped.
 - The Quick Start guide installed with EternalMonitor matches this version's
   buttons and messages, and no longer names an old release.
 - A new Known issues page lists the problems we know about, each with what to
