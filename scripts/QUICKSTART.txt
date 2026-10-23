@@ -1,120 +1,154 @@
-EternalMonitor v0.3.0 - Quick Start
-=================================
-Use your iPad as a second display for a Windows PC, over WiFi or USB.
-v0.3.0 is the current stable Windows release. Use it with iPad v0.3.0,
-TestFlight build 143. Download both from https://eternalmonitor.dev/download.html.
-Step-by-step guide with every screen explained:
+EternalMonitor - Quick Start
+============================
+EternalMonitor turns your iPad into a screen for this PC. You can mirror the
+PC's screen, or add the iPad as a second screen next to your monitor. Touch,
+Apple Pencil and a keyboard on the iPad control the PC.
+
+Full guide with every screen explained:
 https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
+Known issues and what to do about them:
+https://eternalmonitor.dev/known-issues.html
 
 What you need
 -------------
-- Windows 10/11, a supported NVIDIA/AMD/Intel GPU, and the host installer.
-- iPadOS 17 or later and the EternalMonitor app through TestFlight or Xcode.
-- A trusted local network for WiFi. Ethernet for the PC usually helps.
-- For USB: a data cable, the Apple Devices app from the Microsoft Store
-  (open while you stream), and acceptance of the iPad's Trust This Computer
-  prompt.
+- A 64-bit PC with Windows 10 version 1809 or later, or Windows 11.
+- An NVIDIA, AMD or Intel graphics card. Without one that can encode video,
+  the picture uses the processor and may lag.
+- An iPad with iPadOS 17 or later.
+- For Wi-Fi: the PC and iPad on the same home or office network. Guest
+  networks usually block devices from seeing each other.
+- For USB: a cable that carries data, and Apple's free Apple Devices app
+  from the Microsoft Store, open on the PC while you stream. Apple Devices
+  needs Windows 10 version 22H2 (build 19045) or Windows 11. On older
+  Windows 10, use Wi-Fi.
 
-1. Install the matching build
-----------------------------
-Download EternalMonitor-Setup.exe from
-https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0 and
-check its published SHA-256. The unsigned installer may show SmartScreen;
-use More info > Run anyway only for the build you intended to install.
-Approve the installer UAC prompt. It installs the host, virtual display
-and its tasks, plus TCP/UDP firewall rules. Start EternalMonitor.
+Both apps must come from the same version of EternalMonitor. The download
+page always lists the matching pair:
+https://eternalmonitor.dev/download.html
 
-Install Apple's TestFlight app, then open the EternalMonitor invite:
+1. Install the iPad app
+-----------------------
+On the iPad, install TestFlight from the App Store. Then open this invite on
+the iPad and tap Accept and Install:
 https://testflight.apple.com/join/ppc9QfXc
-Install v0.3.0, build 143. The beta is open to anyone with the link.
-Send bugs and feedback through the form on the download page above, which
-emails hello@sideband.studio.
 
-2. Connect and pair over WiFi
-----------------------------
-Keep the PC and iPad on the same local network, outside a guest network.
-In the iPad app, tap your PC under Found on this network, or enter the address shown by the host
-(default port 9876). Enter the six-digit pairing code shown on the PC.
-Scanning the host QR instead carries its pairing token and skips code entry.
-The app remembers the host. On the PC, Settings > Forget all iPads resets pairing.
-Pairing does not encrypt video, audio or input; use a network you trust.
+2. Connect over Wi-Fi
+---------------------
+1. Keep this EternalMonitor window open. It says "Ready for your iPad".
+   You can minimize it. Closing it stops streaming.
+2. Open EternalMonitor on the iPad. The first time, it asks to find devices
+   on your local network. Tap Allow.
+3. Tap your PC under "Found on this network". Or tap "Scan QR code" and
+   point the iPad at the code from "QR code" on the PC. Or type the
+   Address shown in this window and tap "Connect to PC".
+4. The first time, the iPad shows "Pair with your PC". Type the six-digit
+   Pairing code from this window and tap "Pair iPad". You only do this once.
+   Scanning the QR code skips it.
 
-3. Connect by USB
-----------------
-Windows reaches the iPad over the cable through Apple's Apple Devices app.
-Open Apple Devices and leave it running; it can stay minimized. Keep the
-iPad app open, plug in a data cable and accept Trust This Computer. The app
-should show USB. A cable can take over an existing WiFi stream; unplugging
-falls back to WiFi if that host remains reachable.
+If Windows asks about EternalMonitor in a Windows Security Alert, tick
+Private networks and click Allow access.
 
-If the iPad is plugged in but Apple Devices is closed, the host says so and
-offers Open Apple Devices. If Apple Devices is not installed, it links to the
-Microsoft Store. If the iPad still does not appear after Apple Devices
-opens, unplug the cable and plug it in again.
+3. Connect with a USB cable (optional)
+--------------------------------------
+A cable gives a steadier picture and charges the iPad. It needs Windows 10
+version 22H2 (build 19045) or Windows 11, because Apple Devices does. To see
+your version, open Windows Settings, System, About.
+1. Install Apple Devices from the Microsoft Store, open it and leave it
+   open. It can stay minimized.
+2. Plug in the iPad and unlock it. The first time, tap Trust on the iPad.
+3. Open EternalMonitor on the iPad. It connects over the cable by itself.
+   No pairing code is needed.
 
-4. Choose mirror or second screen
----------------------------------
-At the top of the PC's Stream page, next to "Use the iPad as", click
-Second screen. A running stream restarts and the iPad reconnects by itself.
-Drag windows into the new Windows display. To mirror again, click
-Mirror my screen.
-The virtual display should disappear on disconnect and host exit. If it
-cannot start, collect the host log and rerun the matching installer.
+If this window says "Your iPad is plugged in, but Apple Devices is not
+running", click "Open Apple Devices". If it says Apple Devices is not
+installed, click "Get Apple Devices".
 
-5. Audio, keyboard and pointer
------------------------------
-Enable Stream PC audio on the host and Play PC audio on the iPad. The
-speaker indicator shows playback; muting on the iPad leaves video running.
-Audio follows the Windows default output device.
-
-With Control PC on:
-- Tap clicks, drag moves with the button down, two fingers scroll, and a
-  hold gives right-click. Apple Pencil sends native Windows Ink pressure and tilt.
-- Three-finger tap reveals the controls. Keyboard opens the on-screen
-  keyboard and Esc/Tab/modifier/arrow accessory keys.
-- Hardware keyboards relay text and shortcuts. The default maps Command
-  to Ctrl; choose Win in Settings if needed. iPadOS retains Globe, Command-H,
-  Command-Tab and Command-Space.
-- Supported trackpads/mice relay secondary/middle click, scroll and hover.
-
-For drawing in Clip Studio Paint:
-- Enable Drawing mode in the iPad settings, then reconnect over USB. The
-  canvas ignores fingers, audio is muted, and USB requests up to the iPad's
-  maximum frame rate. Set the PC frame-rate limit to 60 or 120 as appropriate.
-- In CSP choose Preferences > Tablet > Tablet PC, then configure pen pressure.
-- Use the on-screen drawing controls button to reveal the toolbar.
-- Apple Pencil USB-C has no pressure sensor. Use a pressure-sensitive Pencil
-  model for variable brush pressure. See docs/pencil-drawing.md.
-- For view-only, turn Control PC off and reconnect.
-
-6. Quality and frame rate
--------------------------
-Start at 60 fps and H.264. HEVC is optional in host Settings. The effective
-rate is the lower host/iPad preference; 120 Hz needs a suitable iPad,
-virtual display mode and enough encoder/network capacity.
-
-If motion stutters, inspect loss/repairs/jitter and capture/encode/decode
-FPS. Try a stronger WiFi signal, 5 GHz or Ethernet on the PC. A software
-fallback banner means the hardware encoder did not open; collect its error,
-update the GPU driver and restart. Keep the default YUV420 input unless
-explicitly testing the BGRA option.
-
-Connection troubleshooting
+4. Mirror or second screen
 --------------------------
-- Try the host's LAN IP instead of discovery; keep its window open.
-- Confirm both apps are v0.3.0 and the iPad build is 143.
-- The v0.3 installer configures Windows Firewall. If a security product or
-  an older installation blocks it, allow the host in Windows Security >
-  Firewall & network protection > Allow an app through firewall.
-- Check the pairing code or regenerate the token and pair again.
-- On USB, report the cable, trust state and USB card text.
+At first the iPad mirrors your main screen. At the top of the Stream page,
+next to "Use the iPad as", click "Second screen" to use the iPad as an extra
+screen. The iPad reconnects by itself. Drag a window past the edge of your
+main screen to move it onto the iPad. "Arrange screens" opens Windows Display
+settings so you can choose which side the iPad is on. To mirror again, click
+"Mirror my screen". The choice is always made on the PC.
 
-What to report
---------------
-Record both versions, iPad model/iPadOS, Windows GPU and active codec,
-WiFi/USB, capture target, and what failed. Use Copy logs on the host's
-Performance page. Session logs also live at:
-%APPDATA%\EternalMonitor\logs\eternal-host-session.log
-Previous sessions are .1 and .2. Redact pairing tokens and QR codes before
-posting logs publicly. docs/hardware-verification.md in the repository lists
-the remaining iPad checks and expected results.
+5. Using it
+-----------
+- Tap to click. Drag to move something. Two fingers scroll. Touch and hold
+  to right-click.
+- Tap with three fingers to show the controls: Keyboard, settings and
+  Disconnect.
+- Sound plays on the iPad when "Stream PC audio" is on in this window's
+  Settings and "Play PC audio" is on in the iPad app's settings.
+- To only watch, turn off "Control PC" in the iPad app's settings.
+- To draw, turn on "Drawing mode" in the iPad app's settings, then tap
+  "Reconnect now to apply". In Clip Studio Paint, choose Preferences, then
+  Tablet, then Tablet PC. Apple Pencil (USB-C) has no pressure sensor.
+
+6. Updates
+----------
+When a new version is out, this window says "EternalMonitor ... is
+available". Click "Update now" and click Yes when Windows asks. If you are
+streaming, the update waits until you stop. On the iPad, tap "Open
+TestFlight", then Update.
+
+If something goes wrong
+-----------------------
+Messages are quoted as the apps show them. The apps use curly apostrophes
+in a few places, so search for a few words rather than the whole line.
+
+What the iPad says, and what to do:
+- "Your PC didn't answer": check that this window says "Ready for your
+  iPad", the PC is awake, and both are on the same Wi-Fi, not a guest
+  network. If so, a firewall is probably blocking EternalMonitor: run
+  EternalMonitor-Setup.exe again, or use a USB cable.
+- "Your PC answered, but no picture arrived": follow any message in this
+  window, click Restart, then tap Try again on the iPad.
+- "Lost the connection to your PC": wake the PC, check EternalMonitor is
+  open, then tap Try again.
+- "That looks like the pairing code, not the PC's address": type the
+  Address from this window, not the Pairing code.
+- "That code didn't match. Check the PC and try again.": type the six
+  digits shown in this window now.
+- "EternalMonitor isn't allowed on your local network": tap Open Settings
+  and turn on Local Network.
+- "The connection over the cable stopped": keep EternalMonitor and Apple
+  Devices open, unlock the iPad, then unplug the cable and plug it in again.
+- "This iPad app is older than EternalMonitor on your PC, so they can't
+  connect. Update the iPad app: open TestFlight and tap Update.": tap Open
+  TestFlight, then Update.
+- "EternalMonitor on your PC is older than this iPad app, so they can't
+  connect. Update EternalMonitor on your PC: click Update now on the PC, or
+  download it from eternalmonitor.dev.": in this window, click "Update now".
+  If the button says "Check for updates" instead, click it, then click
+  "Update now" when it appears. If no update is found, click "Download from
+  the website".
+
+What this window says, and what to do:
+- "The second screen couldn't start, so your main screen is mirrored":
+  the line below says why.
+  If it says Windows' display driver stopped responding, restart the PC.
+  That message has no button.
+  If it says the second screen isn't installed, or part of the install is
+  missing or blocked, click "Download installer", run it, then click
+  "Try again".
+  If it says Windows didn't add the second screen in time, click
+  "Try again". If that keeps happening, run EternalMonitor-Setup.exe again.
+- "Video is using the processor instead of the graphics card": click
+  "Use recommended settings" if shown. Otherwise update your graphics driver
+  from NVIDIA, AMD or Intel, then click Restart.
+- "Your PC is showing the lock screen or a permission prompt": unlock the
+  PC or answer the prompt. The picture comes back by itself.
+- "Update the iPad app to connect": on the iPad, open TestFlight and tap
+  Update.
+
+Getting help
+------------
+In this window, open Performance and click "Copy logs". In the iPad app's
+settings, open Support, then Diagnostics, then "Export diagnostics". Send both
+with what you tried to hello@sideband.studio, or use the form on
+https://eternalmonitor.dev/download.html#feedback.
+
+The stream is not encrypted. Pairing keeps other people's devices out, but
+use EternalMonitor only on a network you trust, such as your home Wi-Fi.
+Keep the QR code private: anyone who scans it can connect.
