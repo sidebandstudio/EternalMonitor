@@ -15,7 +15,9 @@ Windows may promote pen input to mouse messages for applications that request it
    USB but respects the host's limit. Wi-Fi keeps the selected iPad preference.
 4. In CSP, open **Preferences > Tablet > Using tablet service** and choose
    **Tablet PC**. This integration uses Windows Ink; it does not install a
-   WinTab driver. Keep CSP and the host at the same Windows privilege level.
+   WinTab driver. Open CSP and EternalMonitor the same way: Windows blocks
+   input to an app running as administrator from one that isn't, and the
+   Stream page then names the app.
 5. Open **File > Pen Pressure Settings**, draw several light and heavy strokes,
    and select a brush that responds to pressure. Tilt also needs a brush with
    tilt enabled for one of its properties.
@@ -35,8 +37,9 @@ Older hosts continue to receive the existing mouse-style Pencil events outside
 drawing mode. A current host that cannot create the Windows pen device turns
 those Pencil events into mouse input at the same position. Drawing mode shows
 an unavailable message if the connected host does not advertise native pen
-support. The host logs failures to create or inject the Windows pen device once
-per error code, with the sample's position and the virtual screen.
+support. The host logs a failure to create the Windows pen device once, and a
+frame Windows refuses the 1st, 10th, 100th and so on time for each error code,
+with the count, the sample's position and the virtual screen.
 
 ## Stroke delivery and latency
 
@@ -142,6 +145,31 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
 - Each session logs `Input mapping geometry` once, and again when it changes:
   the captured display and virtual screen rectangles, the pen origin, the DPI
   awareness and whether Pencil uses the native pen or the mouse fallback.
+- Pen frames go to Windows at least 250 µs apart. Windows refuses a frame
+  with `E_INVALIDARG` (0x80070057) once a dozen or so come faster than about
+  one every 100 µs. On the reference PC, 64 samples sent back to back lost
+  about one frame in twenty from the 13th on, frames 50 µs apart about one
+  in eighty, and frames 100 µs or more apart none; a receiving app that
+  stopped reading input for 400 ms made no difference. Samples come that
+  fast only as a backlog, after Wi-Fi or the PC stalled, which is how
+  one-monitor PCs hit this; the Pencil's own samples are 4 ms apart. 0.3.1
+  lost each refused sample. The restart described above delivers it, and
+  the probe still received one down and one up per stroke, but it relies on
+  Windows taking a down for a contact it still holds. Windows stamps each
+  frame itself: setting `PerformanceCount` ourselves made it refuse ten
+  times as many.
+- Windows keeps a lower privilege level from controlling a higher one (User
+  Interface Privilege Isolation), so neither native pen input nor
+  `SendInput` reaches an app running as administrator while EternalMonitor
+  is not. Windows does not say so: on the reference PC, with an
+  administrator window in front and under the pen, both reported success
+  and the window received nothing. The host therefore checks the integrity
+  level of the foreground app whenever the foreground window changes, logs
+  its program name once, and the Stream page says to open both apps the
+  same way while it is in front. A pen stroke over an administrator window
+  that is not in front is not detected. `E_ACCESSDENIED` (0x80070005) from
+  native pen injection is most likely the secure desktop (the lock screen or
+  a permission prompt), which the capture notice explains.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
   reject calls spaced less than its 0.1 ms timestamp resolution. If a frame
   is still refused after that, Windows' input queue is stuck: later frames
@@ -175,6 +203,24 @@ first and restores it at the end; `result.json` lists both layouts.
 `-PenSequences` also records which raw frame sequences Windows rejects, and
 checks that destroying the pen device mid-contact ends that contact and that a
 new device then draws normally, at the centre of the probe window.
+
+`scripts/win/Test-PenSoak.ps1` draws strokes into its focused probe window for
+`-Seconds` with pen_probe's `soak` mode and logs every frame Windows refuses,
+with its timing, the virtual screen and what recovered it. `-Pattern` sends
+samples one every 4 ms (`paced`), four back to back every 16 ms as the iPad
+does (`batch`), backlogs of 64 (`burst`) or 32 identical moves (`same`), or
+batches and backlogs with every CPU busy (`load`). `-BusyMs` stops the probe
+reading input that long every three seconds, like a drawing app rendering a
+heavy brush. `-Options 'relay'` sends the samples through the host's input
+relay instead of raw frames, `spacing_us=N` spaces them, and the probe counts
+the pointer downs, ups and frames it receives, so a restarted contact shows
+as an extra down.
+
+`scripts/win/Test-PenUipi.ps1` is the receiving window for a privilege check:
+run it in an interactive task with `RunLevel Highest`, then pen_probe's `uipi`
+mode with `RunLevel Limited` and the bounds from its `probe.json`. The probe
+prints what Windows answers raw pen frames and `SendInput` with, then sends a
+stroke, a tap and a key through the relay and prints the app the host found.
 
 Before release, verify light-to-heavy strokes, pressure-sensitive dots, tilted
 brushes, diagonals and all canvas corners on a physical iPad. Rest a palm before

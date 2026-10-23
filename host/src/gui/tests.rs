@@ -1,5 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, elevated_app_notice, second_screen_notice,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -345,6 +346,34 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     assert!(gpu.contains("open it again"), "{gpu}");
     let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
     assert!(lock.contains("lock screen"), "{lock}");
+}
+
+#[test]
+fn input_blocked_by_an_administrator_app_says_to_open_both_the_same_way() {
+    use crate::input::privilege::ElevatedApp;
+    assert!(elevated_app_notice(None, true).is_none());
+    let named = ElevatedApp {
+        name: Some("CLIPStudioPaint".into()),
+    };
+    // Stopping the stream clears the notice with the condition.
+    assert!(elevated_app_notice(Some(&named), false).is_none());
+    let (title, body) = elevated_app_notice(Some(&named), true).unwrap();
+    assert!(title.contains("CLIPStudioPaint"), "{title}");
+    assert!(body.contains("Open CLIPStudioPaint normally"), "{body}");
+    let unnamed = ElevatedApp { name: None };
+    let (title, body) = elevated_app_notice(Some(&unnamed), true).unwrap();
+    for (title, body) in [
+        (title, body),
+        elevated_app_notice(Some(&named), true).unwrap(),
+    ] {
+        assert!(body.contains("open it as administrator too"), "{body}");
+        for jargon in ["UIPI", "integrity", "elevat", "privilege", "0x8007"] {
+            assert!(
+                !title.contains(jargon) && !body.contains(jargon),
+                "{title} {body}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -153,6 +153,38 @@ impl NotReadyRetry {
     }
 }
 
+/// The least time between two frames on the pen device. Windows refuses a
+/// frame with E_INVALIDARG once a dozen or so have come faster than about
+/// one every 100 µs. On a reference PC, 64-sample bursts sent back to back
+/// lost about one frame in twenty from the 13th on, frames 50 µs apart one in
+/// eighty, and frames 100 µs or more apart none; how busy the receiving app
+/// was made no difference. 0.3.1 lost each refused sample; the injector now
+/// restarts the contact at it, which relies on Windows taking a down for a
+/// contact it still holds. Samples arrive that fast only as a backlog, after
+/// Wi-Fi or the PC stalled; a Pencil's own 240 samples a second are 4 ms
+/// apart, and the iPad's batches of a few samples never hit the limit.
+pub(super) const FRAME_SPACING: Duration = Duration::from_micros(250);
+
+/// Keeps frames on the pen device `FRAME_SPACING` apart, so a backlog that
+/// arrives at once is injected as fast as Windows takes it.
+#[derive(Debug, Default)]
+pub struct FramePacer {
+    sent: Option<Instant>,
+}
+
+impl FramePacer {
+    pub fn call<T>(&mut self, inject: impl FnOnce() -> T) -> T {
+        if let Some(sent) = self.sent {
+            while sent.elapsed() < FRAME_SPACING {
+                std::hint::spin_loop();
+            }
+        }
+        let result = inject();
+        self.sent = Some(Instant::now());
+        result
+    }
+}
+
 /// `sample` with its desktop pixels mapped from its wire position onto
 /// `output`, the capture rect current now.
 fn mapped(mut sample: PenSample, output: Option<CaptureGeometry>) -> PenSample {
@@ -1334,6 +1366,41 @@ mod tests {
             Ok(())
         );
         assert!(!retry.stalled);
+    }
+
+    /// Windows as measured on the reference PC: once twelve frames in a row
+    /// have each come less than `FRAME_SPACING` after the one before, the
+    /// next that fast is refused.
+    #[derive(Default)]
+    struct MeasuredRateLimit {
+        last: Option<Instant>,
+        fast: usize,
+    }
+
+    impl MeasuredRateLimit {
+        fn accepts(&mut self) -> bool {
+            let now = Instant::now();
+            let fast = self
+                .last
+                .is_some_and(|last| now.duration_since(last) < FRAME_SPACING);
+            self.fast = if fast { self.fast + 1 } else { 0 };
+            self.last = Some(now);
+            self.fast <= 12
+        }
+    }
+
+    #[test]
+    fn a_backlog_of_samples_is_spaced_so_windows_takes_every_frame() {
+        // Sent back to back, as the transport delivers a backlog, the burst
+        // that broke strokes in the soak loses frames.
+        let mut windows = MeasuredRateLimit::default();
+        let refused = (0..64).filter(|_| !windows.accepts()).count();
+        assert!(refused > 0, "the model must refuse an unpaced burst");
+        let mut pacer = FramePacer::default();
+        let mut windows = MeasuredRateLimit::default();
+        for frame in 0..64 {
+            assert!(pacer.call(|| windows.accepts()), "frame {frame} refused");
+        }
     }
 
     #[test]

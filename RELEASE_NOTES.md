@@ -11,6 +11,13 @@ Windows changes.
   above the main display, including an extended iPad display placed there.
   Previously the pen moved left or up by that monitor's size, and strokes near
   the far edge stopped with "Windows rejected native pen input".
+- After Wi-Fi or the PC stalls for a moment, the Apple Pencil samples that
+  arrive together are sent to Windows a quarter of a millisecond apart.
+  Windows refused some of them when they came faster, with "Windows
+  rejected native pen input" (0x80070057), even on a PC with one monitor.
+- When the app you draw or type in runs as administrator, Windows blocks
+  Pencil, touch and keyboard input from EternalMonitor. The Stream page now
+  names that app and says to open both the same way.
 - After Windows cancels a pen contact, for example when a display changes mode,
   the stroke continues from the same Pencil sample instead of being dropped
   until the Pencil lifts. A Pencil held still follows a display that moves.

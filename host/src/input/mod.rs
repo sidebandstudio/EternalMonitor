@@ -17,6 +17,7 @@ pub mod windows_inject;
 mod pen_contact;
 #[cfg(any(windows, test))]
 mod pen_device;
+pub mod privilege;
 #[cfg(any(windows, test))]
 mod probe_guard;
 
