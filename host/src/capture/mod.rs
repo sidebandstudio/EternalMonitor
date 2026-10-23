@@ -535,7 +535,15 @@ pub fn run_capture_stage(
     let guard = CloseOnExit(slot.handle());
     let result = recovery::run_until_unblocked(
         &shared,
-        || run_platform_loop(&guard.0, shared.clone(), adapter_index, generation),
+        |frame_number| {
+            run_platform_loop(
+                &guard.0,
+                shared.clone(),
+                adapter_index,
+                generation,
+                frame_number,
+            )
+        },
         |delay| wait_while_blocked(&shared, generation, delay),
     );
     if let Err(ref e) = result {
@@ -580,13 +588,14 @@ fn run_platform_loop(
     shared: SharedControl,
     adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested {
-        synthetic::run_capture_loop(slot, shared, generation)
+        synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
-        dxgi::run_capture_loop(slot, shared, adapter_index, generation)
+        dxgi::run_capture_loop(slot, shared, adapter_index, generation, frame_number)
     }
 }
 
@@ -596,8 +605,9 @@ fn run_platform_loop(
     shared: SharedControl,
     _adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    synthetic::run_capture_loop(slot, shared, generation)
+    synthetic::run_capture_loop(slot, shared, generation, frame_number)
 }
 
 /// Choose the freshly-attached virtual output: the first non-primary output whose device name was

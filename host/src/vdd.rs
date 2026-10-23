@@ -82,7 +82,8 @@ impl TaskOutcome {
 struct TaskGate {
     known_enabled: Option<bool>,
     health: VddTaskHealth,
-    stuck_at: Option<Instant>,
+    /// When a task last timed out, and whether it was the Enable task.
+    stuck: Option<(Instant, bool)>,
     /// An Enable task ran since the last completed Disable, so the display
     /// may be on, even when that Enable timed out and is still running.
     enable_ran: bool,
@@ -94,7 +95,7 @@ impl TaskGate {
         Self {
             known_enabled: None,
             health: VddTaskHealth::Ok,
-            stuck_at: None,
+            stuck: None,
             enable_ran: false,
         }
     }
@@ -113,10 +114,13 @@ impl TaskGate {
         }
         match self.health {
             VddTaskHealth::TasksMissing => Gate::Refuse,
+            // An Enable that timed out can still finish and add the monitor,
+            // so a Disable after it always runs. Refusing it left the monitor
+            // behind when the user quit during the cooldown.
             VddTaskHealth::NotResponding
-                if self
-                    .stuck_at
-                    .is_some_and(|at| now.duration_since(at) < STUCK_COOLDOWN) =>
+                if self.stuck.is_some_and(|(at, enabling)| {
+                    (enabled || !enabling) && now.duration_since(at) < STUCK_COOLDOWN
+                }) =>
             {
                 Gate::Refuse
             }
@@ -144,11 +148,11 @@ impl TaskGate {
             TaskOutcome::Done => {
                 self.known_enabled = Some(enabled);
                 self.health = VddTaskHealth::Ok;
-                self.stuck_at = None;
+                self.stuck = None;
             }
             TaskOutcome::TimedOut => {
                 self.health = VddTaskHealth::NotResponding;
-                self.stuck_at = Some(now);
+                self.stuck = Some((now, enabled));
             }
             TaskOutcome::Missing => self.health = VddTaskHealth::TasksMissing,
             TaskOutcome::Failed => {}
@@ -321,7 +325,7 @@ fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
     {
         TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed;
-            crate::startup::display::change(enabled, || {
+            crate::startup::display::change(enabled, progress, |progress| {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
                 outcome == TaskOutcome::Done
             });
@@ -385,9 +389,10 @@ mod tests {
             gate.before(true, Purpose::Attempt, now + Duration::from_secs(5)),
             Gate::Refuse
         );
+        // A late Enable may still add the monitor, so Disable runs.
         assert_eq!(
             gate.before(false, Purpose::Attempt, now + Duration::from_secs(5)),
-            Gate::Refuse
+            Gate::Run
         );
         assert_eq!(
             gate.before(true, Purpose::Attempt, now + STUCK_COOLDOWN),
@@ -395,6 +400,92 @@ mod tests {
         );
         gate.after(true, TaskOutcome::Done, now + STUCK_COOLDOWN);
         assert_eq!(gate.health, VddTaskHealth::Ok);
+
+        // After a Disable times out, both directions wait for the cooldown.
+        gate.after(false, TaskOutcome::TimedOut, now);
+        assert_eq!(
+            gate.before(false, Purpose::Attempt, now + Duration::from_secs(5)),
+            Gate::Refuse
+        );
+        assert_eq!(
+            gate.before(true, Purpose::Attempt, now + Duration::from_secs(5)),
+            Gate::Refuse
+        );
+    }
+
+    #[test]
+    fn quitting_after_an_enable_timed_out_still_turns_the_display_off() {
+        use std::cell::Cell;
+        let tasks = DriverTasks::new();
+        let display_on = Cell::new(false);
+        // The Enable task outlives the host's wait, then adds the monitor
+        // after capture has fallen back to mirroring.
+        assert!(!tasks.set_enabled(
+            true,
+            Purpose::Attempt,
+            || {},
+            |_, _| {
+                display_on.set(true);
+                TaskOutcome::TimedOut
+            }
+        ));
+        // Quitting within the cooldown. Any Disable runs here, not only the
+        // quit's cleanup.
+        let disabled = tasks.set_enabled(
+            false,
+            Purpose::Attempt,
+            || {},
+            |enabled, _| {
+                display_on.set(enabled);
+                TaskOutcome::Done
+            },
+        );
+        assert!(disabled, "the Disable task was refused");
+        assert!(!display_on.get(), "the monitor stayed after exit");
+    }
+
+    #[test]
+    fn an_enable_the_host_gave_up_on_cannot_undo_the_disable_at_quit() {
+        use std::cell::Cell;
+        let tasks = DriverTasks::new();
+        let display_on = Cell::new(false);
+        // The Enable task keeps running after the host stops waiting, and
+        // adds the monitor when it ends.
+        let enable_running = Cell::new(false);
+        let enable_ends = || {
+            if enable_running.replace(false) {
+                display_on.set(true);
+            }
+        };
+        assert!(!tasks.set_enabled(
+            true,
+            Purpose::Attempt,
+            || {},
+            |_, _| {
+                enable_running.set(true);
+                TaskOutcome::TimedOut
+            }
+        ));
+        assert!(tasks.set_enabled(
+            false,
+            Purpose::Attempt,
+            || {},
+            |enabled, _| {
+                // Every Disable runs vdd_task.ps1 with -After Enable, which
+                // waits for the Enable task to end.
+                if !enabled {
+                    enable_ends();
+                }
+                display_on.set(enabled);
+                TaskOutcome::Done
+            }
+        ));
+        // The host has quit by the time anything still running ends.
+        enable_ends();
+        assert!(
+            !display_on.get(),
+            "a late Enable added the monitor after quit"
+        );
     }
 
     #[test]
@@ -422,9 +513,9 @@ mod tests {
             || {},
             |_, _| { TaskOutcome::TimedOut }
         ));
-        // The pipeline's own requests stay throttled during the cooldown.
+        // The pipeline's own Enable stays throttled during the cooldown.
         assert!(!tasks.set_enabled(
-            false,
+            true,
             Purpose::Attempt,
             || {},
             |_, _| { panic!("an attempt inside the cooldown must not run") }

@@ -260,6 +260,10 @@ impl AnalyzerApp {
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
+            StreamState::Paused => (
+                format!("Streaming to {device} is paused"),
+                paused_detail(client.capture_block).to_string(),
+            ),
         };
 
         widgets::card().show(ui, |ui| {
@@ -743,6 +747,15 @@ pub(super) fn second_screen_notice(
             false,
         ),
         _ => None,
+    }
+}
+
+/// Why a paused stream is paused, under the header. A restarting graphics
+/// driver is not Windows withholding the screen.
+pub(super) fn paused_detail(block: Option<CaptureBlock>) -> &'static str {
+    match block {
+        Some(CaptureBlock::GpuReset) => "The graphics driver restarted. See the message above.",
+        _ => "Windows stopped screen capture. See the message above.",
     }
 }
 

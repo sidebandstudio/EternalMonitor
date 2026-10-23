@@ -1,5 +1,7 @@
 //! Windows mouse/keyboard and native Windows Ink pen injection.
 
+use std::sync::{Mutex, PoisonError};
+
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{ERROR_NOT_READY, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -115,7 +117,22 @@ impl PenApi for Win32Pen {
         }
         sent
     }
+
+    fn owe_release(&mut self, at: (i32, i32)) {
+        *OWED_RELEASE.lock().unwrap_or_else(PoisonError::into_inner) = Some(at);
+    }
+
+    fn take_owed_release(&mut self) -> Option<(i32, i32)> {
+        OWED_RELEASE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
+
+/// A fallback release the last pen device still owed when its pipeline
+/// stopped: Windows holds the left button until the next device sends it.
+static OWED_RELEASE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 pub(crate) type PenDevice = super::pen_device::PenDevice<Win32Pen>;
 
@@ -330,7 +347,7 @@ pub(crate) fn inject(
     }
 }
 
-fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
+pub(super) fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
     let input = match injection {
         Injection::Pen(_) => unreachable!("pen samples go through PenDevice::deliver"),
         Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
@@ -353,8 +370,14 @@ fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
             i32::from(y),
             0,
         ),
+        // Without MOUSEEVENTF_MOVE Windows ignores the position and presses
+        // wherever the cursor is: a fallback press retried after SendInput
+        // inserted only its move would follow the physical mouse.
         Injection::LeftDown { x, y } => mouse_input(
-            MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            MOUSEEVENTF_MOVE
+                | MOUSEEVENTF_LEFTDOWN
+                | MOUSEEVENTF_ABSOLUTE
+                | MOUSEEVENTF_VIRTUALDESK,
             i32::from(x),
             i32::from(y),
             0,
