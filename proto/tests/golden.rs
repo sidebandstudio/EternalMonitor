@@ -111,6 +111,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                     host_name: "ALI-PC".into(),
                     auth_token: [0; 16],
                     host_caps: 0,
+                    reason: String::new(),
                 }),
             ),
         ));
@@ -218,6 +219,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
         ),
         (
@@ -236,6 +238,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
         ),
         (
@@ -399,6 +402,38 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         "hello2_v030",
         encode_control(0, 4, &ControlMessage::Hello2(hello)),
     ));
+    // 0.3.2: answers while the PC isn't streaming, with the reason appended.
+    for (name, status, reason) in [
+        ("hello_ack_stopped", HelloStatus::Stopped, ""),
+        ("hello_ack_restarting", HelloStatus::Restarting, ""),
+        (
+            "hello_ack_failed",
+            HelloStatus::Failed,
+            "Windows is changing the display",
+        ),
+    ] {
+        vectors.push((
+            name,
+            encode_control(
+                0,
+                5,
+                &ControlMessage::HelloAck(HelloAck {
+                    status,
+                    accepted_version: 2,
+                    client_nonce: 0xDEAD_BEEF,
+                    session_id: 0,
+                    heartbeat_interval_ms: 1000,
+                    report_interval_ms: 500,
+                    liveness_timeout_ms: 3000,
+                    stream_config: StreamConfig::default(),
+                    host_name: "ALI-PC".into(),
+                    auth_token: [0; 16],
+                    host_caps: HOSTCAP_NACK,
+                    reason: reason.into(),
+                }),
+            ),
+        ));
+    }
     vectors
 }
 

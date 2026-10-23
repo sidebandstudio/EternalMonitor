@@ -702,6 +702,7 @@ impl Session {
             host_name: config.host_name(),
             auth_token,
             host_caps: HOSTCAP_NACK | config.host_caps(),
+            reason: String::new(),
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
     }

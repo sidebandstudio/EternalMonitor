@@ -253,6 +253,8 @@ struct Hello2: Equatable {
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
     static let featureSupportsNack: UInt16 = 1 << 2
+    /// This iPad understands the stopped, restarting and failed statuses.
+    static let featureStandbyStatus: UInt16 = 1 << 3
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -280,6 +282,15 @@ enum HelloStatus: UInt8 {
     case error = 3
     case unauthorized = 4
     case rateLimited = 5
+    /// The PC answered but isn't streaming: Stop was clicked on it,
+    case stopped = 6
+    /// it is starting or restarting its stream,
+    case restarting = 7
+    /// or it gave up after repeated errors (`HelloAck.reason` says why).
+    case failed = 8
+
+    /// The PC is there and streams again later; keep asking.
+    var pcNotStreaming: Bool { self == .stopped || self == .restarting || self == .failed }
 }
 
 struct HelloAck: Equatable {
@@ -299,6 +310,9 @@ struct HelloAck: Equatable {
     var hostName: String
     var authToken = Data(repeating: 0, count: 16)
     var hostCaps: UInt16 = 0
+    /// Why the PC isn't streaming, for `.failed`, in the words the PC shows.
+    var reason = ""
+    static let maxReasonLength = 255
 }
 
 struct Heartbeat: Equatable {
@@ -457,9 +471,14 @@ extension Wire {
             body.append(UInt8(name.count))
             body.append(name)
             precondition(a.authToken.count == 16)
-            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) {
+            let reason = Data(a.reason.utf8).prefixOnCharBoundary(a.reason, max: HelloAck.maxReasonLength)
+            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) || !reason.isEmpty {
                 body.append(a.authToken)
                 body.appendLE(a.hostCaps)
+            }
+            if !reason.isEmpty {
+                body.append(UInt8(reason.count))
+                body.append(reason)
             }
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
@@ -662,6 +681,11 @@ extension Wire {
             guard let token = r.take(16), let caps = r.readU16() else { return nil }
             ack.authToken = Data(token)
             ack.hostCaps = caps
+        }
+        if r.remaining > 0 {
+            guard let len = r.readU8(), let bytes = r.take(Int(len)),
+                  let reason = String(bytes: bytes, encoding: .utf8) else { return nil }
+            ack.reason = reason
         }
         return .helloAck(ack)
     }
