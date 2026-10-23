@@ -119,7 +119,8 @@ Windows changes.
   decoder error. The iPad keeps the last good picture until the PC sends a
   fresh one, asks again if that takes a second, and shows **Restoring the
   picture…** if it takes longer. Frames the PC skips on purpose don't cause
-  this.
+  this. If the picture is still frozen after 2 seconds, the PC restarts its
+  video encoder; after 5 seconds the iPad reconnects by itself.
 - If the iPad's video decoder fails to start, the iPad tries again with the
   next picture from the PC instead of freezing until you reconnect.
 - When the PC's resolution changes mid-stream, for example as a second screen
