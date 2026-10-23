@@ -1,5 +1,5 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, gpu_switch_body, second_screen_notice,
+    audio_summary, capture_block_notice, gpu_choice_body, gpu_switch_body, second_screen_notice,
     software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
@@ -302,6 +302,18 @@ fn the_graphics_card_switch_names_the_card_and_how_to_undo_it() {
         body.contains("Settings > System > Display > Graphics"),
         "{body}"
     );
+    // Without a certain switch the notice says how to pick the card instead.
+    let choice = gpu_choice_body("NVIDIA GeForce RTX 4090");
+    assert!(
+        choice.contains("connected to the NVIDIA GeForce RTX 4090"),
+        "{choice}"
+    );
+    assert!(
+        choice.contains("pick the NVIDIA GeForce RTX 4090"),
+        "{choice}"
+    );
+    assert!(choice.contains("open it again"), "{choice}");
+    assert!(!choice.contains("Switch graphics card"), "{choice}");
 }
 
 #[test]

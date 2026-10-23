@@ -42,6 +42,9 @@ pub struct SharedControl {
     /// With `UnsupportedOnThisGpu`: the graphics card switch that lets
     /// Windows share the screen, offered to the user in the notice.
     pub gpu_switch: Arc<Mutex<Option<crate::gpu_preference::GpuSwitch>>>,
+    /// EternalMonitor switched its own graphics card and has not captured
+    /// since. Saved in settings; cleared once capture works.
+    pub gpu_switch_made: Arc<AtomicBool>,
     /// Serialize driver reconciliation across retiring capture generations.
     #[cfg(windows)]
     pub(crate) vdd_lifecycle: Arc<Mutex<()>>,
@@ -153,6 +156,7 @@ impl SharedControl {
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             capture_block: Arc::new(Mutex::new(None)),
             gpu_switch: Arc::new(Mutex::new(None)),
+            gpu_switch_made: Arc::new(AtomicBool::new(false)),
             #[cfg(windows)]
             vdd_lifecycle: Arc::new(Mutex::new(())),
             #[cfg(windows)]

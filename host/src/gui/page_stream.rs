@@ -132,6 +132,15 @@ impl AnalyzerApp {
                         self.control.request_start();
                     }
                 }
+                Some(switch) if switch.preference.is_none() => widgets::banner(
+                    ui,
+                    WARNING,
+                    icon,
+                    title,
+                    &gpu_choice_body(&switch.adapter_name),
+                    0.0,
+                    |_| {},
+                ),
                 Some(switch) => {
                     let mut clicked = false;
                     widgets::banner(
@@ -631,6 +640,15 @@ const NVIDIA_DRIVERS_URL: &str = "https://www.nvidia.com/en-us/drivers/";
 pub(super) fn gpu_switch_body(adapter_name: &str) -> String {
     format!(
         "Your screen is connected to the {adapter_name}. Click Switch graphics card and EternalMonitor reopens on it. You can change this later in Settings > System > Display > Graphics."
+    )
+}
+
+/// The notice body when no setting EternalMonitor could write is certain to
+/// pick the card the screen uses (an eGPU or a second card competes for it),
+/// or when a switch it made did not help.
+pub(super) fn gpu_choice_body(adapter_name: &str) -> String {
+    format!(
+        "Your screen is connected to the {adapter_name}. Open Settings > System > Display > Graphics, choose EternalMonitor, and pick the {adapter_name}. Then quit EternalMonitor and open it again."
     )
 }
 

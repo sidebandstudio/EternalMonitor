@@ -9,11 +9,14 @@
 //! writes, and reads it only when a process starts. So the switch writes
 //! EternalMonitor's own entry, only after the user asks, and reopens the app.
 
-/// A switch that would put EternalMonitor on the adapter driving the screen.
+/// The graphics card the screen is wired to, and the preference that would
+/// put EternalMonitor on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuSwitch {
-    /// `GpuPreference` value: 1 = power saving, 2 = high performance.
-    pub preference: u32,
+    /// `GpuPreference` value to write (1 = power saving, 2 = high
+    /// performance), or `None` when no value is certain to select the card.
+    /// The notice then explains how to pick it in Windows Settings instead.
+    pub preference: Option<u32>,
     /// The adapter's name, for the notice.
     pub adapter_name: String,
 }
@@ -21,33 +24,78 @@ pub struct GpuSwitch {
 /// An adapter LUID as (high, low), comparable across APIs.
 pub type AdapterId = (i32, u32);
 
-/// The preference that selects `display`, the adapter the screen is wired
-/// to, among the hardware `adapters` and their dedicated video memory.
-/// Windows calls the adapter with the most memory high performance and the
-/// one with the least power saving. (`EnumAdapterByGpuPreference` cannot
-/// tell: inside a process with a per-app preference it returns that
-/// preference's adapter for both.) `None` when the process already runs on
-/// the display's adapter, or when the display hangs off an adapter in
-/// between that neither preference selects.
+/// How Windows ranks an adapter for the per-app graphics preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterKind {
+    /// Built into the processor: what power saving selects.
+    Integrated,
+    /// An internal graphics card.
+    Discrete,
+    /// An external GPU. High performance ranks these ahead of discrete ones.
+    Detachable,
+    /// Not integrated, but this Windows cannot say whether it is detachable.
+    NotIntegrated,
+    /// Not a hardware graphics adapter (software rendering, a virtual
+    /// display): never selected by a preference.
+    Ignored,
+    /// Windows could not classify it.
+    Unknown,
+}
+
+/// The preference certain to select `display`, the adapter the screen is
+/// wired to, following `EnumAdapterByGpuPreference`'s documented order: power
+/// saving puts integrated adapters first; high performance puts detachable
+/// adapters first, then the other discrete ones. Video memory says nothing
+/// here: a 16 GB internal card loses to an 8 GB eGPU. `None` when the process
+/// already runs on that adapter, or when several adapters share its rank or
+/// one could not be classified, so the choice is not certain.
 pub fn preference_for(
     display: AdapterId,
     current: AdapterId,
-    adapters: &[(AdapterId, u64)],
+    adapters: &[(AdapterId, AdapterKind)],
 ) -> Option<u32> {
-    if display == current || adapters.len() < 2 {
+    if display == current {
         return None;
     }
-    let most = adapters.iter().max_by_key(|(_, memory)| *memory)?;
-    let least = adapters.iter().min_by_key(|(_, memory)| *memory)?;
-    if most.1 == least.1 {
-        None
-    } else if display == most.0 {
-        Some(2)
-    } else if display == least.0 {
-        Some(1)
-    } else {
-        None
+    let ranked: Vec<_> = adapters
+        .iter()
+        .filter(|(_, kind)| *kind != AdapterKind::Ignored)
+        .collect();
+    let count = |wanted: &[AdapterKind]| {
+        ranked
+            .iter()
+            .filter(|(_, kind)| wanted.contains(kind))
+            .count()
+    };
+    if count(&[AdapterKind::Unknown]) > 0 {
+        return None;
     }
+    let kind = ranked.iter().find(|(id, _)| *id == display)?.1;
+    match kind {
+        AdapterKind::Integrated if count(&[AdapterKind::Integrated]) == 1 => Some(1),
+        AdapterKind::Detachable if count(&[AdapterKind::Detachable]) == 1 => Some(2),
+        AdapterKind::Discrete | AdapterKind::NotIntegrated
+            if count(&[
+                AdapterKind::Discrete,
+                AdapterKind::Detachable,
+                AdapterKind::NotIntegrated,
+            ]) == 1 =>
+        {
+            Some(2)
+        }
+        _ => None,
+    }
+}
+
+/// What the notice may offer for `switch`. After a switch EternalMonitor
+/// made (`switch_made`, saved in its own settings until capture works),
+/// capture failing again means the switch did not help: offering it again
+/// would reopen the app in a loop, so the notice explains Windows Settings.
+pub fn offered(switch: Option<GpuSwitch>, switch_made: bool) -> Option<GpuSwitch> {
+    switch.map(|switch| GpuSwitch {
+        preference: switch.preference.filter(|_| !switch_made),
+        ..switch
+    })
 }
 
 /// Sets `GpuPreference` in a `UserGpuPreferences` value and keeps every other
@@ -112,8 +160,10 @@ mod windows_impl {
     use std::os::windows::ffi::OsStrExt;
     use std::time::Duration;
 
+    use std::ffi::c_void;
     use tracing::{info, warn};
-    use windows::core::{w, PCWSTR};
+
+    use windows::core::{s, w, Interface, GUID, HRESULT, PCWSTR};
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -121,9 +171,13 @@ mod windows_impl {
         QDC_ONLY_ACTIVE_PATHS,
     };
     use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, LUID};
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    use windows::Win32::Graphics::DXCore::{
+        DXCoreAdapterProperty, IDXCoreAdapter, IDXCoreAdapterFactory, IDXCoreAdapterList,
+        InstanceLuid, IsDetachable, IsHardware, IsIntegrated,
+        DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS,
     };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
         KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -132,7 +186,7 @@ mod windows_impl {
         OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
     };
 
-    use super::{preference_for, with_gpu_preference, AdapterId, GpuSwitch};
+    use super::{preference_for, with_gpu_preference, AdapterId, AdapterKind, GpuSwitch};
 
     const PREFERENCES_KEY: PCWSTR = w!("Software\\Microsoft\\DirectX\\UserGpuPreferences");
     /// How long a reopened copy waits for the old one to shut down.
@@ -142,13 +196,13 @@ mod windows_impl {
         (luid.HighPart, luid.LowPart)
     }
 
-    /// For a display EternalMonitor's adapter cannot duplicate, the switch
-    /// that moves it to the adapter the display is wired to. `current` is the
-    /// adapter DXGI listed the display under.
+    /// For a display EternalMonitor's adapter cannot duplicate, the card the
+    /// display is wired to and the preference certain to select it, if any.
+    /// `current` is the adapter DXGI listed the display under. `None` when
+    /// the wired adapter cannot be found or named.
     pub fn suggest_switch(device_name: &str, current: LUID) -> Option<GpuSwitch> {
         let wired = display_adapter(device_name)?;
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
-        let mut adapters = Vec::new();
         let mut names = Vec::new();
         for index in 0.. {
             let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
@@ -157,9 +211,6 @@ mod windows_impl {
             let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
                 continue;
             };
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                continue;
-            }
             let name = String::from_utf16_lossy(
                 &desc
                     .Description
@@ -168,10 +219,12 @@ mod windows_impl {
                     .take_while(|&c| c != 0)
                     .collect::<Vec<_>>(),
             );
-            adapters.push((id(desc.AdapterLuid), desc.DedicatedVideoMemory as u64));
             names.push((id(desc.AdapterLuid), name));
         }
-        let preference = preference_for(wired, id(current), &adapters);
+        let kinds = classify_adapters();
+        let preference = kinds
+            .as_deref()
+            .and_then(|kinds| preference_for(wired, id(current), kinds));
         let adapter_name = names
             .iter()
             .find(|(luid, _)| *luid == wired)
@@ -181,14 +234,68 @@ mod windows_impl {
             display_adapter = ?wired,
             display_adapter_name = adapter_name.as_deref().unwrap_or("unknown"),
             running_on = ?id(current),
-            adapters = ?adapters,
+            adapters = ?kinds,
             preference,
             "Checked which graphics card drives the screen"
         );
         Some(GpuSwitch {
-            preference: preference?,
+            preference,
             adapter_name: adapter_name?,
         })
+    }
+
+    /// Every adapter DXCore lists for Direct3D 11, by how the per-app
+    /// preference ranks it. `None` when DXCore is missing (it is loaded at
+    /// run time: Windows 10 1809, which the installer accepts, may lack it).
+    fn classify_adapters() -> Option<Vec<(AdapterId, AdapterKind)>> {
+        type CreateFactory = unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> HRESULT;
+        let module = unsafe { LoadLibraryW(w!("dxcore.dll")) }.ok()?;
+        let create = unsafe { GetProcAddress(module, s!("DXCoreCreateAdapterFactory")) }?;
+        let create: CreateFactory = unsafe { std::mem::transmute(create) };
+        let mut raw = std::ptr::null_mut();
+        unsafe { create(&IDXCoreAdapterFactory::IID, &mut raw) }
+            .ok()
+            .ok()?;
+        let factory = unsafe { IDXCoreAdapterFactory::from_raw(raw) };
+        let list: IDXCoreAdapterList =
+            unsafe { factory.CreateAdapterList(&[DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS]) }
+                .ok()?;
+        let mut adapters = Vec::new();
+        for index in 0..unsafe { list.GetAdapterCount() } {
+            let Ok(adapter) = (unsafe { list.GetAdapter::<IDXCoreAdapter>(index) }) else {
+                continue;
+            };
+            let mut luid = LUID::default();
+            if unsafe {
+                adapter.GetProperty(
+                    InstanceLuid,
+                    std::mem::size_of::<LUID>(),
+                    (&mut luid as *mut LUID).cast(),
+                )
+            }
+            .is_err()
+            {
+                continue;
+            }
+            let flag = |property: DXCoreAdapterProperty| -> Option<bool> {
+                if !unsafe { adapter.IsPropertySupported(property) } {
+                    return None;
+                }
+                let mut value = 0u8;
+                unsafe { adapter.GetProperty(property, 1, (&mut value as *mut u8).cast()) }.ok()?;
+                Some(value != 0)
+            };
+            let kind = match (flag(IsHardware), flag(IsIntegrated), flag(IsDetachable)) {
+                (Some(false), _, _) => AdapterKind::Ignored,
+                (_, None, _) => AdapterKind::Unknown,
+                (_, Some(true), _) => AdapterKind::Integrated,
+                (_, Some(false), Some(true)) => AdapterKind::Detachable,
+                (_, Some(false), Some(false)) => AdapterKind::Discrete,
+                (_, Some(false), None) => AdapterKind::NotIntegrated,
+            };
+            adapters.push((id(luid), kind));
+        }
+        Some(adapters)
     }
 
     /// The adapter that scans out `device_name` (`\\.\DISPLAY1`). Display
@@ -245,6 +352,7 @@ mod windows_impl {
 
     /// Writes EternalMonitor's own per-app graphics preference and starts a
     /// copy that waits for this process to exit. The caller then quits.
+    /// Only for a switch with a certain preference.
     pub fn switch_and_reopen(switch: &GpuSwitch) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let name: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
@@ -266,7 +374,10 @@ mod windows_impl {
             return Err(format!("Could not open the graphics settings: {status:?}"));
         }
         let existing = read_string(key, PCWSTR(name.as_ptr()));
-        let value = with_gpu_preference(existing.as_deref(), switch.preference);
+        let preference = switch
+            .preference
+            .ok_or("no graphics card setting is certain to select this card")?;
+        let value = with_gpu_preference(existing.as_deref(), preference);
         let bytes: Vec<u8> = value
             .encode_utf16()
             .chain([0])
@@ -347,9 +458,11 @@ mod tests {
     const IGPU: AdapterId = (0, 0x1111);
     const DGPU: AdapterId = (0, 0x2222);
 
+    use AdapterKind::*;
+
     #[test]
     fn the_switch_targets_the_adapter_the_screen_is_wired_to() {
-        let laptop = [(IGPU, 512), (DGPU, 8192)];
+        let laptop = [(IGPU, Integrated), (DGPU, Discrete)];
         // A laptop running on its NVIDIA GPU with the panel on the iGPU: the
         // 0.3.1 field case.
         assert_eq!(preference_for(IGPU, DGPU, &laptop), Some(1));
@@ -357,14 +470,64 @@ mod tests {
         assert_eq!(preference_for(DGPU, IGPU, &laptop), Some(2));
         // Already on the right adapter: switching cannot help.
         assert_eq!(preference_for(IGPU, IGPU, &laptop), None);
-        // The middle card of three (RTX 4090 + RTX 3080 + Radeon iGPU) is
-        // neither preference.
-        let three = [(DGPU, 24138), ((0, 0x3333), 10051), (IGPU, 2021)];
-        assert_eq!(preference_for((0, 0x3333), IGPU, &three), None);
-        assert_eq!(preference_for(DGPU, IGPU, &three), Some(2));
-        // One adapter, or two that look alike: no way to choose.
-        assert_eq!(preference_for(DGPU, IGPU, &[(DGPU, 1)]), None);
-        assert_eq!(preference_for(DGPU, IGPU, &[(DGPU, 1), (IGPU, 1)]), None);
+        // A Windows without the detachable property still has one choice.
+        assert_eq!(
+            preference_for(DGPU, IGPU, &[(IGPU, Integrated), (DGPU, NotIntegrated)]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn an_egpu_takes_high_performance_from_a_larger_internal_card() {
+        // Sol's case: a 16 GB internal card (screen) and an 8 GB eGPU. High
+        // performance selects the eGPU, so no value reaches the internal card.
+        let internal = (0, 0x4444);
+        let egpu = (0, 0x5555);
+        let pc = [(IGPU, Integrated), (internal, Discrete), (egpu, Detachable)];
+        assert_eq!(preference_for(internal, IGPU, &pc), None);
+        // A screen on the eGPU or on the iGPU is still certain.
+        assert_eq!(preference_for(egpu, IGPU, &pc), Some(2));
+        assert_eq!(preference_for(IGPU, internal, &pc), Some(1));
+    }
+
+    #[test]
+    fn an_igpu_only_pc_or_two_discrete_cards_give_no_certain_switch() {
+        // Only an iGPU: the process already runs on it.
+        assert_eq!(preference_for(IGPU, IGPU, &[(IGPU, Integrated)]), None);
+        // RTX 4090 + RTX 3080 (+ Radeon iGPU): high performance could pick
+        // either card.
+        let other = (0, 0x3333);
+        let pc = [(DGPU, Discrete), (other, Discrete), (IGPU, Integrated)];
+        assert_eq!(preference_for(DGPU, IGPU, &pc), None);
+        assert_eq!(preference_for(other, IGPU, &pc), None);
+        assert_eq!(preference_for(IGPU, DGPU, &pc), Some(1));
+        // An adapter Windows could not classify makes nothing certain.
+        let unknown = [(IGPU, Integrated), (DGPU, Discrete), (other, Unknown)];
+        assert_eq!(preference_for(DGPU, IGPU, &unknown), None);
+    }
+
+    #[test]
+    fn a_switch_that_did_not_help_is_not_offered_again() {
+        let switch = || {
+            Some(GpuSwitch {
+                preference: Some(2),
+                adapter_name: "NVIDIA GeForce RTX 5080".into(),
+            })
+        };
+        assert_eq!(offered(switch(), false), switch());
+        let after = offered(switch(), true).unwrap();
+        assert_eq!(after.preference, None);
+        assert_eq!(after.adapter_name, "NVIDIA GeForce RTX 5080");
+        assert_eq!(offered(None, true), None);
+    }
+
+    #[test]
+    fn a_virtual_display_adapter_does_not_count() {
+        let vdd = (0, 0x6666);
+        let pc = [(IGPU, Integrated), (DGPU, Discrete), (vdd, Ignored)];
+        assert_eq!(preference_for(DGPU, IGPU, &pc), Some(2));
+        // A screen on the virtual display itself has no preference.
+        assert_eq!(preference_for(vdd, IGPU, &pc), None);
     }
 
     #[test]

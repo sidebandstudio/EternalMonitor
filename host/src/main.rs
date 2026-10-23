@@ -171,6 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
+    shared.gpu_switch_made.store(
+        persisted.gpu_switch_made,
+        std::sync::atomic::Ordering::SeqCst,
+    );
 
     {
         let mut stats = stats::PIPELINE_STATS.lock();

@@ -237,6 +237,9 @@ pub fn run_capture_loop(
             .map_err(blocked_or_error)?,
     );
     info!("Desktop duplication active");
+    if shared.gpu_switch_made.swap(false, Ordering::SeqCst) {
+        info!("Capturing after the graphics card switch");
+    }
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
@@ -741,8 +744,15 @@ fn offer_gpu_switch(output: &IDXGIOutput1, adapter: &IDXGIAdapter1, shared: &Sha
         return;
     };
     let device_name = utf16_to_string(&output_desc.DeviceName);
-    *shared.gpu_switch.lock() =
-        crate::gpu_preference::suggest_switch(&device_name, adapter_desc.AdapterLuid);
+    let made = shared.gpu_switch_made.load(Ordering::SeqCst);
+    let switch = crate::gpu_preference::offered(
+        crate::gpu_preference::suggest_switch(&device_name, adapter_desc.AdapterLuid),
+        made,
+    );
+    if made {
+        warn!("The graphics card switch EternalMonitor made did not let it capture the screen");
+    }
+    *shared.gpu_switch.lock() = switch;
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which

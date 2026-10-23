@@ -500,11 +500,17 @@ fn review_screens() {
     }
     *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
     *shared.gpu_switch.lock() = Some(eternal_host::gpu_preference::GpuSwitch {
-        preference: 1,
+        preference: Some(1),
         adapter_name: "AMD Radeon(TM) Graphics".to_string(),
     });
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_switch.lock() = Some(eternal_host::gpu_preference::GpuSwitch {
+        preference: None,
+        adapter_name: "NVIDIA GeForce RTX 4090".to_string(),
+    });
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-choice");
     *shared.gpu_switch.lock() = None;
     *shared.capture_block.lock() = None;
 

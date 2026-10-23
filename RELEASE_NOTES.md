@@ -128,7 +128,9 @@ Windows changes.
   card the screen isn't connected to, the notice names the right card and
   offers **Switch graphics card**. EternalMonitor then saves its own choice in
   Windows graphics settings and reopens on that card. Nothing changes until
-  you click.
+  you click. When that setting can't be sure to pick the card, for example
+  with an external graphics card attached, or a switch didn't help, the notice
+  says how to pick the card in Windows Settings instead.
 - The Quick Start guide installed with EternalMonitor matches this version's
   buttons and messages, and no longer names an old release.
 - A new Known issues page lists the problems we know about, each with what to
