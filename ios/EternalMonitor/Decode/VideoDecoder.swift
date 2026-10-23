@@ -28,6 +28,11 @@ final class VideoDecoder {
     /// The decoder cannot make progress until the next keyframe (session died, decode error).
     /// Protocol v2 turns this into a keyframe request to the host.
     var onNeedsKeyframe: (() -> Void)?
+    /// The picture has been held `restartStreamAfterUs` with no keyframe
+    /// decoded: ask the host to restart the stream.
+    var onRestartStream: (() -> Void)?
+    /// The picture has been held `reconnectAfterUs`: this session can't recover.
+    var onStalled: (() -> Void)?
 
     /// Which bitstream the host is sending. Sniffed from the NAL units
     /// themselves (an HEVC VPS or an H.264 SPS in a keyframe) because the
@@ -54,9 +59,19 @@ final class VideoDecoder {
     private var packetLogCounter: UInt64 = 0
     /// When the decoder last asked for a keyframe while holding the picture.
     private var lastKeyframeRequestUs: UInt64 = 0
-    /// When the picture started waiting for a keyframe mid-stream; `nil` while
-    /// decoding normally and before the first keyframe of a session.
-    private let keyframeWaitStart = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
+    /// The last clean picture stays on screen from `start` until a frame
+    /// decodes again. Only a frame submitted after the keyframe that ends the
+    /// hold (`resumeGeneration`) counts: one already in flight, or a keyframe
+    /// that fails to decode, is no progress. `nil` while decoding normally and
+    /// before the first keyframe of a session.
+    private struct Hold {
+        var start: UInt64
+        var resumeGeneration: UInt64?
+        var restartedStream = false
+        var reportedStall = false
+    }
+    private let hold = OSAllocatedUnfairLock<Hold?>(initialState: nil)
+    private var recoveryTimer: DispatchSourceTimer?
     private let nowUs: () -> UInt64
     /// Whether each picture follows a lost reference picture.
     private var continuity = ReferenceContinuity()
@@ -67,9 +82,18 @@ final class VideoDecoder {
     typealias SessionFactory = (CMVideoFormatDescription, CFDictionary, CFDictionary) -> (OSStatus, VTDecompressionSession?)
     private let makeSession: SessionFactory
 
-    /// A request can be lost on Wi-Fi as easily as the frame it replaces, so
-    /// one is sent again this often while dependent frames keep arriving.
-    static let keyframeRetryUs: UInt64 = 1_000_000
+    /// While the picture is held: a request can be lost on Wi-Fi as easily as
+    /// the frame it replaces, so one is sent again this often, on a timer, as
+    /// the stream may also have gone silent. The host grants one request per
+    /// 500 ms (`KEYFRAME_REQUEST_MIN_INTERVAL`); the timer's 100 ms tick sends
+    /// the retry 500-600 ms after the last, so none lands inside that window.
+    static let keyframeRetryUs: UInt64 = 500_000
+    /// Then the decoder session is rebuilt and the host asked to restart.
+    static let restartStreamAfterUs: UInt64 = 2_000_000
+    /// Then the connection is rebuilt.
+    static let reconnectAfterUs: UInt64 = 5_000_000
+    /// A hold this long shows Restoring the picture and is logged.
+    static let showRestoringAfterUs: UInt64 = 1_000_000
 
     init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs, makeSession: SessionFactory? = nil) {
         self.nowUs = nowUs
@@ -85,11 +109,16 @@ final class VideoDecoder {
             )
             return (status, session)
         }
+        let timer = DispatchSource.makeTimerSource(queue: decodeQueue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in self?.recoveryTick() }
+        timer.resume()
+        recoveryTimer = timer
     }
 
     /// How long the picture has been held waiting for a keyframe, if it is.
     var keyframeWaitUs: UInt64? {
-        keyframeWaitStart.withLock { $0 }.map { start in nowUs() &- start }
+        hold.withLock { $0 }.map { nowUs() &- $0.start }
     }
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
@@ -98,6 +127,7 @@ final class VideoDecoder {
     var decodeDepth: UInt8 { UInt8(clamping: queued.withLock { $0 } + inFlight.withLock { $0 }) }
 
     deinit {
+        recoveryTimer?.cancel()
         // `shutdown()` is the proper teardown; this is the safety net if an owner
         // drops the decoder without calling it. No callbacks can be in flight at
         // deinit (the session retains its output handlers' captures weakly).
@@ -119,7 +149,37 @@ final class VideoDecoder {
         guard !waitingForSyncSample else { return }
         waitingForSyncSample = true
         let now = nowUs()
-        keyframeWaitStart.withLock { $0 = now }
+        // A keyframe that failed to decode continues the same hold.
+        hold.withLock { current in
+            if current == nil { current = Hold(start: now) } else { current?.resumeGeneration = nil }
+        }
+    }
+
+    /// Recovery while the picture is held, driven by time alone: ask again
+    /// every `keyframeRetryUs`, restart the stream at `restartStreamAfterUs`,
+    /// give the session up at `reconnectAfterUs`.
+    private func recoveryTick() {
+        guard !isShutdown, let current = hold.withLock({ $0 }) else { return }
+        let now = nowUs()
+        let held = now &- current.start
+        if held >= Self.reconnectAfterUs {
+            guard !current.reportedStall else { return }
+            hold.withLock { $0?.reportedStall = true }
+            onStalled?()
+        } else if held >= Self.restartStreamAfterUs, !current.restartedStream {
+            hold.withLock { $0?.restartedStream = true }
+            onEvent?("Picture held \(held / 1000) ms; rebuilding the decoder and asking the PC to restart the stream")
+            // A fresh session from the next keyframe's parameter sets, in case
+            // this one is what keeps rejecting them.
+            teardownSession(waitForFrames: false)
+            formatDescription = nil
+            waitingForSyncSample = true
+            lastKeyframeRequestUs = now
+            onRestartStream?()
+        } else if now &- lastKeyframeRequestUs >= Self.keyframeRetryUs {
+            lastKeyframeRequestUs = now
+            onNeedsKeyframe?()
+        }
     }
 
     /// Ask (again) for a keyframe the host has not sent: a frame arrived that
@@ -138,6 +198,7 @@ final class VideoDecoder {
     func shutdown(completion: (() -> Void)? = nil) {
         decodeQueue.async {
             self.isShutdown = true
+            self.recoveryTimer?.cancel()
             self.teardownSession(waitForFrames: true)
             self.formatDescription = nil
             self.codec = .h264
@@ -145,7 +206,7 @@ final class VideoDecoder {
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
-            self.keyframeWaitStart.withLock { $0 = nil }
+            self.hold.withLock { $0 = nil }
             self.continuity = ReferenceContinuity()
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
@@ -578,12 +639,8 @@ final class VideoDecoder {
         if isSyncSample {
             recoveryGeneration &+= 1
             waitingForSyncSample = false
-            if let start = keyframeWaitStart.withLock({ value -> UInt64? in
-                defer { value = nil }
-                return value
-            }), nowUs() &- start >= Self.keyframeRetryUs {
-                onEvent?("Picture held \((nowUs() &- start) / 1000) ms waiting for a keyframe")
-            }
+            let resume = recoveryGeneration
+            hold.withLock { $0?.resumeGeneration = resume }
         }
         let generation = recoveryGeneration
 
@@ -703,6 +760,14 @@ final class VideoDecoder {
                 return
             }
             guard let pixelBuffer = imageBuffer else { return }
+            let ended = self.hold.withLock { current -> UInt64? in
+                guard let held = current, held.resumeGeneration == generation else { return nil }
+                current = nil
+                return held.start
+            }
+            if let start = ended, self.nowUs() &- start >= Self.showRestoringAfterUs {
+                self.onEvent?("Picture held \((self.nowUs() &- start) / 1000) ms waiting for a keyframe")
+            }
             self.onFrameDecoded?(pixelBuffer, timestampUs)
         }
 

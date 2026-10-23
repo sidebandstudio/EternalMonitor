@@ -426,42 +426,70 @@ final class VideoDecoderTests: XCTestCase {
         }
     }
 
-    func testHeldPictureAsksAgainForAKeyframeOncePerSecond() throws {
-        // The first request, or the host's keyframe, can be lost too.
+    func testSilentStreamStillRetriesThenRestartsThenReconnects() throws {
+        // Sol: recovery must not wait for frames to arrive. A lost frame, then
+        // nothing at all: retry every 500 ms, restart the stream at 2 s, give
+        // the session up at 5 s, with the last clean picture on screen.
         let units = try twoGOPs("h264")
         let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
         let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
         defer { decoder.shutdown() }
-        let requests = OSAllocatedUnfairLock(initialState: 0)
-        let events = OSAllocatedUnfairLock(initialState: [String]())
-        decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
-        decoder.onEvent = { message in events.withLock { $0.append(message) } }
-        let restored = expectation(description: "keyframe after the wait")
+        struct Calls { var requests = 0; var restarts = 0; var stalls = 0; var events: [String] = [] }
+        let calls = OSAllocatedUnfairLock(initialState: Calls())
+        decoder.onNeedsKeyframe = { calls.withLock { $0.requests += 1 } }
+        decoder.onRestartStream = { calls.withLock { $0.restarts += 1 } }
+        decoder.onStalled = { calls.withLock { $0.stalls += 1 } }
+        decoder.onEvent = { message in calls.withLock { $0.events.append(message) } }
+        let restored = expectation(description: "keyframe after the stall")
         decoder.onFrameDecoded = { _, timestamp in if timestamp == 20 * 16_667 { restored.fulfill() } }
-        func frame(_ seq: UInt32, _ index: Int, at seconds: Double) {
-            clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) }
-            decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
-        }
-        func waitFor(_ count: Int) {
-            let met = expectation(for: NSPredicate { _, _ in requests.withLock { $0 } >= count }, evaluatedWith: nil)
+        func at(_ seconds: Double) { clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) } }
+        func until(_ condition: @escaping (Calls) -> Bool) {
+            let met = expectation(for: NSPredicate { _, _ in calls.withLock { condition($0) } }, evaluatedWith: nil)
             wait(for: [met], timeout: 10)
         }
-        frame(1, 0, at: 0)
-        frame(2, 1, at: 0)
-        frame(4, 3, at: 0)      // seq 3 lost: hold, and ask at once
-        waitFor(1)
-        frame(5, 3, at: 0.5)
-        frame(6, 3, at: 1.1)
-        waitFor(2)
-        frame(7, 3, at: 1.5)
-        frame(8, 3, at: 2.2)
-        waitFor(3)
-        XCTAssertEqual(decoder.keyframeWaitUs, 2_200_000)
-        frame(20, 4, at: 2.2)
+        for (seq, index) in [(1, 0), (2, 1), (4, 3)] {
+            decoder.decode(packet: packet(seq: UInt32(seq), data: units[index], keyframe: index == 0))
+        }
+        until { $0.requests == 1 }                       // at once, on the lost frame
+        at(0.3); Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(calls.withLock { $0.requests }, 1, "not before 500 ms")
+        at(0.55); until { $0.requests == 2 }             // no frame arrived
+        at(1.1); until { $0.requests == 3 }
+        at(2.05); until { $0.restarts == 1 }
+        XCTAssertEqual(calls.withLock { $0.stalls }, 0)
+        at(2.6); until { $0.requests == 4 }              // retries continue after the restart
+        at(5.05); until { $0.stalls == 1 }
+        at(6.0); Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(calls.withLock { $0.restarts }, 1, "each step once per hold")
+        XCTAssertEqual(calls.withLock { $0.stalls }, 1, "each step once per hold")
+        XCTAssertNotNil(decoder.keyframeWaitUs)
+        // A keyframe still recovers: the rebuilt decoder opens from its parameter sets.
+        decoder.decode(packet: packet(seq: 20, data: units[4], keyframe: true))
         wait(for: [restored], timeout: 10)
-        XCTAssertEqual(requests.withLock { $0 }, 3)
         XCTAssertNil(decoder.keyframeWaitUs)
-        XCTAssertTrue(events.withLock { $0 }.contains("Picture held 2200 ms waiting for a keyframe"))
+        XCTAssertTrue(calls.withLock { $0.events }.contains { $0.hasPrefix("Picture held 6000 ms") })
+    }
+
+    func testKeyframeThatFailsToDecodeContinuesTheHold() throws {
+        // Progress means a decoded picture. A keyframe VideoToolbox rejects
+        // must not restart the 2 s and 5 s clock, or a stream of bad
+        // keyframes would never escalate.
+        let units = try twoGOPs("h264")
+        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
+        defer { decoder.shutdown() }
+        let failed = expectation(description: "keyframe rejected")
+        decoder.onEvent = { message in if message.hasPrefix("Decoder callback") { failed.fulfill() } }
+        for (seq, index) in [(1, 0), (2, 1), (4, 3)] {
+            decoder.decode(packet: packet(seq: UInt32(seq), data: units[index], keyframe: index == 0))
+        }
+        let holding = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs != nil }, evaluatedWith: nil)
+        wait(for: [holding], timeout: 5)
+        clock.withLock { $0 = 6_000_000 }
+        decoder.decode(packet: packet(seq: 5, data: Data([0, 0, 0, 1, 0x65, 0x80]), keyframe: true))
+        wait(for: [failed], timeout: 10)
+        let settled = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs == 1_000_000 }, evaluatedWith: nil)
+        wait(for: [settled], timeout: 5)
     }
 
     // MARK: - A session that fails to open

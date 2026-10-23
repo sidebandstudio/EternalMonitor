@@ -424,6 +424,19 @@ final class ConnectionManager: ObservableObject {
                 streamEpoch: 0, lastCompleteSeq: 0, reason: .decodeError
             )
         }
+        // A picture held 2 s: the strongest request short of reconnecting.
+        decoder.onRestartStream = { [weak self, weak controlChannelBox] in
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            controlChannelBox?.value?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .resume)
+        }
+        // Held 5 s: reconnect, as for a PC that stopped responding.
+        decoder.onStalled = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connected else { return }
+                self.record(.warning, "decode", "Picture held 5 s without a keyframe — reconnecting")
+                self.beginReconnect(.pcStoppedResponding)
+            }
+        }
 
         decoder.onEvent = { [weak self] message in
             Task { @MainActor in
@@ -800,7 +813,7 @@ final class ConnectionManager: ObservableObject {
         next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
         stats = next
         let restoring = state == .connected
-            && (videoDecoder?.keyframeWaitUs ?? 0) >= VideoDecoder.keyframeRetryUs
+            && (videoDecoder?.keyframeWaitUs ?? 0) >= VideoDecoder.showRestoringAfterUs
         if restoring != pictureRestoring { pictureRestoring = restoring }
 
         // --- Liveness watchdog (host heartbeats stopped => stale picture) ---
