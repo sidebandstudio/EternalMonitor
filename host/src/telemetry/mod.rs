@@ -471,7 +471,9 @@ static NAMES: once_cell::sync::Lazy<Names> = once_cell::sync::Lazy::new(|| {
 });
 
 /// This profile's path, in any case and with either separator, when the
-/// folder name ends there.
+/// folder name ends there: at a separator, a quote or the end of the line.
+/// A space or letter after it is a longer folder name, such as `A Smith` for
+/// profile `A`, which the general rule takes whole.
 fn profile_pattern(path: &str) -> Option<regex::Regex> {
     let path = path.trim().trim_end_matches(['\\', '/']);
     let (parent, folder) = path.rsplit_once(['\\', '/'])?;
@@ -480,7 +482,7 @@ fn profile_pattern(path: &str) -> Option<regex::Regex> {
     }
     let parent: Vec<_> = parent.split(['\\', '/']).map(regex::escape).collect();
     regex::Regex::new(&format!(
-        r#"(?i)({}[\\/]+){}([\\/\s"'=,;)\]]|$)"#,
+        r#"(?i)({}[\\/]+){}([\\/"']|$)"#,
         parent.join(r"[\\/]+"),
         regex::escape(folder)
     ))
@@ -549,20 +551,27 @@ fn redact_upload(text: &str, names: &Names) -> String {
         Some(profile) => profile.replace_all(&text, "${1}[USER]${2}").into_owned(),
         None => text.into_owned(),
     };
-    // Any other profile path. A Windows user name may contain spaces but no
-    // path separator, so a segment that ends at one is taken whole; at the end
-    // of a path, only up to the next space.
+    // Every other profile folder not yet [USER]. A Windows user name may
+    // contain spaces but no path separator, so a segment that ends at one is
+    // taken whole; at the end of a path, only up to the next space.
     static PROFILE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(
-            r#"(?i)(\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:Users|home)/)(?:[^\\/\r\n"'<>|:*?=\[]+([\\/])|[^\\/\s"'<>|:*?=\[]+)"#,
+            r#"(?i)(\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:Users|home)/)(?:([^\\/\r\n"'<>|:*?=]+)([\\/])|([^\\/\s"'<>|:*?=]+))"#,
         )
         .expect("profile path pattern")
     });
     let text = PROFILE.replace_all(&text, |captures: &regex::Captures| {
+        let folder = captures
+            .get(2)
+            .or(captures.get(4))
+            .map_or("", |m| m.as_str());
+        if folder == "[USER]" {
+            return captures[0].to_owned();
+        }
         format!(
             "{}[USER]{}",
             &captures[1],
-            captures.get(2).map_or("", |separator| separator.as_str())
+            captures.get(3).map_or("", |separator| separator.as_str())
         )
     });
     match &names.pc {
@@ -1051,6 +1060,34 @@ mod tests {
         ] {
             assert_eq!(redact_upload(text, &names), uploaded);
         }
+    }
+
+    /// The exact profile counts only where its folder name ends, so a longer
+    /// folder that starts with it goes whole through the general rule.
+    #[test]
+    fn a_profile_that_starts_another_folder_name_does_not_cut_it() {
+        let names = Names::new(Some(r"C:\Users\A"), None);
+        let wrong = [
+            (
+                r"path=C:\Users\A Smith\Desktop\x",
+                r"path=C:\Users\[USER]\Desktop\x",
+            ),
+            (r"C:\Users\A\x", r"C:\Users\[USER]\x"),
+            (r"C:\Users\Al\x", r"C:\Users\[USER]\x"),
+            (r"C:\Users\A Smith\x", r"C:\Users\[USER]\x"),
+            (r"home=C:\Users\A", r"home=C:\Users\[USER]"),
+            (
+                r#"path="C:\Users\A" next=1"#,
+                r#"path="C:\Users\[USER]" next=1"#,
+            ),
+            (r"path='C:\Users\A'", r"path='C:\Users\[USER]'"),
+            (r"path=C:\Users\[USER]\x", r"path=C:\Users\[USER]\x"),
+        ]
+        .into_iter()
+        .filter(|(text, uploaded)| redact_upload(text, &names) != *uploaded)
+        .map(|(text, _)| (text, redact_upload(text, &names)))
+        .collect::<Vec<_>>();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
