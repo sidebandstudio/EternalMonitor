@@ -40,6 +40,27 @@ enum ConnectionProblem: Equatable {
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
     case pcUpdating(UpdateWait)
+    /// The PC answered but isn't streaming. This iPad keeps asking and
+    /// connects as soon as it is.
+    case pcNotStreaming(StreamWait)
+
+    enum StreamWait: Equatable {
+        /// Someone clicked Stop on the PC.
+        case stopped
+        case restarting
+        /// The PC gave up after repeated errors, for the reason it shows.
+        case failed(String)
+
+        /// What the PC's answer means, if it is one of these.
+        init?(_ status: HelloStatus, reason: String) {
+            switch status {
+            case .stopped: self = .stopped
+            case .restarting: self = .restarting
+            case .failed: self = .failed(reason)
+            default: return nil
+            }
+        }
+    }
 
     /// What this iPad does while the PC updates.
     enum UpdateWait: Equatable {
@@ -87,6 +108,9 @@ enum ConnectionProblem: Equatable {
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
+        case .pcNotStreaming(.stopped): return "Your PC isn't streaming"
+        case .pcNotStreaming(.restarting): return "Your PC is restarting the stream…"
+        case .pcNotStreaming(.failed): return "Your PC couldn't start streaming"
         }
     }
 
@@ -147,13 +171,21 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor opened again on the PC, then try again. Windows may still be waiting for you to approve the update there."
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
+        case .pcNotStreaming(.stopped):
+            return "Click Start streaming in EternalMonitor on the PC. This iPad connects as soon as it starts."
+        case .pcNotStreaming(.restarting):
+            return "This iPad connects as soon as it's back."
+        case .pcNotStreaming(.failed(let reason)):
+            let start = "Click Start streaming in EternalMonitor on the PC to try again. This iPad connects as soon as it starts."
+            return reason.isEmpty ? start : "\(reason). \(start)"
         }
     }
 
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]
-        case .reconnecting, .waitingForNetwork, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
+        case .reconnecting, .waitingForNetwork, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress,
+             .pcNotStreaming: return []
         default: return [.retry]
         }
     }
@@ -339,6 +371,8 @@ enum ConnectingStatus: Equatable {
     /// A few tries went unanswered; still trying.
     case noAnswerYet(usb: Bool)
     case answered
+    /// The PC answered that it isn't streaming; still asking.
+    case waitingForStream
 
     /// HELLOs go out every quarter second at first: eight unanswered is two
     /// seconds of silence.
@@ -357,6 +391,8 @@ enum ConnectingStatus: Equatable {
             return "No answer over the cable yet. Check that EternalMonitor and Apple Devices are open on the PC. Still trying…"
         case .answered:
             return "Your PC answered. Waiting for the picture…"
+        case .waitingForStream:
+            return "Waiting for your PC to start streaming…"
         }
     }
 }

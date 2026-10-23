@@ -22,6 +22,9 @@ final class ControlChannel {
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
     var onRejected: ((HelloStatus) -> Void)?
+    /// The PC answered that it isn't streaming, with its reason. The HELLO2
+    /// keeps going out slowly and connects once the PC streams again.
+    var onPCNotStreaming: ((HelloStatus, String) -> Void)?
     /// The last refusal's version mismatch, if any. Read inside `onRejected`.
     private(set) var lastMismatch: VersionMismatch?
     /// HELLO2 went unanswered for the whole retry budget.
@@ -45,6 +48,8 @@ final class ControlChannel {
     private var helloBytes = Data()
     private var helloTemplate: Hello2?
     private var helloAttempts = 0
+    /// The PC said it isn't streaming: keep asking, without a retry budget.
+    private var waitingForStream = false
     private var helloTimer: DispatchSourceTimer?
     private var reportTimer: DispatchSourceTimer?
     private var pingTimer: DispatchSourceTimer?
@@ -74,6 +79,10 @@ final class ControlChannel {
     /// whose firewall the user just allowed, answers a few seconds later.
     private static let slowHelloAttempts = 7
     private static let slowHelloRetryMs = 1000
+    /// How often to ask a PC that answered it isn't streaming. A restart
+    /// takes a second or more; Start takes someone walking to the PC.
+    static let restartingRetryMs = 1000
+    static let stoppedRetryMs = 2000
     private static let pingIntervalMs = 2000
     private static let pingBurstCount = 5
     private static let pingBurstSpacingMs = 200
@@ -120,6 +129,7 @@ final class ControlChannel {
             hostCaps = 0
             msgSeq = 0
             helloAttempts = 0
+            waitingForStream = false
             clientNonce = UInt32.random(in: 1...UInt32.max)
             let hello = Hello2(
                 clientNonce: clientNonce,
@@ -155,6 +165,7 @@ final class ControlChannel {
             hello.pairingCode = code
             helloTemplate = hello
             helloAttempts = 0
+            waitingForStream = false
             helloBytes = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(hello))
             startHelloTimer()
         }
@@ -173,6 +184,10 @@ final class ControlChannel {
         guard sessionId == 0 else {
             helloTimer?.cancel()
             helloTimer = nil
+            return
+        }
+        if waitingForStream {
+            send(helloBytes)
             return
         }
         helloAttempts += 1
@@ -236,6 +251,18 @@ final class ControlChannel {
         }
         helloTimer?.cancel()
         helloTimer = nil
+
+        if ack.status.pcNotStreaming {
+            // Same nonce: the PC answers the same HELLO2 once it streams.
+            let firstAnswer = !waitingForStream
+            waitingForStream = true
+            let everyMs = ack.status == .restarting ? Self.restartingRetryMs : Self.stoppedRetryMs
+            startHelloTimer(after: everyMs, everyMs: everyMs)
+            if firstAnswer { onDiagnostic?("PC answered that it isn't streaming (\(ack.status))") }
+            onPCNotStreaming?(ack.status, ack.reason)
+            return
+        }
+        waitingForStream = false
 
         guard ack.status == .ok else {
             clientNonce = 0
@@ -365,6 +392,7 @@ final class ControlChannel {
             helloTemplate = nil
             helloBytes = Data()
             clientNonce = 0
+            waitingForStream = false
             sessionId = 0
             hostCaps = 0
             estimator.reset()
