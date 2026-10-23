@@ -35,6 +35,11 @@ pub struct GpuInfo {
     pub codec_display_name: String,
 }
 
+/// No NVIDIA drivers to read outside Windows.
+pub fn nvidia_driver_versions() -> Vec<u64> {
+    Vec::new()
+}
+
 /// No hardware encoder fallback chain outside Windows.
 pub fn vendors_present() -> Vec<GpuVendor> {
     Vec::new()

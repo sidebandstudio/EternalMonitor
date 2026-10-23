@@ -679,7 +679,7 @@ impl EncoderState {
         let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts).map_err(|error| {
-            if nvidia_driver_outdated(encoder_name, error) {
+            if nvidia_driver_outdated(encoder_name, error, &crate::gpu::nvidia_driver_versions()) {
                 warn!(
                     encoder = encoder_name,
                     "The NVIDIA driver is too old for NVENC; it needs {NVENC_MIN_DRIVER} or newer"
@@ -884,13 +884,34 @@ fn open_remaining_encoders<T>(
 /// opens with. Older drivers fail with "Driver does not support the required
 /// nvenc API version", and FFmpeg 7.1 prints the minimum as "(unknown)".
 pub const NVENC_MIN_DRIVER: &str = "570";
+/// [`NVENC_MIN_DRIVER`] in hundredths, as [`nvidia_release`] returns it.
+const NVENC_MIN_RELEASE: u32 = 57_000;
 
-/// Whether an encoder open failed only because the NVIDIA driver is too old.
-/// FFmpeg's NVENC returns ENOSYS for exactly that check; a missing driver or
-/// device fails with other codes.
-fn nvidia_driver_outdated(encoder_name: &str, error: ffmpeg_next::Error) -> bool {
+/// NVIDIA's driver number in hundredths (56607 for 566.07) from the Windows
+/// driver version packed as DXGI reports it (32.0.15.6607): the last digit
+/// of the third part followed by the four digits of the fourth.
+fn nvidia_release(windows_version: u64) -> u32 {
+    let third = ((windows_version >> 16) & 0xffff) as u32;
+    let fourth = (windows_version & 0xffff) as u32;
+    (third % 10) * 10_000 + fourth
+}
+
+/// Whether an NVENC open failed because the NVIDIA driver is too old: FFmpeg
+/// returned ENOSYS, and every NVIDIA driver on the PC is older than NVENC
+/// needs. ENOSYS alone is not enough: FFmpeg also uses it for parameters the
+/// encoder does not support. `driver_versions` are the NVIDIA adapters'
+/// Windows driver versions; none known means not outdated.
+fn nvidia_driver_outdated(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: &[u64],
+) -> bool {
     encoder_name.ends_with("_nvenc")
         && matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
+        && !driver_versions.is_empty()
+        && driver_versions
+            .iter()
+            .all(|&version| nvidia_release(version) < NVENC_MIN_RELEASE)
 }
 
 /// The picture size to encode a `width` x `height` desktop at: the same size,
@@ -1785,19 +1806,39 @@ mod tests {
 
     #[test]
     fn only_nvencs_api_version_refusal_means_an_outdated_driver() {
+        let version = |a: u64, b: u64, c: u64, d: u64| a << 48 | b << 32 | c << 16 | d;
+        // Field drivers: GTX 1650 on 517.18, RTX 4060 laptop on 566.07.
+        let old = [version(31, 0, 15, 1718)];
+        let laptop = [version(32, 0, 15, 6607)];
+        let current = [version(32, 0, 16, 2101)];
+        assert_eq!(nvidia_release(old[0]), 51_718);
+        assert_eq!(nvidia_release(laptop[0]), 56_607);
+        assert_eq!(nvidia_release(current[0]), 62_101);
+        assert_eq!(nvidia_release(version(21, 21, 13, 7654)), 37_654);
+
         let enosys = ffmpeg_next::Error::Other {
             errno: libc::ENOSYS,
         };
         let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
-        assert!(nvidia_driver_outdated("h264_nvenc", enosys));
-        assert!(nvidia_driver_outdated("hevc_nvenc", enosys));
-        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
-        assert!(!nvidia_driver_outdated("h264_nvenc", eperm));
+        assert!(nvidia_driver_outdated("h264_nvenc", enosys, &old));
+        assert!(nvidia_driver_outdated("hevc_nvenc", enosys, &laptop));
+        // ENOSYS with a driver new enough is an unsupported parameter.
+        assert!(!nvidia_driver_outdated("h264_nvenc", enosys, &current));
         assert!(!nvidia_driver_outdated(
             "h264_nvenc",
-            ffmpeg_next::Error::External
+            enosys,
+            &[old[0], current[0]]
         ));
-        assert!(!nvidia_driver_outdated("h264_amf", enosys));
+        // No NVIDIA driver version known.
+        assert!(!nvidia_driver_outdated("h264_nvenc", enosys, &[]));
+        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
+        assert!(!nvidia_driver_outdated("h264_nvenc", eperm, &old));
+        assert!(!nvidia_driver_outdated(
+            "h264_nvenc",
+            ffmpeg_next::Error::External,
+            &old
+        ));
+        assert!(!nvidia_driver_outdated("h264_amf", enosys, &old));
     }
 
     #[test]

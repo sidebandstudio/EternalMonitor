@@ -97,6 +97,33 @@ pub fn vendors_present() -> Vec<GpuVendor> {
     vendors
 }
 
+/// Windows driver versions of the NVIDIA adapters, packed as DXGI reports
+/// them (32.0.15.6607). Read when NVENC refuses to open, to tell an old
+/// driver from other refusals.
+pub fn nvidia_driver_versions() -> Vec<u64> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let mut versions = Vec::new();
+    for index in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if desc.VendorId != VENDOR_NVIDIA {
+            continue;
+        }
+        if let Ok(version) = unsafe {
+            adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
+        } {
+            versions.push(version as u64);
+        }
+    }
+    versions
+}
+
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
