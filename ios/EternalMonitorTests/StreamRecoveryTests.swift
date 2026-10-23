@@ -36,6 +36,23 @@ final class StreamRecoveryTests: XCTestCase {
         return manager
     }
 
+    func testFrozenPictureAsksThePCToRestartTheStream() async throws {
+        // A frame is lost and nothing more arrives: after 2 s of frozen
+        // picture the iPad sends Resume, which a PC with this fix answers by
+        // reopening its encoder (0.3.1 PCs force a keyframe).
+        let host = FakeUDPHost()
+        _ = try await streaming(host)
+        let units = try twoGOPs()
+        host.sendFrame(units[1], seq: 2, isKeyframe: false)
+        host.sendFrame(units[3], seq: 4, isKeyframe: false)
+        let reasons = await Task.detached { host.keyframeRequests(within: 3.2) }.value
+        XCTAssertEqual(reasons.first, .decodeError, "the hold asks for a keyframe at once")
+        // Then every 600 ms; from 2 s each retry asks for a restart instead.
+        let firstResume = try XCTUnwrap(reasons.firstIndex(of: .resume), "\(reasons)")
+        XCTAssertGreaterThanOrEqual(firstResume, 3, "\(reasons)")
+        XCTAssertTrue(reasons[..<firstResume].allSatisfy { $0 == .decodeError }, "\(reasons)")
+    }
+
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {
         // The PC reopened its encoder and its new keyframe (seq 2) was lost;
         // the new encoder's first P-frame continues the codec's count. A PC

@@ -441,7 +441,7 @@ final class VideoDecoderTests: XCTestCase {
 
     func testSilentStreamStillRetriesThenRestartsThenReconnects() throws {
         // Sol: recovery must not wait for frames to arrive. A lost frame, then
-        // nothing at all: retry every 500 ms, restart the stream at 2 s, give
+        // nothing at all: retry every 600 ms, restart the stream at 2 s, give
         // the session up at 5 s, with the last clean picture on screen.
         let units = try twoGOPs("h264")
         let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
@@ -464,17 +464,21 @@ final class VideoDecoderTests: XCTestCase {
             decoder.decode(packet: packet(seq: UInt32(seq), data: units[index], keyframe: index == 0))
         }
         until { $0.requests == 1 }                       // at once, on the lost frame
-        at(0.3); Thread.sleep(forTimeInterval: 0.3)
-        XCTAssertEqual(calls.withLock { $0.requests }, 1, "not before 500 ms")
-        at(0.55); until { $0.requests == 2 }             // no frame arrived
-        at(1.1); until { $0.requests == 3 }
+        at(0.5); Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(calls.withLock { $0.requests }, 1, "not before 600 ms")
+        at(0.65); until { $0.requests == 2 }             // no frame arrived
+        at(1.3); until { $0.requests == 3 }
         at(2.05); until { $0.restarts == 1 }
         XCTAssertEqual(calls.withLock { $0.stalls }, 0)
-        at(2.6); until { $0.requests == 4 }              // retries continue after the restart
+        at(2.4); Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(calls.withLock { $0.restarts }, 1, "a retry slot apart, or the channel coalesces it")
+        at(2.7); until { $0.restarts == 2 }              // retries go on as restart requests
+        XCTAssertEqual(calls.withLock { $0.requests }, 3)
         at(5.05); until { $0.stalls == 1 }
         at(6.0); Thread.sleep(forTimeInterval: 0.3)
-        XCTAssertEqual(calls.withLock { $0.restarts }, 1, "each step once per hold")
-        XCTAssertEqual(calls.withLock { $0.stalls }, 1, "each step once per hold")
+        XCTAssertEqual(calls.withLock { $0.stalls }, 1, "reconnect once per hold")
+        XCTAssertEqual(calls.withLock { $0.events.filter { $0.contains("rebuilding the decoder") }.count }, 1,
+                       "the decoder is rebuilt once per hold")
         XCTAssertNotNil(decoder.keyframeWaitUs)
         // A keyframe still recovers: the rebuilt decoder opens from its parameter sets.
         decoder.decode(packet: packet(seq: 20, data: units[4], keyframe: true))

@@ -29,7 +29,8 @@ final class VideoDecoder {
     /// Protocol v2 turns this into a keyframe request to the host.
     var onNeedsKeyframe: (() -> Void)?
     /// The picture has been held `restartStreamAfterUs` with no keyframe
-    /// decoded: ask the host to restart the stream.
+    /// decoded: ask the host to restart the stream. Repeats at each retry, as
+    /// a request can be lost or coalesced like any other.
     var onRestartStream: (() -> Void)?
     /// The picture has been held `reconnectAfterUs`: this session can't recover.
     var onStalled: (() -> Void)?
@@ -86,8 +87,9 @@ final class VideoDecoder {
     /// the frame it replaces, so one is sent again this often, on a timer, as
     /// the stream may also have gone silent. The host grants one request per
     /// 500 ms (`KEYFRAME_REQUEST_MIN_INTERVAL`); the timer's 100 ms tick sends
-    /// the retry 500-600 ms after the last, so none lands inside that window.
-    static let keyframeRetryUs: UInt64 = 500_000
+    /// the retry 600-700 ms after the last, so network jitter can't move one
+    /// inside that window.
+    static let keyframeRetryUs: UInt64 = 600_000
     /// Then the decoder session is rebuilt and the host asked to restart.
     static let restartStreamAfterUs: UInt64 = 2_000_000
     /// Then the connection is rebuilt.
@@ -161,8 +163,10 @@ final class VideoDecoder {
     }
 
     /// Recovery while the picture is held, driven by time alone: ask again
-    /// every `keyframeRetryUs`, restart the stream at `restartStreamAfterUs`,
-    /// give the session up at `reconnectAfterUs`.
+    /// every `keyframeRetryUs`; from `restartStreamAfterUs` each retry asks
+    /// the host to restart the stream instead; give the session up at
+    /// `reconnectAfterUs`. Every request takes a retry slot, because the
+    /// control channel coalesces keyframe requests less than 500 ms apart.
     private func recoveryTick() {
         guard !isShutdown, let current = hold.withLock({ $0 }) else { return }
         let now = nowUs()
@@ -171,7 +175,15 @@ final class VideoDecoder {
             guard !current.reportedStall else { return }
             hold.withLock { $0?.reportedStall = true }
             onStalled?()
-        } else if held >= Self.restartStreamAfterUs, !current.restartedStream {
+            return
+        }
+        guard now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
+        lastKeyframeRequestUs = now
+        guard held >= Self.restartStreamAfterUs else {
+            onNeedsKeyframe?()
+            return
+        }
+        if !current.restartedStream {
             hold.withLock { $0?.restartedStream = true }
             onEvent?("Picture held \(held / 1000) ms; rebuilding the decoder and asking the PC to restart the stream")
             // A fresh session from the next keyframe's parameter sets, in case
@@ -179,12 +191,8 @@ final class VideoDecoder {
             teardownSession(waitForFrames: false)
             formatDescription = nil
             waitingForSyncSample = true
-            lastKeyframeRequestUs = now
-            onRestartStream?()
-        } else if now &- lastKeyframeRequestUs >= Self.keyframeRetryUs {
-            lastKeyframeRequestUs = now
-            onNeedsKeyframe?()
         }
+        onRestartStream?()
     }
 
     /// Ask (again) for a keyframe the host has not sent: a frame arrived that
