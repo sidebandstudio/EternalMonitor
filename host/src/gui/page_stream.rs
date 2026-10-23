@@ -211,6 +211,12 @@ impl AnalyzerApp {
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
         };
+        // Off only until a port another program holds is free.
+        let (title, subtitle) = super::port_notice::waiting_status(
+            state == StreamState::Off,
+            crate::startup::port::starts_when_free(),
+        )
+        .unwrap_or((title, subtitle));
 
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());

@@ -80,7 +80,8 @@ Windows changes.
   the next windows and launches.
 - When another program uses EternalMonitor's network port, the Stream page
   names it and says to quit it, and the stream starts by itself once the port
-  is free. In 0.3.1 the stream stopped until someone clicked **Start**.
+  is free, unless you clicked **Stop** meanwhile. In 0.3.1 the stream stopped
+  until someone clicked **Start**.
 - On a standard Windows account, opening EternalMonitor again no longer
   starts a second copy that cannot stream when the running copy was started
   as administrator with another account's password.
