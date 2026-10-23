@@ -317,7 +317,7 @@ pub async fn start_sender(
                                             // else for the life of the pipeline.
                                             let clamped = abr.set_ceiling(ceiling);
                                             let tunnel_drops = (shared.target_addr.lock().link != LinkId::Udp)
-                                                .then(|| PIPELINE_STATS.lock().usb_frames_dropped);
+                                                .then(link::tunnel_congestion_drops);
                                             let reported =
                                                 abr.on_report(&report, tunnel_drops, Instant::now());
                                             let decision = abr::AbrDecision {

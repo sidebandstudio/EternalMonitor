@@ -25,6 +25,11 @@ struct Stream {
     gop: u64,
     keyframe_bytes: usize,
     delta_bytes: usize,
+    /// The tunnel's socket buffering, between the link's writer and the iPad.
+    buffer: usize,
+    /// The frame before each periodic keyframe reaches the link in the same
+    /// batch, before its writer runs, as a busy runtime can schedule them.
+    batch_before_keyframe: bool,
 }
 
 /// The pipeline's natural keyframe interval (`set_gop(30)`), with keyframes
@@ -33,6 +38,8 @@ const DESKTOP: Stream = Stream {
     gop: 30,
     keyframe_bytes: 60_000,
     delta_bytes: 6_000,
+    buffer: 64 * 1024,
+    batch_before_keyframe: false,
 };
 /// The host grants one client keyframe request per 500 ms, and the iPad
 /// asks at most that often.
@@ -44,6 +51,8 @@ struct Outcome {
     forced_keyframes: u64,
     gap_requests: u64,
     host_drops: u64,
+    /// The drops that showed the tunnel falling behind: ABR's signal.
+    congestion_drops: u64,
     ipad_dropped: u64,
     ipad_frags_lost: u64,
     decodable: u64,
@@ -85,7 +94,7 @@ async fn simulate(bytes_per_sec: f64, run_for: Duration) -> Outcome {
 }
 
 async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) -> Outcome {
-    let (host, mut ipad) = tokio::io::duplex(64 * 1024);
+    let (host, mut ipad) = tokio::io::duplex(stream.buffer);
     let force_idr = Arc::new(AtomicBool::new(false));
     let client_request = Arc::new(AtomicBool::new(false));
     let peer = PeerId::usb(9);
@@ -116,6 +125,9 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
                 link.send(peer, &datagram).await.unwrap();
             }
             encoded += 1;
+            if stream.batch_before_keyframe && encoded.is_multiple_of(stream.gop) {
+                continue;
+            }
             tokio::time::sleep_until(start + FRAME_INTERVAL * (encoded as u32)).await;
         }
         (encoded, forced, link)
@@ -163,7 +175,7 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
             }
             _ = reports.tick() => {
                 report.frags_received = reassembler.counters().frags_received as u32;
-                let drops = stats.frames_dropped.load(Ordering::Relaxed);
+                let drops = stats.congestion_drops.load(Ordering::Relaxed);
                 abr.on_report(&report, Some(drops), clock(Instant::now()));
                 continue;
             }
@@ -193,6 +205,7 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
     outcome.encoded = encoded;
     outcome.forced_keyframes = forced;
     outcome.host_drops = stats.frames_dropped.load(Ordering::Relaxed);
+    outcome.congestion_drops = stats.congestion_drops.load(Ordering::Relaxed);
     let counters = reassembler.counters();
     outcome.ipad_dropped = counters.frames_dropped;
     outcome.ipad_frags_lost = counters.frags_lost;
@@ -264,6 +277,7 @@ async fn keyframes_that_clear_a_backlog_still_step_the_bitrate_down() {
         gop: 10,
         keyframe_bytes: 30_000,
         delta_bytes: 6_000,
+        ..DESKTOP
     };
     let outcome = simulate_stream(stream, 450_000.0, Duration::from_secs(20)).await;
     eprintln!("USB_SIM backlog {outcome:?}");
@@ -275,4 +289,23 @@ async fn keyframes_that_clear_a_backlog_still_step_the_bitrate_down() {
         "{outcome:?}"
     );
     assert!(outcome.final_bps < 15_000_000, "{outcome:?}");
+}
+
+/// A tunnel with room to spare, where the frame before each keyframe reaches
+/// the link just before the keyframe, before the writer has run. The keyframe
+/// replaces it: that picture is lost, but the tunnel is not behind, and the
+/// bitrate must not come down. Counting every replacement as congestion
+/// stepped this stream down to the 4 Mbps floor in 13 s.
+#[tokio::test(start_paused = true)]
+async fn a_frame_replaced_before_the_writer_ran_does_not_cut_the_bitrate() {
+    let stream = Stream {
+        buffer: 1024 * 1024,
+        batch_before_keyframe: true,
+        ..DESKTOP
+    };
+    let outcome = simulate_stream(stream, 10_000_000.0, Duration::from_secs(20)).await;
+    eprintln!("USB_SIM healthy-batched {outcome:?}");
+    assert_eq!(outcome.host_drops, 40, "each replaced frame is still lost");
+    assert_eq!(outcome.congestion_drops, 0);
+    assert!(outcome.final_bps >= 15_000_000, "{outcome:?}");
 }

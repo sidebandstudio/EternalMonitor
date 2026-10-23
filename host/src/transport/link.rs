@@ -176,6 +176,11 @@ struct VideoQueue {
     keyframes: KeyframeBackoff,
     /// The session and stream epoch of the latest frame.
     stream: Option<(u32, u32)>,
+    /// The writer has taken a frame and not yet found the queue empty.
+    writer_busy: bool,
+    /// Frames replaced since the last count while the writer was idle: their
+    /// pictures are lost, but the tunnel was not behind.
+    unscheduled: u64,
 }
 
 impl VideoQueue {
@@ -186,8 +191,9 @@ impl VideoQueue {
     /// biggest frame of all. Dependents of a lost frame are discarded until a
     /// keyframe, and a keyframe always passes, replacing what is still queued.
     /// Replaced frames count as lost, or periodic keyframes would hide a
-    /// tunnel that never catches up. A tunnel that keeps up has nothing
-    /// queued when a keyframe comes: the socket buffers absorb jitter.
+    /// tunnel that never catches up. They show congestion only while the
+    /// writer is busy: a frame can also wait because the sender ran twice
+    /// before the writer was scheduled, with the tunnel idle.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
@@ -213,6 +219,9 @@ impl VideoQueue {
             if header.is_keyframe {
                 // Queued frames are older and the keyframe needs none of them.
                 dropped = self.frames.len() as u64;
+                if !self.writer_busy {
+                    self.unscheduled += dropped;
+                }
                 self.frames.clear();
                 self.bytes = 0;
                 self.awaiting_keyframe = false;
@@ -278,10 +287,12 @@ impl VideoQueue {
 
     fn pop(&mut self) -> Option<Frame> {
         if !self.frames.front().is_some_and(Frame::complete) {
+            self.writer_busy = false;
             return None;
         }
         let frame = self.frames.pop_front().unwrap();
         self.bytes -= frame.bytes;
+        self.writer_busy = true;
         Some(frame)
     }
 }
@@ -382,7 +393,18 @@ impl AudioQueue {
 #[derive(Default)]
 pub struct FramedStats {
     pub frames_dropped: AtomicU64,
+    /// Dropped frames that show the tunnel falling behind; ABR's signal.
+    pub congestion_drops: AtomicU64,
     pub audio_packets_dropped: AtomicU64,
+}
+
+/// Every tunnel's [`FramedStats::congestion_drops`], for ABR.
+static TUNNEL_CONGESTION: AtomicU64 = AtomicU64::new(0);
+
+/// Frames all USB tunnels have dropped because they fell behind, since the
+/// process started.
+pub fn tunnel_congestion_drops() -> u64 {
+    TUNNEL_CONGESTION.load(Ordering::Relaxed)
 }
 
 struct WriterState {
@@ -432,6 +454,11 @@ impl WriterState {
         self.stats
             .frames_dropped
             .fetch_add(dropped, Ordering::Relaxed);
+        let congested = dropped.saturating_sub(std::mem::take(&mut video.unscheduled));
+        self.stats
+            .congestion_drops
+            .fetch_add(congested, Ordering::Relaxed);
+        TUNNEL_CONGESTION.fetch_add(congested, Ordering::Relaxed);
         if video.keyframes.due(now) {
             self.force_idr.store(true, Ordering::SeqCst);
         }
@@ -852,6 +879,25 @@ mod tests {
         assert_eq!(queue.pop().unwrap().seq, 6);
         // An empty queue loses nothing to a keyframe.
         assert_eq!(queue.push(&packet(7, true, 0, 1, 64), now).unwrap(), 0);
+    }
+
+    /// A frame replaced while the writer is busy waited behind real writing:
+    /// the tunnel is behind. One replaced before the writer even ran shows
+    /// only scheduling, although its picture is lost all the same.
+    #[test]
+    fn replacements_show_congestion_only_while_the_writer_is_busy() {
+        let now = Instant::now();
+        let mut queue = VideoQueue::default();
+        queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
+        queue.pop().unwrap();
+        assert!(queue.pop().is_none(), "the writer finds the queue empty");
+        queue.push(&packet(2, false, 0, 1, 64), now).unwrap();
+        assert_eq!(queue.push(&packet(3, true, 0, 1, 64), now).unwrap(), 1);
+        assert_eq!(std::mem::take(&mut queue.unscheduled), 1, "writer idle");
+        queue.pop().unwrap();
+        queue.push(&packet(4, false, 0, 1, 64), now).unwrap();
+        assert_eq!(queue.push(&packet(5, true, 0, 1, 64), now).unwrap(), 1);
+        assert_eq!(queue.unscheduled, 0, "writer busy with frame 3");
     }
 
     /// A pipeline restart keeps the USB tunnel. Its new stream must not

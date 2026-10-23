@@ -100,8 +100,8 @@ impl AbrController {
     }
 
     /// Evaluate one receiver report (cumulative counters — this diffs them).
-    /// `tunnel_drops` is the USB tunnel's cumulative count of frames its full
-    /// queue dropped, or `None` on WiFi.
+    /// `tunnel_drops` is the USB tunnel's cumulative count of frames dropped
+    /// because it fell behind, or `None` on WiFi.
     ///
     /// The cable loses nothing, so over USB the iPad's loss, repair and
     /// partial-frame figures say nothing about the link: a partial frame is
