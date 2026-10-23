@@ -9,8 +9,11 @@
 //! or a `\\?\` spelling of the same install reaches the same key. The mutex
 //! is per Windows session.
 //!
-//! A host run as administrator creates a mutex a normal launch may not open.
-//! Being refused it still means a host from this install is running.
+//! The mutex's default security admits the creator's logon, so a normal
+//! launch opens one a "Run as administrator" copy of the same user created.
+//! A copy elevated with another account's password, as a standard user's
+//! is, creates one this launch may not open. Being refused it still means a
+//! host from this install is running.
 use std::path::Path;
 
 /// `Local\EternalMonitor-<hash>` for this executable and settings folder.
@@ -114,7 +117,7 @@ pub fn acquire_named(name: &str) -> Option<Guard> {
             _handle: handle,
             problem: None,
         }),
-        // An elevated host holds it.
+        // A host elevated as another user holds it.
         Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => None,
         // Never refuse to start because the check itself failed.
         Err(error) => Some(Guard {
@@ -329,9 +332,8 @@ mod tests {
         assert!(guard.is_some(), "after the first exits");
     }
 
-    /// A host run as administrator holds a mutex whose default security a
-    /// normal launch may not open. An empty DACL refuses this process the
-    /// same way.
+    /// A host elevated with another account's password holds a mutex this
+    /// launch may not open. An empty DACL refuses this process the same way.
     #[cfg(windows)]
     #[test]
     fn a_mutex_this_launch_may_not_open_still_means_a_host_is_running() {

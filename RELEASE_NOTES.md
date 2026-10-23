@@ -81,9 +81,9 @@ Windows changes.
 - When another program uses EternalMonitor's network port, the Stream page
   names it and says to quit it, and the stream starts by itself once the port
   is free. In 0.3.1 the stream stopped until someone clicked **Start**.
-- Opening EternalMonitor again brings the running window forward also when
-  that copy was started with **Run as administrator**, instead of starting a
-  second copy that cannot stream.
+- On a standard Windows account, opening EternalMonitor again no longer
+  starts a second copy that cannot stream when the running copy was started
+  as administrator with another account's password.
 - When the Windows host cannot start, or stops unexpectedly, it shows a message
   with the error and the path of the log file. The error is written to the log
   and queued for automatic support diagnostics before the process ends. A
