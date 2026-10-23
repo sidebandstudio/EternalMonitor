@@ -108,11 +108,12 @@ Windows changes.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.
-- Automatic support diagnostics leave out the PC's name and the Windows user
-  name, and send stream statistics as one summary a minute instead of several
-  lines a second. Copy logs and the iPad's Diagnostics report still include
-  everything. Both apps record why a PC turned a connection away, such as a
-  wrong pairing code or a PC that is busy.
+- Automatic support diagnostics leave out the PC's name, the Windows user
+  name and the name of the PC's sound output, such as headphones named after
+  their owner, and send stream statistics as one summary a minute instead of
+  several lines a second. Copy logs and the iPad's Diagnostics report still
+  include everything. Both apps record why a PC turned a connection away, such
+  as a wrong pairing code or a PC that is busy.
 
 ### What to test
 
