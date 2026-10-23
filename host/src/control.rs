@@ -36,6 +36,9 @@ pub struct SharedControl {
     /// Live status of the managed virtual extended display, surfaced in the GUI so a tester
     /// can see when an Extended-display request silently fell back to the primary monitor.
     pub vdd_status: Arc<Mutex<VddStatus>>,
+    /// Why the second screen did not appear, when Windows said, so the GUI
+    /// can say what to do. Cleared at each attempt.
+    pub vdd_problem: Arc<Mutex<Option<crate::vdd_device::VddProblem>>>,
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
@@ -148,6 +151,7 @@ impl SharedControl {
             encoder_override: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
+            vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             vdd_lifecycle: Arc::new(Mutex::new(())),

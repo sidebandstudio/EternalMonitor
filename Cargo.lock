@@ -1185,6 +1185,7 @@ dependencies = [
  "pkg-config",
  "plist",
  "qrcode",
+ "quick-xml 0.41.0",
  "regex",
  "ring",
  "semver",
