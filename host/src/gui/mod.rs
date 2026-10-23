@@ -1248,10 +1248,10 @@ pub fn detect_local_ip(listen_port: u16) -> String {
     format!("unknown:{listen_port}")
 }
 
-/// Whether the window's graphics device is lost, so a panic while drawing
-/// is the GUI's to recover from.
-pub(crate) fn window_device_lost() -> bool {
-    renderer::device_lost()
+/// Whether a panic at `file` on the GUI thread is the window's lost graphics
+/// device, which the GUI recovers from by opening a new window.
+pub(crate) fn panic_is_window_device_loss(file: &str) -> bool {
+    renderer::panic_is_device_loss(file)
 }
 
 /// Launch the GUI window. Blocks the calling thread. A window whose graphics

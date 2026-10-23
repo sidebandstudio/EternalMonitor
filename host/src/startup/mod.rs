@@ -64,7 +64,10 @@ fn crash_dir() -> Option<PathBuf> {
 pub fn install_failure_hooks() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some("main") && crate::gui::window_device_lost() {
+        let file = info.location().map_or("", |location| location.file());
+        if std::thread::current().name() == Some("main")
+            && crate::gui::panic_is_window_device_loss(file)
+        {
             // egui-wgpu panics on the device it was drawing with; the GUI
             // catches this and opens a new window. The stream keeps running.
             tracing::warn!(panic = %info, "The window's graphics device was lost while drawing");

@@ -15,10 +15,17 @@
 //! egui-wgpu keeps drawing with the device it was given, and panics on the
 //! next frame once that device is gone, so a lost device stops the window's
 //! drawing first and closes it.
+//!
+//! Only a confirmed loss rebuilds the window: wgpu's lost-device callback, a
+//! loss the next frame's probe finds after a sign of trouble, or egui-wgpu
+//! panicking right after such a sign (the field crash: a `Validation`
+//! surface status, then the panic). A validation error alone, such as an
+//! oversized texture, leaves the device usable; it is logged and the window
+//! keeps running.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,6 +43,12 @@ const RETRY_AFTER: u32 = 5;
 /// and the failure is reported.
 const MAX_REBUILDS: usize = 3;
 const REBUILD_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// The same kind of validation error is logged at most this often.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+/// Frames, counting the next one, in which a panic inside wgpu after a sign
+/// of trouble counts as a lost device. The next frame probes the device and
+/// paints; the panic, if any, comes in that paint.
+const SUSPECT_FRAMES: u8 = 2;
 const HISTORY_FILE: &str = "history.json";
 /// Held while one instance reads, changes and saves the history.
 const HISTORY_LOCK: &str = "history.lock";
@@ -52,6 +65,12 @@ static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 /// Set when the window's device is lost, until the window is rebuilt.
 static LOST: AtomicBool = AtomicBool::new(false);
+/// Frames left in which a sign of trouble may still turn out to be a loss.
+static SUSPECT: AtomicU8 = AtomicU8::new(0);
+/// Probe the device at the start of the next frame.
+static PROBE: AtomicBool = AtomicBool::new(false);
+/// When each kind of validation error was last logged.
+static REPORTED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 /// The window's device, for the simulated loss.
 static DEVICE: Mutex<Option<wgpu::Device>> = Mutex::new(None);
 /// What the window draws with. Unlike [`STARTED`], kept once the window
@@ -112,25 +131,103 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
     }
     let default = config.on_surface_status.clone();
     config.on_surface_status = Arc::new(move |status| {
-        FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
-        // What egui-wgpu gets once the device is gone (seen before both
-        // field panics); its next frame would panic.
-        if matches!(status, wgpu::CurrentSurfaceTexture::Validation) {
-            lose("the window surface reported a validation error");
-        }
+        surface_status(status);
         default(status)
     });
 }
 
-/// Watch the window's new device: its loss, or an error wgpu would panic
-/// on, marks the window for a rebuild instead.
+fn surface_status(status: &wgpu::CurrentSurfaceTexture) {
+    FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
+    // What egui-wgpu got before both field panics. The device may be gone.
+    if matches!(status, wgpu::CurrentSurfaceTexture::Validation) {
+        suspect("the window surface reported a validation error");
+    }
+}
+
+/// Watch the window's new device. Its loss marks the window for a rebuild;
+/// an error that wgpu would panic on is handled instead.
 pub(super) fn watch(device: &wgpu::Device) {
     device.set_device_lost_callback(|reason, message| {
         lose(&format!("the device was lost ({reason:?}) {message}"))
     });
-    device.on_uncaptured_error(Arc::new(|error| lose(&error.to_string())));
+    device.on_uncaptured_error(Arc::new(uncaptured));
     if let Ok(mut current) = DEVICE.lock() {
         *current = Some(device.clone());
+    }
+}
+
+/// Out of memory or an internal error can mean the device is gone; the next
+/// frame checks. A validation error leaves the device usable.
+fn uncaptured(error: wgpu::Error) {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => suspect("the graphics device ran out of memory"),
+        wgpu::Error::Internal { description, .. } => {
+            log_once_a_minute(
+                &description,
+                "The window's graphics device reported an error",
+            );
+            suspect("the graphics device reported an internal error");
+        }
+        wgpu::Error::Validation { description, .. } => {
+            log_once_a_minute(
+                &description,
+                "The window's renderer hit a graphics error and kept running",
+            );
+        }
+    }
+}
+
+/// Logs a wgpu error, at most once a minute for each kind: the operation it
+/// names (`In Device::create_texture`), else its first line.
+fn log_once_a_minute(description: &str, summary: &str) {
+    let kind = error_kind(description);
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    if due(&mut reported, kind, Instant::now()) {
+        warn!(error = description, "{summary}");
+    }
+}
+
+fn error_kind(description: &str) -> &str {
+    let lines = || description.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .find(|line| line.starts_with("In "))
+        .or_else(|| lines().next())
+        .unwrap_or_default()
+}
+
+fn due(reported: &mut Vec<(String, Instant)>, kind: &str, now: Instant) -> bool {
+    match reported.iter_mut().find(|(k, _)| k == kind) {
+        Some((_, at)) if now.duration_since(*at) < REPORT_EVERY => false,
+        Some((_, at)) => {
+            *at = now;
+            true
+        }
+        None => {
+            reported.push((kind.to_string(), now));
+            true
+        }
+    }
+}
+
+/// A sign the device may be lost: the next frame probes it, and a panic
+/// inside wgpu meanwhile counts as the loss.
+fn suspect(reason: &str) {
+    if SUSPECT.swap(SUSPECT_FRAMES, Ordering::SeqCst) == 0 {
+        info!(reason, "Checking the window's graphics device");
+    }
+    PROBE.store(true, Ordering::SeqCst);
+}
+
+/// A device wgpu already knows is lost reports it through the lost callback
+/// once its queued work is done; this waits briefly for that.
+fn probe() {
+    if let Some(device) = DEVICE.lock().ok().and_then(|device| device.clone()) {
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_millis(250)),
+        });
     }
 }
 
@@ -138,6 +235,21 @@ pub(super) fn watch(device: &wgpu::Device) {
 /// the wgpu call that found it, before egui-wgpu can panic on it.
 pub(crate) fn device_lost() -> bool {
     LOST.load(Ordering::SeqCst)
+}
+
+/// Whether a panic on the GUI thread at `file` is the window's lost device:
+/// after a confirmed loss, or inside wgpu right after a sign of trouble,
+/// which is how the field crash ends. Marks the loss so the window is rebuilt.
+pub(crate) fn panic_is_device_loss(file: &str) -> bool {
+    if device_lost() {
+        return true;
+    }
+    let in_wgpu = file.contains("wgpu");
+    if in_wgpu && SUSPECT.load(Ordering::SeqCst) > 0 {
+        lose("wgpu panicked right after the device reported trouble");
+        return true;
+    }
+    false
 }
 
 fn lose(reason: &str) {
@@ -165,6 +277,10 @@ pub(super) fn frame_started(ctx: &egui::Context) -> bool {
     if simulated == Some(false) {
         destroy_device(false);
     }
+    if PROBE.swap(false, Ordering::SeqCst) {
+        probe();
+    }
+    let _ = SUSPECT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
     if device_lost() {
         close_for_rebuild(ctx);
         return false;
@@ -271,6 +387,8 @@ pub(super) fn rebuild_after_loss() -> Result<bool, String> {
     if let Ok(mut tracker) = PRESENT.lock() {
         *tracker = PresentTracker::new();
     }
+    SUSPECT.store(0, Ordering::SeqCst);
+    PROBE.store(false, Ordering::SeqCst);
     let mut rebuilds = REBUILDS.lock().map_err(|error| error.to_string())?;
     allow_rebuild(&mut rebuilds, Instant::now())
 }
@@ -1017,6 +1135,7 @@ mod tests {
     #[test]
     fn drawing_on_a_lost_device_panics_in_egui_wgpu() {
         let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_loss_state();
         let Some(next) = lose_device_between_frames(false) else {
             return;
         };
@@ -1034,6 +1153,7 @@ mod tests {
     #[test]
     fn a_lost_device_closes_the_window_for_a_rebuild_without_drawing() {
         let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_loss_state();
         let Some(next) = lose_device_between_frames(true) else {
             return;
         };
@@ -1046,6 +1166,144 @@ mod tests {
         // A normal close afterwards opens nothing.
         assert_eq!(rebuild_after_loss(), Ok(false));
         REBUILDS.lock().unwrap().clear();
+    }
+
+    /// Clears the lost-device state a test may leave behind.
+    fn reset_loss_state() {
+        LOST.store(false, Ordering::SeqCst);
+        SUSPECT.store(0, Ordering::SeqCst);
+        PROBE.store(false, Ordering::SeqCst);
+        PLACEMENT.lock().unwrap().take();
+        REBUILDS.lock().unwrap().clear();
+        DEVICE.lock().unwrap().take();
+    }
+
+    fn renderer_for(gpu: &(wgpu::Device, wgpu::Queue)) -> eframe::egui_wgpu::Renderer {
+        eframe::egui_wgpu::Renderer::new(
+            &gpu.0,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Default::default(),
+        )
+    }
+
+    /// Sol's case: a validation error from a texture too large for the
+    /// device leaves the device usable, so the window keeps it.
+    #[test]
+    fn an_oversized_texture_is_logged_and_the_window_keeps_its_device() {
+        let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_loss_state();
+        let Some(gpu) = headless_device() else {
+            return;
+        };
+        watch(&gpu.0);
+        let ctx = egui::Context::default();
+        let mut renderer = renderer_for(&gpu);
+        assert!(!frame(&ctx, &mut renderer, &gpu, true));
+        let too_wide = gpu.0.limits().max_texture_dimension_2d + 1;
+        for _ in 0..3 {
+            let _ = gpu.0.create_texture(&wgpu::TextureDescriptor {
+                label: Some("oversized"),
+                size: wgpu::Extent3d {
+                    width: too_wide,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            assert!(!frame(&ctx, &mut renderer, &gpu, true), "the window stays");
+        }
+        let _ = gpu.0.poll(wgpu::PollType::Poll);
+        assert!(
+            REPORTED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, _)| kind.contains("create_texture")),
+            "wgpu reported the error, and it was logged"
+        );
+        assert!(!device_lost());
+        assert_eq!(
+            rebuild_after_loss(),
+            Ok(false),
+            "nothing to rebuild or record"
+        );
+        reset_loss_state();
+    }
+
+    /// The field crash: the surface reports `Validation`, then the device
+    /// turns out to be lost. The next frame's probe finds the loss before
+    /// egui-wgpu can draw on it.
+    #[test]
+    fn the_field_sequence_still_rebuilds_the_window() {
+        let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_loss_state();
+        let Some(gpu) = headless_device() else {
+            return;
+        };
+        watch(&gpu.0);
+        let ctx = egui::Context::default();
+        let mut renderer = renderer_for(&gpu);
+        assert!(!frame(&ctx, &mut renderer, &gpu, true));
+        surface_status(&wgpu::CurrentSurfaceTexture::Validation);
+        assert!(!device_lost(), "a sign of trouble, not yet a loss");
+        // Lost without wgpu saying so yet.
+        gpu.0.destroy();
+        let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame(&ctx, &mut renderer, &gpu, true)
+        }));
+        assert!(
+            next.expect("no panic on the lost device"),
+            "closes for a rebuild"
+        );
+        assert_eq!(rebuild_after_loss(), Ok(true));
+        reset_loss_state();
+    }
+
+    /// When the probe cannot see the loss yet, egui-wgpu's panic in that
+    /// frame's paint is the loss (the field log: `Validation`, then the
+    /// panic 2 ms later). Without a sign of trouble a panic stays a crash.
+    #[test]
+    fn a_wgpu_panic_right_after_a_sign_of_trouble_is_a_lost_device() {
+        let _serial = DEVICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_loss_state();
+        let field = r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-wgpu-0.36.2\src\renderer.rs";
+        assert!(!panic_is_device_loss(field), "no sign of trouble");
+        surface_status(&wgpu::CurrentSurfaceTexture::Validation);
+        assert!(!panic_is_device_loss("host/src/gui/page_stream.rs"));
+        assert!(panic_is_device_loss(field));
+        assert!(device_lost(), "marked, so the window is rebuilt");
+        assert_eq!(rebuild_after_loss(), Ok(true));
+        reset_loss_state();
+        // The sign covers the next frame's paint only.
+        let ctx = egui::Context::default();
+        surface_status(&wgpu::CurrentSurfaceTexture::Validation);
+        assert!(frame_started(&ctx));
+        assert!(frame_started(&ctx));
+        assert!(!panic_is_device_loss(field));
+        reset_loss_state();
+    }
+
+    #[test]
+    fn the_same_validation_error_is_logged_once_a_minute() {
+        let texture = "Validation Error\n\nCaused by:\n  In Device::create_texture\n    Dimension X value 16385 exceeds the limit of 16384\n";
+        let kind = error_kind(texture);
+        assert_eq!(kind, "In Device::create_texture");
+        assert_eq!(error_kind("Out of memory"), "Out of memory");
+        let start = Instant::now();
+        let mut reported = Vec::new();
+        assert!(due(&mut reported, kind, start));
+        assert!(!due(&mut reported, kind, start + Duration::from_secs(30)));
+        assert!(due(
+            &mut reported,
+            "In Queue::submit",
+            start + Duration::from_secs(30)
+        ));
+        assert!(due(&mut reported, kind, start + REPORT_EVERY));
     }
 
     #[test]
