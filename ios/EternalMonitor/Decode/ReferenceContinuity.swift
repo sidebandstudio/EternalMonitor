@@ -17,11 +17,27 @@ import Foundation
 ///   later contiguous pair disagrees, the stream's POC isn't constant, and
 ///   whole-frame loss isn't read from it again until the stream restarts.
 ///
+/// A PC that numbers sent frames contiguously per epoch (HELLO_ACK host cap
+/// `hostCapContiguousFrameSeq`) makes any forward gap in `frame_seq` a lost
+/// frame, whatever the codec says. That also covers a lost keyframe after the
+/// PC reopened its encoder (bitrate, size, codec, an AMF keyframe), which keeps
+/// the epoch and the numbering but starts the codec's counts again.
+///
 /// A new stream epoch is a new encoder: its pictures can't follow the old
-/// stream's, so it starts again from its keyframe. A picture this cannot read
-/// (an unexpected or malformed stream) is never treated as a loss: holding by
-/// mistake freezes a good picture. Parsing never traps on any input.
+/// stream's, so it starts again from its keyframe. So does a lower `frame_seq`
+/// within an epoch, which a PC sends only after restarting its numbering.
+/// A picture this cannot read (an unexpected or malformed stream) is never
+/// treated as a loss: holding by mistake freezes a good picture. Parsing never
+/// traps on any input.
 struct ReferenceContinuity {
+    /// TODO(integration): the HELLO_ACK host cap from fix/stream-smoothness
+    /// (#77) meaning "frame_seq is contiguous per epoch". Assumed to be the
+    /// next free bit after HOSTCAP_PEN (1 << 4); replace with its constant.
+    static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
+
+    /// Set from the session's host caps: a forward gap in `frame_seq` is a loss.
+    var frameSeqContiguous = false
+
     struct H264Parameters: Equatable {
         var log2MaxFrameNum: Int
         var separateColourPlane: Bool
@@ -79,14 +95,14 @@ struct ReferenceContinuity {
     /// frame number, `epoch` its stream epoch; a lower `seq` or another epoch
     /// means the host restarted its stream.
     mutating func admitH264(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
-        let restarted = noteStream(seq: seq, epoch: epoch)
+        let (restarted, gap) = noteStream(seq: seq, epoch: epoch)
         guard let params = h264, let frameNum = Self.h264FrameNum(nal, params) else {
             previousReferenceFrameNum = nil
-            return !restarted || isKeyframe
+            return isKeyframe || !(restarted || gap)
         }
         let isReference = (nal[nal.startIndex] >> 5) & 0x03 != 0
         if !isKeyframe {
-            if restarted { return false }
+            if restarted || gap { return false }
             if let previous = previousReferenceFrameNum, !params.gapsAllowed {
                 let maxFrameNum = UInt32(1) << params.log2MaxFrameNum
                 guard frameNum == (previous + 1) % maxFrameNum else { return false }
@@ -98,13 +114,13 @@ struct ReferenceContinuity {
 
     mutating func admitHEVC(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
         let contiguous = previousSeq.map { seq == $0 &+ 1 } ?? false
-        let restarted = noteStream(seq: seq, epoch: epoch)
+        let (restarted, gap) = noteStream(seq: seq, epoch: epoch)
         guard let params = hevc, let poc = Self.hevcPocLsb(nal, params) else {
             previousPoc = nil
-            return !restarted || isKeyframe
+            return isKeyframe || !(restarted || gap)
         }
         if !isKeyframe {
-            if restarted { return false }
+            if restarted || gap { return false }
             if let previous = previousPoc, !pocUnreliable {
                 let delta = (poc &- previous) & ((UInt32(1) << params.log2MaxPocLsb) - 1)
                 if contiguous {
@@ -118,20 +134,21 @@ struct ReferenceContinuity {
         return true
     }
 
-    /// Records the wire frame number and epoch; true when the stream restarted.
-    /// Another epoch also forgets the step and whether POC was reliable.
-    private mutating func noteStream(seq: UInt32, epoch: UInt32) -> Bool {
+    /// Records the wire frame number and epoch. `restarted`: another epoch,
+    /// or a lower number in this one, so a new encoder whose counts, POC step
+    /// and reliability start over. `gap`: a number skipped on a PC that
+    /// numbers contiguously.
+    private mutating func noteStream(seq: UInt32, epoch: UInt32) -> (restarted: Bool, gap: Bool) {
         defer { previousSeq = seq; previousEpoch = epoch }
-        let newEpoch = previousEpoch.map { $0 != epoch } ?? false
-        let backwards = previousSeq.map { seq < $0 } ?? false
-        guard newEpoch || backwards else { return false }
-        previousReferenceFrameNum = nil
-        previousPoc = nil
-        if newEpoch {
+        guard let previous = previousSeq else { return (false, false) }
+        guard previousEpoch == epoch, seq >= previous else {
+            previousReferenceFrameNum = nil
+            previousPoc = nil
             pocStep = nil
             pocUnreliable = false
+            return (true, false)
         }
-        return true
+        return (false, frameSeqContiguous && seq > previous &+ 1)
     }
 
     // MARK: - Parsing

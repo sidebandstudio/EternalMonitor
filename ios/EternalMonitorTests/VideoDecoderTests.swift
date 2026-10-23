@@ -426,6 +426,19 @@ final class VideoDecoderTests: XCTestCase {
         }
     }
 
+    func testContiguouslyNumberedPCsLostReopenKeyframeIsHeld() throws {
+        // The PC reopened its encoder; the new keyframe (seq 2) was lost and
+        // the new encoder's first P-frame (frame_num 1) follows the old
+        // keyframe's count. Only contiguous numbering shows the loss.
+        let numbered = VideoDecoder()
+        numbered.setFrameSeqContiguous(true)
+        let (held, _) = try run("h264", [(1, 0), (3, 5), (4, 4), (5, 5)], decoder: numbered)
+        XCTAssertEqual(held.shown, [1, 4, 5])
+        XCTAssertEqual(held.requests, 1)
+        let (shown, _) = try run("h264", [(1, 0), (3, 5), (4, 4), (5, 5)])
+        XCTAssertEqual(shown.shown, [1, 3, 4, 5], "a 0.3.1 PC's numbers skip on their own")
+    }
+
     func testSilentStreamStillRetriesThenRestartsThenReconnects() throws {
         // Sol: recovery must not wait for frames to arrive. A lost frame, then
         // nothing at all: retry every 500 ms, restart the stream at 2 s, give

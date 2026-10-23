@@ -145,6 +145,11 @@ final class VideoDecoder {
         }
     }
 
+    /// The session's PC numbers sent frames contiguously per epoch.
+    func setFrameSeqContiguous(_ contiguous: Bool) {
+        decodeQueue.async { [weak self] in self?.continuity.frameSeqContiguous = contiguous }
+    }
+
     private func beginWaitingForKeyframe() {
         guard !waitingForSyncSample else { return }
         waitingForSyncSample = true
@@ -271,7 +276,9 @@ final class VideoDecoder {
             sps = nil
             pps = nil
             waitingForSyncSample = true
+            let contiguous = continuity.frameSeqContiguous
             continuity = ReferenceContinuity()
+            continuity.frameSeqContiguous = contiguous
         }
         if codec == .hevc {
             decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs, seq: packet.seq, epoch: packet.streamEpoch)

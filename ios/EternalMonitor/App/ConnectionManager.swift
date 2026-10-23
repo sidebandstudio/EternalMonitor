@@ -495,8 +495,9 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "ctrl", message)
             }
         }
-        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler] info in
+        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler, weak decoder] info in
             assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
+            decoder?.setFrameSeqContiguous(info.hostCaps & ReferenceContinuity.hostCapContiguousFrameSeq != 0)
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             Task { @MainActor in

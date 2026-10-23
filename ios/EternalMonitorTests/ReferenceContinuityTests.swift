@@ -137,4 +137,37 @@ final class ReferenceContinuityTests: XCTestCase {
         var continuity = try hevcContinuity()
         XCTAssertEqual(admit(&continuity, [(1, nil, 1), (2, 1, 2), (3, nil, 2), (4, 1, 2)]), [true, false, true, true])
     }
+
+    // MARK: - Contiguous numbering and restarts within an epoch
+
+    func testContiguousNumberingHoldsTheFrameAfterALostEncoderReopenKeyframe() throws {
+        // Sol: the PC reopened its encoder (same epoch, numbering continues),
+        // and the new encoder's keyframe, seq 2, was lost. Its first P-frame
+        // has POC 1, which follows the old keyframe by chance.
+        var numbered = try hevcContinuity()
+        numbered.frameSeqContiguous = true
+        XCTAssertEqual(admit(&numbered, [(1, nil, 1), (3, 1, 1)]), [true, false])
+        // A 0.3.1 PC numbers as captured, so a gap there means nothing.
+        var captured = try hevcContinuity()
+        XCTAssertEqual(admit(&captured, [(1, nil, 1), (3, 1, 1)]), [true, true])
+    }
+
+    func testContiguousNumberingNeverHoldsAnUnbrokenStream() throws {
+        var continuity = try hevcContinuity()
+        continuity.frameSeqContiguous = true
+        XCTAssertEqual(admit(&continuity, [(1, nil, 1), (2, 1, 1), (3, 2, 1), (4, 3, 1)]), [true, true, true, true])
+        // A keyframe after a gap is always shown, and ends the gap.
+        XCTAssertEqual(admit(&continuity, [(7, nil, 1), (8, 1, 1)]), [true, true])
+    }
+
+    func testLowerFrameSeqWithinAnEpochIsARestart() throws {
+        // Sol: step 2 learned on seq 1000-1002; the numbering restarts at 1
+        // with a keyframe, then a valid POC 1 after a skipped number.
+        var continuity = try hevcContinuity()
+        XCTAssertEqual(admit(&continuity, [(1000, nil, 1), (1001, 2, 1), (1002, 4, 1)]), [true, true, true])
+        XCTAssertEqual(admit(&continuity, [(1, nil, 1), (3, 1, 1)]), [true, true])
+        // Without its keyframe the restarted stream is held.
+        var lost = try hevcContinuity()
+        XCTAssertEqual(admit(&lost, [(1000, nil, 1), (1001, 2, 1), (5, 6, 1)]), [true, true, false])
+    }
 }
