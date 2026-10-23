@@ -253,7 +253,11 @@ impl Session {
             }
         }
         match message {
-            ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Hello2(hello) => {
+                let actions = self.handle_hello(source, hello.clone(), config, now);
+                crate::diagnostics::log_hello_answer(source, &hello, &actions.replies);
+                actions
+            }
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
@@ -1631,6 +1635,82 @@ mod tests {
             ))
             .status,
             HelloStatus::Ok
+        );
+    }
+
+    /// Log lines `run` writes on this thread, as the session log has them.
+    fn logged(run: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone)]
+        struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured(Default::default());
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8_lossy(&captured.0.lock()).into_owned();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// Support can tell a PC that never heard the iPad (no line) from one
+    /// that turned it away, and why.
+    #[test]
+    fn every_hello_answer_is_logged_with_its_outcome() {
+        let mut code = 0;
+        let lines = logged(|| {
+            let config = pair_config(true);
+            let mut session = Session::new(10);
+            let now = Instant::now();
+            let peer = addr([192, 0, 2, 1], 50000);
+            let mut hello = pair_hello(1);
+            pair_send(&mut session, &config, peer, hello.clone(), now);
+            code = config.0.lock().code();
+            hello.client_nonce = 2;
+            hello.pairing_code = if code == 1 { 2 } else { 1 };
+            pair_send(&mut session, &config, peer, hello.clone(), now);
+            hello.client_nonce = 3;
+            hello.pairing_code = code;
+            pair_send(&mut session, &config, peer, hello, now);
+            let mut other = pair_hello(4);
+            other.device_id = 18;
+            other.auth_token = [7; 16];
+            let other_peer = addr([192, 0, 2, 2], 50000);
+            pair_send(&mut session, &config, other_peer, other.clone(), now);
+            other.proto_min = 3;
+            other.proto_max = 3;
+            pair_send(&mut session, &config, other_peer, other, now);
+        });
+        let answers: Vec<_> = lines
+            .iter()
+            .filter_map(|line| line.split_once("HELLO answered "))
+            .map(|(_, fields)| fields)
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                "peer=192.0.2.1:50000 outcome=rejected-pairing status=Unauthorized ipad_protocol=2-2 code_sent=false saved_pairing=false",
+                "peer=192.0.2.1:50000 outcome=rejected-pairing status=Unauthorized ipad_protocol=2-2 code_sent=true saved_pairing=false",
+                "peer=192.0.2.1:50000 outcome=accepted status=Ok ipad_protocol=2-2 code_sent=true saved_pairing=false",
+                "peer=192.0.2.2:50000 outcome=busy status=Busy ipad_protocol=2-2 code_sent=false saved_pairing=true",
+                "peer=192.0.2.2:50000 outcome=wrong-version status=VersionUnsupported ipad_protocol=3-3 code_sent=false saved_pairing=true",
+            ],
+            "{lines:#?}"
+        );
+        let code = format!("{code:06}");
+        assert!(
+            answers.iter().all(|line| !line.contains(&code)),
+            "the code itself is never logged"
         );
     }
 }

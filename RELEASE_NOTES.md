@@ -116,6 +116,12 @@ Windows changes.
   show, what it means and what to do.
 - On Windows older than Windows 10 version 1809, the installer says which
   Windows version EternalMonitor needs, in plain words.
+- Automatic support diagnostics leave out the PC's name, the Windows user
+  name and the name of the PC's sound output, such as headphones named after
+  their owner, and send stream statistics as one summary a minute instead of
+  several lines a second. Copy logs and the iPad's Diagnostics report still
+  include everything. Both apps record why a PC turned a connection away, such
+  as a wrong pairing code or a PC that is busy.
 
 ### What to test
 

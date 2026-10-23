@@ -4,7 +4,9 @@ use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
 use crate::control::SharedControl;
-use tracing::info;
+use crate::transport::link::PeerId;
+use eternal_wire::v2::control::{parse_control, ControlMessage, Hello2, HelloStatus};
+use tracing::{info, warn};
 
 static SYSTEM_REPORT: OnceLock<String> = OnceLock::new();
 
@@ -27,6 +29,49 @@ pub fn system_report() -> &'static str {
 pub fn log_system_report() {
     for line in system_report().lines() {
         info!(details = line, "Support system information");
+    }
+}
+
+/// How the host answered an iPad's HELLO2.
+pub fn hello_outcome(status: HelloStatus) -> &'static str {
+    match status {
+        HelloStatus::Ok => "accepted",
+        HelloStatus::Unauthorized | HelloStatus::RateLimited => "rejected-pairing",
+        HelloStatus::VersionUnsupported => "wrong-version",
+        HelloStatus::Busy => "busy",
+        HelloStatus::Error => "error",
+    }
+}
+
+/// One line for each HELLO2 the host answers, from the ACK in `replies`, so
+/// support can tell a PC that never heard the iPad (no line) from one that
+/// turned it away, and why. For a pairing refusal it says whether the iPad
+/// sent a code or a saved pairing, never the code or token. Retries of one
+/// attempt log the same line, which the repeat collapser counts.
+pub fn log_hello_answer(peer: PeerId, hello: &Hello2, replies: &[(PeerId, Vec<u8>)]) {
+    let Some(status) = replies
+        .iter()
+        .filter(|(to, _)| *to == peer)
+        .find_map(|(_, bytes)| match parse_control(bytes) {
+            Ok((_, ControlMessage::HelloAck(ack))) => Some(ack.status),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let outcome = hello_outcome(status);
+    let ipad_protocol = format!("{}-{}", hello.proto_min, hello.proto_max);
+    let code_sent = hello.pairing_code != 0;
+    let saved_pairing = hello.auth_token != [0; 16];
+    match status {
+        HelloStatus::Ok | HelloStatus::Busy | HelloStatus::Unauthorized => info!(
+            %peer, %outcome, ?status, %ipad_protocol, code_sent, saved_pairing,
+            "HELLO answered"
+        ),
+        _ => warn!(
+            %peer, %outcome, ?status, %ipad_protocol, code_sent, saved_pairing,
+            "HELLO answered"
+        ),
     }
 }
 

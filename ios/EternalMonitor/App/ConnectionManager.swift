@@ -524,9 +524,11 @@ final class ConnectionManager: ObservableObject {
                     }
                     self.awaitingPairing = true
                     let prompt = self.pairingPrompt ?? PairingSheetModel()
+                    let refusal = SupportDiagnostics.pairingRefusal(status, codeSent: prompt.submitting,
+                        savedPairing: PairingStore.valid(pairingToken))
                     prompt.reject(status)
                     self.pairingPrompt = prompt
-                    self.record(.info, "pairing", status == .rateLimited ? "Pairing rate limited for 60 seconds" : "Pairing code required")
+                    self.record(refusal.level, "pairing", refusal.message)
                     return
                 }
                 switch status {

@@ -4,10 +4,14 @@
 use std::time::{Duration, Instant};
 
 use windows::core::GUID;
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Devices::FunctionDiscovery::{
+    PKEY_Device_EnumeratorName, PKEY_Device_FriendlyName,
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
 use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+use windows::Win32::System::Com::StructuredStorage::{
+    PropVariantToStringAlloc, PropVariantToUInt32,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
@@ -78,6 +82,56 @@ fn device_name(device: &IMMDevice) -> windows::core::Result<String> {
     }
 }
 
+/// What kind of output this is, without its name, which can be the owner's:
+/// the endpoint's form factor, and the bus its device is on (`BTHENUM` for
+/// Bluetooth, `USB`, `HDAUDIO`). Either is "unknown" when Windows doesn't say.
+fn device_kind(device: &IMMDevice) -> (&'static str, String) {
+    unsafe {
+        let Ok(properties) = device.OpenPropertyStore(STGM_READ) else {
+            return ("unknown", "unknown".into());
+        };
+        let form_factor = properties
+            .GetValue(&PKEY_AudioEndpoint_FormFactor)
+            .and_then(|value| PropVariantToUInt32(&value))
+            .map_or("unknown", form_factor_name);
+        let bus = properties
+            .GetValue(&PKEY_Device_EnumeratorName)
+            .and_then(|value| {
+                let name = PropVariantToStringAlloc(&value)?;
+                let text = name.to_string();
+                CoTaskMemFree(Some(name.0.cast()));
+                Ok(text?)
+            })
+            .ok()
+            // An enumerator is a short system identifier; anything else is
+            // not logged.
+            .filter(|bus| {
+                !bus.is_empty()
+                    && bus.len() <= 32
+                    && bus.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+            .unwrap_or_else(|| "unknown".into());
+        (form_factor, bus)
+    }
+}
+
+/// `EndpointFormFactor` values.
+fn form_factor_name(value: u32) -> &'static str {
+    match value {
+        0 => "remote-network",
+        1 => "speakers",
+        2 => "line-level",
+        3 => "headphones",
+        4 => "microphone",
+        5 => "headset",
+        6 => "handset",
+        7 => "digital-passthrough",
+        8 => "spdif",
+        9 => "hdmi-or-displayport",
+        _ => "unknown",
+    }
+}
+
 fn parse_format(mix: &MixFormat) -> AudioResult<(PcmFormat, SampleEncoding)> {
     if mix.0.is_null() {
         return Err("WASAPI returned no mix format".into());
@@ -141,6 +195,7 @@ impl Loopback {
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
             let id = device_id(&device)?;
             let name = device_name(&device).unwrap_or_else(|_| "Default PC output".into());
+            let (form_factor, bus) = device_kind(&device);
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let mix = MixFormat(client.GetMixFormat()?);
             let (format, encoding) = parse_format(&mix)?;
@@ -158,7 +213,8 @@ impl Loopback {
             client.SetEventHandle(event.0)?;
             let capture = client.GetService()?;
             client.Start()?;
-            tracing::info!(device = %name, rate = format.rate, channels = format.channels, "WASAPI loopback active");
+            tracing::info!(device = %name, form_factor, %bus, rate = format.rate,
+                channels = format.channels, "WASAPI loopback active");
             Ok(Self {
                 capture,
                 client,
