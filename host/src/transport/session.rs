@@ -13,8 +13,9 @@ use super::link::{LinkId, PeerId};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, Nack,
-    ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
+    ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus, InputEvent, KeyframeRequest, Nack,
+    ReceiverReport, StreamConfig, FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK,
+    FEATURE_WANTS_INPUT, HOSTCAP_NACK,
 };
 use tracing::{info, warn};
 
@@ -53,6 +54,15 @@ pub struct Actions {
     pub goodbye: Option<(PeerId, Vec<u8>)>,
     /// How a HELLO2 was answered: the status of the ACK sent back.
     pub hello: Option<HelloStatus>,
+}
+
+/// Why no stream is running, for an iPad that asks while none is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standby {
+    Stopped,
+    Restarting,
+    /// With the reason the Stream page shows.
+    Failed(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -328,25 +338,7 @@ impl Session {
         now: Instant,
     ) -> Actions {
         let mut actions = Actions::default();
-
-        // Version gate first.
-        if hello.proto_min > 2 || hello.proto_max < 2 {
-            crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
-            let ack = self.make_ack(
-                HelloStatus::VersionUnsupported,
-                hello.client_nonce,
-                0,
-                config,
-            );
-            actions.replies.push((source, ack));
-            return actions;
-        }
-
-        // An update is about to close the host: don't start a stream it would cut.
-        // The iPad shows Busy ("already streaming"); a retry after the restart works.
-        if self.updating {
-            info!(peer = %source, "Client turned away while an update starts");
-            let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
+        if let Some(ack) = self.refuse_hello(source, &hello, config) {
             actions.replies.push((source, ack));
             return actions;
         }
@@ -476,6 +468,78 @@ impl Session {
         actions.replies.push((source, ack));
         actions.new_target = Some(media_target);
         actions.force_idr = true;
+        actions
+    }
+
+    /// The refusals that come before pairing, whether or not a stream runs.
+    fn refuse_hello(
+        &mut self,
+        source: PeerId,
+        hello: &Hello2,
+        config: &impl ConfigSource,
+    ) -> Option<Vec<u8>> {
+        // Version gate first.
+        if hello.proto_min > 2 || hello.proto_max < 2 {
+            crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
+            return Some(self.make_ack(
+                HelloStatus::VersionUnsupported,
+                hello.client_nonce,
+                0,
+                config,
+            ));
+        }
+
+        // An update is about to close the host: don't start a stream it would cut.
+        // The iPad shows Busy ("already streaming"); a retry after the restart works.
+        if self.updating {
+            info!(peer = %source, "Client turned away while an update starts");
+            return Some(self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config));
+        }
+        None
+    }
+
+    /// A HELLO2 that arrived while no pipeline runs. It passes the same
+    /// version, update and pairing checks as one that would start a session,
+    /// so only a paired iPad learns why the PC isn't streaming, and the
+    /// pairing rate limit counts its wrong codes. No session starts and the
+    /// pairing code stays valid for when the stream is back.
+    pub fn standby_hello(
+        &mut self,
+        source: PeerId,
+        hello: Hello2,
+        config: &impl ConfigSource,
+        standby: Standby,
+        now: Instant,
+    ) -> Actions {
+        let mut actions = Actions::default();
+        let refusal = self.refuse_hello(source, &hello, config).or_else(|| {
+            let refused = config
+                .pairing()
+                .and_then(|state| state.lock().authorize(source, &hello, now).err());
+            refused.map(|status| self.make_ack(status, hello.client_nonce, 0, config))
+        });
+        let ack = refusal.or_else(|| {
+            let (status, reason) = if hello.feature_caps & FEATURE_STANDBY_STATUS != 0 {
+                match standby {
+                    Standby::Stopped => (HelloStatus::Stopped, ""),
+                    Standby::Restarting => (HelloStatus::Restarting, ""),
+                    Standby::Failed(reason) => (HelloStatus::Failed, reason),
+                }
+            } else {
+                // 0.3.1 drops an ACK whose status it doesn't know. Its HELLO
+                // retries already outlast a restart, so let them; a stopped
+                // PC turns it away as one that can't take the connection.
+                match standby {
+                    Standby::Restarting => return None,
+                    Standby::Stopped | Standby::Failed(_) => (HelloStatus::Error, ""),
+                }
+            };
+            Some(self.make_reply(status, hello.client_nonce, 0, config, [0; 16], reason))
+        });
+        if let Some(ack) = ack {
+            actions.hello = ack_status(&ack);
+            actions.replies.push((source, ack));
+        }
         actions
     }
 
@@ -689,6 +753,18 @@ impl Session {
         config: &impl ConfigSource,
         auth_token: [u8; 16],
     ) -> Vec<u8> {
+        self.make_reply(status, client_nonce, session_id, config, auth_token, "")
+    }
+
+    fn make_reply(
+        &mut self,
+        status: HelloStatus,
+        client_nonce: u32,
+        session_id: u32,
+        config: &impl ConfigSource,
+        auth_token: [u8; 16],
+        reason: &str,
+    ) -> Vec<u8> {
         let msg_seq = self.next_msg_seq();
         let ack = ControlMessage::HelloAck(HelloAck {
             status,
@@ -702,7 +778,7 @@ impl Session {
             host_name: config.host_name(),
             auth_token,
             host_caps: HOSTCAP_NACK | config.host_caps(),
-            reason: String::new(),
+            reason: reason.to_string(),
         });
         eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
     }
@@ -1676,5 +1752,174 @@ mod tests {
             .status,
             HelloStatus::Ok
         );
+    }
+
+    fn standby_send(
+        session: &mut Session,
+        config: &PairConfig,
+        hello: Hello2,
+        standby: Standby,
+        now: Instant,
+    ) -> Actions {
+        session.standby_hello(addr([192, 0, 2, 1], 50000), hello, config, standby, now)
+    }
+
+    fn paired_hello(nonce: u32, feature_caps: u16) -> Hello2 {
+        let mut hello = pair_hello(nonce);
+        hello.auth_token = [7; 16];
+        hello.feature_caps = feature_caps;
+        hello
+    }
+
+    /// A paired iPad that asks while nothing streams hears why, and nothing
+    /// starts: no session, no media target, no pairing token.
+    #[test]
+    fn standby_tells_a_new_ipad_why_the_pc_is_not_streaming() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        for (standby, status, reason) in [
+            (Standby::Stopped, HelloStatus::Stopped, ""),
+            (Standby::Restarting, HelloStatus::Restarting, ""),
+            (
+                Standby::Failed("Windows is changing the display"),
+                HelloStatus::Failed,
+                "Windows is changing the display",
+            ),
+        ] {
+            let actions = standby_send(
+                &mut session,
+                &config,
+                paired_hello(1, FEATURE_STANDBY_STATUS),
+                standby,
+                now,
+            );
+            let ack = pair_ack(&actions);
+            assert_eq!((ack.status, ack.reason.as_str()), (status, reason));
+            assert_eq!(actions.hello, Some(status));
+            assert_eq!(ack.session_id, 0);
+            assert_eq!(ack.auth_token, [0; 16]);
+            assert!(actions.new_target.is_none() && !actions.force_idr);
+            assert!(!session.is_active());
+        }
+    }
+
+    /// 0.3.1 drops statuses past RateLimited. While the PC restarts it hears
+    /// nothing and keeps retrying, as before; a stopped or failed PC turns it
+    /// away with Error, which it shows at once instead of timing out.
+    #[test]
+    fn standby_gives_a_0_3_1_ipad_only_statuses_it_knows() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        let restarting = standby_send(
+            &mut session,
+            &config,
+            paired_hello(1, 0),
+            Standby::Restarting,
+            now,
+        );
+        assert!(restarting.replies.is_empty());
+        assert_eq!(restarting.hello, None);
+        for standby in [Standby::Stopped, Standby::Failed("reason")] {
+            let actions = standby_send(&mut session, &config, paired_hello(2, 0), standby, now);
+            let ack = pair_ack(&actions);
+            assert_eq!(ack.status, HelloStatus::Error);
+            assert!(ack.reason.is_empty());
+        }
+        assert!(!session.is_active());
+    }
+
+    /// Only a paired iPad learns the stream state. The pairing rate limit
+    /// counts wrong codes here too, and the right code is not spent, so it
+    /// still works once the stream starts.
+    #[test]
+    fn standby_keeps_pairing_and_its_rate_limit() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        let unpaired = pair_hello(1);
+        let mut new_unpaired = unpaired.clone();
+        new_unpaired.feature_caps = FEATURE_STANDBY_STATUS;
+        for hello in [unpaired, new_unpaired.clone()] {
+            for standby in [Standby::Stopped, Standby::Restarting, Standby::Failed("r")] {
+                let ack = pair_ack(&standby_send(
+                    &mut session,
+                    &config,
+                    hello.clone(),
+                    standby,
+                    now,
+                ));
+                assert_eq!(ack.status, HelloStatus::Unauthorized);
+                assert!(ack.reason.is_empty());
+            }
+        }
+        let mut guess = new_unpaired.clone();
+        let mut statuses = Vec::new();
+        for attempt in 1..=5 {
+            guess.client_nonce = 10 + attempt;
+            guess.pairing_code = 1_000_000 + attempt;
+            statuses.push(
+                pair_ack(&standby_send(
+                    &mut session,
+                    &config,
+                    guess.clone(),
+                    Standby::Stopped,
+                    now,
+                ))
+                .status,
+            );
+        }
+        assert_eq!(statuses.last(), Some(&HelloStatus::RateLimited));
+
+        let config = pair_config(true);
+        let code = config.0.lock().code();
+        let mut right = new_unpaired;
+        right.pairing_code = code;
+        let ack = pair_ack(&standby_send(
+            &mut session,
+            &config,
+            right.clone(),
+            Standby::Stopped,
+            now,
+        ));
+        assert_eq!(ack.status, HelloStatus::Stopped);
+        assert_eq!(ack.auth_token, [0; 16]);
+        assert_eq!(config.0.lock().code(), code, "the code stays valid");
+        let accepted = pair_send(
+            &mut session,
+            &config,
+            addr([192, 0, 2, 1], 50000),
+            right,
+            now,
+        );
+        assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+    }
+
+    #[test]
+    fn standby_keeps_the_version_and_update_refusals() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        let mut old = paired_hello(1, FEATURE_STANDBY_STATUS);
+        old.proto_min = 1;
+        old.proto_max = 1;
+        let ack = pair_ack(&standby_send(
+            &mut session,
+            &config,
+            old,
+            Standby::Stopped,
+            now,
+        ));
+        assert_eq!(ack.status, HelloStatus::VersionUnsupported);
+        assert!(session.begin_update(false));
+        let ack = pair_ack(&standby_send(
+            &mut session,
+            &config,
+            paired_hello(2, FEATURE_STANDBY_STATUS),
+            Standby::Stopped,
+            now,
+        ));
+        assert_eq!(ack.status, HelloStatus::Busy);
     }
 }

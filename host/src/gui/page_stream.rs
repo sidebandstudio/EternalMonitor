@@ -10,7 +10,7 @@ use super::{
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::capture::recovery::CaptureBlock;
-use crate::control::VddStatus;
+use crate::control::{StreamPhase, VddStatus};
 use crate::vdd::VddTaskHealth;
 
 impl AnalyzerApp {
@@ -206,7 +206,19 @@ impl AnalyzerApp {
             .as_ref()
             .map(|i| i.device_name.clone())
             .unwrap_or_default();
+        let phase = *self.control.shared.stream_phase.lock();
         let (title, subtitle) = match state {
+            StreamState::Off if phase == StreamPhase::Restarting => (
+                "Restarting the stream…".to_string(),
+                "The iPad reconnects by itself.".to_string(),
+            ),
+            StreamState::Off if phase == StreamPhase::Failed => {
+                let reason = stream_failed_reason(*self.control.shared.capture_block.lock());
+                (
+                    STREAM_FAILED_TITLE.to_string(),
+                    format!("{reason}. Click Start streaming to try again."),
+                )
+            }
             StreamState::Off => (
                 "Streaming is off".to_string(),
                 "Click Start streaming so your iPad can connect.".to_string(),
@@ -694,7 +706,21 @@ pub(super) fn capture_block_notice(
     if !running {
         return None;
     }
-    Some(match block? {
+    block.map(capture_block_text)
+}
+
+pub(super) const STREAM_FAILED_TITLE: &str = "Streaming stopped after repeated errors";
+
+/// Why the stream stopped after repeated errors. The Stream page shows it,
+/// and so does an iPad that tries to connect meanwhile.
+pub(crate) fn stream_failed_reason(block: Option<CaptureBlock>) -> &'static str {
+    block.map_or("Capturing or sending your screen kept failing", |block| {
+        capture_block_text(block).1
+    })
+}
+
+fn capture_block_text(block: CaptureBlock) -> (Icon, &'static str, &'static str) {
+    match block {
         CaptureBlock::SecureDesktop => (
             Icon::Lock,
             "Your PC is showing the lock screen or a permission prompt",
@@ -720,7 +746,7 @@ pub(super) fn capture_block_notice(
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
         ),
-    })
+    }
 }
 
 /// What the Stream page says under the mirror / second screen choice.

@@ -238,7 +238,26 @@ pub struct TransportLinks {
     pub udp: UdpLink,
     usb: HashMap<LinkId, ActiveLink>,
     events: mpsc::Receiver<HubEvent>,
-    token: u64,
+    subscription: HubToken,
+}
+
+/// The hub's events go to this owner until it is dropped.
+struct HubToken(u64);
+
+impl Drop for HubToken {
+    fn drop(&mut self) {
+        UsbHub::get().unsubscribe(self.0);
+    }
+}
+
+/// The links between two owners on different runtimes. The UDP socket stays
+/// bound with its receive queue, and tunnel events wait in their channel, so
+/// nothing an iPad sends during the hand-over is lost.
+pub struct ParkedLinks {
+    udp: std::net::UdpSocket,
+    usb: HashMap<LinkId, ActiveLink>,
+    events: mpsc::Receiver<HubEvent>,
+    subscription: HubToken,
 }
 
 impl TransportLinks {
@@ -248,13 +267,45 @@ impl TransportLinks {
             udp: UdpLink::new(socket),
             usb: HashMap::new(),
             events: subscription.events,
-            token: subscription.token,
+            subscription: HubToken(subscription.token),
         };
         for (id, generation, link) in subscription.open {
             info!(?id, generation, "USB tunnel kept across pipeline restart");
             links.adopt(generation, link);
         }
         links
+    }
+
+    /// Releases the links from this runtime for the next owner.
+    pub fn park(self) -> io::Result<ParkedLinks> {
+        let Self {
+            udp,
+            usb,
+            events,
+            subscription,
+        } = self;
+        Ok(ParkedLinks {
+            udp: udp.socket.into_std()?,
+            usb,
+            events,
+            subscription,
+        })
+    }
+
+    /// Takes parked links over on the calling task's runtime.
+    pub fn resume(parked: ParkedLinks) -> io::Result<Self> {
+        let ParkedLinks {
+            udp,
+            usb,
+            events,
+            subscription,
+        } = parked;
+        Ok(Self {
+            udp: UdpLink::new(UdpSocket::from_std(udp)?),
+            usb,
+            events,
+            subscription,
+        })
     }
 
     fn adopt(&mut self, generation: u64, link: Arc<FramedLink>) {
@@ -358,12 +409,6 @@ impl TransportLinks {
                 }
             }
         }
-    }
-}
-
-impl Drop for TransportLinks {
-    fn drop(&mut self) {
-        UsbHub::get().unsubscribe(self.token);
     }
 }
 

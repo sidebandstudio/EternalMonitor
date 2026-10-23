@@ -73,6 +73,26 @@ pub struct SharedControl {
     /// resets the client's reassembly.
     pub session: Arc<Mutex<crate::transport::session::Session>>,
     pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
+    /// What the supervisor is doing with the stream. iPads that ask while
+    /// no pipeline runs are told this.
+    pub stream_phase: Arc<Mutex<StreamPhase>>,
+    /// The control port and USB tunnels, held by the running pipeline or,
+    /// between pipelines, by the standby responder.
+    pub links: Arc<crate::transport::standby::LinkSlot>,
+}
+
+/// The supervisor's state as iPads and the Stream page see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamPhase {
+    /// A pipeline generation is running or starting.
+    #[default]
+    Running,
+    /// Waiting out the pause before an automatic restart.
+    Restarting,
+    /// The user clicked Stop.
+    Stopped,
+    /// Stopped after repeated failures, until someone clicks Start.
+    Failed,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -166,6 +186,8 @@ impl SharedControl {
                     .build_hasher()
                     .finish() as u32
             }))),
+            stream_phase: Arc::new(Mutex::new(StreamPhase::Running)),
+            links: Arc::new(crate::transport::standby::LinkSlot::default()),
         }
     }
 
