@@ -47,9 +47,6 @@ pub struct GpuInfo {
     pub dedicated_vram_mb: u64,
     pub encoder_name: String,
     pub codec_display_name: String,
-    /// Vendors of every hardware adapter found. The encoder fallback skips
-    /// encoders whose vendor is absent. Empty when unknown: try them all.
-    pub vendors_present: Vec<GpuVendor>,
 }
 
 impl GpuInfo {
@@ -73,16 +70,37 @@ impl GpuInfo {
             dedicated_vram_mb: 0,
             encoder_name: "libx264".to_string(),
             codec_display_name: "H.264 (x264)".to_string(),
-            vendors_present: Vec::new(),
         }
     }
+}
+
+/// Vendors of the hardware adapters present right now. Read at each
+/// encoder fallback rather than at launch, so a GPU connected since (an
+/// eGPU, a dock) is used. Empty if DXGI cannot be asked.
+pub fn vendors_present() -> Vec<GpuVendor> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let mut vendors = Vec::new();
+    for index in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        let vendor = GpuVendor::from_vendor_id(desc.VendorId);
+        if desc.Flags & FLAG_SOFTWARE == 0 && !vendors.contains(&vendor) {
+            vendors.push(vendor);
+        }
+    }
+    vendors
 }
 
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
     let mut best: Option<(u32, String, GpuVendor, u64)> = None;
-    let mut vendors_present = Vec::new();
     let mut index = 0u32;
 
     loop {
@@ -108,9 +126,6 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>(),
         );
         let vendor = GpuVendor::from_vendor_id(desc.VendorId);
-        if !vendors_present.contains(&vendor) {
-            vendors_present.push(vendor);
-        }
         let vram_mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
         let driver_version = match unsafe {
             adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
@@ -164,7 +179,6 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
         dedicated_vram_mb: vram_mb,
         encoder_name,
         codec_display_name,
-        vendors_present,
     })
 }
 

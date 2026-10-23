@@ -258,8 +258,10 @@ fn run_encode_loop(
                         error = %e,
                         "Preferred encoder failed to open; trying remaining encoders"
                     );
-                    let (name, state) =
-                        open_remaining_encoders(&encoder_name, &gpu.vendors_present, |name| {
+                    let (name, state) = open_remaining_encoders(
+                        &encoder_name,
+                        crate::gpu::vendors_present,
+                        |name| {
                             EncoderState::new(
                                 name,
                                 raw_frame.width,
@@ -268,7 +270,8 @@ fn run_encode_loop(
                                 target_fps,
                                 input_mode,
                             )
-                        })?;
+                        },
+                    )?;
                     encoder_name = name.to_string();
                     encoder_state = Some(state);
                     PIPELINE_STATS
@@ -840,7 +843,7 @@ impl InFlightFrames {
 
 fn open_remaining_encoders<T>(
     failed: &str,
-    vendors_present: &[GpuVendor],
+    vendors_present: impl FnOnce() -> Vec<GpuVendor>,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
     let hardware: &[(&str, GpuVendor)] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv")
@@ -852,6 +855,11 @@ fn open_remaining_encoders<T>(
         ]
     } else {
         &[]
+    };
+    let vendors_present = if hardware.is_empty() {
+        Vec::new()
+    } else {
+        vendors_present()
     };
     for &(name, vendor) in hardware {
         if name == failed {
@@ -1604,7 +1612,7 @@ mod tests {
     #[test]
     fn startup_tries_other_hardware_before_software() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", &[], |name| {
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", Vec::new, |name| {
             attempts.push(name.to_string());
             match name {
                 "h264_qsv" => Ok(()),
@@ -1623,7 +1631,7 @@ mod tests {
         let mut attempts = Vec::new();
         let (selected, ()) = open_remaining_encoders(
             "h264_nvenc",
-            &[GpuVendor::Nvidia, GpuVendor::Amd, GpuVendor::Unknown],
+            || vec![GpuVendor::Nvidia, GpuVendor::Amd, GpuVendor::Unknown],
             |name| {
                 attempts.push(name.to_string());
                 match name {
@@ -1635,21 +1643,40 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, ["h264_amf", "libx264"]);
         assert_eq!(selected, "libx264");
-        // An NVIDIA-only PC goes straight to the CPU.
-        let mut attempts = Vec::new();
-        open_remaining_encoders("h264_nvenc", &[GpuVendor::Nvidia], |name| {
-            attempts.push(name.to_string());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(attempts, ["libx264"]);
+    }
+
+    #[test]
+    fn each_pipeline_start_sees_the_graphics_cards_present_then() {
+        // NVIDIA only at the first start; an AMD eGPU connected before the
+        // second. The adapters are read at each fallback, not at launch.
+        let mut present = vec![
+            vec![GpuVendor::Nvidia],
+            vec![GpuVendor::Nvidia, GpuVendor::Amd],
+        ]
+        .into_iter();
+        let mut start = || {
+            let vendors = present.next().unwrap();
+            let mut attempts = Vec::new();
+            open_remaining_encoders(
+                "h264_nvenc",
+                || vendors,
+                |name| {
+                    attempts.push(name.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            attempts
+        };
+        assert_eq!(start(), ["libx264"]);
+        assert_eq!(start(), ["h264_amf"]);
     }
 
     #[test]
     fn startup_uses_software_only_after_all_other_hardware_fails() {
         for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
             let mut attempts = Vec::new();
-            let (selected, ()) = open_remaining_encoders(failed, &[], |name| {
+            let (selected, ()) = open_remaining_encoders(failed, Vec::new, |name| {
                 attempts.push(name.to_string());
                 if name == "libx264" {
                     Ok(())
@@ -1663,7 +1690,7 @@ mod tests {
             assert!(!attempts.iter().any(|name| name == failed));
             assert_eq!(attempts.last().unwrap(), "libx264");
         }
-        assert!(open_remaining_encoders::<()>("h264_amf", &[], |_| {
+        assert!(open_remaining_encoders::<()>("h264_amf", Vec::new, |_| {
             Err("no encoder can open".into())
         })
         .is_err());
@@ -1672,7 +1699,7 @@ mod tests {
     #[test]
     fn non_windows_backends_keep_their_software_fallback() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", &[], |name| {
+        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", Vec::new, |name| {
             attempts.push(name.to_string());
             Ok(())
         })
