@@ -204,6 +204,24 @@ first and restores it at the end; `result.json` lists both layouts.
 checks that destroying the pen device mid-contact ends that contact and that a
 new device then draws normally, at the centre of the probe window.
 
+`scripts/win/Test-PenSoak.ps1` draws strokes into its focused probe window for
+`-Seconds` with pen_probe's `soak` mode and logs every frame Windows refuses,
+with its timing, the virtual screen and what recovered it. `-Pattern` sends
+samples one every 4 ms (`paced`), four back to back every 16 ms as the iPad
+does (`batch`), backlogs of 64 (`burst`) or 32 identical moves (`same`), or
+batches and backlogs with every CPU busy (`load`). `-BusyMs` stops the probe
+reading input that long every three seconds, like a drawing app rendering a
+heavy brush. `-Options 'relay'` sends the samples through the host's input
+relay instead of raw frames, `spacing_us=N` spaces them, and the probe counts
+the pointer downs, ups and frames it receives, so a restarted contact shows
+as an extra down.
+
+`scripts/win/Test-PenUipi.ps1` is the receiving window for a privilege check:
+run it in an interactive task with `RunLevel Highest`, then pen_probe's `uipi`
+mode with `RunLevel Limited` and the bounds from its `probe.json`. The probe
+prints what Windows answers raw pen frames and `SendInput` with, then sends a
+stroke, a tap and a key through the relay and prints the app the host found.
+
 Before release, verify light-to-heavy strokes, pressure-sensitive dots, tilted
 brushes, diagonals and all canvas corners on a physical iPad. Rest a palm before
 and during a stroke. Test both iPad orientations, Windows display scaling,
