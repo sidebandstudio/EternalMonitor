@@ -29,6 +29,7 @@ use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
+use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::settings::SettingsFile;
@@ -127,6 +128,8 @@ struct ClientSnapshot {
     peer: Option<PeerId>,
     session_id: Option<u32>,
     report: Option<ReceiverReport>,
+    /// Why Windows is withholding the screen from it, if it is.
+    capture_block: Option<CaptureBlock>,
 }
 
 impl ClientSnapshot {
@@ -137,6 +140,7 @@ impl ClientSnapshot {
             peer: session.peer(),
             session_id: session.session_id(),
             report: session.last_report(),
+            capture_block: *control.shared.capture_block.lock(),
         }
     }
 
@@ -158,16 +162,21 @@ enum StreamState {
     Off,
     Ready,
     Streaming,
+    /// An iPad is connected, but Windows withholds the screen, so its
+    /// picture is frozen. Capture retries until Windows allows it again.
+    Paused,
 }
 
 impl StreamState {
     fn of(snap: &StatsSnapshot, client: &ClientSnapshot) -> Self {
         if !snap.pipeline_running {
             StreamState::Off
-        } else if client.info.is_some() {
-            StreamState::Streaming
-        } else {
+        } else if client.info.is_none() {
             StreamState::Ready
+        } else if client.capture_block.is_some() {
+            StreamState::Paused
+        } else {
+            StreamState::Streaming
         }
     }
 
@@ -175,12 +184,13 @@ impl StreamState {
         match self {
             StreamState::Off => TEXT_FAINT,
             StreamState::Ready | StreamState::Streaming => ACCENT,
+            StreamState::Paused => WARNING,
         }
     }
 
     fn dot(self) -> widgets::Dot {
         match self {
-            StreamState::Off => widgets::Dot::Idle,
+            StreamState::Off | StreamState::Paused => widgets::Dot::Idle,
             StreamState::Ready => widgets::Dot::Ready,
             StreamState::Streaming => widgets::Dot::Live,
         }
@@ -872,8 +882,13 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
     let (title, detail) = match state {
         StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
         StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
-        StreamState::Streaming => (
-            "Streaming".to_string(),
+        StreamState::Streaming | StreamState::Paused => (
+            if state == StreamState::Paused {
+                "Paused"
+            } else {
+                "Streaming"
+            }
+            .to_string(),
             format!(
                 "{} · {}",
                 client

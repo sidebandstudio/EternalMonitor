@@ -209,6 +209,10 @@ impl AnalyzerApp {
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
+            StreamState::Paused => (
+                format!("Streaming to {device} is paused"),
+                "Windows stopped screen capture. See the message above.".to_string(),
+            ),
         };
 
         widgets::card().show(ui, |ui| {

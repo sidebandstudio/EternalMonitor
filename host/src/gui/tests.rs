@@ -114,6 +114,45 @@ fn cable_notice_appears_only_for_a_plugged_in_ipad_without_the_service() {
 }
 
 #[test]
+fn a_connected_ipad_without_a_picture_is_not_shown_as_streaming() {
+    let mut snap = StatsSnapshot::take();
+    snap.pipeline_running = true;
+    let mut client = ClientSnapshot {
+        info: Some(ClientInfo {
+            device_name: "iPad".into(),
+            device_id: 1,
+            screen_px: (2388, 1668),
+            refresh_hz: 120,
+            preferred_fps: 60,
+            decoder_caps: 1,
+            feature_caps: 0,
+            connected_at: Instant::now(),
+        }),
+        peer: None,
+        session_id: None,
+        report: None,
+        capture_block: Some(CaptureBlock::UnsupportedOnThisGpu),
+    };
+    // Capture retries this forever while heartbeats stay current.
+    assert!(StreamState::of(&snap, &client) == StreamState::Paused);
+    let (_, title, body) = capture_block_notice(client.capture_block, true).unwrap();
+    assert!(title.contains("graphics card"), "{title}");
+    assert!(body.contains("Power saving"), "{body}");
+
+    client.capture_block = None;
+    assert!(StreamState::of(&snap, &client) == StreamState::Streaming);
+    assert!(capture_block_notice(None, true).is_none());
+}
+
+#[test]
+fn a_stopped_stream_does_not_promise_the_picture_will_come_back() {
+    let block = Some(CaptureBlock::DisplayChanging);
+    assert!(capture_block_notice(block, true).is_some());
+    // Stop leaves the last block recorded, but nothing retries any more.
+    assert!(capture_block_notice(block, false).is_none());
+}
+
+#[test]
 fn codec_names_read_as_codec_and_engine() {
     assert_eq!(friendly_codec("h264_nvenc"), "H.264 · NVENC");
     assert_eq!(friendly_codec("hevc_amf"), "HEVC · AMF");

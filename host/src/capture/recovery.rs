@@ -139,14 +139,20 @@ impl BlockedRetry {
 /// cannot unlock the PC, and a restart would drop the iPad's session.
 /// `wait` sleeps in short slices and returns false once this generation
 /// should stop.
+///
+/// Every attempt numbers its frames from where the last one stopped. Frame
+/// numbers become the stream's sequence, and a retry keeps the transport's
+/// stream epoch: an attempt that started again at 1 sent sequence 1 after
+/// 200, and the iPad dropped every frame until the count passed 200 again.
 pub fn run_until_unblocked(
     shared: &SharedControl,
-    mut capture: impl FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    mut capture: impl FnMut(&mut u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     mut wait: impl FnMut(Duration) -> bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry = BlockedRetry::default();
+    let mut frame_number = 0;
     loop {
-        let error = match capture() {
+        let error = match capture(&mut frame_number) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -263,7 +269,7 @@ mod tests {
         let waits = RefCell::new(Vec::new());
         let result = run_until_unblocked(
             &shared,
-            || {
+            |_| {
                 *attempts.borrow_mut() += 1;
                 match *attempts.borrow() {
                     1..=3 => Err(blocked(CaptureBlock::SecureDesktop)),
@@ -289,15 +295,87 @@ mod tests {
         assert_eq!(*shared.capture_block.lock(), None);
     }
 
+    /// Frames the iPad shows, in order, when one frame per sequence number
+    /// arrives in a single stream epoch.
+    fn shown(sequence: &[u64], repair: bool) -> Vec<u64> {
+        use eternal_wire::reassembly::{AddOutcome, Reassembler};
+        use eternal_wire::v2::media::MediaHeader;
+        let mut ipad = Reassembler::new();
+        ipad.configure_repair(
+            repair,
+            Duration::from_micros(16_667),
+            Duration::from_millis(10),
+        );
+        let now = Instant::now();
+        let mut shown = Vec::new();
+        for &seq in sequence {
+            let header = MediaHeader {
+                session_id: 1,
+                stream_epoch: 7,
+                frame_seq: seq as u32,
+                frag_index: 0,
+                frag_count: 1,
+                is_keyframe: seq == 1,
+                is_retransmit: false,
+                capture_ts_us: seq * 16_667,
+                payload_len: 4,
+            };
+            if let AddOutcome::Completed(_) = ipad.add_media(header, &[0; 4], now) {
+                shown.push(seq);
+            }
+            shown.extend(ipad.take_ready().iter().map(|frame| u64::from(frame.seq)));
+        }
+        shown
+    }
+
+    #[test]
+    fn a_retry_continues_the_frame_numbers_the_ipad_is_showing() {
+        let shared = SharedControl::new(0, 1);
+        let attempts = RefCell::new(0);
+        let sent = RefCell::new(Vec::new());
+        let result = run_until_unblocked(
+            &shared,
+            |frame_number| {
+                *attempts.borrow_mut() += 1;
+                // 200 frames, then Windows withholds the desktop past the
+                // loop's give-up window. The retry captures one frame.
+                let first = *attempts.borrow() == 1;
+                let frames = if first { 200 } else { 1 };
+                for _ in 0..frames {
+                    *frame_number += 1;
+                    sent.borrow_mut().push(*frame_number);
+                }
+                if first {
+                    Err(blocked(CaptureBlock::DisplayChanging))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| true,
+        );
+        assert!(result.is_ok());
+        let sent = sent.into_inner();
+        assert_eq!(sent.last(), Some(&201));
+
+        let mut restarted: Vec<u64> = (1..=200).collect();
+        restarted.push(1);
+        for repair in [false, true] {
+            // The previous loops counted from zero again: the iPad dropped
+            // the recovered frame and kept the frozen picture.
+            assert_eq!(shown(&restarted, repair).last(), Some(&200), "{repair}");
+            assert_eq!(shown(&sent, repair).last(), Some(&201), "{repair}");
+        }
+    }
+
     #[test]
     fn real_errors_still_reach_the_supervisor_and_stop_ends_the_wait() {
         let shared = SharedControl::new(0, 1);
-        let result = run_until_unblocked(&shared, || Err("device removed".into()), |_| true);
+        let result = run_until_unblocked(&shared, |_| Err("device removed".into()), |_| true);
         assert_eq!(result.unwrap_err().to_string(), "device removed");
 
         let result = run_until_unblocked(
             &shared,
-            || Err(blocked(CaptureBlock::UnsupportedOnThisGpu)),
+            |_| Err(blocked(CaptureBlock::UnsupportedOnThisGpu)),
             |_| false,
         );
         assert!(result.is_ok(), "a stopped generation exits cleanly");
