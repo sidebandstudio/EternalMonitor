@@ -122,6 +122,17 @@ Windows changes.
 - While connecting, the iPad says what is happening, says when nothing has
   answered yet, and keeps trying for the whole wait instead of only the first
   two seconds, so a PC whose stream is restarting still connects.
+- The PC answers the iPad while it isn't streaming: after **Stop**, while its
+  stream restarts, and after it stopped because of repeated errors. The iPad
+  says which (**Your PC isn't streaming** with where to click Start, **Your PC
+  is restarting the stream…**, or **Your PC couldn't start streaming** with
+  the reason the PC shows), keeps asking, and connects as soon as the PC
+  streams again without using up its reconnect attempts. Before, the PC didn't
+  answer at all and the iPad said so. An iPad on 0.3.1 is told the PC turned
+  down the connection while it is stopped.
+- The Windows Stream page says when the stream is restarting, and when it
+  stopped after repeated errors and why. **Start streaming** works while a
+  restart is pending.
 - When the iPad's Wi-Fi drops during a session, reconnecting waits for it to
   come back and then tries straight away, instead of running out of attempts.
 - The Windows host logs a short network summary at startup (adapter kinds,
@@ -135,7 +146,9 @@ On a PC with a VPN, WSL or Hyper-V, check that the Address on the Stream page
 and in the QR code is the PC's Wi-Fi or Ethernet address, then connect from
 the iPad. Type an address with a dot missing on the iPad and check that it
 says the address doesn't look right. Connect to a PC that is switched off and
-check that the iPad says nothing has answered yet while it waits.
+check that the iPad says nothing has answered yet while it waits. Click
+**Stop** on the PC, then connect from the iPad: it should say the PC isn't
+streaming, and connect by itself once you click **Start streaming**.
 
 On a PC where EternalMonitor 0.3.1 opened a console window that closed after a
 few seconds, install this build and open EternalMonitor. The window should
