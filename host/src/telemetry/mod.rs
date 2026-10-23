@@ -489,13 +489,36 @@ struct Names {
     /// Profile folder names on this PC, longest first, so `A Smith` is tried
     /// before `A`.
     profiles: Vec<String>,
+    /// Registered profiles outside a `Users` folder, such as
+    /// `D:\Profiles\Name Smith`, as (parent, folder), longest first.
+    redirected: Vec<(String, String)>,
     /// Lowercase, for a whole-token match in any case.
     pc: Option<String>,
 }
 impl Names {
-    /// `profiles` are profile paths; only folders directly under a `Users`
-    /// (or `home`) folder count, and never the shared ones.
+    /// `profiles` are profile paths. Folders directly under a `Users` (or
+    /// `home`) folder are local names, never the shared ones; any other
+    /// path is a redirected profile, except Windows' own service profiles.
     fn new(profiles: &[&str], pc: Option<&str>) -> Self {
+        let mut redirected: Vec<(String, String)> = profiles
+            .iter()
+            .filter(|path| profile_folder(path).is_none())
+            .filter_map(|path| {
+                let path = path.trim().trim_end_matches(['\\', '/']);
+                let (parent, folder) = path.rsplit_once(['\\', '/'])?;
+                let system = path
+                    .split(['\\', '/'])
+                    .any(|part| part.eq_ignore_ascii_case("windows"));
+                (!system && !parent.is_empty() && !folder.is_empty())
+                    .then(|| (parent.to_owned(), folder.to_owned()))
+            })
+            .collect();
+        redirected.sort_by_key(|(parent, folder)| {
+            std::cmp::Reverse(parent.chars().count() + folder.chars().count())
+        });
+        redirected.dedup_by(|a, b| {
+            a.0.to_lowercase() == b.0.to_lowercase() && a.1.to_lowercase() == b.1.to_lowercase()
+        });
         let mut folders: Vec<String> = profiles
             .iter()
             .filter_map(|path| profile_folder(path))
@@ -510,6 +533,7 @@ impl Names {
         folders.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
         Self {
             profiles: folders,
+            redirected,
             pc: pc
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
@@ -537,7 +561,8 @@ fn profile_folder(path: &str) -> Option<&str> {
 }
 
 /// This user's profile and, on Windows, every profile in the registry's
-/// ProfileList, which standard users can read.
+/// ProfileList (`ProfileImagePath`), which standard users can read. Paths
+/// outside `\Users\` are kept: they are redirected profiles.
 fn profile_paths() -> Vec<String> {
     #[allow(unused_mut)]
     let mut paths: Vec<String> = ["USERPROFILE", "HOME"]
@@ -612,14 +637,8 @@ fn windows_profile_list() -> Vec<String> {
     paths
 }
 
-/// Where a profile folder name in a path ends.
-fn ends_folder(next: Option<char>) -> bool {
-    next.is_none_or(|c| matches!(c, '\\' | '/' | '"' | '\'' | ',' | ';' | ')') || c.is_whitespace())
-}
-
-/// The length in bytes of `name` at the start of `text`, in any case, when a
-/// folder name ends right after it.
-fn folder_at(text: &str, name: &str) -> Option<usize> {
+/// `name` at the start of `text`, in any case: the length in bytes it takes.
+fn starts_with_name(text: &str, name: &str) -> Option<usize> {
     let mut chars = text.char_indices();
     for expected in name.chars() {
         let (_, found) = chars.next()?;
@@ -627,20 +646,80 @@ fn folder_at(text: &str, name: &str) -> Option<usize> {
             return None;
         }
     }
-    let end = chars.next().map_or(text.len(), |(index, _)| index);
-    ends_folder(text[end..].chars().next()).then_some(end)
+    Some(chars.next().map_or(text.len(), |(index, _)| index))
 }
 
-/// Replaces the profile folder after each `<drive>:\Users\` (or `/Users/`,
-/// `/home/`) with `[USER]`. This PC's profile names are matched exactly,
-/// longest first, so a name with spaces goes whole whatever follows it.
-/// Shared folders and `[USER]` stay. Any other name is a profile not on this
-/// PC, such as a deleted user's or a path from another PC: only its first
-/// run of name characters is replaced, never past whitespace and never into
-/// the text after it, so a surname after a space in such a path stays. That
-/// is the accepted residual: from the text alone, the folder's end can't be
-/// told from what follows it.
+/// How a profile segment ended.
+#[derive(Clone, Copy, PartialEq)]
+enum SegmentEnd {
+    /// `\` or `/`, a character Windows forbids in file names
+    /// (`: * ? " < > |`), or `'`: the segment is exactly the folder name.
+    Delimiter,
+    /// The end of the line, or a space before the next `word=` field.
+    Open,
+}
+
+/// The segment after `\Users\` in `rest`: its length in bytes and how it
+/// ended.
+fn segment(rest: &str) -> (usize, SegmentEnd) {
+    static FIELD: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^\s+[A-Za-z_][A-Za-z0-9_]*=").expect("field pattern")
+    });
+    for (index, c) in rest.char_indices() {
+        if matches!(
+            c,
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\''
+        ) {
+            return (index, SegmentEnd::Delimiter);
+        }
+        if c.is_whitespace() && FIELD.is_match(&rest[index..]) {
+            return (index, SegmentEnd::Open);
+        }
+    }
+    (rest.len(), SegmentEnd::Open)
+}
+
+/// Windows local profile folder names are short: a user name of at most 20
+/// characters plus a suffix such as `.DOMAIN` or `.000`.
+const LOCAL_FOLDER_CHARS: usize = 32;
+
+/// Replaces profile folder names in `text` with `[USER]`.
+///
+/// Step 1, registered profiles outside `<drive>:\Users\` (redirected, such as
+/// `D:\Profiles\Name Smith`): the exact registered path, longest first, in any
+/// case and with either separator, becomes `<parent>\[USER]`.
+///
+/// Step 2, after every `<drive>:\Users\` (and `/Users/`, `/home/` on macOS and
+/// Linux), in any case and with either separator: the segment runs to the
+/// first `\` or `/`, character Windows forbids in file names
+/// (`: * ? " < > |`), `'`, end of line, or space before a `word=` field.
+///
+/// - (a) A segment that starts with `[USER]`, or is `Public`, `Default`,
+///   `Default User` or `All Users`, stays.
+/// - (b) A segment ended by a separator, forbidden character or quote is
+///   exactly the folder name: all of it becomes `[USER]`.
+/// - (c) Otherwise, a known local profile name, longest first, that starts
+///   the segment and is followed by whitespace, `.`, `,`, `;`, `)` or the
+///   end is replaced, exactly that name.
+/// - (d) Otherwise, a segment of at most 32 characters is replaced whole.
+/// - (e) Otherwise, only up to its first whitespace: the documented
+///   residual, an unknown, non-local profile followed by free text with no
+///   separator.
+///
+/// With local profile `C:\Users\Name Smith`:
+///
+/// | Input | Upload |
+/// |---|---|
+/// | `home=C:\Users\Name Smith: next=1` | `home=C:\Users\[USER]: next=1` |
+/// | `home=C:\Users\Name Smith.` | `home=C:\Users\[USER].` |
+/// | `home=C:\Users\Name Smith next=1` | `home=C:\Users\[USER] next=1` |
+/// | `C:\Users\A Smith\Desktop\x` (local `A` only) | `C:\Users\[USER]\Desktop\x` |
+/// | `path=C:\Users\[USER] access denied while opening /config` | unchanged |
+/// | `D:\Profiles\Name Smith\AppData\x` (registered) | `D:\Profiles\[USER]\AppData\x` |
+/// | `"C:\Users\A"` | `"C:\Users\[USER]"` |
+/// | `C:\Users\Public\x` | unchanged |
 fn redact_profiles(text: &str, names: &Names) -> String {
+    let text = redact_redirected(text, names);
     static PREFIX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(
             r"(?i)\b[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|/(?:users|home)/",
@@ -649,37 +728,83 @@ fn redact_profiles(text: &str, names: &Names) -> String {
     });
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for prefix in PREFIX.find_iter(text) {
+    for prefix in PREFIX.find_iter(&text) {
         if prefix.start() < copied {
             continue;
         }
         let rest = &text[prefix.end()..];
-        let kept = if rest.starts_with("[USER]") {
-            Some("[USER]".len())
-        } else {
-            SHARED_PROFILES
+        let (length, end) = segment(rest);
+        let folder = &rest[..length];
+        // a. Already redacted, or a shared folder.
+        if folder.starts_with("[USER]")
+            || SHARED_PROFILES
                 .iter()
-                .find_map(|name| folder_at(rest, name))
-        };
-        if let Some(end) = kept {
-            out.push_str(&text[copied..prefix.end() + end]);
-            copied = prefix.end() + end;
+                .any(|name| name.eq_ignore_ascii_case(folder))
+        {
             continue;
         }
-        let end = names
-            .profiles
-            .iter()
-            .find_map(|name| folder_at(rest, name))
-            .unwrap_or_else(|| rest.find(|c| ends_folder(Some(c))).unwrap_or(rest.len()));
-        if end == 0 {
+        let replaced = if end == SegmentEnd::Delimiter {
+            // b. Exactly the folder name.
+            length
+        } else if let Some(name) = names.profiles.iter().find_map(|name| {
+            starts_with_name(folder, name).filter(|&after| {
+                rest[after..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ')'))
+            })
+        }) {
+            // c. A known local name.
+            name
+        } else if folder.chars().count() <= LOCAL_FOLDER_CHARS {
+            // d. Short enough to be a local folder name.
+            length
+        } else {
+            // e. The residual.
+            folder.find(char::is_whitespace).unwrap_or(length)
+        };
+        if replaced == 0 {
             continue;
         }
         out.push_str(&text[copied..prefix.end()]);
         out.push_str("[USER]");
-        copied = prefix.end() + end;
+        copied = prefix.end() + replaced;
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// Step 1 of [`redact_profiles`]: each registered profile outside a `Users`
+/// folder, as an exact path that ends at its folder name.
+fn redact_redirected<'a>(text: &'a str, names: &Names) -> std::borrow::Cow<'a, str> {
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for (parent, folder) in &names.redirected {
+        let parent: Vec<_> = parent.split(['\\', '/']).map(regex::escape).collect();
+        let Ok(pattern) = regex::Regex::new(&format!(
+            r"(?i)({}[\\/]+){}",
+            parent.join(r"[\\/]+"),
+            regex::escape(folder)
+        )) else {
+            continue;
+        };
+        let replaced = pattern.replace_all(&text, |captures: &regex::Captures| {
+            let whole = captures.get(0).expect("match");
+            // A longer folder that starts with this name is another folder.
+            let continues = text[whole.end()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric);
+            if continues {
+                whole.as_str().to_owned()
+            } else {
+                format!("{}[USER]", &captures[1])
+            }
+        });
+        if let std::borrow::Cow::Owned(replaced) = replaced {
+            text = replaced.into();
+        }
+    }
+    text
 }
 
 /// Lines whose `device=` is the PC's audio output. Its name can be the
@@ -1222,8 +1347,25 @@ mod tests {
     fn upload_redaction_table() {
         const NAME_SMITH: &[&str] = &[r"C:\Users\Name Smith"];
         const A_AND_A_SMITH: &[&str] = &[r"C:\Users\A", r"C:\Users\A Smith"];
+        const A_ONLY: &[&str] = &[r"C:\Users\A"];
+        const REDIRECTED: &[&str] = &[r"C:\Users\Name Smith", r"D:\Profiles\Name Smith"];
         const NONE: &[&str] = &[];
         let cases: &[(&[&str], &str, &str)] = &[
+            // The algorithm's table (see `redact_profiles`).
+            (NAME_SMITH, r"home=C:\Users\Name Smith: next=1", r"home=C:\Users\[USER]: next=1"),
+            (NAME_SMITH, r"home=C:\Users\Name Smith.", r"home=C:\Users\[USER]."),
+            (NAME_SMITH, r"home=C:\Users\Name Smith next=1", r"home=C:\Users\[USER] next=1"),
+            (A_ONLY, r"C:\Users\A Smith\Desktop\x", r"C:\Users\[USER]\Desktop\x"),
+            (NAME_SMITH, r"path=C:\Users\[USER] access denied while opening /config",
+                r"path=C:\Users\[USER] access denied while opening /config"),
+            (REDIRECTED, r"D:\Profiles\Name Smith\AppData\x", r"D:\Profiles\[USER]\AppData\x"),
+            (NAME_SMITH, r#""C:\Users\A""#, r#""C:\Users\[USER]""#),
+            (NAME_SMITH, r"C:\Users\Public\x", r"C:\Users\Public\x"),
+            // Redirected profiles in any case, either separator, at the end.
+            (REDIRECTED, r"dir=d:/profiles/name smith/x", r"dir=d:/profiles/[USER]/x"),
+            (REDIRECTED, r"home=D:\Profiles\Name Smith", r"home=D:\Profiles\[USER]"),
+            (REDIRECTED, r"home=D:\Profiles\Name Smith: next=1", r"home=D:\Profiles\[USER]: next=1"),
+            (NONE, r"home=D:\Profiles\Name Smith\x", r"home=D:\Profiles\Name Smith\x"),
             (NONE, "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=Headphones (Maria's AirPods) form_factor=headphones bus=BTHENUM",
                 "2026-10-22T18:00:00.000000Z  INFO WASAPI loopback active device=[AUDIO-DEVICE] form_factor=headphones bus=BTHENUM"),
             (NAME_SMITH, r"home=C:\Users\Name Smith", r"home=C:\Users\[USER]"),
@@ -1250,12 +1392,16 @@ mod tests {
             (NONE, r"path=C:\Users\All Users\x", r"path=C:\Users\All Users\x"),
             (NONE, r"member=BUILTIN\Users\group", r"member=BUILTIN\Users\group"),
             (NONE, r"path=C:\Program Files\EternalMonitor", r"path=C:\Program Files\EternalMonitor"),
-            // Profiles not on this PC: one segment, never past whitespace.
+            // Profiles not on this PC.
             (NONE, r"Host panic at C:\Users\bob\.cargo\registry\src\renderer.rs:984:17:",
                 r"Host panic at C:\Users\[USER]\.cargo\registry\src\renderer.rs:984:17:"),
             (NONE, r"home=C:\Users\bob next=1", r"home=C:\Users\[USER] next=1"),
-            (NONE, r"home=C:\Users\bob, next=1", r"home=C:\Users\[USER], next=1"),
-            (NONE, r"home=C:\Users\Bob Smith\x", r"home=C:\Users\[USER] Smith\x"),
+            (NONE, r"home=C:\Users\bob, next=1", r"home=C:\Users\[USER] next=1"),
+            (NONE, r"home=C:\Users\Bob Smith\x", r"home=C:\Users\[USER]\x"),
+            (NONE, r"path=C:\Users\bob was not found", r"path=C:\Users\[USER]"),
+            // The residual: long free text after an unknown profile.
+            (NONE, r"path=C:\Users\bob could not be opened because the disk is full",
+                r"path=C:\Users\[USER] could not be opened because the disk is full"),
             (NONE, "panicked at /Users/bob/src/main.rs:1:1", "panicked at /Users/[USER]/src/main.rs:1:1"),
             (NONE, "dir=/home/bob/.config", "dir=/home/[USER]/.config"),
             (&["/home/Name Smith"], "dir=/home/Name Smith next=1", "dir=/home/[USER] next=1"),
@@ -1271,8 +1417,9 @@ mod tests {
         assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     }
 
-    /// What the registry's profile list feeds in: only personal folders
-    /// directly under `Users` (or `home`), longest first.
+    /// What the registry's profile list feeds in: personal folders directly
+    /// under `Users` (or `home`), longest first, and redirected profiles,
+    /// never Windows' service profiles.
     #[test]
     fn the_profile_list_keeps_personal_folders_under_users() {
         let names = Names::new(
@@ -1285,10 +1432,16 @@ mod tests {
                 r"C:\Users\Default",
                 r"C:\users\a\",
                 "/home/bob",
+                r"D:\Profiles\Name Smith",
+                r"d:\profiles\name smith\",
             ],
             None,
         );
         assert_eq!(names.profiles, ["A Smith", "bob", "A"]);
+        assert_eq!(
+            names.redirected,
+            [(r"D:\Profiles".to_owned(), "Name Smith".to_owned())]
+        );
     }
 
     #[test]
