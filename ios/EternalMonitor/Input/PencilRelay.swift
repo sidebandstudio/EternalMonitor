@@ -61,6 +61,8 @@ struct PencilReading {
 /// Only final readings away from the lift count: UIKit can send an estimated
 /// force first, and every force falls as the tip lifts. On iPad one measured
 /// force means a sensor, for good, as iPad has always sent what it measures.
+/// Every other lesson takes a completed stroke: a palm, a rotation or the next
+/// touch-down can cancel one on readings no finished stroke would send.
 /// "No sensor" takes a stroke of several final readings, all 0, with no
 /// estimated force above 0 either, so a short tap teaches nothing. iPhone takes
 /// only the USB-C Pencil and starts without pressure; it believes a sensor only
@@ -126,11 +128,12 @@ struct PencilPressure: Equatable {
     }
 
     mutating func strokeEnded(completed: Bool) {
+        guard completed else { return }
         if needsVariation && stroke.finalReadings >= 2
             && stroke.highest - stroke.lowest >= Self.variationForPressure {
             sensor = .pressure
         }
-        if completed && sensor == .unknown && stroke.finalReadings >= Self.zeroReadingsForNoSensor
+        if sensor == .unknown && stroke.finalReadings >= Self.zeroReadingsForNoSensor
             && stroke.highest == 0 && !stroke.estimatedForce {
             sensor = .none
         }

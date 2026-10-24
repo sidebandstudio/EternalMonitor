@@ -199,6 +199,36 @@ final class DuoPencilTests: XCTestCase {
         XCTAssertEqual(estimated.pressure.sensor, .none)
     }
 
+    /// Sol's noisy stroke, final readings of 1 and 51, teaches iPhone nothing
+    /// when it is cancelled, so a constant 1 afterwards still draws at 500.
+    func testACancelledStrokeTeachesIPhoneNothing() {
+        var cancelled = PencilRelayMachine(pressure: phone)
+        _ = cancelled.began(reading(force: 0.004, time: 1))
+        _ = cancelled.moved(reading(force: 0.204, time: 2))
+        XCTAssertEqual(cancelled.ended(nil, cancelled: true).map(\.phase), [3])
+        XCTAssertEqual(cancelled.pressure.sensor, .none)
+        XCTAssertEqual(stroke(&cancelled, [0.004, 0.004, 0.004], from: 10), [500, 500, 500, 0])
+        // Ended by a second touch-down instead.
+        var replaced = PencilRelayMachine(pressure: phone)
+        _ = replaced.began(reading(force: 0.004, time: 1))
+        _ = replaced.moved(reading(force: 0.204, time: 2))
+        XCTAssertEqual(replaced.began(reading(force: 0.004, time: 3)).map(\.phase), [3, 0])
+        XCTAssertEqual(replaced.pressure.sensor, .none)
+        // A picture change cancels it in the view.
+        PencilPressure.session = phone
+        let view = relay()
+        view.onEvents = { _ in }
+        let light = Tip(force: 0.004)
+        view.touchesBegan([light], with: nil)
+        let heavier = Tip(force: 0.213)
+        heavier.sampleTime = 2
+        view.touchesMoved([light], with: Coalesced(light, [heavier]))
+        view.pictureFit = .fill
+        light.sampleTime = 3
+        view.touchesEnded([light], with: nil)
+        XCTAssertEqual(PencilPressure.session.sensor, .none)
+    }
+
     /// A second touch-down while a stroke is down ends it, and what it taught
     /// is kept rather than replaced by the session's older lesson.
     func testATouchDownMidStrokeKeepsItsLesson() {
