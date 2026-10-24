@@ -101,6 +101,8 @@ jobs:
 
   archive:
     name: Archive and upload to EternalMonitor Duo Beta (Xcode 27.1)
+    # Only this branch signs and uploads, even from a manual dispatch.
+    if: github.ref == 'refs/heads/feat/iphone-duo'
     runs-on: xcode-27
     timeout-minutes: 100
     env:
