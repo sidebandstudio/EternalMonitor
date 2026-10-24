@@ -1,19 +1,38 @@
-// Spike e: CGEvents posted into this app's own window, and what AppKit
-// delivers for them. In the second-screen gate the window fills the virtual
-// display and every position comes from a wire coordinate (0...65535)
-// mapped onto that display's bounds, as the host will map touches. Two paths: CGEventPostToPid (only this process can
-// receive it), then the HID tap the host will use, each event sent only
-// while this app is active, its window is key, and the location is inside
-// that window. Keys are plain characters; no ⌘ shortcut is ever sent.
+// Spike e: CGEvents posted at this app's own window, and what arrives. In
+// the second-screen gate the window covers the whole virtual display at
+// shielding level, and every position comes from a wire coordinate
+// (0...65535) mapped onto that display's bounds, as the host will map touches.
+//
+// Two paths. CGEventPostToPid, which only this process can receive. Then the
+// system (HID) path the host will use, guarded by the probe's own event tap
+// (ProbeTap), the last check before macOS delivers an event:
+//   - keys are recorded by the tap and swallowed there, so no app gets them;
+//   - mouse and pen events pass only inside the virtual display the window
+//     covers, with the probe frontmost and not annotated for another
+//     process; anything else is swallowed and is a failure;
+//   - no ⌘, ⌃, ⌥ or fn, and no modifier key events, on this path;
+//   - without the tap nothing is posted on this path, and if macOS turns
+//     the tap off, posting stops;
+//   - real input (someone moving the mouse) stops the run at once.
+// Every event carries a tag and sequence number, and what arrives is matched
+// against what was posted: type, location within 1 pt, and order.
 import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 
 /// Logs every event AppKit delivers to it.
 final class EventView: NSView {
+    /// What arrived, for matching against what was posted.
+    struct Record {
+        let userData: Int64
+        let type: String
+        let point: CGPoint?
+        let keyCode: Int?
+        let chars: String?
+    }
+
     private(set) var received: [String] = []
-    /// Where the last pointer event landed, in CG global coordinates.
-    private(set) var lastGlobal: CGPoint?
+    private(set) var records: [Record] = []
     private var tracking: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool { true }
@@ -35,14 +54,22 @@ final class EventView: NSView {
         ])
     }
 
+    func seen(run: UInt64) -> [SeenEvent] {
+        records.map { SeenEvent(seq: ProbeTag.seq($0.userData, run: run), type: $0.type, point: $0.point, keyCode: $0.keyCode, chars: $0.chars) }
+    }
+
+    func has(run: UInt64, seq: Int) -> Bool { records.contains { ProbeTag.seq($0.userData, run: run) == seq } }
+
     private func record(_ event: NSEvent, _ detail: String = "") {
         let p = convert(event.locationInWindow, from: nil)
-        var line = "\(event.type.rawValue):\(Self.name(event.type)) at=(\(String(format: "%.1f,%.1f", p.x, p.y)))"
-        if let window, ![.keyDown, .keyUp, .flagsChanged].contains(event.type) {
+        let userData = event.cgEvent?.getIntegerValueField(.eventSourceUserData) ?? 0
+        var line = "\(event.type.rawValue):\(eventName(event.type.rawValue)) tag=0x\(String(UInt64(bitPattern: userData), radix: 16)) at=(\(String(format: "%.1f,%.1f", p.x, p.y)))"
+        let isKey = [.keyDown, .keyUp, .flagsChanged].contains(event.type)
+        var global: CGPoint?
+        if let window, !isKey {
             let screen = window.convertPoint(toScreen: event.locationInWindow)
-            let global = CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.height ?? 0) - screen.y)
-            lastGlobal = global
-            line += String(format: " global=(%.2f,%.2f)", global.x, global.y)
+            global = CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.height ?? 0) - screen.y)
+            line += String(format: " global=(%.2f,%.2f)", global!.x, global!.y)
         }
         switch event.type {
         case .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .mouseMoved:
@@ -53,20 +80,12 @@ final class EventView: NSView {
         default: break
         }
         if !detail.isEmpty { line += " " + detail }
+        records.append(Record(userData: userData, type: eventName(event.type.rawValue), point: global,
+                              keyCode: isKey ? Int(event.keyCode) : nil,
+                              chars: [.keyDown, .keyUp].contains(event.type) ? event.characters : nil))
         received.append(line)
         Log.line("RECV \(line)")
         needsDisplay = true
-    }
-
-    static func name(_ type: NSEvent.EventType) -> String {
-        switch type {
-        case .leftMouseDown: "leftDown"; case .leftMouseUp: "leftUp"; case .leftMouseDragged: "leftDragged"
-        case .rightMouseDown: "rightDown"; case .rightMouseUp: "rightUp"; case .otherMouseDown: "otherDown"
-        case .otherMouseUp: "otherUp"; case .mouseMoved: "moved"; case .scrollWheel: "scroll"
-        case .keyDown: "keyDown"; case .keyUp: "keyUp"; case .flagsChanged: "flagsChanged"
-        case .tabletPoint: "tabletPoint"; case .tabletProximity: "tabletProximity"
-        default: "type\(type.rawValue)"
-        }
     }
 
     override func mouseDown(with e: NSEvent) { record(e) }
@@ -99,6 +118,135 @@ final class EventView: NSView {
             detail += " chars=\"\(chars)\" utf16=\(chars.utf16.map { String(format: "%04x", $0) }.joined(separator: " "))"
         }
         return detail
+    }
+}
+
+/// The probe's own event tap: at the annotated session tap, appended last,
+/// so it sees each event just before macOS delivers it, after the target
+/// process is known. It runs on a thread of its own, so it always answers in
+/// time. TapPolicy decides; this records what it saw.
+final class ProbeTap: @unchecked Sendable {
+    struct Seen {
+        let userData: Int64
+        let type: CGEventType
+        let location: CGPoint
+        let keyCode: Int
+        let chars: String
+        let targetPID: Int32
+        let decision: TapDecision
+    }
+
+    private let lock = NSLock()
+    private var state = TapState(ownPID: getpid())
+    private var seenEvents: [Seen] = []
+    private var firstInput: String?
+    private var disabledBy: String?
+    private var port: CFMachPort?
+    private var runLoop: CFRunLoop?
+
+    /// Installs the tap, or returns nil if macOS refuses it (then nothing is
+    /// posted on the system path).
+    static func install() -> ProbeTap? {
+        let tap = ProbeTap()
+        let callback: CGEventTapCallBack = { _, type, event, info in
+            Unmanaged<ProbeTap>.fromOpaque(info!).takeUnretainedValue().handle(type, event)
+        }
+        guard let port = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .tailAppendEventTap, options: .defaultTap,
+                                           eventsOfInterest: ~CGEventMask(0), callback: callback,
+                                           userInfo: Unmanaged.passUnretained(tap).toOpaque()) else { return nil }
+        tap.port = port
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            let source = CFMachPortCreateRunLoopSource(nil, port, 0)
+            tap.lock.lock()
+            tap.runLoop = CFRunLoopGetCurrent()
+            tap.lock.unlock()
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: port, enable: true)
+            ready.signal()
+            CFRunLoopRun()
+        }
+        thread.name = "probe.tap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        guard ready.wait(timeout: .now() + 2) == .success, CGEvent.tapIsEnabled(tap: port) else {
+            tap.remove()
+            return nil
+        }
+        return tap
+    }
+
+    func remove() {
+        lock.lock()
+        let loop = runLoop
+        lock.unlock()
+        if let port {
+            CGEvent.tapEnable(tap: port, enable: false)
+            CFMachPortInvalidate(port)
+        }
+        if let loop { CFRunLoopStop(loop) }
+    }
+
+    func update(_ change: (inout TapState) -> Void) {
+        lock.lock()
+        change(&state)
+        lock.unlock()
+    }
+
+    /// Why posting must stop now: the tap is off, or someone used the Mac.
+    var problem: String? {
+        lock.lock()
+        let input = firstInput
+        lock.unlock()
+        return offReason ?? input.map { "real input: \($0)" }
+    }
+
+    /// Set once the tap can no longer stop anything; then nothing is posted.
+    var offReason: String? {
+        lock.lock()
+        let disabled = disabledBy
+        lock.unlock()
+        if let disabled { return "macOS turned the tap off (\(disabled))" }
+        guard let port, CGEvent.tapIsEnabled(tap: port) else { return "the tap is not enabled" }
+        return nil
+    }
+
+    func seen(run: UInt64) -> [(seq: Int, event: Seen)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return seenEvents.compactMap { event in ProbeTag.seq(event.userData, run: run).map { ($0, event) } }
+    }
+
+    private func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            lock.lock()
+            disabledBy = type == .tapDisabledByTimeout ? "timeout" : "user input"
+            lock.unlock()
+            return Unmanaged.passUnretained(event)
+        }
+        let userData = event.getIntegerValueField(.eventSourceUserData)
+        let target = Int32(truncatingIfNeeded: event.getIntegerValueField(.eventTargetUnixProcessID))
+        lock.lock()
+        defer { lock.unlock() }
+        let decision = TapPolicy.decide(type: type, userData: userData, location: event.location, flags: event.flags,
+                                        targetPID: target, state: state)
+        if decision == .passThrough {
+            if TapPolicy.isInput(type), firstInput == nil {
+                firstInput = String(format: "%@ at (%.0f,%.0f)", eventName(UInt(type.rawValue)), event.location.x, event.location.y)
+            }
+        } else {
+            var chars = ""
+            if TapPolicy.keyTypes.contains(type) {
+                var length = 0
+                var units = [UniChar](repeating: 0, count: 8)
+                event.keyboardGetUnicodeString(maxStringLength: units.count, actualStringLength: &length, unicodeString: &units)
+                chars = String(utf16CodeUnits: units, count: length)
+            }
+            seenEvents.append(Seen(userData: userData, type: type, location: event.location,
+                                   keyCode: Int(event.getIntegerValueField(.keyboardEventKeycode)), chars: chars,
+                                   targetPID: target, decision: decision))
+        }
+        return decision.swallowed ? nil : Unmanaged.passUnretained(event)
     }
 }
 
@@ -161,9 +309,10 @@ struct EventSpike {
         return event
     }
 
-    private func proximity(_ enter: Bool, _ source: CGEventSource) -> CGEvent {
+    private func proximity(_ enter: Bool, at: CGPoint, _ source: CGEventSource) -> CGEvent {
         let event = CGEvent(source: source)!
         event.type = .tabletProximity
+        event.location = at
         let fields: [(CGEventField, Int64)] = [
             (.tabletProximityEventVendorID, 0x56a), (.tabletProximityEventTabletID, 1), (.tabletProximityEventPointerID, 1),
             (.tabletProximityEventDeviceID, deviceID), (.tabletProximityEventSystemTabletID, 1),
@@ -192,9 +341,31 @@ struct EventSpike {
         return event
     }
 
-    private func sequence(_ source: CGEventSource) -> [(String, CGEvent)] {
+    /// One event of the sequence.
+    private struct Step {
+        let name: String
+        let event: CGEvent
+        /// Also sent on the system path. Modifier keys only go to this process.
+        var systemPath = true
+        /// The characters a keyDown must deliver (only for Unicode-string
+        /// events; keycode events depend on the keyboard layout).
+        var chars: String?
+        /// Whether its location is checked (pointer events).
+        var located = true
+
+        var isKey: Bool { [.keyDown, .keyUp, .flagsChanged].contains(event.type) }
+
+        func expected(_ seq: Int) -> PostedEvent {
+            PostedEvent(seq: seq, name: name, type: eventName(UInt(event.type.rawValue)),
+                        point: located && !isKey ? event.location : nil,
+                        keyCode: isKey ? Int(event.getIntegerValueField(.keyboardEventKeycode)) : nil,
+                        chars: event.type == .keyDown ? chars : nil)
+        }
+    }
+
+    private func sequence(_ source: CGEventSource) -> [Step] {
         // Inside the event view either way: on the virtual display the window
-        // fills the screen below its status strip, which ends near y=0.3.
+        // covers the screen and the view fills it below the status strip.
         let a = globalPoint(0.3, 0.55), b = globalPoint(0.5, 0.6), c = globalPoint(0.7, 0.45)
         let scrollPixels = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -40, wheel2: 10, wheel3: 0)!
         scrollPixels.location = b
@@ -211,81 +382,192 @@ struct EventSpike {
         pure.setDoubleValueField(.tabletEventTiltX, value: -0.25)
         pure.setDoubleValueField(.tabletEventTiltY, value: 0.5)
         return [
-            ("move", mouse(.mouseMoved, a, .left, source)),
-            ("left down", mouse(.leftMouseDown, a, .left, source)),
-            ("left drag", mouse(.leftMouseDragged, b, .left, source)),
-            ("left up", mouse(.leftMouseUp, b, .left, source)),
-            ("right down", mouse(.rightMouseDown, b, .right, source)),
-            ("right up", mouse(.rightMouseUp, b, .right, source)),
-            ("scroll pixels dy=-40 dx=10", scrollPixels),
-            ("scroll lines dy=3 dx=-1", scrollLines),
-            ("key a down", key(CGKeyCode(kVK_ANSI_A), true, [], source)),
-            ("key a up", key(CGKeyCode(kVK_ANSI_A), false, [], source)),
-            ("shift down", key(CGKeyCode(kVK_Shift), true, shift, source)),
-            ("key A (shift) down", key(CGKeyCode(kVK_ANSI_A), true, shift, source)),
-            ("key A (shift) up", key(CGKeyCode(kVK_ANSI_A), false, shift, source)),
-            ("shift up", key(CGKeyCode(kVK_Shift), false, [], source)),
-            ("unicode é", unicode("é", true, source)),
-            ("unicode é up", unicode("é", false, source)),
-            ("unicode 😀 (one event)", unicode("😀", true, source)),
-            ("unicode 😀 up", unicode("😀", false, source)),
-            ("pen proximity enter", proximity(true, source)),
-            ("pen down p=0.25 tilt=(0.4,-0.6) rot=47.5", pen(.leftMouseDown, a, pressure: 0.25, tilt: (0.4, -0.6), rotation: 47.5, source)),
-            ("pen drag p=0.5", pen(.leftMouseDragged, b, pressure: 0.5, tilt: (0.2, -0.3), rotation: 50, source)),
-            ("pen drag p=0.733989", pen(.leftMouseDragged, c, pressure: 0.733989, tilt: (0.416639, -0.666646), rotation: 47.5, source)),
-            ("pen up", pen(.leftMouseUp, c, pressure: 0, tilt: (0, 0), rotation: 0, source)),
-            ("pure tablet point p=0.6 tilt=(-0.25,0.5)", pure),
-            ("pen proximity exit", proximity(false, source)),
+            Step(name: "move", event: mouse(.mouseMoved, a, .left, source)),
+            Step(name: "left down", event: mouse(.leftMouseDown, a, .left, source)),
+            Step(name: "left drag", event: mouse(.leftMouseDragged, b, .left, source)),
+            Step(name: "left up", event: mouse(.leftMouseUp, b, .left, source)),
+            Step(name: "right down", event: mouse(.rightMouseDown, b, .right, source)),
+            Step(name: "right up", event: mouse(.rightMouseUp, b, .right, source)),
+            Step(name: "scroll pixels dy=-40 dx=10", event: scrollPixels),
+            Step(name: "scroll lines dy=3 dx=-1", event: scrollLines),
+            Step(name: "key a down", event: key(CGKeyCode(kVK_ANSI_A), true, [], source)),
+            Step(name: "key a up", event: key(CGKeyCode(kVK_ANSI_A), false, [], source)),
+            Step(name: "shift down", event: key(CGKeyCode(kVK_Shift), true, shift, source), systemPath: false),
+            Step(name: "key A (shift) down", event: key(CGKeyCode(kVK_ANSI_A), true, shift, source)),
+            Step(name: "key A (shift) up", event: key(CGKeyCode(kVK_ANSI_A), false, shift, source)),
+            Step(name: "shift up", event: key(CGKeyCode(kVK_Shift), false, [], source), systemPath: false),
+            Step(name: "unicode é", event: unicode("é", true, source), chars: "é"),
+            Step(name: "unicode é up", event: unicode("é", false, source)),
+            Step(name: "unicode 😀 (one event)", event: unicode("😀", true, source), chars: "😀"),
+            Step(name: "unicode 😀 up", event: unicode("😀", false, source)),
+            Step(name: "pen proximity enter", event: proximity(true, at: a, source), located: false),
+            Step(name: "pen down p=0.25 tilt=(0.4,-0.6) rot=47.5", event: pen(.leftMouseDown, a, pressure: 0.25, tilt: (0.4, -0.6), rotation: 47.5, source)),
+            Step(name: "pen drag p=0.5", event: pen(.leftMouseDragged, b, pressure: 0.5, tilt: (0.2, -0.3), rotation: 50, source)),
+            Step(name: "pen drag p=0.733989", event: pen(.leftMouseDragged, c, pressure: 0.733989, tilt: (0.416639, -0.666646), rotation: 47.5, source)),
+            Step(name: "pen up", event: pen(.leftMouseUp, c, pressure: 0, tilt: (0, 0), rotation: 0, source)),
+            Step(name: "pure tablet point p=0.6 tilt=(-0.25,0.5)", event: pure),
+            Step(name: "pen proximity exit", event: proximity(false, at: c, source), located: false),
         ]
     }
 
-    /// True while an event may go to the HID tap: this app active, its
-    /// window key, and the event's location inside that window.
-    private func safeForHID(_ event: CGEvent) -> Bool {
-        guard NSApp.isActive, app.window.isKeyWindow, NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() else { return false }
-        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-        let cocoa = NSPoint(x: event.location.x, y: mainHeight - event.location.y)
-        let isKey = [.keyDown, .keyUp, .flagsChanged].contains(event.type)
-        return isKey || app.window.frame.contains(cocoa)
+    private func waitFor(_ seconds: Double, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return true
     }
 
-    private static let pointerTypes: Set<CGEventType> = [.mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp]
+    /// This app active, its window key, and macOS agreeing it is frontmost.
+    private func frontmost() -> Bool {
+        NSApp.isActive && app.window.isKeyWindow && NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid()
+    }
 
-    private func post(_ path: String) async -> (sent: Int, delivered: Int, maxErrorPt: Double, offDisplay: Int) {
-        guard let source = CGEventSource(stateID: .privateState) else { return (0, 0, 0, 0) }
-        var sent = 0, delivered = 0, offDisplay = 0
-        var maxError = 0.0
-        for (name, event) in sequence(source) {
-            if path == "pid" {
-                event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(app.window.windowNumber))
-                event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(app.window.windowNumber))
+    private func report(_ label: String, _ match: MatchReport) {
+        Log.result("events_\(label.replacingOccurrences(of: " ", with: "_"))", [
+            ("expected", match.expected), ("matched", match.matched), ("missing", match.missing.count),
+            ("wrong", match.mismatched.count), ("out_of_order", match.outOfOrder.count),
+            ("max_pointer_error_pt", String(format: "%.2f", match.maxErrorPt)), ("untagged", match.untagged),
+        ])
+        Log.check(match.passed, "\(label): every posted event arrived, in order, of the right type, within 1 pt — \(match.summary)")
+    }
+
+    /// CGEventPostToPid: only this process can receive these.
+    private func postToPid(_ steps: [Step], tap: ProbeTap?) async {
+        let run = ProbeTag.newRun()
+        tap?.update { $0.pidRun = run }
+        for (seq, step) in steps.enumerated() {
+            if let problem = tap?.problem {
+                Log.check(false, "\(where_) pid: stopped before #\(seq) \"\(step.name)\": \(problem)")
+                break
             }
-            let before = app.events.received.count
-            if path == "pid" {
-                event.postToPid(getpid())
-            } else {
-                guard safeForHID(event) else {
-                    Log.check(false, "hid: stopped before \"\(name)\": the probe is no longer frontmost with its window key")
-                    break
-                }
-                event.post(tap: .cghidEventTap)
-            }
-            sent += 1
-            Log.line("SENT \(path) \(name) type=\(event.type.rawValue)")
-            for _ in 0..<15 where app.events.received.count == before {
-                try? await Task.sleep(nanoseconds: 20_000_000)
-            }
-            let got = app.events.received.count - before
-            if got > 0 { delivered += 1 }
-            if got > 0, Self.pointerTypes.contains(event.type), let landed = app.events.lastGlobal {
-                let error = hypot(landed.x - event.location.x, landed.y - event.location.y)
-                maxError = max(maxError, error)
-                if let display, !CGDisplayBounds(display).contains(landed) { offDisplay += 1 }
-                Log.line(String(format: "  sent at (%.2f,%.2f) landed at (%.2f,%.2f) error %.2f pt", event.location.x, event.location.y, landed.x, landed.y, error))
-            }
-            Log.line("\(got > 0 ? "GOT" : "MISSING") \(path) \(name)\(got > 1 ? " (+\(got - 1) more)" : "")")
+            step.event.setIntegerValueField(.eventSourceUserData, value: ProbeTag.make(run: run, seq: seq))
+            step.event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(app.window.windowNumber))
+            step.event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(app.window.windowNumber))
+            step.event.postToPid(getpid())
+            Log.line("SENT pid #\(seq) \(step.name) type=\(step.event.type.rawValue)")
+            let got = await waitFor(0.3) { app.events.has(run: run, seq: seq) }
+            Log.line("\(got ? "GOT" : "MISSING") pid #\(seq) \(step.name)")
         }
-        return (sent, delivered, maxError, offDisplay)
+        // Against the whole sequence: anything not sent is missing.
+        report("\(where_) pid", SequenceMatcher.match(steps.enumerated().map { $1.expected($0) }, app.events.seen(run: run)))
+    }
+
+    /// The system path, only through the tap.
+    private func postToSystem(_ all: [Step], tap: ProbeTap?, source: CGEventSource) async {
+        let label = "\(where_) hid"
+        guard let tap else {
+            Log.check(false, "\(label): skipped; the probe's event tap could not be installed, and nothing is posted on the system path without it")
+            return
+        }
+        var bounds: CGRect?
+        if let display {
+            let covered = app.covers(display)
+            Log.check(covered, "\(label): the probe window covers virtual display \(display) at shielding level")
+            if covered { bounds = CGDisplayBounds(display) }
+        } else {
+            Log.line("INFO \(label): mouse and pen events go on the system path only on the virtual display (spike c); this baseline sends keys only")
+        }
+        let steps = all.filter { $0.systemPath && (bounds != nil || $0.isKey) }
+        let run = ProbeTag.newRun()
+        tap.update {
+            $0.systemRun = run
+            $0.display = bounds
+        }
+        let observers = [
+            NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
+                let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+                tap.update { $0.frontmost = pid == getpid() }
+            },
+            NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { _ in
+                tap.update { $0.frontmost = false }
+            },
+        ]
+        defer {
+            NSWorkspace.shared.notificationCenter.removeObserver(observers[0])
+            NotificationCenter.default.removeObserver(observers[1])
+            tap.update {
+                $0.systemRun = nil
+                $0.frontmost = false
+            }
+        }
+
+        var stopped: String?
+        var held: [String: CGEvent] = [:] // the release for each button or key still down
+        var seq = 0
+        for step in steps {
+            if let problem = tap.problem { stopped = "before #\(seq) \"\(step.name)\": \(problem)"; break }
+            let front = frontmost()
+            tap.update { $0.frontmost = front }
+            guard front else { stopped = "before #\(seq) \"\(step.name)\": the probe is no longer frontmost"; break }
+            let event = step.event
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            switch event.type {
+            case .leftMouseDown: held["left"] = mouse(.leftMouseUp, event.location, .left, source)
+            case .rightMouseDown: held["right"] = mouse(.rightMouseUp, event.location, .right, source)
+            case .keyDown: held["key \(keyCode)"] = key(CGKeyCode(keyCode), false, [], source)
+            case .leftMouseUp: held["left"] = nil
+            case .rightMouseUp: held["right"] = nil
+            case .keyUp: held["key \(keyCode)"] = nil
+            default: break
+            }
+            post(event, step.name, run: run, seq: seq)
+            seq += 1
+            guard let seen = await waitForTap(tap, run: run, seq: seq - 1) else {
+                stopped = "the tap never saw #\(seq - 1) \"\(step.name)\""
+                break
+            }
+            Log.line("TAP hid #\(seq - 1) \(step.name): \(seen.decision) target_pid=\(seen.targetPID)")
+            if case .swallow(let why) = seen.decision { stopped = "#\(seq - 1) \"\(step.name)\" was swallowed: \(why)"; break }
+            if seen.decision == .deliver {
+                let got = await waitFor(0.3) { app.events.has(run: run, seq: seq - 1) }
+                Log.line("\(got ? "GOT" : "MISSING") hid #\(seq - 1) \(step.name)")
+            }
+        }
+        if let stopped {
+            Log.check(false, "\(label): stopped \(stopped)")
+            // Release whatever is still down, through the same tap and checks,
+            // unless the tap is off (then nothing more is posted).
+            for (what, release) in held where tap.offReason == nil {
+                post(release, "release \(what)", run: run, seq: seq)
+                let seen = await waitForTap(tap, run: run, seq: seq)
+                Log.line("TAP hid #\(seq) release \(what): \(seen.map { "\($0.decision)" } ?? "not seen")")
+                seq += 1
+            }
+        }
+
+        let expected = steps.enumerated().map { $1.expected($0) }
+        let seen = tap.seen(run: run)
+        let unsafe = seen.filter { if case .swallow = $0.event.decision { true } else { false } }
+        for item in unsafe { Log.line("UNSAFE hid #\(item.seq): \(item.event.decision)") }
+        Log.check(unsafe.isEmpty, "\(label): no posted event was swallowed as unsafe (\(unsafe.count))")
+        Log.check(seen.allSatisfy { $0.event.decision != .deliver || !TapPolicy.keyTypes.contains($0.event.type) },
+                  "\(label): no key was let through the tap")
+        // Keys stop at the tap; pointer events must reach the window.
+        let keysAtTap = seen.filter { $0.event.decision == .swallowKey }.map {
+            SeenEvent(seq: $0.seq, type: eventName(UInt($0.event.type.rawValue)), point: nil, keyCode: $0.event.keyCode, chars: $0.event.chars)
+        }
+        report("\(where_) hid keys (recorded and swallowed by the tap)", SequenceMatcher.match(expected.filter { $0.keyCode != nil }, keysAtTap))
+        if bounds != nil {
+            report("\(where_) hid pointer", SequenceMatcher.match(expected.filter { $0.keyCode == nil }, app.events.seen(run: run)))
+        }
+    }
+
+    /// Tags and posts one event on the system path. Callers check the tap first.
+    private func post(_ event: CGEvent, _ name: String, run: UInt64, seq: Int) {
+        event.setIntegerValueField(.eventSourceUserData, value: ProbeTag.make(run: run, seq: seq))
+        event.post(tap: .cghidEventTap)
+        Log.line("SENT hid #\(seq) \(name) type=\(event.type.rawValue)")
+    }
+
+    private func waitForTap(_ tap: ProbeTap, run: UInt64, seq: Int) async -> ProbeTap.Seen? {
+        var found: ProbeTap.Seen?
+        _ = await waitFor(0.5) {
+            found = tap.seen(run: run).first { $0.seq == seq }?.event
+            return found != nil
+        }
+        return found
     }
 
     /// The edges of the wire range land on the virtual display and never on
@@ -314,20 +596,31 @@ struct EventSpike {
             Log.check(false, "spike e needs Accessibility; run --mode grant first")
             return
         }
+        guard let source = CGEventSource(stateID: .privateState) else {
+            Log.check(false, "spike e: no private event source")
+            return
+        }
         app.window.makeKeyAndOrderFront(nil)
         NSApp.activate()
         app.window.makeFirstResponder(app.events)
         try? await Task.sleep(nanoseconds: 500_000_000)
         let cursor = CGEvent(source: nil)?.location ?? .zero
-        if let display { checkEdges(display) }
-        for path in ["pid", "hid"] {
-            app.say("Spike e: posting events into this window (\(path)). Please don't click elsewhere for a few seconds.")
-            let (sent, delivered, maxError, offDisplay) = await post(path)
-            Log.result("events_\(where_)_\(path)", [("sent", sent), ("delivered", delivered),
-                                                      ("max_pointer_error_pt", String(format: "%.2f", maxError)), ("landed_off_display", offDisplay)])
-            Log.check(maxError <= 1, "\(where_) \(path): pointer events land within 1 pt of where they were sent (max \(String(format: "%.2f", maxError)))")
+        Cleanup.saveCursor(cursor)
+        defer {
+            CGWarpMouseCursorPosition(cursor) // back where Ali left it, however the run ends
+            Cleanup.saveCursor(nil)
+            Log.line("cursor restored to (\(cursor.x), \(cursor.y))")
         }
-        CGWarpMouseCursorPosition(cursor) // back where Ali left it
-        Log.line("cursor restored to (\(cursor.x), \(cursor.y))")
+        if let display {
+            checkEdges(display)
+            try? await Task.sleep(nanoseconds: 300_000_000) // let the warps settle before the tap watches for input
+        }
+        let tap = ProbeTap.install()
+        Log.check(tap != nil, "the probe's event tap is installed (annotated session, appended last)")
+        defer { tap?.remove() }
+        app.say("Spike e: posting events into this window (pid). Please don't touch the mouse or keyboard.")
+        await postToPid(sequence(source), tap: tap)
+        app.say("Spike e: posting events through the system path, guarded by the probe's tap. Please don't touch the mouse or keyboard.")
+        await postToSystem(sequence(source), tap: tap, source: source)
     }
 }

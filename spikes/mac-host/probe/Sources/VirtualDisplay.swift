@@ -6,7 +6,8 @@
 //      pixels, at 60 and 120 Hz;
 //   2. placement right of the main display, and whether it survives the
 //      display being recreated;
-//   3. capture (spike d) and input mapped onto its bounds (spike e);
+//   3. capture (spike d) and input mapped onto its bounds (spike e), with
+//      encode at 120 fps tested at the Duo outer size;
 //   4. removal within 2 s after mode changes (macOS 26 reportedly stops
 //      removing a display whose mode was changed), recreation with another
 //      mode, and a third creation after that;
@@ -79,12 +80,37 @@ enum Displays {
         let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         return (CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode]) ?? []
     }
+
+    /// The probe's own virtual displays that are online.
+    static func probes() -> [CGDirectDisplayID] {
+        online().filter { CGDisplayVendorNumber($0) == VirtualDisplaySpike.vendorID }
+    }
+
+    /// `--mode displays`, for probe.sh after every run: lists the online
+    /// displays, marking the probe's own. Creates nothing.
+    static func list() -> Never {
+        for id in online() {
+            let bounds = CGDisplayBounds(id)
+            print(String(format: "DISPLAY id=%u vendor=0x%x model=0x%x serial=0x%x bounds=(%.0f,%.0f %.0fx%.0f) probe=%d",
+                         id, CGDisplayVendorNumber(id), CGDisplayModelNumber(id), CGDisplaySerialNumber(id),
+                         bounds.minX, bounds.minY, bounds.width, bounds.height, probes().contains(id) ? 1 : 0))
+        }
+        print("PROBE_DISPLAYS \(probes().count)")
+        exit(0)
+    }
 }
 
 /// `--mode vd-child [--exit]`: creates a display, prints `READY <id>`, then
-/// either waits to be killed or exits without releasing it.
+/// either waits to be killed or exits without releasing it. It never
+/// outlives its parent or 20 s.
 enum VirtualDisplayChild {
     static func run() -> Never {
+        let parent = getppid()
+        Watchdog.arm(seconds: 20) {}
+        let parentWatch = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit, queue: .global())
+        parentWatch.setEventHandler { _exit(0) }
+        parentWatch.resume()
+        if getppid() != parent { _exit(0) }
         var spec = VirtualDisplaySpec.inner
         spec.serial = VirtualDisplaySpike.serial + 1 // never collides with the parent's
         guard let display = spec.make(queue: .main) else {
@@ -100,7 +126,7 @@ enum VirtualDisplayChild {
             usleep(300_000)
             exit(0) // no release: does the display outlive the process?
         }
-        withExtendedLifetime(display) { dispatchMain() }
+        withExtendedLifetime((display, parentWatch)) { dispatchMain() }
     }
 }
 
@@ -187,18 +213,17 @@ struct VirtualDisplaySpike {
                                  ("right_of_main_at_top", bounds.minX == main.maxX && bounds.minY == main.minY)])
     }
 
-    /// The probe window fills `id`'s visible frame (or goes back to the main
-    /// display), so its animation drives capture there and input lands in it.
+    /// The probe window covers all of `id` at shielding level (or goes back
+    /// to a normal window on the main display), so its animation drives
+    /// capture there and nothing else can be under the pointer.
     private func moveWindow(to id: CGDirectDisplayID?) async {
-        let screen = id.flatMap(Displays.screen) ?? NSScreen.screens.first
-        guard let screen else { return }
-        if id != nil {
-            app.window.setFrame(screen.visibleFrame.insetBy(dx: 8, dy: 8), display: true)
+        if let id, let screen = Displays.screen(id) {
+            app.cover(screen)
         } else {
-            app.window.setFrame(NSRect(x: screen.visibleFrame.minX + 200, y: screen.visibleFrame.minY + 200, width: 900, height: 620), display: true)
+            app.uncover()
         }
-        app.window.makeKeyAndOrderFront(nil)
         try? await Task.sleep(nanoseconds: 300_000_000)
+        if let id { Log.check(app.covers(id), "the probe window covers display \(id) at shielding level") }
     }
 
     /// Releases the display and checks it is gone within 2 s.
@@ -214,41 +239,36 @@ struct VirtualDisplaySpike {
 
     /// A child process owns a display; it is killed, or exits without
     /// releasing it. The display must go with it.
+    /// The child runs in a process group of its own and is only ever stopped
+    /// by PID; every wait on it has a deadline.
     private func processDeath(exitNormally: Bool) async {
         let label = exitNormally ? "child exits without releasing" : "child killed (SIGKILL)"
-        let child = Process()
-        child.executableURL = Bundle.main.executableURL
-        child.arguments = ["--mode", "vd-child"] + (exitNormally ? ["--exit"] : [])
-        let pipe = Pipe()
-        child.standardOutput = pipe
-        do { try child.run() } catch {
+        let child: ChildProcess
+        do {
+            child = try ChildProcess.spawn(Bundle.main.executablePath ?? "", ["--mode", "vd-child"] + (exitNormally ? ["--exit"] : []))
+        } catch {
             Log.check(false, "\(label): could not start child: \(error)")
             return
         }
-        var output = ""
-        let readDeadline = Date().addingTimeInterval(6)
-        while !output.contains("\n"), Date() < readDeadline {
-            if let chunk = try? pipe.fileHandleForReading.read(upToCount: 64), !chunk.isEmpty {
-                output += String(decoding: chunk, as: UTF8.self)
-            } else {
-                try? await Task.sleep(nanoseconds: 20_000_000)
-            }
+        ChildRegistry.add(child.pid)
+        defer {
+            if !child.stop() { Log.check(false, "\(label): child pid \(child.pid) still running after SIGKILL") }
+            ChildRegistry.remove(child.pid)
         }
-        guard output.hasPrefix("READY"), let id = CGDirectDisplayID(output.split(separator: " ").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") else {
-            Log.check(false, "\(label): child did not create a display (\(output.trimmingCharacters(in: .whitespacesAndNewlines)))")
-            child.terminate()
+        let line = await Task.detached { child.readLine(timeout: 6) }.value ?? ""
+        guard line.hasPrefix("READY"), let id = CGDirectDisplayID(line.split(separator: " ").last ?? "") else {
+            Log.check(false, "\(label): child did not report a display within 6 s (\(line.isEmpty ? child.pending : line)); killed by PID")
             return
         }
-        Log.check(Displays.online().contains(id), "\(label): child pid \(child.processIdentifier) owns display \(id)")
+        Log.check(Displays.online().contains(id), "\(label): child pid \(child.pid) owns display \(id)")
         let start = Date()
-        if !exitNormally { kill(child.processIdentifier, SIGKILL) }
-        let exited = await waitFor(5) { !child.isRunning }
-        let gone = await waitFor(5) { !Displays.online().contains(id) }
-        let sinceDeath = gone.map { $0 - (exited ?? 0) }
+        if !exitNormally { child.signal(SIGKILL) }
+        let exited = await Task.detached { child.waitExit(timeout: 5) }.value
+        let gone = await waitFor(5) { !Displays.online().contains(id) } // measured from the exit
         Log.result("process_death", [("case", "\"\(label)\""), ("child_exited_ms", exited.map { String(format: "%.0f", $0 * 1000) } ?? "no"),
-                                     ("display_gone_ms_after_exit", sinceDeath.map { String(format: "%.0f", $0 * 1000) } ?? "no"),
+                                     ("display_gone_ms_after_exit", gone.map { String(format: "%.0f", $0 * 1000) } ?? "no"),
                                      ("total_ms", String(format: "%.0f", Date().timeIntervalSince(start) * 1000))])
-        Log.check(gone != nil && (sinceDeath ?? 99) <= 2, "\(label): display \(id) went away with the process")
+        Log.check(exited != nil && gone.map { $0 <= 2 } ?? false, "\(label): display \(id) went away with the process")
     }
 
     func run() async {
@@ -265,7 +285,7 @@ struct VirtualDisplaySpike {
             await moveWindow(to: id)
             app.say("Second-screen gate: capturing the virtual display at \(Int(rate)) Hz")
             await CaptureSpike(app: app).capture(displayID: id, name: "virtual_\(Int(rate))hz", rates: [Int(rate)],
-                                                 idle: index == inner.rates.count - 1)
+                                                 idle: index == inner.rates.count - 1, gate: true)
         }
         app.say("Second-screen gate: input mapped onto the virtual display. Please don't touch the mouse or keyboard.")
         await EventSpike(app: app, display: id).run()
@@ -279,6 +299,12 @@ struct VirtualDisplaySpike {
         if let id2 = second?.displayID {
             logPlacement(id2, "outer, recreated after a placed inner (same vendor/product/serial)")
             await select(.outer, id2, rate: 120)
+            // Encode at 120 fps is tested here: the outer size stays on HEVC
+            // Main tier at 120, where full size is capped at 60.
+            await moveWindow(to: id2)
+            app.say("Second-screen gate: capturing and encoding the outer-size display at 120 Hz")
+            await CaptureSpike(app: app).capture(displayID: id2, name: "virtual_outer_120hz", rates: [120], idle: false,
+                                                 gate: true, expectEncodeFps: 120)
             await select(.outer, id2, rate: 60)
         }
         await remove(&second, "duo-outer after mode change 120→60")
@@ -295,6 +321,7 @@ struct VirtualDisplaySpike {
         await processDeath(exitNormally: false)
         await processDeath(exitNormally: true)
         Log.line("online after the gate: \(Displays.online().map(Displays.describe))")
+        Log.check(Displays.probes().isEmpty, "no probe virtual display is left online (\(Displays.probes()))")
         app.say("Second-screen gate: done; the virtual display is gone.")
     }
 }

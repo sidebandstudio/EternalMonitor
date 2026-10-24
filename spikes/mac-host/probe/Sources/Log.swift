@@ -42,6 +42,11 @@ enum Log {
         if !ok { failures += 1 }
         line("\(ok ? "PASS" : "FAIL") \(what)")
     }
+
+    /// An informational check: an INFO line, never counted as a failure.
+    static func info(_ ok: Bool, _ what: String) {
+        line("INFO \(ok ? "pass" : "fail") \(what)")
+    }
 }
 
 /// p50/p95/p99/max of a list, formatted to one decimal.

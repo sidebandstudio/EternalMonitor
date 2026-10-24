@@ -1,6 +1,29 @@
 // Spike d: ScreenCaptureKit capture of a display at 60 and 120 fps, the
 // idle-frame rate, capture latency, zero-copy encode through the host's
 // direct VideoToolbox encoder, decode of what it produced, and system audio.
+//
+// A capture passes only if, over a fixed window, it delivered about 0.9×
+// the target fps while the content changed every frame; the probe's content
+// marker (Measure.swift) reads back from captured and decoded frames with
+// the captured display's ID; the encoder kept up with its planned rate; and
+// the probe's tone was heard. Full-size HEVC is capped at 60 fps on Main
+// tier by design, so encode at 120 is tested at the Duo outer size; full size
+// at 120 (experimental High tier) is informational.
+
+/// Reads the probe's content marker from a 420v frame's luma plane.
+func readMarker(_ image: CVPixelBuffer, _ centres: [(Int, Int)]) -> (display: UInt16, counter: UInt16)? {
+    guard CVPixelBufferLockBaseAddress(image, .readOnly) == kCVReturnSuccess else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(image, 0) else { return nil }
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
+    let width = CVPixelBufferGetWidthOfPlane(image, 0), height = CVPixelBufferGetHeightOfPlane(image, 0)
+    var luma: [UInt8] = []
+    for (x, y) in centres {
+        guard x >= 0, y >= 0, x < width, y < height else { return nil }
+        luma.append(base.load(fromByteOffset: y * stride + x, as: UInt8.self))
+    }
+    return Marker.decode(luma)
+}
 import AVFoundation
 import AppKit
 import CoreMedia
@@ -17,8 +40,15 @@ final class AnnexBDecoder {
     private(set) var decoded = 0
     private(set) var failed = 0
     private(set) var size = (0, 0)
+    /// Where to read the content marker in decoded frames, and what was read.
+    private let markerCentres: [(Int, Int)]?
+    private(set) var markers = MarkerStats(display: 0)
 
-    init(hevc: Bool) { self.hevc = hevc }
+    init(hevc: Bool, markerCentres: [(Int, Int)]? = nil, display: UInt32 = 0) {
+        self.hevc = hevc
+        self.markerCentres = markerCentres
+        markers = MarkerStats(display: display)
+    }
 
     private func nalType(_ nal: Data) -> Int {
         hevc ? Int((nal[nal.startIndex] >> 1) & 0x3f) : Int(nal[nal.startIndex] & 0x1f)
@@ -77,6 +107,7 @@ final class AnnexBDecoder {
             if status == noErr, let image {
                 self.decoded += 1
                 self.size = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image))
+                if let centres = self.markerCentres { self.markers.add(readMarker(image, centres)) }
             } else {
                 self.failed += 1
             }
@@ -127,12 +158,17 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
     let label: String
     let fps: Int
     let pixelSize: (Int, Int)
+    let display: CGDirectDisplayID
+    /// Block centres of the probe's content marker in this display's frames,
+    /// or nil if the probe window's marker isn't on it.
+    let markerCentres: [(Int, Int)]?
     private let queue = DispatchQueue(label: "probe.capture", qos: .userInteractive)
     private var stream: SCStream?
 
     // Video
     private var statuses: [Int: Int] = [:]
     private var completeTimes: [UInt64] = []
+    private var captureMarkers: [(display: UInt16, counter: UInt16)?] = []
     private var latencyMs: [Double] = []
     private var surfaceBacked = 0
     private var formats: Set<String> = []
@@ -146,6 +182,8 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encodeUs: [Double] = []
     private var captureToEncodedMs: [Double] = []
     private var displayTimes: [UInt64: UInt64] = [:]
+    private var submitTimes: [UInt64: UInt64] = [:]
+    private var encodedSubmitTimes: [UInt64] = []
     private var encodedFrames = 0
     private var keyframes = 0
     private var lastSubmit: UInt64 = 0
@@ -156,10 +194,12 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
     private var audioPeak: Float = 0
     private var stopError: Error?
 
-    init(label: String, fps: Int, pixelSize: (Int, Int)) {
+    init(label: String, fps: Int, pixelSize: (Int, Int), display: CGDirectDisplayID, markerCentres: [(Int, Int)]?) {
         self.label = label
         self.fps = fps
         self.pixelSize = pixelSize
+        self.display = display
+        self.markerCentres = markerCentres
     }
 
     func start(display: SCDisplay, options: Options, encode: Bool) async throws {
@@ -170,8 +210,15 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
             if encoder == nil {
                 Log.check(false, "\(label): encoder did not open: \(String(cString: error))")
             } else {
-                decoder = AnnexBDecoder(hevc: options.hevc)
-                Log.line("\(label): encoder plan encode_fps=\(plan.encode_fps) level_idc=\(plan.level_idc) high_tier=\(plan.high_tier) max_bitrate=\(plan.max_bitrate_bps)")
+                decoder = AnnexBDecoder(hevc: options.hevc, markerCentres: markerCentres, display: self.display)
+                Log.line("\(label): encoder plan \(pixelSize.0)x\(pixelSize.1) encode_fps=\(plan.encode_fps) level_idc=\(plan.level_idc) high_tier=\(plan.high_tier) max_bitrate=\(plan.max_bitrate_bps)")
+                if plan.high_tier {
+                    Log.line("\(label): ENCODE INFORMATIONAL: experimental HEVC High tier (ETERNAL_VT_EXPERIMENTAL_HEVC_HIGH_TIER); its encode checks are INFO lines, not counted")
+                } else if Int(plan.encode_fps) < fps {
+                    Log.line("\(label): ENCODE CAPPED: \(pixelSize.0)x\(pixelSize.1) at \(fps) Hz plans \(plan.encode_fps) fps on HEVC Main tier, by design; encode at 120 is tested at the Duo outer size")
+                } else {
+                    Log.line("\(label): ENCODE GATE: \(pixelSize.0)x\(pixelSize.1) at \(plan.encode_fps) fps on \(options.hevc ? "HEVC Main tier" : "H.264")")
+                }
             }
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -190,12 +237,14 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        try await stream.startCapture()
         self.stream = stream
+        try await withDeadline(10) { try await stream.startCapture() }
     }
 
     func stop() async {
-        do { try await stream?.stopCapture() } catch { Log.line("\(label): stopCapture \(error)") }
+        if let stream {
+            do { try await withDeadline(10) { try await stream.stopCapture() } } catch { Log.line("\(label): stopCapture \(error)") }
+        }
         queue.sync {
             if let encoder {
                 _ = em_encoder_flush(encoder)
@@ -227,6 +276,7 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
         guard SCFrameStatus(rawValue: raw) == .complete, let image = CMSampleBufferGetImageBuffer(sample) else { return }
         let displayTime = (info[.displayTime] as? UInt64) ?? now
         completeTimes.append(now)
+        captureMarkers.append(markerCentres.flatMap { readMarker(image, $0) })
         latencyMs.append(machToMs(now &- displayTime))
         if CVPixelBufferGetIOSurface(image) != nil { surfaceBacked += 1 }
         let fourcc = CVPixelBufferGetPixelFormatType(image)
@@ -241,6 +291,7 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
         lastSubmit = now
         let number = UInt64(submitted)
         displayTimes[number] = displayTime
+        submitTimes[number] = now
         let force = submitted % max(Int(plan.encode_fps), 1) == 0
         if em_encoder_encode(encoder, Unmanaged.passUnretained(image).toOpaque(), number, force) != 0 {
             encodeErrors += 1
@@ -260,6 +311,7 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
             if let shown = displayTimes.removeValue(forKey: frame.frame_number) {
                 captureToEncodedMs.append(machToMs(mach_absolute_time() &- shown))
             }
+            if let submitted = submitTimes.removeValue(forKey: frame.frame_number) { encodedSubmitTimes.append(submitted) }
             decoder?.decode(Data(bytes: frame.data, count: frame.len))
         }
     }
@@ -271,20 +323,34 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee {
             audioFormat = "\(Int(asbd.mSampleRate))Hz ch=\(asbd.mChannelsPerFrame) bits=\(asbd.mBitsPerChannel) flags=\(asbd.mFormatFlags)"
         }
-        var list = AudioBufferList()
+        // Non-interleaved stereo has one buffer per channel: ask for the size first.
+        guard let description = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0, asbd.mBitsPerChannel == 32 else { return }
+        var needed = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, bufferListSizeNeededOut: &needed, bufferListOut: nil, bufferListSize: 0,
+                                                                blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+        guard needed > 0 else { return }
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: needed, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
         var block: CMBlockBuffer?
-        if CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, bufferListSizeNeededOut: nil, bufferListOut: &list,
-                                                                   bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
-                                                                   blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block) == noErr,
-           let data = list.mBuffers.mData {
-            let count = Int(list.mBuffers.mDataByteSize) / 4
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, bufferListSizeNeededOut: nil, bufferListOut: list, bufferListSize: needed,
+                                                                      blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0,
+                                                                      blockBufferOut: &block) == noErr else { return }
+        for buffer in UnsafeMutableAudioBufferListPointer(list) {
+            guard let data = buffer.mData else { continue }
+            let count = Int(buffer.mDataByteSize) / 4
             let samples = data.bindMemory(to: Float.self, capacity: count)
             for i in 0..<count { audioPeak = max(audioPeak, abs(samples[i])) }
         }
     }
 
-    /// Delivered fps over the run, from complete frames only.
-    func report(seconds: Double) {
+    /// Delivered fps over the run, from complete frames only. `target` is the
+    /// rate an animated run must reach (nil for the idle run); `expectEncodeFps`
+    /// is the planned encode rate the run is meant to prove; `tone` says the
+    /// probe's tone played, so audio must have arrived.
+    func report(seconds: Double, target: Int?, expectEncodeFps: Int?, tone: Bool) {
         queue.sync {
             let complete = statuses[SCFrameStatus.complete.rawValue] ?? 0
             let idle = statuses[SCFrameStatus.idle.rawValue] ?? 0
@@ -300,6 +366,30 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
             ])
             Log.line("\(label): frame gap ms \(percentiles(gaps))")
             Log.line("\(label): capture latency ms (displayTime -> handler) \(percentiles(latencyMs))")
+
+            let times = completeTimes.map { machToMs($0) / 1000 }
+            let window = FrameRate.window(first: times.first ?? 0, seconds: seconds)
+            let inWindow = { (t: Double) in t >= window.start && t < window.start + window.length }
+            let captureFps = FrameRate.inWindow(times, start: window.start, length: window.length)
+            var allMarkers = MarkerStats(display: display), windowMarkers = MarkerStats(display: display)
+            for (time, marker) in zip(times, captureMarkers) {
+                allMarkers.add(marker)
+                if inWindow(time) { windowMarkers.add(marker) }
+            }
+            let changesPerSecond = Double(windowMarkers.changes) / window.length
+            Log.result("\(label)_window", [("window_s", String(format: "%.1f", window.length)), ("capture_fps", String(format: "%.1f", captureFps)),
+                                           ("content_changes_per_s", String(format: "%.1f", changesPerSecond)), ("markers", "\"\(allMarkers.summary)\"")])
+            if let target {
+                if markerCentres == nil {
+                    Log.check(false, "\(label): the probe window's marker is not on display \(display), so the captured content can't be proved")
+                } else {
+                    Log.check(allMarkers.proves, "\(label): every captured frame shows the probe's marker for display \(display) (\(allMarkers.summary))")
+                    Log.check(FrameRate.meets(changesPerSecond, target: target),
+                              String(format: "%@: content changed every frame: %.1f changes/s over %.0f s, target %d", label, changesPerSecond, window.length, target))
+                }
+                Log.check(FrameRate.meets(captureFps, target: target),
+                          String(format: "%@: capture delivered %.1f fps over %.0f s, at least 0.9 × %d", label, captureFps, window.length, target))
+            }
             if encoder != nil {
                 let emitted = em_encoder_emitted(encoder!)
                 Log.result("\(label)_encode", [
@@ -311,15 +401,36 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
                 ])
                 Log.line("\(label): encode ms (submit -> callback) \(percentiles(encodeUs))")
                 Log.line("\(label): capture -> encoded ms (displayTime -> packet) \(percentiles(captureToEncodedMs))")
-                Log.check(encodeErrors == 0 && encodedFrames == submitted, "\(label): every submitted frame encoded (\(encodedFrames)/\(submitted))")
-                Log.check(decoder?.failed == 0 && decoder?.decoded == encodedFrames, "\(label): every encoded frame decoded (\(decoder?.decoded ?? 0)/\(encodedFrames))")
-                Log.check(emitted.valid && !(emitted.high_tier && !plan.high_tier), "\(label): emitted tier matches the plan")
+                // Experimental High tier is informational: INFO lines, not counted.
+                let check: (Bool, String) -> Void = plan.high_tier ? Log.info : Log.check
+                let encodeTimes = encodedSubmitTimes.map { machToMs($0) / 1000 }
+                let encodeFps = FrameRate.inWindow(encodeTimes, start: window.start, length: window.length)
+                let decodedMarkers = decoder?.markers ?? MarkerStats(display: display)
+                Log.result("\(label)_encode_window", [("encode_fps", String(format: "%.1f", encodeFps)), ("planned", plan.encode_fps),
+                                                      ("decoded_markers", "\"\(decodedMarkers.summary)\"")])
+                check(encodeErrors == 0 && encodedFrames == submitted, "\(label): every submitted frame encoded (\(encodedFrames)/\(submitted))")
+                check(decoder?.failed == 0 && decoder?.decoded == encodedFrames, "\(label): every encoded frame decoded (\(decoder?.decoded ?? 0)/\(encodedFrames))")
+                check(emitted.valid && !(emitted.high_tier && !plan.high_tier), "\(label): emitted tier matches the plan")
+                if target != nil {
+                    check(FrameRate.meets(encodeFps, target: Int(plan.encode_fps)),
+                          String(format: "%@: encoded %.1f fps over %.0f s, at least 0.9 × the planned %d", label, encodeFps, window.length, plan.encode_fps))
+                    check(markerCentres != nil && decodedMarkers.proves,
+                          "\(label): every decoded frame shows the probe's marker for display \(display) (\(decodedMarkers.summary))")
+                }
+                if let expectEncodeFps {
+                    check(Int(plan.encode_fps) == expectEncodeFps && !plan.high_tier,
+                          "\(label): \(pixelSize.0)x\(pixelSize.1) plans \(expectEncodeFps) fps on Main tier (planned \(plan.encode_fps), high_tier=\(plan.high_tier))")
+                }
                 em_encoder_destroy(encoder)
                 encoder = nil
             }
             Log.result("\(label)_audio", [("buffers", audioBuffers), ("frames", audioFrames),
                                           ("frames_per_s", String(format: "%.0f", Double(audioFrames) / seconds)),
                                           ("format", "\"\(audioFormat)\""), ("peak", String(format: "%.3f", audioPeak))])
+            if tone {
+                Log.check(audioFrames > 0 && audioPeak >= 0.01,
+                          String(format: "%@: system audio captured the probe's tone (%d frames, peak %.3f)", label, audioFrames, audioPeak))
+            }
             if let stopError { Log.check(false, "\(label): stream error \(stopError)") }
         }
     }
@@ -360,15 +471,32 @@ struct CaptureSpike {
         return (mode.pixelWidth, mode.pixelHeight)
     }
 
+    /// Block centres, in `id`'s pixels, of the marker the probe window draws,
+    /// or nil if the window's marker isn't entirely on that display.
+    private func markerCentres(on id: CGDirectDisplayID, pixelWidth: Int) -> [(Int, Int)]? {
+        guard let window = app.animation.window else { return nil }
+        let rect = window.convertToScreen(app.animation.convert(app.animation.markerRect, to: nil))
+        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
+        let global = CGRect(x: rect.minX, y: mainHeight - rect.maxY, width: rect.width, height: rect.height)
+        let bounds = CGDisplayBounds(id)
+        guard bounds.contains(global), bounds.width > 0 else { return nil }
+        let scale = Double(pixelWidth) / bounds.width
+        return Marker.centres(x: (global.minX - bounds.minX) * scale, y: (global.minY - bounds.minY) * scale, blockPx: Marker.blockPt * scale)
+    }
+
     /// Captures `displayID` at each rate, then once with the animation
-    /// stopped to count idle frames.
-    func capture(displayID: CGDirectDisplayID, name: String, rates: [Int], idle: Bool = true) async {
+    /// stopped to count idle frames. In the gate the target is the asked
+    /// rate; on the main display (a baseline) it is capped at its refresh.
+    func capture(displayID: CGDirectDisplayID, name: String, rates: [Int], idle: Bool = true, gate: Bool = false,
+                 expectEncodeFps: Int? = nil) async {
         guard CGPreflightScreenCaptureAccess() else {
             Log.check(false, "spike d needs Screen Recording; run --mode grant first")
             return
         }
         let content: SCShareableContent
-        do { content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) } catch {
+        do {
+            content = try await withDeadline(10) { try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) }
+        } catch {
             Log.check(false, "SCShareableContent failed: \(error)")
             return
         }
@@ -380,28 +508,37 @@ struct CaptureSpike {
         let size = Self.pixelSize(displayID)
         let refresh = CGDisplayCopyDisplayMode(displayID)?.refreshRate ?? 0
         Log.line("capture \(name): display \(displayID) \(display.width)x\(display.height)pt \(size.0)x\(size.1)px refresh=\(refresh)")
-        for (index, fps) in rates.enumerated() {
+        let centres = markerCentres(on: displayID, pixelWidth: size.0)
+        Log.line("capture \(name): marker \(centres.map { "at pixel (\($0[0].0),\($0[0].1))…" } ?? "not on this display")")
+        for fps in rates {
             app.animation.animating = true
             app.say("Spike d: capturing \(name) at \(fps) fps for \(Int(app.options.seconds)) s")
-            if index == 0, app.options.tone { Tone().play(seconds: 1.5) }
-            await timed(display: display, label: "capture_\(name)_\(fps)", fps: fps, size: size, encode: true)
+            let target = gate || refresh < 1 ? fps : min(fps, Int(refresh.rounded()))
+            if target != fps { Log.line("capture \(name) at \(fps): this display refreshes at \(refresh) Hz, so the baseline's target is \(target) fps") }
+            await timed(display: display, label: "capture_\(name)_\(fps)", fps: fps, size: size, encode: true, centres: centres,
+                        target: target, expectEncodeFps: expectEncodeFps, tone: app.options.tone)
         }
         guard idle else { return }
         app.animation.animating = false
         app.say("Spike d: capturing \(name) with nothing changing (idle frames)")
-        await timed(display: display, label: "capture_\(name)_idle", fps: 60, size: size, encode: false)
+        await timed(display: display, label: "capture_\(name)_idle", fps: 60, size: size, encode: false, centres: centres,
+                    target: nil, expectEncodeFps: nil, tone: false)
         app.animation.animating = true
     }
 
-    private func timed(display: SCDisplay, label: String, fps: Int, size: (Int, Int), encode: Bool) async {
-        let run = CaptureRun(label: label, fps: fps, pixelSize: size)
+    private func timed(display: SCDisplay, label: String, fps: Int, size: (Int, Int), encode: Bool, centres: [(Int, Int)]?,
+                       target: Int?, expectEncodeFps: Int?, tone: Bool) async {
+        let run = CaptureRun(label: label, fps: fps, pixelSize: size, display: display.displayID, markerCentres: centres)
         do { try await run.start(display: display, options: app.options, encode: encode) } catch {
             Log.check(false, "\(label): startCapture failed: \(error)")
+            await run.stop()
             return
         }
+        if tone { Tone().play(seconds: 1.5) }
+        if !app.options.tone, target != nil { Log.line("INFO \(label): audio not checked (--no-tone)") }
         try? await Task.sleep(nanoseconds: UInt64(app.options.seconds * 1e9))
         await run.stop()
-        run.report(seconds: app.options.seconds)
+        run.report(seconds: app.options.seconds, target: target, expectEncodeFps: expectEncodeFps, tone: tone)
     }
 
     func run() async {

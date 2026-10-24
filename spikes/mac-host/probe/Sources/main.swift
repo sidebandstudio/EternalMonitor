@@ -5,8 +5,15 @@
 //   EternalMonitorMacProbe --mode grant|status|selftest|d|e|c|all [--seconds N]
 //                          [--experimental] [--h264] [--confirm-display]
 //                          [--persist-arrangement] [--no-tone]
+//                          [--deadline S] [--run-dir DIR]
 // Spike c is the second-screen gate and the one that matters; d and e on
-// the main display are baselines.
+// the main display are baselines. --mode displays lists the probe's virtual
+// displays for probe.sh and creates nothing.
+//
+// Every run has a hard self-deadline (--deadline, or a default per mode):
+// when it passes, the probe restores the pointer, kills its children by PID
+// and exits, which releases any virtual display it owns. SIGTERM does the
+// same. --run-dir is where probe.sh finds the PIDs to stop.
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -19,6 +26,8 @@ struct Options {
     var confirmDisplay = false
     var tone = true
     var persistArrangement = false
+    var deadline: Double?
+    var runDir: String?
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -31,10 +40,79 @@ struct Options {
             case "--confirm-display": confirmDisplay = true
             case "--no-tone": tone = false
             case "--persist-arrangement": persistArrangement = true
+            case "--deadline": deadline = Double(it.next() ?? "")
+            case "--run-dir": runDir = it.next()
             default: break // LaunchServices adds its own arguments (-psn_…)
             }
         }
+        if ProcessInfo.processInfo.environment["ETERNAL_VT_EXPERIMENTAL_HEVC_HIGH_TIER"] == "1" { experimental = true }
     }
+
+    /// Seconds before the probe exits by itself. probe.sh uses the same table.
+    var hardDeadline: Double {
+        if let deadline { return deadline }
+        switch mode {
+        case "grant": return 1800
+        case "status", "displays": return 30
+        case "selftest": return 120
+        case "d": return 240
+        case "e": return 120
+        case "c": return 600
+        case "all": return 900
+        default: return 60
+        }
+    }
+}
+
+/// What a deadline or a signal must undo before the process exits: the
+/// pointer goes back and the probe's children are killed by PID. Runs on
+/// background queues, whatever the main thread is doing.
+enum Cleanup {
+    private static let lock = NSLock()
+    private static var cursor: CGPoint?
+    private static var signalSources: [DispatchSourceSignal] = []
+
+    static func saveCursor(_ point: CGPoint?) {
+        lock.lock()
+        cursor = point
+        lock.unlock()
+    }
+
+    static func emergency(_ why: String) {
+        Log.line("ABORT \(why)")
+        lock.lock()
+        let point = cursor
+        lock.unlock()
+        if let point { CGWarpMouseCursorPosition(point) }
+        ChildRegistry.killAll()
+    }
+
+    static func start(_ options: Options) {
+        if let dir = options.runDir {
+            try? "\(getpid())\n".write(toFile: dir + "/probe.pid", atomically: true, encoding: .utf8)
+            ChildRegistry.file = dir + "/children"
+        }
+        let seconds = options.hardDeadline
+        Watchdog.arm(seconds: seconds) {
+            emergency("hard deadline of \(String(format: "%g", seconds)) s reached; exiting, which releases any virtual display this process owns")
+        }
+        for number in [SIGTERM, SIGINT, SIGHUP] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .global(qos: .userInteractive))
+            source.setEventHandler {
+                emergency("signal \(number); exiting, which releases any virtual display this process owns")
+                _exit(128 + number)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+}
+
+/// Borderless windows can't become key unless they say so.
+final class ProbeWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 enum Permissions {
@@ -66,6 +144,11 @@ final class AnimationView: NSView {
         needsDisplay = true
     }
 
+    /// Where the content marker is drawn: the top-left corner of this view.
+    var markerRect: NSRect {
+        NSRect(x: 0, y: bounds.height - Marker.blockPt, width: Double(Marker.count) * Marker.blockPt, height: Marker.blockPt)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.black.setFill()
         bounds.fill()
@@ -75,11 +158,19 @@ final class AnimationView: NSView {
         ("frame \(count)" as NSString).draw(at: NSPoint(x: 8, y: 8), withAttributes: [
             .foregroundColor: NSColor.white, .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
         ])
+        // The display this window is on and the frame count, for capture to
+        // read back from captured and decoded frames.
+        let display = (window?.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+        let rect = markerRect
+        for (index, on) in Marker.bits(display: display, counter: UInt32(truncatingIfNeeded: count)).enumerated() {
+            (on ? NSColor.white : NSColor.black).setFill()
+            NSRect(x: rect.minX + Double(index) * Marker.blockPt, y: rect.minY, width: Marker.blockPt, height: Marker.blockPt).fill()
+        }
     }
 }
 
 final class ProbeApp: NSObject, NSApplicationDelegate {
-    let options = Options(CommandLine.arguments)
+    let options = probeOptions
     var window: NSWindow!
     let animation = AnimationView()
     let events = EventView()
@@ -89,6 +180,7 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
         let logURL = Log.open(mode: options.mode)
         Log.line("EternalMonitor Mac Probe mode=\(options.mode) pid=\(getpid()) bundle=\(Bundle.main.bundleIdentifier ?? "?") log=\(logURL.path)")
         Log.line("macOS \(ProcessInfo.processInfo.operatingSystemVersionString); \(Permissions.describe())")
+        Log.line("hard deadline \(String(format: "%g", options.hardDeadline)) s; experimental HEVC High tier \(options.experimental ? "on (informational)" : "off")")
         buildWindow()
         Task { @MainActor in
             await run()
@@ -96,8 +188,9 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 900, height: 620),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 900, height: 620),
+                             styleMask: Self.titled, backing: .buffered, defer: false)
+        window.acceptsMouseMovedEvents = true
         window.title = "EternalMonitor Mac Probe — \(options.mode)"
         let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
         status.frame = NSRect(x: 16, y: 520, width: 868, height: 90)
@@ -112,6 +205,36 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(events)
         NSApp.activate()
+    }
+
+    private static let titled: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+
+    /// Covers `screen` (a virtual display) with the probe window at shielding
+    /// level, so nothing else can be under the pointer there.
+    func cover(_ screen: NSScreen) {
+        window.styleMask = [.borderless]
+        window.setFrame(screen.frame, display: true)
+        window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(events)
+    }
+
+    /// Back to a normal titled window on the main display. The level drops
+    /// first, so a shielding window never sits on Ali's screen.
+    func uncover() {
+        window.level = .normal
+        window.styleMask = Self.titled
+        if let main = NSScreen.screens.first?.visibleFrame {
+            window.setFrame(NSRect(x: main.minX + 200, y: main.minY + 200, width: 900, height: 620), display: true)
+        }
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(events)
+    }
+
+    /// The window covers all of display `id` at shielding level.
+    func covers(_ id: CGDirectDisplayID) -> Bool {
+        guard let screen = Displays.screen(id) else { return false }
+        return window.isVisible && window.level.rawValue >= Int(CGShieldingWindowLevel()) && window.frame == screen.frame
     }
 
     func say(_ text: String) {
@@ -196,7 +319,12 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
-if CommandLine.arguments.contains("vd-child") { VirtualDisplayChild.run() }
+let probeOptions = Options(CommandLine.arguments)
+switch probeOptions.mode {
+case "vd-child": VirtualDisplayChild.run()
+case "displays": Displays.list()
+default: Cleanup.start(probeOptions)
+}
 
 let app = NSApplication.shared
 let delegate = ProbeApp()
