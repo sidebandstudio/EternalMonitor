@@ -176,4 +176,32 @@ mod tests {
         assert!(!path.with_extension("xml.tmp").exists(), "tmp cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// iPhone Duo reports its panels portrait-native, like an iPad: inner
+    /// 1878x2670 and outer 1398x2034, both at 120 Hz.
+    #[test]
+    fn iphone_duo_panels_get_even_landscape_modes_at_120_hz() {
+        for (w, h) in [(1878, 2670), (1398, 2034)] {
+            let modes = modes_for_client(w, h, 120);
+            let native = VddMode {
+                width: u32::from(h),
+                height: u32::from(w),
+                refresh_hz: 120,
+            };
+            assert_eq!(modes[0], native, "{w}x{h}");
+            assert_eq!(
+                modes[1],
+                VddMode {
+                    refresh_hz: 60,
+                    ..native
+                },
+                "{w}x{h}"
+            );
+            for mode in &modes {
+                assert!(mode.width >= mode.height, "{w}x{h}: {mode:?}");
+                assert_eq!(mode.width % 2, 0, "{w}x{h}: {mode:?}");
+                assert_eq!(mode.height % 2, 0, "{w}x{h}: {mode:?}");
+            }
+        }
+    }
 }
