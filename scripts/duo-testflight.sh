@@ -10,7 +10,8 @@ if [ "${1:-}" = --dry-run ]; then MODE=dry; shift; fi
 if [ "$#" != 0 ]; then echo "Usage: $0 [--dry-run]" >&2; exit 2; fi
 BUNDLE=com.eternal.monitor.duo
 # An upload takes the next build number from App Store Connect, so builds
-# only go up; BUILD names a dry run's build.
+# only go up; BUILD names a dry run's build. An upload is skipped when only
+# files outside the app changed since the newest build.
 BUILD="${BUILD:-}"
 # The Duo runs full screen only with the iOS 27.1 SDK; an older SDK shows a
 # centred window. DUO_MIN_SDK lowers this for a fallback build.
@@ -84,6 +85,27 @@ PY
     fi
     [ -f "$ASC_KEY_PATH" ] || { echo "App Store Connect private key file is missing" >&2; exit 2; }
     [ -z "$BUILD" ] || { echo "An upload chooses its own build number; unset BUILD" >&2; exit 2; }
+    # Testers get a notice for every build, so one that would hold the same
+    # app as the newest upload is skipped. Uncommitted edits always upload.
+    COMMIT=$(git -C "$ROOT" rev-parse HEAD)
+    XCODE_BUILD=$(xcodebuild -version | awk '/^Build version/ {print $3}')
+    if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+        CHANGED="the checkout has uncommitted changes"
+    else
+        CHANGED=$(ASC_KEY_PATH="$ASC_KEY_PATH" "${DUO_PYTHON:-python3}" "$ROOT/scripts/duo_testflight_build.py" \
+            --app-changes --commit "$COMMIT" --xcode "$XCODE_BUILD")
+    fi
+    if [ -z "$CHANGED" ]; then
+        echo "Nothing that reaches the app changed since the newest Duo build; no archive or upload"
+        python3 - "$OUT/result.json" "$VERSION" "$COMMIT" <<'PY'
+import json,pathlib,sys
+result=dict(mode='skipped',version=sys.argv[2],commit=sys.argv[3],status='PASS',
+            reason='Only CI, scripts, docs, tests or the PC side changed since the newest Duo build')
+pathlib.Path(sys.argv[1]).write_text(json.dumps(result,indent=2)+'\n')
+PY
+        exit 0
+    fi
+    echo "Uploading because $CHANGED"
     BUILD=$(ASC_KEY_PATH="$ASC_KEY_PATH" "${DUO_PYTHON:-python3}" "$ROOT/scripts/duo_testflight_build.py" --next-build)
     AUTH=(-allowProvisioningUpdates -allowProvisioningDeviceRegistration
         -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID"
@@ -174,7 +196,7 @@ if [ "$MODE" = upload ]; then
     echo "Uploaded EternalMonitor Duo $VERSION build $BUILD to App Store Connect"
     # Wait for processing, set What to Test, and check the Duo internal group.
     ASC_KEY_PATH="$ASC_KEY_PATH" "${DUO_PYTHON:-python3}" "$ROOT/scripts/duo_testflight_build.py" \
-        --version "$VERSION" --build "$BUILD" --result "$OUT/asc.json"
+        --version "$VERSION" --build "$BUILD" --commit "$COMMIT" --xcode "$XCODE_BUILD" --result "$OUT/asc.json"
 else
     echo "Unsigned Release archive passed; upload skipped because this is a dry run"
 fi

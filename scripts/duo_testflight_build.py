@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Before a Duo upload, choose its build number. After it: wait for App Store
+"""Before a Duo upload, tell whether the app changed since the newest build
+and choose its build number. After it: wait for App Store
 Connect to process the build, set its What to Test, and check that the Duo
 internal group can install it.
 
@@ -11,6 +12,8 @@ import argparse
 import json
 import os
 import pathlib
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -89,6 +92,55 @@ def next_build():
     return max(builds + uploads + [0]) + 1
 
 
+def what_to_test(commit, xcode):
+    return WHAT_TO_TEST + f"\nBuilt from {commit} with Xcode {xcode}.\n"
+
+
+def uploaded_source():
+    """The commit and Xcode build of the newest Duo build, from its What to
+    Test, or None when the newest number has no processed build that names
+    them (an upload is still processing, failed, or was stopped)."""
+    newest = next_build() - 1
+    status, data = call("GET", f"/builds?filter[app]={APP_ID}&filter[version]={newest}&limit=5")
+    if status != 200:
+        sys.exit(f"Build lookup failed ({status}): {errors(data)}")
+    valid = [b for b in data["data"] if b["attributes"]["processingState"] == "VALID"]
+    if len(valid) != 1 or len(data["data"]) != 1:
+        return None
+    status, data = call("GET", f"/builds/{valid[0]['id']}/betaBuildLocalizations")
+    if status != 200:
+        sys.exit(f"Reading What to Test failed ({status}): {errors(data)}")
+    notes = next((l["attributes"]["whatsNew"] or "" for l in data["data"] if l["attributes"]["locale"] == "en-US"), "")
+    found = re.search(r"^Built from ([0-9a-f]{40}) with Xcode (\w+)\.$", notes, re.M)
+    return found and (found[1], found[2])
+
+
+# Paths that never reach the app bundle. Anything else counts as an app
+# change, so a path this list doesn't know about still uploads.
+NOT_APP = re.compile(r"^(\.github/|scripts/|docs/|notes/|host/|installer/|updater/|proto/"
+                     r"|ios/EternalMonitorTests/|ios/EternalMonitorUITests/"
+                     r"|Cargo\.(toml|lock)$|rust-toolchain\.toml$|LICENSE$|\.gitignore$)"
+                     # The app bundles whatever its source folder holds.
+                     r"|^(?!ios/EternalMonitor/).*\.md$")
+
+
+def app_changes(commit, xcode):
+    """Why HEAD's app may differ from the newest upload, or nothing when only
+    CI, scripts, docs, tests or the PC side changed."""
+    source = uploaded_source()
+    if not source:
+        return "the newest Duo build doesn't name the commit it came from"
+    if source[1] != xcode:
+        return f"the newest Duo build used Xcode {source[1]}, not {xcode}"
+    diff = subprocess.run(["git", "diff", "--name-only", source[0], commit], capture_output=True, text=True)
+    if diff.returncode:
+        return f"commit {source[0]} of the newest Duo build can't be compared here"
+    changed = [path for path in diff.stdout.splitlines() if not NOT_APP.search(path)]
+    if changed:
+        return f"{len(changed)} app files changed since {source[0][:7]}, such as {changed[0]}"
+    return None
+
+
 def find_build(version, build):
     status, data = call("GET", f"/builds?filter[app]={APP_ID}&filter[version]={build}"
                         f"&filter[preReleaseVersion.version]={version}&include=buildBetaDetail&limit=5")
@@ -115,7 +167,7 @@ def wait_for_processing(version, build, deadline):
         time.sleep(30)
 
 
-def set_what_to_test(build_id):
+def set_what_to_test(build_id, notes):
     status, data = call("GET", f"/builds/{build_id}/betaBuildLocalizations")
     if status != 200:
         sys.exit(f"Reading What to Test failed ({status}): {errors(data)}")
@@ -123,11 +175,11 @@ def set_what_to_test(build_id):
     if current:
         status, data = call("PATCH", f"/betaBuildLocalizations/{current['id']}", {"data": {
             "type": "betaBuildLocalizations", "id": current["id"],
-            "attributes": {"whatsNew": WHAT_TO_TEST}}})
+            "attributes": {"whatsNew": notes}}})
     else:
         status, data = call("POST", "/betaBuildLocalizations", {"data": {
             "type": "betaBuildLocalizations",
-            "attributes": {"locale": "en-US", "whatsNew": WHAT_TO_TEST},
+            "attributes": {"locale": "en-US", "whatsNew": notes},
             "relationships": {"build": {"data": {"type": "builds", "id": build_id}}}}})
     if status not in (200, 201):
         sys.exit(f"Setting What to Test failed ({status}): {errors(data)}")
@@ -181,6 +233,10 @@ def testers():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--next-build", action="store_true", help="print the build number to upload next")
+    parser.add_argument("--app-changes", action="store_true",
+                        help="print why --commit needs a new upload, or nothing when it doesn't")
+    parser.add_argument("--commit", help="the full commit being built")
+    parser.add_argument("--xcode", help="the Xcode build doing it, such as 27A9275")
     parser.add_argument("--version")
     parser.add_argument("--build")
     parser.add_argument("--timeout-minutes", type=float, default=60)
@@ -189,11 +245,16 @@ def main():
     if args.next_build:
         print(next_build())
         return
+    if not args.commit or not re.fullmatch(r"[0-9a-f]{40}", args.commit) or not args.xcode:
+        parser.error("--commit (a full commit) and --xcode are required")
+    if args.app_changes:
+        print(app_changes(args.commit, args.xcode) or "")
+        return
     if not args.version or not args.build:
         parser.error("--version and --build are required")
     deadline = time.monotonic() + args.timeout_minutes * 60
     found = wait_for_processing(args.version, args.build, deadline)
-    set_what_to_test(found["id"])
+    set_what_to_test(found["id"], what_to_test(args.commit, args.xcode))
     listed = ensure_in_group(found["id"])
     state = wait_for_beta_state(args.version, args.build, deadline)
     # States only, never names or addresses.

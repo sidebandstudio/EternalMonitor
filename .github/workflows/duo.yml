@@ -111,6 +111,10 @@ jobs:
       DUO_MIN_SDK: "27.1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The upload is skipped when nothing in the app changed since the
+          # newest build's commit, which can be any earlier commit.
+          fetch-depth: 0
       - name: Install XcodeGen and the App Store Connect client
         run: |
           brew install xcodegen
@@ -120,7 +124,8 @@ jobs:
       - name: Install the Metal toolchain if this Xcode lacks it
         run: xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
       - name: Archive, upload, and prepare the build for Duo internal
-        # The build number is one above App Store Connect's highest.
+        # The build number is one above App Store Connect's highest. When
+        # only CI, scripts, docs or tests changed, nothing is uploaded.
         env:
           ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
           ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
@@ -181,6 +186,10 @@ jobs:
           python3 - <<'PY'
           import json,os,pathlib
           result=json.loads(pathlib.Path('build/duo-testflight/result.json').read_text())
+          if result['mode']=='skipped':
+              with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+                  out.write(f"No new Duo build: {result['reason']}.\n")
+              raise SystemExit
           archive=result['archive']; asc=result.get('app_store_connect',{})
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
               out.write(f"EternalMonitor Duo {result['version']} ({result['build']}): {result['mode']} passed.\n\n")
