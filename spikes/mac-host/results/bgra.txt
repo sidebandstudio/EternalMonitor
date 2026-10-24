@@ -1,0 +1,33 @@
+== bgra-hevc-inner-60-jpeg
+config label=bgra-hevc-inner-60-jpeg encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=BGRA range=Some(JPEG) gop=30 low_delay=false overrides=[] mode=paced seconds=20 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xbc10cf5348e4926a [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xbc10cf533a94726a [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xbc10cf533a947d6a [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=59.5 n=594 p50=86.24ms p95=103.86ms p99=115.17ms max=131.07ms late_sends=4 in_flight=6 load={ 568.95 381.16 323.78 } therm=[]
+window t=20s out_fps=60.1 n=600 p50=100.69ms p95=104.04ms p99=112.22ms max=120.36ms late_sends=0 in_flight=6 load={ 551.90 383.73 325.37 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153 rate=300855600 luma/s
+RESULT label=bgra-hevc-inner-60-jpeg status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1200 packets=1200 wall_s=20.07 throughput_fps=59.8 steady_fps=60.0 submit_only_s=20.00 latency[n=1200 p50=100.45ms p95=104.59ms p99=116.12ms max=168.71ms] send[n=1200 p50=0.62ms p95=3.58ms p99=9.99ms max=34.24ms] keyframe_req[n=9 p50=100.03ms p95=104.59ms p99=104.59ms max=104.59ms] keyframe_misses=0 keyframes=40 achieved_mbps=15.24 key_kb_avg=172.9 same_call_pct=99.5 late_sends=4
+== bgra-hevc-inner-120-jpeg
+config label=bgra-hevc-inner-120-jpeg encoder=hevc_videotoolbox size=2670x1878 fps=120 mbps=15 pix=BGRA range=Some(JPEG) gop=30 low_delay=false overrides=[] mode=paced seconds=20 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0x95a7e7229bf774fc [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x95a7e722e98794fc [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x95a7e722e9879bfc [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=119.3 n=1192 p50=67.26ms p95=68.62ms p99=73.79ms max=80.50ms late_sends=5 in_flight=8 load={ 522.78 383.03 325.80 } therm=[]
+window t=20s out_fps=117.8 n=1196 p50=67.29ms p95=97.62ms p99=182.12ms max=405.06ms late_sends=140 in_flight=12 load={ 495.98 381.89 326.07 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.2 required_idc=156 rate=601711200 luma/s
+RESULT label=bgra-hevc-inner-120-jpeg status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=2400 packets=2400 wall_s=20.27 throughput_fps=118.4 steady_fps=118.5 submit_only_s=20.17 latency[n=2400 p50=67.28ms p95=96.86ms p99=124.18ms max=405.06ms] send[n=2400 p50=0.56ms p95=7.10ms p99=7.84ms max=114.79ms] keyframe_req[n=9 p50=66.75ms p95=68.19ms p99=68.19ms max=68.19ms] keyframe_misses=0 keyframes=80 achieved_mbps=27.60 key_kb_avg=124.4 same_call_pct=99.5 late_sends=145
+== bgra-h264-inner-60-jpeg
+config label=bgra-h264-inner-60-jpeg encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=BGRA range=Some(JPEG) gop=30 low_delay=false overrides=[] mode=paced seconds=20 drain=poll
+RESULT label=bgra-h264-inner-60-jpeg status=open_failed error="open failed: code=-22 Invalid argument"

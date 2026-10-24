@@ -1,0 +1,257 @@
+== pc-hevc-inner-60-host
+config label=pc-hevc-inner-60-host encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xa60bcafba280bb14 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xa60bcafbd0f05b14 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xa60bcafbd0f05414 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=59.3 n=592 p50=94.27ms p95=183.11ms p99=229.53ms max=273.94ms late_sends=61 in_flight=8 load={ 101.71 144.64 185.79 } therm=[]
+window t=20s out_fps=60.1 n=600 p50=133.99ms p95=135.45ms p99=138.40ms max=165.78ms late_sends=0 in_flight=8 load={ 121.96 147.56 186.35 } therm=[]
+window t=30s out_fps=60.2 n=600 p50=133.92ms p95=165.28ms p99=258.50ms max=273.54ms late_sends=68 in_flight=8 load={ 128.65 148.21 186.12 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153 rate=300855600 luma/s
+RESULT label=pc-hevc-inner-60-host status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=30.00 throughput_fps=60.0 steady_fps=60.3 submit_only_s=30.00 latency[n=1800 p50=133.79ms p95=142.85ms p99=242.07ms max=273.94ms] send[n=1800 p50=0.57ms p95=7.57ms p99=27.46ms max=101.28ms] keyframe_req[n=14 p50=133.75ms p95=134.81ms p99=221.59ms max=221.59ms] keyframe_misses=0 keyframes=60 achieved_mbps=15.14 key_kb_avg=113.3 same_call_pct=99.6 late_sends=129
+== pc-hevc-inner-60-hostdrain
+config label=pc-hevc-inner-60-hostdrain encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=host
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0x8029aecf331f5704 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x8029aecf416fb704 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x8029aecf416fb804 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=59.3 n=592 p50=130.09ms p95=221.50ms p99=266.59ms max=280.45ms late_sends=426 in_flight=8 load={ 123.27 146.40 185.04 } therm=[]
+window t=20s out_fps=58.8 n=600 p50=132.65ms p95=238.60ms p99=448.83ms max=493.95ms late_sends=448 in_flight=8 load={ 115.30 143.95 183.72 } therm=[]
+window t=30s out_fps=61.5 n=600 p50=128.22ms p95=212.91ms p99=598.66ms max=748.96ms late_sends=446 in_flight=8 load={ 112.68 142.46 182.73 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153 rate=300855600 luma/s
+RESULT label=pc-hevc-inner-60-hostdrain status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=30.03 throughput_fps=59.9 steady_fps=60.3 submit_only_s=30.02 latency[n=1800 p50=129.78ms p95=225.22ms p99=388.54ms max=748.96ms] send[n=1800 p50=0.52ms p95=19.73ms p99=34.88ms max=227.41ms] keyframe_req[n=14 p50=145.09ms p95=192.56ms p99=221.50ms max=221.50ms] keyframe_misses=0 keyframes=60 achieved_mbps=15.13 key_kb_avg=113.6 same_call_pct=99.6 late_sends=1320
+== pc-hevc-inner-60-bgra-mpeg
+config label=pc-hevc-inner-60-bgra-mpeg encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=BGRA range=Some(MPEG) gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+RESULT label=pc-hevc-inner-60-bgra-mpeg status=open_failed error="open failed: code=-22 Invalid argument"
+== pc-hevc-inner-60-rt0-speed
+config label=pc-hevc-inner-60-rt0-speed encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[("realtime", "0"), ("prio_speed", "1")] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xb5d5ba97194f2589 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb5d5ba976b3fc589 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb5d5ba976b3fca89 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=20s out_fps=29.0 n=585 p50=120.16ms p95=4802.72ms p99=7149.39ms max=7367.38ms late_sends=584 in_flight=15 load={ 103.54 138.42 180.34 } therm=[]
+window t=31s out_fps=56.6 n=600 p50=63.98ms p95=2841.79ms p99=4297.85ms max=4491.26ms late_sends=600 in_flight=15 load={ 96.19 135.71 178.89 } therm=[]
+window t=37s out_fps=103.6 n=600 p50=78.78ms p95=664.99ms p99=1768.28ms max=1798.70ms late_sends=600 in_flight=15 load={ 91.13 133.31 177.53 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153 rate=300855600 luma/s
+RESULT label=pc-hevc-inner-60-rt0-speed status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=36.82 throughput_fps=48.9 steady_fps=50.0 submit_only_s=36.61 latency[n=1800 p50=79.49ms p95=1768.28ms p99=4875.51ms max=7367.38ms] send[n=1800 p50=7.03ms p95=30.95ms p99=127.78ms max=6543.22ms] keyframe_req[n=14 p50=71.66ms p95=686.07ms p99=2912.20ms max=2912.20ms] keyframe_misses=0 keyframes=60 achieved_mbps=12.36 key_kb_avg=121.5 same_call_pct=99.2 late_sends=1784
+== pc-hevc-inner-120-host
+config label=pc-hevc-inner-120-host encoder=hevc_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0x846befe6ffb7f6fb [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x846befe68dc716fb [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x846befe68dc719fb [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=119.3 n=1192 p50=66.42ms p95=71.71ms p99=234.14ms max=248.49ms late_sends=648 in_flight=8 load={ 88.95 131.49 176.37 } therm=[]
+window t=20s out_fps=120.2 n=1200 p50=66.81ms p95=73.16ms p99=232.49ms max=234.44ms late_sends=622 in_flight=8 load={ 83.26 128.87 174.92 } therm=[]
+window t=30s out_fps=115.0 n=1200 p50=66.82ms p95=169.19ms p99=233.89ms max=243.91ms late_sends=821 in_flight=8 load={ 79.63 126.58 173.57 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.2 required_idc=156 rate=601711200 luma/s
+RESULT label=pc-hevc-inner-120-host status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.52 throughput_fps=118.0 steady_fps=119.7 submit_only_s=30.45 latency[n=3600 p50=66.76ms p95=81.30ms p99=233.78ms max=248.49ms] send[n=3600 p50=7.21ms p95=9.70ms p99=29.83ms max=36.91ms] keyframe_req[n=14 p50=66.42ms p95=67.15ms p99=67.17ms max=67.17ms] keyframe_misses=0 keyframes=120 achieved_mbps=18.00 key_kb_avg=59.3 same_call_pct=99.8 late_sends=2091
+== pc-hevc-inner-120-rt0-speed
+config label=pc-hevc-inner-120-rt0-speed encoder=hevc_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[("realtime", "0"), ("prio_speed", "1")] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xb37ce0c36074ac5b [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb37ce0c312044c5b [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb37ce0c31204435b [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=113.3 n=1185 p50=43.30ms p95=197.37ms p99=428.31ms max=470.90ms late_sends=208 in_flight=15 load={ 74.06 123.85 172.05 } therm=[]
+window t=20s out_fps=126.1 n=1200 p50=125.49ms p95=127.07ms p99=142.56ms max=269.73ms late_sends=144 in_flight=15 load={ 70.24 121.40 170.61 } therm=[]
+window t=30s out_fps=120.1 n=1200 p50=125.64ms p95=132.15ms p99=139.05ms max=155.86ms late_sends=9 in_flight=15 load={ 67.83 119.18 169.25 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.2 required_idc=156 rate=601711200 luma/s
+RESULT label=pc-hevc-inner-120-rt0-speed status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.03 throughput_fps=119.9 steady_fps=122.6 submit_only_s=30.03 latency[n=3600 p50=125.32ms p95=130.83ms p99=274.76ms max=470.90ms] send[n=3600 p50=0.55ms p95=7.14ms p99=12.28ms max=256.94ms] keyframe_req[n=14 p50=125.18ms p95=127.99ms p99=128.81ms max=128.81ms] keyframe_misses=0 keyframes=120 achieved_mbps=18.04 key_kb_avg=74.0 same_call_pct=99.6 late_sends=361
+== pc-hevc-inner-120-rt1-speed
+config label=pc-hevc-inner-120-rt1-speed encoder=hevc_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[("prio_speed", "1")] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xbdcca8812674fc13 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xbdcca88154041c13 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xbdcca88154041313 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=119.0 n=1192 p50=66.50ms p95=87.16ms p99=139.91ms max=160.11ms late_sends=252 in_flight=8 load={ 68.25 117.55 168.09 } therm=[]
+window t=20s out_fps=120.8 n=1200 p50=66.87ms p95=78.17ms p99=164.29ms max=466.47ms late_sends=522 in_flight=8 load={ 75.83 117.58 167.50 } therm=[]
+window t=30s out_fps=120.2 n=1200 p50=67.18ms p95=68.56ms p99=71.74ms max=104.21ms late_sends=6 in_flight=8 load={ 72.28 115.43 166.16 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.2 required_idc=156 rate=601711200 luma/s
+RESULT label=pc-hevc-inner-120-rt1-speed status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.02 throughput_fps=119.9 steady_fps=120.2 submit_only_s=30.01 latency[n=3600 p50=66.93ms p95=74.61ms p99=133.61ms max=466.47ms] send[n=3600 p50=0.60ms p95=7.63ms p99=14.96ms max=123.39ms] keyframe_req[n=14 p50=66.92ms p95=78.45ms p99=92.11ms max=92.11ms] keyframe_misses=0 keyframes=120 achieved_mbps=18.27 key_kb_avg=59.0 same_call_pct=99.8 late_sends=780
+== pc-hevc-outer-120-host
+config label=pc-hevc-outer-120-host encoder=hevc_videotoolbox size=2034x1398 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xaffb09e8134d6380 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xaffb09e8613d8380 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xaffb09e8613d8c80 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=119.6 n=1195 p50=42.15ms p95=43.53ms p99=46.03ms max=51.81ms late_sends=3 in_flight=5 load={ 68.78 113.25 164.79 } therm=[]
+window t=22s out_fps=98.4 n=1197 p50=66.09ms p95=187.29ms p99=1087.08ms max=1541.73ms late_sends=549 in_flight=8 load={ 104.01 118.84 165.88 } therm=[]
+window t=31s out_fps=160.9 n=1200 p50=39.79ms p95=134.65ms p99=759.48ms max=1049.66ms late_sends=1200 in_flight=8 load={ 121.95 122.31 166.83 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.0 level_idc=150
+bitstream SPS profile="Main, Main tier" level=5.0 level_idc=150
+bitstream required_level=5.1 required_idc=153 rate=341223840 luma/s
+RESULT label=pc-hevc-outer-120-host status=ok encoder=hevc_videotoolbox size=2034x1398 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.57 throughput_fps=117.8 steady_fps=117.4 submit_only_s=30.53 latency[n=3600 p50=41.92ms p95=97.75ms p99=513.79ms max=1541.73ms] send[n=3600 p50=1.04ms p95=6.50ms p99=51.39ms max=1323.89ms] keyframe_req[n=14 p50=42.11ms p95=67.63ms p99=248.99ms max=248.99ms] keyframe_misses=0 keyframes=120 achieved_mbps=14.86 key_kb_avg=59.5 same_call_pct=99.8 late_sends=1752
+== pc-hevc-outer-60-host
+config label=pc-hevc-outer-60-host encoder=hevc_videotoolbox size=2034x1398 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xa7c722f4b6b28ee6 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xa7c722f4c4c26ee6 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xa7c722f4c4c261e6 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=59.3 n=592 p50=133.57ms p95=157.83ms p99=521.87ms max=557.41ms late_sends=79 in_flight=8 load={ 138.41 125.88 167.58 } therm=[]
+window t=20s out_fps=60.1 n=600 p50=134.26ms p95=268.54ms p99=418.49ms max=479.09ms late_sends=192 in_flight=8 load={ 149.10 128.62 168.07 } therm=[]
+window t=30s out_fps=60.4 n=600 p50=133.71ms p95=371.44ms p99=602.48ms max=744.35ms late_sends=460 in_flight=8 load={ 150.68 129.64 167.97 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.0 level_idc=150
+bitstream SPS profile="Main, Main tier" level=5.0 level_idc=150
+bitstream required_level=5.0 required_idc=150 rate=170611920 luma/s
+RESULT label=pc-hevc-outer-60-host status=ok encoder=hevc_videotoolbox size=2034x1398 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=30.05 throughput_fps=59.9 steady_fps=60.2 submit_only_s=30.00 latency[n=1800 p50=133.82ms p95=267.46ms p99=529.06ms max=744.35ms] send[n=1800 p50=1.81ms p95=46.07ms p99=81.48ms max=277.99ms] keyframe_req[n=14 p50=134.24ms p95=140.65ms p99=176.46ms max=176.46ms] keyframe_misses=0 keyframes=60 achieved_mbps=15.02 key_kb_avg=69.1 same_call_pct=99.6 late_sends=731
+== pc-h264-inner-60-host
+config label=pc-h264-inner-60-host encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600000263810 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xb83ae55768b48ddb [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb83ae5571ac462db [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb83ae5571ac462db [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=13s out_fps=43.9 n=585 p50=167.53ms p95=854.13ms p99=1416.51ms max=1765.28ms late_sends=121 in_flight=15 load={ 166.79 134.02 168.85 } therm=[]
+window t=28s out_fps=42.1 n=600 p50=132.74ms p95=1517.14ms p99=2062.95ms max=2471.44ms late_sends=600 in_flight=15 load={ 257.45 155.52 175.90 } therm=[]
+window t=37s out_fps=63.4 n=600 p50=193.44ms p95=774.71ms p99=1009.67ms max=1052.18ms late_sends=600 in_flight=15 load={ 293.37 166.58 179.59 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.1 level_idc=51
+bitstream required_level=5.2 required_idc=52 rate=1182360 MB/s
+RESULT label=pc-h264-inner-60-host status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=37.24 throughput_fps=48.3 steady_fps=46.3 submit_only_s=37.17 latency[n=1800 p50=167.70ms p95=1009.15ms p99=1903.25ms max=2471.44ms] send[n=1800 p50=2.25ms p95=51.01ms p99=264.74ms max=904.32ms] keyframe_req[n=14 p50=167.36ms p95=794.28ms p99=2262.66ms max=2262.66ms] keyframe_misses=0 keyframes=60 achieved_mbps=16.15 key_kb_avg=111.7 same_call_pct=99.2 late_sends=1321
+== pc-h264-inner-60-l52
+config label=pc-h264-inner-60-l52 encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[("level", "5.2")] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x6000021e7db0 [0x20c85bf78]>{contents = "H264_Baseline_5_2"}"
+open session AverageBitRate="<CFNumber 0x9b8f4fdbcd7988ee [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x9b8f4fdbbf0967ee [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x9b8f4fdbbf0967ee [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=13s out_fps=45.2 n=585 p50=168.23ms p95=1393.90ms p99=3342.91ms max=3655.13ms late_sends=471 in_flight=15 load={ 310.20 174.38 182.21 } therm=[]
+window t=20s out_fps=85.5 n=600 p50=143.74ms p95=274.93ms p99=613.57ms max=613.91ms late_sends=420 in_flight=15 load={ 309.96 178.81 183.69 } therm=[]
+window t=30s out_fps=60.1 n=600 p50=249.99ms p95=569.11ms p99=1151.59ms max=1217.36ms late_sends=270 in_flight=15 load={ 319.56 185.11 185.86 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.2 level_idc=52
+bitstream required_level=5.2 required_idc=52 rate=1182360 MB/s
+RESULT label=pc-h264-inner-60-l52 status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=30.02 throughput_fps=60.0 steady_fps=69.7 submit_only_s=30.00 latency[n=1800 p50=200.81ms p95=582.71ms p99=1447.12ms max=3655.13ms] send[n=1800 p50=0.70ms p95=45.19ms p99=81.79ms max=2086.68ms] keyframe_req[n=14 p50=165.10ms p95=250.93ms p99=371.18ms max=371.18ms] keyframe_misses=0 keyframes=60 achieved_mbps=20.03 key_kb_avg=111.7 same_call_pct=99.2 late_sends=1161
+== pc-h264-inner-120-l52
+config label=pc-h264-inner-120-l52 encoder=h264_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[("level", "5.2")] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600001566970 [0x20c85bf78]>{contents = "H264_Baseline_5_2"}"
+open session AverageBitRate="<CFNumber 0xb61066aec0593716 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb61066aeb229d816 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb61066aeb229d816 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=12s out_fps=98.3 n=1185 p50=102.34ms p95=612.67ms p99=762.17ms max=820.93ms late_sends=1174 in_flight=15 load={ 320.06 189.59 187.44 } therm=[]
+window t=26s out_fps=84.8 n=1200 p50=164.77ms p95=495.57ms p99=787.13ms max=882.81ms late_sends=1200 in_flight=15 load={ 318.86 195.65 189.64 } therm=[]
+window t=39s out_fps=93.7 n=1200 p50=128.44ms p95=389.64ms p99=793.52ms max=832.63ms late_sends=1200 in_flight=15 load={ 315.58 200.96 191.63 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.2 level_idc=52
+bitstream required_level=6.0 required_idc=60 rate=2364720 MB/s
+RESULT label=pc-h264-inner-120-l52 status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=39.19 throughput_fps=91.9 steady_fps=88.6 submit_only_s=39.07 latency[n=3600 p50=128.21ms p95=500.53ms p99=787.02ms max=882.81ms] send[n=3600 p50=7.15ms p95=47.76ms p99=64.33ms max=598.42ms] keyframe_req[n=14 p50=128.06ms p95=201.64ms p99=662.56ms max=662.56ms] keyframe_misses=0 keyframes=120 achieved_mbps=29.79 key_kb_avg=91.6 same_call_pct=99.6 late_sends=3574
+== pc-h264-inner-120-host
+config label=pc-h264-inner-120-host encoder=h264_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x6000017e4090 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0x9e52473ac24913e8 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x9e52473ab039fce8 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x9e52473ab039fce8 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=11s out_fps=110.9 n=1185 p50=96.91ms p95=282.70ms p99=725.96ms max=821.27ms late_sends=1028 in_flight=15 load={ 302.53 201.93 192.09 } therm=[]
+window t=22s out_fps=110.7 n=1200 p50=128.35ms p95=269.25ms p99=587.89ms max=641.37ms late_sends=1200 in_flight=15 load={ 288.46 202.24 192.31 } therm=[]
+window t=31s out_fps=123.5 n=1200 p50=128.31ms p95=210.58ms p99=308.01ms max=359.25ms late_sends=1200 in_flight=15 load={ 275.33 202.27 192.44 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.1 level_idc=51
+bitstream required_level=6.0 required_idc=60 rate=2364720 MB/s
+RESULT label=pc-h264-inner-120-host status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=31.40 throughput_fps=114.7 steady_fps=118.7 submit_only_s=31.31 latency[n=3600 p50=126.05ms p95=252.81ms p99=605.57ms max=821.27ms] send[n=3600 p50=3.26ms p95=30.20ms p99=49.10ms max=528.14ms] keyframe_req[n=14 p50=130.41ms p95=200.87ms p99=271.26ms max=271.26ms] keyframe_misses=0 keyframes=120 achieved_mbps=37.18 key_kb_avg=91.6 same_call_pct=99.6 late_sends=3428
+== pc-h264-inner-60-lowdelay
+config label=pc-h264-inner-60-lowdelay encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=true overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder=<status -12900>
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality=<status -12900>
+open session ProfileLevel="<CFString 0x20d6c1c60 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0x9ccafe1c585dabfa [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt32Type}"
+open session ExpectedFrameRate="<CFNumber 0x9ccafe1c2a2d44c2 [0x20c85bf78]>{value = +30.00000000000000000000, type = kCFNumberFloat64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x9ccafe1c2a2d44f2 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=22s out_fps=27.6 n=600 p50=34.07ms p95=47.60ms p99=74.58ms max=1006.68ms late_sends=599 in_flight=0 load={ 249.98 201.21 192.29 } therm=[]
+window t=41s out_fps=30.5 n=600 p50=32.66ms p95=42.03ms p99=57.89ms max=981.51ms late_sends=600 in_flight=0 load={ 227.84 199.33 191.82 } therm=[]
+window t=61s out_fps=30.3 n=600 p50=32.89ms p95=44.73ms p99=67.35ms max=944.95ms late_sends=600 in_flight=0 load={ 211.07 197.35 191.28 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.1 level_idc=51
+bitstream required_level=5.2 required_idc=52 rate=1182360 MB/s
+RESULT label=pc-h264-inner-60-lowdelay status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=61.26 throughput_fps=29.4 steady_fps=29.7 submit_only_s=61.26 latency[n=1800 p50=32.95ms p95=44.61ms p99=67.35ms max=1006.68ms] send[n=1800 p50=32.95ms p95=44.61ms p99=67.35ms max=1006.68ms] keyframe_req[n=14 p50=35.19ms p95=39.81ms p99=61.29ms max=61.29ms] keyframe_misses=0 keyframes=60 achieved_mbps=7.41 key_kb_avg=127.0 same_call_pct=100.0 late_sends=1799
+== pc-h264-outer-120-host
+config label=pc-h264-outer-120-host encoder=h264_videotoolbox size=2034x1398 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600002ed2df0 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xb278e3328a273ed8 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb278e332f857d1d8 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb278e332f857d1d8 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=118.6 n=1185 p50=111.39ms p95=130.50ms p99=301.37ms max=328.39ms late_sends=113 in_flight=15 load={ 204.17 196.33 190.99 } therm=[]
+window t=20s out_fps=120.2 n=1200 p50=125.42ms p95=159.36ms p99=291.01ms max=357.19ms late_sends=206 in_flight=15 load={ 195.95 194.81 190.51 } therm=[]
+window t=30s out_fps=120.2 n=1200 p50=125.42ms p95=126.85ms p99=265.00ms max=304.60ms late_sends=63 in_flight=15 load={ 184.59 192.42 189.71 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.0 level_idc=50
+bitstream required_level=5.2 required_idc=52 rate=1351680 MB/s
+RESULT label=pc-h264-outer-120-host status=ok encoder=h264_videotoolbox size=2034x1398 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.01 throughput_fps=120.0 steady_fps=120.7 submit_only_s=30.01 latency[n=3600 p50=125.28ms p95=134.13ms p99=291.01ms max=357.19ms] send[n=3600 p50=0.42ms p95=6.28ms p99=21.18ms max=148.15ms] keyframe_req[n=14 p50=125.34ms p95=125.67ms p99=152.56ms max=152.56ms] keyframe_misses=0 keyframes=120 achieved_mbps=22.72 key_kb_avg=56.3 same_call_pct=99.6 late_sends=382
+== pc-hevc-inner-120-expfps
+config label=pc-hevc-inner-120-expfps encoder=hevc_videotoolbox size=2670x1878 fps=120 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+set ExpectedFrameRate on FFmpeg's session status=0
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0x91ffd3986cb2e8f6 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x91ffd3981ec234f6 [0x20c85bf78]>{value = +120, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x91ffd3981ec207f6 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=11s out_fps=108.4 n=1192 p50=72.76ms p95=156.57ms p99=250.84ms max=282.64ms late_sends=949 in_flight=8 load={ 174.71 189.89 188.86 } therm=[]
+window t=21s out_fps=124.6 n=1200 p50=65.75ms p95=84.95ms p99=241.19ms max=264.47ms late_sends=1200 in_flight=8 load={ 166.55 187.63 188.07 } therm=[]
+window t=30s out_fps=124.6 n=1200 p50=65.74ms p95=83.65ms p99=239.86ms max=264.57ms late_sends=1200 in_flight=8 load={ 156.95 184.89 187.09 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.2 required_idc=156 rate=601711200 luma/s
+RESULT label=pc-hevc-inner-120-expfps status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=120 mode=paced frames=3600 packets=3600 wall_s=30.38 throughput_fps=118.5 steady_fps=121.4 submit_only_s=30.31 latency[n=3600 p50=65.79ms p95=92.41ms p99=246.83ms max=282.64ms] send[n=3600 p50=7.29ms p95=16.66ms p99=30.59ms max=61.44ms] keyframe_req[n=14 p50=66.43ms p95=81.47ms p99=82.19ms max=82.19ms] keyframe_misses=0 keyframes=120 achieved_mbps=18.00 key_kb_avg=58.7 same_call_pct=99.8 late_sends=3349
+== pc-h264-inner-60-expfps
+config label=pc-h264-inner-60-expfps encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+set ExpectedFrameRate on FFmpeg's session status=0
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600003328090 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0x963149636e4d4f86 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x963149631c3db186 [0x20c85bf78]>{value = +60, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x963149631c3da086 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=10s out_fps=58.7 n=586 p50=51.04ms p95=234.19ms p99=235.02ms max=238.35ms late_sends=1 in_flight=14 load={ 145.86 181.59 185.90 } therm=[]
+window t=22s out_fps=51.9 n=599 p50=233.89ms p95=237.40ms p99=405.78ms max=1825.54ms late_sends=11 in_flight=15 load={ 137.76 178.66 184.80 } therm=[]
+window t=45s out_fps=25.5 n=600 p50=104.72ms p95=4682.81ms p99=8266.98ms max=8958.40ms late_sends=600 in_flight=15 load={ 119.79 171.18 181.93 } therm=[]
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.1 level_idc=51
+bitstream required_level=5.2 required_idc=52 rate=1182360 MB/s
+RESULT label=pc-h264-inner-60-expfps status=ok encoder=h264_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=1800 packets=1800 wall_s=45.17 throughput_fps=39.9 steady_fps=36.8 submit_only_s=45.08 latency[n=1800 p50=180.47ms p95=889.41ms p99=6046.92ms max=8958.40ms] send[n=1800 p50=0.53ms p95=12.30ms p99=186.76ms max=3595.57ms] keyframe_req[n=14 p50=230.42ms p95=258.98ms p99=4797.29ms max=4797.29ms] keyframe_misses=0 keyframes=60 achieved_mbps=13.27 key_kb_avg=111.2 same_call_pct=99.2 late_sends=612
+== pc-h264-inner-60-bgra-mpeg
+config label=pc-h264-inner-60-bgra-mpeg encoder=h264_videotoolbox size=2670x1878 fps=60 mbps=15 pix=BGRA range=Some(MPEG) gop=30 low_delay=false overrides=[] mode=paced seconds=30 drain=poll
+RESULT label=pc-h264-inner-60-bgra-mpeg status=open_failed error="open failed: code=-22 Invalid argument"

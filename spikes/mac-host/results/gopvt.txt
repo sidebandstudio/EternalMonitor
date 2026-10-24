@@ -1,0 +1,118 @@
+== gop-vt-hevc-inner-60-gop30
+config label=gop-vt-hevc-inner-60-gop30 codec=hevc size=2670x1878 fps=60 mbps=15 llrc=false realtime=true pix=nv12 mode=paced gop=30
+create status=0 took_ms=132.0
+set RealTime status=0 took_us=777
+set AllowFrameReordering status=0 took_us=377
+set ProfileLevel status=0 took_us=464
+set AverageBitRate status=0 took_us=404
+set ExpectedFrameRate status=0 took_us=386
+set MaxKeyFrameInterval status=0 took_us=378
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x6000036a03c0 [0x20c85bf78]>{contents = "HEVC_Main_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xbd5f03e7eedcc60a [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xbd5f03e79cac380a [0x20c85bf78]>{value = +60, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xbd5f03e79cac290a [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153
+RESULT label=gop-vt-hevc-inner-60-gop30 status=ok frames=1200 packets=1200 errors=[] dropped=0 dropped_key_requests=0 wall_s=20.08 submit_s=20.00 out_fps=59.8 latency[n=1200 p50=37.64ms p95=80.37ms p99=92.56ms max=102.26ms] encode_call[n=1200 p50=0.18ms p95=0.84ms p99=2.56ms max=32.81ms] keyframe_req[n=9 p50=26.69ms p95=65.23ms p99=65.23ms max=65.23ms] unexpected_keys=[30, 60, 90, 150, 180, 210, 270, 300, 330, 390, 420, 450, 510, 540, 570, 630, 660, 690, 750, 780, 810, 870, 900, 930, 990, 1020, 1050, 1110, 1140, 1170] mbps_per_s=[16.2k 14.9k 15.2k 15.2k 15.1k 15.0k 15.3k 15.0k 15.2k 15.1k 15.2k 15.1k 15.2k 14.9k 15.2k 15.1k 15.2k 15.1k 15.1k 15.1k]
+== gop-vt-hevc-inner-60-gop100k
+config label=gop-vt-hevc-inner-60-gop100k codec=hevc size=2670x1878 fps=60 mbps=15 llrc=false realtime=true pix=nv12 mode=paced gop=100000
+create status=0 took_ms=98.4
+set RealTime status=0 took_us=786
+set AllowFrameReordering status=0 took_us=383
+set ProfileLevel status=0 took_us=418
+set AverageBitRate status=0 took_us=365
+set ExpectedFrameRate status=0 took_us=365
+set MaxKeyFrameInterval status=0 took_us=360
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600003699920 [0x20c85bf78]>{contents = "HEVC_Main_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0x8fb35145b3748256 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x8fb35145c1047c56 [0x20c85bf78]>{value = +60, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x8fb35145c1c73256 [0x20c85bf78]>{value = +100000, type = kCFNumberSInt64Type}"
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153
+RESULT label=gop-vt-hevc-inner-60-gop100k status=ok frames=1200 packets=1200 errors=[] dropped=0 dropped_key_requests=0 wall_s=20.10 submit_s=20.07 out_fps=59.7 latency[n=1200 p50=36.17ms p95=79.52ms p99=93.65ms max=103.56ms] encode_call[n=1200 p50=0.18ms p95=0.85ms p99=5.17ms max=34.15ms] keyframe_req[n=9 p50=43.11ms p95=98.27ms p99=98.27ms max=98.27ms] unexpected_keys=[] mbps_per_s=[15.8k 14.7 15.2k 14.7 15.4k 14.8 15.4k 14.6 15.5k 14.5 15.4k 14.6 15.3k 14.7 15.4k 14.7 15.3k 14.7 15.3k 14.8]
+== gop-vt-hevc-inner-120-gop100k
+config label=gop-vt-hevc-inner-120-gop100k codec=hevc size=2670x1878 fps=120 mbps=15 llrc=false realtime=true pix=nv12 mode=paced gop=100000
+create status=0 took_ms=101.4
+set RealTime status=0 took_us=749
+set AllowFrameReordering status=0 took_us=386
+set ProfileLevel status=0 took_us=419
+set AverageBitRate status=0 took_us=364
+set ExpectedFrameRate status=0 took_us=358
+set MaxKeyFrameInterval status=0 took_us=368
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x6000002f8030 [0x20c85bf78]>{contents = "HEVC_Main_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0x8fe5cffea8a11724 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0x8fe5cffedad1cb24 [0x20c85bf78]>{value = +120, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0x8fe5cffeda12a724 [0x20c85bf78]>{value = +100000, type = kCFNumberSInt64Type}"
+bitstream VPS profile="Main, High tier" level=5.2 level_idc=156
+bitstream SPS profile="Main, High tier" level=5.2 level_idc=156
+bitstream required_level=5.2 required_idc=156
+RESULT label=gop-vt-hevc-inner-120-gop100k status=ok frames=2400 packets=2400 errors=[] dropped=0 dropped_key_requests=0 wall_s=20.07 submit_s=20.02 out_fps=119.6 latency[n=2400 p50=42.73ms p95=65.10ms p99=72.20ms max=91.32ms] encode_call[n=2400 p50=0.17ms p95=2.25ms p99=7.77ms max=36.31ms] keyframe_req[n=9 p50=45.02ms p95=65.01ms p99=65.01ms max=65.01ms] unexpected_keys=[] mbps_per_s=[16.1k 14.3 15.1k 14.9 15.2k 15.0 15.2k 15.0 15.2k 14.9 15.1k 14.9 15.2k 14.9 15.2k 15.0 15.2k 14.9 15.2k 14.9]
+== re-vt-h264-inner-60-speed
+config label=re-vt-h264-inner-60-speed codec=h264 size=2670x1878 fps=60 mbps=15 llrc=false realtime=true pix=nv12 mode=paced gop=100000
+create status=0 took_ms=74.5
+set RealTime status=0 took_us=770
+set AllowFrameReordering status=0 took_us=410
+set ProfileLevel status=0 took_us=468
+set AverageBitRate status=0 took_us=352
+set ExpectedFrameRate status=0 took_us=384
+set MaxKeyFrameInterval status=0 took_us=514
+set PrioritizeEncodingSpeedOverQuality status=0 took_us=475
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session ProfileLevel="<CFString 0x60000110c090 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xa50895245f01e043 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xa50895242d711e43 [0x20c85bf78]>{value = +60, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xa50895242db25043 [0x20c85bf78]>{value = +100000, type = kCFNumberSInt64Type}"
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.2 level_idc=52
+bitstream required_level=5.2 required_idc=52
+RESULT label=re-vt-h264-inner-60-speed status=ok frames=600 packets=600 errors=[] dropped=0 dropped_key_requests=0 wall_s=10.22 submit_s=10.11 out_fps=58.7 latency[n=600 p50=65.20ms p95=105.15ms p99=255.97ms max=966.00ms] encode_call[n=600 p50=0.24ms p95=11.73ms p99=19.56ms max=292.00ms] keyframe_req[n=9 p50=33.33ms p95=104.47ms p99=104.47ms max=104.47ms] unexpected_keys=[] mbps_per_s=[21.0k 17.8k 17.9k 17.8k 17.9k 17.8k 17.9k 17.8k 17.9k 17.8k]
+== re-vt-h264-inner-60-bgra
+config label=re-vt-h264-inner-60-bgra codec=h264 size=2670x1878 fps=60 mbps=15 llrc=false realtime=true pix=bgra mode=paced gop=100000
+create status=0 took_ms=1495.1
+set RealTime status=0 took_us=12420
+set AllowFrameReordering status=0 took_us=6070
+set ProfileLevel status=0 took_us=176081
+set AverageBitRate status=0 took_us=181058
+set ExpectedFrameRate status=0 took_us=109836
+set MaxKeyFrameInterval status=0 took_us=4272
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600002548ae0 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xb5d3bae5c32cf721 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb5d3bae5b15c0921 [0x20c85bf78]>{value = +60, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb5d3bae5b19f4721 [0x20c85bf78]>{value = +100000, type = kCFNumberSInt64Type}"
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.2 level_idc=52
+bitstream required_level=5.2 required_idc=52
+RESULT label=re-vt-h264-inner-60-bgra status=ok frames=600 packets=600 errors=[] dropped=0 dropped_key_requests=0 wall_s=10.14 submit_s=10.06 out_fps=59.2 latency[n=600 p50=98.12ms p95=180.39ms p99=399.45ms max=558.61ms] encode_call[n=600 p50=2.63ms p95=16.05ms p99=66.43ms max=489.92ms] keyframe_req[n=9 p50=107.33ms p95=342.10ms p99=342.10ms max=342.10ms] unexpected_keys=[] mbps_per_s=[30.7k 26.3k 26.2k 26.3k 26.2k 26.3k 26.2k 26.3k 26.2k 26.3k]
+== re-vt-h264-outer-120-llrc0
+config label=re-vt-h264-outer-120-llrc0 codec=h264 size=2034x1398 fps=120 mbps=15 llrc=false realtime=true pix=nv12 mode=paced gop=100000
+create status=0 took_ms=91.3
+set RealTime status=0 took_us=823
+set AllowFrameReordering status=0 took_us=445
+set ProfileLevel status=0 took_us=538
+set AverageBitRate status=0 took_us=354
+set ExpectedFrameRate status=0 took_us=307
+set MaxKeyFrameInterval status=0 took_us=295
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x600002ded620 [0x20c85bf78]>{contents = "H264_Baseline_AutoLevel"}"
+open session AverageBitRate="<CFNumber 0xb8c4f40c1106dc6d [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xb8c4f40c6376006d [0x20c85bf78]>{value = +120, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xb8c4f40c63b56c6d [0x20c85bf78]>{value = +100000, type = kCFNumberSInt64Type}"
+bitstream SPS profile="Baseline (constraints 0x00)" level=5.2 level_idc=52
+bitstream required_level=5.2 required_idc=52
+RESULT label=re-vt-h264-outer-120-llrc0 status=ok frames=1200 packets=1200 errors=[] dropped=0 dropped_key_requests=0 wall_s=22.85 submit_s=22.77 out_fps=52.5 latency[n=1200 p50=60.65ms p95=419.77ms p99=805.85ms max=1309.08ms] encode_call[n=1200 p50=1.65ms p95=90.08ms p99=209.22ms max=423.64ms] keyframe_req[n=9 p50=59.88ms p95=504.81ms p99=504.81ms max=504.81ms] unexpected_keys=[] mbps_per_s=[22.5k 20.9k 20.9k 20.9k 20.9k 20.9k 20.9k 20.9k 20.9k 20.9k]

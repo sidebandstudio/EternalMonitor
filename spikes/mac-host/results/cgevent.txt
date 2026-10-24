@@ -1,0 +1,93 @@
+source keyboard_type=103 pid=98323
+
+## Mouse
+
+| event | type | location | flags | fields |
+|---|---|---|---|---|
+| move | 5 | (-1016.25, 12.50) | 0x0 | button=0 click=0 subtype=0 pressure=0 |
+| left down | 1 | (-1016.25, 12.50) | 0x0 | button=0 click=1 subtype=0 pressure=1 |
+| left drag | 6 | (-1016.25, 12.50) | 0x0 | button=0 click=1 subtype=0 pressure=1 |
+| left up | 2 | (-1016.25, 12.50) | 0x0 | button=0 click=1 subtype=0 pressure=0 |
+| right down | 3 | (-1016.25, 12.50) | 0x0 | button=1 click=1 subtype=0 pressure=1 |
+| right drag | 7 | (-1016.25, 12.50) | 0x0 | button=1 click=1 subtype=0 pressure=1 |
+| right up | 4 | (-1016.25, 12.50) | 0x0 | button=1 click=1 subtype=0 pressure=0 |
+| middle down | 25 | (-1016.25, 12.50) | 0x0 | button=2 click=1 subtype=0 pressure=1 |
+| middle up | 26 | (-1016.25, 12.50) | 0x0 | button=2 click=1 subtype=0 pressure=0 |
+| cmd click | 1 | (-1016.25, 12.50) | 0x0 | button=0 click=1 subtype=0 pressure=1 |
+| cmd click, flags set | 1 | (-1016.25, 12.50) | 0x100008 |  |
+
+## Scroll
+
+| event | type | location | flags | fields |
+|---|---|---|---|---|
+| scroll pixels | 22 | (-1016.25, 12.50) | 0x0 | delta1=-4 delta2=1 point1=-40 point2=10 fixed1=-262144 fixed2=65536 continuous=1 phase=0 momentum=0 |
+| scroll lines | 22 | (-1016.25, 12.50) | 0x0 | delta1=3 delta2=-1 point1=30 point2=-10 fixed1=196608 fixed2=-65536 continuous=0 phase=0 momentum=0 |
+
+## Keys
+
+Every usage: keycode, flags and type read back as set; failures, if any, print above.
+Held modifiers at the end (all released): 0x0
+
+| usage | kVK | created type | final type | flags | auto unicode |
+|---|---|---|---|---|---|
+| 0x04 | 0x00 | 10 | 10 | 0x0 | "a" |
+| 0x14 | 0x0c | 10 | 10 | 0x0 | "q" |
+| 0x1e | 0x12 | 10 | 10 | 0x0 | "1" |
+| 0x28 | 0x24 | 10 | 10 | 0x0 | "\r" |
+| 0x2a | 0x33 | 10 | 10 | 0x0 | "\u{8}" |
+| 0x3a | 0x7a | 10 | 10 | 0x800000 | "\u{10}" |
+| 0x4c | 0x75 | 10 | 10 | 0x800000 | "\u{7f}" |
+| 0x52 | 0x7e | 10 | 10 | 0xa00000 | "\u{1e}" |
+| 0x58 | 0x4c | 10 | 10 | 0x200000 | "\u{3}" |
+| 0x64 | 0x0a | 10 | 10 | 0x0 | "§" |
+| 0xe1 | 0x38 | 12 | 12 | 0x20002 | "" |
+| 0xe3 | 0x37 | 12 | 12 | 0x100008 | "" |
+| 0xe7 | 0x36 | 12 | 12 | 0x100010 | "" |
+
+Cmd+Shift+Z: keycode=0x6 flags=0x12000a unicode="z"
+
+## Unicode text
+
+| input | UTF-16 set | read back | ok |
+|---|---|---|---|
+| é | [e9] | [e9] | yes |
+| € | [20ac] | [20ac] | yes |
+| 😀 as one event | [d83d, de00] | [d83d, de00] | yes |
+| 😀 high half alone | [d83d] | [d83d] | yes |
+| 😀 low half alone | [de00] | [de00] | yes |
+| 👍🏽 (4 units) | [d83d, dc4d, d83c, dffd] | [d83d, dc4d, d83c, dffd] | yes |
+| 25 units | [61, 62, 63, 64, 65, 66, 67, 68, 69, 6a, 6b, 6c, 6d, 6e, 6f, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79] | [61, 62, 63, 64, 65, 66, 67, 68, 69, 6a, 6b, 6c, 6d, 6e, 6f, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79] | yes |
+
+## Tablet
+
+wire tilt (25°, -40°) -> CGEvent (0.4167, -0.6667) at ±60° full scale
+pure proximity enter: type=24 enter=1 pointer=1 caps=0x25c7 device=0x4d01
+mouse proximity enter: type=5 subtype=2 enter=1 device=0x4d01
+pen down: type=1 subtype=1 pressure=0.733989 mouse_pressure=0.733333 tilt=(0.416639,-0.666646) rotation=47.5000 point=(4107,720) buttons=1 device=0x4d01
+pen drag: type=6 subtype=1 pressure=0.733989 mouse_pressure=0.733333 tilt=(0.416639,-0.666646) rotation=47.5000 point=(4107,720) buttons=1 device=0x4d01
+pen up: type=2 subtype=1 pressure=0.733989 mouse_pressure=0.733333 tilt=(0.416639,-0.666646) rotation=47.5000 point=(4107,720) buttons=0 device=0x4d01
+pure tablet pointer: type=23 subtype=0 pressure=0.733989 mouse_pressure=0.000000 tilt=(0.416639,-0.666646) rotation=47.5000 point=(4107,720) buttons=1 device=0x4d01
+subtype set last: subtype=1 pressure=0.000000 mouse_pressure=0.733333 tilt=(0.000000,0.000000) rotation=0.0000 point=(0,0) buttons=0 device=0x0
+no subtype: subtype=0 pressure=0.000000 mouse_pressure=0.733333 tilt=(0.000000,0.000000) rotation=0.0000 point=(0,0) buttons=0 device=0x0
+pressure 0..1 in 1/1000 steps: worst readback error 1.518e-5
+tilt -90..90 degrees: worst readback error 3.001e-5
+
+## Displays
+
+| id | bounds (points) | mode points | mode pixels | rotation | corners map inside |
+|---|---|---|---|---|---|
+CGGetActiveDisplayList status=0 count=1
+
+| 5 | (0, 0) 3440x1440 | 3440x1440 | 3440x1440 | 0° | yes |
+
+## Non-US layouts (UCKeyTranslate, read-only)
+
+current layout: com.apple.keylayout.US
+| layout | A | Q | W | Y | Z | 1 | ; | - | ` | ISO § |
+|---|---|---|---|---|---|---|---|---|---|---|
+| US | a / A | q / Q | w / W | y / Y | z / Z | 1 / ! | ; / : | - / _ | ` / ~ | § / ± |
+| French | q / Q | a / A | z / Z | y / Y | w / W | & / 1 | m / M | ) / ° | < / > | @ / # |
+| German | a / A | q / Q | w / W | z / Z | y / Y | 1 / ! | ö / Ö | ß / ? | < / > | ^ / ° |
+| Dvorak | a / A | ' / " | , / < | f / F | ; / : | 1 / ! | s / S | [ / { | ` / ~ | § / ± |
+
+RESULT checks_passed=723 checks_failed=0

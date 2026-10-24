@@ -1,0 +1,34 @@
+== soak-hevc-inner-60-host
+config label=soak-hevc-inner-60-host encoder=hevc_videotoolbox size=2670x1878 fps=60 mbps=15 pix=NV12 range=None gop=30 low_delay=false overrides=[] mode=paced seconds=630 drain=poll
+open session UsingHardwareAcceleratedVideoEncoder="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session RealTime="<CFBoolean 0x20c85bf38 [0x20c85bf78]>{value = true}"
+open session PrioritizeEncodingSpeedOverQuality="<CFBoolean 0x20c85bf48 [0x20c85bf78]>{value = false}"
+open session ProfileLevel="<CFString 0x20c864fd0 [0x20c85bf78]>{contents = ""}"
+open session AverageBitRate="<CFNumber 0xabcbb719ace7e182 [0x20c85bf78]>{value = +15000000, type = kCFNumberSInt64Type}"
+open session ExpectedFrameRate="<CFNumber 0xabcbb719de970182 [0x20c85bf78]>{value = +0, type = kCFNumberSInt64Type}"
+open session MaxKeyFrameInterval="<CFNumber 0xabcbb719de970e82 [0x20c85bf78]>{value = +30, type = kCFNumberSInt64Type}"
+window t=30s out_fps=59.8 n=1792 p50=133.68ms p95=236.22ms p99=436.45ms max=542.74ms late_sends=603 in_flight=8 load={ 70.10 135.02 165.94 } therm=[]
+window t=60s out_fps=60.0 n=1800 p50=133.89ms p95=147.38ms p99=321.54ms max=801.91ms late_sends=199 in_flight=8 load={ 56.39 125.24 161.31 } therm=[]
+window t=90s out_fps=60.0 n=1800 p50=133.93ms p95=135.59ms p99=141.32ms max=178.76ms late_sends=3 in_flight=8 load={ 44.42 115.94 156.70 } therm=[]
+window t=122s out_fps=56.1 n=1800 p50=68.02ms p95=621.46ms p99=982.25ms max=1894.37ms late_sends=1566 in_flight=8 load={ 134.59 130.67 160.42 } therm=[]
+window t=150s out_fps=64.7 n=1800 p50=133.80ms p95=139.11ms p99=158.73ms max=334.21ms late_sends=257 in_flight=8 load={ 189.20 143.75 164.27 } therm=[]
+window t=180s out_fps=59.4 n=1800 p50=70.02ms p95=490.42ms p99=973.63ms max=2406.43ms late_sends=1580 in_flight=8 load={ 356.87 187.36 179.29 } therm=[]
+window t=210s out_fps=60.7 n=1800 p50=134.01ms p95=198.97ms p99=222.27ms max=453.68ms late_sends=378 in_flight=8 load={ 505.34 240.20 198.76 } therm=[]
+window t=240s out_fps=60.0 n=1800 p50=134.03ms p95=141.98ms p99=168.56ms max=265.90ms late_sends=31 in_flight=8 load={ 567.38 281.64 215.28 } therm=[]
+window t=270s out_fps=60.0 n=1800 p50=134.04ms p95=140.48ms p99=157.23ms max=215.99ms late_sends=18 in_flight=8 load={ 506.37 293.68 221.91 } therm=[]
+window t=300s out_fps=60.0 n=1800 p50=133.89ms p95=136.34ms p99=142.44ms max=152.23ms late_sends=0 in_flight=8 load={ 427.63 295.23 224.98 } therm=[]
+window t=330s out_fps=60.0 n=1800 p50=133.16ms p95=264.06ms p99=1001.66ms max=2414.87ms late_sends=820 in_flight=8 load={ 411.56 302.86 230.11 } therm=[]
+window t=360s out_fps=60.0 n=1800 p50=119.92ms p95=474.42ms p99=759.83ms max=1137.53ms late_sends=1269 in_flight=8 load={ 547.05 344.91 247.80 } therm=[]
+window t=390s out_fps=60.0 n=1800 p50=134.00ms p95=159.28ms p99=340.26ms max=551.18ms late_sends=188 in_flight=8 load={ 661.44 392.21 268.33 } therm=[]
+window t=420s out_fps=60.5 n=1800 p50=133.97ms p95=143.12ms p99=227.63ms max=347.80ms late_sends=72 in_flight=8 load={ 773.89 444.78 291.65 } therm=[]
+window t=450s out_fps=60.0 n=1800 p50=134.06ms p95=139.84ms p99=153.48ms max=257.30ms late_sends=15 in_flight=8 load={ 724.23 465.45 304.53 } therm=[]
+window t=480s out_fps=60.0 n=1800 p50=134.01ms p95=138.58ms p99=148.81ms max=177.35ms late_sends=10 in_flight=8 load={ 603.44 461.25 308.60 } therm=[]
+window t=510s out_fps=60.0 n=1800 p50=133.94ms p95=136.23ms p99=141.37ms max=177.18ms late_sends=2 in_flight=8 load={ 475.60 444.18 307.72 } therm=[]
+window t=540s out_fps=60.0 n=1800 p50=134.05ms p95=141.18ms p99=155.51ms max=253.49ms late_sends=15 in_flight=8 load={ 406.15 430.28 307.40 } therm=[]
+window t=570s out_fps=60.0 n=1800 p50=133.96ms p95=139.96ms p99=194.49ms max=296.14ms late_sends=43 in_flight=8 load={ 373.84 419.56 307.74 } therm=[]
+window t=600s out_fps=60.1 n=1800 p50=133.98ms p95=138.36ms p99=151.92ms max=777.00ms late_sends=72 in_flight=8 load={ 410.31 424.50 313.43 } therm=[]
+window t=630s out_fps=60.0 n=1800 p50=133.96ms p95=135.66ms p99=141.27ms max=165.12ms late_sends=0 in_flight=8 load={ 393.45 419.61 315.54 } therm=[]
+bitstream VPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream SPS profile="Main, Main tier" level=5.1 level_idc=153
+bitstream required_level=5.1 required_idc=153 rate=300855600 luma/s
+RESULT label=soak-hevc-inner-60-host status=ok encoder=hevc_videotoolbox size=2670x1878 fps_target=60 mode=paced frames=37800 packets=37800 wall_s=630.01 throughput_fps=60.0 steady_fps=60.0 submit_only_s=630.01 latency[n=37800 p50=133.87ms p95=166.62ms p99=503.12ms max=2414.87ms] send[n=37800 p50=0.61ms p95=10.84ms p99=50.76ms max=1378.10ms] keyframe_req[n=125 p50=133.99ms p95=186.74ms p99=768.91ms max=947.42ms] keyframe_misses=0 keyframes=1260 achieved_mbps=15.07 key_kb_avg=109.9 same_call_pct=100.0 late_sends=7141
