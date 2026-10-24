@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use self::bitstream::ProfileTierLevel;
 use self::config::{
     plan_change, plan_session, Codec, HevcLimit, Limits, PlanChange, SessionPlan, Tier,
 };
@@ -178,6 +179,34 @@ fn note_session_opened(shared: &SharedControl, plan: &SessionPlan) {
 /// session encodes at, not the 120 a capped request asked for.
 fn note_frame_rate(shared: &SharedControl, encode_fps: u32) {
     shared.active_fps.store(encode_fps, Ordering::SeqCst);
+}
+
+/// What the profile, tier and level VideoToolbox wrote mean for a session.
+/// The level and the tier are judged independently: a level below the plan
+/// never hides a tier that needs the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmittedCheck {
+    /// The level is below the plan's, which Apple decoders may reject.
+    below_plan: bool,
+    /// HEVC High tier without the experimental opt-in: reopen below this rate.
+    lower_rate_to: Option<u32>,
+}
+
+fn check_emitted(
+    level: ProfileTierLevel,
+    opened: &SessionPlan,
+    hevc_limit: HevcLimit,
+) -> EmittedCheck {
+    let tier = if level.high_tier {
+        Tier::High
+    } else {
+        Tier::Main
+    };
+    EmittedCheck {
+        below_plan: level.level_idc < opened.level.idc,
+        lower_rate_to: (!hevc_limit.allows(tier))
+            .then(|| opened.encode_fps.saturating_sub(1).max(1)),
+    }
 }
 
 pub(super) fn run_encode_loop(
@@ -419,15 +448,10 @@ pub(super) fn run_encode_loop(
 
         if !level_checked {
             if let Some(level) = open.emitted_level() {
-                level_checked = true;
                 let opened = *open.plan();
                 let written = level.describe(codec);
-                let tier = if level.high_tier {
-                    Tier::High
-                } else {
-                    Tier::Main
-                };
-                if level.level_idc < opened.level.idc {
+                let check = check_emitted(level, &opened, hevc_limit);
+                if check.below_plan {
                     // VideoToolbox picked the level; Apple decoders reject a
                     // stream whose level is too low for its size and rate.
                     error!(
@@ -435,24 +459,29 @@ pub(super) fn run_encode_loop(
                         required = opened.level.name,
                         "VideoToolbox wrote a level below the stream's requirement"
                     );
-                } else if !hevc_limit.allows(tier) {
+                }
+                if let Some(fps) = check.lower_rate_to {
                     // AutoLevel went to High tier below the rate
-                    // `vt_hevc_tier` predicts: run slower on this size.
+                    // `vt_hevc_tier` predicts: run slower on this size,
+                    // whatever level it wrote.
                     error!(
                         written,
                         encode_fps = opened.encode_fps,
                         "VideoToolbox wrote HEVC High tier, which needs the experimental opt-in; lowering the frame rate"
                     );
-                    tier_cap = Some((size, opened.encode_fps.saturating_sub(1).max(1)));
+                    tier_cap = Some((size, fps));
                     session = None;
                     pending_keyframe = true;
-                } else {
+                } else if !check.below_plan {
                     info!(
                         written,
                         required = opened.level.name,
                         "Stream profile and level"
                     );
                 }
+                // Only after both the level and the tier were judged; a
+                // reopen clears it for the next session.
+                level_checked = true;
             }
         }
     }
@@ -489,5 +518,73 @@ mod tests {
         assert!(!selects_direct(None, vt, true, ffmpeg_has));
         // A caller that selected libx264 itself keeps it.
         assert!(!selects_direct(None, "libx264", false, ffmpeg_has));
+    }
+
+    /// An HEVC VPS (Main profile) with the given tier and level, as
+    /// VideoToolbox writes it, emulation-prevention bytes included.
+    fn vps(high_tier: bool, level_idc: u8) -> Vec<u8> {
+        vec![
+            0x40,
+            0x01,
+            0x0c,
+            0x01,
+            0xff,
+            0xff,
+            if high_tier { 0x21 } else { 0x01 },
+            0x60,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x90,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            level_idc,
+        ]
+    }
+
+    #[test]
+    fn high_tier_falls_back_whatever_level_was_written() {
+        // Full Duo size at 60 fps plans Main tier, level 5.1 (idc 153).
+        let opened =
+            plan_session(Codec::Hevc, 2670, 1878, 60, 15_000_000, Limits::default()).unwrap();
+        assert_eq!((opened.tier, opened.level.idc), (Tier::Main, 153));
+        let lower = Some(opened.encode_fps - 1);
+        let cases = [
+            // (high tier, level idc, below the plan, fallback rate)
+            (true, 150, true, lower), // the reviewed case: High tier 5.0
+            (true, 153, false, lower),
+            (true, 156, false, lower),
+            (false, 150, true, None),
+            (false, 156, false, None),
+        ];
+        for (high_tier, level_idc, below_plan, lower_rate_to) in cases {
+            let nal = vps(high_tier, level_idc);
+            let level = bitstream::parameter_set_ptl(Codec::Hevc, &nal).unwrap();
+            assert_eq!((level.high_tier, level.level_idc), (high_tier, level_idc));
+            assert_eq!(
+                check_emitted(level, &opened, HevcLimit::MainTier),
+                EmittedCheck {
+                    below_plan,
+                    lower_rate_to
+                },
+                "high_tier={high_tier} level_idc={level_idc}"
+            );
+            // With the experimental opt-in High tier is allowed: no fallback,
+            // and the level is still judged on its own.
+            assert_eq!(
+                check_emitted(level, &opened, HevcLimit::ExperimentalHighTier),
+                EmittedCheck {
+                    below_plan,
+                    lower_rate_to: None
+                },
+                "experimental high_tier={high_tier} level_idc={level_idc}"
+            );
+        }
     }
 }
