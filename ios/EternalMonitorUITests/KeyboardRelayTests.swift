@@ -13,8 +13,17 @@ final class KeyboardRelayTests: XCTestCase {
         app.launch()
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
-        keyboard.tap()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        // A runner starved while the stream starts can drop the first tap;
+        // tap again only while the button still offers the keyboard.
+        for _ in 0..<2 where !app.keyboards.firstMatch.exists {
+            if !keyboard.exists {
+                app.revealHUD(.threeFingerTap)
+                _ = keyboard.waitForExistence(timeout: 5)
+            }
+            if keyboard.exists && keyboard.label == "Keyboard" { keyboard.tap() }
+            _ = app.keyboards.firstMatch.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
         app.typeText("Hi!\n")
         let commands = ["Unicode(72)", "Unicode(105)", "Unicode(33)", "KeyDown { scan: 28, extended: false }", "KeyUp { scan: 28, extended: false }"]
         let relayed = NSPredicate { _, _ in

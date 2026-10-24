@@ -77,6 +77,8 @@ jobs:
         id: sim
         run: |
           xcodebuild -version
+          # keepsNavigationBar() needs the Swift that ships with the iOS 27 SDK.
+          xcrun swift --version
           read -r DEVICE_TYPE RUNTIME < <(python3 - <<'PY'
           import json,subprocess,sys
           def listing(kind): return json.loads(subprocess.check_output(['xcrun','simctl','list',kind,'-j']))[kind]
@@ -116,12 +118,26 @@ jobs:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
           EM_TEST_STAMP: iphone-duo-fold
         run: scripts/test_ios.sh -only-testing:EternalMonitorUITests/DuoFoldTests
-      - name: Run the other UI and streaming tests on the folded iPhone Duo
+      # The same groups the iPad runs (scripts/e2e_stream_ui.sh, then the
+      # rest), so a saved host or setting from one can't change the other.
+      - name: Run the streaming UI tests on the folded iPhone Duo
+        if: ${{ !cancelled() }}
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
+          EM_TEST_STAMP: iphone-duo-stream
+        run: |
+          scripts/test_ios.sh -only-testing:EternalMonitorUITests/AudioStreamTests \
+            -only-testing:EternalMonitorUITests/StreamDiagnosticsTests \
+            -only-testing:EternalMonitorUITests/USBStreamTests -only-testing:EternalMonitorUITests/HUDHideTests
+      - name: Run the other UI tests on the folded iPhone Duo
         if: ${{ !cancelled() }}
         env:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
           EM_TEST_STAMP: iphone-duo-ui
-        run: scripts/test_ios.sh -only-testing:EternalMonitorUITests -skip-testing:EternalMonitorUITests/DuoFoldTests
+        run: |
+          scripts/test_ios.sh -only-testing:EternalMonitorUITests -skip-testing:EternalMonitorUITests/DuoFoldTests \
+            -skip-testing:EternalMonitorUITests/AudioStreamTests -skip-testing:EternalMonitorUITests/StreamDiagnosticsTests \
+            -skip-testing:EternalMonitorUITests/USBStreamTests -skip-testing:EternalMonitorUITests/HUDHideTests
       # Screenshots of both screens. Only synthetic content is on them; the
       # PNGs keep pixel chunks only and are checked for secret values first.
       - name: Collect the fold screenshots

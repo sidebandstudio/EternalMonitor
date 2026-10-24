@@ -43,8 +43,8 @@
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
-// Device Hub's hinge slider: vendor page 0xFF61, usage 0x5B, carrying a
-// binary-serialized dictionary with the angle in degrees.
+// Device Hub's hinge slider and orientation picker: vendor page 0xFF61,
+// usage 0x5B, carrying a binary-serialized dictionary with the value.
 static const uint32_t kUsagePage = 0xFF61, kUsage = 0x5B;
 static const int kClientTypeSimple = 4;
 static const CFOptionFlags kSerializeBinary = 1;
@@ -62,7 +62,7 @@ static Class AngleManager(void) {
     return [manager respondsToSelector:@selector(isAvailable)] && [manager isAvailable] ? manager : Nil;
 }
 
-static BOOL SendAngle(double degrees, NSString **error) {
+static BOOL SendDeviceState(NSString *source, NSString *type, id value, NSString **error) {
     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
     IOHIDEventSystemClientRef (*createClient)(CFAllocatorRef, int, CFDictionaryRef) =
         iokit ? dlsym(iokit, "IOHIDEventSystemClientCreateWithType") : NULL;
@@ -82,7 +82,7 @@ static BOOL SendAngle(double degrees, NSString **error) {
     }
     // The simulator ignores the provider; this is the one Device Hub sends.
     NSDictionary *payload = @{@"provider": @"com.apple.Virtualization.VirtualMachines",
-                              @"source": @"hinge-slider-control", @"type": @"range", @"value": @(degrees)};
+                              @"source": source, @"type": type, @"value": value};
     CFDataRef data = serialize((__bridge CFTypeRef)payload, kSerializeBinary);
     IOHIDEventRef event = data ? createEvent(NULL, mach_absolute_time(), kUsagePage, kUsage, 0,
                                              CFDataGetBytePtr(data), CFDataGetLength(data), 0) : NULL;
@@ -92,7 +92,7 @@ static BOOL SendAngle(double degrees, NSString **error) {
     }
     if (data) CFRelease(data);
     CFRelease(client);
-    if (!event && error) *error = @"Could not build the hinge event";
+    if (!event && error) *error = @"Could not build the device state event";
     return event != NULL;
 }
 
@@ -116,7 +116,7 @@ BOOL EMSetHingeAngle(double degrees, NSTimeInterval timeout, NSString **error) {
         reported = [angle angleDegrees];
         [lock unlock];
     }];
-    BOOL sent = SendAngle(degrees, error), done = NO;
+    BOOL sent = SendDeviceState(@"hinge-slider-control", @"range", @(degrees), error), done = NO;
     double last = NAN;
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + timeout;
     // Run this thread's loop meanwhile, as CoreMotion may deliver through it.
@@ -132,6 +132,14 @@ BOOL EMSetHingeAngle(double degrees, NSTimeInterval timeout, NSString **error) {
         *error = [NSString stringWithFormat:@"The hinge stayed at %.1f degrees instead of %.1f", last, degrees];
     }
     return done;
+}
+
+BOOL EMSetDeviceOrientation(NSString *orientation, NSString **error) {
+    if (!AngleManager()) {
+        if (error) *error = @"Only the iPhone Duo simulator takes Device Hub's orientation event";
+        return NO;
+    }
+    return SendDeviceState(@"orientation-picker-control", @"enum", orientation, error);
 }
 
 #ifdef EM_HINGE_TOOL

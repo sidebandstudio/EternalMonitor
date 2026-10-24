@@ -4,13 +4,22 @@ import XCTest
 /// the navigation bar offers Pair too. iPad never shows it.
 final class PairingLandscapeTests: XCTestCase {
     override func tearDown() {
-        XCUIDevice.shared.orientation = .portrait
+        rotate(.portrait)
+    }
+
+    /// XCUIDevice rotates every simulator but the iPhone Duo, which follows
+    /// only Device Hub's orientation picker.
+    private func rotate(_ orientation: UIDeviceOrientation) {
+        XCUIDevice.shared.orientation = orientation
+        if EMHingeAvailable() {
+            _ = EMSetDeviceOrientation(orientation == .portrait ? "portrait" : "landscape-left", nil)
+        }
     }
 
     func testPairStaysReachableAboveTheNumberPad() throws {
         try XCTSkipIf(UIDevice.current.userInterfaceIdiom != .phone, "iPhone only")
         continueAfterFailure = false
-        XCUIDevice.shared.orientation = .landscapeLeft
+        rotate(.landscapeLeft)
         let app = XCUIApplication()
         app.launchArguments = ["-allowUSB", "NO", "-didSeeOnboarding", "YES"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "pairing"
@@ -23,7 +32,7 @@ final class PairingLandscapeTests: XCTestCase {
         XCTAssertTrue(bar.isHittable && bar.isEnabled)
         XCTAssertLessThan(bar.frame.maxY, app.keyboards.firstMatch.frame.minY)
 
-        XCUIDevice.shared.orientation = .portrait
+        rotate(.portrait)
         XCTAssertTrue(app.buttons["pairing.submit"].waitForExistence(timeout: 5))
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: bar)
         waitForExpectations(timeout: 5)
@@ -35,7 +44,7 @@ final class PairingLandscapeTests: XCTestCase {
     func testErrorsAndWaitingStayAboveTheNumberPad() throws {
         try XCTSkipIf(UIDevice.current.userInterfaceIdiom != .phone, "iPhone only")
         for state in ["pairing-wrong-code", "pairing-rate-limited", "pairing-submitting"] {
-            XCUIDevice.shared.orientation = .landscapeLeft
+            rotate(.landscapeLeft)
             let app = XCUIApplication()
             app.launchArguments = ["-allowUSB", "NO", "-didSeeOnboarding", "YES"]
             app.launchEnvironment["EM_UI_PREVIEW"] = state

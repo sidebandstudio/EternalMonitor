@@ -46,6 +46,11 @@ final class StreamLifecycleTests: XCTestCase {
         for cycle in 1...3 {
             let before = readHostLog().count
             XCUIDevice.shared.press(.home)
+            // The iPhone Duo simulator ignores Home; opening another app
+            // sends this one to the background the same way.
+            if !app.wait(for: .runningBackground, timeout: 5) {
+                XCUIApplication(bundleIdentifier: "com.apple.Preferences").activate()
+            }
             XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
             expectation(for: NSPredicate { _, _ in
                 self.readHostLog().dropFirst(before).contains("AppBackground")

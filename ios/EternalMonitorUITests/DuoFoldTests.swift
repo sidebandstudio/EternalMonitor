@@ -127,6 +127,21 @@ final class DuoFoldTests: XCTestCase {
         Thread.sleep(forTimeInterval: 1)
     }
 
+    /// XCUITest reports the inner screen in its portrait panel's points
+    /// (669 x 951) while the app lays out in landscape on it (951 x 669),
+    /// its top along the panel's right edge.
+    private func interfaceSize(_ app: XCUIApplication) -> CGSize {
+        let frame = app.frame.size
+        return screenShowing(app) == .inner && frame.height > frame.width
+            ? CGSize(width: frame.height, height: frame.width) : frame
+    }
+
+    /// Where XCUITest must touch to reach `point` in the app's layout.
+    private func screenPoint(_ point: CGPoint, app: XCUIApplication) -> CGPoint {
+        let frame = app.frame.size
+        return interfaceSize(app) == frame ? point : CGPoint(x: frame.width - point.y, y: point.x)
+    }
+
     private func screenShowing(_ app: XCUIApplication) -> Screen? {
         let size = app.frame.size
         if size.width < 600 && size.height > size.width { return .outer }
@@ -152,7 +167,7 @@ final class DuoFoldTests: XCTestCase {
             expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: pictureButton)
             waitForExpectations(timeout: 10)
         }
-        let window = app.frame.size
+        let window = interfaceSize(app)
         let picture = pictureRect(fill: fill, in: window)
         var problems: [String] = []
         let deadline = Date().addingTimeInterval(10)
@@ -171,7 +186,8 @@ final class DuoFoldTests: XCTestCase {
                        CGPoint(x: window.width * 0.7, y: window.height * 0.55)]
         let before = (try? Data(contentsOf: URL(fileURLWithPath: log)).count) ?? 0
         for target in targets {
-            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: target.x, dy: target.y)).tap()
+            let point = screenPoint(target, app: app)
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x, dy: point.y)).tap()
         }
         var presses: [CGPoint] = []
         let pressDeadline = Date().addingTimeInterval(10)
@@ -257,8 +273,8 @@ final class DuoFoldTests: XCTestCase {
         return screen == .outer ? shots.first! : shots.last!
     }
 
-    /// The screenshot drawn the way the app's window is laid out. The inner
-    /// screen's pixels run a quarter turn from the app's landscape window.
+    /// The screenshot drawn the way the app lays out. The inner screen's
+    /// pixels run a quarter turn clockwise from the app's landscape layout.
     private func upright(_ image: UIImage, like window: CGSize) -> UIImage {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -267,9 +283,10 @@ final class DuoFoldTests: XCTestCase {
         }
         guard (oriented.size.width > oriented.size.height) != (window.width > window.height) else { return oriented }
         let turned = CGSize(width: oriented.size.height, height: oriented.size.width)
+        // A quarter turn back: the panel's right edge becomes the top.
         return UIGraphicsImageRenderer(size: turned, format: format).image { context in
-            context.cgContext.translateBy(x: turned.width, y: 0)
-            context.cgContext.rotate(by: .pi / 2)
+            context.cgContext.translateBy(x: 0, y: turned.height)
+            context.cgContext.rotate(by: -.pi / 2)
             oriented.draw(at: .zero)
         }
     }
@@ -282,7 +299,7 @@ final class DuoFoldTests: XCTestCase {
     }
 
     private func capture(_ name: String, on screen: Screen, app: XCUIApplication) {
-        attach(upright(screenshot(of: screen), like: app.frame.size), name: "\(screen)-\(name)")
+        attach(upright(screenshot(of: screen), like: interfaceSize(app)), name: "\(screen)-\(name)")
     }
 }
 
