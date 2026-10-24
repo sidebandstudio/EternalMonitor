@@ -63,20 +63,30 @@ def errors(data):
     return "; ".join(f"{e.get('code')}: {e.get('detail')}" for e in data.get("errors", []))
 
 
-def next_build():
-    """One above the highest build App Store Connect has for the Duo app, in
-    any version, so a re-run of an older run can't go below a newer upload."""
-    highest = 0
-    path = f"/builds?filter[app]={APP_ID}&fields[builds]=version&limit=200"
+def listed_numbers(path, field):
+    """Every build number in a paginated App Store Connect listing."""
+    numbers = []
     while path:
         status, data = call("GET", path)
         if status != 200:
-            sys.exit(f"Build list failed ({status}): {errors(data)}")
-        for found in data["data"]:
-            highest = max(highest, int(found["attributes"]["version"].split(".")[0]))
+            sys.exit(f"Listing {path.split('?')[0]} failed ({status}): {errors(data)}")
+        numbers += [int(found["attributes"][field].split(".")[0]) for found in data["data"]]
         following = data.get("links", {}).get("next")
         path = following[len(API):] if following else None
-    return highest + 1
+    return numbers
+
+
+def next_build():
+    """One above the highest build number the Duo app has used, in any
+    version, so a re-run of an older run can't go below a newer upload.
+
+    An upload record exists from the moment xcodebuild starts sending, while
+    its build reaches /builds only once processing begins. A run stopped in
+    between would leave a number that /builds doesn't show yet, so the upload
+    records count too, failed ones included."""
+    builds = listed_numbers(f"/builds?filter[app]={APP_ID}&fields[builds]=version&limit=200", "version")
+    uploads = listed_numbers(f"/apps/{APP_ID}/buildUploads?limit=200", "cfBundleVersion")
+    return max(builds + uploads + [0]) + 1
 
 
 def find_build(version, build):
