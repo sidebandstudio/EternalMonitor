@@ -21,6 +21,8 @@ TIMEOUT_SECS="${EM_TIMEOUT:-120}"
 # EM_CODEC=hevc runs the same system test over H.265: the host prefers HEVC
 # (ETERNAL_HEVC=1 → libx265 via the variant table) and the app's VideoToolbox
 # session software-decodes it in the simulator.
+# EM_ENCODER=videotoolbox streams through the macOS host's direct
+# VideoToolbox encoder instead of libx264 (needs a Mac with a hardware encoder).
 CODEC="${EM_CODEC:-h264}"
 TRANSPORT="${EM_TRANSPORT:-udp}"
 AUDIO="${EM_AUDIO:-0}"
@@ -206,7 +208,7 @@ ETERNAL_USB_DIRECT="$USB_DIRECT" \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_AUDIO=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
-ETERNAL_ENCODER=libx264 \
+ETERNAL_ENCODER="${EM_ENCODER:-libx264}" \
 ETERNAL_HEVC="$HEVC_FLAG" \
 ETERNAL_FPS="${ETERNAL_FPS:-60}" \
     "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &

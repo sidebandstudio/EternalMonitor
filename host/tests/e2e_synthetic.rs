@@ -1345,8 +1345,6 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 /// sniffs the codec per keyframe for exactly this reason).
 #[test]
 fn hevc_stream_negotiates_and_decodes() {
-    use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
-
     let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
@@ -1355,6 +1353,28 @@ fn hevc_stream_negotiates_and_decodes() {
         eprintln!("libx265 not present in this FFmpeg build — skipping HEVC E2E");
         return;
     }
+    stream_hevc_and_decode(Some("libx264"), GpuInfo::software_fallback());
+}
+
+/// The macOS host's default path: the direct VideoToolbox encoder, no
+/// override, streaming HEVC to a client that decodes it. Ignored by default
+/// because CI's macOS VMs have no hardware encoder; run it on a Mac with
+/// `cargo test -p eternal-host --test e2e_synthetic videotoolbox -- --ignored`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn videotoolbox_hevc_stream_negotiates_and_decodes() {
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    stream_hevc_and_decode(None, GpuInfo::detect());
+}
+
+/// Streams the synthetic source as HEVC to a fake client that advertises
+/// HEVC decode, and checks the handoff, the codec on the wire and the
+/// decoded frame counters.
+fn stream_hevc_and_decode(encoder_override: Option<&str>, gpu_info: GpuInfo) {
+    use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
 
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -1363,11 +1383,10 @@ fn hevc_stream_negotiates_and_decodes() {
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
     shared.pairing.lock().required = false;
-    *shared.encoder_override.lock() = Some("libx264".to_string());
+    *shared.encoder_override.lock() = encoder_override.map(str::to_string);
     shared
         .hevc_enabled
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let gpu_info = GpuInfo::software_fallback();
 
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
     let supervisor_shared = shared.clone();
