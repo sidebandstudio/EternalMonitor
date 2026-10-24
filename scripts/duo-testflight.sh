@@ -9,8 +9,9 @@ MODE=auto
 if [ "${1:-}" = --dry-run ]; then MODE=dry; shift; fi
 if [ "$#" != 0 ]; then echo "Usage: $0 [--dry-run]" >&2; exit 2; fi
 BUNDLE=com.eternal.monitor.duo
-BUILD="${BUILD:?Set BUILD to a build number of the Duo app}"
-[[ "$BUILD" =~ ^[1-9][0-9]*(\.[0-9]+){0,2}$ ]] || { echo "BUILD must be one to three integers, like 4 or 4.2" >&2; exit 2; }
+# An upload takes the next build number from App Store Connect, so builds
+# only go up; BUILD names a dry run's build.
+BUILD="${BUILD:-}"
 # The Duo runs full screen only with the iOS 27.1 SDK; an older SDK shows a
 # centred window. DUO_MIN_SDK lowers this for a fallback build.
 MIN_SDK="${DUO_MIN_SDK:-27.1}"
@@ -64,7 +65,7 @@ fi
 ARCHIVE_ARGS=(-project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonitor
     -configuration Release -destination 'generic/platform=iOS'
     -archivePath "$OUT/EternalMonitor.xcarchive" -derivedDataPath "$OUT/DerivedData"
-    "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE" "CURRENT_PROJECT_VERSION=$BUILD")
+    "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE")
 if [ -n "$DEPLOYMENT" ]; then ARCHIVE_ARGS+=("IPHONEOS_DEPLOYMENT_TARGET=$DEPLOYMENT"); fi
 if [ "$MODE" = dry ]; then
     ARCHIVE_ARGS+=(CODE_SIGNING_ALLOWED=NO)
@@ -82,6 +83,8 @@ PY
         ASC_KEY_PATH="${ASC_KEY_PATH:-$HOME/private_keys/AuthKey_$ASC_KEY_ID.p8}"
     fi
     [ -f "$ASC_KEY_PATH" ] || { echo "App Store Connect private key file is missing" >&2; exit 2; }
+    [ -z "$BUILD" ] || { echo "An upload chooses its own build number; unset BUILD" >&2; exit 2; }
+    BUILD=$(ASC_KEY_PATH="$ASC_KEY_PATH" "${DUO_PYTHON:-python3}" "$ROOT/scripts/duo_testflight_build.py" --next-build)
     AUTH=(-allowProvisioningUpdates -allowProvisioningDeviceRegistration
         -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID"
         -authenticationKeyIssuerID "$ASC_ISSUER_ID")
@@ -136,6 +139,9 @@ PYPROFILE
         EXPORT_OPTIONS="$TF_PRIVATE/exportOptions.plist"
     fi
 fi
+BUILD="${BUILD:-1}"
+[[ "$BUILD" =~ ^[1-9][0-9]*$ ]] || { echo "BUILD must be a whole number above 0" >&2; exit 2; }
+ARCHIVE_ARGS+=("CURRENT_PROJECT_VERSION=$BUILD")
 if [ -n "${ETERNAL_DIAGNOSTICS_ENDPOINT:-}" ] || [ -n "${ETERNAL_DIAGNOSTICS_INGEST_KEY:-}" ]; then
     : "${ETERNAL_DIAGNOSTICS_ENDPOINT:?Set both diagnostics build settings}" "${ETERNAL_DIAGNOSTICS_INGEST_KEY:?Set both diagnostics build settings}"
     ARCHIVE_ARGS+=("ETERNAL_DIAGNOSTICS_ENDPOINT=$ETERNAL_DIAGNOSTICS_ENDPOINT" "ETERNAL_DIAGNOSTICS_INGEST_KEY=$ETERNAL_DIAGNOSTICS_INGEST_KEY")

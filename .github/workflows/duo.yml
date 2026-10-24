@@ -119,13 +119,8 @@ jobs:
           echo "DUO_PYTHON=$RUNNER_TEMP/asc/bin/python" >> "$GITHUB_ENV"
       - name: Install the Metal toolchain if this Xcode lacks it
         run: xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
-      - name: Select the Duo build number
-        # The Duo app counts its own builds. A re-run gets its own number.
-        run: |
-          BUILD=$GITHUB_RUN_NUMBER
-          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then BUILD=$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT; fi
-          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
       - name: Archive, upload, and prepare the build for Duo internal
+        # The build number is one above App Store Connect's highest.
         env:
           ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
           ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
@@ -174,7 +169,7 @@ jobs:
         if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: EternalMonitor-Duo-${{ env.BUILD }}
+          name: EternalMonitor-Duo-run-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             build/duo-testflight/archive-info.json
             build/duo-testflight/asc.json

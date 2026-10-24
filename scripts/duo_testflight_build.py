@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""After a Duo upload: wait for App Store Connect to process the build, set its
-What to Test, and check that the Duo internal group can install it.
+"""Before a Duo upload, choose its build number. After it: wait for App Store
+Connect to process the build, set its What to Test, and check that the Duo
+internal group can install it.
 
 Touches only the "EternalMonitor Duo Beta" app and its "Duo internal" group.
 Prints no secrets. Needs PyJWT with cryptography, and ASC_KEY_ID,
@@ -60,6 +61,22 @@ def call(method, path, body=None):
 
 def errors(data):
     return "; ".join(f"{e.get('code')}: {e.get('detail')}" for e in data.get("errors", []))
+
+
+def next_build():
+    """One above the highest build App Store Connect has for the Duo app, in
+    any version, so a re-run of an older run can't go below a newer upload."""
+    highest = 0
+    path = f"/builds?filter[app]={APP_ID}&fields[builds]=version&limit=200"
+    while path:
+        status, data = call("GET", path)
+        if status != 200:
+            sys.exit(f"Build list failed ({status}): {errors(data)}")
+        for found in data["data"]:
+            highest = max(highest, int(found["attributes"]["version"].split(".")[0]))
+        following = data.get("links", {}).get("next")
+        path = following[len(API):] if following else None
+    return highest + 1
 
 
 def find_build(version, build):
@@ -153,11 +170,17 @@ def testers():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--build", required=True)
+    parser.add_argument("--next-build", action="store_true", help="print the build number to upload next")
+    parser.add_argument("--version")
+    parser.add_argument("--build")
     parser.add_argument("--timeout-minutes", type=float, default=60)
     parser.add_argument("--result")
     args = parser.parse_args()
+    if args.next_build:
+        print(next_build())
+        return
+    if not args.version or not args.build:
+        parser.error("--version and --build are required")
     deadline = time.monotonic() + args.timeout_minutes * 60
     found = wait_for_processing(args.version, args.build, deadline)
     set_what_to_test(found["id"])
