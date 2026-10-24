@@ -1202,6 +1202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eternal-mac-spikes"
+version = "0.0.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "ffmpeg-next",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+]
+
+[[package]]
 name = "eternal-updater"
 version = "0.1.0"
 dependencies = [

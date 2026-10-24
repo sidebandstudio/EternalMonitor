@@ -1,0 +1,23 @@
+[package]
+name = "eternal-mac-spikes"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 0 spikes for the macOS host. Throwaway except src/keymap.rs and src/display_map.rs."
+
+# Everything is macOS-only. On other targets the library and examples are empty.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same version and features as eternal-host, so both share one FFmpeg build.
+ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
+core-foundation = "0.10"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
+] }
