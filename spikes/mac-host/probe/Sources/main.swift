@@ -4,6 +4,9 @@
 //
 //   EternalMonitorMacProbe --mode grant|status|selftest|d|e|c|all [--seconds N]
 //                          [--experimental] [--h264] [--confirm-display]
+//                          [--persist-arrangement] [--no-tone]
+// Spike c is the second-screen gate and the one that matters; d and e on
+// the main display are baselines.
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -15,6 +18,7 @@ struct Options {
     var hevc = true
     var confirmDisplay = false
     var tone = true
+    var persistArrangement = false
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -26,6 +30,7 @@ struct Options {
             case "--h264": hevc = false
             case "--confirm-display": confirmDisplay = true
             case "--no-tone": tone = false
+            case "--persist-arrangement": persistArrangement = true
             default: break // LaunchServices adds its own arguments (-psn_…)
             }
         }
@@ -92,10 +97,13 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 900, height: 620),
-                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "EternalMonitor Mac Probe — \(options.mode)"
         let root = NSView(frame: window.contentRect(forFrameRect: window.frame))
         status.frame = NSRect(x: 16, y: 520, width: 868, height: 90)
+        status.autoresizingMask = [.width, .minYMargin]
+        animation.autoresizingMask = [.width, .minYMargin]
+        events.autoresizingMask = [.width, .height]
         status.font = .systemFont(ofSize: 15)
         animation.frame = NSRect(x: 16, y: 440, width: 868, height: 70)
         events.frame = NSRect(x: 16, y: 16, width: 868, height: 410)
@@ -131,9 +139,9 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
             await runDisplaySpike()
             finish()
         case "all":
+            await runDisplaySpike()
             await CaptureSpike(app: self).run()
             await EventSpike(app: self).run()
-            await runDisplaySpike()
             finish()
         default:
             Log.line("unknown mode \(options.mode)")
@@ -187,6 +195,8 @@ final class ProbeApp: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
+
+if CommandLine.arguments.contains("vd-child") { VirtualDisplayChild.run() }
 
 let app = NSApplication.shared
 let delegate = ProbeApp()

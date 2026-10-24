@@ -21,28 +21,35 @@ spikes/mac-host/probe/probe.sh grant | status | selftest | d | e | c | all [--se
 
 ## Modes
 
+Second screen comes first; mirror is the fallback (Ali, 2026-10-24). **Spike c is the gate.** Capture and input are measured on the virtual display there. `d` and `e` on their own are main-display baselines.
+
 | mode | permissions | what it does |
 |---|---|---|
 | `grant` | asks for both | Requests Screen Recording, then Accessibility. This lists the app in Privacy & Security. It waits, showing the state, until both are on. |
 | `status` | none | Logs the three preflight states. |
 | `selftest` | none | 420v IOSurface buffers go through `VtSession::encode_pixel_buffer` (via `ffi/`) and are decoded with VideoToolbox. Runs at 2670×1878@60, 2034×1398@120 and 3440×1440@60. |
-| `d` | Screen Recording | ScreenCaptureKit on the main display at 60 and 120 fps, with the window animating, then an idle run with nothing changing. Every frame is encoded zero-copy and decoded. System audio is captured, with a quiet 1.5 s 440 Hz tone so there's something to hear. |
-| `e` | Accessibility | The event sequence below, posted with `CGEventPostToPid` (this process only), then with the HID tap. HID posting is guarded: the app must be active, its window key, and the location inside the window. Keys are plain characters, never ⌘ shortcuts. The cursor is put back afterwards. |
-| `c` | Screen Recording | The virtual display sequence below. **It adds a display to the Mac**, so it's for when Ali is connected and agrees. |
+| `c` | both | **The second-screen gate.** It adds displays to the Mac, so it's only for when Ali is connected and says go. |
+| `d` | Screen Recording | Baseline: the main display at 60 and 120 fps, then idle. Frames are encoded and decoded, and audio is captured. |
+| `e` | Accessibility | Baseline: the event sequence posted into the probe window on the main display. |
+| `all` | both | `c`, then `d`, then `e`. |
 
-### Spike e's events
+### The gate (`c`) checks
 
-Mouse move, left/right click, drag, pixel and line scroll, keys with and without Shift, and Unicode (é, and 😀 as one event). Then a pen: proximity in, down/drag/up with pressure and tilt, a pure tablet point, and proximity out.
-
-### Spike c's sequence
-
-The display is a `CGVirtualDisplay` at 2670×1878 pixels: HiDPI, modes at 1335×939 points @60/@120, `maxPixels` at full size, vendor `0x454d`, serial `0x26701878`.
-1. Checks logical size, backing pixels and refresh at each rate.
-2. Captures it at each rate (spike d's capture, run on the virtual display).
-3. Arranges it right of the main display, for the session only.
-4. Removes it and checks it's gone within 2 s.
-5. Recreates it at 2034×1398 @120 and logs whether the arrangement was remembered.
-6. Removes it again.
+1. **HiDPI mode.** A `CGVirtualDisplay` at 2670×1878 pixels: modes at 1335×939 pt @60/@120, `maxPixels` at full size, vendor `0x454d`, serial `0x26701878`. Logical size, backing pixels, `backingScaleFactor` 2 and refresh are checked when the display is created and at each rate.
+2. **Placement.**
+   - Logs where macOS puts the display, then places it right of the main display for the session. `--persist-arrangement` places it permanently instead, which writes devbox1's saved arrangement for this display, so it needs Ali's OK.
+   - Every recreation logs where the display came back.
+3. **Capture.** The probe window fills the virtual display, and its animation runs at that display's refresh. ScreenCaptureKit captures at 60 and at 120 Hz at 2670×1878, then idle. Frames are encoded zero-copy through the host's direct encoder and decoded, with fps, latency, level and audio.
+4. **Input.**
+   - Wire coordinates (0…65535) map onto the display's bounds as in `display_map::norm_to_display_point`.
+   - The corners, the centre and the right edge are checked to land on the virtual display, never its neighbour. The cursor is warped there, not sent an event.
+   - The full sequence goes through the pid and HID paths, guarded. Each pointer event's landing point is compared with where it was sent: within 1 pt, and on the display.
+   - The sequence: mouse move, left/right click, drag, pixel and line scroll, keys with and without Shift, Unicode (é, and 😀 as one event), then a pen with proximity, pressure and tilt.
+5. **Removal and recreation.**
+   - A mode change 60→120→60, then removal within 2 s. This is the macOS 26 failure.
+   - Recreation at 2034×1398, a mode change 120→60, then removal.
+   - A third creation at the inner size, a mode change, then removal.
+6. **Process death.** A child process (`--mode vd-child`) owns a display and is killed with SIGKILL, then a second child exits without releasing it. Each time, the display must go away within 2 s.
 
 ## Why the runner
 

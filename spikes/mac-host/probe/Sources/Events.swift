@@ -1,5 +1,7 @@
 // Spike e: CGEvents posted into this app's own window, and what AppKit
-// delivers for them. Two paths: CGEventPostToPid (only this process can
+// delivers for them. In the second-screen gate the window fills the virtual
+// display and every position comes from a wire coordinate (0...65535)
+// mapped onto that display's bounds, as the host will map touches. Two paths: CGEventPostToPid (only this process can
 // receive it), then the HID tap the host will use, each event sent only
 // while this app is active, its window is key, and the location is inside
 // that window. Keys are plain characters; no ⌘ shortcut is ever sent.
@@ -10,6 +12,8 @@ import CoreGraphics
 /// Logs every event AppKit delivers to it.
 final class EventView: NSView {
     private(set) var received: [String] = []
+    /// Where the last pointer event landed, in CG global coordinates.
+    private(set) var lastGlobal: CGPoint?
     private var tracking: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool { true }
@@ -34,6 +38,12 @@ final class EventView: NSView {
     private func record(_ event: NSEvent, _ detail: String = "") {
         let p = convert(event.locationInWindow, from: nil)
         var line = "\(event.type.rawValue):\(Self.name(event.type)) at=(\(String(format: "%.1f,%.1f", p.x, p.y)))"
+        if let window, ![.keyDown, .keyUp, .flagsChanged].contains(event.type) {
+            let screen = window.convertPoint(toScreen: event.locationInWindow)
+            let global = CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.height ?? 0) - screen.y)
+            lastGlobal = global
+            line += String(format: " global=(%.2f,%.2f)", global.x, global.y)
+        }
         switch event.type {
         case .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .mouseMoved:
             line += " button=\(event.buttonNumber) clicks=\(event.clickCount) pressure=\(String(format: "%.6f", event.pressure)) subtype=\(event.subtype.rawValue)"
@@ -95,14 +105,34 @@ final class EventView: NSView {
 @MainActor
 struct EventSpike {
     let app: ProbeApp
+    /// The virtual display input is mapped onto, or nil for the main-display baseline.
+    let display: CGDirectDisplayID?
     private let deviceID: Int64 = 0x4d01
     // NX_TABLET_CAPABILITY_{DEVICEID,ABSX,ABSY,BUTTONS,TILTX,TILTY,PRESSURE,ROTATION}MASK
     private let capabilities: Int64 = 0x0001 | 0x0002 | 0x0004 | 0x0040 | 0x0080 | 0x0100 | 0x0400 | 0x2000
 
-    init(app: ProbeApp) { self.app = app }
+    init(app: ProbeApp, display: CGDirectDisplayID? = nil) {
+        self.app = app
+        self.display = display
+    }
 
-    /// A point in the event view, in CG global coordinates (top-left origin).
+    private var where_: String { display == nil ? "main" : "virtual" }
+
+    /// spike b's `norm_to_display_point`: each wire value maps to the centre
+    /// of its 1/65536 slice, so 65535 stays inside the display.
+    static func wireToPoint(_ x: UInt16, _ y: UInt16, _ bounds: CGRect) -> CGPoint {
+        CGPoint(x: bounds.minX + (Double(x) + 0.5) / 65536 * bounds.width,
+                y: bounds.minY + (Double(y) + 0.5) / 65536 * bounds.height)
+    }
+
+    static func wire(_ f: CGFloat) -> UInt16 { UInt16((f * 65535).rounded()) }
+
+    /// A point for the sequence, in CG global coordinates (top-left origin):
+    /// a wire coordinate on the virtual display, or a spot in the event view.
     private func globalPoint(_ fx: CGFloat, _ fy: CGFloat) -> CGPoint {
+        if let display {
+            return Self.wireToPoint(Self.wire(fx), Self.wire(fy), CGDisplayBounds(display))
+        }
         let view = app.events
         let local = NSPoint(x: view.bounds.width * fx, y: view.bounds.height * fy)
         let screen = app.window.convertPoint(toScreen: view.convert(local, to: nil))
@@ -163,7 +193,9 @@ struct EventSpike {
     }
 
     private func sequence(_ source: CGEventSource) -> [(String, CGEvent)] {
-        let a = globalPoint(0.3, 0.5), b = globalPoint(0.5, 0.5), c = globalPoint(0.7, 0.4)
+        // Inside the event view either way: on the virtual display the window
+        // fills the screen below its status strip, which ends near y=0.3.
+        let a = globalPoint(0.3, 0.55), b = globalPoint(0.5, 0.6), c = globalPoint(0.7, 0.45)
         let scrollPixels = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -40, wheel2: 10, wheel3: 0)!
         scrollPixels.location = b
         let scrollLines = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: 3, wheel2: -1, wheel3: 0)!
@@ -217,9 +249,12 @@ struct EventSpike {
         return isKey || app.window.frame.contains(cocoa)
     }
 
-    private func post(_ path: String) async -> (sent: Int, delivered: Int) {
-        guard let source = CGEventSource(stateID: .privateState) else { return (0, 0) }
-        var sent = 0, delivered = 0
+    private static let pointerTypes: Set<CGEventType> = [.mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp]
+
+    private func post(_ path: String) async -> (sent: Int, delivered: Int, maxErrorPt: Double, offDisplay: Int) {
+        guard let source = CGEventSource(stateID: .privateState) else { return (0, 0, 0, 0) }
+        var sent = 0, delivered = 0, offDisplay = 0
+        var maxError = 0.0
         for (name, event) in sequence(source) {
             if path == "pid" {
                 event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(app.window.windowNumber))
@@ -242,13 +277,39 @@ struct EventSpike {
             }
             let got = app.events.received.count - before
             if got > 0 { delivered += 1 }
+            if got > 0, Self.pointerTypes.contains(event.type), let landed = app.events.lastGlobal {
+                let error = hypot(landed.x - event.location.x, landed.y - event.location.y)
+                maxError = max(maxError, error)
+                if let display, !CGDisplayBounds(display).contains(landed) { offDisplay += 1 }
+                Log.line(String(format: "  sent at (%.2f,%.2f) landed at (%.2f,%.2f) error %.2f pt", event.location.x, event.location.y, landed.x, landed.y, error))
+            }
             Log.line("\(got > 0 ? "GOT" : "MISSING") \(path) \(name)\(got > 1 ? " (+\(got - 1) more)" : "")")
         }
-        return (sent, delivered)
+        return (sent, delivered, maxError, offDisplay)
+    }
+
+    /// The edges of the wire range land on the virtual display and never on
+    /// its neighbour. The cursor is warped (no event is posted) and read back.
+    private func checkEdges(_ display: CGDirectDisplayID) {
+        let bounds = CGDisplayBounds(display)
+        let scale = Double(CGDisplayCopyDisplayMode(display)?.pixelWidth ?? 0) / bounds.width
+        for (x, y) in [(0, 0), (65535, 0), (0, 65535), (65535, 65535), (32768, 32768), (65535, 32768)] as [(UInt16, UInt16)] {
+            let point = Self.wireToPoint(x, y, bounds)
+            CGWarpMouseCursorPosition(point)
+            let readBack = CGEvent(source: nil)?.location ?? .zero
+            var ids = [CGDirectDisplayID](repeating: 0, count: 4)
+            var count: UInt32 = 0
+            CGGetDisplaysWithPoint(readBack, 4, &ids, &count)
+            let pixel = (Int((point.x - bounds.minX) * scale), Int((point.y - bounds.minY) * scale))
+            Log.check(count == 1 && ids[0] == display,
+                      String(format: "wire (%u,%u) -> (%.3f,%.3f) pt, pixel (%d,%d); cursor at (%.2f,%.2f) on display %@",
+                             x, y, point.x, point.y, pixel.0, pixel.1, readBack.x, readBack.y,
+                             ids.prefix(Int(count)).map { "\($0)" }.joined(separator: ",")))
+        }
     }
 
     func run() async {
-        Log.line("=== spike e: CGEvent into the probe window === \(Permissions.describe())")
+        Log.line("=== spike e: CGEvent into the probe window on the \(where_) display === \(Permissions.describe())")
         guard AXIsProcessTrusted() || CGPreflightPostEventAccess() else {
             Log.check(false, "spike e needs Accessibility; run --mode grant first")
             return
@@ -258,10 +319,13 @@ struct EventSpike {
         app.window.makeFirstResponder(app.events)
         try? await Task.sleep(nanoseconds: 500_000_000)
         let cursor = CGEvent(source: nil)?.location ?? .zero
+        if let display { checkEdges(display) }
         for path in ["pid", "hid"] {
             app.say("Spike e: posting events into this window (\(path)). Please don't click elsewhere for a few seconds.")
-            let (sent, delivered) = await post(path)
-            Log.result("events_\(path)", [("sent", sent), ("delivered", delivered)])
+            let (sent, delivered, maxError, offDisplay) = await post(path)
+            Log.result("events_\(where_)_\(path)", [("sent", sent), ("delivered", delivered),
+                                                      ("max_pointer_error_pt", String(format: "%.2f", maxError)), ("landed_off_display", offDisplay)])
+            Log.check(maxError <= 1, "\(where_) \(path): pointer events land within 1 pt of where they were sent (max \(String(format: "%.2f", maxError)))")
         }
         CGWarpMouseCursorPosition(cursor) // back where Ali left it
         Log.line("cursor restored to (\(cursor.x), \(cursor.y))")

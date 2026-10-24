@@ -362,7 +362,7 @@ struct CaptureSpike {
 
     /// Captures `displayID` at each rate, then once with the animation
     /// stopped to count idle frames.
-    func capture(displayID: CGDirectDisplayID, name: String, rates: [Int]) async {
+    func capture(displayID: CGDirectDisplayID, name: String, rates: [Int], idle: Bool = true) async {
         guard CGPreflightScreenCaptureAccess() else {
             Log.check(false, "spike d needs Screen Recording; run --mode grant first")
             return
@@ -386,6 +386,7 @@ struct CaptureSpike {
             if index == 0, app.options.tone { Tone().play(seconds: 1.5) }
             await timed(display: display, label: "capture_\(name)_\(fps)", fps: fps, size: size, encode: true)
         }
+        guard idle else { return }
         app.animation.animating = false
         app.say("Spike d: capturing \(name) with nothing changing (idle frames)")
         await timed(display: display, label: "capture_\(name)_idle", fps: 60, size: size, encode: false)
@@ -404,7 +405,7 @@ struct CaptureSpike {
     }
 
     func run() async {
-        Log.line("=== spike d: ScreenCaptureKit ===")
+        Log.line("=== spike d: ScreenCaptureKit on the main display (baseline; the virtual display is captured in spike c) ===")
         await capture(displayID: CGMainDisplayID(), name: "main", rates: [60, 120])
     }
 }
