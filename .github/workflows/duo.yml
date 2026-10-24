@@ -134,14 +134,46 @@ jobs:
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
           IOS_DUO_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_DUO_PROVISION_PROFILE_BASE64 }}
         run: scripts/duo-testflight.sh
-      - name: Retain build evidence
+      # The repository is public, and artifact files are not masked like the
+      # job log. Build logs hold the diagnostics settings, so they stay on the
+      # runner; the evidence is the facts the scripts wrote, checked first.
+      - name: Check the evidence for secret values
+        id: scan
         if: always()
+        env:
+          ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
+          ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          IOS_DUO_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_DUO_PROVISION_PROFILE_BASE64 }}
+        run: |
+          python3 - build/duo-testflight/archive-info.json build/duo-testflight/asc.json build/duo-testflight/result.json <<'PY'
+          import os,pathlib,re,sys
+          needles=[]
+          for name in ['ETERNAL_DIAGNOSTICS_ENDPOINT','ETERNAL_DIAGNOSTICS_INGEST_KEY','ASC_KEY_ID','ASC_ISSUER_ID',
+                       'ASC_KEY_P8','IOS_DIST_P12_BASE64','IOS_DIST_P12_PASSWORD','IOS_DUO_PROVISION_PROFILE_BASE64']:
+              value=os.environ.get(name,'').strip()
+              if len(value)<6: continue
+              needles+=[(name,value),(name+' prefix',value[:12])]
+              host=re.match(r'https?://([^/:]+)',value)
+              if host: needles.append((name+' host',host[1]))
+          found=[]
+          for path in map(pathlib.Path,sys.argv[1:]):
+              if path.exists():
+                  data=path.read_bytes()
+                  found+=[f'{path}: {name}' for name,value in needles if value.encode() in data]
+          if found: sys.exit('Evidence contains secret values; nothing was uploaded:\n'+'\n'.join(found))
+          print(f'No secret values in the evidence ({len(needles)} values checked)')
+          PY
+      - name: Retain build evidence
+        if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: EternalMonitor-Duo-${{ env.BUILD }}
           path: |
-            build/duo-testflight/archive.log
-            build/duo-testflight/export.log
             build/duo-testflight/archive-info.json
             build/duo-testflight/asc.json
             build/duo-testflight/result.json
