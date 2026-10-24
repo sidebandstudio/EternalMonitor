@@ -141,6 +141,7 @@ struct FeedbackCopySheet: View {
             .background(Theme.canvas.ignoresSafeArea())
             .navigationTitle("Send feedback")
             .navigationBarTitleDisplayMode(.inline)
+            .keepsNavigationBar()
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }

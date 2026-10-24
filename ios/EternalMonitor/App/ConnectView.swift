@@ -157,6 +157,7 @@ struct ConnectView: View {
                     && feedbackRequest == nil && !preparingFeedback && !showsFeedbackAsk)
             }
             .navigationBarTitleDisplayMode(.inline)
+            .keepsNavigationBar()
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

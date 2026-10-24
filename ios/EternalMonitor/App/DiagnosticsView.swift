@@ -76,6 +76,7 @@ struct DiagnosticsView: View {
         }
         .navigationTitle("Diagnostics")
         .navigationBarTitleDisplayMode(.inline)
+        .keepsNavigationBar()
         .sheet(item: $exported) { item in DiagnosticsShareSheet(url: item.url) }
     }
 }

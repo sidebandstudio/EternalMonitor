@@ -178,6 +178,22 @@ extension View {
     func card(padding: CGFloat = 20, tint: Color? = nil) -> some View {
         modifier(CardModifier(padding: padding, tint: tint))
     }
+
+    /// With the iOS 27 SDK a navigation bar minimizes while its content
+    /// scrolls, and takes Done, Cancel, Pair or the Settings button with it.
+    /// Keep every bar as it is on earlier iOS. Older SDKs lack the modifier.
+    @ViewBuilder
+    func keepsNavigationBar() -> some View {
+        #if compiler(>=6.4)
+        if #available(iOS 27.0, *) {
+            toolbarMinimizationBehavior(.never, for: .navigationBar)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
+    }
 }
 
 /// Small uppercase label above a group.

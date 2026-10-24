@@ -114,6 +114,7 @@ struct PairingSheet: View {
             .background(Theme.canvas.ignoresSafeArea())
             .navigationTitle("Pair with PC")
             .navigationBarTitleDisplayMode(.inline)
+            .keepsNavigationBar()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", action: cancel)
