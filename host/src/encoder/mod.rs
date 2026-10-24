@@ -901,7 +901,8 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
 }
 
 /// After every successful encoder open: report the live codec on the wire
-/// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
+/// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI. FFmpeg
+/// encoders run at `effective_fps`, so none is published.
 fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
     let codec = if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
@@ -909,6 +910,7 @@ fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
         eternal_wire::v2::control::CODEC_H264
     };
     shared.active_codec.store(codec, Ordering::SeqCst);
+    shared.active_fps.store(0, Ordering::SeqCst);
     PIPELINE_STATS
         .lock()
         .set_codec_name(codec_display_name_for(encoder_name));

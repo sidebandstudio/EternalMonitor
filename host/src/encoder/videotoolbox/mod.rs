@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use self::config::{plan_change, plan_session, Codec, PlanChange};
+use self::config::{
+    plan_change, plan_session, Codec, HevcLimit, Limits, PlanChange, SessionPlan, Tier,
+};
 use self::session::{FrameInfo, OutputQueue, Tuning, VtError, VtSession};
 use super::NALUnit;
 use crate::capture::FrameSlot;
@@ -156,15 +158,26 @@ impl Drop for Forwarder {
     }
 }
 
-fn note_session_opened(shared: &SharedControl, codec: Codec) {
+/// After every open: the codec and the planned rate go on the wire
+/// (HELLO_ACK/heartbeat `StreamConfig`), the codec into the GUI too.
+fn note_session_opened(shared: &SharedControl, plan: &SessionPlan) {
     shared.active_codec.store(
-        match codec {
+        match plan.codec {
             Codec::Hevc => eternal_wire::v2::control::CODEC_HEVC,
             Codec::H264 => eternal_wire::v2::control::CODEC_H264,
         },
         Ordering::SeqCst,
     );
-    PIPELINE_STATS.lock().set_codec_name(codec.display_name());
+    note_frame_rate(shared, plan.encode_fps);
+    PIPELINE_STATS
+        .lock()
+        .set_codec_name(plan.codec.display_name());
+}
+
+/// The rate the iPad's assembler times gaps and repairs by: what the
+/// session encodes at, not the 120 a capped request asked for.
+fn note_frame_rate(shared: &SharedControl, encode_fps: u32) {
+    shared.active_fps.store(encode_fps, Ordering::SeqCst);
 }
 
 pub(super) fn run_encode_loop(
@@ -174,7 +187,12 @@ pub(super) fn run_encode_loop(
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tuning = Tuning::from_env();
-    info!(?tuning, "Using the direct VideoToolbox encoder");
+    let hevc_limit = HevcLimit::from_env();
+    info!(
+        ?tuning,
+        ?hevc_limit,
+        "Using the direct VideoToolbox encoder"
+    );
     // Hardware or nothing: this backend never reports a software fallback.
     PIPELINE_STATS.lock().set_software_fallback(false);
     let output = OutputQueue::new();
@@ -195,6 +213,9 @@ pub(super) fn run_encode_loop(
     let mut reopen_after: Option<Instant> = None;
     let mut last_submitted: Option<Instant> = None;
     let mut level_checked = false;
+    // A frame size and the rate it must stay below, set when VideoToolbox
+    // writes an HEVC tier `hevc_limit` rules out (see `vt_hevc_tier`).
+    let mut tier_cap: Option<((u32, u32), u32)> = None;
 
     while let Some(raw_frame) = frames.blocking_take() {
         if !shared.running.load(Ordering::SeqCst)
@@ -224,15 +245,27 @@ pub(super) fn run_encode_loop(
             .abr_current_bps
             .load(Ordering::SeqCst)
             .max(config::MIN_BITRATE_BPS);
+        // The level is planned for the user's ceiling, which the ABR's
+        // pick never exceeds, so ABR steps stay live property changes.
+        let ceiling = shared.bitrate_bps.load(Ordering::SeqCst).max(bitrate);
         let codec = Codec::negotiate(
             shared.hevc_enabled.load(Ordering::SeqCst)
                 && shared.session.lock().client_supports_hevc(),
         );
+        let size = (raw_frame.width, raw_frame.height);
+        let limits = Limits {
+            hevc: hevc_limit,
+            max_fps: tier_cap
+                .filter(|(capped, _)| *capped == size)
+                .map_or(u32::MAX, |(_, fps)| fps),
+        };
         let plan = plan_session(
             codec,
             raw_frame.width,
             raw_frame.height,
             shared.effective_fps(),
+            ceiling,
+            limits,
         )?;
         pending_keyframe |= shared.force_next_idr.swap(false, Ordering::SeqCst);
 
@@ -252,7 +285,8 @@ pub(super) fn run_encode_loop(
                 width = plan.width,
                 height = plan.height,
                 encode_fps = plan.encode_fps,
-                "Reopening VideoToolbox session for a new codec, size or level"
+                level = plan.level.name,
+                "Reopening VideoToolbox session for a new codec, size, level or tier"
             );
             // Dropping flushes the old session's frames ahead of the new IDR.
             session = None;
@@ -261,10 +295,12 @@ pub(super) fn run_encode_loop(
         let open = match session.as_mut() {
             Some(open) => {
                 if let Some(PlanChange::UpdateFrameRate(fps)) = change {
-                    if let Err(error) = open.set_frame_rate(fps) {
-                        warn!(%error, fps, "Could not change the frame rate live");
+                    match open.set_frame_rate(fps) {
+                        Ok(()) => note_frame_rate(&shared, fps),
+                        Err(error) => warn!(%error, fps, "Could not change the frame rate live"),
                     }
                 }
+                let bitrate = open.plan().clamp_bitrate(bitrate);
                 if open.bitrate() != bitrate {
                     if let Err(error) = open.set_bitrate(bitrate) {
                         warn!(%error, bitrate, "Could not change the bitrate live");
@@ -279,7 +315,7 @@ pub(super) fn run_encode_loop(
                 match VtSession::new(plan, bitrate, tuning, output.clone()) {
                     Ok(opened) => {
                         info!(properties = %opened.describe(), "VideoToolbox session ready");
-                        note_session_opened(&shared, codec);
+                        note_session_opened(&shared, &plan);
                         failed_opens = 0;
                         reopen_after = None;
                         level_checked = false;
@@ -384,19 +420,36 @@ pub(super) fn run_encode_loop(
         if !level_checked {
             if let Some(level) = open.emitted_level() {
                 level_checked = true;
+                let opened = *open.plan();
                 let written = level.describe(codec);
-                if level.level_idc < plan.level.idc {
+                let tier = if level.high_tier {
+                    Tier::High
+                } else {
+                    Tier::Main
+                };
+                if level.level_idc < opened.level.idc {
                     // VideoToolbox picked the level; Apple decoders reject a
                     // stream whose level is too low for its size and rate.
                     error!(
                         written,
-                        required = plan.level.name,
+                        required = opened.level.name,
                         "VideoToolbox wrote a level below the stream's requirement"
                     );
+                } else if !hevc_limit.allows(tier) {
+                    // AutoLevel went to High tier below the rate
+                    // `vt_hevc_tier` predicts: run slower on this size.
+                    error!(
+                        written,
+                        encode_fps = opened.encode_fps,
+                        "VideoToolbox wrote HEVC High tier, which needs the experimental opt-in; lowering the frame rate"
+                    );
+                    tier_cap = Some((size, opened.encode_fps.saturating_sub(1).max(1)));
+                    session = None;
+                    pending_keyframe = true;
                 } else {
                     info!(
                         written,
-                        required = plan.level.name,
+                        required = opened.level.name,
                         "Stream profile and level"
                     );
                 }

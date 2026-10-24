@@ -66,6 +66,12 @@ pub struct SharedControl {
     /// What the encoder is actually emitting right now (wire `CODEC_*` value),
     /// written on every encoder open and reported in HELLO_ACK/heartbeats.
     pub active_codec: Arc<AtomicU8>,
+    /// The rate the encoder actually runs at, when it runs below
+    /// `effective_fps` (the direct VideoToolbox encoder thins frames when a
+    /// level or tier cannot carry the target). Written on every encoder open
+    /// and live rate change; 0 for an encoder that runs at `effective_fps`.
+    /// HELLO_ACK/heartbeats advertise it through [`Self::advertised_fps`].
+    pub active_fps: Arc<AtomicU32>,
     /// The client session. Lives here (not in the transport task) so a
     /// pipeline restart — crash recovery, virtual-display toggle, settings
     /// change — does NOT force the iPad through a fresh handshake: the new
@@ -160,6 +166,7 @@ impl SharedControl {
             hevc_enabled: Arc::new(AtomicBool::new(crate::settings::default_hevc_enabled())),
             audio_enabled: Arc::new(AtomicBool::new(true)),
             active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),
+            active_fps: Arc::new(AtomicU32::new(0)),
             session: Arc::new(Mutex::new(crate::transport::session::Session::new({
                 use std::hash::{BuildHasher, Hasher};
                 std::collections::hash_map::RandomState::new()
@@ -178,6 +185,18 @@ impl SharedControl {
             self.target_fps.load(Ordering::SeqCst),
             self.client_preferred_fps.load(Ordering::SeqCst),
         )
+    }
+
+    /// The host's frame rate as HELLO_ACK and heartbeats carry it (before the
+    /// client's own preference caps it): the encoder's planned rate when it
+    /// runs slower than the host's target, which the iPad uses for gap
+    /// detection and repair deadlines.
+    pub fn advertised_fps(&self) -> u32 {
+        let target = self.target_fps.load(Ordering::SeqCst);
+        match self.active_fps.load(Ordering::SeqCst) {
+            0 => target,
+            active => active.min(target),
+        }
     }
 
     /// Is a client actually watching? Protocol v2 makes the session the only
@@ -293,6 +312,18 @@ mod tests {
             assert_eq!(shared.effective_fps(), expected);
             assert_eq!(shared.target_fps.load(Ordering::SeqCst), host);
         }
+    }
+
+    #[test]
+    fn the_encoder_planned_rate_is_advertised_when_lower() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        assert_eq!(shared.advertised_fps(), 120, "an FFmpeg encoder");
+        shared.active_fps.store(60, Ordering::SeqCst);
+        assert_eq!(shared.advertised_fps(), 60);
+        // A target lowered since the encoder last planned wins at once.
+        shared.target_fps.store(30, Ordering::SeqCst);
+        assert_eq!(shared.advertised_fps(), 30);
     }
 
     #[test]

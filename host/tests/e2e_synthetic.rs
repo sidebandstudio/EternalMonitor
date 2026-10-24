@@ -1370,6 +1370,106 @@ fn videotoolbox_hevc_stream_negotiates_and_decodes() {
     stream_hevc_and_decode(None, GpuInfo::detect());
 }
 
+/// A 120 Hz request at full Duo size that the direct VideoToolbox encoder
+/// thins (H.264 runs at 60 at most): HELLO_ACK, STREAM_CONFIG and heartbeats
+/// must carry the 60 it encodes at, because the iPad times gap detection and
+/// repair deadlines by that rate. The planned rate must arrive before the
+/// session's first media datagram.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn videotoolbox_advertises_the_rate_it_encodes() {
+    use std::sync::atomic::Ordering;
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", "2670x1878");
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    shared.target_fps.store(120, Ordering::SeqCst);
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::detect(),
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut receiver = FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, 0);
+        eprintln!("HELLO_ACK fps={}", receiver.advertised_fps);
+        let mut announced: Vec<(&str, u16)> = Vec::new();
+        let mut media_seen = 0u32;
+        let mut first_media_after: Option<usize> = None;
+        let mut heartbeats_at_60 = 0;
+        let mut buffer = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while heartbeats_at_60 < 2 || media_seen < 30 {
+            assert!(
+                Instant::now() < deadline,
+                "advertised rates {announced:?}, {media_seen} media datagrams"
+            );
+            receiver.maybe_report(0, 0);
+            let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            match classify(&buffer[..len]) {
+                Classified::Control(_) => match parse_control(&buffer[..len]) {
+                    Ok((_, ControlMessage::Heartbeat(heartbeat))) => {
+                        announced.push(("heartbeat", heartbeat.stream_config.fps));
+                        if heartbeat.stream_config.fps == 60 {
+                            heartbeats_at_60 += 1;
+                        }
+                    }
+                    Ok((_, ControlMessage::StreamConfig(config))) => {
+                        announced.push(("stream_config", config.fps));
+                    }
+                    _ => {}
+                },
+                Classified::Media { .. } => {
+                    media_seen += 1;
+                    first_media_after.get_or_insert(announced.len());
+                }
+                _ => {}
+            }
+        }
+        eprintln!("ADVERTISED {announced:?} first media after {first_media_after:?}");
+        let before_media = &announced[..first_media_after.unwrap()];
+        assert!(
+            receiver.advertised_fps == 60 || before_media.iter().any(|(_, fps)| *fps == 60),
+            "the planned 60 must be announced before media: ack {} then {before_media:?}",
+            receiver.advertised_fps
+        );
+        let last_heartbeat = announced
+            .iter()
+            .rfind(|(kind, _)| *kind == "heartbeat")
+            .unwrap();
+        assert_eq!(last_heartbeat.1, 60);
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    shared.stop();
+    supervisor_tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bounded shutdown");
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
 /// Streams the synthetic source as HEVC to a fake client that advertises
 /// HEVC decode, and checks the handoff, the codec on the wire and the
 /// decoded frame counters.

@@ -7,7 +7,7 @@
 //! needs `unsafe` but is always sound: they are immutable statics the
 //! frameworks initialise before `main`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -268,7 +268,19 @@ struct Pending {
     keyframe_requested: bool,
 }
 
-/// State the output callback reaches through its refcon.
+/// Callback states by session ID. VideoToolbox gets the ID as the output
+/// callback's refcon instead of a pointer. A callback looks its state up
+/// here and clones the `Arc`; `VtSession`'s Drop removes the entry, so a
+/// late callback from a lost session finds nothing and returns, and the
+/// state is freed with its last clone.
+static CALLBACKS: Mutex<BTreeMap<u64, Arc<CallbackState>>> = Mutex::new(BTreeMap::new());
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn callback_state(session_id: u64) -> Option<Arc<CallbackState>> {
+    CALLBACKS.lock().get(&session_id).cloned()
+}
+
+/// State the output callback reaches through its session ID.
 struct CallbackState {
     codec: Codec,
     output: Arc<OutputQueue>,
@@ -346,11 +358,10 @@ extern "C" fn on_encoded(
     flags: u32,
     sample: ffi::CMSampleBufferRef,
 ) {
-    // SAFETY: `refcon` is the `Arc<CallbackState>` pointer the session took
-    // with `Arc::into_raw`. It is released only after
-    // VTCompressionSessionCompleteFrames and Invalidate have returned, and
-    // never for a session that was lost mid-encode (see `Drop`).
-    let state = unsafe { &*(refcon as *const CallbackState) };
+    // `refcon` is the session ID, an integer and never dereferenced.
+    let Some(state) = callback_state(refcon as u64) else {
+        return;
+    };
     let token = frame_refcon as u64;
     // A panic must not unwind into VideoToolbox.
     if std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -484,7 +495,8 @@ pub struct SessionCounters {
 
 pub struct VtSession {
     raw: ffi::VTCompressionSessionRef,
-    state: *const CallbackState,
+    id: u64,
+    state: Arc<CallbackState>,
     plan: SessionPlan,
     live_fps: u32,
     bitrate_bps: u32,
@@ -498,7 +510,7 @@ pub struct VtSession {
 
 // SAFETY: a VTCompressionSession may be driven from any thread as long as
 // calls are not concurrent; a VtSession is owned and called by one encode
-// thread at a time. The callback state behind `state` is Sync.
+// thread at a time.
 unsafe impl Send for VtSession {}
 
 impl VtSession {
@@ -543,7 +555,8 @@ impl VtSession {
             i32::try_from(plan.width).map_err(|_| VtError::Input("width too large".into()))?,
             i32::try_from(plan.height).map_err(|_| VtError::Input("height too large".into()))?,
         );
-        let state = Arc::into_raw(Arc::new(CallbackState {
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let state = Arc::new(CallbackState {
             codec: plan.codec,
             output,
             pending: Mutex::new(HashMap::new()),
@@ -553,10 +566,11 @@ impl VtSession {
             failed: AtomicU64::new(0),
             last_failure: AtomicI32::new(0),
             emitted: Mutex::new(None),
-        }));
+        });
+        CALLBACKS.lock().insert(id, state.clone());
         let mut raw: ffi::VTCompressionSessionRef = std::ptr::null_mut();
-        // SAFETY: the dictionaries outlive the call; `state` stays valid until
-        // Drop releases it after invalidation.
+        // SAFETY: the dictionaries outlive the call. The refcon is the
+        // session ID, an integer the callback looks up.
         let status = unsafe {
             ffi::VTCompressionSessionCreate(
                 std::ptr::null(),
@@ -570,13 +584,12 @@ impl VtSession {
                 source_attributes.as_concrete_TypeRef().cast(),
                 std::ptr::null(),
                 Some(on_encoded),
-                state as *mut c_void,
+                id as *mut c_void,
                 &mut raw,
             )
         };
         if status != 0 || raw.is_null() {
-            // SAFETY: no session exists, so no callback can hold `state`.
-            drop(unsafe { Arc::from_raw(state) });
+            CALLBACKS.lock().remove(&id);
             return Err(match classify_status(status) {
                 StatusClass::NoHardware => VtError::NoHardware(format!(
                     "no hardware {} encoder for {}x{} (status {status})",
@@ -594,10 +607,12 @@ impl VtSession {
         // From here on Drop tears the session down on any error.
         let mut session = Self {
             raw,
+            id,
             state,
             plan,
             live_fps: plan.encode_fps,
-            bitrate_bps,
+            // Prepared at the level's bitrate; `set_bitrate` below moves it.
+            bitrate_bps: plan.level_bitrate_bps,
             data_rate_limit: tuning.data_rate_limit,
             converter,
             next_token: 0,
@@ -606,6 +621,10 @@ impl VtSession {
             force_keyframe,
         };
         session.configure(tuning)?;
+        let bitrate_bps = plan.clamp_bitrate(bitrate_bps);
+        if bitrate_bps != session.bitrate_bps {
+            session.set_bitrate(bitrate_bps)?;
+        }
         if !session.copy_bool(unsafe {
             ffi::kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder
         }) {
@@ -620,7 +639,9 @@ impl VtSession {
             height = plan.height,
             target_fps = plan.target_fps,
             encode_fps = plan.encode_fps,
+            required_tier = ?plan.tier,
             required_level = plan.level.name,
+            level_bitrate_bps = plan.level_bitrate_bps,
             bitrate_bps,
             ?tuning,
             "Opened VideoToolbox session"
@@ -630,6 +651,9 @@ impl VtSession {
 
     fn configure(&mut self, tuning: Tuning) -> Result<(), VtError> {
         let plan = self.plan;
+        // VideoToolbox has no explicit HEVC levels: AutoLevel picks the
+        // level from the size, ExpectedFrameRate and AverageBitRate when the
+        // session is prepared, which `plan_session` predicts.
         let profile = match plan.codec {
             Codec::Hevc => unsafe { ffi::kVTProfileLevel_HEVC_Main_AutoLevel },
             Codec::H264 => h264_profile_level(plan)?,
@@ -828,9 +852,20 @@ impl VtSession {
     }
 
     /// Changes `AverageBitRate` (and `DataRateLimits` when enabled) on the
-    /// open session: no reopen, no IDR, no gap.
+    /// open session: no reopen, no IDR, no gap. Clamped to what the level
+    /// carries: VideoToolbox accepts more live but keeps the level it
+    /// prepared with, so the stream would no longer conform to it.
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), VtError> {
-        let bitrate_bps = bitrate_bps.max(config::MIN_BITRATE_BPS);
+        let requested = bitrate_bps;
+        let bitrate_bps = self.plan.clamp_bitrate(bitrate_bps);
+        if bitrate_bps < requested {
+            warn!(
+                requested,
+                clamped = bitrate_bps,
+                level = self.plan.level.name,
+                "Bitrate clamped to what the stream's level carries"
+            );
+        }
         let status = self.set(
             unsafe { ffi::kVTCompressionPropertyKey_AverageBitRate },
             &CFNumber::from(i64::from(bitrate_bps)).as_CFType(),
@@ -889,8 +924,7 @@ impl VtSession {
     }
 
     fn state(&self) -> &CallbackState {
-        // SAFETY: `state` is released only in Drop.
-        unsafe { &*self.state }
+        &self.state
     }
 
     /// Frames submitted whose callback has not run yet.
@@ -1098,6 +1132,48 @@ impl VtSession {
         // SAFETY: live session; Drop invalidates again, which is allowed.
         unsafe { ffi::VTCompressionSessionInvalidate(self.raw) };
     }
+
+    #[cfg(test)]
+    pub fn callback_probe(&self) -> CallbackProbe {
+        CallbackProbe {
+            id: self.id,
+            state: Arc::downgrade(&self.state),
+        }
+    }
+}
+
+/// Watches a session's callback state after the session is gone.
+#[cfg(test)]
+pub struct CallbackProbe {
+    id: u64,
+    state: std::sync::Weak<CallbackState>,
+}
+
+#[cfg(test)]
+impl CallbackProbe {
+    pub fn is_registered(&self) -> bool {
+        CALLBACKS.lock().contains_key(&self.id)
+    }
+
+    pub fn is_freed(&self) -> bool {
+        self.state.strong_count() == 0
+    }
+
+    /// Runs the output callback as a frame from this session would.
+    pub fn late_callback(&self, status: i32) {
+        on_encoded(
+            self.id as *mut c_void,
+            std::ptr::null_mut(),
+            status,
+            0,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(test)]
+pub fn registered_callbacks() -> usize {
+    CALLBACKS.lock().len()
 }
 
 /// `DataRateLimits` as a CFArray of [bytes, seconds].
@@ -1134,23 +1210,105 @@ fn h264_profile_level(plan: SessionPlan) -> Result<CFStringRef, VtError> {
 
 impl Drop for VtSession {
     fn drop(&mut self) {
-        let lost = self.is_lost();
         // SAFETY: we own the session's only reference. CompleteFrames runs
         // every pending callback; Invalidate stops further ones.
         unsafe {
-            if !lost {
+            if !self.is_lost() {
                 ffi::VTCompressionSessionCompleteFrames(self.raw, ffi::CMTime::INVALID);
             }
             ffi::VTCompressionSessionInvalidate(self.raw);
             ffi::CFRelease(self.raw as CFTypeRef);
         }
-        if lost {
-            // A lost session's pending frames never complete, and no API
-            // promises their callbacks won't still arrive. Leaking the small
-            // callback state keeps a late callback from reading freed memory.
-            return;
+        // A lost session's pending frames never complete, and no API
+        // promises their callbacks won't still arrive. Once the entry is
+        // gone such a callback finds nothing; one already running holds
+        // its own clone of the state.
+        CALLBACKS.lock().remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn register(state: &Arc<CallbackState>) -> u64 {
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        CALLBACKS.lock().insert(id, state.clone());
+        id
+    }
+
+    fn callback_state() -> Arc<CallbackState> {
+        Arc::new(CallbackState {
+            codec: Codec::Hevc,
+            output: OutputQueue::new(),
+            pending: Mutex::new(HashMap::new()),
+            lost: AtomicBool::new(false),
+            rekey: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            last_failure: AtomicI32::new(0),
+            emitted: Mutex::new(None),
+        })
+    }
+
+    fn pending() -> Pending {
+        Pending {
+            info: FrameInfo {
+                captured: Instant::now(),
+                frame_number: 1,
+            },
+            started: Instant::now(),
+            keyframe_requested: false,
         }
-        // SAFETY: balances Arc::into_raw in `new`; no callback can run now.
-        drop(unsafe { Arc::from_raw(self.state) });
+    }
+
+    fn callback(id: u64, token: u64, status: i32) {
+        on_encoded(
+            id as *mut c_void,
+            token as *mut c_void,
+            status,
+            0,
+            std::ptr::null_mut(),
+        );
+    }
+
+    #[test]
+    fn callbacks_reach_a_registered_session_and_late_ones_are_no_ops() {
+        let state = callback_state();
+        let id = register(&state);
+        state.pending.lock().insert(1, pending());
+        callback(id, 1, ffi::VT_INVALID_SESSION);
+        assert!(state.lost.load(Ordering::Relaxed));
+        assert_eq!(state.failed.load(Ordering::Relaxed), 1);
+
+        // Teardown of a lost session: frames still pending never completed.
+        state.pending.lock().insert(2, pending());
+        let freed = Arc::downgrade(&state);
+        drop(state);
+        CALLBACKS.lock().remove(&id);
+        assert_eq!(freed.strong_count(), 0, "freed with its last clone");
+        // The late callback for frame 2 finds no session and returns.
+        callback(id, 2, 0);
+        callback(id, 2, ffi::VT_INVALID_SESSION);
+    }
+
+    #[test]
+    fn lost_sessions_leave_nothing_behind() {
+        let mut freed = Vec::new();
+        for _ in 0..10_000 {
+            let state = callback_state();
+            let id = register(&state);
+            for token in 0..4 {
+                state.pending.lock().insert(token, pending());
+            }
+            callback(id, 0, ffi::VT_INVALID_SESSION);
+            freed.push((id, Arc::downgrade(&state)));
+            drop(state);
+            CALLBACKS.lock().remove(&id);
+            callback(id, 1, 0);
+        }
+        assert!(freed.iter().all(|(_, state)| state.strong_count() == 0));
+        let registry = CALLBACKS.lock();
+        assert!(freed.iter().all(|(id, _)| !registry.contains_key(id)));
     }
 }

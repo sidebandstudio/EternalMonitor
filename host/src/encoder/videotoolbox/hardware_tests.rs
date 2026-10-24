@@ -23,10 +23,12 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use parking_lot::Mutex;
 
-use super::bitstream::ProfileTierLevel;
-use super::config::{plan_session, Codec, SessionPlan};
+use super::bitstream::{self, ProfileTierLevel};
+use super::config::{plan_session, Codec, HevcLimit, Limits, SessionPlan, Tier};
 use super::ffi;
-use super::session::{EncodedFrame, FrameInfo, OutputQueue, Tuning, VtError, VtSession};
+use super::session::{
+    registered_callbacks, EncodedFrame, FrameInfo, OutputQueue, Tuning, VtError, VtSession,
+};
 use crate::capture::synthetic::{
     decode_frame_counter_from_luma, draw_frame_counter, render_synthetic_frame, COUNTER_BITS,
     COUNTER_MARGIN, COUNTER_SQUARE, COUNTER_STRIP_H,
@@ -45,6 +47,7 @@ struct Spec {
     bitrate_change: Option<(f64, u32)>,
     keyframe_every: Option<f64>,
     tuning: Tuning,
+    limits: Limits,
 }
 
 impl Spec {
@@ -63,6 +66,20 @@ impl Spec {
             keyframe_every: Some(1.0),
             // ETERNAL_VT_* overrides apply, for comparing settings.
             tuning: Tuning::from_env(),
+            limits: Limits {
+                hevc: HevcLimit::from_env(),
+                ..Limits::default()
+            },
+        }
+    }
+
+    fn experimental(self) -> Self {
+        Self {
+            limits: Limits {
+                hevc: HevcLimit::ExperimentalHighTier,
+                ..self.limits
+            },
+            ..self
         }
     }
 }
@@ -73,6 +90,8 @@ struct Run {
     outputs: Vec<EncodedFrame>,
     keyframe_requests: Vec<u64>,
     call_us: Vec<u64>,
+    /// Gaps between successive encode calls: the harness's own pacing.
+    submit_gap_us: Vec<u64>,
     bitrate_change_us: Option<u128>,
     change_frame: Option<u64>,
     emitted: Option<ProfileTierLevel>,
@@ -101,7 +120,23 @@ fn pattern_frames(width: u32, height: u32) -> Vec<Vec<u8>> {
 }
 
 fn run(spec: &Spec) -> Run {
-    let plan = plan_session(spec.codec, spec.size.0, spec.size.1, spec.fps).unwrap();
+    // Pace like the pipeline's capture thread; at the default QoS a loaded
+    // machine oversleeps the frame interval by 100 ms and more.
+    crate::capture::timing::set_stream_qos();
+    // As in the encode loop: the level is planned for the ceiling, here the
+    // higher of the two bitrates.
+    let ceiling = spec
+        .bitrate_change
+        .map_or(spec.bitrate, |(_, to)| to.max(spec.bitrate));
+    let plan = plan_session(
+        spec.codec,
+        spec.size.0,
+        spec.size.1,
+        spec.fps,
+        ceiling,
+        spec.limits,
+    )
+    .unwrap();
     let output = OutputQueue::new();
     let mut session = VtSession::new(plan, spec.bitrate, spec.tuning, output.clone())
         .expect("hardware VideoToolbox session");
@@ -119,6 +154,8 @@ fn run(spec: &Spec) -> Run {
         .map(|every| (every * f64::from(fps)).round() as u64);
     let mut keyframe_requests = Vec::new();
     let mut call_us = Vec::new();
+    let mut submit_gap_us = Vec::new();
+    let mut last_call: Option<Instant> = None;
     let mut bitrate_change_us = None;
     let load = load_average();
     let started = Instant::now();
@@ -139,6 +176,9 @@ fn run(spec: &Spec) -> Run {
         let frame = &mut frames[(i % 8) as usize];
         draw_frame_counter(frame, width, i);
         let call = Instant::now();
+        if let Some(last) = last_call.replace(call) {
+            submit_gap_us.push(call.duration_since(last).as_micros() as u64);
+        }
         session
             .encode_bgra(
                 frame,
@@ -167,6 +207,7 @@ fn run(spec: &Spec) -> Run {
         outputs,
         keyframe_requests,
         call_us,
+        submit_gap_us,
         bitrate_change_us,
         change_frame,
         emitted,
@@ -271,13 +312,14 @@ fn summarize(label: &str, run: &Run) -> Summary {
         .map(|o| o.frame_number)
         .collect();
     let calls = ms_stats(run.call_us.iter().copied());
+    let submit_gap_p99_ms = ms_stats(run.submit_gap_us.iter().copied()).2;
     eprintln!(
         "RESULT {label} codec={:?} size={}x{} fps={} load=[{}] submitted={} out={} dropped={} failed={} \
          out_fps={out_fps:.1} latency_ms p50={:.1} p95={:.1} p99={:.1} \
          encode_call_ms p50={:.2} p95={:.2} p99={:.2} \
          keyframe_req={} keyframe_ms p50={:.1} p95={:.1} max={:.1} \
          level={} required={} bitrate_change_us={:?} gap_near_change_ms={max_gap_near_change_ms:.1} \
-         p99_gap_ms={p99_gap_ms:.1} mbps_before={mbps_before:.1} mbps_after={mbps_after:.1} \
+         p99_gap_ms={p99_gap_ms:.1} submit_gap_p99_ms={submit_gap_p99_ms:.1} mbps_before={mbps_before:.1} mbps_after={mbps_after:.1} \
          unrequested_keys={unexpected_keys:?}",
         run.plan.codec,
         run.plan.width,
@@ -343,6 +385,13 @@ fn assert_stream(run: &Run, summary: &Summary) {
         "level {} below the required {}",
         emitted.describe(run.plan.codec),
         run.plan.level.name
+    );
+    assert_eq!(
+        emitted.high_tier,
+        run.plan.tier == Tier::High,
+        "VideoToolbox wrote {} for a {:?}-tier plan",
+        emitted.describe(run.plan.codec),
+        run.plan.tier
     );
     assert!(
         summary.out_fps > fps * 0.9,
@@ -856,16 +905,65 @@ fn hevc_full_size_at_60() {
     stream_and_verify("hevc_full_60", Spec::hevc(FULL, 60));
 }
 
+/// The default: Main tier, so a 120 Hz request at full size runs at 60.
 #[test]
 #[ignore = "needs a hardware VideoToolbox encoder"]
-fn hevc_full_size_at_120_is_level_5_2() {
-    stream_and_verify("hevc_full_120", Spec::hevc(FULL, 120));
+fn hevc_full_size_at_120_runs_main_tier_at_60() {
+    let spec = Spec {
+        limits: Limits::default(),
+        ..Spec::hevc(FULL, 120)
+    };
+    let run = run(&spec);
+    assert_eq!((run.plan.encode_fps, run.plan.tier), (60, Tier::Main));
+    let summary = summarize("hevc_full_120_default", &run);
+    assert_stream(&run, &summary);
+    assert_eq!(
+        run.emitted.unwrap().describe(Codec::Hevc),
+        "Main Main tier 5.1"
+    );
+    assert_decoded(
+        "hevc_full_120_default videotoolbox",
+        &run,
+        &videotoolbox_decode(&run),
+    );
+    assert_decoded("hevc_full_120_default ffmpeg", &run, &ffmpeg_decode(&run));
 }
 
+/// `ETERNAL_VT_EXPERIMENTAL_HEVC_HIGH_TIER`: full size at 120 is Main High
+/// tier 5.2, which no device decoder has been checked with.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn experimental_hevc_full_size_at_120_is_high_tier_5_2() {
+    let summary_spec = Spec::hevc(FULL, 120).experimental();
+    let run = run(&summary_spec);
+    assert_eq!((run.plan.encode_fps, run.plan.tier), (120, Tier::High));
+    let summary = summarize("hevc_full_120_experimental", &run);
+    assert_stream(&run, &summary);
+    assert_eq!(
+        run.emitted.unwrap().describe(Codec::Hevc),
+        "Main High tier 5.2"
+    );
+    assert_decoded(
+        "hevc_full_120_experimental videotoolbox",
+        &run,
+        &videotoolbox_decode(&run),
+    );
+    assert_decoded(
+        "hevc_full_120_experimental ffmpeg",
+        &run,
+        &ffmpeg_decode(&run),
+    );
+}
+
+/// The outer screen keeps 120 fps on Main tier 5.1 by default.
 #[test]
 #[ignore = "needs a hardware VideoToolbox encoder"]
 fn hevc_outer_size_at_120() {
-    stream_and_verify("hevc_outer_120", Spec::hevc(OUTER, 120));
+    let spec = Spec {
+        limits: Limits::default(),
+        ..Spec::hevc(OUTER, 120)
+    };
+    stream_and_verify("hevc_outer_120", spec);
 }
 
 #[test]
@@ -898,7 +996,7 @@ fn h264_outer_size_at_120_runs_at_60() {
 #[test]
 #[ignore = "needs a hardware VideoToolbox encoder"]
 fn a_lost_session_is_replaced_and_the_stream_still_decodes() {
-    let plan = plan_session(Codec::Hevc, 1280, 720, 60).unwrap();
+    let plan = plan_session(Codec::Hevc, 1280, 720, 60, 8_000_000, Limits::default()).unwrap();
     let output = OutputQueue::new();
     let mut frames = pattern_frames(1280, 720);
     let mut encode = |session: &mut VtSession, i: u64, force: bool| {
@@ -964,6 +1062,7 @@ fn a_lost_session_is_replaced_and_the_stream_still_decodes() {
         outputs,
         keyframe_requests: vec![31],
         call_us: Vec::new(),
+        submit_gap_us: Vec::new(),
         bitrate_change_us: None,
         change_frame: None,
         emitted,
@@ -1034,11 +1133,409 @@ fn tuning_matrix_at_full_size_120() {
             bitrate_change: None,
             keyframe_every: Some(2.0),
             tuning,
-            ..Spec::hevc(FULL, 120)
+            // 120 fps at full size needs High tier.
+            ..Spec::hevc(FULL, 120).experimental()
         };
         let run = run(&spec);
         let summary = summarize(&format!("tuning_{label}"), &run);
         table.insert(label, (summary.out_fps, summary.latency, run.dropped));
     }
     eprintln!("TUNING {table:?}");
+}
+
+/// Runs the real encode loop on the synthetic pattern at `size` and `fps`
+/// for `seconds`. Halfway through, the user's ceiling and the ABR's pick
+/// both rise from `from` to `to`, and a few frames later a keyframe is
+/// requested, so the stream's next parameter sets show the level the
+/// session declares after the change. Returns every access unit and the
+/// frame number the change came at.
+fn run_loop_with_bitrate_increase(
+    codec: Codec,
+    size: (u32, u32),
+    fps: u32,
+    seconds: f64,
+    from: u32,
+    to: u32,
+) -> (Vec<super::NALUnit>, u64, crate::control::SharedControl) {
+    use std::sync::atomic::Ordering;
+
+    let shared = crate::control::SharedControl::new(0, from);
+    shared.running.store(true, Ordering::SeqCst);
+    shared.target_fps.store(fps, Ordering::SeqCst);
+    shared
+        .hevc_enabled
+        .store(codec == Codec::Hevc, Ordering::SeqCst);
+    if codec == Codec::Hevc {
+        // A client that advertises HEVC decode, as HELLO2 would register it.
+        struct Config;
+        impl crate::transport::session::ConfigSource for Config {
+            fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
+                eternal_wire::v2::control::StreamConfig {
+                    stream_epoch: 1,
+                    width: 0,
+                    height: 0,
+                    fps: 0,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 0,
+                }
+            }
+            fn host_name(&self) -> String {
+                "test".into()
+            }
+        }
+        use eternal_wire::v2::control::{ControlMessage, Hello2, CAP_DECODE_H264, CAP_DECODE_HEVC};
+        shared.session.lock().handle_control(
+            crate::transport::link::PeerId::udp(([127, 0, 0, 1], 50_000).into()),
+            0,
+            ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 1,
+                listen_port: 50_000,
+                decoder_caps: CAP_DECODE_H264 | CAP_DECODE_HEVC,
+                feature_caps: 0,
+                screen_px_w: size.0 as u16,
+                screen_px_h: size.1 as u16,
+                screen_pt_w: size.0 as u16 / 2,
+                screen_pt_h: size.1 as u16 / 2,
+                refresh_hz: 120,
+                device_name: "test".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            }),
+            &Config,
+            Instant::now(),
+        );
+        assert!(shared.session.lock().client_supports_hevc());
+    }
+    let (producer, consumer) = crate::capture::frame_slot();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+    let loop_shared = shared.clone();
+    // The pipeline's capture and encode threads run at this QoS
+    // (`run_encode_stage`); without it a loaded machine starves them.
+    let encoder = std::thread::spawn(move || {
+        crate::capture::timing::set_stream_qos();
+        super::run_encode_loop(consumer, tx, loop_shared, generation).map_err(|e| e.to_string())
+    });
+    crate::capture::timing::set_stream_qos();
+    let (width, height) = size;
+    let mut frames = pattern_frames(width, height);
+    let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+    let total = (seconds * f64::from(fps)).round() as u64;
+    let change = total / 2;
+    let started = Instant::now();
+    for i in 0..total {
+        if let Some(wait) = (started + interval * i as u32).checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        if i == change {
+            shared.bitrate_bps.store(to, Ordering::SeqCst);
+            shared.abr_current_bps.store(to, Ordering::SeqCst);
+        }
+        if i == change + 5 {
+            shared.force_next_idr.store(true, Ordering::SeqCst);
+        }
+        let frame = &mut frames[(i % 8) as usize];
+        draw_frame_counter(frame, width, i);
+        producer.publish(crate::capture::RawFrame {
+            frame_number: i,
+            timestamp: Instant::now(),
+            data: Arc::new(frame.clone()),
+            width,
+            height,
+        });
+    }
+    eprintln!(
+        "LOOP published {total} frames in {:.2} s (asked for {seconds} s)",
+        started.elapsed().as_secs_f64()
+    );
+    producer.close();
+    encoder.join().unwrap().unwrap();
+    let mut units = Vec::new();
+    while let Ok(unit) = rx.try_recv() {
+        units.push(unit);
+    }
+    (units, change, shared)
+}
+
+/// The profile, tier and level in an access unit's VPS (HEVC) or SPS.
+fn access_unit_ptl(codec: Codec, unit: &[u8]) -> Option<ProfileTierLevel> {
+    let starts: Vec<usize> = unit
+        .windows(4)
+        .enumerate()
+        .filter(|(_, window)| *window == [0, 0, 0, 1])
+        .map(|(at, _)| at + 4)
+        .collect();
+    starts.iter().enumerate().find_map(|(index, &start)| {
+        let end = starts.get(index + 1).map_or(unit.len(), |next| next - 4);
+        bitstream::parameter_set_ptl(codec, &unit[start..end])
+    })
+}
+
+/// Decodes what the encode loop sent, with VideoToolbox and FFmpeg.
+fn assert_loop_stream_decodes(label: &str, plan: SessionPlan, units: &[super::NALUnit]) {
+    let outputs: Vec<EncodedFrame> = units
+        .iter()
+        .map(|unit| EncodedFrame {
+            keyframe: unit.is_keyframe,
+            keyframe_requested: false,
+            captured: unit.timestamp,
+            frame_number: unit.sequence,
+            encode_us: unit.encode_duration_us,
+            delivered: Instant::now(),
+            data: unit.data.clone(),
+        })
+        .collect();
+    let run = Run {
+        plan,
+        submitted: outputs.len(),
+        outputs,
+        keyframe_requests: Vec::new(),
+        call_us: Vec::new(),
+        submit_gap_us: Vec::new(),
+        bitrate_change_us: None,
+        change_frame: None,
+        // FFmpeg reports the parameter sets it saw last.
+        emitted: units
+            .iter()
+            .rev()
+            .find_map(|unit| access_unit_ptl(plan.codec, &unit.data)),
+        dropped: 0,
+        failed: 0,
+        load: load_average(),
+    };
+    let numbers: Vec<u64> = run.outputs.iter().map(|o| o.frame_number).collect();
+    let skipped: Vec<u64> = numbers
+        .windows(2)
+        .filter(|pair| pair[1] - pair[0] > 1)
+        .map(|pair| pair[0] + 1)
+        .collect();
+    eprintln!(
+        "LOOP {label}: {} frames out, first {:?}, gaps after {skipped:?}",
+        numbers.len(),
+        numbers.first()
+    );
+    assert_decoded(
+        &format!("{label} videotoolbox"),
+        &run,
+        &videotoolbox_decode(&run),
+    );
+    assert_decoded(&format!("{label} ffmpeg"), &run, &ffmpeg_decode(&run));
+}
+
+fn level_after_increase(label: &str, codec: Codec, from: u32, to: u32) -> (u8, u8) {
+    let (units, change, _) = run_loop_with_bitrate_increase(codec, (1280, 720), 30, 4.0, from, to);
+    let plan = plan_session(codec, 1280, 720, 30, to, Limits::default()).unwrap();
+    assert_loop_stream_decodes(&format!("loop {label}"), plan, &units);
+    let levels: Vec<(u64, ProfileTierLevel)> = units
+        .iter()
+        .filter(|unit| unit.is_keyframe)
+        .filter_map(|unit| Some((unit.sequence, access_unit_ptl(codec, &unit.data)?)))
+        .collect();
+    eprintln!(
+        "LEVELS {label} load=[{}] change_at={change} {:?}",
+        load_average(),
+        levels
+            .iter()
+            .map(|(frame, ptl)| format!("{frame}:{}", ptl.describe(codec)))
+            .collect::<Vec<_>>()
+    );
+    let before = levels.first().expect("a first keyframe").1.level_idc;
+    let after = levels
+        .iter()
+        .rfind(|(frame, _)| *frame > change)
+        .expect("a keyframe after the change")
+        .1
+        .level_idc;
+    (before, after)
+}
+
+/// Sol's repro: H.264 1280x720 at 30 fps, 15 Mbps raised to 50 live. Level
+/// 3.1 carries 17.5 Mbps; the stream must declare 4.1 after the raise.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn a_live_bitrate_increase_raises_the_h264_level() {
+    let (before, after) = level_after_increase("h264", Codec::H264, 15_000_000, 50_000_000);
+    assert_eq!(before, 31);
+    assert!(after >= 41, "SPS declares level_idc {after} at 50 Mbps");
+}
+
+/// HEVC at 1280x720 and 30 fps: AutoLevel writes 4.1 at 15 Mbps, which
+/// carries 20; 30 Mbps needs 5.1.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn a_live_bitrate_increase_raises_the_hevc_level() {
+    let (before, after) = level_after_increase("hevc", Codec::Hevc, 15_000_000, 30_000_000);
+    assert_eq!(before, 123);
+    assert!(after >= 153, "VPS declares level_idc {after} at 30 Mbps");
+}
+
+/// The encode loop publishes the rate it plans: a 120 Hz request at full
+/// size runs at 60 on Main tier, and that is what the wire advertises.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn the_planned_rate_is_published_and_the_stream_decodes() {
+    let (units, change, shared) =
+        run_loop_with_bitrate_increase(Codec::Hevc, FULL, 120, 3.0, 15_000_000, 30_000_000);
+    assert_eq!(
+        shared.active_fps.load(std::sync::atomic::Ordering::SeqCst),
+        60
+    );
+    assert_eq!(shared.advertised_fps(), 60);
+    let plan = plan_session(
+        Codec::Hevc,
+        FULL.0,
+        FULL.1,
+        120,
+        30_000_000,
+        Limits::default(),
+    )
+    .unwrap();
+    // Thinned to 60, and capped further by how fast this test can copy
+    // 20 MB frames: what matters is that frames span the change.
+    assert!(units.len() >= 30, "{} frames", units.len());
+    assert!(units.iter().any(|unit| unit.sequence > change));
+    assert_loop_stream_decodes("loop full_120", plan, &units);
+}
+
+/// Sessions lost mid-encode, over and over: each one's callback state is
+/// freed once the session is dropped, the registry is back where it began,
+/// and a late callback for a dead session is a no-op.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn lost_sessions_free_their_callback_state() {
+    let plan = plan_session(Codec::Hevc, 640, 360, 60, 4_000_000, Limits::default()).unwrap();
+    let mut frame = vec![0u8; 640 * 360 * 4];
+    render_synthetic_frame(&mut frame, 640, 360, 1);
+    let baseline = registered_callbacks();
+    let mut probes = Vec::new();
+    for round in 0..200u64 {
+        let output = OutputQueue::new();
+        let mut session = VtSession::new(plan, 4_000_000, Tuning::default(), output).unwrap();
+        // Frames in flight when the session dies.
+        for i in 0..3 {
+            session
+                .encode_bgra(
+                    &frame,
+                    640 * 4,
+                    FrameInfo {
+                        captured: Instant::now(),
+                        frame_number: round * 10 + i,
+                    },
+                    i == 0,
+                )
+                .unwrap();
+        }
+        session.invalidate_for_test();
+        let error = session
+            .encode_bgra(
+                &frame,
+                640 * 4,
+                FrameInfo {
+                    captured: Instant::now(),
+                    frame_number: round * 10 + 9,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(error, VtError::SessionLost(_)), "{error:?}");
+        assert!(session.is_lost());
+        let probe = session.callback_probe();
+        drop(session);
+        assert!(!probe.is_registered());
+        probe.late_callback(0);
+        probe.late_callback(ffi::VT_INVALID_SESSION);
+        probes.push(probe);
+    }
+    // A VideoToolbox callback still running at teardown holds its own clone
+    // for the length of that call.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while probes.iter().any(|probe| !probe.is_freed()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let leaked = probes.iter().filter(|probe| !probe.is_freed()).count();
+    eprintln!(
+        "LOST 200 sessions: leaked={leaked} registry={} baseline={baseline}",
+        registered_callbacks()
+    );
+    assert_eq!(leaked, 0);
+    assert_eq!(registered_callbacks(), baseline);
+}
+
+/// The profile, tier and level VideoToolbox writes in the first keyframe of
+/// a session prepared at `bitrate`, at exactly `fps`.
+fn emitted_ptl(size: (u32, u32), fps: u32, bitrate: u32) -> ProfileTierLevel {
+    let plan = SessionPlan {
+        encode_fps: fps,
+        target_fps: fps,
+        level_bitrate_bps: bitrate,
+        max_bitrate_bps: bitrate,
+        ..plan_session(Codec::Hevc, size.0, size.1, 1, bitrate, Limits::default()).unwrap()
+    };
+    let output = OutputQueue::new();
+    let mut session = VtSession::new(plan, bitrate, Tuning::default(), output).unwrap();
+    let mut frame = vec![0u8; size.0 as usize * size.1 as usize * 4];
+    render_synthetic_frame(&mut frame, size.0, size.1, 3);
+    for i in 0..2 {
+        session
+            .encode_bgra(
+                &frame,
+                size.0 as usize * 4,
+                FrameInfo {
+                    captured: Instant::now(),
+                    frame_number: i,
+                },
+                i == 0,
+            )
+            .unwrap();
+    }
+    session.flush().unwrap();
+    session.emitted_level().expect("a keyframe")
+}
+
+/// Where HEVC AutoLevel lands, by size, rate and bitrate: the data behind
+/// `config::VT_HEVC_MAIN_TIER_MAX_LUMA_RATE` and `config::tests::VT_HEVC_SURVEY`.
+/// Prints one SURVEY line per session and checks the planner's prediction.
+#[test]
+#[ignore = "needs a hardware VideoToolbox encoder"]
+fn hevc_auto_level_survey() {
+    let mut mismatches = Vec::new();
+    for (size, rates) in [
+        ((1280, 720), &[30, 60, 120, 240][..]),
+        ((1920, 1080), &[60, 90, 120, 240][..]),
+        (OUTER, &[60, 100, 120][..]),
+        ((2460, 1640), &[120][..]),
+        ((2500, 1700), &[120][..]),
+        (FULL, &[30, 60, 90, 98, 99, 100, 120][..]),
+    ] {
+        for &fps in rates {
+            for mbps in [4, 12, 13, 15, 26, 30, 39, 41, 50] {
+                let bitrate = mbps * 1_000_000;
+                let written = emitted_ptl(size, fps, bitrate);
+                let tier = super::config::vt_hevc_tier(size.0, size.1, fps);
+                let predicted =
+                    super::config::min_level(Codec::Hevc, tier, size.0, size.1, fps, bitrate)
+                        .unwrap();
+                let matches =
+                    written.level_idc == predicted.idc && written.high_tier == (tier == Tier::High);
+                eprintln!(
+                    "SURVEY {}x{} fps={fps} mbps={mbps} -> {} predicted {:?} {}{}",
+                    size.0,
+                    size.1,
+                    written.describe(Codec::Hevc),
+                    tier,
+                    predicted.name,
+                    if matches { "" } else { " MISMATCH" }
+                );
+                if !matches {
+                    mismatches.push((size, fps, mbps));
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
 }

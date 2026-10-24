@@ -61,11 +61,7 @@ impl ConfigSource for SharedConfigSource<'_> {
             stream_epoch: self.stream_epoch,
             width: width.min(u32::from(u16::MAX)) as u16,
             height: height.min(u32::from(u16::MAX)) as u16,
-            fps: self
-                .shared
-                .target_fps
-                .load(Ordering::SeqCst)
-                .min(u32::from(u16::MAX)) as u16,
+            fps: self.shared.advertised_fps().min(u32::from(u16::MAX)) as u16,
             codec: self.shared.active_codec.load(Ordering::SeqCst),
             flags: if software {
                 eternal_wire::v2::control::STREAM_FLAG_SOFTWARE_ENCODER
@@ -204,6 +200,11 @@ pub async fn start_sender(
     // pre-IDR leftovers; a new session must begin with a keyframe.
     let mut last_session_id: Option<u32> = None;
     let mut awaiting_keyframe = true;
+    // The frame rate last notified to a session. The encoder plans its rate
+    // after the HELLO_ACK went out and may lower it later, so the first frame
+    // of each session and every change send one STREAM_CONFIG at once
+    // rather than waiting for the next heartbeat.
+    let mut notified_fps: Option<(u32, u32)> = None;
 
     let mut retransmit_ring = RetransmitRing::default();
     let mut audio_sender = audio::AudioSender::default();
@@ -368,6 +369,14 @@ pub async fn start_sender(
                 if last_session_id != Some(session_id) {
                     last_session_id = Some(session_id);
                     awaiting_keyframe = true;
+                }
+                let fps = shared.advertised_fps();
+                if notified_fps != Some((session_id, fps)) {
+                    notified_fps = Some((session_id, fps));
+                    let notify = shared.session.lock().stream_config_notify(&config);
+                    for (destination, datagram) in notify {
+                        let _ = links.send_to(&datagram, destination).await;
+                    }
                 }
                 if awaiting_keyframe {
                     let started = shared.session.lock().client_info().map(|info| info.connected_at);
@@ -739,6 +748,21 @@ mod tests {
         encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,
         FEATURE_SUPPORTS_NACK,
     };
+
+    #[test]
+    fn acks_and_heartbeats_carry_the_rate_the_encoder_planned() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+        };
+        assert_eq!(config.stream_config().fps, 120);
+        // The VideoToolbox encoder thinned a 120 Hz request to 60.
+        shared.active_fps.store(60, Ordering::SeqCst);
+        assert_eq!(config.stream_config().fps, 60);
+    }
 
     #[tokio::test]
     async fn repairs_current_and_previous_frames_before_the_pacing_wait_ends() {
