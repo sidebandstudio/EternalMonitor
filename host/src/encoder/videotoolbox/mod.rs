@@ -31,7 +31,8 @@ use tracing::{debug, error, info, warn};
 
 use self::bitstream::ProfileTierLevel;
 use self::config::{
-    plan_change, plan_session, Codec, HevcLimit, Limits, PlanChange, SessionPlan, Tier,
+    plan_change, plan_session, Codec, HevcLimit, Limits, PlanChange, PlanError, SessionPlan, Tier,
+    VT_HEVC_MAIN_TIER_MAX_LUMA_RATE,
 };
 use self::session::{FrameInfo, OutputQueue, Tuning, VtError, VtSession};
 use super::NALUnit;
@@ -204,8 +205,98 @@ fn check_emitted(
     };
     EmittedCheck {
         below_plan: level.level_idc < opened.level.idc,
-        lower_rate_to: (!hevc_limit.allows(tier))
+        lower_rate_to: (opened.codec == Codec::Hevc && !hevc_limit.allows(tier))
             .then(|| opened.encode_fps.saturating_sub(1).max(1)),
+    }
+}
+
+/// A frame size and the requested rate: what a `TierFallback` holds for.
+type StreamConfiguration = ((u32, u32), u32);
+
+/// Rate steps allowed before giving up on HEVC for a stream configuration.
+const MAX_TIER_RATE_STEPS: u8 = 2;
+
+/// What the encode loop does, for one stream configuration (frame size and
+/// requested rate), after VideoToolbox wrote HEVC High tier without the
+/// experimental opt-in. Bounded: at most [`MAX_TIER_RATE_STEPS`] lower
+/// rates, then H.264, which has no tiers and whose level the planner sets
+/// itself. Nothing follows H.264, so a persistent High tier costs at most
+/// three reopens (three IDRs), never a loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierFallback {
+    /// HEVC as planned.
+    Planned,
+    /// HEVC below `max_fps`, after `steps` rate steps.
+    Capped { max_fps: u32, steps: u8 },
+    /// H.264 at the planned level. Terminal for this configuration.
+    H264,
+}
+
+impl TierFallback {
+    /// The codec to open: H.264 once terminal, otherwise what the client
+    /// negotiated.
+    fn codec(self, negotiated: Codec) -> Codec {
+        if self == Self::H264 {
+            Codec::H264
+        } else {
+            negotiated
+        }
+    }
+
+    fn max_fps(self) -> u32 {
+        match self {
+            Self::Capped { max_fps, .. } => max_fps,
+            Self::Planned | Self::H264 => u32::MAX,
+        }
+    }
+
+    /// The next state after `opened` came out High tier. A lower rate only
+    /// helps near the rate where VideoToolbox switches tiers
+    /// (`VT_HEVC_MAIN_TIER_MAX_LUMA_RATE`, measured on an M1 Max). A High
+    /// tier more than a quarter below it means the planner's tier model is
+    /// wrong for this machine, so the stream goes straight to H.264, as it
+    /// does after the last allowed step.
+    fn after_high_tier(self, opened: &SessionPlan) -> Self {
+        let steps = match self {
+            Self::Planned => 0,
+            Self::Capped { steps, .. } => steps,
+            Self::H264 => return Self::H264,
+        };
+        let aligned = u64::from(opened.width.next_multiple_of(16))
+            * u64::from(opened.height.next_multiple_of(16));
+        let model_wrong =
+            aligned * u64::from(opened.encode_fps) * 4 < VT_HEVC_MAIN_TIER_MAX_LUMA_RATE * 3;
+        if steps >= MAX_TIER_RATE_STEPS || model_wrong || opened.encode_fps <= 1 {
+            Self::H264
+        } else {
+            Self::Capped {
+                max_fps: opened.encode_fps - 1,
+                steps: steps + 1,
+            }
+        }
+    }
+
+    /// Plans the session this state allows.
+    fn plan(
+        self,
+        negotiated: Codec,
+        size: (u32, u32),
+        fps: u32,
+        ceiling_bps: u32,
+        hevc_limit: HevcLimit,
+    ) -> Result<SessionPlan, PlanError> {
+        let limits = Limits {
+            hevc: hevc_limit,
+            max_fps: self.max_fps(),
+        };
+        plan_session(
+            self.codec(negotiated),
+            size.0,
+            size.1,
+            fps,
+            ceiling_bps,
+            limits,
+        )
     }
 }
 
@@ -242,9 +333,10 @@ pub(super) fn run_encode_loop(
     let mut reopen_after: Option<Instant> = None;
     let mut last_submitted: Option<Instant> = None;
     let mut level_checked = false;
-    // A frame size and the rate it must stay below, set when VideoToolbox
-    // writes an HEVC tier `hevc_limit` rules out (see `vt_hevc_tier`).
-    let mut tier_cap: Option<((u32, u32), u32)> = None;
+    // The stream configuration (frame size, requested rate) VideoToolbox
+    // wrote an HEVC tier `hevc_limit` rules out for, and what that led to
+    // (see `vt_hevc_tier` and `TierFallback`).
+    let mut tier_fallback: Option<(StreamConfiguration, TierFallback)> = None;
 
     while let Some(raw_frame) = frames.blocking_take() {
         if !shared.running.load(Ordering::SeqCst)
@@ -277,25 +369,18 @@ pub(super) fn run_encode_loop(
         // The level is planned for the user's ceiling, which the ABR's
         // pick never exceeds, so ABR steps stay live property changes.
         let ceiling = shared.bitrate_bps.load(Ordering::SeqCst).max(bitrate);
-        let codec = Codec::negotiate(
+        let negotiated = Codec::negotiate(
             shared.hevc_enabled.load(Ordering::SeqCst)
                 && shared.session.lock().client_supports_hevc(),
         );
         let size = (raw_frame.width, raw_frame.height);
-        let limits = Limits {
-            hevc: hevc_limit,
-            max_fps: tier_cap
-                .filter(|(capped, _)| *capped == size)
-                .map_or(u32::MAX, |(_, fps)| fps),
-        };
-        let plan = plan_session(
-            codec,
-            raw_frame.width,
-            raw_frame.height,
-            shared.effective_fps(),
-            ceiling,
-            limits,
-        )?;
+        let configuration = (size, shared.effective_fps());
+        // A fallback holds until the frame size or requested rate changes.
+        let fallback = tier_fallback
+            .filter(|(for_configuration, _)| *for_configuration == configuration)
+            .map_or(TierFallback::Planned, |(_, fallback)| fallback);
+        let codec = fallback.codec(negotiated);
+        let plan = fallback.plan(negotiated, size, configuration.1, ceiling, hevc_limit)?;
         pending_keyframe |= shared.force_next_idr.swap(false, Ordering::SeqCst);
 
         if let Some(open) = session.as_ref() {
@@ -460,16 +545,20 @@ pub(super) fn run_encode_loop(
                         "VideoToolbox wrote a level below the stream's requirement"
                     );
                 }
-                if let Some(fps) = check.lower_rate_to {
+                if check.lower_rate_to.is_some() {
                     // AutoLevel went to High tier below the rate
-                    // `vt_hevc_tier` predicts: run slower on this size,
-                    // whatever level it wrote.
+                    // `vt_hevc_tier` predicts, whatever level it wrote: a
+                    // lower rate, or H.264 once that is bounded out. The
+                    // reopen publishes the new codec and rate
+                    // (`note_session_opened`).
+                    let next = fallback.after_high_tier(&opened);
                     error!(
                         written,
                         encode_fps = opened.encode_fps,
-                        "VideoToolbox wrote HEVC High tier, which needs the experimental opt-in; lowering the frame rate"
+                        ?next,
+                        "VideoToolbox wrote HEVC High tier, which needs the experimental opt-in; falling back"
                     );
-                    tier_cap = Some((size, fps));
+                    tier_fallback = Some((configuration, next));
                     session = None;
                     pending_keyframe = true;
                 } else if !check.below_plan {
@@ -492,6 +581,7 @@ pub(super) fn run_encode_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::config::h264_profile_level_name;
     use super::*;
 
     #[test]
@@ -586,5 +676,134 @@ mod tests {
                 "experimental high_tier={high_tier} level_idc={level_idc}"
             );
         }
+    }
+    const FULL: (u32, u32) = (2670, 1878);
+
+    /// Runs `checks` level checks as the encode loop does: VideoToolbox
+    /// writes the parameter set `writes` returns for the opened plan and
+    /// the check number, and every fallback reopens (one IDR). Returns the
+    /// reopens, the final state and the final plan.
+    fn drive(
+        size: (u32, u32),
+        fps: u32,
+        hevc_limit: HevcLimit,
+        checks: usize,
+        writes: impl Fn(&SessionPlan, usize) -> Vec<u8>,
+    ) -> (usize, TierFallback, SessionPlan) {
+        let mut state = TierFallback::Planned;
+        let mut plan = state
+            .plan(Codec::Hevc, size, fps, 15_000_000, hevc_limit)
+            .unwrap();
+        let mut reopens = 0;
+        for check in 0..checks {
+            let nal = writes(&plan, check);
+            let level = bitstream::parameter_set_ptl(plan.codec, &nal).unwrap();
+            if check_emitted(level, &plan, hevc_limit)
+                .lower_rate_to
+                .is_some()
+            {
+                state = state.after_high_tier(&plan);
+                plan = state
+                    .plan(Codec::Hevc, size, fps, 15_000_000, hevc_limit)
+                    .unwrap();
+                reopens += 1;
+            }
+        }
+        (reopens, state, plan)
+    }
+
+    /// High tier for every HEVC session; H.264 has no tier.
+    fn always_high(plan: &SessionPlan, _: usize) -> Vec<u8> {
+        match plan.codec {
+            Codec::Hevc => vps(true, plan.level.idc),
+            Codec::H264 => vec![0x27, 100, 0x00, plan.level.idc],
+        }
+    }
+
+    #[test]
+    fn a_persistent_high_tier_ends_in_h264_without_an_idr_storm() {
+        // Sol's injection: full size at 60 fps, Main tier predicted, High
+        // written every time. Far below the measured switch rate, so the
+        // tier model is wrong here: straight to H.264 at 60.
+        let (reopens, state, plan) = drive(FULL, 60, HevcLimit::MainTier, 40, always_high);
+        assert_eq!((reopens, state), (1, TierFallback::H264));
+        assert_eq!((plan.codec, plan.encode_fps), (Codec::H264, 60));
+        assert_eq!(h264_profile_level_name(plan.level), Some("H264_High_5_2"));
+        // Near the switch rate (90 Hz at full size) one rate step is tried,
+        // then H.264: still bounded, still quiet afterwards.
+        let (reopens, state, plan) = drive(FULL, 90, HevcLimit::MainTier, 40, always_high);
+        assert!(reopens <= 3, "{reopens} reopens");
+        assert_eq!(state, TierFallback::H264);
+        assert_eq!((plan.codec, plan.encode_fps), (Codec::H264, 45));
+        // After the terminal state nothing changes, however long it runs.
+        let (more, _, _) = drive(FULL, 60, HevcLimit::MainTier, 400, always_high);
+        assert_eq!(more, 1);
+    }
+
+    #[test]
+    fn rate_steps_are_bounded_at_two() {
+        let near = plan_session(
+            Codec::Hevc,
+            FULL.0,
+            FULL.1,
+            90,
+            15_000_000,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(near.encode_fps, 90);
+        let first = TierFallback::Planned.after_high_tier(&near);
+        assert_eq!(
+            first,
+            TierFallback::Capped {
+                max_fps: 89,
+                steps: 1
+            }
+        );
+        let second = first.after_high_tier(&near);
+        assert_eq!(
+            second,
+            TierFallback::Capped {
+                max_fps: 89,
+                steps: 2
+            }
+        );
+        assert_eq!(second.after_high_tier(&near), TierFallback::H264);
+        assert_eq!(
+            TierFallback::H264.after_high_tier(&near),
+            TierFallback::H264
+        );
+        assert_eq!(TierFallback::H264.codec(Codec::Hevc), Codec::H264);
+        assert_eq!(TierFallback::Planned.codec(Codec::Hevc), Codec::Hevc);
+    }
+
+    #[test]
+    fn a_transient_high_tier_settles_after_one_step() {
+        let (reopens, state, plan) = drive(FULL, 90, HevcLimit::MainTier, 40, |plan, check| {
+            vps(check == 0, plan.level.idc)
+        });
+        assert_eq!(reopens, 1);
+        assert_eq!(
+            state,
+            TierFallback::Capped {
+                max_fps: 89,
+                steps: 1
+            }
+        );
+        assert_eq!(
+            (plan.codec, plan.encode_fps, plan.tier),
+            (Codec::Hevc, 45, Tier::Main)
+        );
+    }
+
+    #[test]
+    fn the_experimental_opt_in_changes_nothing() {
+        let (reopens, state, plan) =
+            drive(FULL, 120, HevcLimit::ExperimentalHighTier, 40, always_high);
+        assert_eq!((reopens, state), (0, TierFallback::Planned));
+        assert_eq!(
+            (plan.codec, plan.encode_fps, plan.tier),
+            (Codec::Hevc, 120, Tier::High)
+        );
     }
 }
