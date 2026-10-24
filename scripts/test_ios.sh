@@ -37,6 +37,7 @@ for argument in "$@"; do
         -only-testing:EternalMonitorTests*|-only-testing:EternalMonitorUITests/ConnectScreenTests*|-only-testing:EternalMonitorUITests/UpdateBannerTests*) SELECTED=1 ;;
         -only-testing:EternalMonitorUITests/StreamLifecycleTests*) SELECTED=1; NEED_STREAM=1; NEED_LIFECYCLE=1 ;;
         -only-testing:EternalMonitorUITests/PairingFlowTests*) SELECTED=1; NEED_PAIRING=1 ;;
+        -only-testing:EternalMonitorUITests/DuoFoldTests*) SELECTED=1; NEED_STREAM=1; NEED_PAIRING=1 ;;
         -only-testing:EternalMonitorUITests/USBStreamTests*) SELECTED=1; NEED_STREAM=1; NEED_USB=1 ;;
         -only-testing:EternalMonitorUITests) SELECTED=0; break ;;
         -only-testing:*) SELECTED=1; NEED_STREAM=1 ;;

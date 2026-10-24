@@ -1,4 +1,5 @@
 #import <XCTest/XCTest.h>
+#import "DuoHinge.h"
 
 // Compiled into the UI test runner only; never linked into EternalMonitor.app.
 void EMSwipeTwoFingers(CGPoint start, CGFloat distance,
