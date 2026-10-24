@@ -157,7 +157,7 @@ impl SharedControl {
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
             capture_geometry: Arc::new(Mutex::new(None)),
-            hevc_enabled: Arc::new(AtomicBool::new(false)),
+            hevc_enabled: Arc::new(AtomicBool::new(crate::settings::default_hevc_enabled())),
             audio_enabled: Arc::new(AtomicBool::new(true)),
             active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),
             session: Arc::new(Mutex::new(crate::transport::session::Session::new({

@@ -26,8 +26,10 @@ pub struct SettingsFile {
     #[serde(default)]
     pub capture_display: Option<String>,
     /// Prefer H.265/HEVC when the connected client can decode it.
-    /// Off by default until verified on real encoder hardware.
-    #[serde(default)]
+    /// Off by default on Windows until verified on real encoder hardware; on
+    /// by default on macOS, where the direct VideoToolbox encoder needs HEVC
+    /// to reach 120 fps at a legal level.
+    #[serde(default = "default_hevc_enabled")]
     pub hevc_enabled: bool,
     #[serde(default = "default_true")]
     pub stream_audio: bool,
@@ -57,6 +59,10 @@ fn default_true() -> bool {
     true
 }
 
+pub fn default_hevc_enabled() -> bool {
+    cfg!(target_os = "macos")
+}
+
 fn default_max_dgram() -> u16 {
     eternal_wire::v2::MAX_DGRAM_SIZE as u16
 }
@@ -72,7 +78,7 @@ impl Default for SettingsFile {
             encoder_input: Default::default(),
             check_for_updates: true,
             capture_display: None,
-            hevc_enabled: false,
+            hevc_enabled: default_hevc_enabled(),
             stream_audio: true,
             require_pairing: true,
             auth_token_hex: String::new(),
