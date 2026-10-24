@@ -1,0 +1,162 @@
+# iPhone Duo test builds for TestFlight: "EternalMonitor Duo Beta",
+# com.eternal.monitor.duo. This file lives only on feat/iphone-duo and is
+# deleted before the branch could ever merge.
+name: iPhone Duo TestFlight
+
+on:
+  push:
+    branches: [feat/iphone-duo]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duo-testflight
+  cancel-in-progress: false
+
+jobs:
+  unit-tests:
+    name: Unit tests on iPhone and iPad (Xcode 16.4)
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      # The toolchain main's CI uses, so the branch keeps building there.
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Create iPhone and iPad simulators
+        id: sim
+        run: |
+          xcodebuild -version
+          RUNTIME=com.apple.CoreSimulator.SimRuntime.iOS-18-6
+          echo "iphone=$(python3 scripts/ci_simulator.py duo-iphone com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max $RUNTIME)" >> "$GITHUB_OUTPUT"
+          echo "ipad=$(python3 scripts/ci_simulator.py duo-ipad com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB $RUNTIME)" >> "$GITHUB_OUTPUT"
+      - name: Run unit tests on iPhone
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.iphone }}
+          EM_TEST_STAMP: iphone
+        run: scripts/test_ios.sh -only-testing:EternalMonitorTests
+      - name: Run unit tests on iPad
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.ipad }}
+          EM_TEST_STAMP: ipad
+        run: scripts/test_ios.sh -only-testing:EternalMonitorTests
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: duo-unit-tests-xcode-16.4
+          path: |
+            build/ios-tests-*.log
+            build/ios-tests-*.xcresult
+          retention-days: 14
+
+  duo-simulator-tests:
+    name: Unit tests on the iPhone Duo simulator (Xcode 27.1)
+    runs-on: xcode-27
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Install the Metal toolchain if this Xcode lacks it
+        run: xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Create an iPhone Duo simulator
+        id: sim
+        run: |
+          xcodebuild -version
+          read -r DEVICE_TYPE RUNTIME < <(python3 - <<'PY'
+          import json,subprocess,sys
+          def listing(kind): return json.loads(subprocess.check_output(['xcrun','simctl','list',kind,'-j']))[kind]
+          types=listing('devicetypes'); runtimes=listing('runtimes')
+          duo=[t for t in types if t['name']=='iPhone Duo']
+          ios=[r for r in runtimes if r['platform']=='iOS' and r['isAvailable'] and r['version'].startswith('27.1')]
+          if not duo or not ios:
+              sys.exit('No iPhone Duo or iOS 27.1: '+', '.join(t['name'] for t in types if 'iPhone' in t['name'])
+                       +' / '+', '.join(r['version'] for r in runtimes if r['platform']=='iOS'))
+          print(duo[0]['identifier'], ios[-1]['identifier'])
+          PY
+          )
+          echo "Using $DEVICE_TYPE on $RUNTIME"
+          echo "udid=$(python3 scripts/ci_simulator.py duo-sim "$DEVICE_TYPE" "$RUNTIME")" >> "$GITHUB_OUTPUT"
+      - name: Run unit tests on iPhone Duo
+        env:
+          EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
+          EM_TEST_STAMP: iphone-duo
+        run: scripts/test_ios.sh -only-testing:EternalMonitorTests
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: duo-unit-tests-xcode-27.1
+          path: |
+            build/ios-tests-*.log
+            build/ios-tests-*.xcresult
+          retention-days: 14
+
+  archive:
+    name: Archive and upload to EternalMonitor Duo Beta (Xcode 27.1)
+    runs-on: xcode-27
+    timeout-minutes: 100
+    env:
+      # The iOS 27.1 SDK is what lets the app fill both iPhone Duo screens.
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      DUO_MIN_SDK: "27.1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen and the App Store Connect client
+        run: |
+          brew install xcodegen
+          python3 -m venv "$RUNNER_TEMP/asc"
+          "$RUNNER_TEMP/asc/bin/pip" install --quiet 'pyjwt[crypto]'
+          echo "DUO_PYTHON=$RUNNER_TEMP/asc/bin/python" >> "$GITHUB_ENV"
+      - name: Install the Metal toolchain if this Xcode lacks it
+        run: xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Select the Duo build number
+        # The Duo app counts its own builds. A re-run gets its own number.
+        run: |
+          BUILD=$GITHUB_RUN_NUMBER
+          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then BUILD=$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT; fi
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+      - name: Archive, upload, and prepare the build for Duo internal
+        env:
+          ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
+          ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          IOS_DUO_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_DUO_PROVISION_PROFILE_BASE64 }}
+        run: scripts/duo-testflight.sh
+      - name: Retain build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-Duo-${{ env.BUILD }}
+          path: |
+            build/duo-testflight/archive.log
+            build/duo-testflight/export.log
+            build/duo-testflight/archive-info.json
+            build/duo-testflight/asc.json
+            build/duo-testflight/result.json
+          retention-days: 14
+      - name: Summarize the result
+        if: success()
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          result=json.loads(pathlib.Path('build/duo-testflight/result.json').read_text())
+          archive=result['archive']; asc=result.get('app_store_connect',{})
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write(f"EternalMonitor Duo {result['version']} ({result['build']}): {result['mode']} passed.\n\n")
+              out.write(f"SDK {archive['DTSDKName']}, Xcode {archive['DTXcode']}, minimum iOS {archive['MinimumOSVersion']}.\n\n")
+              if asc:
+                  out.write(f"App Store Connect: {asc['processing_state']}, internal testing {asc['internal_build_state']}, "
+                            f"in Duo internal: {asc['in_duo_internal']}.\n")
+          PY
