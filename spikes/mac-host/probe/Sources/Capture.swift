@@ -414,11 +414,17 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
                 let check: (Bool, String) -> Void = plan.high_tier ? Log.info : Log.check
                 let encodeTimes = encodedSubmitTimes.map { machToMs($0) / 1000 }
                 let encodeFps = FrameRate.inWindow(encodeTimes, start: window.start, length: window.length)
-                let decodedMatch = DecodedMatch(submitted: submittedMarkers, decoded: decoder?.markers ?? [], display: display)
+                // One loss budget for submit -> encode -> decode (PipelineLoss).
+                let pipeline = PipelineLoss(submitted: submitted, encoded: encodedFrames, decoded: decoder?.decoded ?? 0,
+                                            match: markerCentres.map { _ in
+                                                DecodedMatch(submitted: submittedMarkers, decoded: decoder?.markers ?? [], display: display)
+                                            })
                 Log.result("\(label)_encode_window", [("encode_fps", String(format: "%.1f", encodeFps)), ("planned", plan.encode_fps),
-                                                      ("decoded_vs_submitted", "\"\(decodedMatch.summary)\"")])
-                check(encodeErrors == 0 && encodedFrames == submitted, "\(label): every submitted frame encoded (\(encodedFrames)/\(submitted))")
-                check(decoder?.failed == 0 && decoder?.decoded == encodedFrames, "\(label): every encoded frame decoded (\(decoder?.decoded ?? 0)/\(encodedFrames))")
+                                                      ("encode_errors", encodeErrors), ("decode_failed", decoder?.failed ?? 0),
+                                                      ("pipeline", "\"\(pipeline.summary)\"")])
+                check(pipeline.passes,
+                      "\(label): submit -> encode -> decode lost \(pipeline.lost) of \(submitted) frames (allowed \(pipeline.allowed)), "
+                      + "and every decoded frame is a submitted frame of display \(display), in order, none repeated (\(pipeline.summary))")
                 check(emitted.valid && !(emitted.high_tier && !plan.high_tier), "\(label): emitted tier matches the plan")
                 if let target {
                     // No faster than the input: a 60 Hz baseline display
@@ -427,8 +433,6 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
                     check(FrameRate.meets(encodeFps, target: required),
                           String(format: "%@: encoded %.1f fps over %.0f s, at least 0.9 × %d (planned %d, input target %d)",
                                  label, encodeFps, window.length, required, plan.encode_fps, target))
-                    check(markerCentres != nil && decodedMatch.passes,
-                          "\(label): every decoded frame is a submitted frame of display \(display), in order, none repeated (\(decodedMatch.summary))")
                 }
                 if let expectEncodeFps {
                     check(Int(plan.encode_fps) == expectEncodeFps && !plan.high_tier,

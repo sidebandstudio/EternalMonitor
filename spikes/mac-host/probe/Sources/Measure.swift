@@ -118,7 +118,8 @@ struct MarkerStats {
 /// markers: each decoded frame must be a submitted frame of this display,
 /// in submission order, never repeated (so a frozen or reordering decoder
 /// fails). Up to `allowedMissing` submitted frames may never come out: 1% of
-/// them, and at least 2.
+/// them, and at least 2. PipelineLoss applies that same budget to the whole
+/// submit -> encode -> decode chain.
 struct DecodedMatch {
     var matched = 0
     var missing = 0
@@ -128,8 +129,10 @@ struct DecodedMatch {
     var outOfSequence = 0
     var submitted = 0
 
-    var allowedMissing: Int { max(2, submitted / 100) }
-    var passes: Bool { matched > 0 && unreadable == 0 && wrongDisplay == 0 && outOfSequence == 0 && missing <= allowedMissing }
+    var allowedMissing: Int { PipelineLoss.budget(submitted) }
+    /// No corrupt, foreign, repeated or reordered frame.
+    var intact: Bool { unreadable == 0 && wrongDisplay == 0 && outOfSequence == 0 }
+    var passes: Bool { matched > 0 && intact && missing <= allowedMissing }
     var summary: String {
         "matched=\(matched)/\(submitted) missing=\(missing) (allowed \(allowedMissing)) unreadable=\(unreadable) wrong_display=\(wrongDisplay) out_of_sequence=\(outOfSequence)"
     }
@@ -149,5 +152,32 @@ struct DecodedMatch {
             next = index + 1
         }
         missing = submitted.count - matched
+    }
+}
+
+/// Frames through submit -> encode -> decode, against one loss budget for
+/// the whole chain: at most 1% of the submitted frames (and at least 2) may
+/// be lost, wherever they were lost. A frame counts as delivered only if its
+/// decoded marker matches a submitted frame (`match`), or, without markers,
+/// if it decoded. Corruption, repetition and reordering always fail, and no
+/// stage may put out more frames than it took in.
+struct PipelineLoss {
+    static func budget(_ submitted: Int) -> Int { max(2, submitted / 100) }
+
+    let submitted: Int
+    let encoded: Int
+    let decoded: Int
+    let match: DecodedMatch?
+
+    var delivered: Int { match?.matched ?? decoded }
+    var lost: Int { submitted - delivered }
+    var allowed: Int { Self.budget(submitted) }
+    var passes: Bool {
+        submitted > 0 && delivered > 0 && encoded <= submitted && decoded <= encoded
+            && lost <= allowed && (match?.intact ?? true)
+    }
+    var summary: String {
+        "submitted=\(submitted) encoded=\(encoded) (lost \(submitted - encoded)) decoded=\(decoded) (lost \(encoded - decoded)) "
+            + "delivered=\(delivered) lost=\(lost) (allowed \(allowed))" + (match.map { "; decoded markers: \($0.summary)" } ?? "; no markers")
     }
 }

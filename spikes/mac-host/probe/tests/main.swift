@@ -313,5 +313,27 @@ expect(!DecodedMatch(submitted: sent, decoded: markers(Array(0..<600), display: 
 expect(!DecodedMatch(submitted: sent, decoded: [], display: id).passes, "nothing decoded fails")
 expect(!DecodedMatch(submitted: sent, decoded: markers(Array(0..<600) + [700]), display: id).passes, "a frame that was never submitted fails")
 
+// MARK: PipelineLoss (one budget for submit -> encode -> decode)
+
+func pipeline(encoded: Int, decodedCounters: [Int]) -> PipelineLoss {
+    PipelineLoss(submitted: 600, encoded: encoded, decoded: decodedCounters.count,
+                 match: DecodedMatch(submitted: sent, decoded: markers(decodedCounters), display: id))
+}
+// One frame lost at the encoder and one at the decoder: 598 of 600.
+let lost598 = pipeline(encoded: 599, decodedCounters: (0..<600).filter { $0 != 10 && $0 != 300 })
+expect(lost598.passes && lost598.lost == 2, "598/600 delivered (one lost encoding, one decoding) passes: \(lost598.summary)")
+let lost590 = pipeline(encoded: 595, decodedCounters: (0..<600).filter { $0 % 60 != 0 })
+expect(!lost590.passes && lost590.lost == 10, "590/600 delivered (10 lost, budget 6) fails")
+var repeated598 = (0..<600).filter { $0 != 10 && $0 != 300 }
+repeated598.insert(200, at: 200)
+expect(!pipeline(encoded: 600, decodedCounters: repeated598).passes, "a repeated frame fails even within the loss budget")
+var reordered598 = (0..<600).filter { $0 != 10 && $0 != 300 }
+reordered598.swapAt(400, 401)
+expect(!pipeline(encoded: 600, decodedCounters: reordered598).passes, "a reordered frame fails even within the loss budget")
+expect(!PipelineLoss(submitted: 600, encoded: 600, decoded: 601, match: nil).passes, "more decoded than encoded fails")
+expect(!PipelineLoss(submitted: 600, encoded: 601, decoded: 600, match: nil).passes, "more encoded than submitted fails")
+expect(PipelineLoss(submitted: 600, encoded: 599, decoded: 598, match: nil).passes, "without markers the same budget applies to the counts")
+expect(!PipelineLoss(submitted: 0, encoded: 0, decoded: 0, match: nil).passes, "nothing submitted fails")
+
 print("\(checks - failures)/\(checks) passed, failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

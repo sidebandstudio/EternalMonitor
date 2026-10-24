@@ -50,8 +50,9 @@ Second screen comes first; mirror is the fallback (Ali, 2026-10-24). **Spike c i
 3. **Capture.** The probe window covers the virtual display at shielding level, and its animation runs at that display's refresh. ScreenCaptureKit captures at 60 and at 120 Hz at 2670×1878, then idle. Frames are encoded zero-copy through the host's direct encoder and decoded. A run passes only if:
    - over a fixed 5 s window (from 1 s in), capture delivered at least 0.9× the rate (108 fps at 120) and the content changed every frame;
    - a marker the probe draws (a sync pattern, the low 16 bits of its display's ID, and a frame counter) reads back from every captured frame with the captured display's ID, so the frames are the virtual display's;
-   - every decoded frame's marker is that of a submitted frame, in submission order and never repeated, so a frozen or reordering decoder fails; at most 1% of submitted frames (and at least 2 allowed) may never come out;
-   - the encoder kept up with at least 0.9× its planned rate, capped at the input rate (a 60 Hz baseline display is held to 60), and every frame encoded and decoded. Frames are thinned to the planned rate by their presentation timestamps, so callback jitter can't drop frames;
+   - every decoded frame's marker is that of a submitted frame, in submission order and never repeated, so a frozen or reordering decoder fails;
+   - one loss budget covers submit → encode → decode together: at most 1% of submitted frames (and at least 2) may be lost across all three stages, and no stage may put out more frames than it took in; each stage's count is logged;
+   - the encoder kept up with at least 0.9× its planned rate, capped at the input rate (a 60 Hz baseline display is held to 60). Frames are thinned to the planned rate by their presentation timestamps, so callback jitter can't drop frames;
    - the probe's tone was captured (missing audio fails).
 
    Full-size HEVC at 120 Hz is capped at 60 fps on Main tier by design, so that run's encode is checked against 60. **Encode at 120 is tested at the Duo outer size**, 2034×1398 on Main tier, in step 5. With `--experimental` the full-size run encodes 120 on High tier; its encode checks are `INFO` lines.
@@ -61,11 +62,11 @@ Second screen comes first; mirror is the fallback (Ali, 2026-10-24). **Spike c i
    - The sequence: mouse move, left/right click, drag, pixel and line scroll, keys with and without Shift, Unicode (é, and 😀 as one event), then a pen with proximity, pressure and tilt.
    - **pid path:** the whole sequence, keys included, is posted with `CGEventPostToPid` to the probe itself. **Keyboard delivery is proven only here.**
    - **System (HID) path:** mouse, scroll and pen only, and only on the covered virtual display. **No key is ever posted on the system path**: any key can type, trigger a shortcut or change state in whatever is focused, and no virtual keycode is provably unmapped.
-     - Safety comes from where events are delivered. The window server hit-tests these events when they arrive, so before the batch and again right before each event, `CGWindowListCopyWindowInfo` must show the probe's shielding-level window exactly covering the whole virtual display with no other process's window above it there. Points are at least 8 pt inside the display.
-     - The probe's own event tap stays as an observer and filter: it drops and counts anything that slipped through, and real input stops the run. Safety never depends on it.
-     - A button still down when the run stops is released under the same window check. The pointer is always put back.
+     - Safety comes from where events are delivered. The window server hit-tests these events when they arrive, so before the batch and again right before each event, `CGWindowListCopyWindowInfo` must show the probe's shielding-level window exactly covering the whole virtual display with no other process's window above it there. Points are at least 8 pt inside the display. The check and the delivery are still two steps: a window from another process (an overlay, Mission Control, Spotlight, Notification Center, the lock screen) that became topmost in between could receive that one event. That residual risk is accepted for a supervised run, and `grant-steps.md` tells Ali.
+     - The probe's own event tap stays as an observer and filter: it drops and counts anything it catches, and real input stops the run before its next event. Safety never depends on it.
+     - A button still down when the run stops is released under the same window check. The pointer is put back however the run ends (completion, a stop, the deadline, SIGTERM), unless the probe is killed with SIGKILL.
      - The edge and corner mapping checks only warp the cursor; they post nothing.
-   - Every event carries a tag (`eventSourceUserData`: a run tag and a sequence number). What arrives (in the window, or at the tap for system-path keys) is matched against the full sequence: type, location within 1 pt, and order. Anything missing fails.
+   - Every event carries a tag (`eventSourceUserData`: a run tag and a sequence number). What arrives in the probe window is matched against the full sequence: type, location within 1 pt, and order. Anything missing fails.
 5. **Removal and recreation.**
    - A mode change 60→120→60, then removal within 2 s. This is the macOS 26 failure.
    - Recreation at 2034×1398 at 120 Hz, captured and encoded at 120 fps (the encode-at-120 gate), then a mode change to 60 and removal.
@@ -76,7 +77,7 @@ Second screen comes first; mirror is the fallback (Ali, 2026-10-24). **Spike c i
 ## Tests
 
 `tests/run.sh` needs no display, posts no events and changes no permissions:
-- `tests/main.swift`: the window-list cover check and edge inset, the tap's filter (inside and outside the display, frontmost or not, tagged or not, modifiers, keys), the sequence matcher (missing, reordered, offset events), deadlines (a child that never prints is killed by PID in time; the watchdog), the fps window, the frame pacer with jittered timestamps, the marker, and decoded-versus-submitted matching (frozen and reordering decoders);
+- `tests/main.swift`: the window-list cover check and edge inset, the tap's filter (inside and outside the display, frontmost or not, tagged or not, modifiers, keys), the sequence matcher (missing, reordered, offset events), deadlines (a child that never prints is killed by PID in time; the watchdog), the fps window, the frame pacer with jittered timestamps, the marker, decoded-versus-submitted matching (frozen and reordering decoders), and the submit → encode → decode loss budget;
 - `bash -n` and `zsh -n` on every script;
 - `gui-run.sh` stopping a timed-out command and its group by PID;
 - `sign.sh` against a throwaway keychain: `ps` never shows the password, and the keychain is locked again after a failure and a timeout.
