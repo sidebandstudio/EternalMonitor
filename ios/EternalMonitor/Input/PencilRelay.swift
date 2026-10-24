@@ -14,9 +14,14 @@ struct PencilReading {
          altitude: CGFloat, azimuth: CGFloat, timeUs: UInt64) {
         self.point = point
         // A device without a pressure sensor still draws at a fixed pressure.
+        // A Pencil without one (the USB-C Pencil, the only Pencil on iPhone)
+        // can report a maximum force but no force, and Windows apps draw
+        // nothing at 0, so a contact that measures 0 draws at that pressure too.
+        // Hover sends 0 regardless; see `event`.
         let normalized = maximumForce.isFinite && maximumForce > 0 && force.isFinite
-            ? min(1, max(0, force / maximumForce)) : 0.5
-        pressure = UInt16((normalized * 1000).rounded())
+            ? min(1, max(0, force / maximumForce)) : 0
+        let measured = UInt16((normalized * 1000).rounded())
+        pressure = measured > 0 ? measured : 500
         // UIKit's azimuth is already in this view's coordinate system. Project
         // the shaft onto XZ/YZ planes, matching Windows' signed tilt axes.
         if altitude.isFinite && azimuth.isFinite {
