@@ -12,11 +12,15 @@ struct PencilReading {
     /// False while UIKit still expects to update this sample's force: an
     /// estimated 0 at touch-down says nothing about the Pencil.
     var forceIsFinal: Bool
+    /// The sample as the tip lifts. Every Pencil's force falls there, so it
+    /// says nothing about the sensor either.
+    var atLift: Bool
 
     init(point: TouchRelayMachine.Point, force: CGFloat, maximumForce: CGFloat,
-         altitude: CGFloat, azimuth: CGFloat, timeUs: UInt64, forceIsFinal: Bool = true) {
+         altitude: CGFloat, azimuth: CGFloat, timeUs: UInt64, forceIsFinal: Bool = true, atLift: Bool = false) {
         self.point = point
         self.forceIsFinal = forceIsFinal
+        self.atLift = atLift
         // A device without a pressure sensor still draws at a fixed pressure.
         let normalized = maximumForce.isFinite && maximumForce > 0 && force.isFinite
             ? min(1, max(0, force / maximumForce)) : 0.5
@@ -46,10 +50,16 @@ struct PencilReading {
 
 /// Whether the Pencil senses pressure. UIKit names neither the Pencil model
 /// nor its sensors, and the USB-C Pencil has none on iPad or iPhone, so this
-/// is learned from what the Pencil reports. Any measured force means it senses
-/// pressure, for good. A whole stroke that measured none means it doesn't, and
-/// then contact draws at a fixed 500, because Windows apps draw nothing at 0.
-/// Only final readings count: UIKit can send an estimated force first.
+/// is learned from what the Pencil reports. Without a sensor, contact draws at
+/// a fixed 500, because Windows apps draw nothing at 0.
+///
+/// Only final readings away from the lift count: UIKit can send an estimated
+/// force first, and every force falls as the tip lifts. On iPad one measured
+/// force means a sensor, for good, as iPad has always sent what it measures.
+/// "No sensor" takes a stroke of several final readings, all 0, with no
+/// estimated force above 0 either, so a short tap teaches nothing. iPhone takes
+/// only the USB-C Pencil and starts without pressure; it believes a sensor only
+/// from forces that vary within a stroke, so a small constant still draws at 500.
 struct PencilPressure: Equatable {
     enum Sensor {
         case unknown
@@ -57,34 +67,62 @@ struct PencilPressure: Equatable {
         case none
     }
 
-    private(set) var sensor: Sensor
-    private var strokeHadFinalReading = false
+    /// What one stroke reported.
+    struct Stroke: Equatable {
+        var finalReadings = 0
+        var lowest: UInt16 = .max
+        var highest: UInt16 = 0
+        var estimatedForce = false
+    }
 
-    init(sensor: Sensor = .unknown) {
+    static let zeroReadingsForNoSensor = 3
+    /// The spread of final pressures, out of 1000, that proves a sensor on iPhone.
+    static let variationForPressure: UInt16 = 50
+
+    private(set) var sensor: Sensor
+    /// iPhone's rule: a sensor only from forces that vary.
+    let needsVariation: Bool
+    private(set) var stroke = Stroke()
+
+    init(sensor: Sensor = .unknown, needsVariation: Bool = false) {
         self.sensor = sensor
+        self.needsVariation = needsVariation
     }
 
     /// iPhone supports only the USB-C Pencil, so it starts without pressure.
     /// iPad starts as it always has: the measured force, 0 included.
     static var deviceDefault: PencilPressure {
-        PencilPressure(sensor: DeviceNoun.isPhone ? .none : .unknown)
+        DeviceNoun.isPhone ? PencilPressure(sensor: .none, needsVariation: true) : PencilPressure()
     }
 
     /// What this app session has learned, so a reconnect needn't learn again.
     @MainActor static var session = deviceDefault
 
     mutating func strokeBegan() {
-        strokeHadFinalReading = false
+        stroke = Stroke()
     }
 
     mutating func observe(_ reading: PencilReading) {
-        guard reading.forceIsFinal else { return }
-        strokeHadFinalReading = true
-        if reading.pressure > 0 { sensor = .pressure }
+        guard !reading.atLift else { return }
+        guard reading.forceIsFinal else {
+            if reading.pressure > 0 { stroke.estimatedForce = true }
+            return
+        }
+        stroke.finalReadings += 1
+        stroke.lowest = min(stroke.lowest, reading.pressure)
+        stroke.highest = max(stroke.highest, reading.pressure)
+        if !needsVariation && reading.pressure > 0 { sensor = .pressure }
     }
 
     mutating func strokeEnded(completed: Bool) {
-        if completed && sensor == .unknown && strokeHadFinalReading { sensor = .none }
+        if needsVariation && stroke.finalReadings >= 2
+            && stroke.highest - stroke.lowest >= Self.variationForPressure {
+            sensor = .pressure
+        }
+        if completed && sensor == .unknown && stroke.finalReadings >= Self.zeroReadingsForNoSensor
+            && stroke.highest == 0 && !stroke.estimatedForce {
+            sensor = .none
+        }
     }
 
     func pressure(for reading: PencilReading) -> UInt16 {

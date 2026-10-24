@@ -18,18 +18,22 @@ final class DuoPencilTests: XCTestCase {
     }
 
     private func reading(force: CGFloat, maximumForce: CGFloat = 4, altitude: CGFloat = .pi / 4,
-                         azimuth: CGFloat = 0, time: UInt64 = 1, final: Bool = true) -> PencilReading {
+                         azimuth: CGFloat = 0, time: UInt64 = 1, final: Bool = true,
+                         lift: Bool = false) -> PencilReading {
         PencilReading(point: .init(x: 100, y: 200), force: force, maximumForce: maximumForce,
-            altitude: altitude, azimuth: azimuth, timeUs: time, forceIsFinal: final)
+            altitude: altitude, azimuth: azimuth, timeUs: time, forceIsFinal: final, atLift: lift)
     }
+
+    private let phone = PencilPressure(sensor: .none, needsVariation: true)
 
     /// One stroke, each sample at the next timestamp; the pressures sent.
     private func stroke(_ pen: inout PencilRelayMachine, _ forces: [CGFloat], from time: UInt64 = 1,
-                        final: Bool = true) -> [UInt16] {
+                        maximumForce: CGFloat = 4, final: Bool = true) -> [UInt16] {
         guard let first = forces.first else { return [] }
-        var events = pen.began(reading(force: first, time: time, final: final))
+        var events = pen.began(reading(force: first, maximumForce: maximumForce, time: time, final: final))
         for (i, force) in forces.dropFirst().enumerated() {
-            events += pen.moved(reading(force: force, time: time + UInt64(i) + 1, final: final))
+            events += pen.moved(reading(force: force, maximumForce: maximumForce, time: time + UInt64(i) + 1,
+                                        final: final))
         }
         events += pen.ended(nil, cancelled: false)
         return events.map(\.pressureX1000)
@@ -75,6 +79,10 @@ final class DuoPencilTests: XCTestCase {
         XCTAssertEqual(stroke(&learning, [0, 0, 0]), [0, 0, 0, 0])
         XCTAssertEqual(learning.pressure.sensor, .none)
         XCTAssertEqual(stroke(&learning, [0, 0, 0], from: 10), [500, 500, 500, 0])
+        // A stroke of two readings is too short to judge.
+        var short = PencilRelayMachine()
+        XCTAssertEqual(stroke(&short, [0, 0]), [0, 0, 0])
+        XCTAssertEqual(short.pressure.sensor, .unknown)
         // A cancelled stroke teaches nothing.
         var cancelled = PencilRelayMachine()
         _ = cancelled.began(reading(force: 0, time: 1))
@@ -87,34 +95,127 @@ final class DuoPencilTests: XCTestCase {
     func testWhatTheViewLearnsOutlastsTheConnection() {
         PencilPressure.session = .deviceDefault
         XCTAssertEqual(PencilPressure.session.sensor, DeviceNoun.isPhone ? .none : .unknown)
-        let connections: [(Int, [UInt16])] = [(1, DeviceNoun.isPhone ? [500, 500, 0] : [0, 0, 0]), (2, [500, 500, 0])]
+        let connections: [(Int, [UInt16])] = [(1, DeviceNoun.isPhone ? [500, 500, 500, 0] : [0, 0, 0, 0]),
+                                              (2, [500, 500, 500, 0])]
         for (connection, expected) in connections {
             let view = relay()
             var events: [WireInputEvent] = []
             view.onEvents = { events += $0 }
+            // Three readings away from the lift: long enough to judge.
             let tip = Tip(force: 0)
             view.touchesBegan([tip], with: nil)
-            tip.sampleTime = 2
-            view.touchesMoved([tip], with: nil)
+            for time in [2.0, 3.0] {
+                tip.sampleTime = time
+                view.touchesMoved([tip], with: nil)
+            }
             view.touchesEnded([tip], with: nil)
-            XCTAssertEqual(events.map(\.phase), [0, 1, 2], "connection \(connection)")
+            XCTAssertEqual(events.map(\.phase), [0, 1, 1, 2], "connection \(connection)")
             XCTAssertEqual(events.map(\.pressureX1000), expected, "connection \(connection)")
             XCTAssertTrue(events.allSatisfy { $0.kind == 1 && $0.tiltX == 45 })
         }
         XCTAssertEqual(PencilPressure.session.sensor, .none)
     }
 
-    /// Once a Pencil has measured any force, a 0 is a 0. A Pencil thought to
-    /// have no sensor that measures force is believed at once.
-    func testOneMeasuredForceMeansPressureForGood() {
+    /// On iPad, once a Pencil has measured any force, a 0 is a 0.
+    func testOneMeasuredForceMeansPressureForGoodOnIPad() {
         var pen = PencilRelayMachine()
         XCTAssertEqual(stroke(&pen, [2]), [500, 0])
         XCTAssertEqual(stroke(&pen, [0, 0, 0], from: 10), [0, 0, 0, 0])
         XCTAssertEqual(pen.pressure.sensor, .pressure)
+    }
 
-        var phone = PencilRelayMachine(pressure: PencilPressure(sensor: .none))
-        XCTAssertEqual(stroke(&phone, [0, 1, 0]), [500, 250, 0, 0])
-        XCTAssertEqual(phone.pressure.sensor, .pressure)
+    /// The review's tap: an estimated force at touch-down, then a final 0 as
+    /// the tip lifts. It must not teach "no sensor", or the next stroke's
+    /// estimated samples would jump from what the Pencil measured to 500.
+    func testAShortTapDoesNotTeachNoSensor() {
+        PencilPressure.session = PencilPressure()
+        let first = relay()
+        first.onEvents = { _ in }
+        let down = Tip(force: 0.2, estimated: true)
+        first.touchesBegan([down], with: nil)
+        let lift = Tip(force: 0)
+        lift.sampleTime = 2
+        first.touchesEnded([down], with: Coalesced(down, [lift]))
+        XCTAssertEqual(PencilPressure.session.sensor, .unknown)
+
+        let next = relay()
+        var events: [WireInputEvent] = []
+        next.onEvents = { events += $0 }
+        let tip = Tip(force: 0.2, estimated: true)
+        tip.sampleTime = 10
+        next.touchesBegan([tip], with: nil)
+        for time in [11.0, 12.0] {
+            tip.sampleTime = time
+            next.touchesMoved([tip], with: nil)
+        }
+        // 0.2 of 4.17, as main sends it.
+        XCTAssertEqual(events.map(\.pressureX1000), [48, 48, 48])
+    }
+
+    /// Each mitigation alone keeps a stroke from teaching "no sensor".
+    func testOnlyALongStrokeOfFinalZerosTeachesNoSensor() {
+        // An estimated force above 0, even with three final zeros after it.
+        var estimated = PencilRelayMachine()
+        _ = estimated.began(reading(force: 0.8, time: 1, final: false))
+        for time: UInt64 in 2...4 { _ = estimated.moved(reading(force: 0, time: time)) }
+        _ = estimated.ended(nil, cancelled: false)
+        XCTAssertEqual(estimated.pressure.sensor, .unknown)
+        // Two final zeros and the lift's: the lift doesn't count.
+        var lift = PencilRelayMachine()
+        _ = lift.began(reading(force: 0, time: 1))
+        _ = lift.moved(reading(force: 0, time: 2))
+        _ = lift.moved(reading(force: 0, time: 3, lift: true))
+        _ = lift.ended(nil, cancelled: false)
+        XCTAssertEqual(lift.pressure.sensor, .unknown)
+        // Three final zeros away from the lift.
+        var long = PencilRelayMachine()
+        _ = long.began(reading(force: 0, time: 1))
+        for time: UInt64 in 2...3 { _ = long.moved(reading(force: 0, time: time)) }
+        _ = long.moved(reading(force: 0, time: 4, lift: true))
+        _ = long.ended(nil, cancelled: false)
+        XCTAssertEqual(long.pressure.sensor, .none)
+    }
+
+    /// iPhone believes a sensor only from forces that vary within a stroke,
+    /// and then from the next stroke on, so no stroke changes halfway.
+    func testIPhoneLearnsPressureOnlyFromVariation() {
+        // A small constant, as the USB-C Pencil might report: still 500.
+        var constant = PencilRelayMachine(pressure: phone)
+        XCTAssertEqual(stroke(&constant, [0.004, 0.004, 0.004, 0.004], maximumForce: 4.17), [500, 500, 500, 500, 0])
+        XCTAssertEqual(constant.pressure.sensor, .none)
+        XCTAssertEqual(stroke(&constant, [0.004, 0.004], from: 10, maximumForce: 4.17), [500, 500, 0])
+        // Zero throughout: 500.
+        var zero = PencilRelayMachine(pressure: phone)
+        XCTAssertEqual(stroke(&zero, [0, 0, 0, 0]), [500, 500, 500, 500, 0])
+        XCTAssertEqual(zero.pressure.sensor, .none)
+        // A ramp is a sensor: the next stroke goes out as measured.
+        var ramp = PencilRelayMachine(pressure: phone)
+        XCTAssertEqual(stroke(&ramp, [0.4, 1, 2, 3]), [500, 500, 500, 500, 0])
+        XCTAssertEqual(ramp.pressure.sensor, .pressure)
+        XCTAssertEqual(stroke(&ramp, [1, 0, 3], from: 10), [250, 0, 750, 0])
+        // Estimated forces never count as variation.
+        var estimated = PencilRelayMachine(pressure: phone)
+        XCTAssertEqual(stroke(&estimated, [0.4, 3, 0.4], final: false), [500, 500, 500, 0])
+        XCTAssertEqual(estimated.pressure.sensor, .none)
+    }
+
+    /// A second touch-down while a stroke is down ends it, and what it taught
+    /// is kept rather than replaced by the session's older lesson.
+    func testATouchDownMidStrokeKeepsItsLesson() {
+        PencilPressure.session = PencilPressure()
+        let view = relay()
+        view.onEvents = { _ in }
+        let first = Tip(force: 2)
+        view.touchesBegan([first], with: nil)
+        let second = Tip(force: 0)
+        second.sampleTime = 2
+        view.touchesBegan([second], with: nil)
+        for time in [3.0, 4.0] {
+            second.sampleTime = time
+            view.touchesMoved([second], with: nil)
+        }
+        view.touchesEnded([second], with: nil)
+        XCTAssertEqual(PencilPressure.session.sensor, .pressure)
     }
 
     func testHoverSendsNoPressure() {
@@ -151,6 +252,15 @@ final class DuoPencilTests: XCTestCase {
         view.nativePenSupported = true
         return view
     }
+}
+
+/// An event whose coalesced samples for one touch are given.
+private final class Coalesced: UIEvent {
+    let touch: UITouch
+    let samples: [UITouch]
+    init(_ touch: UITouch, _ samples: [UITouch]) { self.touch = touch; self.samples = samples; super.init() }
+    override var allTouches: Set<UITouch>? { [touch] }
+    override func coalescedTouches(for touch: UITouch) -> [UITouch]? { touch === self.touch ? samples : nil }
 }
 
 /// A Pencil tip with a maximum force, as the USB-C Pencil might report itself.
