@@ -1203,6 +1203,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "eternal-mac-probe-ffi"
+version = "0.0.0"
+dependencies = [
+ "eternal-host",
+]
+
+[[package]]
 name = "eternal-mac-spikes"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,12 @@
+[package]
+name = "eternal-mac-probe-ffi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "C ABI over the host's direct VideoToolbox encoder, linked into the Swift Mac probe app (spike d)."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+eternal-host = { path = "../../../../host" }

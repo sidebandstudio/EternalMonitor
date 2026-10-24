@@ -1,6 +1,6 @@
 # docs/ contains the static website (GitHub Pages). Never write build output here.
 [workspace]
-members = ["host", "proto", "updater", "spikes/mac-host"]
+members = ["host", "proto", "updater", "spikes/mac-host", "spikes/mac-host/probe/ffi"]
 resolver = "2"
 
 [profile.release]
