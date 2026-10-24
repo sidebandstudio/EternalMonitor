@@ -27,6 +27,10 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
     private let captureSession = AVCaptureSession()
     private let overlay = ScannerOverlayView()
     private var previewLayer: AVCaptureVideoPreviewLayer?
+    /// Keeps the preview upright as the interface rotates; without it the
+    /// picture is sideways in landscape.
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
     private var didFinish = false
 
     override func viewDidLoad() {
@@ -137,9 +141,21 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
         preview.frame = view.bounds
         view.layer.insertSublayer(preview, at: 0)
         previewLayer = preview
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: preview)
+        rotatePreview(to: coordinator.videoRotationAngleForHorizonLevelPreview)
+        rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview, options: .new) { [weak self] _, change in
+            guard let angle = change.newValue else { return }
+            Task { @MainActor in self?.rotatePreview(to: angle) }
+        }
+        rotationCoordinator = coordinator
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.captureSession.startRunning()
         }
+    }
+
+    private func rotatePreview(to angle: CGFloat) {
+        guard let connection = previewLayer?.connection, connection.isVideoRotationAngleSupported(angle) else { return }
+        connection.videoRotationAngle = angle
     }
 
     private func showCameraDeniedAlert() {
@@ -203,6 +219,8 @@ final class ScannerOverlayView: UIView {
             windowLayoutGuide.centerYAnchor.constraint(equalTo: centerYAnchor),
             windowLayoutGuide.heightAnchor.constraint(equalTo: windowLayoutGuide.widthAnchor),
             windowLayoutGuide.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.7),
+            // Room for the hint above and Cancel below on a phone in landscape.
+            windowLayoutGuide.heightAnchor.constraint(lessThanOrEqualTo: heightAnchor, constant: -240),
             side,
         ])
     }
