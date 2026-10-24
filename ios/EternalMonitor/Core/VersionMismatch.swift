@@ -17,9 +17,17 @@ enum VersionMismatch: Equatable {
     }
 
     var message: String {
+        message(publicApp: InstalledApp.current.receivesPublicUpdates)
+    }
+
+    /// A test app, under another bundle ID, updates from its own TestFlight
+    /// build, never the public app's Update.
+    func message(publicApp: Bool) -> String {
         switch self {
         case .iPadOlder:
-            return "This \(DeviceNoun.current) app is older than EternalMonitor on your PC, so they can't connect. Update the \(DeviceNoun.current) app: open TestFlight and tap Update."
+            return publicApp
+                ? "This \(DeviceNoun.current) app is older than EternalMonitor on your PC, so they can't connect. Update the \(DeviceNoun.current) app: open TestFlight and tap Update."
+                : "This \(DeviceNoun.current) app is older than EternalMonitor on your PC, so they can't connect. Install the newest build of this test app from TestFlight."
         case .pcOlder:
             return "EternalMonitor on your PC is older than this \(DeviceNoun.current) app, so they can't connect. Update EternalMonitor on your PC: click Update now on the PC, or download it from eternalmonitor.dev."
         case .pcLegacy:

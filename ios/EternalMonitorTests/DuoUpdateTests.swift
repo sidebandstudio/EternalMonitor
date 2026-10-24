@@ -34,6 +34,26 @@ final class DuoUpdateTests: XCTestCase {
         XCTAssertNil(UpdateChecker(defaults: defaults, source: .disabled, installed: test).available)
     }
 
+    /// The test app is never told to update the public app. The PC's side
+    /// reads the same in both.
+    func testTheTestAppsVersionMismatchNamesItsOwnBuild() {
+        let noun = DeviceNoun.current
+        let older = VersionMismatch.iPadOlder
+        XCTAssertEqual(older.message(publicApp: false),
+                       "This \(noun) app is older than EternalMonitor on your PC, so they can't connect. "
+                       + "Install the newest build of this test app from TestFlight.")
+        XCTAssertFalse(older.message(publicApp: false).contains("tap Update"))
+        XCTAssertEqual(older.message(publicApp: true),
+                       "This \(noun) app is older than EternalMonitor on your PC, so they can't connect. "
+                       + "Update the \(noun) app: open TestFlight and tap Update.")
+        // This test bundle runs inside the public app.
+        XCTAssertEqual(older.message, older.message(publicApp: true))
+        for pc in [VersionMismatch.pcOlder, .pcLegacy] {
+            XCTAssertEqual(pc.message(publicApp: false), pc.message(publicApp: true))
+            XCTAssertEqual(pc.message, pc.message(publicApp: true))
+        }
+    }
+
     func testThePublicAppStillOffersTheUpdate() {
         let installed = InstalledApp(version: "0.3.2", build: 7)
         XCTAssertEqual(installed.bundleID, "com.eternal.monitor")
