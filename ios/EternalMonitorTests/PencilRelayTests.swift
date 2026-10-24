@@ -37,8 +37,7 @@ final class PencilRelayTests: XCTestCase {
         XCTAssertEqual(sample(.nan, .infinity).tiltX, 0)
         XCTAssertEqual(sample(.nan, .infinity).pressure, 500)
         XCTAssertEqual(reading(1, force: 100).pressure, 1000)
-        // A negative force measures nothing, like 0: the fixed pressure.
-        XCTAssertEqual(reading(1, force: -1).pressure, 500)
+        XCTAssertEqual(reading(1, force: -1).pressure, 0)
     }
 
     func testCancelAndHoverNeverDrawAndReleaseOnlyOnce() {

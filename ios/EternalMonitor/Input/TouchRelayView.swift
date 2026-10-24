@@ -216,7 +216,7 @@ final class RelayTouchUIView: UIView {
     @objc private func cancelInput() {
         holdTimer?.cancel()
         holdTimer = nil
-        onEvents?(keyboard.cancel() + pointer.ended(at: nil) + pencil.cancel())
+        onEvents?(keyboard.cancel() + pointer.ended(at: nil) + cancelPencil())
         pencilTouch = nil
         ignoredTouches.removeAll()
         // Cancel active touch edges without toggling the HUD.
@@ -239,7 +239,7 @@ final class RelayTouchUIView: UIView {
         holdTimer = nil
         // Keep tracking a cancelled tip until it lifts: its samples send
         // nothing more, and palms that land meanwhile are still rejected.
-        onEvents?(pointer.ended(at: nil) + pencil.cancel())
+        onEvents?(pointer.ended(at: nil) + cancelPencil())
         run(machine.threeFingerTap(timeUs: ControlChannel.clientNowUs()).filter {
             if case .toggleHUD = $0 { return false }; return true
         })
@@ -320,6 +320,7 @@ final class RelayTouchUIView: UIView {
                 machine = TouchRelayMachine()
                 machine.videoPixelSize = videoSize
                 ignoredTouches.formUnion(event?.allTouches?.filter { $0.type != .pencil } ?? [])
+                pencil.pressure = PencilPressure.session
                 onEvents?(pointer.ended(at: nil) + pencil.began(reading))
                 pencilTouch = touch
             }
@@ -405,6 +406,7 @@ final class RelayTouchUIView: UIView {
                 onEvents?(samples.compactMap { pencilReading($0, clamp: true) }.flatMap { pencil.moved($0) })
             }
             onEvents?(pencil.ended(pencilReading(pencilTouch, clamp: true), cancelled: cancelled))
+            PencilPressure.session = pencil.pressure
             self.pencilTouch = nil
         }
         for touch in touches {
@@ -425,6 +427,14 @@ final class RelayTouchUIView: UIView {
         }
     }
 
+    /// Ends a stroke or hover. A stroke's lesson about pressure is kept.
+    private func cancelPencil() -> [WireInputEvent] {
+        guard pencil.isDown else { return pencil.cancel() }
+        let events = pencil.cancel()
+        PencilPressure.session = pencil.pressure
+        return events
+    }
+
     private func pencilReading(_ touch: UITouch, clamp: Bool = false) -> PencilReading? {
         var location = touch.preciseLocation(in: self)
         if clamp {
@@ -436,7 +446,8 @@ final class RelayTouchUIView: UIView {
         guard let point = point(location) else { return nil }
         return PencilReading(point: point, force: touch.force, maximumForce: touch.maximumPossibleForce,
             altitude: touch.altitudeAngle, azimuth: touch.azimuthAngle(in: self),
-            timeUs: UInt64(max(0, touch.timestamp) * 1_000_000))
+            timeUs: UInt64(max(0, touch.timestamp) * 1_000_000),
+            forceIsFinal: !touch.estimatedPropertiesExpectingUpdates.contains(.force))
     }
 
     @objc private func pencilHovered(_ gesture: UIHoverGestureRecognizer) {
