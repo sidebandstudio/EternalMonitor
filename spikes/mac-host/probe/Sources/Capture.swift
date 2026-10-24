@@ -4,9 +4,12 @@
 //
 // A capture passes only if, over a fixed window, it delivered about 0.9×
 // the target fps while the content changed every frame; the probe's content
-// marker (Measure.swift) reads back from captured and decoded frames with
-// the captured display's ID; the encoder kept up with its planned rate; and
-// the probe's tone was heard. Full-size HEVC is capped at 60 fps on Main
+// marker (Measure.swift) reads back from every captured frame with the
+// captured display's ID, and every decoded frame is a submitted frame, in
+// order, never repeated (DecodedMatch); the encoder kept up with its planned
+// rate, capped at the rate the input actually had; and the probe's tone was
+// heard. Frames are thinned to the planned rate by their presentation
+// timestamps (FramePacer), never by when their callbacks ran. Full-size HEVC is capped at 60 fps on Main
 // tier by design, so encode at 120 is tested at the Duo outer size; full size
 // at 120 (experimental High tier) is informational.
 
@@ -40,14 +43,14 @@ final class AnnexBDecoder {
     private(set) var decoded = 0
     private(set) var failed = 0
     private(set) var size = (0, 0)
-    /// Where to read the content marker in decoded frames, and what was read.
+    /// Where to read the content marker in decoded frames, and what was
+    /// read, in decode order.
     private let markerCentres: [(Int, Int)]?
-    private(set) var markers = MarkerStats(display: 0)
+    private(set) var markers: [(display: UInt16, counter: UInt16)?] = []
 
-    init(hevc: Bool, markerCentres: [(Int, Int)]? = nil, display: UInt32 = 0) {
+    init(hevc: Bool, markerCentres: [(Int, Int)]? = nil) {
         self.hevc = hevc
         self.markerCentres = markerCentres
-        markers = MarkerStats(display: display)
     }
 
     private func nalType(_ nal: Data) -> Int {
@@ -107,7 +110,7 @@ final class AnnexBDecoder {
             if status == noErr, let image {
                 self.decoded += 1
                 self.size = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image))
-                if let centres = self.markerCentres { self.markers.add(readMarker(image, centres)) }
+                if let centres = self.markerCentres { self.markers.append(readMarker(image, centres)) }
             } else {
                 self.failed += 1
             }
@@ -186,7 +189,9 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encodedSubmitTimes: [UInt64] = []
     private var encodedFrames = 0
     private var keyframes = 0
-    private var lastSubmit: UInt64 = 0
+    private var pacer = FramePacer(fps: 1)
+    /// The capture marker of each submitted frame, in submission order.
+    private var submittedMarkers: [(display: UInt16, counter: UInt16)?] = []
     // Audio
     private var audioBuffers = 0
     private var audioFrames = 0
@@ -210,7 +215,8 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
             if encoder == nil {
                 Log.check(false, "\(label): encoder did not open: \(String(cString: error))")
             } else {
-                decoder = AnnexBDecoder(hevc: options.hevc, markerCentres: markerCentres, display: self.display)
+                decoder = AnnexBDecoder(hevc: options.hevc, markerCentres: markerCentres)
+                pacer = FramePacer(fps: Int(plan.encode_fps))
                 Log.line("\(label): encoder plan \(pixelSize.0)x\(pixelSize.1) encode_fps=\(plan.encode_fps) level_idc=\(plan.level_idc) high_tier=\(plan.high_tier) max_bitrate=\(plan.max_bitrate_bps)")
                 if plan.high_tier {
                     Log.line("\(label): ENCODE INFORMATIONAL: experimental HEVC High tier (ETERNAL_VT_EXPERIMENTAL_HEVC_HIGH_TIER); its encode checks are INFO lines, not counted")
@@ -275,23 +281,26 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
         statuses[raw, default: 0] += 1
         guard SCFrameStatus(rawValue: raw) == .complete, let image = CMSampleBufferGetImageBuffer(sample) else { return }
         let displayTime = (info[.displayTime] as? UInt64) ?? now
+        let presented = CMSampleBufferGetPresentationTimeStamp(sample)
+        let marker = markerCentres.flatMap { readMarker(image, $0) }
         completeTimes.append(now)
-        captureMarkers.append(markerCentres.flatMap { readMarker(image, $0) })
+        captureMarkers.append(marker)
         latencyMs.append(machToMs(now &- displayTime))
         if CVPixelBufferGetIOSurface(image) != nil { surfaceBacked += 1 }
         let fourcc = CVPixelBufferGetPixelFormatType(image)
         formats.insert("\(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) \(String(format: "%08x", fourcc))")
         guard let encoder else { return }
-        // Thin to the planned rate, as the host's encode loop does.
-        let minGapMs = 0.9 * 1000 / Double(max(plan.encode_fps, 1))
-        if lastSubmit != 0, machToMs(now - lastSubmit) < minGapMs {
+        // Thin to the planned rate, as the host's encode loop does, by the
+        // frame's presentation time: callback jitter must not drop frames.
+        let time = presented.isValid ? presented.seconds : machToMs(displayTime) / 1000
+        guard pacer.take(time) else {
             thinned += 1
             return
         }
-        lastSubmit = now
         let number = UInt64(submitted)
         displayTimes[number] = displayTime
         submitTimes[number] = now
+        submittedMarkers.append(marker)
         let force = submitted % max(Int(plan.encode_fps), 1) == 0
         if em_encoder_encode(encoder, Unmanaged.passUnretained(image).toOpaque(), number, force) != 0 {
             encodeErrors += 1
@@ -405,17 +414,21 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
                 let check: (Bool, String) -> Void = plan.high_tier ? Log.info : Log.check
                 let encodeTimes = encodedSubmitTimes.map { machToMs($0) / 1000 }
                 let encodeFps = FrameRate.inWindow(encodeTimes, start: window.start, length: window.length)
-                let decodedMarkers = decoder?.markers ?? MarkerStats(display: display)
+                let decodedMatch = DecodedMatch(submitted: submittedMarkers, decoded: decoder?.markers ?? [], display: display)
                 Log.result("\(label)_encode_window", [("encode_fps", String(format: "%.1f", encodeFps)), ("planned", plan.encode_fps),
-                                                      ("decoded_markers", "\"\(decodedMarkers.summary)\"")])
+                                                      ("decoded_vs_submitted", "\"\(decodedMatch.summary)\"")])
                 check(encodeErrors == 0 && encodedFrames == submitted, "\(label): every submitted frame encoded (\(encodedFrames)/\(submitted))")
                 check(decoder?.failed == 0 && decoder?.decoded == encodedFrames, "\(label): every encoded frame decoded (\(decoder?.decoded ?? 0)/\(encodedFrames))")
                 check(emitted.valid && !(emitted.high_tier && !plan.high_tier), "\(label): emitted tier matches the plan")
-                if target != nil {
-                    check(FrameRate.meets(encodeFps, target: Int(plan.encode_fps)),
-                          String(format: "%@: encoded %.1f fps over %.0f s, at least 0.9 × the planned %d", label, encodeFps, window.length, plan.encode_fps))
-                    check(markerCentres != nil && decodedMarkers.proves,
-                          "\(label): every decoded frame shows the probe's marker for display \(display) (\(decodedMarkers.summary))")
+                if let target {
+                    // No faster than the input: a 60 Hz baseline display
+                    // can't feed a plan that allows 120.
+                    let required = min(Int(plan.encode_fps), target)
+                    check(FrameRate.meets(encodeFps, target: required),
+                          String(format: "%@: encoded %.1f fps over %.0f s, at least 0.9 × %d (planned %d, input target %d)",
+                                 label, encodeFps, window.length, required, plan.encode_fps, target))
+                    check(markerCentres != nil && decodedMatch.passes,
+                          "\(label): every decoded frame is a submitted frame of display \(display), in order, none repeated (\(decodedMatch.summary))")
                 }
                 if let expectEncodeFps {
                     check(Int(plan.encode_fps) == expectEncodeFps && !plan.high_tier,

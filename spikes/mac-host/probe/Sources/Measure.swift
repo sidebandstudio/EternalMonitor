@@ -23,6 +23,30 @@ enum FrameRate {
     static func meets(_ fps: Double, target: Int) -> Bool { fps >= 0.9 * Double(target) }
 }
 
+/// Chooses which frames to encode when the encoder runs below the capture
+/// rate, from the frames' presentation timestamps (not when their callbacks
+/// ran, which jitter). A frame is taken once its timestamp reaches the next
+/// slot, less 40% of an interval of slack, so jitter of up to 40% of an
+/// interval never drops a frame at the full rate, while 120 fps input still
+/// halves cleanly to 60. After a gap the schedule restarts instead of
+/// bursting to catch up.
+struct FramePacer {
+    let interval: Double
+    private var next: Double?
+
+    init(fps: Int) { interval = 1 / Double(max(fps, 1)) }
+
+    mutating func take(_ time: Double) -> Bool {
+        guard let due = next else {
+            next = time + interval
+            return true
+        }
+        guard time >= due - 0.4 * interval else { return false }
+        next = time > due + 0.5 * interval ? time + interval : due + interval
+        return true
+    }
+}
+
 /// A row of black and white blocks the probe draws in its window: a sync
 /// pattern, the low 16 bits of the display the window is on, and a frame
 /// counter. Read back from frames, it proves they show the probe's window on
@@ -88,4 +112,42 @@ struct MarkerStats {
     var proves: Bool { valid > 0 && unreadable == 0 && wrongDisplay == 0 && backwards == 0 }
 
     var summary: String { "valid=\(valid) unreadable=\(unreadable) wrong_display=\(wrongDisplay) changes=\(changes) backwards=\(backwards)" }
+}
+
+/// Decoded frames against the frames submitted to the encoder, by their
+/// markers: each decoded frame must be a submitted frame of this display,
+/// in submission order, never repeated (so a frozen or reordering decoder
+/// fails). Up to `allowedMissing` submitted frames may never come out: 1% of
+/// them, and at least 2.
+struct DecodedMatch {
+    var matched = 0
+    var missing = 0
+    var unreadable = 0
+    var wrongDisplay = 0
+    /// Repeated, reordered or never submitted.
+    var outOfSequence = 0
+    var submitted = 0
+
+    var allowedMissing: Int { max(2, submitted / 100) }
+    var passes: Bool { matched > 0 && unreadable == 0 && wrongDisplay == 0 && outOfSequence == 0 && missing <= allowedMissing }
+    var summary: String {
+        "matched=\(matched)/\(submitted) missing=\(missing) (allowed \(allowedMissing)) unreadable=\(unreadable) wrong_display=\(wrongDisplay) out_of_sequence=\(outOfSequence)"
+    }
+
+    init(submitted: [(display: UInt16, counter: UInt16)?], decoded: [(display: UInt16, counter: UInt16)?], display: UInt32) {
+        let id = UInt16(truncatingIfNeeded: display)
+        self.submitted = submitted.count
+        var next = 0 // the first submitted frame not yet matched
+        for frame in decoded {
+            guard let frame else { unreadable += 1; continue }
+            guard frame.display == id else { wrongDisplay += 1; continue }
+            guard let index = submitted[next...].firstIndex(where: { $0?.display == id && $0?.counter == frame.counter }) else {
+                outOfSequence += 1
+                continue
+            }
+            matched += 1
+            next = index + 1
+        }
+        missing = submitted.count - matched
+    }
 }

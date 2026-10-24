@@ -60,9 +60,9 @@ background.frontmost = false
 expect(isSwallow(decide(.leftMouseDown, sys, inside, background)), "system pointer while the probe is not frontmost: swallowed")
 expect(isSwallow(decide(.scrollWheel, sys, inside, background)), "system scroll while not frontmost: swallowed")
 expect(decide(.tabletProximity, sys, inside) == .deliver, "pen proximity inside, frontmost: delivered")
-expect(decide(.keyDown, sys, outside) == .swallowKey, "system key: recorded and swallowed")
-expect(decide(.keyUp, sys, inside, background) == .swallowKey, "system key while not frontmost: still swallowed")
-expect(decide(.keyDown, sys, inside, flags: .maskShift) == .swallowKey, "shifted key: swallowed like any key")
+expect(isSwallow(decide(.keyDown, sys, inside)), "a system-path key (never posted) is swallowed as a failure")
+expect(isSwallow(decide(.keyUp, sys, outside, background)), "a system-path key up is swallowed as a failure")
+expect(decide(.keyDown, pid, inside) == .passOwnPid, "keys go only to the probe's own process")
 for (flag, name) in [(CGEventFlags.maskCommand, "⌘"), (.maskControl, "⌃"), (.maskAlternate, "⌥"), (.maskSecondaryFn, "fn")] {
     expect(isSwallow(decide(.keyDown, sys, inside, flags: flag)), "system key with \(name): swallowed as a failure")
     expect(isSwallow(decide(.leftMouseDown, sys, inside, flags: flag)), "system click with \(name): swallowed as a failure")
@@ -72,6 +72,36 @@ expect(TapPolicy.isInput(.mouseMoved) && TapPolicy.isInput(.keyDown) && TapPolic
 expect(!TapPolicy.isInput(.null), "non-input events don't stop the run")
 expect(TapPolicy.isInput(.scrollWheel) && TapPolicy.isInput(.leftMouseDown), "real clicks and scrolls count as input")
 expect(!TapPolicy.isInput(.tabletPointer) && !TapPolicy.isInput(.tabletProximity), "tablet events (none are real here) don't stop the run")
+
+// MARK: PointerSafety (what makes a system-path pointer event safe)
+
+let shielding = 2_147_483_628
+let ownWindow = 77
+func win(_ number: Int, pid: Int32, layer: Int, _ bounds: CGRect, _ owner: String = "Other") -> WindowInfo {
+    WindowInfo(number: number, pid: pid, layer: layer, bounds: bounds, owner: owner)
+}
+let probeWindow = win(ownWindow, pid: me, layer: shielding, display, "Probe")
+let mainBounds = CGRect(x: 0, y: 0, width: 3440, height: 1440)
+func cover(_ windows: [WindowInfo]) -> String? {
+    PointerSafety.coverProblem(windows, display: display, ownPID: me, ownWindow: ownWindow, minLayer: shielding)
+}
+expect(cover([probeWindow, win(5, pid: 99, layer: 0, display)]) == nil, "topmost and exactly covering, others below it: safe")
+expect(cover([win(1, pid: 99, layer: 25, mainBounds), probeWindow]) == nil, "a window above it on another display only: safe")
+expect(cover([win(1, pid: 99, layer: shielding + 2, CGRect(x: display.minX + 100, y: 100, width: 50, height: 50)), probeWindow]) != nil,
+       "another process's window above it on the display: not safe")
+expect(cover([win(1, pid: 99, layer: shielding, CGRect(x: display.minX - 10, y: 0, width: 20, height: 20)), probeWindow]) != nil,
+       "another window overlapping the display's edge from above: not safe")
+expect(cover([win(1, pid: me, layer: shielding + 1, CGRect(x: display.minX, y: 0, width: 10, height: 10)), probeWindow]) == nil,
+       "the probe's own window above it: safe")
+expect(cover([win(ownWindow, pid: me, layer: 0, display)]) != nil, "below shielding level: not safe")
+expect(cover([win(ownWindow, pid: me, layer: shielding, display.insetBy(dx: 2, dy: 0))]) != nil, "not covering the whole display: not safe")
+expect(cover([win(ownWindow, pid: me, layer: shielding, display.offsetBy(dx: 0, dy: 3))]) != nil, "shifted off the display: not safe")
+expect(cover([win(5, pid: 99, layer: 0, display)]) != nil, "probe window not on screen: not safe")
+expect(cover([win(ownWindow, pid: 99, layer: shielding, display)]) != nil, "a window number owned by another pid: not safe")
+expect(PointerSafety.inset(CGPoint(x: display.minX + 400, y: 500), display), "a point well inside: allowed")
+expect(!PointerSafety.inset(CGPoint(x: display.minX + 3, y: 500), display), "a point 3 pt from the left edge: refused")
+expect(!PointerSafety.inset(CGPoint(x: display.maxX - 1, y: 500), display), "a point 1 pt from the right edge (next display): refused")
+expect(!PointerSafety.inset(CGPoint(x: display.minX + 400, y: display.maxY - 4), display), "a point 4 pt from the bottom: refused")
 
 // MARK: SequenceMatcher
 
@@ -191,6 +221,30 @@ let stalled = at120.filter { $0 < 2 || $0 > 4 } // a 2 s stall inside the window
 expect(!FrameRate.meets(FrameRate.inWindow(stalled, start: 1, length: 5), target: 120), "a stall inside the window fails")
 expect(FrameRate.inWindow([], start: 1, length: 5) == 0, "no frames is 0 fps")
 
+// MARK: FramePacer
+
+func paced(_ times: [Double], fps: Int) -> [Double] {
+    var pacer = FramePacer(fps: fps)
+    return times.filter { pacer.take($0) }
+}
+let steady120 = (0..<960).map { Double($0) / 120 }
+// Sol's case: alternate gaps of 6.33 and 10.33 ms (±2 ms of callback jitter).
+let jittered120: [Double] = (0..<960).map { (n: Int) -> Double in
+    let delay: Double = n % 2 == 1 ? -0.002 : 0
+    return Double(n) / 120 + delay
+}
+let wobbly120: [Double] = (0..<960).map { (n: Int) -> Double in Double(n) / 120 + 0.003 * sin(Double(n) * 1.7) }
+expect(paced(steady120, fps: 120).count == 960, "steady 120 fps at a 120 target: every frame taken")
+expect(paced(jittered120, fps: 120).count == 960, "120 fps with alternating 6.33/10.33 ms gaps at a 120 target: every frame taken")
+expect(paced(wobbly120, fps: 120).count == 960, "120 fps with ±3 ms timestamp jitter: every frame taken")
+let halved = paced(steady120, fps: 60)
+expect(halved.count == 480 && FrameRate.meets(FrameRate.inWindow(halved, start: 1, length: 5), target: 60), "120 fps thinned to a 60 target: every other frame")
+let halvedJittered = paced(jittered120, fps: 60)
+expect(abs(halvedJittered.count - 480) <= 1, "jittered 120 fps thinned to 60: still half (\(halvedJittered.count))")
+let gap = steady120.filter { $0 < 2 || $0 >= 3 } // a 1 s pause in delivery
+let afterGap = paced(gap, fps: 60).filter { $0 >= 3 }
+expect(abs(FrameRate.inWindow(afterGap, start: 3, length: 4) - 60) < 1, "after a pause the rate resumes at 60, with no burst")
+
 // MARK: Marker
 
 func luma(_ bits: [Bool], noise: Int = 0) -> [UInt8] {
@@ -237,6 +291,27 @@ var back = stats
 back.add((0x5678, 1))
 expect(!back.proves && back.backwards == 1, "a counter that goes back fails")
 expect(!MarkerStats(display: id).proves, "no frames proves nothing")
+
+// MARK: DecodedMatch
+
+func markers(_ counters: [Int], display: UInt16 = 0x5678) -> [(display: UInt16, counter: UInt16)?] {
+    counters.map { (display, UInt16(truncatingIfNeeded: $0)) }
+}
+let sent = markers(Array(0..<600))
+expect(DecodedMatch(submitted: sent, decoded: sent, display: id).passes, "every submitted frame decoded, in order: passes")
+let frozen = DecodedMatch(submitted: sent, decoded: markers(Array(repeating: 0, count: 600)), display: id)
+expect(!frozen.passes && frozen.outOfSequence == 599, "a frozen decoder (600 identical markers) fails: \(frozen.summary)")
+var swappedOrder = Array(0..<600)
+swappedOrder.swapAt(100, 101)
+expect(!DecodedMatch(submitted: sent, decoded: markers(swappedOrder), display: id).passes, "a reordering decoder fails")
+let twoLost = DecodedMatch(submitted: sent, decoded: markers((0..<600).filter { $0 != 10 && $0 != 300 }), display: id)
+expect(twoLost.passes && twoLost.missing == 2, "two frames lost of 600 is within the stated tolerance (\(twoLost.allowedMissing))")
+let manyLost = DecodedMatch(submitted: sent, decoded: markers((0..<600).filter { $0 % 50 != 0 }), display: id)
+expect(!manyLost.passes, "12 frames lost of 600 (2%) fails")
+expect(!DecodedMatch(submitted: sent, decoded: sent + [nil], display: id).passes, "an unreadable decoded frame fails")
+expect(!DecodedMatch(submitted: sent, decoded: markers(Array(0..<600), display: 0x9999), display: id).passes, "frames of another display fail")
+expect(!DecodedMatch(submitted: sent, decoded: [], display: id).passes, "nothing decoded fails")
+expect(!DecodedMatch(submitted: sent, decoded: markers(Array(0..<600) + [700]), display: id).passes, "a frame that was never submitted fails")
 
 print("\(checks - failures)/\(checks) passed, failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

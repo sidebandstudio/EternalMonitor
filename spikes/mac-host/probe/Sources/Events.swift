@@ -3,17 +3,25 @@
 // shielding level, and every position comes from a wire coordinate
 // (0...65535) mapped onto that display's bounds, as the host will map touches.
 //
-// Two paths. CGEventPostToPid, which only this process can receive. Then the
-// system (HID) path the host will use, guarded by the probe's own event tap
-// (ProbeTap), the last check before macOS delivers an event:
-//   - keys are recorded by the tap and swallowed there, so no app gets them;
-//   - mouse and pen events pass only inside the virtual display the window
-//     covers, with the probe frontmost and not annotated for another
-//     process; anything else is swallowed and is a failure;
-//   - no ⌘, ⌃, ⌥ or fn, and no modifier key events, on this path;
-//   - without the tap nothing is posted on this path, and if macOS turns
-//     the tap off, posting stops;
-//   - real input (someone moving the mouse) stops the run at once.
+// Two paths. CGEventPostToPid, which only this process can receive: the
+// whole sequence, keys included. Keyboard delivery is proven only here.
+// Then the system (HID) path the host will use, for mouse, scroll and pen
+// only, and only on the covered virtual display. No key is ever posted on
+// the system path: any key can type, trigger a shortcut or change state in
+// whatever is focused, and no virtual keycode is provably unmapped.
+//
+// Safety on the system path comes from where events are delivered. The
+// window server hit-tests mouse, scroll and pen events when they arrive and
+// gives them to the window under the pointer, whatever is focused. So each
+// one is posted only after CGWindowListCopyWindowInfo shows the probe's
+// shielding-level window exactly covering the whole virtual display with no
+// other process's window above it there, and only at points at least 8 pt
+// inside the display (PointerSafety). The probe's event tap stays as an
+// observer and filter (it drops what slipped through, counts it, and stops
+// the run on real input) but safety never depends on it, since macOS can
+// turn a tap off at any moment. The edge and corner mapping checks only
+// warp the cursor; they post nothing.
+//
 // Every event carries a tag and sequence number, and what arrives is matched
 // against what was posted: type, location within 1 pt, and order.
 import AppKit
@@ -341,12 +349,10 @@ struct EventSpike {
         return event
     }
 
-    /// One event of the sequence.
+    /// One event of the sequence. Keys go only to this process.
     private struct Step {
         let name: String
         let event: CGEvent
-        /// Also sent on the system path. Modifier keys only go to this process.
-        var systemPath = true
         /// The characters a keyDown must deliver (only for Unicode-string
         /// events; keycode events depend on the keyboard layout).
         var chars: String?
@@ -392,10 +398,10 @@ struct EventSpike {
             Step(name: "scroll lines dy=3 dx=-1", event: scrollLines),
             Step(name: "key a down", event: key(CGKeyCode(kVK_ANSI_A), true, [], source)),
             Step(name: "key a up", event: key(CGKeyCode(kVK_ANSI_A), false, [], source)),
-            Step(name: "shift down", event: key(CGKeyCode(kVK_Shift), true, shift, source), systemPath: false),
+            Step(name: "shift down", event: key(CGKeyCode(kVK_Shift), true, shift, source)),
             Step(name: "key A (shift) down", event: key(CGKeyCode(kVK_ANSI_A), true, shift, source)),
             Step(name: "key A (shift) up", event: key(CGKeyCode(kVK_ANSI_A), false, shift, source)),
-            Step(name: "shift up", event: key(CGKeyCode(kVK_Shift), false, [], source), systemPath: false),
+            Step(name: "shift up", event: key(CGKeyCode(kVK_Shift), false, [], source)),
             Step(name: "unicode é", event: unicode("é", true, source), chars: "é"),
             Step(name: "unicode é up", event: unicode("é", false, source)),
             Step(name: "unicode 😀 (one event)", event: unicode("😀", true, source), chars: "😀"),
@@ -454,22 +460,46 @@ struct EventSpike {
         report("\(where_) pid", SequenceMatcher.match(steps.enumerated().map { $1.expected($0) }, app.events.seen(run: run)))
     }
 
-    /// The system path, only through the tap.
+    /// Why a system-path pointer event can't be posted on `bounds` now, or
+    /// nil: the window list must show the probe's window topmost over all of
+    /// it. A window whose details can't be read counts as covering everything.
+    private func coverProblem(_ bounds: CGRect) -> String? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return "the window list is unavailable"
+        }
+        let windows = list.map { info in
+            WindowInfo(number: info[kCGWindowNumber as String] as? Int ?? -1,
+                       pid: Int32(info[kCGWindowOwnerPID as String] as? Int ?? -1),
+                       layer: info[kCGWindowLayer as String] as? Int ?? Int.max,
+                       bounds: (info[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) } ?? .infinite,
+                       owner: info[kCGWindowOwnerName as String] as? String ?? "?")
+        }
+        return PointerSafety.coverProblem(windows, display: bounds, ownPID: getpid(), ownWindow: app.window.windowNumber,
+                                          minLayer: Int(CGShieldingWindowLevel()))
+    }
+
+    /// The system path: mouse, scroll and pen, on the covered virtual display only.
     private func postToSystem(_ all: [Step], tap: ProbeTap?, source: CGEventSource) async {
         let label = "\(where_) hid"
-        guard let tap else {
-            Log.check(false, "\(label): skipped; the probe's event tap could not be installed, and nothing is posted on the system path without it")
+        guard let display else {
+            Log.line("INFO \(label): nothing is posted on the system path on the main display; mouse, scroll and pen go through it only on the covered virtual display (spike c)")
             return
         }
-        var bounds: CGRect?
-        if let display {
-            let covered = app.covers(display)
-            Log.check(covered, "\(label): the probe window covers virtual display \(display) at shielding level")
-            if covered { bounds = CGDisplayBounds(display) }
-        } else {
-            Log.line("INFO \(label): mouse and pen events go on the system path only on the virtual display (spike c); this baseline sends keys only")
+        guard let tap else {
+            Log.check(false, "\(label): skipped; the probe's event tap (its observer and filter) could not be installed")
+            return
         }
-        let steps = all.filter { $0.systemPath && (bounds != nil || $0.isKey) }
+        let bounds = CGDisplayBounds(display)
+        if let problem = coverProblem(bounds) {
+            Log.check(false, "\(label): nothing posted: \(problem)")
+            return
+        }
+        Log.check(true, "\(label): the window list shows the probe window topmost over all of virtual display \(display)")
+        let steps = all.filter { !$0.isKey }
+        if let outside = steps.first(where: { !PointerSafety.inset($0.event.location, bounds) }) {
+            Log.check(false, "\(label): nothing posted: \"\(outside.name)\" is not \(PointerSafety.insetPt) pt inside the display")
+            return
+        }
         let run = ProbeTag.newRun()
         tap.update {
             $0.systemRun = run
@@ -494,22 +524,20 @@ struct EventSpike {
         }
 
         var stopped: String?
-        var held: [String: CGEvent] = [:] // the release for each button or key still down
+        var held: [String: CGEvent] = [:] // the release for each button still down
         var seq = 0
         for step in steps {
             if let problem = tap.problem { stopped = "before #\(seq) \"\(step.name)\": \(problem)"; break }
+            // Right before each event: still topmost over the whole display.
+            if let problem = coverProblem(bounds) { stopped = "before #\(seq) \"\(step.name)\": \(problem)"; break }
             let front = frontmost()
             tap.update { $0.frontmost = front }
-            guard front else { stopped = "before #\(seq) \"\(step.name)\": the probe is no longer frontmost"; break }
             let event = step.event
-            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             switch event.type {
             case .leftMouseDown: held["left"] = mouse(.leftMouseUp, event.location, .left, source)
             case .rightMouseDown: held["right"] = mouse(.rightMouseUp, event.location, .right, source)
-            case .keyDown: held["key \(keyCode)"] = key(CGKeyCode(keyCode), false, [], source)
             case .leftMouseUp: held["left"] = nil
             case .rightMouseUp: held["right"] = nil
-            case .keyUp: held["key \(keyCode)"] = nil
             default: break
             }
             post(event, step.name, run: run, seq: seq)
@@ -520,16 +548,17 @@ struct EventSpike {
             }
             Log.line("TAP hid #\(seq - 1) \(step.name): \(seen.decision) target_pid=\(seen.targetPID)")
             if case .swallow(let why) = seen.decision { stopped = "#\(seq - 1) \"\(step.name)\" was swallowed: \(why)"; break }
-            if seen.decision == .deliver {
-                let got = await waitFor(0.3) { app.events.has(run: run, seq: seq - 1) }
-                Log.line("\(got ? "GOT" : "MISSING") hid #\(seq - 1) \(step.name)")
-            }
+            let got = await waitFor(0.3) { app.events.has(run: run, seq: seq - 1) }
+            Log.line("\(got ? "GOT" : "MISSING") hid #\(seq - 1) \(step.name)")
         }
         if let stopped {
             Log.check(false, "\(label): stopped \(stopped)")
-            // Release whatever is still down, through the same tap and checks,
-            // unless the tap is off (then nothing more is posted).
-            for (what, release) in held where tap.offReason == nil {
+            // Release any button still down, under the same window check.
+            for (what, release) in held {
+                if let problem = coverProblem(bounds) {
+                    Log.line("hid: not releasing \(what): \(problem)")
+                    continue
+                }
                 post(release, "release \(what)", run: run, seq: seq)
                 let seen = await waitForTap(tap, run: run, seq: seq)
                 Log.line("TAP hid #\(seq) release \(what): \(seen.map { "\($0.decision)" } ?? "not seen")")
@@ -537,24 +566,14 @@ struct EventSpike {
             }
         }
 
-        let expected = steps.enumerated().map { $1.expected($0) }
         let seen = tap.seen(run: run)
-        let unsafe = seen.filter { if case .swallow = $0.event.decision { true } else { false } }
-        for item in unsafe { Log.line("UNSAFE hid #\(item.seq): \(item.event.decision)") }
-        Log.check(unsafe.isEmpty, "\(label): no posted event was swallowed as unsafe (\(unsafe.count))")
-        Log.check(seen.allSatisfy { $0.event.decision != .deliver || !TapPolicy.keyTypes.contains($0.event.type) },
-                  "\(label): no key was let through the tap")
-        // Keys stop at the tap; pointer events must reach the window.
-        let keysAtTap = seen.filter { $0.event.decision == .swallowKey }.map {
-            SeenEvent(seq: $0.seq, type: eventName(UInt($0.event.type.rawValue)), point: nil, keyCode: $0.event.keyCode, chars: $0.event.chars)
-        }
-        report("\(where_) hid keys (recorded and swallowed by the tap)", SequenceMatcher.match(expected.filter { $0.keyCode != nil }, keysAtTap))
-        if bounds != nil {
-            report("\(where_) hid pointer", SequenceMatcher.match(expected.filter { $0.keyCode == nil }, app.events.seen(run: run)))
-        }
+        let refused = seen.filter { $0.event.decision.swallowed }
+        for item in refused { Log.line("REFUSED hid #\(item.seq): \(item.event.decision)") }
+        Log.check(refused.isEmpty, "\(label): the tap's filter refused none of the posted events (\(refused.count))")
+        report("\(where_) hid pointer", SequenceMatcher.match(steps.enumerated().map { $1.expected($0) }, app.events.seen(run: run)))
     }
 
-    /// Tags and posts one event on the system path. Callers check the tap first.
+    /// Tags and posts one event on the system path. Callers check the window list first.
     private func post(_ event: CGEvent, _ name: String, run: UInt64, seq: Int) {
         event.setIntegerValueField(.eventSourceUserData, value: ProbeTag.make(run: run, seq: seq))
         event.post(tap: .cghidEventTap)
@@ -616,11 +635,12 @@ struct EventSpike {
             try? await Task.sleep(nanoseconds: 300_000_000) // let the warps settle before the tap watches for input
         }
         let tap = ProbeTap.install()
-        Log.check(tap != nil, "the probe's event tap is installed (annotated session, appended last)")
+        Log.check(tap != nil, "the probe's event tap (observer and filter) is installed (annotated session, appended last)")
         defer { tap?.remove() }
         app.say("Spike e: posting events into this window (pid). Please don't touch the mouse or keyboard.")
         await postToPid(sequence(source), tap: tap)
-        app.say("Spike e: posting events through the system path, guarded by the probe's tap. Please don't touch the mouse or keyboard.")
+        Log.line("KEYBOARD: keys are proven only through the process-targeted path (CGEventPostToPid to the probe itself); no key is posted through the system path")
+        app.say("Spike e: clicks, scrolls and pen strokes through the system path, on the covered display only. Please don't touch the mouse or keyboard.")
         await postToSystem(sequence(source), tap: tap, source: source)
     }
 }

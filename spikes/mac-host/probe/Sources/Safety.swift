@@ -1,7 +1,9 @@
 // Safety and deadline logic, kept free of AppKit, displays and event posting
-// so tests/run.sh can exercise all of it without touching the session: the
-// event tap's decision, the posted-versus-received matcher, child processes
-// with real deadlines, and the probe's hard self-deadline.
+// so tests/run.sh can exercise all of it without touching the session: what
+// makes a system-path pointer event safe (the probe's window topmost over
+// the whole virtual display, points inset from its edges), the event tap's
+// filter, the posted-versus-received matcher, child processes with real
+// deadlines, and the probe's hard self-deadline.
 import CoreGraphics
 import Darwin
 import Foundation
@@ -31,25 +33,66 @@ func eventName(_ raw: UInt) -> String {
     }
 }
 
-// MARK: The event tap's decision
+// MARK: Where system-path pointer events land
+
+/// One on-screen window, as CGWindowListCopyWindowInfo lists it (front to
+/// back), bounds in CG global coordinates.
+struct WindowInfo {
+    let number: Int
+    let pid: Int32
+    let layer: Int
+    let bounds: CGRect
+    let owner: String
+}
+
+/// The window server delivers mouse, scroll and pen events to the window
+/// under the pointer when they arrive, whatever is focused. So a system-path
+/// pointer event is safe only where the probe's own window is topmost.
+enum PointerSafety {
+    /// Points stay at least this far inside the virtual display.
+    static let insetPt = 8.0
+
+    /// Nil when the probe's window (`ownWindow`, at `minLayer` or above)
+    /// covers exactly all of `display`, and no other process's window is
+    /// above it anywhere on that display; otherwise why not.
+    static func coverProblem(_ windows: [WindowInfo], display: CGRect, ownPID: Int32, ownWindow: Int, minLayer: Int) -> String? {
+        guard let index = windows.firstIndex(where: { $0.number == ownWindow }) else {
+            return "the probe window \(ownWindow) is not on screen"
+        }
+        let own = windows[index]
+        guard own.pid == ownPID else { return "window \(ownWindow) belongs to pid \(own.pid)" }
+        guard own.layer >= minLayer else { return "the probe window is at layer \(own.layer), below shielding (\(minLayer))" }
+        let edges = [own.bounds.minX - display.minX, own.bounds.minY - display.minY,
+                     own.bounds.maxX - display.maxX, own.bounds.maxY - display.maxY]
+        guard edges.allSatisfy({ abs($0) <= 0.5 }) else {
+            return "the probe window \(own.bounds) does not exactly cover the display \(display)"
+        }
+        for window in windows[..<index] where window.pid != ownPID && !window.bounds.intersection(display).isEmpty {
+            return "window \(window.number) of \(window.owner) (pid \(window.pid), layer \(window.layer)) is above the probe window on the display"
+        }
+        return nil
+    }
+
+    /// The point is inside `display` by at least `insetPt` on every side.
+    static func inset(_ point: CGPoint, _ display: CGRect) -> Bool {
+        display.insetBy(dx: insetPt, dy: insetPt).contains(point)
+    }
+}
+
+// MARK: The event tap's filter (never what makes posting safe)
 
 enum TapDecision: Equatable {
     /// Not the probe's: real input or the system's own. Untouched.
     case passThrough
     /// A CGEventPostToPid event, addressed to this process only.
     case passOwnPid
-    /// A system-path pointer event that can only land in the probe's window.
+    /// A system-path pointer event that passed the filter.
     case deliver
-    /// A system-path key: recorded, then dropped, so no app receives it.
-    case swallowKey
-    /// A system-path event that is not provably safe: dropped, and a failure.
+    /// A system-path event the filter refuses: dropped, and a failure.
     case swallow(String)
 
     var swallowed: Bool {
-        switch self {
-        case .swallowKey, .swallow: true
-        default: false
-        }
+        if case .swallow = self { true } else { false }
     }
 }
 
@@ -81,9 +124,12 @@ enum TapPolicy {
             || (pointerTypes.contains(type) && type != .tabletPointer && type != .tabletProximity)
     }
 
-    /// The last check before macOS delivers an event. A system-path event
-    /// passes only if it is a pointer event inside the virtual display, with
-    /// the probe frontmost and macOS not annotating it for another process.
+    /// A filter at the last tap before delivery. Safety comes from where the
+    /// event is posted (PointerSafety), since macOS can turn a tap off at any
+    /// time; this only drops what slipped past that and counts it. A
+    /// system-path event passes only if it is a pointer event inside the
+    /// virtual display, with the probe frontmost and macOS not annotating it
+    /// for another process. Keys are never posted on the system path.
     static func decide(type: CGEventType, userData: Int64, location: CGPoint, flags: CGEventFlags,
                        targetPID: Int32, state: TapState) -> TapDecision {
         guard userData != 0 else { return .passThrough }
@@ -93,7 +139,7 @@ enum TapPolicy {
         if !flags.intersection(forbiddenFlags).isEmpty {
             return .swallow("modifier flags 0x\(String(flags.rawValue, radix: 16)) on the system path")
         }
-        if keyTypes.contains(type) { return .swallowKey }
+        if keyTypes.contains(type) { return .swallow("keys are never posted on the system path") }
         guard pointerTypes.contains(type) else { return .swallow("\(eventName(UInt(type.rawValue))) is not allowed on the system path") }
         guard let display = state.display, display.contains(location) else {
             return .swallow(String(format: "(%.2f,%.2f) is outside the virtual display", location.x, location.y))
