@@ -45,6 +45,15 @@ enum Feedback {
             )
         }
 
+        /// "iPad", or "iPhone" when the model is one.
+        var device: String { DeviceNoun.noun(forModel: model) }
+
+        /// The model as the details name it. iPhone Duo is spelled out so its
+        /// mail is easy to find; other models give the identifier alone.
+        var modelName: String {
+            model == "iPhone19,4" ? "iPhone Duo (\(model))" : model
+        }
+
         /// The hardware identifier, such as iPad16,3.
         static func modelIdentifier() -> String {
             if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
@@ -60,13 +69,13 @@ enum Feedback {
 
     /// "EternalMonitor 0.3.2 (7) for iPad: Problem", so the studio can sort mail.
     static func subject(_ kind: Kind, _ context: Context) -> String {
-        "EternalMonitor \(context.appVersion) (\(context.build)) for iPad: \(kind.label)"
+        "EternalMonitor \(context.appVersion) (\(context.build)) for \(context.device): \(kind.label)"
     }
 
     /// Said first in Mail whenever the Diagnostics report is attached, since
     /// the report can name the PC and iPad.
     static let attachmentNotice = "We attached a diagnostics report to help us look into it. "
-        + "It can include your PC's and iPad's names and local network addresses. "
+        + "It can include your PC's and \(DeviceNoun.current)'s names and local network addresses. "
         + "Remove it before sending if you'd rather not share it."
 
     /// Room to write, then the details in short lines. With the Diagnostics
@@ -76,9 +85,9 @@ enum Feedback {
         if case .problem(let title) = kind {
             lines.append("Problem: \(title)")
         }
-        lines.append("App: EternalMonitor \(context.appVersion) (\(context.build)) for iPad")
-        lines.append("iPadOS: \(context.systemVersion)")
-        lines.append("iPad: \(context.model)")
+        lines.append("App: EternalMonitor \(context.appVersion) (\(context.build)) for \(context.device)")
+        lines.append("\(context.device == "iPhone" ? "iOS" : "iPadOS"): \(context.systemVersion)")
+        lines.append("\(context.device): \(context.modelName)")
         lines.append("PC app: \(context.pcVersion.map { "EternalMonitor \($0)" } ?? "unknown")")
         lines.append("Connection: \(context.connection ?? "not connected")")
         let notice = attachesDiagnostics ? attachmentNotice + "\n" : ""

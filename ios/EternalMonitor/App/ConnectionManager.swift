@@ -283,7 +283,7 @@ final class ConnectionManager: ObservableObject {
 
     func forgetPairedHosts() {
         do { try pairingStore.forgetAll() }
-        catch { connectionError = "Could not remove saved pairings from this iPad." }
+        catch { connectionError = "Could not remove saved pairings from this \(DeviceNoun.current)." }
     }
 
     /// A connection the user or a cable starts. It replaces any automatic
@@ -716,7 +716,7 @@ final class ConnectionManager: ObservableObject {
         self.mediaLink = receiver
 
         guard receiver.start(host: normalizedHost) else {
-            connectionError = "Couldn't start streaming on this iPad. Try again."
+            connectionError = "Couldn't start streaming on this \(DeviceNoun.current). Try again."
             record(.error, "connection", "Receiver failed to start")
             disconnect()
             return

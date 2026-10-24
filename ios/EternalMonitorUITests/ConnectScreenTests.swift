@@ -57,7 +57,8 @@ final class ConnectScreenTests: XCTestCase {
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
         XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
-        let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
+        let device = UIDevice.current.userInterfaceIdiom == .phone ? "iPhone" : "iPad"
+        let listening = NSPredicate(format: "label == %@", "Plug this \(device) into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
         waitForExpectations(timeout: 5)
     }

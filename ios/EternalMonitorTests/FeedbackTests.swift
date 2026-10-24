@@ -65,7 +65,7 @@ final class FeedbackTests: XCTestCase {
     func testMailSaysTheDiagnosticsAreAttachedAndHowToRemoveThem() {
         let attached = Feedback.body(.problem("Your PC didn't answer"), context, attachesDiagnostics: true)
         XCTAssertTrue(attached.hasPrefix(Feedback.attachmentNotice + "\n\n\n\n--\n"), attached)
-        XCTAssertTrue(Feedback.attachmentNotice.contains("PC's and iPad's names and local network addresses"))
+        XCTAssertTrue(Feedback.attachmentNotice.contains("PC's and \(DeviceNoun.current)'s names and local network addresses"))
         XCTAssertTrue(Feedback.attachmentNotice.contains("Remove it before sending"))
         // Without an attachment (the copy sheet) it says nothing about one.
         XCTAssertFalse(Feedback.body(.general, context).contains("diagnostics"))

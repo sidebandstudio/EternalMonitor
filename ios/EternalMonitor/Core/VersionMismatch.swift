@@ -19,9 +19,9 @@ enum VersionMismatch: Equatable {
     var message: String {
         switch self {
         case .iPadOlder:
-            return "This iPad app is older than EternalMonitor on your PC, so they can't connect. Update the iPad app: open TestFlight and tap Update."
+            return "This \(DeviceNoun.current) app is older than EternalMonitor on your PC, so they can't connect. Update the \(DeviceNoun.current) app: open TestFlight and tap Update."
         case .pcOlder:
-            return "EternalMonitor on your PC is older than this iPad app, so they can't connect. Update EternalMonitor on your PC: click Update now on the PC, or download it from eternalmonitor.dev."
+            return "EternalMonitor on your PC is older than this \(DeviceNoun.current) app, so they can't connect. Update EternalMonitor on your PC: click Update now on the PC, or download it from eternalmonitor.dev."
         case .pcLegacy:
             return "EternalMonitor on your PC is too old to connect. On your PC, download the new version from eternalmonitor.dev."
         }

@@ -57,7 +57,7 @@ struct SettingsView: View {
                         sectionHeader("Streaming")
                     } footer: {
                         footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls. "
-                            + "Fill uses the whole iPad screen and trims the edges of the PC picture that don't fit.")
+                            + "Fill uses the whole \(DeviceNoun.current) screen and trims the edges of the PC picture that don't fit.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
 
@@ -124,7 +124,7 @@ struct SettingsView: View {
                     } header: {
                         sectionHeader("Apple Pencil")
                     } footer: {
-                        footnote("Draw with Apple Pencil in Windows apps, with pressure and tilt; fingers on the picture are ignored and PC sound is muted while it's on. "
+                        footnote("Draw with Apple Pencil in Windows apps, with \(DeviceNoun.isPhone ? "tilt" : "pressure and tilt"); fingers on the picture are ignored and PC sound is muted while it's on. "
                             + "In Clip Studio Paint, choose Preferences > Tablet > Tablet PC.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
@@ -168,9 +168,9 @@ struct SettingsView: View {
                     // Play PC audio switch, and this explains what the PC decides.
                     Section {
                         Label {
-                            Text("Your PC chooses whether this iPad mirrors its screen or works as a second screen. "
+                            Text("Your PC chooses whether this \(DeviceNoun.current) mirrors its screen or works as a second screen. "
                                 + "In EternalMonitor on the PC, pick Mirror my screen or Second screen at the top of the Stream page. "
-                                + "This iPad reconnects by itself.")
+                                + "This \(DeviceNoun.current) reconnects by itself.")
                                 .font(.app(15, relativeTo: .callout))
                                 .foregroundStyle(Theme.text)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -217,7 +217,7 @@ struct SettingsView: View {
                     } header: {
                         sectionHeader("Support")
                     } footer: {
-                        footnote("We're a small studio and we read every message. Mail opens with your iPad's details and a diagnostics report attached, which you can remove.")
+                        footnote("We're a small studio and we read every message. Mail opens with your \(DeviceNoun.current)'s details and a diagnostics report attached, which you can remove.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
 

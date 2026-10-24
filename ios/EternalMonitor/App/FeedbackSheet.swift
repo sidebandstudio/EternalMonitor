@@ -90,7 +90,7 @@ struct FeedbackCopySheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Mail isn't set up on this iPad")
+                        Text("Mail isn't set up on this \(DeviceNoun.current)")
                             .font(.app(20, .semibold, relativeTo: .title3))
                             .foregroundStyle(Theme.text)
                             .accessibilityIdentifier("feedback.copyTitle")

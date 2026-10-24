@@ -8,7 +8,9 @@ literal as the app renders it, or literals the source joins into one message
 (Swift `+`, Rust `concat!`), with comments between them ignored. When a
 quote is not a whole message but starts one, the error names that message. A
 placeholder such as {version} or \\(host) in the source is written as an
-ellipsis (…). Runs of whitespace compare as one space. QUICKSTART.txt is
+ellipsis (…), except that the iOS app's \\(DeviceNoun.current) reads as
+"iPad": the guides quote the iPad wording, which an iPhone shows with
+"iPhone". Runs of whitespace compare as one space. QUICKSTART.txt is
 ASCII, so there it is "..." and apostrophes are straight.
 
 This is a drift detector, not a compiler. A source file it can't read is
@@ -30,6 +32,8 @@ RUST_CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])
 # The format string is a macro's first argument, or its second after a writer.
 RUST_FORMAT_CALL = re.compile(r"\w!\(\s*(?:[^,()\"]+,\s*)?$")
 SWIFT_OPEN = re.compile(r'(#*)("""|")')
+# Swift placeholders the guides quote as a word, not an ellipsis.
+SWIFT_WORDS = {"DeviceNoun.current": "iPad"}
 
 
 class LexError(ValueError):
@@ -153,8 +157,9 @@ def _swift_body(text, i, close, escape):
     out = []
     while not text.startswith(close, i):
         if text.startswith(escape + "(", i):
-            i = _skip_parens(text, i + len(escape))
-            out.append("…")
+            start = i + len(escape)
+            i = _skip_parens(text, start)
+            out.append(SWIFT_WORDS.get(text[start + 1:i - 1].strip(), "…"))
         elif text.startswith(escape, i):
             piece, i = _escape(text[:i] + "\\" + text[i + len(escape):], i, skip_indent=False)
             i += len(escape) - 1

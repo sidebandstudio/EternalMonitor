@@ -224,7 +224,7 @@ struct ConnectView: View {
                 Text("EternalMonitor")
                     .font(.app(30, .semibold, relativeTo: .largeTitle))
                     .foregroundStyle(Theme.text)
-                Text("Use this iPad as a second screen for your Windows PC.")
+                Text("Use this \(DeviceNoun.current) as a second screen for your Windows PC.")
                     .font(.app(16, relativeTo: .body))
                     .foregroundStyle(Theme.textMuted)
                     .multilineTextAlignment(.center)
@@ -252,7 +252,7 @@ struct ConnectView: View {
             onboardingStep(1, "Install and open EternalMonitor on your Windows PC.")
             onboardingStep(2, "Tap your PC when it appears below, scan the QR code on the PC, or plug in a USB cable.")
             onboardingStep(3, "The first time on Wi-Fi, type the six-digit pairing code the PC shows.")
-            onboardingStep(4, "Your PC's screen is mirrored at first. To use this iPad as a second screen, choose Second screen in EternalMonitor on the PC.")
+            onboardingStep(4, "Your PC's screen is mirrored at first. To use this \(DeviceNoun.current) as a second screen, choose Second screen in EternalMonitor on the PC.")
         }
         .card()
         .transition(.opacity.combined(with: .move(edge: .top)))

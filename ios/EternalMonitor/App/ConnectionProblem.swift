@@ -59,11 +59,11 @@ enum ConnectionProblem: Equatable {
         case .noReply(usb: false): return "Your PC didn't answer"
         case .noReply(usb: true): return "Your PC didn't answer over the cable"
         case .noPicture: return "Your PC answered, but no picture arrived"
-        case .receiverNotReady: return "This iPad couldn't start the connection"
+        case .receiverNotReady: return "This \(DeviceNoun.current) couldn't start the connection"
         case .badAddress: return "That address doesn't look right"
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
-        case .noNetwork: return "This iPad isn't connected to a network"
+        case .noNetwork: return "This \(DeviceNoun.current) isn't connected to a network"
         case .localNetworkBlocked: return "EternalMonitor isn't allowed on your local network"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
@@ -89,14 +89,14 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again."
         case .noPicture:
             return "EternalMonitor on the PC couldn't send its screen. Look there for a message and follow it, click Restart, then try again. "
-                + "If it keeps happening, send us Settings, Diagnostics from this iPad and Performance, Copy logs from the PC."
+                + "If it keeps happening, send us Settings, Diagnostics from this \(DeviceNoun.current) and Performance, Copy logs from the PC."
         case .receiverNotReady:
-            return "Close EternalMonitor on this iPad and open it again."
+            return "Close EternalMonitor on this \(DeviceNoun.current) and open it again."
         case .badAddress(let host):
-            return "This iPad couldn't find \"\(host)\". Type the Address exactly as the PC window shows it, for example 192.168.1.20."
+            return "This \(DeviceNoun.current) couldn't find \"\(host)\". Type the Address exactly as the PC window shows it, for example 192.168.1.20."
         case .pairingCodeAsAddress:
             return "Type the Address shown in the EternalMonitor window on the PC, for example 192.168.1.20. "
-                + "This iPad asks for the pairing code after it connects."
+                + "This \(DeviceNoun.current) asks for the pairing code after it connects."
         case .routerAddress:
             return "Addresses ending in .1 usually belong to the Wi-Fi router. Type the Address shown in the "
                 + "EternalMonitor window on the PC, for example 192.168.1.20."
@@ -105,13 +105,13 @@ enum ConnectionProblem: Equatable {
         case .localNetworkBlocked:
             return "Open Settings and turn on Local Network for EternalMonitor, then try again."
         case .couldNotConnect:
-            return "Check that this iPad and your PC are on the same Wi-Fi and that EternalMonitor is open on the PC, then try again."
+            return "Check that this \(DeviceNoun.current) and your PC are on the same Wi-Fi and that EternalMonitor is open on the PC, then try again."
         case .usbFailed:
-            return "Keep EternalMonitor and Apple Devices open on the PC, unlock this iPad, then unplug the cable and plug it in again."
+            return "Keep EternalMonitor and Apple Devices open on the PC, unlock this \(DeviceNoun.current), then unplug the cable and plug it in again."
         case .lost(.pcStoppedResponding):
             return "The PC may have gone to sleep, closed EternalMonitor, or lost its network. Wake the PC, check EternalMonitor is open, then try again."
         case .lost(.cableUnplugged):
-            return "Plug the cable back in. This iPad reconnects by itself."
+            return "Plug the cable back in. This \(DeviceNoun.current) reconnects by itself."
         case .lost(.usbTurnedOff):
             return "Turn on Allow USB connections in Settings to use the cable again."
         case .reconnecting(let attempt, let total):
@@ -121,13 +121,15 @@ enum ConnectionProblem: Equatable {
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
         case .pcUpdating(.reconnecting):
-            return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
+            return "This \(DeviceNoun.current) reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcUpdating(.manual):
             return "Tap Try again once EternalMonitor has opened again on the PC."
         case .pcUpdating(.notBack):
             return "Check that EternalMonitor opened again on the PC, then try again. Windows may still be waiting for you to approve the update there."
         case .pcBusy:
-            return "Disconnect the other iPad first, then try again."
+            // The other device may be either kind.
+            return DeviceNoun.isPhone ? "Disconnect the other device first, then try again."
+                : "Disconnect the other iPad first, then try again."
         }
     }
 
@@ -251,7 +253,7 @@ enum USBStatusText {
     static func describe(_ status: String) -> String {
         switch status {
         case "USB: off": return "Off. Turn on to connect with a cable."
-        case "USB: waiting for a cable": return "Plug this iPad into your PC. Keep Apple Devices open on the PC."
+        case "USB: waiting for a cable": return "Plug this \(DeviceNoun.current) into your PC. Keep Apple Devices open on the PC."
         case "USB: disconnected": return "Paused. Tap Connect USB to use the cable again."
         case "USB: connecting": return "Connecting over the cable…"
         case "USB: unavailable": return "The cable can't be used right now. Wi-Fi still works."

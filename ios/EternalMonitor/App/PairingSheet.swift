@@ -88,7 +88,7 @@ struct PairingSheet: View {
                                 if model.submitting {
                                     ProgressView().tint(Theme.onAccent)
                                 }
-                                Text(remaining > 0 ? "Try again in \(remaining) s" : "Pair iPad")
+                                Text(remaining > 0 ? "Try again in \(remaining) s" : "Pair \(DeviceNoun.current)")
                             }
                         }
                         .buttonStyle(PrimaryButtonStyle())

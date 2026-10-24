@@ -241,7 +241,7 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertTrue(VersionMismatch.iPadOlder.opensTestFlight)
         XCTAssertFalse(VersionMismatch.pcOlder.opensTestFlight)
         XCTAssertFalse(VersionMismatch.pcLegacy.opensTestFlight)
-        XCTAssertTrue(VersionMismatch.iPadOlder.message.contains("Update the iPad app: open TestFlight"))
+        XCTAssertTrue(VersionMismatch.iPadOlder.message.contains("Update the \(DeviceNoun.current) app: open TestFlight"))
         XCTAssertTrue(VersionMismatch.pcOlder.message.contains("click Update now on the PC"))
         XCTAssertTrue(VersionMismatch.pcLegacy.message.contains("eternalmonitor.dev"))
     }

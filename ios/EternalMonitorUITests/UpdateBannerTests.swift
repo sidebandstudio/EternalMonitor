@@ -168,7 +168,7 @@ final class UpdateBannerTests: XCTestCase {
         app.launchEnvironment["EM_UI_PREVIEW"] = "mismatch"
         app.launch()
         XCTAssertTrue(app.buttons["mismatch.openTestFlight"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Update the iPad app: open TestFlight")).firstMatch.exists)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Update the \(UIDevice.current.userInterfaceIdiom == .phone ? "iPhone" : "iPad") app: open TestFlight")).firstMatch.exists)
         attach(app, "version-mismatch")
     }
 }

@@ -188,6 +188,12 @@ class LiteralFormsTest(unittest.TestCase):
         messages = swift('let s = "Found \\(n) PC\\(n == 1 ? "" : "s")"\nlet t = "Next"')
         self.assertEqual(messages, {"Found … PC…", "Next"})
 
+    def test_the_device_noun_reads_as_ipad(self):
+        # The guides quote what an iPad shows; an iPhone shows "iPhone" there.
+        messages = swift('let s = "This \\(DeviceNoun.current) app is older. Update the \\( DeviceNoun.current ) app."\n'
+                         'let t = "Pair \\(DeviceNoun.isPhone)"')
+        self.assertEqual(messages, {"This iPad app is older. Update the iPad app.", "Pair …"})
+
     def test_swift_comment_inside_an_interpolation(self):
         self.assertEqual(swift('let s = "Reaching \\(1 /* ( */)"'), {"Reaching …"})
 

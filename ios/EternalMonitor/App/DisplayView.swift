@@ -217,7 +217,7 @@ struct DisplayView: View {
                 Text("Connection quality")
                     .font(.app(17, .semibold, relativeTo: .headline))
                     .foregroundStyle(Theme.text)
-                Text("\(transportName) · measured on this iPad")
+                Text("\(transportName) · measured on this \(DeviceNoun.current)")
                     .font(.app(13, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
             }
