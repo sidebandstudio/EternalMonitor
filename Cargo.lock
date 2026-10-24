@@ -1172,6 +1172,7 @@ name = "eternal-host"
 version = "0.3.2"
 dependencies = [
  "cc",
+ "core-foundation 0.10.1",
  "eframe",
  "egui_kittest",
  "eternal-updater",

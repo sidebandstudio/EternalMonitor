@@ -1,5 +1,7 @@
 //! Accelerate's BGRA conversion on macOS. The Windows encoder path is unchanged.
 //! ABI declarations follow the macOS SDK's vImage_Types.h and Conversion.h.
+//! [`Converter`] feeds FFmpeg (BT.601 planar); [`Nv12Converter`] feeds the
+//! direct VideoToolbox encoder (BT.709 biplanar).
 use ffmpeg_next::{format::Pixel, frame::Video};
 use std::ffi::c_void;
 
@@ -28,6 +30,7 @@ struct PixelRange {
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
     static kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4: *const Matrix;
+    static kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2: *const Matrix;
     fn vImageConvert_ARGBToYpCbCr_GenerateConversion(
         matrix: *const Matrix,
         range: *const PixelRange,
@@ -45,19 +48,31 @@ extern "C" {
         permute: *const u8,
         flags: u32,
     ) -> isize;
+    fn vImageConvert_ARGB8888To420Yp8_CbCr8(
+        source: *const Buffer,
+        y: *const Buffer,
+        cbcr: *const Buffer,
+        info: *const Converter,
+        permute: *const u8,
+        flags: u32,
+    ) -> isize;
 }
+
+/// Video-range limits: Y 16..235, Cb/Cr 16..240 around 128.
+const VIDEO_RANGE: PixelRange = PixelRange {
+    values: [16, 128, 235, 240, 235, 16, 240, 16],
+};
+/// `kvImage420Yp8_CbCr8`: CoreVideo's `420v`/`420f`.
+const YPCBCR_420_BIPLANAR: u32 = 4;
 
 impl Converter {
     pub(super) fn new() -> Result<Self, String> {
         let mut info = Self { opaque: [0; 128] };
         // BT.601 limited range, matching swscale's existing BGRA -> YUV420P path.
-        let range = PixelRange {
-            values: [16, 128, 235, 240, 235, 16, 240, 16],
-        };
         let error = unsafe {
             vImageConvert_ARGBToYpCbCr_GenerateConversion(
                 kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4,
-                &range,
+                &VIDEO_RANGE,
                 &mut info,
                 0,
                 3,
@@ -127,6 +142,108 @@ impl Converter {
             Ok(())
         } else {
             Err(format!("vImage BGRA conversion failed: {error}"))
+        }
+    }
+}
+
+/// BGRA to BT.709 video-range NV12 (`420v`). The direct VideoToolbox encoder
+/// tags its stream BT.709, and the iPad decodes to video-range NV12 and
+/// defaults its shader to BT.709 (`MetalView.swift`).
+pub(super) struct Nv12Converter(Converter);
+
+/// One writable plane of a locked pixel buffer.
+pub(super) struct Plane {
+    pub data: *mut u8,
+    pub row_bytes: usize,
+    pub rows: usize,
+}
+
+impl Nv12Converter {
+    pub(super) fn new() -> Result<Self, String> {
+        let mut info = Converter { opaque: [0; 128] };
+        // SAFETY: the matrix is a static the framework exports; `info` is the
+        // 128-byte, 16-aligned vImage_ARGBToYpCbCr the call fills in.
+        let error = unsafe {
+            vImageConvert_ARGBToYpCbCr_GenerateConversion(
+                kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2,
+                &VIDEO_RANGE,
+                &mut info,
+                0,
+                YPCBCR_420_BIPLANAR,
+                0,
+            )
+        };
+        if error == 0 {
+            Ok(Self(info))
+        } else {
+            Err(format!("vImage NV12 conversion setup failed: {error}"))
+        }
+    }
+
+    /// Converts a packed BGRA image into an NV12 luma and CbCr plane pair.
+    ///
+    /// # Safety
+    /// Each plane's `data` must be writable for `rows * row_bytes` bytes for
+    /// the duration of the call (a locked CVPixelBuffer plane), and neither
+    /// may overlap `source`.
+    pub(super) unsafe fn convert(
+        &self,
+        source: &[u8],
+        width: usize,
+        height: usize,
+        row_bytes: usize,
+        luma: &Plane,
+        chroma: &Plane,
+    ) -> Result<(), String> {
+        if width < 2
+            || height < 2
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
+            || row_bytes < width * 4
+            || row_bytes
+                .checked_mul(height)
+                .is_none_or(|size| source.len() < size)
+            || luma.rows < height
+            || luma.row_bytes < width
+            || chroma.rows < height / 2
+            || chroma.row_bytes < width
+        {
+            return Err(format!(
+                "vImage NV12 conversion needs even dimensions and planes that fit {width}x{height}"
+            ));
+        }
+        let src = Buffer {
+            data: source.as_ptr() as *mut c_void,
+            width,
+            height,
+            row_bytes,
+        };
+        let y = Buffer {
+            data: luma.data.cast(),
+            width,
+            height,
+            row_bytes: luma.row_bytes,
+        };
+        let cbcr = Buffer {
+            data: chroma.data.cast(),
+            width: width / 2,
+            height: height / 2,
+            row_bytes: chroma.row_bytes,
+        };
+        // Flags 0 lets vImage split the frame across cores: at 2670x1878 a
+        // single core costs several milliseconds a frame.
+        let error = vImageConvert_ARGB8888To420Yp8_CbCr8(
+            &src,
+            &y,
+            &cbcr,
+            &self.0,
+            [3, 2, 1, 0].as_ptr(),
+            0,
+        );
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(format!("vImage NV12 conversion failed: {error}"))
         }
     }
 }

@@ -22,6 +22,8 @@ use crate::stats::PIPELINE_STATS;
 pub mod input;
 use input::{select_input, EncoderInput};
 #[cfg(target_os = "macos")]
+pub mod videotoolbox;
+#[cfg(target_os = "macos")]
 mod vimage;
 
 const CHANNEL_CAPACITY: usize = 4;
@@ -68,6 +70,13 @@ fn run_encode_loop(
     gpu: GpuInfo,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    if videotoolbox::is_selected(
+        shared.encoder_override.lock().clone().as_deref(),
+        &gpu.encoder_name,
+    ) {
+        return videotoolbox::run_encode_loop(frames, tx, shared, generation);
+    }
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
     let (mut encoder_name, codec_display_name) = {
@@ -800,6 +809,14 @@ fn open_remaining_encoders<T>(
     failed: &str,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
+    // The Mac build links an LGPL FFmpeg without libx264, and a silent
+    // software encode at Duo size would be unusable anyway.
+    if cfg!(target_os = "macos") && failed.ends_with("_videotoolbox") {
+        return Err(format!(
+            "{failed} failed to open and the macOS host has no software encoder fallback"
+        )
+        .into());
+    }
     let hardware: &[&str] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
         &["h264_nvenc", "h264_amf", "h264_qsv"]
     } else {
@@ -1547,15 +1564,20 @@ mod tests {
     }
 
     #[test]
-    fn non_windows_backends_keep_their_software_fallback() {
+    fn videotoolbox_falls_back_to_software_only_off_macos() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", |name| {
+        let result = open_remaining_encoders("h264_videotoolbox", |name| {
             attempts.push(name.to_string());
             Ok(())
-        })
-        .unwrap();
-        assert_eq!(selected, "libx264");
-        assert_eq!(attempts, ["libx264"]);
+        });
+        if cfg!(target_os = "macos") {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("no software encoder fallback"), "{error}");
+            assert!(attempts.is_empty());
+        } else {
+            assert_eq!(result.unwrap().0, "libx264");
+            assert_eq!(attempts, ["libx264"]);
+        }
     }
 
     #[test]

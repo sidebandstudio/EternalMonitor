@@ -1,8 +1,8 @@
 //! Non-Windows GPU/encoder selection. There is no DXGI here; the "adapter" is
-//! whatever the OS gives us, and the encoder chain prefers the platform's
-//! hardware encoder (VideoToolbox on macOS) before falling back to libx264.
-//! This exists so the whole host pipeline builds and runs on a development
-//! Mac and in CI — production remains the Windows build.
+//! whatever the OS gives us. macOS always encodes with VideoToolbox, directly
+//! (`encoder::videotoolbox`) unless FFmpeg's wrapper is asked for, and never
+//! falls back to libx264: the Mac build links an LGPL FFmpeg. Other systems
+//! (CI) try FFmpeg's VideoToolbox name, then libx264.
 
 use tracing::{info, warn};
 
@@ -38,6 +38,18 @@ pub struct GpuInfo {
 impl GpuInfo {
     /// Probe the platform encoder chain and describe the result.
     pub fn detect() -> Self {
+        if cfg!(target_os = "macos") {
+            info!("Selected the VideoToolbox encoder");
+            return Self {
+                vendor: GpuVendor::Unknown,
+                name: std::env::consts::OS.to_string(),
+                adapter_index: 0,
+                dedicated_vram_mb: 0,
+                // The FFmpeg loop's name, used with ETERNAL_MAC_ENCODER=ffmpeg.
+                encoder_name: "h264_videotoolbox".to_string(),
+                codec_display_name: "VideoToolbox".to_string(),
+            };
+        }
         let chain: &[(&str, &str)] = &[
             ("h264_videotoolbox", "H.264 (VideoToolbox)"),
             ("libx264", "H.264 (x264)"),
