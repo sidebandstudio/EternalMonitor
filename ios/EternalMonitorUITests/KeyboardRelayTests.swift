@@ -30,7 +30,12 @@ final class KeyboardRelayTests: XCTestCase {
         XCTAssertEqual(control.value as? String, "On")
         app.buttons["keyboard.key.80"].tap()
         XCTAssertEqual(control.value as? String, "Off")
-        app.keyboards.buttons["Hide keyboard"].tap()
+        // An iPhone keyboard has no hide key; there the bar's Done hides it.
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            app.keyboards.buttons["Hide keyboard"].tap()
+        } else {
+            app.buttons["keyboard.done"].tap()
+        }
         verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         capture("keyboard-dismissed", app: app)
         // A slow screenshot can use up the HUD's 5 s timer (CI took 2.3 s

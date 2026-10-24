@@ -29,7 +29,7 @@ targets:
       base:
         INFOPLIST_FILE: EternalMonitor/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: com.eternal.monitor
-        TARGETED_DEVICE_FAMILY: "2"
+        TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_XR: "NO"
         MARKETING_VERSION: "0.3.2"
         CURRENT_PROJECT_VERSION: "7"
