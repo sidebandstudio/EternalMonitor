@@ -15,12 +15,17 @@ struct PencilReading {
     /// The sample as the tip lifts. Every Pencil's force falls there, so it
     /// says nothing about the sensor either.
     var atLift: Bool
+    /// What UIKit reported, for the Pencil diagnostics line.
+    var force: CGFloat
+    var maximumForce: CGFloat
 
     init(point: TouchRelayMachine.Point, force: CGFloat, maximumForce: CGFloat,
          altitude: CGFloat, azimuth: CGFloat, timeUs: UInt64, forceIsFinal: Bool = true, atLift: Bool = false) {
         self.point = point
         self.forceIsFinal = forceIsFinal
         self.atLift = atLift
+        self.force = force
+        self.maximumForce = maximumForce
         // A device without a pressure sensor still draws at a fixed pressure.
         let normalized = maximumForce.isFinite && maximumForce > 0 && force.isFinite
             ? min(1, max(0, force / maximumForce)) : 0.5
@@ -69,9 +74,12 @@ struct PencilPressure: Equatable {
 
     /// What one stroke reported.
     struct Stroke: Equatable {
+        var maximumForce: CGFloat = 0
         var finalReadings = 0
+        var forces = Set<CGFloat>()
         var lowest: UInt16 = .max
         var highest: UInt16 = 0
+        var estimated = false
         var estimatedForce = false
     }
 
@@ -103,12 +111,15 @@ struct PencilPressure: Equatable {
     }
 
     mutating func observe(_ reading: PencilReading) {
+        stroke.maximumForce = reading.maximumForce
         guard !reading.atLift else { return }
         guard reading.forceIsFinal else {
+            stroke.estimated = true
             if reading.pressure > 0 { stroke.estimatedForce = true }
             return
         }
         stroke.finalReadings += 1
+        if reading.force.isFinite { stroke.forces.insert(reading.force) }
         stroke.lowest = min(stroke.lowest, reading.pressure)
         stroke.highest = max(stroke.highest, reading.pressure)
         if !needsVariation && reading.pressure > 0 { sensor = .pressure }
@@ -123,6 +134,27 @@ struct PencilPressure: Equatable {
             && stroke.highest == 0 && !stroke.estimatedForce {
             sensor = .none
         }
+    }
+
+    /// The diagnostics line for the stroke that just ended: forces and counts
+    /// only, never where the Pencil was.
+    var strokeSummary: String {
+        let forces = stroke.forces
+        func value(_ force: CGFloat?) -> String { force.map { String(format: "%.4f", $0) } ?? "none" }
+        return "max_force=\(value(stroke.maximumForce)) final=\(stroke.finalReadings) "
+            + "min=\(value(forces.min())) max=\(value(forces.max())) distinct=\(forces.count) "
+            + "estimated=\(stroke.estimated) estimated_force=\(stroke.estimatedForce) learned=\(sensor)"
+    }
+
+    /// Strokes logged this session. The first few show what the hardware
+    /// reports; after that the lines would only repeat.
+    @MainActor static var strokesLogged = 0
+    static let strokesToLog = 8
+
+    @MainActor static func logStroke(_ pressure: PencilPressure, to diagnostics: SupportDiagnostics = .shared) {
+        guard strokesLogged < strokesToLog else { return }
+        strokesLogged += 1
+        diagnostics.record("info", "pencil", "stroke=\(strokesLogged) \(pressure.strokeSummary)")
     }
 
     func pressure(for reading: PencilReading) -> UInt16 {

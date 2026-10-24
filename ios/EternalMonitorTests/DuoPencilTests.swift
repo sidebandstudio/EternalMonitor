@@ -218,6 +218,41 @@ final class DuoPencilTests: XCTestCase {
         XCTAssertEqual(PencilPressure.session.sensor, .pressure)
     }
 
+    /// One line per stroke for the device test: forces and counts, no place.
+    func testTheStrokeSummaryReportsWhatTheHardwareSent() {
+        var pen = PencilRelayMachine()
+        _ = pen.began(reading(force: 0.5, maximumForce: 4.17, time: 1, final: false))
+        for (time, force) in [(2, 0.5), (3, 1.25), (4, 1.25)] as [(UInt64, CGFloat)] {
+            _ = pen.moved(reading(force: force, maximumForce: 4.17, time: time))
+        }
+        _ = pen.moved(reading(force: 0, maximumForce: 4.17, time: 5, lift: true))
+        _ = pen.ended(nil, cancelled: false)
+        XCTAssertEqual(pen.pressure.strokeSummary,
+                       "max_force=4.1700 final=3 min=0.5000 max=1.2500 distinct=2 "
+                       + "estimated=true estimated_force=true learned=pressure")
+        XCTAssertEqual(SupportDiagnostics.redact(pen.pressure.strokeSummary), pen.pressure.strokeSummary)
+    }
+
+    /// The first strokes of a session reach Diagnostics; later ones would repeat.
+    func testOnlyTheFirstStrokesOfASessionAreLogged() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SupportDiagnostics(directory: directory)
+        let saved = PencilPressure.strokesLogged
+        defer { PencilPressure.strokesLogged = saved }
+        PencilPressure.strokesLogged = 0
+        var pen = PencilRelayMachine(pressure: phone)
+        for stroke in 0..<(PencilPressure.strokesToLog + 2) {
+            _ = self.stroke(&pen, [0, 0, 0], from: UInt64(stroke * 10 + 1), maximumForce: 4.17)
+            PencilPressure.logStroke(pen.pressure, to: diagnostics)
+        }
+        let report = await diagnostics.report()
+        XCTAssertTrue(report.contains("[pencil] stroke=1 max_force=4.1700 final=3 min=0.0000 max=0.0000 distinct=1 "
+                                      + "estimated=false estimated_force=false learned=none"), report)
+        XCTAssertTrue(report.contains("[pencil] stroke=\(PencilPressure.strokesToLog) "))
+        XCTAssertFalse(report.contains("[pencil] stroke=\(PencilPressure.strokesToLog + 1) "))
+    }
+
     func testHoverSendsNoPressure() {
         for sensor in [PencilPressure.Sensor.unknown, .pressure, .none] {
             var pen = PencilRelayMachine(pressure: PencilPressure(sensor: sensor))

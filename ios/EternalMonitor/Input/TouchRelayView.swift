@@ -441,6 +441,7 @@ final class RelayTouchUIView: UIView {
 
     private func savePencilLesson() {
         PencilPressure.session = pencil.pressure
+        PencilPressure.logStroke(pencil.pressure)
     }
 
     private func pencilReading(_ touch: UITouch, clamp: Bool = false, atLift: Bool = false) -> PencilReading? {
