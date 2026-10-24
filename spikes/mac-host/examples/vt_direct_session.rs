@@ -389,15 +389,19 @@ mod imp {
             bitstream::h264_min_level(width, height, fps)
         };
         println!("bitstream required_level={name} required_idc={idc}");
+        // One guard for both counts: a second lock inside the same
+        // statement would deadlock on the first's temporary.
+        let dropped = shared.dropped.lock().unwrap().clone();
+        let dropped_key_requests = requested_keys
+            .iter()
+            .filter(|i| dropped.contains(i))
+            .count();
         println!(
             "RESULT label={label} status=ok frames={total} packets={} errors={:?} dropped={} dropped_key_requests={} wall_s={wall:.2} submit_s={:.2} out_fps={:.1} latency[{}] encode_call[{}] keyframe_req[{}] unexpected_keys={:?} mbps_per_s=[{}]",
             outputs.len(),
             shared.errors.lock().unwrap(),
-            shared.dropped.lock().unwrap().len(),
-            requested_keys
-                .iter()
-                .filter(|i| shared.dropped.lock().unwrap().contains(i))
-                .count(),
+            dropped.len(),
+            dropped_key_requests,
             submitted_all.as_secs_f64(),
             outputs.len() as f64 / wall,
             common::summarize(latencies),

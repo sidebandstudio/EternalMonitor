@@ -55,6 +55,29 @@ soak60)
 soak120)
   run "soak-hevc-inner-120-rt0-speed" --codec hevc --size inner --fps 120 --seconds 630 --realtime 0 --prio_speed 1 --keyframe_every 5 --window 30
   ;;
+gop)
+  K="--keyframe_every 2 --window 10 --seconds 20"
+  run "gop-ff-hevc-inner-60-gop30" --codec hevc --size inner --fps 60 --gop 30 $K
+  run "gop-ff-hevc-inner-60-gop600" --codec hevc --size inner --fps 60 --gop 600 $K
+  run "gop-ff-hevc-inner-60-gop100k" --codec hevc --size inner --fps 60 --gop 100000 $K
+  run "gop-ff-hevc-inner-120-gop100k" --codec hevc --size inner --fps 120 --gop 100000 $K
+  run "gop-ff-h264-inner-60-l52-gop100k" --codec h264 --size inner --fps 60 --level 5.2 --gop 100000 $K
+  ;;
+bgra)
+  K="--keyframe_every 2 --window 10 --seconds 20"
+  run "bgra-hevc-inner-60-jpeg" --codec hevc --size inner --fps 60 --pix bgra --range jpeg $K
+  run "bgra-hevc-inner-120-jpeg" --codec hevc --size inner --fps 120 --pix bgra --range jpeg $K
+  run "bgra-h264-inner-60-jpeg" --codec h264 --size inner --fps 60 --pix bgra --range jpeg $K
+  ;;
+gopvt)
+  B=${D:-target/release/examples/vt_direct_session}
+  run "gop-vt-hevc-inner-60-gop30" --codec hevc --size inner --fps 60 --gop 30 --seconds 20 --keyframe_every 2
+  run "gop-vt-hevc-inner-60-gop100k" --codec hevc --size inner --fps 60 --seconds 20 --keyframe_every 2
+  run "gop-vt-hevc-inner-120-gop100k" --codec hevc --size inner --fps 120 --seconds 20 --keyframe_every 2
+  run "re-vt-h264-inner-60-speed" --codec h264 --size inner --fps 60 --seconds 10 --prio_speed 1 --keyframe_every 1
+  run "re-vt-h264-inner-60-bgra" --codec h264 --size inner --fps 60 --seconds 10 --pix bgra --keyframe_every 1
+  run "re-vt-h264-outer-120-llrc0" --codec h264 --size outer --fps 120 --seconds 10 --keyframe_every 1
+  ;;
 direct)
   B=${D:-target/release/examples/vt_direct_session}
   for codec in hevc h264; do
