@@ -51,6 +51,14 @@ struct ConnectView: View {
             && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected)
     }
 
+    private var showsErrorCard: Bool {
+        connectionManager.problem != nil || connectionManager.connectionError != nil
+    }
+
+    private var isPhone: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+    }
+
     private var canConnect: Bool {
         !normalizedHostIP.isEmpty && parsedPort != nil
     }
@@ -63,14 +71,17 @@ struct ConnectView: View {
                 GeometryReader { geometry in
                     ScrollView {
                         VStack(spacing: 20) {
-                            header
-                                .padding(.top, 24)
-                                .padding(.bottom, 8)
-                                .entrance(appeared)
+                            // On a phone, an error card and Connect need the room.
+                            if !(isPhone && showsErrorCard) {
+                                header
+                                    .padding(.top, 24)
+                                    .padding(.bottom, 8)
+                                    .entrance(appeared)
+                            }
 
                             UpdateBanner()
 
-                            if !didSeeOnboarding {
+                            if !didSeeOnboarding && !isPhone {
                                 onboardingCard
                                     .entrance(appeared, delay: 0.08)
                             }
@@ -97,6 +108,13 @@ struct ConnectView: View {
                                 connectCard
                                     .entrance(appeared, delay: 0.14)
                                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                            }
+
+                            // A phone screen is short: above, the tips would push
+                            // Connect and any error below the fold.
+                            if !didSeeOnboarding && isPhone {
+                                onboardingCard
+                                    .entrance(appeared, delay: 0.17)
                             }
 
                             if !scanner.hosts.isEmpty {
