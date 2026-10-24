@@ -414,16 +414,21 @@ final class CaptureRun: NSObject, SCStreamOutput, SCStreamDelegate {
                 let check: (Bool, String) -> Void = plan.high_tier ? Log.info : Log.check
                 let encodeTimes = encodedSubmitTimes.map { machToMs($0) / 1000 }
                 let encodeFps = FrameRate.inWindow(encodeTimes, start: window.start, length: window.length)
-                // One loss budget for submit -> encode -> decode (PipelineLoss).
+                // One loss budget for submit -> encode -> decode (PipelineLoss);
+                // errors (a refused submit, a failed output callback, a
+                // decoder failure) fail on their own.
+                let callbackErrors = Int(em_encoder_callback_errors(encoder!))
                 let pipeline = PipelineLoss(submitted: submitted, encoded: encodedFrames, decoded: decoder?.decoded ?? 0,
                                             match: markerCentres.map { _ in
                                                 DecodedMatch(submitted: submittedMarkers, decoded: decoder?.markers ?? [], display: display)
-                                            })
+                                            },
+                                            encodeErrors: encodeErrors + callbackErrors, decodeFailures: decoder?.failed ?? 0)
                 Log.result("\(label)_encode_window", [("encode_fps", String(format: "%.1f", encodeFps)), ("planned", plan.encode_fps),
-                                                      ("encode_errors", encodeErrors), ("decode_failed", decoder?.failed ?? 0),
+                                                      ("submit_errors", encodeErrors), ("callback_errors", callbackErrors),
+                                                      ("vt_dropped", em_encoder_dropped(encoder!)), ("decode_failed", decoder?.failed ?? 0),
                                                       ("pipeline", "\"\(pipeline.summary)\"")])
                 check(pipeline.passes,
-                      "\(label): submit -> encode -> decode lost \(pipeline.lost) of \(submitted) frames (allowed \(pipeline.allowed)), "
+                      "\(label): no encoder or decoder errors, submit -> encode -> decode lost \(pipeline.lost) of \(submitted) frames (allowed \(pipeline.allowed)), "
                       + "and every decoded frame is a submitted frame of display \(display), in order, none repeated (\(pipeline.summary))")
                 check(emitted.valid && !(emitted.high_tier && !plan.high_tier), "\(label): emitted tier matches the plan")
                 if let target {

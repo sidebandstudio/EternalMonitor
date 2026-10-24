@@ -171,6 +171,19 @@ pub unsafe extern "C" fn em_encoder_next(encoder: *mut ProbeEncoder, frame: *mut
     true
 }
 
+/// Frames VideoToolbox's output callback reported as failed (a non-zero
+/// status, or output the session could not use).
+#[no_mangle]
+pub unsafe extern "C" fn em_encoder_callback_errors(encoder: *const ProbeEncoder) -> u64 {
+    (*encoder).session.counters().failed
+}
+
+/// Frames VideoToolbox dropped without an error (`FrameDropped`).
+#[no_mangle]
+pub unsafe extern "C" fn em_encoder_dropped(encoder: *const ProbeEncoder) -> u64 {
+    (*encoder).session.counters().dropped
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn em_encoder_in_flight(encoder: *const ProbeEncoder) -> u32 {
     (*encoder).session.in_flight() as u32

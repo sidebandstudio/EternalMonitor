@@ -58,6 +58,8 @@ int32_t em_encoder_encode(ProbeEncoder *_Nonnull encoder, void *_Nonnull pixel_b
 const char *_Nonnull em_encoder_error(const ProbeEncoder *_Nonnull encoder);
 bool em_encoder_next(ProbeEncoder *_Nonnull encoder, EmFrame *_Nonnull frame);
 uint32_t em_encoder_in_flight(const ProbeEncoder *_Nonnull encoder);
+uint64_t em_encoder_callback_errors(const ProbeEncoder *_Nonnull encoder);
+uint64_t em_encoder_dropped(const ProbeEncoder *_Nonnull encoder);
 EmLevel em_encoder_emitted(const ProbeEncoder *_Nonnull encoder);
 int32_t em_encoder_flush(ProbeEncoder *_Nonnull encoder);
 void em_encoder_destroy(ProbeEncoder *_Nullable encoder);

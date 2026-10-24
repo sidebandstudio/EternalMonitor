@@ -334,6 +334,19 @@ expect(!PipelineLoss(submitted: 600, encoded: 600, decoded: 601, match: nil).pas
 expect(!PipelineLoss(submitted: 600, encoded: 601, decoded: 600, match: nil).passes, "more encoded than submitted fails")
 expect(PipelineLoss(submitted: 600, encoded: 599, decoded: 598, match: nil).passes, "without markers the same budget applies to the counts")
 expect(!PipelineLoss(submitted: 0, encoded: 0, decoded: 0, match: nil).passes, "nothing submitted fails")
+// Errors are never budgeted loss: a rejected access unit leaves no marker.
+let decoded599 = (0..<600).filter { $0 != 300 }
+let quietLoss = PipelineLoss(submitted: 600, encoded: 600, decoded: 599,
+                             match: DecodedMatch(submitted: sent, decoded: markers(decoded599), display: id))
+expect(quietLoss.passes, "600/600/599 with no error passes (one frame lost within the budget)")
+let decodeError = PipelineLoss(submitted: 600, encoded: 600, decoded: 599,
+                               match: DecodedMatch(submitted: sent, decoded: markers(decoded599), display: id), decodeFailures: 1)
+expect(!decodeError.passes, "600/600/599 with one decode failure fails: \(decodeError.summary)")
+let encodeError = PipelineLoss(submitted: 600, encoded: 599, decoded: 599,
+                               match: DecodedMatch(submitted: sent, decoded: markers(decoded599), display: id), encodeErrors: 1)
+expect(!encodeError.passes, "one encoder error fails, though the loss is within the budget")
+expect(!PipelineLoss(submitted: 600, encoded: 600, decoded: 600, match: nil, decodeFailures: 1).passes,
+       "a decode failure fails without markers too")
 
 print("\(checks - failures)/\(checks) passed, failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

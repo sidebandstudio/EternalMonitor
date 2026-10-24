@@ -51,7 +51,7 @@ Second screen comes first; mirror is the fallback (Ali, 2026-10-24). **Spike c i
    - over a fixed 5 s window (from 1 s in), capture delivered at least 0.9× the rate (108 fps at 120) and the content changed every frame;
    - a marker the probe draws (a sync pattern, the low 16 bits of its display's ID, and a frame counter) reads back from every captured frame with the captured display's ID, so the frames are the virtual display's;
    - every decoded frame's marker is that of a submitted frame, in submission order and never repeated, so a frozen or reordering decoder fails;
-   - one loss budget covers submit → encode → decode together: at most 1% of submitted frames (and at least 2) may be lost across all three stages, and no stage may put out more frames than it took in; each stage's count is logged;
+   - one loss budget covers submit → encode → decode together: at most 1% of submitted frames (and at least 2) may be lost across all three stages, and no stage may put out more frames than it took in; any encoder error or decoder failure fails the run on its own, whatever the budget; each stage's count is logged;
    - the encoder kept up with at least 0.9× its planned rate, capped at the input rate (a 60 Hz baseline display is held to 60). Frames are thinned to the planned rate by their presentation timestamps, so callback jitter can't drop frames;
    - the probe's tone was captured (missing audio fails).
 

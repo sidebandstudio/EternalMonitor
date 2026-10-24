@@ -160,7 +160,9 @@ struct DecodedMatch {
 /// be lost, wherever they were lost. A frame counts as delivered only if its
 /// decoded marker matches a submitted frame (`match`), or, without markers,
 /// if it decoded. Corruption, repetition and reordering always fail, and no
-/// stage may put out more frames than it took in.
+/// stage may put out more frames than it took in. Errors are not losses: any
+/// encoder error or decoder failure fails the run, whatever the budget,
+/// since a rejected access unit leaves no image or marker to catch.
 struct PipelineLoss {
     static func budget(_ submitted: Int) -> Int { max(2, submitted / 100) }
 
@@ -168,16 +170,18 @@ struct PipelineLoss {
     let encoded: Int
     let decoded: Int
     let match: DecodedMatch?
+    var encodeErrors = 0
+    var decodeFailures = 0
 
     var delivered: Int { match?.matched ?? decoded }
     var lost: Int { submitted - delivered }
     var allowed: Int { Self.budget(submitted) }
     var passes: Bool {
         submitted > 0 && delivered > 0 && encoded <= submitted && decoded <= encoded
-            && lost <= allowed && (match?.intact ?? true)
+            && encodeErrors == 0 && decodeFailures == 0 && lost <= allowed && (match?.intact ?? true)
     }
     var summary: String {
         "submitted=\(submitted) encoded=\(encoded) (lost \(submitted - encoded)) decoded=\(decoded) (lost \(encoded - decoded)) "
-            + "delivered=\(delivered) lost=\(lost) (allowed \(allowed))" + (match.map { "; decoded markers: \($0.summary)" } ?? "; no markers")
+            + "encode_errors=\(encodeErrors) decode_failures=\(decodeFailures) delivered=\(delivered) lost=\(lost) (allowed \(allowed))" + (match.map { "; decoded markers: \($0.summary)" } ?? "; no markers")
     }
 }
