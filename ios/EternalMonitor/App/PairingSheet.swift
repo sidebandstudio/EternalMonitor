@@ -6,6 +6,7 @@ struct PairingSheet: View {
     let cancel: () -> Void
     @FocusState private var focused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var appeared = false
     // Counts wrong codes; each one shakes the field once.
     @State private var shakes: CGFloat = 0
@@ -122,6 +123,16 @@ struct PairingSheet: View {
                     Button("Cancel", action: cancel)
                         .foregroundStyle(Theme.text)
                         .accessibilityIdentifier("pairing.cancel")
+                }
+                // A phone in landscape: the number pad covers the Pair button.
+                if verticalSizeClass == .compact {
+                    ToolbarItem(placement: .confirmationAction) {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            Button("Pair", action: submit)
+                                .disabled(model.submitting || model.remaining(at: context.date) > 0)
+                                .accessibilityIdentifier("pairing.submitBar")
+                        }
+                    }
                 }
             }
             .tint(Theme.accent)
