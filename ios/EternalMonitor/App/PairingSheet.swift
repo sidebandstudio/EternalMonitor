@@ -32,11 +32,17 @@ struct PairingSheet: View {
                         Text("Pair with your PC")
                             .font(.app(24, .semibold, relativeTo: .title2))
                             .foregroundStyle(Theme.text)
-                        Text("Enter the 6-digit code shown in EternalMonitor on your PC. You only need to do this once.")
-                            .font(.app(15, relativeTo: .body))
-                            .foregroundStyle(Theme.textMuted)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
+                        // A phone in landscape: below the field is under the
+                        // number pad, so an error takes the instructions' place.
+                        if compact, let error = model.error {
+                            errorRow(error)
+                        } else {
+                            Text("Enter the 6-digit code shown in EternalMonitor on your PC. You only need to do this once.")
+                                .font(.app(15, relativeTo: .body))
+                                .foregroundStyle(Theme.textMuted)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
 
                     TextField("000000", text: $model.code, prompt: Text("000000").foregroundStyle(Theme.textFaint.opacity(0.6)))
@@ -68,18 +74,8 @@ struct PairingSheet: View {
                         .accessibilityLabel("Pairing code")
                         .accessibilityIdentifier("pairing.code")
 
-                    if let error = model.error {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .accessibilityHidden(true)
-                            Text(error)
-                                .multilineTextAlignment(.leading)
-                                .accessibilityIdentifier("pairing.error")
-                        }
-                        .font(.app(14, relativeTo: .callout))
-                        .foregroundStyle(Theme.danger)
-                        .frame(maxWidth: 360)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    if !compact, let error = model.error {
+                        errorRow(error)
                     }
 
                     TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -125,12 +121,19 @@ struct PairingSheet: View {
                         .accessibilityIdentifier("pairing.cancel")
                 }
                 // A phone in landscape: the number pad covers the Pair button.
-                if verticalSizeClass == .compact {
+                if compact {
                     ToolbarItem(placement: .confirmationAction) {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
-                            Button("Pair", action: submit)
-                                .disabled(model.submitting || model.remaining(at: context.date) > 0)
-                                .accessibilityIdentifier("pairing.submitBar")
+                            let remaining = model.remaining(at: context.date)
+                            if model.submitting {
+                                ProgressView()
+                                    .accessibilityLabel("Pairing")
+                                    .accessibilityIdentifier("pairing.submitBar.progress")
+                            } else {
+                                Button(remaining > 0 ? "Try again in \(remaining) s" : "Pair", action: submit)
+                                    .disabled(remaining > 0)
+                                    .accessibilityIdentifier("pairing.submitBar")
+                            }
                         }
                     }
                 }
@@ -143,5 +146,22 @@ struct PairingSheet: View {
             }
         }
         .presentationBackground(Theme.canvas)
+    }
+
+    /// A phone in landscape.
+    private var compact: Bool { verticalSizeClass == .compact }
+
+    private func errorRow(_ error: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .accessibilityHidden(true)
+            Text(error)
+                .multilineTextAlignment(.leading)
+                .accessibilityIdentifier("pairing.error")
+        }
+        .font(.app(14, relativeTo: .callout))
+        .foregroundStyle(Theme.danger)
+        .frame(maxWidth: 360)
+        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 }

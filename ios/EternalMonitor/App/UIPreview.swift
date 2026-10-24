@@ -4,7 +4,7 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
+/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|pairing-wrong-code|pairing-rate-limited|pairing-submitting|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
 /// Launch with `-feedbackLongSessions 3` to show the one-time feedback card.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
@@ -55,6 +55,13 @@ enum UIPreview {
             manager.connectionError = VersionMismatch.iPadOlder.message
         case "pairing":
             manager.pairingPrompt = PairingSheetModel()
+        case "pairing-wrong-code", "pairing-rate-limited", "pairing-submitting":
+            let model = PairingSheetModel()
+            model.code = "123456"
+            _ = model.submit()
+            if mode == "pairing-wrong-code" { model.reject(.unauthorized) }
+            if mode == "pairing-rate-limited" { model.reject(.rateLimited) }
+            manager.pairingPrompt = model
         case "recent":
             RecentConnectionStore.shared.add(host: "192.168.1.20", port: 9876, isUSB: false)
             RecentConnectionStore.shared.add(host: "Studio PC", port: 9877, isUSB: true)
