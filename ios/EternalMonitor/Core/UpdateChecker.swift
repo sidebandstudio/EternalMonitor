@@ -84,20 +84,31 @@ struct AppVersion: Comparable {
 }
 
 struct InstalledApp: Equatable {
+    /// The public app: the manifest and its TestFlight invite describe only it.
+    static let publicBundleID = "com.eternal.monitor"
+
     let version: String
     let build: Int
+    /// Any other ID is a separate test app, such as an iPhone Duo test build.
+    var bundleID = InstalledApp.publicBundleID
 
     static var current: InstalledApp {
         let info = Bundle.main.infoDictionary
         return InstalledApp(
             version: info?["CFBundleShortVersionString"] as? String ?? "0.0.0",
-            build: Int(info?["CFBundleVersion"] as? String ?? "") ?? 0
+            build: Int(info?["CFBundleVersion"] as? String ?? "") ?? 0,
+            bundleID: Bundle.main.bundleIdentifier ?? ""
         )
     }
 
-    /// True when TestFlight has a newer build than this one.
+    /// A test app is never pointed at the public app's TestFlight page.
+    var receivesPublicUpdates: Bool { bundleID == Self.publicBundleID }
+
+    /// True when TestFlight has a newer build than this one. Never for a test
+    /// app, so it shows no update banner, popup or Settings row.
     func isOlder(than available: UpdateManifest.IPad) -> Bool {
-        guard let newest = AppVersion(available.version), let mine = AppVersion(version) else { return false }
+        guard receivesPublicUpdates,
+              let newest = AppVersion(available.version), let mine = AppVersion(version) else { return false }
         if newest != mine { return mine < newest }
         return build < available.build
     }

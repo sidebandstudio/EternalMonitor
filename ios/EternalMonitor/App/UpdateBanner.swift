@@ -177,12 +177,13 @@ struct UpdateSettingsSection: View {
     }
 }
 
-/// The button under a version-mismatch error, on the side that can act.
+/// The button under a version-mismatch error, on the side that can act. A
+/// test app has no button: the link opens the public app.
 struct VersionMismatchAction: View {
     let mismatch: VersionMismatch?
 
     var body: some View {
-        if mismatch?.opensTestFlight == true {
+        if mismatch?.opensTestFlight == true && InstalledApp.current.receivesPublicUpdates {
             Button("Open TestFlight") { TestFlightLink.open() }
                 .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                 .accessibilityIdentifier("mismatch.openTestFlight")
