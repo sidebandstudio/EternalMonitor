@@ -283,6 +283,46 @@ final class DuoPencilTests: XCTestCase {
         XCTAssertFalse(report.contains("[pencil] stroke=\(PencilPressure.strokesToLog + 1) "))
     }
 
+    /// Each stroke is logged once, however it ends: a picture change before
+    /// the tip lifts, or a second touch-down before it lifts at all.
+    func testTheViewLogsEachStrokeOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let saved = PencilPressure.strokesLogged
+        defer { PencilPressure.strokesLogged = saved }
+        PencilPressure.strokesLogged = 0
+        PencilPressure.session = PencilPressure()
+        let view = relay()
+        view.diagnostics = SupportDiagnostics(directory: directory)
+        view.onEvents = { _ in }
+        // 1: the picture changes, then the tip lifts.
+        let first = Tip(force: 2)
+        view.touchesBegan([first], with: nil)
+        view.pictureFit = .fill
+        first.sampleTime = 2
+        view.touchesEnded([first], with: nil)
+        // 2: ended by 3's touch-down; 3 lifts.
+        let second = Tip(force: 1)
+        second.sampleTime = 3
+        view.touchesBegan([second], with: nil)
+        let third = Tip(force: 0.5)
+        third.sampleTime = 4
+        view.touchesBegan([third], with: nil)
+        third.sampleTime = 5
+        view.touchesEnded([third], with: nil)
+
+        let report = await view.diagnostics.report()
+        let recent = report.components(separatedBy: "--- Recent memory log ---").last ?? ""
+        let lines = recent.components(separatedBy: "\n").compactMap { line in
+            line.range(of: "[pencil] ").map { String(line[$0.upperBound...]) }
+        }
+        XCTAssertEqual(lines, [1, 2, 3].map { id in
+            let force = ["2.0000", "1.0000", "0.5000"][id - 1]
+            return "stroke=\(id) max_force=4.1700 final=1 min=\(force) max=\(force) distinct=1 "
+                + "estimated=false estimated_force=false learned=pressure"
+        }, report)
+    }
+
     func testHoverSendsNoPressure() {
         for sensor in [PencilPressure.Sensor.unknown, .pressure, .none] {
             var pen = PencilRelayMachine(pressure: PencilPressure(sensor: sensor))

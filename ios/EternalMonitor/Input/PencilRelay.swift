@@ -149,8 +149,9 @@ struct PencilPressure: Equatable {
             + "estimated=\(stroke.estimated) estimated_force=\(stroke.estimatedForce) learned=\(sensor)"
     }
 
-    /// Strokes logged this session. The first few show what the hardware
-    /// reports; after that the lines would only repeat.
+    /// Strokes logged this session, each once, so this is also the stroke's
+    /// number. The first few show what the hardware reports; after that the
+    /// lines would only repeat.
     @MainActor static var strokesLogged = 0
     static let strokesToLog = 8
 
@@ -171,6 +172,8 @@ struct PencilRelayMachine {
     private var last: PencilReading?
     /// The view keeps this for the app session; see `PencilPressure.session`.
     var pressure: PencilPressure
+    /// The stroke that ended last, however it ended, until the view logs it.
+    private var endedStroke: PencilPressure?
 
     init(pressure: PencilPressure = PencilPressure()) {
         self.pressure = pressure
@@ -193,7 +196,14 @@ struct PencilRelayMachine {
         isDown = false
         last = nil
         pressure.strokeEnded(completed: !cancelled)
+        endedStroke = pressure
         return [sample.event(phase: cancelled ? 3 : 2, contact: true)]
+    }
+
+    /// Each ended stroke once, so the diagnostics log it once.
+    mutating func takeEndedStroke() -> PencilPressure? {
+        defer { endedStroke = nil }
+        return endedStroke
     }
 
     private mutating func contact(_ reading: PencilReading, phase: UInt8) -> WireInputEvent {

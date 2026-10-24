@@ -58,6 +58,8 @@ final class RelayTouchUIView: UIView {
         didSet { if oldValue != pictureFit { pictureMoved() } }
     }
 
+    /// Where the first strokes' Pencil lines go.
+    var diagnostics = SupportDiagnostics.shared
     private var machine = TouchRelayMachine()
     private var pencil = PencilRelayMachine()
     private var pencilTouch: UITouch?
@@ -324,6 +326,7 @@ final class RelayTouchUIView: UIView {
                 // what it has added; began() ends it without losing either.
                 if !pencil.isDown { pencil.pressure = PencilPressure.session }
                 onEvents?(pointer.ended(at: nil) + pencil.began(reading))
+                logEndedPencilStroke()
                 pencilTouch = touch
             }
         }
@@ -441,7 +444,12 @@ final class RelayTouchUIView: UIView {
 
     private func savePencilLesson() {
         PencilPressure.session = pencil.pressure
-        PencilPressure.logStroke(pencil.pressure)
+        logEndedPencilStroke()
+    }
+
+    /// A stroke ends once: at its lift, or earlier when it is cancelled.
+    private func logEndedPencilStroke() {
+        if let stroke = pencil.takeEndedStroke() { PencilPressure.logStroke(stroke, to: diagnostics) }
     }
 
     private func pencilReading(_ touch: UITouch, clamp: Bool = false, atLift: Bool = false) -> PencilReading? {
