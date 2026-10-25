@@ -221,9 +221,7 @@ impl SettingsFile {
                 // Atomic tmp+rename: a crash mid-write must never leave a
                 // truncated settings.json (load() would silently reset every
                 // preference to defaults).
-                let tmp = path.with_extension("json.tmp");
-                let result = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path));
-                if let Err(error) = result {
+                if let Err(error) = replace_file(&path, &text) {
                     warn!(
                         path = %path.display(),
                         error = %error,
@@ -236,6 +234,48 @@ impl SettingsFile {
             }
         }
     }
+}
+
+/// Replaces `path` with `contents` atomically and durably: the text goes to
+/// a temporary file of its own in the same directory (named for this
+/// process and write, so concurrent writers never share one), is synced,
+/// and is renamed over `path`; then, on macOS and Linux, the directory is
+/// synced so the rename survives a power loss. A failed write removes its
+/// temporary file and leaves `path` as it was.
+pub(crate) fn replace_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written?;
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => std::path::Path::new("."),
+        };
+        // The file is in place either way; only its durability is at stake.
+        if let Err(error) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+            warn!(path = %dir.display(), %error, "Could not sync the directory after a write");
+        }
+    }
+    Ok(())
 }
 
 /// The per-user writable data directory for EternalMonitor (`%APPDATA%/EternalMonitor` on

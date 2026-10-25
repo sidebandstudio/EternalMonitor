@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -139,7 +139,8 @@ pub fn fit(content: (u32, u32), screen: (u32, u32), mode: FitMode) -> Placement 
 type Profiles = BTreeMap<String, DisplayProfile>;
 
 /// `display-profiles.json`: read when it changes, written atomically
-/// (temporary file, then rename). Only explicit edits change a saved
+/// (`settings::replace_file`) under a lock every process shares
+/// ([`lock`]). Only explicit edits change a saved
 /// profile ([`Self::remember`]); the display owner only adds one for a
 /// device seen for the first time ([`Self::save_if_absent`]).
 pub struct ProfileStore {
@@ -148,8 +149,33 @@ pub struct ProfileStore {
     seen: Option<Option<SystemTime>>,
 }
 
-/// Serialises writers in this process.
-static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+/// How long a writer waits for another, in any process, to finish.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// The lock every writer of `path`, in any process, holds from reading the
+/// file to renaming the new one over it: `flock` on macOS and Linux,
+/// `LockFileEx` on Windows, on the sibling `<name>.lock` file. Released
+/// when the returned file is dropped. `Ok(None)` if another writer still
+/// holds it after `wait`.
+fn lock(path: &Path, wait: Duration) -> std::io::Result<Option<std::fs::File>> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_file_name(format!("{name}.lock")))?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
 
 fn key(device_id: u64) -> String {
     format!("{device_id:016x}")
@@ -223,8 +249,9 @@ impl ProfileStore {
 
     /// Saves `profile` for a device that has no saved profile, never
     /// replacing one: the file is read again under the write lock, and an
-    /// entry found there (saved since this store last read it) is kept.
-    /// Returns whether it was written.
+    /// entry found there (saved since this store last read it, by any
+    /// process) is kept. Returns whether it was written; if the lock is
+    /// busy for `LOCK_WAIT`, nothing is, and the next pass tries again.
     pub fn save_if_absent(&mut self, device_id: u64, profile: DisplayProfile) -> bool {
         if device_id == 0 || self.get(device_id).is_some() {
             return false;
@@ -236,7 +263,23 @@ impl ProfileStore {
         let Some(path) = self.path.clone() else {
             return false;
         };
-        let _write = WRITE.lock();
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::warn!(path = %parent.display(), %error, "Could not make the display profiles' directory");
+                return false;
+            }
+        }
+        let _lock = match lock(&path, LOCK_WAIT) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                tracing::warn!(path = %path.display(), "Display profiles are busy; not saving this time");
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Could not lock the display profiles");
+                return false;
+            }
+        };
         // Start from what is on disk now, not the cache.
         let mut profiles = match read(&path) {
             Ok(profiles) => profiles,
@@ -254,13 +297,7 @@ impl ProfileStore {
         let written = serde_json::to_string_pretty(&profiles)
             .map_err(|error| error.to_string())
             .and_then(|text| {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                let tmp = path.with_extension("json.tmp");
-                std::fs::write(&tmp, text)
-                    .and_then(|()| std::fs::rename(&tmp, &path))
-                    .map_err(|error| error.to_string())
+                crate::settings::replace_file(&path, &text).map_err(|error| error.to_string())
             });
         match written {
             Ok(()) => {
@@ -402,7 +439,14 @@ mod tests {
         store.remember(7, ipad);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"0123456789abcdef\""), "{text}");
-        assert!(!dir.join("display-profiles.json.tmp").exists());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".tmp")),
+            "{names:?}"
+        );
         // Another reader sees both, and the Duo coming back on its inner
         // screen at 60 Hz keeps its saved profile.
         let mut reader = ProfileStore::at(Some(path.clone()));
@@ -468,6 +512,130 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk.len(), 2);
         assert_eq!(on_disk[&key(0xd0)], profile(2034));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    const EDITOR_DIR: &str = "EM_PROFILE_EDITOR_DIR";
+    const RACES: u64 = 50;
+    const EDIT: DisplayProfile = DisplayProfile {
+        width_px: 2034,
+        height_px: 1398,
+        refresh_hz: 120,
+        hidpi: true,
+    };
+
+    /// Waits for `path` to exist, spinning so a race stays tight.
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Not a test on its own: the other process of
+    /// `an_edit_in_another_process_always_wins_over_a_first_save`, an editor
+    /// that saves `EDIT` for device `n` as soon as it sees `go-n`.
+    #[test]
+    fn profile_editor_child() {
+        let Some(dir) = std::env::var_os(EDITOR_DIR).map(PathBuf::from) else {
+            return;
+        };
+        for device in 1..=RACES {
+            wait_for(&dir.join(format!("go-{device}")));
+            let mut editor = ProfileStore::at(Some(dir.join("display-profiles.json")));
+            assert!(
+                editor.remember(device, EDIT),
+                "the edit of {device} was not written"
+            );
+            std::fs::write(dir.join(format!("done-{device}")), "").unwrap();
+        }
+    }
+
+    /// The editor process, killed if the race fails so it does not wait on.
+    struct Editor(std::process::Child);
+
+    impl Drop for Editor {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn an_edit_in_another_process_always_wins_over_a_first_save() {
+        let dir = temp_dir("two-processes");
+        let path = dir.join("display-profiles.json");
+        let mut editor = Editor(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "display_profile::tests::profile_editor_child",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(EDITOR_DIR, &dir)
+                .spawn()
+                .unwrap(),
+        );
+        let default = DisplayProfile {
+            width_px: 2670,
+            ..EDIT
+        };
+        let mut host = ProfileStore::at(Some(path.clone()));
+        for device in 1..=RACES {
+            // Both see no entry for `device`; they race to write it.
+            assert_eq!(host.get(device), None);
+            std::fs::write(dir.join(format!("go-{device}")), "").unwrap();
+            host.save_if_absent(device, default);
+            wait_for(&dir.join(format!("done-{device}")));
+            let on_disk: Profiles = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+                .expect("the file always parses");
+            assert_eq!(on_disk.get(&key(device)), Some(&EDIT), "race {device}");
+            assert_eq!(on_disk.len() as u64, device);
+        }
+        assert!(
+            editor.0.wait().unwrap().success(),
+            "the editor process failed"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".tmp")),
+            "{names:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_busy_lock_skips_the_first_save_until_the_next_attempt() {
+        let dir = temp_dir("busy-lock");
+        let path = dir.join("display-profiles.json");
+        let held = lock(&path, Duration::ZERO)
+            .unwrap()
+            .expect("the lock is free");
+        let mut host = ProfileStore::at(Some(path.clone()));
+        let started = Instant::now();
+        assert!(
+            !host.save_if_absent(0xd0, EDIT),
+            "skipped while another writer holds it"
+        );
+        assert!(started.elapsed() >= LOCK_WAIT);
+        assert!(
+            started.elapsed() < LOCK_WAIT + Duration::from_secs(2),
+            "bounded"
+        );
+        assert!(!path.exists());
+        assert!(!host.remember(7, EDIT), "explicit edits wait no longer");
+        drop(held);
+        assert!(host.save_if_absent(0xd0, EDIT), "the next attempt saves");
+        assert_eq!(ProfileStore::at(Some(path)).get(0xd0), Some(EDIT));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
