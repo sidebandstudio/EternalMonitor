@@ -65,7 +65,10 @@ def scan(paths):
         if host:
             needles.append((name + " host", host[1]))
     files = [f for p in paths for f in ([p] if p.is_file() else sorted(p.rglob("*"))) if f.is_file()]
-    found = [f"{path}: {name}" for path in files for name, value in needles if value.encode() in path.read_bytes()]
+    found = []
+    for path in files:
+        data = path.read_bytes()
+        found += [f"{path}: {name}" for name, value in needles if value.encode() in data]
     if found:
         sys.exit("Evidence contains secret values; nothing was uploaded:\n" + "\n".join(found))
     print(f"No secret values in {len(files)} evidence files ({len(needles)} values checked)")

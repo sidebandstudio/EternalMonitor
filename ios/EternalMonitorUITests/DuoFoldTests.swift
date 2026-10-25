@@ -71,6 +71,7 @@ final class DuoFoldTests: XCTestCase {
     }
 
     func testStreamKeepsPictureAndTouchesAcrossFolds() throws {
+        print("Duo touchscreens: \(EMTouchscreens())")
         let environment = ProcessInfo.processInfo.environment
         let log = try XCTUnwrap(environment["EM_INPUT_HOST_LOG"])
         fold(to: 0)
@@ -151,10 +152,18 @@ final class DuoFoldTests: XCTestCase {
 
     // MARK: - Stream checks
 
-    private func setFill(_ fill: Bool, app: XCUIApplication) {
+    /// Touches go through the stream's own element: on the inner screen,
+    /// touches placed from the application element never reached the app.
+    private func setFill(_ fill: Bool, app: XCUIApplication, file: StaticString = #filePath, line: UInt = #line) {
         let label = fill ? "Show the whole picture" : "Fill the screen"
         let after = app.buttons.matching(NSPredicate(format: "identifier == 'display.pictureFit' AND label == %@", label)).firstMatch
-        app.tapHUDControl("display.pictureFit", until: after, reveal: .threeFingerTap)
+        let control = app.buttons["display.pictureFit"]
+        for _ in 0..<3 where !after.exists {
+            if !control.exists { app.otherElements["display.relay"].tap(withNumberOfTaps: 1, numberOfTouches: 3) }
+            if control.waitForExistence(timeout: 5) && !after.exists { control.tap() }
+            _ = after.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(after.exists, "The picture button did not switch to \(fill ? "Fill" : "Fit")", file: file, line: line)
     }
 
     /// The picture fills or fits the screen the app is on, with bars only in
@@ -180,14 +189,28 @@ final class DuoFoldTests: XCTestCase {
         } while Date() < deadline
         attach(shot, name: "\(screen)-\(name)")
         XCTAssertTrue(problems.isEmpty, "\(screen) \(name): " + problems.joined(separator: "; "), file: file, line: line)
+        // The pattern moves every frame, so a live stream never repeats.
+        let first = Pixels(shot, window: window)
+        Thread.sleep(forTimeInterval: 0.5)
+        let later = Pixels(upright(screenshot(of: screen), like: window), window: window)
+        let area = visiblePicture(picture, in: window)
+        let grid = (1...7).flatMap { x in (1...7).map { y in
+            CGPoint(x: area.minX + area.width * CGFloat(x) / 8, y: area.minY + area.height * CGFloat(y) / 8)
+        } }
+        XCTAssertTrue(grid.contains { abs(first.green(at: $0) - later.green(at: $0)) > 8 },
+                      "\(screen) \(name): the picture stopped moving", file: file, line: line)
 
         // Two touches inside the picture, away from its edges and the HUD.
         let targets = [CGPoint(x: window.width * 0.3, y: window.height * 0.45),
                        CGPoint(x: window.width * 0.7, y: window.height * 0.55)]
         let before = (try? Data(contentsOf: URL(fileURLWithPath: log)).count) ?? 0
+        let relay = app.otherElements["display.relay"]
+        XCTAssertTrue(relay.waitForExistence(timeout: 5), file: file, line: line)
+        let origin = relay.frame.origin
         for target in targets {
             let point = screenPoint(target, app: app)
-            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x, dy: point.y)).tap()
+            relay.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: point.x - origin.x, dy: point.y - origin.y)).tap()
         }
         var presses: [CGPoint] = []
         let pressDeadline = Date().addingTimeInterval(10)
@@ -227,7 +250,7 @@ final class DuoFoldTests: XCTestCase {
             let green = pixels.green(at: point)
             if shown ? green <= 48 : green >= 24 { problems.append("\(what) at \(point) has green \(green)") }
         }
-        let visible = picture.intersection(CGRect(origin: .zero, size: window))
+        let visible = visiblePicture(picture, in: window)
         expect(CGPoint(x: visible.minX + visible.width * 0.25, y: visible.midY), picture: true, "the picture")
         expect(CGPoint(x: visible.minX + visible.width * 0.75, y: visible.midY), picture: true, "the picture")
         expect(CGPoint(x: visible.midX, y: visible.minY + visible.height * 0.85), picture: true, "the picture")
@@ -250,6 +273,10 @@ final class DuoFoldTests: XCTestCase {
             expect(CGPoint(x: picture.minX - 5, y: window.height / 2), picture: false, "left of the picture")
         }
         return problems
+    }
+
+    private func visiblePicture(_ picture: CGRect, in window: CGSize) -> CGRect {
+        picture.intersection(CGRect(origin: .zero, size: window))
     }
 
     /// Positions of the host's recorded left-button presses since `offset`.

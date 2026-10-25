@@ -9,3 +9,5 @@ BOOL EMSetHingeAngle(double degrees, NSTimeInterval timeout, NSString * _Nullabl
 // XCUIDevice can't rotate the iPhone Duo simulator; Device Hub's orientation
 // picker can. `orientation` is portrait, landscape-left, landscape-right or pud.
 BOOL EMSetDeviceOrientation(NSString *orientation, NSString * _Nullable * _Nullable error);
+// The simulator's touchscreen services, one per display, for diagnostics.
+NSArray<NSDictionary *> *EMTouchscreens(void);

@@ -142,6 +142,29 @@ BOOL EMSetDeviceOrientation(NSString *orientation, NSString **error) {
     return SendDeviceState(@"orientation-picker-control", @"enum", orientation, error);
 }
 
+NSArray<NSDictionary *> *EMTouchscreens(void) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    IOHIDEventSystemClientRef (*createClient)(CFAllocatorRef, int, CFDictionaryRef) =
+        iokit ? dlsym(iokit, "IOHIDEventSystemClientCreateWithType") : NULL;
+    CFArrayRef (*copyServices)(IOHIDEventSystemClientRef) = iokit ? dlsym(iokit, "IOHIDEventSystemClientCopyServices") : NULL;
+    CFTypeRef (*copyProperty)(CFTypeRef, CFStringRef) = iokit ? dlsym(iokit, "IOHIDServiceClientCopyProperty") : NULL;
+    if (!createClient || !copyServices || !copyProperty) return @[];
+    IOHIDEventSystemClientRef client = createClient(NULL, 1 /* monitor */, NULL);
+    if (!client) return @[];
+    NSMutableArray *found = [NSMutableArray array];
+    for (id service in CFBridgingRelease(copyServices(client))) {
+        NSMutableDictionary *properties = [NSMutableDictionary dictionary];
+        for (NSString *key in @[@"PrimaryUsagePage", @"Product", @"displayUUID", @"Built-In"]) {
+            id value = CFBridgingRelease(copyProperty((__bridge CFTypeRef)service, (__bridge CFStringRef)key));
+            if (value) properties[key] = value;
+        }
+        // Digitizers: the touchscreens, one per display.
+        if ([properties[@"PrimaryUsagePage"] intValue] == 0x0D) [found addObject:properties];
+    }
+    CFRelease(client);
+    return found;
+}
+
 #ifdef EM_HINGE_TOOL
 int main(int argc, char **argv) {
     @autoreleasepool {
