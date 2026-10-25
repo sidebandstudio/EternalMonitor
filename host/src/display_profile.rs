@@ -15,10 +15,15 @@
 //! the display its user last had. Profiles live in their own file,
 //! `display-profiles.json` beside `settings.json` ([`ProfileStore`]), so
 //! the capture path that saves them never rewrites the user's settings.
+//! The display owner reads and saves them through [`ProfileIo`], a thread
+//! of their own, so it never waits on the disk.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
+
+use parking_lot::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -318,6 +323,76 @@ impl ProfileStore {
                 false
             }
         }
+    }
+}
+
+/// How often the profile thread looks for edits made by any process.
+const RELOAD_POLL: Duration = Duration::from_millis(200);
+
+/// The saved profiles as the profile thread last read or wrote them. Reading
+/// it touches no file.
+#[derive(Clone, Default)]
+pub struct ProfileView(Arc<RwLock<Profiles>>);
+
+impl ProfileView {
+    /// The saved profile for a client device, as [`ProfileStore::get`].
+    pub fn get(&self, device_id: u64) -> Option<DisplayProfile> {
+        if device_id == 0 {
+            return None;
+        }
+        self.0.read().get(&key(device_id)).copied()
+    }
+
+    fn publish(&self, profiles: &Profiles) {
+        if *self.0.read() != *profiles {
+            *self.0.write() = profiles.clone();
+        }
+    }
+}
+
+/// A thread that makes every disk access to a [`ProfileStore`]: it re-reads
+/// the file when it changes (every `RELOAD_POLL`), makes the first-time
+/// saves it is asked for, and publishes what it has in a [`ProfileView`].
+/// It stops when this handle is dropped.
+pub struct ProfileIo {
+    view: ProfileView,
+    saves: mpsc::Sender<(u64, DisplayProfile)>,
+}
+
+impl ProfileIo {
+    /// Starts the thread over `store`. The file is read once before this
+    /// returns, so the first answer made from the view already has the
+    /// saved profiles.
+    pub fn spawn(mut store: ProfileStore) -> std::io::Result<Self> {
+        let view = ProfileView::default();
+        store.refresh();
+        view.publish(&store.cache);
+        let (saves, asked) = mpsc::channel();
+        let published = view.clone();
+        std::thread::Builder::new()
+            .name("display-profiles".into())
+            .spawn(move || loop {
+                match asked.recv_timeout(RELOAD_POLL) {
+                    Ok((device_id, profile)) => {
+                        store.save_if_absent(device_id, profile);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => store.refresh(),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                published.publish(&store.cache);
+            })?;
+        Ok(Self { view, saves })
+    }
+
+    pub fn view(&self) -> ProfileView {
+        self.view.clone()
+    }
+
+    /// Asks the thread for [`ProfileStore::save_if_absent`] and returns at
+    /// once. Whether it saved shows in the view: a device with a profile
+    /// there has one on disk.
+    pub fn save_if_absent(&self, device_id: u64, profile: DisplayProfile) {
+        let _ = self.saves.send((device_id, profile));
     }
 }
 
@@ -652,6 +727,58 @@ mod tests {
         drop(held);
         assert!(host.save_if_absent(0xd0, EDIT), "the next attempt saves");
         assert_eq!(ProfileStore::at(Some(path)).get(0xd0), Some(EDIT));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Waits for `view` to show `want` for `device_id`.
+    fn until_viewed(view: &ProfileView, device_id: u64, want: Option<DisplayProfile>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.get(device_id) != want {
+            assert!(
+                Instant::now() < deadline,
+                "{device_id} is {:?}",
+                view.get(device_id)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_profile_thread_publishes_saved_edited_and_first_saved_profiles() {
+        let dir = temp_dir("profile-thread");
+        let path = dir.join("display-profiles.json");
+        let default = DisplayProfile {
+            width_px: 2670,
+            ..EDIT
+        };
+        assert!(ProfileStore::at(Some(path.clone())).remember(7, EDIT));
+        // Read before it starts: the view has what was saved already.
+        let io = ProfileIo::spawn(ProfileStore::at(Some(path.clone()))).unwrap();
+        let view = io.view();
+        assert_eq!(
+            (view.get(7), view.get(0xd0), view.get(0)),
+            (Some(EDIT), None, None)
+        );
+        // A first save, asked for without waiting, shows once it is made.
+        let asked = Instant::now();
+        io.save_if_absent(0xd0, default);
+        assert!(asked.elapsed() < Duration::from_millis(5));
+        until_viewed(&view, 0xd0, Some(default));
+        assert_eq!(
+            ProfileStore::at(Some(path.clone())).get(0xd0),
+            Some(default)
+        );
+        // An edit by another writer shows within a reload, and a later
+        // first save for that device changes nothing.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(ProfileStore::at(Some(path.clone())).remember(0xd0, EDIT));
+        until_viewed(&view, 0xd0, Some(EDIT));
+        io.save_if_absent(0xd0, default);
+        io.save_if_absent(0, default);
+        std::thread::sleep(RELOAD_POLL * 2);
+        assert_eq!(view.get(0xd0), Some(EDIT));
+        assert_eq!(ProfileStore::at(Some(path)).get(0xd0), Some(EDIT));
+        drop(io);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use super::sck::{CaptureFailure, DisplayChoice, Worker, HEARTBEAT_SLICE, LIST_POLL};
 use super::FrameSlot;
 use crate::control::SharedControl;
-use crate::display_profile::{ClientScreen, ProfileStore};
+use crate::display_profile::{ClientScreen, ProfileIo, ProfileStore, ProfileView};
 use crate::settings::SettingsFile;
 use crate::virtual_display::mac::{CgVirtualDisplays, ModeChange};
 use crate::virtual_display::owner::DisplayOwner;
@@ -61,20 +61,40 @@ static OWNER: OnceLock<Option<DisplayOwner>> = OnceLock::new();
 fn owner(shared: &SharedControl) -> Option<&'static DisplayOwner> {
     OWNER
         .get_or_init(|| {
-            let shared = shared.clone();
-            let mut profiles = ProfileStore::beside_settings();
-            let mut first_saves = ProfileStore::beside_settings();
-            DisplayOwner::spawn(
+            spawn_owner(
                 || CgVirtualDisplays::new(ModeChange::Recreate),
-                move || live_client(&shared, &mut profiles),
-                move |device_id, profile| {
-                    first_saves.save_if_absent(device_id, profile);
-                },
+                shared,
+                ProfileStore::beside_settings(),
             )
+            .map(|(owner, _)| owner)
             .inspect_err(|error| warn!(%error, "Could not start the display owner"))
             .ok()
         })
         .as_ref()
+}
+
+/// A display owner over `make`'s displays for the session in `shared`. Its
+/// profiles go through a [`ProfileIo`] thread over `store`, so the owner
+/// thread never touches the disk: it reads the published view and hands
+/// first-time saves over.
+fn spawn_owner<M, F>(
+    make: F,
+    shared: &SharedControl,
+    store: ProfileStore,
+) -> std::io::Result<(DisplayOwner, ProfileView)>
+where
+    M: crate::virtual_display::VirtualDisplayManager + 'static,
+    F: FnOnce() -> Result<M, crate::virtual_display::DisplayError> + Send + 'static,
+{
+    let profiles = ProfileIo::spawn(store)?;
+    let (view, live) = (profiles.view(), profiles.view());
+    let shared = shared.clone();
+    let owner = DisplayOwner::spawn(
+        make,
+        move || live_client(&shared, &live),
+        move |device_id, profile| profiles.save_if_absent(device_id, profile),
+    )?;
+    Ok((owner, view))
 }
 
 /// Second screen was turned off: remove its display now. Starts nothing if
@@ -106,8 +126,8 @@ fn live_info(shared: &SharedControl) -> Option<crate::transport::session::Client
 }
 
 /// The live session as the display owner reads it on every turn: the
-/// connected client and the saved profile for its device.
-fn live_client(shared: &SharedControl, profiles: &mut ProfileStore) -> Option<LiveClient> {
+/// connected client and the saved profile for its device, from memory.
+fn live_client(shared: &SharedControl, profiles: &ProfileView) -> Option<LiveClient> {
     let info = live_info(shared)?;
     let client = ClientScreen {
         device_id: info.device_id,
@@ -533,17 +553,19 @@ pub(crate) mod tests {
     /// A display owner over fake displays that reports what it does. It
     /// follows `shared`'s session as the host does, with no profile store.
     pub(crate) fn fake_owner(shared: &SharedControl) -> (DisplayOwner, mpsc::Receiver<Op>) {
-        fake_owner_with(|| {}, shared, None)
+        let (owner, ops, _) = fake_owner_with(|| {}, shared, None);
+        (owner, ops)
     }
 
     /// The same, with its profile store at `profiles`, as the host's is
     /// beside `settings.json`, running `during_create` while a display is
-    /// being made.
+    /// being made. Wired as the host's is (`spawn_owner`); the view is the
+    /// owner's.
     pub(crate) fn fake_owner_with(
         during_create: impl Fn() + Send + 'static,
         shared: &SharedControl,
         profiles: Option<PathBuf>,
-    ) -> (DisplayOwner, mpsc::Receiver<Op>) {
+    ) -> (DisplayOwner, mpsc::Receiver<Op>, ProfileView) {
         use crate::virtual_display::{DisplayError, DisplaySpec, VirtualDisplay};
         let (ops_tx, ops) = mpsc::channel();
         struct Reporting(FakeDisplays, mpsc::Sender<Op>, Box<dyn Fn() + Send>);
@@ -573,22 +595,13 @@ pub(crate) mod tests {
             }
         }
         let during_create: Box<dyn Fn() + Send> = Box::new(during_create);
-        let shared = shared.clone();
-        let owner = DisplayOwner::spawn(
+        let (owner, view) = spawn_owner(
             move || Ok(Reporting(FakeDisplays::default(), ops_tx, during_create)),
-            {
-                let mut profiles = ProfileStore::at(profiles.clone());
-                move || live_client(&shared, &mut profiles)
-            },
-            {
-                let mut first_saves = ProfileStore::at(profiles);
-                move |device_id, profile| {
-                    first_saves.save_if_absent(device_id, profile);
-                }
-            },
+            shared,
+            ProfileStore::at(profiles),
         )
         .expect("owner thread");
-        (owner, ops)
+        (owner, ops, view)
     }
 
     /// ScreenCaptureKit, faked: lists a display after so many checks.
@@ -653,7 +666,7 @@ pub(crate) mod tests {
             crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
         let dir = temp_dir("connect");
         let profiles = dir.join("display-profiles.json");
-        let (owner, ops) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
+        let (owner, ops, _) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
         let mut targets = targets(
             &shared,
             &owner,
@@ -705,7 +718,7 @@ pub(crate) mod tests {
         let shared = SharedControl::new(0, 15_000_000);
         let dir = temp_dir("profile-change");
         let profiles = dir.join("display-profiles.json");
-        let (owner, ops) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
+        let (owner, ops, view) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
         let mut targets = targets(
             &shared,
             &owner,
@@ -726,6 +739,8 @@ pub(crate) mod tests {
             hidpi: true,
         };
         assert!(ProfileStore::at(Some(profiles.clone())).remember(0xd0, outer));
+        // The owner's view has it within a reload; the next pass applies it.
+        until_viewed(&view, 0xd0, outer);
         let second = targets.display(now);
         assert_eq!(targets.display(now), second);
         // The edit stands: nothing wrote the old size back.
@@ -786,6 +801,23 @@ pub(crate) mod tests {
         )
     }
 
+    /// Waits for the owner's view of the profiles to show `profile` for
+    /// `device_id`: an edit reaches it within a reload.
+    fn until_viewed(
+        view: &ProfileView,
+        device_id: u64,
+        profile: crate::display_profile::DisplayProfile,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.get(device_id) != Some(profile) {
+            assert!(
+                Instant::now() < deadline,
+                "the edit never reached the owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `on_disk` once the owner's first-time save, which follows its
     /// answer, has written the file.
     fn saved_soon(path: &std::path::Path) -> (String, SystemTime) {
@@ -808,7 +840,7 @@ pub(crate) mod tests {
         let seen = SharedControl::new(0, 15_000_000);
         let dir = temp_dir("stale-device");
         let path = dir.join("display-profiles.json");
-        let (owner, ops) = fake_owner_with(|| {}, &live, Some(path.clone()));
+        let (owner, ops, view) = fake_owner_with(|| {}, &live, Some(path.clone()));
         let settings = || {
             Box::new(MemorySettings {
                 next: Some(enabled()),
@@ -830,6 +862,7 @@ pub(crate) mod tests {
         };
         assert!(ProfileStore::at(Some(path.clone())).remember(0xd0, outer));
         let edited = on_disk(&path);
+        until_viewed(&view, 0xd0, outer);
         // 2. A stale A request arrives first: it gets B's display as it is,
         //    and the store is not touched.
         std::thread::sleep(Duration::from_millis(20));
@@ -882,7 +915,7 @@ pub(crate) mod tests {
         let user_path = settings_path.clone();
         // The user turns second screen off while the display is being made.
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner_with(
+        let (owner, ops, _) = fake_owner_with(
             move || {
                 std::thread::sleep(Duration::from_millis(20));
                 write_settings(&user_path, &SettingsFile::default());

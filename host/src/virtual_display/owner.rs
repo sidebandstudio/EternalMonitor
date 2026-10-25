@@ -49,9 +49,12 @@ impl DisplayOwner {
     /// `save_first` saves the default profile of a device that has none,
     /// without replacing one saved meanwhile. It is the only profile write
     /// the owner makes, and capture makes none. It runs after the request
-    /// that called for it is answered, and must not wait for a busy store:
-    /// a save that did not happen is tried again on a later turn
-    /// (`Keeper::save_first_profile`).
+    /// that called for it is answered; a save that did not happen is tried
+    /// again on a later turn (`Keeper::save_first_profile`).
+    ///
+    /// Neither `live` nor `save_first` may touch the disk, or every answer
+    /// after them waits for it: the host reads a `ProfileView` and hands
+    /// saves to a `ProfileIo` thread (`capture::mac_screen::spawn_owner`).
     pub fn spawn<M, F>(
         make: F,
         mut live: impl FnMut() -> Option<LiveClient> + Send + 'static,
@@ -148,7 +151,7 @@ impl DisplayOwner {
 mod tests {
     use super::super::fake::{FakeDisplays, Op};
     use super::*;
-    use crate::display_profile::ClientScreen;
+    use crate::display_profile::{ClientScreen, ProfileIo, ProfileStore, ProfileView};
     use std::sync::{Arc, Mutex};
 
     const DUO: u64 = 0xd0;
@@ -271,64 +274,80 @@ mod tests {
         assert!(ops.try_recv().is_err(), "no create, remove or change");
     }
 
+    /// An owner wired as the host wires it (`capture::mac_screen`), over
+    /// `dir`'s profiles: the live session's saved profile comes from the
+    /// profile thread's view, and first saves are handed to that thread.
+    /// The live device is `session`'s, and `asked` counts first saves.
+    fn owner_with_profiles(
+        dir: &std::path::Path,
+        session: Arc<Mutex<LiveClient>>,
+    ) -> (
+        DisplayOwner,
+        Arc<std::sync::atomic::AtomicUsize>,
+        ProfileView,
+    ) {
+        let io =
+            ProfileIo::spawn(ProfileStore::at(Some(dir.join("display-profiles.json")))).unwrap();
+        let (view, live) = (io.view(), io.view());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        let owner = DisplayOwner::spawn(
+            || Ok(FakeDisplays::default()),
+            move || {
+                let session = session.lock().unwrap().clone();
+                Some(LiveClient {
+                    saved: live.get(session.client.device_id),
+                    ..session
+                })
+            },
+            move |device_id, profile| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                io.save_if_absent(device_id, profile);
+            },
+        )
+        .unwrap();
+        (owner, asked, view)
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("eternal-owner-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn a_busy_profile_store_never_slows_the_answers_and_the_first_save_follows_once() {
-        use crate::display_profile::ProfileStore;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let dir = std::env::temp_dir().join(format!("eternal-owner-busy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("busy");
         let path = dir.join("display-profiles.json");
         // Another writer, in any process, holds the profiles' lock.
         let held = std::fs::File::create(dir.join("display-profiles.json.lock")).unwrap();
         held.lock().unwrap();
-        // Wired as the host wires it: the live session reads the store, and
-        // first saves go through a store of their own.
-        let (attempts, written) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let owner = DisplayOwner::spawn(
-            || Ok(FakeDisplays::default()),
-            {
-                let mut profiles = ProfileStore::at(Some(path.clone()));
-                move || {
-                    Some(LiveClient {
-                        saved: profiles.get(DUO),
-                        ..duo()
-                    })
-                }
-            },
-            {
-                let mut first_saves = ProfileStore::at(Some(path.clone()));
-                let (attempts, written) = (attempts.clone(), written.clone());
-                move |device_id, profile| {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    if first_saves.save_if_absent(device_id, profile) {
-                        written.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            },
-        )
-        .unwrap();
+        let (owner, asked, view) = owner_with_profiles(&dir, Arc::new(Mutex::new(duo())));
         let grace = Duration::from_secs(60);
         let mut display = None;
         for pass in 0..10 {
-            let asked = Instant::now();
+            let started = Instant::now();
             let answer = owner.want(want(true, grace)).unwrap();
             assert!(
-                asked.elapsed() < Duration::from_millis(50),
+                started.elapsed() < Duration::from_millis(50),
                 "pass {pass} took {:?}",
-                asked.elapsed()
+                started.elapsed()
             );
             assert!(answer.is_some());
             display = display.or(answer);
             assert_eq!(answer, display);
         }
-        assert_eq!(attempts.load(Ordering::SeqCst), 1, "tried once, then waits");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "tried once, then waits");
+        std::thread::sleep(Duration::from_millis(100));
         assert!(!path.exists(), "nothing written while the lock is held");
+        assert_eq!(view.get(DUO), None);
         // The lock is released: the owner's next try saves, within
         // SAVE_RETRY and a poll, whether or not capture asks meanwhile.
         let released = Instant::now();
         drop(held);
         let deadline = released + super::super::SAVE_RETRY + Duration::from_secs(2);
-        while written.load(Ordering::SeqCst) == 0 {
+        while view.get(DUO).is_none() {
             assert!(Instant::now() < deadline, "never saved");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -337,18 +356,73 @@ mod tests {
             ProfileStore::at(Some(path.clone())).get(DUO),
             display.map(|display| display.profile)
         );
-        // Saved once: the store now has it, so later turns try nothing.
+        // Saved once: the view now has it, so later turns try nothing.
+        let saved = std::fs::metadata(&path).unwrap().modified().unwrap();
         for _ in 0..5 {
             assert_eq!(owner.want(want(true, grace)).unwrap(), display);
             std::thread::sleep(PRESENCE_POLL / 2);
         }
-        assert_eq!(
-            (
-                attempts.load(Ordering::SeqCst),
-                written.load(Ordering::SeqCst)
-            ),
-            (2, 1)
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), saved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_saves_never_delay_the_answers() {
+        use std::sync::atomic::Ordering;
+        const PASSES: u64 = 250;
+        const PER_DEVICE: u64 = 5;
+        let dir = temp_dir("timing");
+        let session = Arc::new(Mutex::new(duo()));
+        let (owner, asked, view) = owner_with_profiles(&dir, session.clone());
+        let grace = Duration::from_secs(60);
+        // A fresh device every few passes: each one's first pass hands a
+        // save over, which the profile thread writes and syncs while the
+        // passes go on, a couple of milliseconds apart.
+        let mut waits = Vec::new();
+        for pass in 0..PASSES {
+            let device = 0x100 + pass / PER_DEVICE;
+            session.lock().unwrap().client.device_id = device;
+            let started = Instant::now();
+            let answer = owner.want(Want {
+                device: Some(device),
+                ..want(true, grace)
+            });
+            waits.push(started.elapsed());
+            assert!(matches!(answer, Ok(Some(_))), "{answer:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let devices = PASSES / PER_DEVICE;
+        let saved_during = (0..devices)
+            .filter(|n| view.get(0x100 + n).is_some())
+            .count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (0..devices).any(|n| view.get(0x100 + n).is_none()) {
+            assert!(Instant::now() < deadline, "not every device was saved");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        waits.sort();
+        let at = |q: usize| waits[(waits.len() - 1) * q / 100];
+        let (p50, p95, max) = (at(50), at(95), at(100));
+        println!(
+            "{PASSES} answers with {devices} first saves ({saved_during} written by the last): \
+             p50 {p50:?}, p95 {p95:?}, max {max:?}"
         );
+        assert_eq!(
+            asked.load(Ordering::SeqCst) as u64,
+            devices,
+            "one save each"
+        );
+        // A save that delayed the next answer (about 10 ms each, Sol's
+        // round 9) would put one pass in five over p95. The bound on the
+        // maximum leaves room for the scheduler on a loaded machine, which
+        // stalls a pass as long with no saves at all.
+        assert!(p50 < Duration::from_millis(2), "p50 {p50:?}");
+        assert!(p95 < Duration::from_millis(10), "p95 {p95:?}");
+        assert!(max < Duration::from_millis(50), "max {max:?}");
+        let mut on_disk = ProfileStore::at(Some(dir.join("display-profiles.json")));
+        assert!((0..devices).all(|n| on_disk.get(0x100 + n).is_some()));
+        drop(owner);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
