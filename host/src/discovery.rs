@@ -114,4 +114,26 @@ fn hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(system_hostname)
+}
+
+/// The system's host name, without `.local`. A Mac app's environment has no
+/// HOSTNAME (shells set it without exporting it).
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; gethostname writes a
+    // NUL-terminated name into it, truncated if needed.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let name = std::str::from_utf8(&buffer[..end]).ok()?;
+    let name = name.strip_suffix(".local").unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
