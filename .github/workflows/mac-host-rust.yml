@@ -1,0 +1,113 @@
+# The Rust jobs from ci.yml, for feat/mac-host only. ci.yml runs on main and
+# pull requests, and this branch has neither. No artifacts are uploaded and no
+# secrets are used: the repository is public.
+name: Mac host (Rust)
+
+on:
+  push:
+    branches: [feat/mac-host]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-host-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (linux, pure crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release version parity
+        run: scripts/check-versions.sh
+      - name: Test system measurement parser
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check -p eternal-wire
+      - name: Test pure crates
+        run: cargo test -p eternal-wire --locked
+
+  rust-windows:
+    name: Rust (windows, full host)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      # ffmpeg-sys-next bindgen needs libclang; preinstalled LLVM on the runner image
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FFmpeg 7.1.1 shared SDK
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\ffmpeg
+          key: ffmpeg-7.1.1-full_build-shared
+
+      - name: Download FFmpeg 7.1.1 shared SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.7z"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z
+          7z x ffmpeg.7z -oC:\ffmpeg-extract | Out-Null
+          Move-Item C:\ffmpeg-extract\ffmpeg-7.1.1-full_build-shared C:\ffmpeg
+
+      - name: Configure FFmpeg environment
+        shell: pwsh
+        run: |
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        env:
+          # The runner has no AMD driver, so AMF must fail to open and the
+          # encode stage must fall back to libx264 (host/tests/amf_encoder.rs).
+          ETERNAL_AMF_TEST: fallback
+        run: cargo test --workspace --locked
+
+      - name: Test virtual display task scripts
+        shell: powershell
+        run: |
+          ./scripts/win/Test-VddToggle.ps1
+          ./scripts/win/Test-VddState.ps1
+          ./scripts/win/Test-VddTask.ps1
+      - name: Verify virtual display driver ownership on uninstall
+        shell: powershell
+        run: ./installer/tests/Test-VddDriverRemoval.ps1
+      - name: Verify virtual display driver binding checks
+        shell: powershell
+        run: ./installer/tests/Test-VddDriverVerification.ps1
+
+  rust-macos:
+    name: Rust (macOS, full workspace + E2E)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg 7.1 SDK
+        run: brew install ffmpeg@7 pkgconf
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint workspace
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace (includes synthetic end-to-end stream)
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
+        run: cargo test --workspace --locked
