@@ -55,6 +55,18 @@ pkg-config = "0.3"
 # Same version as the Mac spikes, so the lockfile carries one copy.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+# CGEvent input (input/mac/cg.rs). Same versions as the Mac spikes.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGDirectDisplay",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
+    "CGSession",
+] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }

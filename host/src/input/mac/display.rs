@@ -45,13 +45,19 @@ fn slice_centre(n: u16, size: f64) -> f64 {
 
 /// Map a wire position to a global point on `bounds`, for a CGEvent.
 ///
-/// The result stays strictly inside `[origin, origin + size)`, so it needs no
-/// clamp: the far edge, `origin + size`, belongs to the neighbouring display,
-/// and a pointer placed on it would move to another screen.
+/// The result stays strictly inside `[origin, origin + size)`: the far edge,
+/// `origin + size`, belongs to the neighbouring display, and a pointer
+/// placed on it would move to another screen. Slice centres already stop
+/// half a slice short of it; the clamp keeps that true even where rounding
+/// at a large origin could reach the edge.
 pub fn norm_to_display_point(x_norm: u16, y_norm: u16, bounds: DisplayBounds) -> (f64, f64) {
+    let inside = |origin: f64, size: f64, n: u16| {
+        let last = (origin + size).next_down().max(origin);
+        (origin + slice_centre(n, size)).min(last)
+    };
     (
-        bounds.x + slice_centre(x_norm, bounds.width),
-        bounds.y + slice_centre(y_norm, bounds.height),
+        inside(bounds.x, bounds.width, x_norm),
+        inside(bounds.y, bounds.height, y_norm),
     )
 }
 
@@ -275,5 +281,28 @@ mod tests {
             point_to_capture_pixel(-5000.0, 1e9, RIGHT, RIGHT_PIXELS),
             (0, RIGHT_PIXELS.height - 1)
         );
+    }
+
+    #[test]
+    fn full_scale_never_reaches_the_neighbour_even_far_from_the_origin() {
+        // A display so far out that its 1/65536 slice is below the spacing
+        // of f64 values there: the edge itself would be the next value.
+        for bounds in [
+            DisplayBounds {
+                x: 1e15,
+                y: -1e15,
+                width: 0.25,
+                height: 0.25,
+            },
+            DisplayBounds {
+                x: 3440.0,
+                y: 0.0,
+                width: 1335.0,
+                height: 939.0,
+            },
+        ] {
+            let (x, y) = norm_to_display_point(u16::MAX, u16::MAX, bounds);
+            assert!(bounds.contains(x, y), "{bounds:?} -> ({x}, {y})");
+        }
     }
 }

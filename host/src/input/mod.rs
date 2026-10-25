@@ -1,14 +1,20 @@
 //! Input relay: turns the client's INPUT_EVENT messages (normalized
 //! coordinates over the displayed video) into Windows input injection.
 //!
-//! Coordinate mapping, stroke state, deduplication and wheel scaling are
-//! portable and unit-tested. Native pen and `SendInput`
-//! calls live in `windows_inject.rs`; other platforms record events for the
-//! end-to-end tests instead.
+//! [`neutral`] reads each wire event into platform-neutral intents; this
+//! module converts them to Windows units ([`resolve`]). Coordinate mapping,
+//! stroke state, deduplication and wheel scaling are portable and
+//! unit-tested. Native pen and `SendInput` calls live in `windows_inject.rs`;
+//! other platforms record events for the end-to-end tests instead. The
+//! macOS conversion to CGEvents is [`mac`].
 
 use eternal_wire::v2::control::InputEvent;
 mod hid;
 pub use hid::hid_to_scancode;
+#[cfg(any(target_os = "macos", test))]
+pub mod mac;
+pub mod neutral;
+use neutral::{Button, InputIntent, NormPoint};
 
 #[cfg(windows)]
 pub mod windows_inject;
@@ -242,116 +248,90 @@ impl EventDeduper {
     }
 }
 
-/// Resolve one wire event into zero or more injections.
+/// Resolve one wire event into zero or more Windows injections: the neutral
+/// intents (`neutral::resolve_intents`) converted to `SendInput`'s absolute
+/// space, scan codes and wheel units, and the pen's desktop pixels.
 pub fn resolve(
     event: &InputEvent,
     output: CaptureGeometry,
     screen: VirtualScreen,
 ) -> Vec<Injection> {
-    if event.input_ver != 1 && !(event.input_ver == 2 && event.kind == KIND_PENCIL) {
-        return Vec::new();
-    }
-    let (px, py) = norm_to_output_pixel(event.x_norm, event.y_norm, output);
-    let (ax, ay) = desktop_pixel_to_abs(px, py, screen);
+    neutral::resolve_intents(event)
+        .into_iter()
+        .flat_map(|intent| windows_injections(intent, output, screen))
+        .collect()
+}
 
-    match event.kind {
-        KIND_PENCIL => {
-            let contact = event.input_ver == 1 || event.buttons & 1 != 0;
-            let phase = match (event.phase, contact) {
-                (PHASE_BEGAN, true) => PenPhase::Down,
-                (PHASE_MOVED, true) => PenPhase::Move,
-                (PHASE_ENDED, true) => PenPhase::Up,
-                (PHASE_CANCELLED, true) => PenPhase::Cancel,
-                (PHASE_MOVED, false) => PenPhase::Hover,
-                (PHASE_ENDED | PHASE_CANCELLED, false) => PenPhase::Leave,
-                _ => return Vec::new(),
-            };
+/// One neutral intent in Windows units.
+fn windows_injections(
+    intent: InputIntent,
+    output: CaptureGeometry,
+    screen: VirtualScreen,
+) -> Vec<Injection> {
+    let abs = |at: NormPoint| {
+        let (px, py) = norm_to_output_pixel(at.x, at.y, output);
+        desktop_pixel_to_abs(px, py, screen)
+    };
+    match intent {
+        InputIntent::Pen(pen) => {
+            let (x, y) = norm_to_output_pixel(pen.at.x, pen.at.y, output);
             vec![Injection::Pen(PenSample {
-                phase,
-                x: px,
-                y: py,
-                x_norm: event.x_norm,
-                y_norm: event.y_norm,
-                pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
-                    (u32::from(event.pressure_x1000.min(1000)) * 1024 + 500) / 1000
-                } else {
-                    0
-                },
-                tilt_x: i32::from(event.tilt_x.clamp(-90, 90)),
-                tilt_y: i32::from(event.tilt_y.clamp(-90, 90)),
+                phase: pen.phase,
+                x,
+                y,
+                x_norm: pen.at.x,
+                y_norm: pen.at.y,
+                pressure: (u32::from(pen.pressure_x1000) * 1024 + 500) / 1000,
+                tilt_x: i32::from(pen.tilt_x),
+                tilt_y: i32::from(pen.tilt_y),
             })]
         }
-        KIND_TOUCH | KIND_MOUSE_ABS => {
-            let right_button = event.buttons & 0b10 != 0;
-            let middle_button = event.buttons & 0b100 != 0;
-            match event.phase {
-                PHASE_BEGAN => {
-                    if middle_button {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::MiddleDown { x: ax, y: ay },
-                        ]
-                    } else if right_button {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::RightDown { x: ax, y: ay },
-                        ]
-                    } else {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::LeftDown { x: ax, y: ay },
-                        ]
-                    }
-                }
-                PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
-                PHASE_ENDED | PHASE_CANCELLED => {
-                    if middle_button {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::MiddleUp { x: ax, y: ay },
-                        ]
-                    } else if right_button {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::RightUp { x: ax, y: ay },
-                        ]
-                    } else {
-                        vec![
-                            Injection::MoveAbs { x: ax, y: ay },
-                            Injection::LeftUp { x: ax, y: ay },
-                        ]
-                    }
-                }
-                _ => Vec::new(),
-            }
+        InputIntent::PointerMove { at } => {
+            let (x, y) = abs(at);
+            vec![Injection::MoveAbs { x, y }]
         }
-        KIND_HOVER if event.phase == PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
-        KIND_KEY => {
-            let Some((scan, extended)) = hid_to_scancode(event.keycode) else {
+        InputIntent::ButtonDown { button, at } => {
+            let (x, y) = abs(at);
+            vec![match button {
+                Button::Left => Injection::LeftDown { x, y },
+                Button::Right => Injection::RightDown { x, y },
+                Button::Middle => Injection::MiddleDown { x, y },
+            }]
+        }
+        InputIntent::ButtonUp { button, at } => {
+            let (x, y) = abs(at);
+            vec![match button {
+                Button::Left => Injection::LeftUp { x, y },
+                Button::Right => Injection::RightUp { x, y },
+                Button::Middle => Injection::MiddleUp { x, y },
+            }]
+        }
+        InputIntent::Key { usage, down } => {
+            let Some((scan, extended)) = hid_to_scancode(usage) else {
                 return Vec::new();
             };
-            match event.phase {
-                PHASE_BEGAN => vec![Injection::KeyDown { scan, extended }],
-                PHASE_ENDED | PHASE_CANCELLED => vec![Injection::KeyUp { scan, extended }],
-                _ => Vec::new(),
-            }
+            vec![if down {
+                Injection::KeyDown { scan, extended }
+            } else {
+                Injection::KeyUp { scan, extended }
+            }]
         }
-        KIND_TEXT if event.phase == PHASE_BEGAN => vec![Injection::Unicode(event.keycode)],
-        KIND_SCROLL => {
-            let mut injections = vec![Injection::MoveAbs { x: ax, y: ay }];
-            if event.scroll_dy != 0 {
+        InputIntent::Text(unit) => vec![Injection::Unicode(unit)],
+        InputIntent::Scroll { at, dx, dy } => {
+            let (x, y) = abs(at);
+            let mut injections = vec![Injection::MoveAbs { x, y }];
+            if dy != 0 {
                 injections.push(Injection::Wheel {
-                    delta: scroll_to_wheel(event.scroll_dy),
+                    delta: scroll_to_wheel(dy),
                 });
             }
-            if event.scroll_dx != 0 {
+            if dx != 0 {
                 injections.push(Injection::HWheel {
-                    delta: scroll_to_wheel(event.scroll_dx),
+                    delta: scroll_to_wheel(dx),
                 });
             }
             injections
         }
-        _ => Vec::new(),
     }
 }
 
@@ -1726,5 +1706,170 @@ mod tests {
                 "replayed after session reset: {replayed:?}"
             );
         }
+    }
+
+    /// `resolve` as it was before the neutral split, verbatim.
+    fn legacy_resolve(
+        event: &InputEvent,
+        output: CaptureGeometry,
+        screen: VirtualScreen,
+    ) -> Vec<Injection> {
+        if event.input_ver != 1 && !(event.input_ver == 2 && event.kind == KIND_PENCIL) {
+            return Vec::new();
+        }
+        let (px, py) = norm_to_output_pixel(event.x_norm, event.y_norm, output);
+        let (ax, ay) = desktop_pixel_to_abs(px, py, screen);
+
+        match event.kind {
+            KIND_PENCIL => {
+                let contact = event.input_ver == 1 || event.buttons & 1 != 0;
+                let phase = match (event.phase, contact) {
+                    (PHASE_BEGAN, true) => PenPhase::Down,
+                    (PHASE_MOVED, true) => PenPhase::Move,
+                    (PHASE_ENDED, true) => PenPhase::Up,
+                    (PHASE_CANCELLED, true) => PenPhase::Cancel,
+                    (PHASE_MOVED, false) => PenPhase::Hover,
+                    (PHASE_ENDED | PHASE_CANCELLED, false) => PenPhase::Leave,
+                    _ => return Vec::new(),
+                };
+                vec![Injection::Pen(PenSample {
+                    phase,
+                    x: px,
+                    y: py,
+                    x_norm: event.x_norm,
+                    y_norm: event.y_norm,
+                    pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
+                        (u32::from(event.pressure_x1000.min(1000)) * 1024 + 500) / 1000
+                    } else {
+                        0
+                    },
+                    tilt_x: i32::from(event.tilt_x.clamp(-90, 90)),
+                    tilt_y: i32::from(event.tilt_y.clamp(-90, 90)),
+                })]
+            }
+            KIND_TOUCH | KIND_MOUSE_ABS => {
+                let right_button = event.buttons & 0b10 != 0;
+                let middle_button = event.buttons & 0b100 != 0;
+                match event.phase {
+                    PHASE_BEGAN => {
+                        if middle_button {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::MiddleDown { x: ax, y: ay },
+                            ]
+                        } else if right_button {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::RightDown { x: ax, y: ay },
+                            ]
+                        } else {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::LeftDown { x: ax, y: ay },
+                            ]
+                        }
+                    }
+                    PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
+                    PHASE_ENDED | PHASE_CANCELLED => {
+                        if middle_button {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::MiddleUp { x: ax, y: ay },
+                            ]
+                        } else if right_button {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::RightUp { x: ax, y: ay },
+                            ]
+                        } else {
+                            vec![
+                                Injection::MoveAbs { x: ax, y: ay },
+                                Injection::LeftUp { x: ax, y: ay },
+                            ]
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            KIND_HOVER if event.phase == PHASE_MOVED => vec![Injection::MoveAbs { x: ax, y: ay }],
+            KIND_KEY => {
+                let Some((scan, extended)) = hid_to_scancode(event.keycode) else {
+                    return Vec::new();
+                };
+                match event.phase {
+                    PHASE_BEGAN => vec![Injection::KeyDown { scan, extended }],
+                    PHASE_ENDED | PHASE_CANCELLED => vec![Injection::KeyUp { scan, extended }],
+                    _ => Vec::new(),
+                }
+            }
+            KIND_TEXT if event.phase == PHASE_BEGAN => vec![Injection::Unicode(event.keycode)],
+            KIND_SCROLL => {
+                let mut injections = vec![Injection::MoveAbs { x: ax, y: ay }];
+                if event.scroll_dy != 0 {
+                    injections.push(Injection::Wheel {
+                        delta: scroll_to_wheel(event.scroll_dy),
+                    });
+                }
+                if event.scroll_dx != 0 {
+                    injections.push(Injection::HWheel {
+                        delta: scroll_to_wheel(event.scroll_dx),
+                    });
+                }
+                injections
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn windows_output_is_unchanged_by_the_neutral_split() {
+        // Every kind, phase, button mask and version, over each layout, with
+        // edge and odd wire values, keys across the whole usage range, and
+        // out-of-range pressure, tilt and scroll.
+        let mut checked = 0u32;
+        for (_, output, monitors) in layouts() {
+            let screen = bounding(&monitors);
+            for kind in 0..=7u8 {
+                for phase in 0..=4u8 {
+                    for buttons in [0u8, 1, 2, 3, 4, 6, 7] {
+                        for input_ver in [0u8, 1, 2, 3] {
+                            for (i, (x, y)) in
+                                [(0, 0), (65_535, 65_535), (32_768, 1), (12_345, 54_321)]
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let mut e = event(kind, phase, x, y);
+                                e.buttons = buttons;
+                                e.input_ver = input_ver;
+                                e.keycode = [0x04, 0x4f, 0xe7, 0x66, 0xffff, 0xd83d]
+                                    [(i + usize::from(kind)) % 6];
+                                e.pressure_x1000 =
+                                    [0, 1, 999, 1000, 1001, u16::MAX][(i + usize::from(phase)) % 6];
+                                e.tilt_x = [i16::MIN, -91, -90, 0, 37, i16::MAX]
+                                    [(i + usize::from(buttons)) % 6];
+                                e.tilt_y = [i16::MAX, 90, 91, -1][i % 4];
+                                e.scroll_dx = [0, 1, -40, i16::MIN][i % 4];
+                                e.scroll_dy = [i16::MAX, 0, 7, -1][(i + 1) % 4];
+                                assert_eq!(
+                                    resolve(&e, output, screen),
+                                    legacy_resolve(&e, output, screen),
+                                    "{e:?}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for usage in 0..=u16::MAX {
+            let mut e = event(KIND_KEY, PHASE_BEGAN, 0, 0);
+            e.keycode = usage;
+            assert_eq!(
+                resolve(&e, OUTPUT, SINGLE_SCREEN),
+                legacy_resolve(&e, OUTPUT, SINGLE_SCREEN)
+            );
+        }
+        assert!(checked > 30_000, "{checked}");
     }
 }
