@@ -5,7 +5,7 @@ use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sen
 use super::page_performance::page_header;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
-use super::{AnalyzerApp, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL, ENCODER_CHOICES};
+use super::{AnalyzerApp, Platform, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL, ENCODER_CHOICES};
 use crate::encoder::input::EncoderInput;
 
 impl AnalyzerApp {
@@ -75,15 +75,24 @@ impl AnalyzerApp {
                 .audio_enabled
                 .load(std::sync::atomic::Ordering::SeqCst);
             let mut audio = enabled;
-            widgets::setting_row(
-                ui,
-                "Stream PC audio",
-                "Plays this PC's sound on the iPad. Video keeps streaming if audio fails.",
-                64.0,
-                |ui| {
-                    widgets::toggle(ui, &mut audio, "Stream PC audio");
-                },
-            );
+            let available = super::audio_available(self.platform, crate::audio::source_requested());
+            let (title, description) = match self.platform {
+                Platform::Windows => (
+                    "Stream PC audio",
+                    "Plays this PC's sound on the iPad. Video keeps streaming if audio fails.",
+                ),
+                Platform::Mac => (
+                    "Stream Mac audio",
+                    "Sound isn't available on Mac yet. Your device gets the picture only.",
+                ),
+            };
+            widgets::setting_row(ui, title, description, 64.0, |ui| {
+                if available {
+                    widgets::toggle(ui, &mut audio, title);
+                } else {
+                    ui.add_enabled_ui(false, |ui| widgets::toggle(ui, &mut audio, title));
+                }
+            });
             if audio != enabled {
                 self.set_stream_audio(audio);
             }

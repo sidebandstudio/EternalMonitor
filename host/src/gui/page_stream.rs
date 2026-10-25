@@ -529,13 +529,13 @@ impl AnalyzerApp {
             widgets::divider(ui);
 
             // Audio
-            if self.platform == Platform::Mac {
+            if !super::audio_available(self.platform, crate::audio::source_requested()) {
                 widgets::icon_row(
                     ui,
                     Icon::Speaker,
                     TEXT_MUTED,
                     "Audio",
-                    "Video only for now. Your device plays no sound from this Mac.",
+                    "Sound isn't available on Mac yet. Your device gets the picture only.",
                     0.0,
                     |_| {},
                 );

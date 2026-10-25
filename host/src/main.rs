@@ -176,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Mac host captures no audio yet, and its stand-in source is a test
     // tone. Video only, unless automation asks for a source by name.
     #[cfg(target_os = "macos")]
-    if std::env::var_os("ETERNAL_AUDIO").is_none() {
+    if !eternal_host::audio::source_requested() {
         info!("No audio capture on macOS yet; streaming video only");
         shared
             .audio_enabled

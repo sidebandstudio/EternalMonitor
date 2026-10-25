@@ -5,7 +5,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
+use egui_kittest::{
+    kittest::{NodeT, Queryable},
+    Harness, SnapshotResults,
+};
 use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
 use eternal_host::gui::{AnalyzerApp, Platform};
@@ -387,6 +390,22 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         .scroll_to_me();
     harness.run_steps(4);
     snapshot(&mut harness, &shared, "settings");
+    // On Windows the audio switch works as before.
+    assert!(shared.audio_enabled.load(Ordering::SeqCst));
+    harness
+        .get_by_role_and_label(Role::CheckBox, "Stream PC audio")
+        .scroll_to_me();
+    harness.run_steps(4);
+    harness
+        .get_by_role_and_label(Role::CheckBox, "Stream PC audio")
+        .click();
+    harness.run_steps(4);
+    assert!(!shared.audio_enabled.load(Ordering::SeqCst));
+    harness
+        .get_by_role_and_label(Role::CheckBox, "Stream PC audio")
+        .click();
+    harness.run_steps(4);
+    assert!(shared.audio_enabled.load(Ordering::SeqCst));
 
     // General sits below the fold of the Settings page.
     harness
@@ -579,6 +598,8 @@ fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mu
     }
     *shared.capture_block.lock() = None;
     *shared.second_screen.lock() = SecondScreenStatus::Off;
+    // As main.rs leaves it on macOS.
+    shared.audio_enabled.store(false, Ordering::SeqCst);
     connect_named(shared, "iPhone", 10, 20);
     let mut window = harness_for(shared, egui::vec2(1040.0, 820.0), 1.0, Platform::Mac);
     let second_screen_on = || SettingsFile::load().mac_second_screen;
@@ -588,7 +609,7 @@ fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.get_by_label_contains("Test picture");
     assert!(window.query_by_label("Use the iPad as").is_none());
     assert!(window.query_by_label("Stream PC audio").is_none());
-    window.get_by_label("Video only for now. Your device plays no sound from this Mac.");
+    window.get_by_label("Sound isn't available on Mac yet. Your device gets the picture only.");
 
     window
         .get_by_role_and_label(Role::CheckBox, "Second screen")
@@ -625,6 +646,16 @@ fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mu
         .click();
     window.run_steps(4);
     assert!(!second_screen_on(), "the switch turned it off again");
+
+    // Settings can't turn the test tone on: the switch is disabled, and
+    // clicking it changes nothing.
+    nav(&mut window, "Settings");
+    window.get_by_label("Sound isn't available on Mac yet. Your device gets the picture only.");
+    let audio = window.get_by_role_and_label(Role::CheckBox, "Stream Mac audio");
+    assert!(audio.accesskit_node().is_disabled());
+    audio.click();
+    window.run_steps(4);
+    assert!(!shared.audio_enabled.load(Ordering::SeqCst));
     results.extend_harness(&mut window);
 }
 

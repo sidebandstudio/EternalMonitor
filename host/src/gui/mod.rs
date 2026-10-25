@@ -722,6 +722,7 @@ impl AnalyzerApp {
     }
 
     fn set_stream_audio(&mut self, enabled: bool) {
+        let enabled = enabled && audio_available(self.platform, crate::audio::source_requested());
         self.control
             .shared
             .audio_enabled
@@ -1362,6 +1363,13 @@ fn open_display_settings() {
             warn!(error = %error, "Could not open Windows display settings");
         }
     }
+}
+
+/// Whether the window may turn audio on. The Mac host has no audio
+/// capture yet (its only source is a test tone), so there it stays off
+/// unless automation named a source.
+fn audio_available(platform: Platform, source_requested: bool) -> bool {
+    platform == Platform::Windows || source_requested
 }
 
 /// Opens System Settings at Privacy & Security › Screen & System Audio

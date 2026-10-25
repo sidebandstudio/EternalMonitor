@@ -23,6 +23,13 @@ pub const FRAME_SAMPLES: usize = 960;
 pub const BITRATE: usize = 128_000;
 pub type AudioResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Whether automation named an audio source (`ETERNAL_AUDIO`). The Mac
+/// host captures no audio yet and its only source is a test tone, so it
+/// streams audio only then.
+pub fn source_requested() -> bool {
+    std::env::var_os("ETERNAL_AUDIO").is_some()
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
     pub seq: u32,

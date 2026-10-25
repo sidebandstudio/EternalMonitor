@@ -587,3 +587,12 @@ fn mac_second_screen_status_line_says_what_the_device_shows() {
     assert_eq!(mode_label(true, &S::NotCapturable(7)), "Mirroring");
     assert_eq!(mode_label(false, &S::Active(7)), "Test picture");
 }
+
+#[test]
+fn only_the_windows_host_may_turn_audio_on_by_itself() {
+    assert!(audio_available(Platform::Windows, false));
+    assert!(audio_available(Platform::Windows, true));
+    // The Mac's only source is a test tone: off unless automation asks.
+    assert!(!audio_available(Platform::Mac, false));
+    assert!(audio_available(Platform::Mac, true));
+}
