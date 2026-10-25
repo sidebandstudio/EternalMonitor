@@ -259,13 +259,28 @@ impl<M: VirtualDisplayManager> Keeper<M> {
         }
     }
 
-    /// The display to capture: the client's, or the one kept for a client
-    /// that left less than the grace period ago. `None` means mirror.
-    pub fn want(
+    /// One turn of the display owner. The live session state is observed
+    /// first and expiry is checked against it; only then is the request
+    /// (if any) answered. A request was snapshotted earlier and may be
+    /// stale: on its own it can never remove the display.
+    pub fn serve(
         &mut self,
-        want: Want,
+        session_active: bool,
+        want: Option<Want>,
         now: Instant,
-    ) -> Result<Option<VirtualDisplay>, DisplayError> {
+    ) -> Option<Result<Option<VirtualDisplay>, DisplayError>> {
+        self.observe(session_active, now);
+        if let Err(error) = self.expire(now) {
+            tracing::warn!(%error, "The second-screen display did not go away");
+        }
+        want.map(|want| self.want(want))
+    }
+
+    /// The display to capture: the client's, or the one kept for a client
+    /// whose session ended less than the grace period ago. `None` means
+    /// mirror. Never expires the display: a request without a client only
+    /// says that capture pass saw none.
+    pub fn want(&mut self, want: Want) -> Result<Option<VirtualDisplay>, DisplayError> {
         self.grace = want.grace.max(MIN_GRACE);
         if !want.enabled {
             if self.screen.active().is_some() {
@@ -281,9 +296,8 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             self.gone_since = None;
             return Ok(Some(display));
         }
-        // No client in this request is not news of a disconnect; only
-        // `observe` starts the grace period.
-        self.expire(now)?;
+        // No client in this request is not news of a disconnect: only
+        // `observe` starts the grace period, and only `expire` ends it.
         Ok(self.screen.active().copied())
     }
 
@@ -594,7 +608,7 @@ mod tests {
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
         let display = keeper
-            .want(want_with(Some(duo), Duration::ZERO), start)
+            .want(want_with(Some(duo), Duration::ZERO))
             .unwrap()
             .unwrap();
         // Connected: no expiry is armed, whatever time passes and whatever
@@ -604,7 +618,7 @@ mod tests {
             let at = start + Duration::from_secs(hours * 3600);
             keeper.observe(true, at);
             assert_eq!(
-                keeper.want(want_with(None, Duration::ZERO), at),
+                keeper.want(want_with(None, Duration::ZERO)),
                 Ok(Some(display))
             );
             keeper.expire(at).unwrap();
@@ -622,10 +636,7 @@ mod tests {
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
         let grace = Duration::from_secs(5);
-        let display = keeper
-            .want(want_with(Some(duo), grace), start)
-            .unwrap()
-            .unwrap();
+        let display = keeper.want(want_with(Some(duo), grace)).unwrap().unwrap();
         // Capture ends and no generation asks for 30 s, while the session
         // stays up: the owner keeps observing it every second.
         for second in 1..=30 {
@@ -634,10 +645,7 @@ mod tests {
             keeper.expire(at).unwrap();
         }
         let back = start + Duration::from_secs(30);
-        assert_eq!(
-            keeper.want(want_with(Some(duo), grace), back),
-            Ok(Some(display))
-        );
+        assert_eq!(keeper.want(want_with(Some(duo), grace)), Ok(Some(display)));
         assert_eq!(removals(&keeper), 0);
         // The session ends: removed once the grace period has passed.
         let gone = back + Duration::from_secs(1);
@@ -655,10 +663,10 @@ mod tests {
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
-        let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        let display = keeper.want(want(Some(duo))).unwrap().unwrap();
         let late = start + GRACE * 3;
         keeper.expire(late).unwrap();
-        assert_eq!(keeper.want(want(Some(duo)), late), Ok(Some(display)));
+        assert_eq!(keeper.want(want(Some(duo))), Ok(Some(display)));
         assert_eq!(removals(&keeper), 0);
     }
 
@@ -667,16 +675,14 @@ mod tests {
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
-        keeper.want(want(Some(duo)), start).unwrap();
+        keeper.want(want(Some(duo))).unwrap();
         let gone = start + Duration::from_secs(600);
         keeper.observe(true, gone - Duration::from_secs(1));
         keeper.observe(false, gone);
         assert_eq!(keeper.expires_at(), Some(gone + GRACE));
         // Later observations without a session do not move the start.
         keeper.observe(false, gone + Duration::from_secs(30));
-        keeper
-            .want(want(None), gone + Duration::from_secs(30))
-            .unwrap();
+        keeper.want(want(None)).unwrap();
         assert_eq!(keeper.expires_at(), Some(gone + GRACE));
         keeper
             .expire(gone + GRACE - Duration::from_millis(1))
@@ -686,7 +692,7 @@ mod tests {
         assert_eq!(removals(&keeper), 1);
         assert!(keeper.screen.manager.online.is_empty());
         assert_eq!(keeper.expires_at(), None);
-        assert_eq!(keeper.want(want(None), gone + GRACE * 2), Ok(None));
+        assert_eq!(keeper.want(want(None)), Ok(None));
     }
 
     #[test]
@@ -694,18 +700,18 @@ mod tests {
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
-        let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        let display = keeper.want(want(Some(duo))).unwrap().unwrap();
         let gone = start + Duration::from_secs(5);
         keeper.observe(false, gone);
         for second in 0..60 {
             let at = gone + Duration::from_secs(second);
             keeper.observe(false, at);
-            assert_eq!(keeper.want(want(None), at), Ok(Some(display)));
+            assert_eq!(keeper.want(want(None)), Ok(Some(display)));
             keeper.expire(at).unwrap();
         }
         let back = gone + GRACE - Duration::from_millis(1);
         keeper.observe(true, back);
-        assert_eq!(keeper.want(want(Some(duo)), back), Ok(Some(display)));
+        assert_eq!(keeper.want(want(Some(duo))), Ok(Some(display)));
         assert_eq!(keeper.expires_at(), None, "connected again: disarmed");
         keeper.expire(gone + GRACE * 2).unwrap();
         assert_eq!(removals(&keeper), 0);
@@ -720,28 +726,98 @@ mod tests {
     }
 
     #[test]
-    fn turning_second_screen_off_removes_the_display_at_once() {
+    fn a_stale_request_cannot_remove_a_reconnected_clients_display() {
+        // Sol's sequence, through the owner's turn (`serve`).
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
-        keeper
-            .want(want(Some(client(DUO, (2670, 1878)))), start)
+        let duo = client(DUO, (2670, 1878));
+        let grace = Duration::from_secs(5);
+        let display = keeper
+            .serve(true, Some(want_with(Some(duo), grace)), start)
+            .unwrap()
+            .unwrap()
             .unwrap();
+        // The session drops; the owner's timer observes it.
+        let gone = start + Duration::from_secs(10);
+        keeper.serve(false, None, gone);
+        assert_eq!(keeper.expires_at(), Some(gone + grace));
+        // 1. A capture pass snapshots no client and queues its request.
+        let stale = want_with(None, grace);
+        // 2. The client reconnects within the grace period (nothing has
+        //    observed it yet).
+        // 3. The stale request reaches the owner exactly at the deadline.
+        let answer = keeper.serve(true, Some(stale), gone + grace);
+        // 4. The live session was observed first: the display survives.
+        assert_eq!(answer, Some(Ok(Some(display))));
+        assert_eq!(removals(&keeper), 0);
+        assert_eq!(keeper.expires_at(), None);
+        // And the next capture pass with the client gets the same ID.
+        assert_eq!(
+            keeper.serve(true, Some(want_with(Some(duo), grace)), gone + grace * 2),
+            Some(Ok(Some(display)))
+        );
+        assert_eq!(
+            keeper.screen.manager.ops.len(),
+            1,
+            "one create, nothing else"
+        );
+        // Without the reconnect, the same request at the deadline finds the
+        // session still gone, and the live state expires the display.
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        keeper.serve(true, Some(want_with(Some(duo), grace)), start);
+        keeper.serve(false, None, gone);
+        assert_eq!(
+            keeper.serve(false, Some(want_with(None, grace)), gone + grace),
+            Some(Ok(None))
+        );
+        assert_eq!(removals(&keeper), 1);
+    }
+
+    #[test]
+    fn a_request_without_a_client_never_removes_the_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let display = keeper.want(want(Some(duo))).unwrap().unwrap();
+        // Session connected: any number of passes without a client, at any
+        // time, through the owner's turn.
+        for hours in [0, 1, 24, 240] {
+            let at = start + Duration::from_secs(hours * 3600);
+            assert_eq!(
+                keeper.serve(true, Some(want(None)), at),
+                Some(Ok(Some(display)))
+            );
+        }
+        // Even with the grace period armed and long past, a request alone
+        // does not remove it; only expiry from the live state does.
+        keeper.observe(false, start);
+        for _ in 0..3 {
+            assert_eq!(keeper.want(want(None)), Ok(Some(display)));
+        }
+        assert_eq!(removals(&keeper), 0);
+        keeper.expire(start + GRACE).unwrap();
+        assert_eq!(removals(&keeper), 1);
+    }
+
+    #[test]
+    fn turning_second_screen_off_removes_the_display_at_once() {
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        keeper.want(want(Some(client(DUO, (2670, 1878))))).unwrap();
         let off = Want {
             enabled: false,
             ..want(Some(client(DUO, (2670, 1878))))
         };
-        assert_eq!(keeper.want(off.clone(), start), Ok(None));
+        assert_eq!(keeper.want(off.clone()), Ok(None));
         assert_eq!(removals(&keeper), 1);
-        assert_eq!(keeper.want(off, start), Ok(None));
+        assert_eq!(keeper.want(off), Ok(None));
         assert_eq!(removals(&keeper), 1);
     }
 
     #[test]
     fn a_size_change_and_quitting_remove_the_display() {
-        let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
-        let first = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        let first = keeper.want(want(Some(duo))).unwrap().unwrap();
         let outer = Want {
             client: Some(Wanted {
                 client: duo,
@@ -755,7 +831,7 @@ mod tests {
             }),
             ..want(None)
         };
-        let second = keeper.want(outer, start).unwrap().unwrap();
+        let second = keeper.want(outer).unwrap().unwrap();
         assert_ne!(second.id, first.id);
         assert_eq!(removals(&keeper), 1);
         keeper.release().unwrap();

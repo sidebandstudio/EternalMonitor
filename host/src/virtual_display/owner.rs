@@ -69,10 +69,15 @@ impl DisplayOwner {
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    // Every turn observes the live session before anything
+                    // else, so a request snapshotted before a reconnect
+                    // cannot remove the reconnected client's display.
                     match request {
                         Some(Request::Want { want, reply }) => {
                             let result = match &mut keeper {
-                                Ok(keeper) => keeper.want(want, Instant::now()),
+                                Ok(keeper) => keeper
+                                    .serve(session_active(), Some(want), Instant::now())
+                                    .expect("a request is answered"),
                                 Err(error) if want.enabled && want.client.is_some() => {
                                     Err(error.clone())
                                 }
@@ -87,13 +92,10 @@ impl DisplayOwner {
                             };
                             let _ = reply.send(result);
                         }
-                        None => {}
-                    }
-                    if let Ok(keeper) = &mut keeper {
-                        let now = Instant::now();
-                        keeper.observe(session_active(), now);
-                        if let Err(error) = keeper.expire(now) {
-                            tracing::warn!(%error, "The second-screen display did not go away");
+                        None => {
+                            if let Ok(keeper) = &mut keeper {
+                                keeper.serve(session_active(), None, Instant::now());
+                            }
                         }
                     }
                 }
