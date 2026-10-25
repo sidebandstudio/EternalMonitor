@@ -82,31 +82,44 @@ final class DuoFoldTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
                                "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
+        let logStart = (try? Data(contentsOf: URL(fileURLWithPath: log)).count) ?? 0
         app.launch()
         defer { app.terminate() }
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 15))
-        waitUntil(app, isOn: .outer)
+        let stream = try hostSession(app: app, log: log, after: logStart)
+        waitUntil(app, isOn: .outer, stream: stream)
         check(app, on: .outer, fill: false, log: log, name: "fit")
+        assertUnbroken(stream, "fit on the outer screen")
         setFill(true, app: app)
+        assertUnbroken(stream, "switching to Fill on the outer screen")
         check(app, on: .outer, fill: true, log: log, name: "fill")
+        assertUnbroken(stream, "fill on the outer screen")
 
         // Open and close in each mode, all on one stream.
-        fold(to: 180, app: app, expecting: .inner)
+        fold(to: 180, app: app, expecting: .inner, stream: stream)
         check(app, on: .inner, fill: true, log: log, name: "fill-after-unfolding")
+        assertUnbroken(stream, "fill after unfolding")
         setFill(false, app: app)
+        assertUnbroken(stream, "switching to Fit on the inner screen")
         check(app, on: .inner, fill: false, log: log, name: "fit")
+        assertUnbroken(stream, "fit on the inner screen")
         // Half open stays on the inner screen.
-        fold(to: 110, app: app, expecting: .inner)
+        fold(to: 110, app: app, expecting: .inner, stream: stream)
         check(app, on: .inner, fill: false, log: log, name: "fit-half-open")
-        fold(to: 0, app: app, expecting: .outer)
+        assertUnbroken(stream, "fit half open")
+        fold(to: 0, app: app, expecting: .outer, stream: stream)
         check(app, on: .outer, fill: false, log: log, name: "fit-after-folding")
-        fold(to: 180, app: app, expecting: .inner)
+        assertUnbroken(stream, "fit after folding")
+        fold(to: 180, app: app, expecting: .inner, stream: stream)
         check(app, on: .inner, fill: false, log: log, name: "fit-after-unfolding")
+        assertUnbroken(stream, "fit after unfolding")
         setFill(true, app: app)
+        assertUnbroken(stream, "switching to Fill on the inner screen")
         check(app, on: .inner, fill: true, log: log, name: "fill")
-        fold(to: 0, app: app, expecting: .outer)
+        assertUnbroken(stream, "fill on the inner screen")
+        fold(to: 0, app: app, expecting: .outer, stream: stream)
         check(app, on: .outer, fill: true, log: log, name: "fill-after-folding")
-        XCTAssertFalse(app.staticTexts["Reconnecting to your PC"].exists, "A fold dropped the stream")
+        assertUnbroken(stream, "fill after folding")
     }
 
     /// The sheet's Pair button, or the bar's when the number pad covers it,
@@ -126,23 +139,32 @@ final class DuoFoldTests: XCTestCase {
 
     // MARK: - Folding
 
+    /// With a stream, the stream must not break at any point of the fold:
+    /// it is checked as soon as the hinge moves, while the app changes
+    /// screens, and once the move has settled.
     private func fold(to degrees: Double, app: XCUIApplication? = nil, expecting screen: Screen? = nil,
-                      file: StaticString = #filePath, line: UInt = #line) {
+                      stream: Stream? = nil, file: StaticString = #filePath, line: UInt = #line) {
         var error: NSString?
         XCTAssertTrue(EMSetHingeAngle(degrees, 5, &error), error as String? ?? "", file: file, line: line)
-        if let app, let screen { waitUntil(app, isOn: screen, file: file, line: line) }
+        if let stream { assertUnbroken(stream, "folding to \(Int(degrees))°", file: file, line: line) }
+        if let app, let screen { waitUntil(app, isOn: screen, stream: stream, file: file, line: line) }
     }
 
     /// The outer screen is iPhone-sized (466 x 678 points); the inner one
     /// shows the app in landscape, about 951 x 669.
-    private func waitUntil(_ app: XCUIApplication, isOn screen: Screen,
+    private func waitUntil(_ app: XCUIApplication, isOn screen: Screen, stream: Stream? = nil,
                            file: StaticString = #filePath, line: UInt = #line) {
         let deadline = Date().addingTimeInterval(10)
-        while screenShowing(app) != screen && Date() < deadline { Thread.sleep(forTimeInterval: 0.25) }
+        while screenShowing(app) != screen && Date() < deadline {
+            if let stream { assertUnbroken(stream, "moving to the \(screen) screen", file: file, line: line) }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
         XCTAssertEqual(screenShowing(app), screen, "The app is \(app.frame.size), not on the \(screen) screen",
                        file: file, line: line)
+        if let stream { assertUnbroken(stream, "arriving on the \(screen) screen", file: file, line: line) }
         // Let the move between screens finish before reading the picture.
         Thread.sleep(forTimeInterval: 1)
+        if let stream { assertUnbroken(stream, "settling on the \(screen) screen", file: file, line: line) }
     }
 
     /// XCUITest reports the inner screen in its portrait panel's points
@@ -159,6 +181,66 @@ final class DuoFoldTests: XCTestCase {
         if size.width < 600 && size.height > size.width { return .outer }
         if max(size.width, size.height) > 800 { return .inner }
         return nil
+    }
+
+    // MARK: - One unbroken stream
+
+    /// The stream's session on the synthetic host. A stream that broke and
+    /// came back leaves its trace in the host's log even when the picture
+    /// looks fine again: a second session, or the first one ending.
+    private struct Stream {
+        let app: XCUIApplication
+        let log: String
+        let offset: Int
+        let sessionID: String
+    }
+
+    private func hostSession(app: XCUIApplication, log: String, after offset: Int,
+                             file: StaticString = #filePath, line: UInt = #line) throws -> Stream {
+        var sessions: [String] = []
+        let deadline = Date().addingTimeInterval(5)
+        repeat {
+            sessions = hostEvents(in: log, after: offset).sessions
+            if !sessions.isEmpty { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+        XCTAssertEqual(sessions.count, 1, "The host started sessions \(sessions) for one connect", file: file, line: line)
+        return Stream(app: app, log: log, offset: offset, sessionID: try XCTUnwrap(sessions.first, file: file, line: line))
+    }
+
+    /// Fails at once, without waiting for a recovery, if the app shows a
+    /// lost signal or a problem, is back on the connect screen, or the host
+    /// saw a new HELLO or the session end.
+    private func assertUnbroken(_ stream: Stream, _ step: String, file: StaticString = #filePath, line: UInt = #line) {
+        let broken = stream.app.descendants(matching: .any).matching(NSPredicate(
+            format: "label CONTAINS[c] 'reconnecting' OR identifier IN %@",
+            ["connect.problemTitle", "connect.host", "connect.button"])).firstMatch
+        if broken.exists {
+            XCTFail("\(step): the stream broke; the app shows \(broken.identifier) \"\(broken.label)\"", file: file, line: line)
+        }
+        let events = hostEvents(in: stream.log, after: stream.offset)
+        XCTAssertEqual(events.sessions, [stream.sessionID], "\(step): the host started another session", file: file, line: line)
+        XCTAssertEqual(events.breaks, [], "\(step): the host's session broke", file: file, line: line)
+    }
+
+    /// Session IDs the host established since `offset`, and its lines about
+    /// a session ending or a new HELLO arriving while one runs.
+    private func hostEvents(in log: String, after offset: Int) -> (sessions: [String], breaks: [String]) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: log)), data.count > offset else { return ([], []) }
+        // The host colours its console log.
+        let text = String(decoding: data.dropFirst(offset), as: UTF8.self)
+            .replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+        let breaking = ["superseding session", "Second client rejected", "said goodbye", "liveness expired", "turned away"]
+        var sessions: [String] = [], breaks: [String] = []
+        for line in text.split(separator: "\n").map(String.init) {
+            if line.contains("Client session established") {
+                let id = line.range(of: #"session_id=\d+"#, options: .regularExpression)
+                sessions.append(id.map { String(line[$0].dropFirst("session_id=".count)) } ?? line)
+            } else if breaking.contains(where: line.contains) {
+                breaks.append(line)
+            }
+        }
+        return (sessions, breaks)
     }
 
     // MARK: - Stream checks
