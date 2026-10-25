@@ -1,7 +1,7 @@
 import XCTest
 
-/// On a phone in landscape the number pad covers the sheet's Pair button, so
-/// the navigation bar offers Pair too. iPad never shows it.
+/// On a phone in landscape, or a short one, the number pad covers the sheet's
+/// Pair button, so the navigation bar offers Pair too. iPad never shows it.
 final class PairingLandscapeTests: XCTestCase {
     override func tearDown() {
         rotate(.portrait)
@@ -33,10 +33,16 @@ final class PairingLandscapeTests: XCTestCase {
         XCTAssertLessThan(bar.frame.maxY, app.keyboards.firstMatch.frame.minY)
 
         rotate(.portrait)
-        XCTAssertTrue(app.buttons["pairing.submit"].waitForExistence(timeout: 5))
-        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: bar)
+        let submit = app.buttons["pairing.submit"]
+        XCTAssertTrue(submit.waitForExistence(timeout: 5))
+        // The bar goes, unless the pad still covers the sheet's Pair, as on
+        // a short phone such as the folded iPhone Duo.
+        let settled = NSPredicate { _, _ in
+            let top = app.keyboards.firstMatch.frame.minY
+            return submit.frame.maxY > top ? bar.exists && bar.frame.maxY < top : !bar.exists && submit.isHittable
+        }
+        expectation(for: settled, evaluatedWith: nil)
         waitForExpectations(timeout: 5)
-        XCTAssertTrue(app.buttons["pairing.submit"].isHittable)
     }
 
     /// The bar says why Pair can't be tapped, and an error shows above the

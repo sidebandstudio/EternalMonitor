@@ -48,12 +48,14 @@ final class DuoFoldTests: XCTestCase {
         connect.tap()
         let input = app.textFields["pairing.code"]
         XCTAssertTrue(input.waitForExistence(timeout: 10), "Connect on the inner screen did not ask for the code")
+        assertPairAboveTheNumberPad(app, on: .inner)
         capture("pairing", on: .inner, app: app)
 
         fold(to: 0, app: app, expecting: .outer)
         XCTAssertTrue(input.waitForExistence(timeout: 5), "Folding closed the pairing sheet")
-        capture("pairing", on: .outer, app: app)
         input.tap()
+        assertPairAboveTheNumberPad(app, on: .outer)
+        capture("pairing", on: .outer, app: app)
         input.typeText(code)
         let bar = app.buttons["pairing.submitBar"]
         (bar.exists ? bar : app.buttons["pairing.submit"]).tap()
@@ -107,6 +109,21 @@ final class DuoFoldTests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Reconnecting to your PC"].exists, "A fold dropped the stream")
     }
 
+    /// The sheet's Pair button, or the bar's when the number pad covers it,
+    /// sits above the pad: a number pad has no key that submits.
+    private func assertPairAboveTheNumberPad(_ app: XCUIApplication, on screen: Screen,
+                                             file: StaticString = #filePath, line: UInt = #line) {
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "No number pad on the \(screen) screen", file: file, line: line)
+        let submit = app.buttons["pairing.submit"], bar = app.buttons["pairing.submitBar"]
+        let reachable = NSPredicate { _, _ in
+            let top = keyboard.frame.minY
+            return (bar.exists && bar.frame.maxY <= top) || submit.frame.maxY <= top
+        }
+        let result = XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: reachable, object: nil)], timeout: 5)
+        XCTAssertEqual(result, .completed, "Pair is under the number pad on the \(screen) screen", file: file, line: line)
+    }
+
     // MARK: - Folding
 
     private func fold(to degrees: Double, app: XCUIApplication? = nil, expecting screen: Screen? = nil,
@@ -135,12 +152,6 @@ final class DuoFoldTests: XCTestCase {
         let frame = app.frame.size
         return screenShowing(app) == .inner && frame.height > frame.width
             ? CGSize(width: frame.height, height: frame.width) : frame
-    }
-
-    /// Where XCUITest must touch to reach `point` in the app's layout.
-    private func screenPoint(_ point: CGPoint, app: XCUIApplication) -> CGPoint {
-        let frame = app.frame.size
-        return interfaceSize(app) == frame ? point : CGPoint(x: frame.width - point.y, y: point.x)
     }
 
     private func screenShowing(_ app: XCUIApplication) -> Screen? {
@@ -208,13 +219,12 @@ final class DuoFoldTests: XCTestCase {
         let targets = [CGPoint(x: window.width * 0.3, y: window.height * 0.45),
                        CGPoint(x: window.width * 0.7, y: window.height * 0.55)]
         let before = (try? Data(contentsOf: URL(fileURLWithPath: log)).count) ?? 0
+        // Offsets from the stream's element are in the app's own layout,
+        // even where XCUITest reports frames in the inner panel's points.
         let relay = app.otherElements["display.relay"]
         XCTAssertTrue(relay.waitForExistence(timeout: 5), file: file, line: line)
-        let origin = relay.frame.origin
         for target in targets {
-            let point = screenPoint(target, app: app)
-            relay.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: point.x - origin.x, dy: point.y - origin.y)).tap()
+            relay.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: target.x, dy: target.y)).tap()
         }
         var presses: [CGPoint] = []
         let pressDeadline = Date().addingTimeInterval(10)
