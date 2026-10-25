@@ -114,13 +114,19 @@ impl ContentLister for ScreenCaptureKitLister {
 
 static OWNER: OnceLock<Option<DisplayOwner>> = OnceLock::new();
 
-/// The process's display owner, started on first use.
-fn owner() -> Option<&'static DisplayOwner> {
+/// The process's display owner, started on first use. It follows the
+/// transport's session state in `shared`, which alone decides when a
+/// client is gone.
+fn owner(shared: &SharedControl) -> Option<&'static DisplayOwner> {
     OWNER
         .get_or_init(|| {
-            DisplayOwner::spawn(|| CgVirtualDisplays::new(ModeChange::Recreate))
-                .inspect_err(|error| warn!(%error, "Could not start the display owner"))
-                .ok()
+            let shared = shared.clone();
+            DisplayOwner::spawn(
+                || CgVirtualDisplays::new(ModeChange::Recreate),
+                move || shared.client_connected(),
+            )
+            .inspect_err(|error| warn!(%error, "Could not start the display owner"))
+            .ok()
         })
         .as_ref()
 }
@@ -438,25 +444,6 @@ impl<'a> Targets<'a> {
     }
 }
 
-impl Targets<'_> {
-    /// This capture generation is over, so nothing watches the client any
-    /// more: start the grace period as if it had left. A restart's next
-    /// generation sees the client again well within it.
-    pub(crate) fn capture_ended(&mut self) {
-        if !self.settings.mac_second_screen {
-            return;
-        }
-        let unobserved = Want {
-            enabled: true,
-            client: None,
-            grace: Duration::from_secs(self.settings.mac_second_screen_grace_secs.into()),
-        };
-        if let Err(error) = self.owner.want(unobserved) {
-            warn!(%error, "Could not hand the second-screen display back to the owner");
-        }
-    }
-}
-
 impl DisplayChoice for Targets<'_> {
     fn display(&mut self, now: Instant) -> u32 {
         self.choose(now)
@@ -485,7 +472,7 @@ pub(super) fn run_capture_loop(
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let main = CGMainDisplayID();
-    let Some(owner) = owner() else {
+    let Some(owner) = owner(&shared) else {
         return super::sck::stream::run_capture_loop(
             slot,
             shared,
@@ -507,10 +494,7 @@ pub(super) fn run_capture_loop(
         }),
         main,
     );
-    let result =
-        super::sck::stream::run_capture_loop(slot, shared, generation, frame_number, &mut targets);
-    targets.capture_ended();
-    result
+    super::sck::stream::run_capture_loop(slot, shared, generation, frame_number, &mut targets)
 }
 
 /// The main display, when there is no display owner at all.
@@ -612,14 +596,24 @@ pub(crate) mod tests {
         assert!(shared.client_connected());
     }
 
-    /// A display owner over fake displays that reports what it does.
+    /// A display owner over fake displays that reports what it does. Its
+    /// session is always active.
     pub(crate) fn fake_owner() -> (DisplayOwner, mpsc::Receiver<Op>) {
-        fake_owner_with(|| {})
+        fake_owner_with(|| {}, || true)
+    }
+
+    /// The same, following `shared`'s session state as the host does.
+    pub(crate) fn fake_owner_following(
+        shared: &SharedControl,
+    ) -> (DisplayOwner, mpsc::Receiver<Op>) {
+        let shared = shared.clone();
+        fake_owner_with(|| {}, move || shared.client_connected())
     }
 
     /// The same, running `during_create` while a display is being made.
     pub(crate) fn fake_owner_with(
         during_create: impl Fn() + Send + 'static,
+        session_active: impl Fn() -> bool + Send + 'static,
     ) -> (DisplayOwner, mpsc::Receiver<Op>) {
         use crate::virtual_display::{DisplayError, DisplaySpec, VirtualDisplay};
         let (ops_tx, ops) = mpsc::channel();
@@ -650,9 +644,10 @@ pub(crate) mod tests {
             }
         }
         let during_create: Box<dyn Fn() + Send> = Box::new(during_create);
-        let owner = DisplayOwner::spawn(move || {
-            Ok(Reporting(FakeDisplays::default(), ops_tx, during_create))
-        })
+        let owner = DisplayOwner::spawn(
+            move || Ok(Reporting(FakeDisplays::default(), ops_tx, during_create)),
+            session_active,
+        )
         .expect("owner thread");
         (owner, ops)
     }
@@ -804,26 +799,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_restart_keeps_the_display_and_a_stopped_pipeline_starts_the_grace_period() {
+    fn a_long_gap_between_generations_keeps_the_display_until_the_session_ends() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner_following(&shared);
         let settings = || {
             Box::new(MemorySettings {
-                next: Some(enabled()),
+                next: Some(SettingsFile {
+                    mac_second_screen_grace_secs: 5,
+                    ..enabled()
+                }),
             })
         };
         connect(&shared, 0xd0, (2670, 1878));
         let mut first = targets(&shared, &owner, settings(), FakeLister::listed());
         let id = first.display(Instant::now());
-        // A restart: the generation ends, the next one sees the client.
-        first.capture_ended();
+        // The generation ends; none follows for longer than the grace
+        // period, while the session stays active.
+        drop(first);
+        std::thread::sleep(crate::virtual_display::MIN_GRACE + Duration::from_secs(1));
         let mut second = targets(&shared, &owner, settings(), FakeLister::listed());
         assert_eq!(second.display(Instant::now()), id);
         let made: Vec<_> = ops.try_iter().collect();
         assert!(matches!(made[..], [Op::Create(_)]), "{made:?}");
-        // Streaming stops: the owner's grace clock is running.
-        second.capture_ended();
-        assert!(ops.try_recv().is_err(), "kept for the grace period");
+        drop(second);
+        // The transport loses the session: removed after the grace period.
+        let gone = Instant::now();
+        let _ = shared
+            .session
+            .lock()
+            .link_lost(crate::transport::link::LinkId::Udp);
+        assert!(!shared.client_connected());
+        assert_eq!(
+            ops.recv_timeout(Duration::from_secs(10)),
+            Ok(Op::Remove(id))
+        );
+        assert!(gone.elapsed() >= crate::virtual_display::MIN_GRACE);
     }
 
     /// Writes settings the way the host does: a temporary file, renamed.
@@ -840,10 +850,13 @@ pub(crate) mod tests {
         write_settings(&settings_path, &enabled());
         let user_path = settings_path.clone();
         // The user turns second screen off while the display is being made.
-        let (owner, ops) = fake_owner_with(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            write_settings(&user_path, &SettingsFile::default());
-        });
+        let (owner, ops) = fake_owner_with(
+            move || {
+                std::thread::sleep(Duration::from_millis(20));
+                write_settings(&user_path, &SettingsFile::default());
+            },
+            || true,
+        );
         let shared = SharedControl::new(0, 15_000_000);
         let mut targets = Targets::new(
             shared.clone(),

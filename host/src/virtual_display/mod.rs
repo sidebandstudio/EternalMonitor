@@ -225,17 +225,16 @@ pub struct Want {
     pub grace: Duration,
 }
 
-/// The shortest grace period. A pipeline restart passes through a moment
-/// with no client seen (`mac_screen` reports one when a capture generation
-/// ends), and a restart must never remove the display; a setting below
-/// this, including 0, is raised to it.
+/// The shortest grace period; a setting below this, including 0, is
+/// raised to it, so a session that drops for a moment keeps its display.
 pub const MIN_GRACE: Duration = Duration::from_secs(5);
 
 /// When a display goes away. A pipeline restart or a capture retry never
 /// removes it; only these do:
-/// - its client has been gone for the grace period, counted from the
-///   disconnect (a connected client's display never expires, however long
-///   a request takes);
+/// - its client's session has been gone for the grace period, counted from
+///   when the transport's session state ([`Keeper::observe`]) first showed
+///   no session. Capture only ever reports presence: a connected client's
+///   display never expires, whatever capture is doing or how long it pauses;
 /// - second screen is turned off;
 /// - the device's profile changes size (`SecondScreen::ensure`), or
 ///   another device takes over;
@@ -282,12 +281,21 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             self.gone_since = None;
             return Ok(Some(display));
         }
-        if self.screen.active().is_some() && self.gone_since.is_none() {
-            tracing::info!(grace = ?self.grace, "Second-screen client gone; keeping its display for the grace period");
-            self.gone_since = Some(now);
-        }
+        // No client in this request is not news of a disconnect; only
+        // `observe` starts the grace period.
         self.expire(now)?;
         Ok(self.screen.active().copied())
+    }
+
+    /// The transport's session state. An active session keeps the display;
+    /// the first observation without one starts the grace period.
+    pub fn observe(&mut self, session_active: bool, now: Instant) {
+        if session_active {
+            self.gone_since = None;
+        } else if self.screen.active().is_some() && self.gone_since.is_none() {
+            tracing::info!(grace = ?self.grace, "Second-screen session gone; keeping its display for the grace period");
+            self.gone_since = Some(now);
+        }
     }
 
     /// Removes the display once its client has been gone for the grace
@@ -589,29 +597,57 @@ mod tests {
             .want(want_with(Some(duo), Duration::ZERO), start)
             .unwrap()
             .unwrap();
-        // Connected: no expiry is armed, whatever time passes between
-        // requests (a slow target check, a long stall).
+        // Connected: no expiry is armed, whatever time passes and whatever
+        // capture reports (a pass without the client is not a disconnect).
         assert_eq!(keeper.expires_at(), None);
         for hours in [0, 1, 24] {
-            keeper
-                .expire(start + Duration::from_secs(hours * 3600))
-                .unwrap();
+            let at = start + Duration::from_secs(hours * 3600);
+            keeper.observe(true, at);
+            assert_eq!(
+                keeper.want(want_with(None, Duration::ZERO), at),
+                Ok(Some(display))
+            );
+            keeper.expire(at).unwrap();
         }
+        assert_eq!(removals(&keeper), 0);
+        // Grace 0 means the minimum, counted from the session's end.
+        let gone = start + Duration::from_secs(90_000);
+        keeper.observe(false, gone);
+        assert_eq!(keeper.expires_at(), Some(gone + MIN_GRACE));
+    }
+
+    #[test]
+    fn a_long_gap_between_generations_keeps_a_connected_clients_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let grace = Duration::from_secs(5);
+        let display = keeper
+            .want(want_with(Some(duo), grace), start)
+            .unwrap()
+            .unwrap();
+        // Capture ends and no generation asks for 30 s, while the session
+        // stays up: the owner keeps observing it every second.
+        for second in 1..=30 {
+            let at = start + Duration::from_secs(second);
+            keeper.observe(true, at);
+            keeper.expire(at).unwrap();
+        }
+        let back = start + Duration::from_secs(30);
         assert_eq!(
-            keeper.want(
-                want_with(Some(duo), Duration::ZERO),
-                start + Duration::from_secs(86_400)
-            ),
+            keeper.want(want_with(Some(duo), grace), back),
             Ok(Some(display))
         );
         assert_eq!(removals(&keeper), 0);
-        // Grace 0 means the minimum, counted from the disconnect.
-        let gone = start + Duration::from_secs(90_000);
-        assert_eq!(
-            keeper.want(want_with(None, Duration::ZERO), gone),
-            Ok(Some(display))
-        );
-        assert_eq!(keeper.expires_at(), Some(gone + MIN_GRACE));
+        // The session ends: removed once the grace period has passed.
+        let gone = back + Duration::from_secs(1);
+        keeper.observe(false, gone);
+        keeper
+            .expire(gone + grace - Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(removals(&keeper), 0);
+        keeper.expire(gone + grace).unwrap();
+        assert_eq!(removals(&keeper), 1);
     }
 
     #[test]
@@ -620,8 +656,6 @@ mod tests {
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
         let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
-        // The next request from a connected client arrives long after the
-        // grace period (the capture thread was busy): the display stays.
         let late = start + GRACE * 3;
         keeper.expire(late).unwrap();
         assert_eq!(keeper.want(want(Some(duo)), late), Ok(Some(display)));
@@ -629,24 +663,21 @@ mod tests {
     }
 
     #[test]
-    fn grace_counts_from_the_disconnect_and_then_removes_the_display() {
+    fn grace_counts_from_the_sessions_end_and_then_removes_the_display() {
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
         keeper.want(want(Some(duo)), start).unwrap();
-        // Connected for ten minutes, then gone.
         let gone = start + Duration::from_secs(600);
-        keeper
-            .want(want(Some(duo)), gone - Duration::from_secs(1))
-            .unwrap();
-        keeper.want(want(None), gone).unwrap();
+        keeper.observe(true, gone - Duration::from_secs(1));
+        keeper.observe(false, gone);
         assert_eq!(keeper.expires_at(), Some(gone + GRACE));
-        // Later passes without the client do not move the start.
+        // Later observations without a session do not move the start.
+        keeper.observe(false, gone + Duration::from_secs(30));
         keeper
             .want(want(None), gone + Duration::from_secs(30))
             .unwrap();
         assert_eq!(keeper.expires_at(), Some(gone + GRACE));
-        // The owner's timer, with no request at all.
         keeper
             .expire(gone + GRACE - Duration::from_millis(1))
             .unwrap();
@@ -665,13 +696,15 @@ mod tests {
         let duo = client(DUO, (2670, 1878));
         let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
         let gone = start + Duration::from_secs(5);
-        // Pipeline restarts and capture retries ask without a client.
+        keeper.observe(false, gone);
         for second in 0..60 {
             let at = gone + Duration::from_secs(second);
+            keeper.observe(false, at);
             assert_eq!(keeper.want(want(None), at), Ok(Some(display)));
             keeper.expire(at).unwrap();
         }
         let back = gone + GRACE - Duration::from_millis(1);
+        keeper.observe(true, back);
         assert_eq!(keeper.want(want(Some(duo)), back), Ok(Some(display)));
         assert_eq!(keeper.expires_at(), None, "connected again: disarmed");
         keeper.expire(gone + GRACE * 2).unwrap();
@@ -681,9 +714,8 @@ mod tests {
             1,
             "one create, nothing else"
         );
-        // A second disconnect starts a fresh grace period.
         let again = back + Duration::from_secs(10);
-        keeper.want(want(None), again).unwrap();
+        keeper.observe(false, again);
         assert_eq!(keeper.expires_at(), Some(again + GRACE));
     }
 
