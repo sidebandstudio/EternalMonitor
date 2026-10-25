@@ -16,7 +16,7 @@
 //! security decision (plan-v2 point 2); until then the relay keeps
 //! recording, as on every non-Windows host.
 
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use objc2_core_graphics::CGMainDisplayID;
@@ -32,17 +32,75 @@ use crate::virtual_display::mac::{CgVirtualDisplays, ModeChange};
 use crate::virtual_display::owner::DisplayOwner;
 use crate::virtual_display::{SecondScreenStatus, Want, Wanted};
 
-/// How long a new display may take to appear in ScreenCaptureKit's list
-/// before the main display is mirrored instead (macOS 15.7 has been seen
-/// not to list a virtual display at all).
+/// How long, in wall-clock time, a new display may take to appear in
+/// ScreenCaptureKit's list before the main display is mirrored instead
+/// (macOS 15.7 has been seen not to list a virtual display at all).
 const LIST_WAIT: Duration = Duration::from_secs(4);
+/// The pause between one listing answer and the next question.
 const LIST_POLL: Duration = Duration::from_millis(250);
 /// How often a display that was not listed is checked again.
 const LIST_RECHECK: Duration = Duration::from_secs(5);
+/// The longest the capture thread goes without a heartbeat while waiting.
+const HEARTBEAT_SLICE: Duration = Duration::from_millis(50);
 
-/// Whether ScreenCaptureKit offers a display.
-pub(crate) trait ContentLister {
+/// Whether ScreenCaptureKit offers a display. A call can block for many
+/// seconds, so it runs on a [`ListingWorker`], never the capture thread.
+pub(crate) trait ContentLister: Send {
     fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure>;
+}
+
+/// Runs listing calls one at a time on a thread of its own. A call still
+/// running is never joined by another, and its answer is collected
+/// whenever it arrives.
+struct ListingWorker {
+    questions: mpsc::Sender<u32>,
+    answers: mpsc::Receiver<(u32, bool)>,
+    outstanding: Option<u32>,
+}
+
+impl ListingWorker {
+    fn spawn(lister: Box<dyn ContentLister>) -> Self {
+        let (questions, incoming) = mpsc::channel::<u32>();
+        let (reply, answers) = mpsc::channel();
+        // Ends when the worker is dropped and any call in hand returns.
+        let spawned = std::thread::Builder::new()
+            .name("display-listing".into())
+            .spawn(move || {
+                for display_id in incoming {
+                    let listed = lister.is_listed(display_id).unwrap_or(false);
+                    if reply.send((display_id, listed)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            warn!(%error, "Could not start the display listing thread");
+        }
+        Self {
+            questions,
+            answers,
+            outstanding: None,
+        }
+    }
+
+    /// Asks about `display_id`, unless a call is still running.
+    fn ask(&mut self, display_id: u32) {
+        if self.outstanding.is_none() && self.questions.send(display_id).is_ok() {
+            self.outstanding = Some(display_id);
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
+    /// The running call's answer, waiting up to `timeout` for it.
+    fn answer(&mut self, timeout: Duration) -> Option<(u32, bool)> {
+        self.outstanding?;
+        let answer = self.answers.recv_timeout(timeout).ok()?;
+        self.outstanding = None;
+        Some(answer)
+    }
 }
 
 struct ScreenCaptureKitLister;
@@ -131,9 +189,9 @@ pub(crate) struct Targets<'a> {
     owner: &'a DisplayOwner,
     settings_source: Box<dyn SettingsSource + 'a>,
     settings: SettingsFile,
-    lister: Box<dyn ContentLister + 'a>,
-    /// Sleeps between listing checks, keeping the stage's heartbeats.
-    wait: Box<dyn FnMut(Duration) + 'a>,
+    listing: ListingWorker,
+    /// Stamps the stage's heartbeats while the capture thread waits.
+    heartbeat: Box<dyn FnMut() + 'a>,
     main: u32,
     /// The display ScreenCaptureKit was last seen to offer.
     listed: Option<u32>,
@@ -146,8 +204,8 @@ impl<'a> Targets<'a> {
         shared: SharedControl,
         owner: &'a DisplayOwner,
         settings_source: Box<dyn SettingsSource + 'a>,
-        lister: Box<dyn ContentLister + 'a>,
-        wait: Box<dyn FnMut(Duration) + 'a>,
+        lister: Box<dyn ContentLister>,
+        heartbeat: Box<dyn FnMut() + 'a>,
         main: u32,
     ) -> Self {
         Self {
@@ -155,8 +213,8 @@ impl<'a> Targets<'a> {
             owner,
             settings_source,
             settings: SettingsFile::default(),
-            lister,
-            wait,
+            listing: ListingWorker::spawn(lister),
+            heartbeat,
             main,
             listed: None,
             unlisted: None,
@@ -186,25 +244,29 @@ impl<'a> Targets<'a> {
         *current = status;
     }
 
-    /// Whether ScreenCaptureKit offers `id`: at once if it was seen before,
-    /// after a bounded wait for a display it has not been asked about, and
-    /// every `LIST_RECHECK` for one it did not offer.
+    /// Whether ScreenCaptureKit offers `id`. A display seen before is
+    /// capturable at once. A new one gets up to `LIST_WAIT` of wall-clock
+    /// time, heartbeats included, however slow each call is; a call still
+    /// running then is left to finish while the main display is mirrored.
+    /// A display that was not listed is asked about again every
+    /// `LIST_RECHECK` without blocking.
     fn capturable(&mut self, id: u32, now: Instant) -> bool {
         if self.listed == Some(id) {
             return true;
         }
         let listed = match self.unlisted {
-            Some((pending, next)) if pending == id && now < next => return false,
-            Some((pending, _)) if pending == id => self.lister.is_listed(id).unwrap_or(false),
+            Some((pending, next)) if pending == id => {
+                let listed = matches!(self.listing.answer(Duration::ZERO), Some((answered, true)) if answered == id);
+                if !listed && now >= next && !self.listing.busy() {
+                    self.listing.ask(id);
+                    self.unlisted = Some((id, now + LIST_RECHECK));
+                }
+                listed
+            }
             _ => {
-                let mut listed = false;
-                let polls = LIST_WAIT.as_millis() / LIST_POLL.as_millis();
-                for poll in 0..=polls {
-                    listed = self.lister.is_listed(id).unwrap_or(false);
-                    if listed || poll == polls {
-                        break;
-                    }
-                    (self.wait)(LIST_POLL);
+                let listed = self.wait_listed(id);
+                if !listed {
+                    self.unlisted = Some((id, now + LIST_RECHECK));
                 }
                 listed
             }
@@ -212,10 +274,32 @@ impl<'a> Targets<'a> {
         if listed {
             self.listed = Some(id);
             self.unlisted = None;
-        } else {
-            self.unlisted = Some((id, now + LIST_RECHECK));
         }
         listed
+    }
+
+    fn wait_listed(&mut self, id: u32) -> bool {
+        let deadline = Instant::now() + LIST_WAIT;
+        let mut ask_at = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if now >= ask_at {
+                self.listing.ask(id);
+            }
+            let slice = HEARTBEAT_SLICE.min(deadline - now);
+            match self.listing.answer(slice) {
+                Some((answered, true)) if answered == id => return true,
+                // An answer about this display, or a stale one about
+                // another: ask again after a pause.
+                Some(_) => ask_at = Instant::now() + LIST_POLL,
+                None if !self.listing.busy() => std::thread::sleep(slice),
+                None => {}
+            }
+            (self.heartbeat)();
+        }
     }
 
     fn choose(&mut self, now: Instant) -> u32 {
@@ -343,19 +427,15 @@ pub(super) fn run_capture_loop(
             &mut Fixed(main),
         );
     };
-    let wait_shared = shared.clone();
+    let heartbeat_shared = shared.clone();
     let mut targets = Targets::new(
         shared.clone(),
         owner,
         Box::new(SettingsOnDisk::default()),
         Box::new(ScreenCaptureKitLister),
-        Box::new(move |duration| {
-            // A bounded wait inside one capture pass: keep the stage alive.
-            let until = Instant::now() + duration;
-            while Instant::now() < until {
-                super::idle_heartbeat(&wait_shared, crate::clock::host_now_us() / 1000);
-                std::thread::sleep(Duration::from_millis(50).min(until - Instant::now()));
-            }
+        // A bounded wait inside one capture pass: keep the stage alive.
+        Box::new(move || {
+            super::idle_heartbeat(&heartbeat_shared, crate::clock::host_now_us() / 1000)
         }),
         main,
     );
@@ -382,7 +462,8 @@ impl DisplayChoice for Fixed {
 pub(crate) mod tests {
     use super::*;
     use crate::virtual_display::fake::{FakeDisplays, Op};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{mpsc, Arc};
 
     pub(crate) const MAIN: u32 = 1;
 
@@ -492,7 +573,7 @@ pub(crate) mod tests {
     /// ScreenCaptureKit, faked: lists a display after so many checks.
     pub(crate) struct FakeLister {
         pub(crate) listed_after: Option<u32>,
-        pub(crate) checks: std::rc::Rc<std::cell::Cell<u32>>,
+        pub(crate) checks: Arc<AtomicU32>,
     }
 
     impl FakeLister {
@@ -511,8 +592,7 @@ pub(crate) mod tests {
     impl ContentLister for FakeLister {
         fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure> {
             assert_ne!(display_id, MAIN, "only virtual displays are checked");
-            let checks = self.checks.get();
-            self.checks.set(checks + 1);
+            let checks = self.checks.fetch_add(1, Ordering::SeqCst);
             Ok(self.listed_after.is_some_and(|after| checks >= after))
         }
     }
@@ -528,7 +608,7 @@ pub(crate) mod tests {
             owner,
             settings,
             Box::new(lister),
-            Box::new(|_| {}),
+            Box::new(|| {}),
             MAIN,
         )
     }
@@ -681,17 +761,60 @@ pub(crate) mod tests {
             "{ops:?}"
         );
     }
-    /// A lister whose answer can change, and the time a test has waited.
+    /// A lister whose answer can change, which can be slow, and which
+    /// records how many calls ever ran at once.
+    #[derive(Clone, Default)]
     struct Scripted {
-        listed: std::rc::Rc<std::cell::Cell<bool>>,
-        checks: std::rc::Rc<std::cell::Cell<u32>>,
+        listed: Arc<AtomicBool>,
+        checks: Arc<AtomicU32>,
+        delay: Duration,
+        running: Arc<AtomicU32>,
+        most_at_once: Arc<AtomicU32>,
     }
 
     impl ContentLister for Scripted {
         fn is_listed(&self, _display_id: u32) -> Result<bool, CaptureFailure> {
-            self.checks.set(self.checks.get() + 1);
-            Ok(self.listed.get())
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(running, Ordering::SeqCst);
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.listed.load(Ordering::SeqCst))
         }
+    }
+
+    fn scripted_targets<'a>(
+        shared: &SharedControl,
+        owner: &'a DisplayOwner,
+        lister: &Scripted,
+        beats: Arc<parking_lot::Mutex<Vec<Instant>>>,
+    ) -> Targets<'a> {
+        let beat_shared = shared.clone();
+        Targets::new(
+            shared.clone(),
+            owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+                saved: mpsc::channel().0,
+            }),
+            Box::new(lister.clone()),
+            Box::new(move || {
+                beats.lock().push(Instant::now());
+                crate::capture::idle_heartbeat(&beat_shared, crate::clock::host_now_us() / 1000);
+            }),
+            MAIN,
+        )
+    }
+
+    fn longest_gap(start: Instant, beats: &[Instant], end: Instant) -> Duration {
+        std::iter::once(start)
+            .chain(beats.iter().copied())
+            .chain(std::iter::once(end))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap()
     }
 
     #[test]
@@ -700,58 +823,93 @@ pub(crate) mod tests {
         let (owner, _ops) = fake_owner();
         let lister = FakeLister::after(Some(3));
         let checks = lister.checks.clone();
-        let waited = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
-        let waited_in = waited.clone();
-        let mut targets = Targets::new(
-            shared.clone(),
+        let mut targets = targets(
+            &shared,
             &owner,
             Box::new(MemorySettings {
                 next: Some(enabled()),
                 saved: mpsc::channel().0,
             }),
-            Box::new(lister),
-            Box::new(move |d| waited_in.set(waited_in.get() + d)),
-            MAIN,
+            lister,
         );
         connect(&shared, 0xd0, (2670, 1878));
-        let id = targets.display(Instant::now());
+        let start = Instant::now();
+        let id = targets.display(start);
         assert_ne!(id, MAIN);
-        assert_eq!(checks.get(), 4);
-        assert_eq!(waited.get(), LIST_POLL * 3);
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+        // Three pauses between answers, well inside the bound.
+        assert!(start.elapsed() >= LIST_POLL * 3 && start.elapsed() < LIST_WAIT);
         assert_eq!(*shared.second_screen.lock(), SecondScreenStatus::Active(id));
         // Seen once, never asked again.
         targets.display(Instant::now());
-        assert_eq!(checks.get(), 4);
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn a_slow_lister_reaches_the_mirror_fallback_in_four_seconds_with_heartbeats() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let machine = crate::supervisor::Machine::new(1);
+        let (owner, ops) = fake_owner();
+        // Every call takes 10 s, longer than the 3 s watchdog.
+        let lister = Scripted {
+            delay: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let beats = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut targets = scripted_targets(&shared, &owner, &lister, beats.clone());
+        connect(&shared, 0xd0, (2670, 1878));
+        let start = Instant::now();
+        assert_eq!(targets.display(start), MAIN);
+        let took = start.elapsed();
+        assert!(
+            took >= LIST_WAIT && took < LIST_WAIT + Duration::from_millis(500),
+            "{took:?}"
+        );
+        let gap = longest_gap(start, &beats.lock(), Instant::now());
+        assert!(gap < Duration::from_millis(500), "heartbeat gap {gap:?}");
+        assert_eq!(
+            crate::supervisor::wedge_reason_at(
+                &shared,
+                &machine,
+                crate::clock::host_now_us() / 1000
+            ),
+            None,
+            "the watchdog sees a live stage"
+        );
+        let SecondScreenStatus::NotCapturable(id) = *shared.second_screen.lock() else {
+            panic!("a clear status")
+        };
+        assert!(matches!(ops.try_recv(), Ok(Op::Create(_))));
+        // The call still running is never joined by another, even when a
+        // recheck falls due, and later passes do not wait for it.
+        for later in [Duration::from_secs(1), LIST_RECHECK, LIST_RECHECK * 2] {
+            let pass = Instant::now();
+            assert_eq!(targets.display(start + later), MAIN);
+            assert!(pass.elapsed() < Duration::from_millis(100));
+        }
+        assert_eq!(lister.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(lister.most_at_once.load(Ordering::SeqCst), 1);
+        assert!(ops.try_recv().is_err(), "the display is kept");
+        let _ = id;
     }
 
     #[test]
     fn a_display_screencapturekit_never_lists_falls_back_to_mirroring_and_is_kept() {
         let shared = SharedControl::new(0, 15_000_000);
         let (owner, ops) = fake_owner();
-        let listed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
-        let waited = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
-        let waited_in = waited.clone();
-        let mut targets = Targets::new(
-            shared.clone(),
-            &owner,
-            Box::new(MemorySettings {
-                next: Some(enabled()),
-                saved: mpsc::channel().0,
-            }),
-            Box::new(Scripted {
-                listed: listed.clone(),
-                checks: checks.clone(),
-            }),
-            Box::new(move |d| waited_in.set(waited_in.get() + d)),
-            MAIN,
-        );
+        let lister = Scripted::default();
+        let beats = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut targets = scripted_targets(&shared, &owner, &lister, beats);
         connect(&shared, 0xd0, (2670, 1878));
         let start = Instant::now();
-        // A bounded wait, then the main display.
+        // A bounded wait, asking every LIST_POLL, then the main display.
         assert_eq!(targets.display(start), MAIN);
-        assert_eq!(waited.get(), LIST_WAIT);
-        assert_eq!(checks.get(), 17);
+        assert!(start.elapsed() >= LIST_WAIT);
+        // Let a call sent just before the deadline reach the lister.
+        std::thread::sleep(Duration::from_millis(50));
+        let asked = lister.checks.load(Ordering::SeqCst);
+        // About one question per LIST_POLL plus a heartbeat slice.
+        assert!((8..=17).contains(&asked), "{asked}");
         let Ok(Op::Create(_)) = ops.try_recv() else {
             panic!("the display was made")
         };
@@ -759,14 +917,26 @@ pub(crate) mod tests {
             panic!("a clear status")
         };
         // Until the recheck, capture stays on the main display and nothing
-        // waits or asks again.
+        // is asked.
         assert_eq!(targets.display(start + Duration::from_secs(1)), MAIN);
-        assert_eq!(checks.get(), 17);
-        // A later check finds it: capture moves to it, the same display.
-        listed.set(true);
-        assert_eq!(targets.display(start + LIST_RECHECK), id);
-        assert_eq!(checks.get(), 18);
-        assert_eq!(waited.get(), LIST_WAIT, "rechecks do not wait");
+        assert_eq!(lister.checks.load(Ordering::SeqCst), asked);
+        // The recheck asks without waiting; once listed, the next pass
+        // moves capture to the same display.
+        lister.listed.store(true, Ordering::SeqCst);
+        let pass = Instant::now();
+        assert_eq!(targets.display(start + LIST_RECHECK), MAIN);
+        assert!(
+            pass.elapsed() < Duration::from_millis(100),
+            "rechecks do not wait"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut chosen = MAIN;
+        while chosen == MAIN && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            chosen = targets.display(start + LIST_RECHECK);
+        }
+        assert_eq!(chosen, id);
+        assert_eq!(lister.checks.load(Ordering::SeqCst), asked + 1);
         assert!(ops.try_recv().is_err(), "kept, never removed or remade");
     }
 
