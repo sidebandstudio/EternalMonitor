@@ -55,12 +55,17 @@ pkg-config = "0.3"
 # Same version as the Mac spikes, so the lockfile carries one copy.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-# CGEvent input (input/mac/cg.rs). Same versions as the Mac spikes.
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+# CGEvent input (input/mac/cg.rs) and the private CGVirtualDisplay
+# (virtual_display/mac.rs). Same versions as the Mac spikes.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
     "CGDirectDisplay",
+    "CGDisplayConfiguration",
     "CGError",
+    "libc",
     "CGEvent",
     "CGEventSource",
     "CGEventTypes",

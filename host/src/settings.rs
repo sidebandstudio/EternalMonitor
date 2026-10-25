@@ -53,6 +53,12 @@ pub struct SettingsFile {
     /// The sidebar's GitHub star card was clicked; it says thank you since.
     #[serde(default)]
     pub star_clicked: bool,
+    /// The second-screen display mode chosen for each client device, by
+    /// `device_id` in hex (`display_profile.rs`). Only the macOS host's
+    /// virtual display uses it.
+    #[serde(default)]
+    pub display_profiles:
+        std::collections::BTreeMap<String, crate::display_profile::DisplayProfile>,
 }
 
 fn default_true() -> bool {
@@ -87,11 +93,40 @@ impl Default for SettingsFile {
             feedback_sessions: 0,
             feedback_ask_done: false,
             star_clicked: false,
+            display_profiles: Default::default(),
         }
     }
 }
 
 impl SettingsFile {
+    /// The saved display profile for a client device. Device 0 is a client
+    /// that sent no identity, which never has one.
+    pub fn display_profile(
+        &self,
+        device_id: u64,
+    ) -> Option<crate::display_profile::DisplayProfile> {
+        if device_id == 0 {
+            return None;
+        }
+        self.display_profiles
+            .get(&format!("{device_id:016x}"))
+            .copied()
+    }
+
+    /// Remember `profile` for a client device. Returns whether it changed.
+    pub fn remember_display_profile(
+        &mut self,
+        device_id: u64,
+        profile: crate::display_profile::DisplayProfile,
+    ) -> bool {
+        if device_id == 0 || self.display_profile(device_id) == Some(profile) {
+            return false;
+        }
+        self.display_profiles
+            .insert(format!("{device_id:016x}"), profile);
+        true
+    }
+
     /// Upgrade old settings once, before networking starts. An invalid or
     /// missing secret is replaced; entropy failures never disable pairing.
     pub fn ensure_auth_token(&mut self) -> Result<[u8; 16], getrandom::Error> {
@@ -254,5 +289,52 @@ mod tests {
         assert!(parsed.feedback_ask_done);
         assert_eq!(parsed.feedback_sessions, 2);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn display_profiles_are_kept_per_device_and_survive_a_round_trip() {
+        use crate::display_profile::{profile_for, ClientScreen, DisplayProfile};
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let mut settings: SettingsFile = serde_json::from_str(old).unwrap();
+        assert!(settings.display_profiles.is_empty());
+
+        // A Duo that first connects folded still saves the inner size.
+        let duo = ClientScreen {
+            device_id: 0x0123_4567_89ab_cdef,
+            screen_px: (1398, 2034),
+            refresh_hz: 120,
+        };
+        let profile = profile_for(duo, settings.display_profile(duo.device_id));
+        assert_eq!((profile.width_px, profile.height_px), (2670, 1878));
+        assert!(settings.remember_display_profile(duo.device_id, profile));
+        assert!(!settings.remember_display_profile(duo.device_id, profile));
+        // A client with no identity is never saved.
+        assert!(!settings.remember_display_profile(0, profile));
+        assert_eq!(settings.display_profile(0), None);
+
+        let ipad = DisplayProfile {
+            width_px: 2420,
+            height_px: 1668,
+            refresh_hz: 120,
+            hidpi: true,
+        };
+        settings.remember_display_profile(7, ipad);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"0123456789abcdef\""), "{json}");
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.display_profile(duo.device_id), Some(profile));
+        assert_eq!(parsed.display_profile(7), Some(ipad));
+        assert_eq!(parsed.display_profile(8), None);
+        // The saved profile is used when the Duo comes back on its inner
+        // screen at 60 Hz.
+        let back = ClientScreen {
+            screen_px: (1878, 2670),
+            refresh_hz: 60,
+            ..duo
+        };
+        assert_eq!(
+            profile_for(back, parsed.display_profile(back.device_id)),
+            profile
+        );
     }
 }

@@ -471,6 +471,8 @@ impl AnalyzerApp {
                     Some((*ffmpeg).to_string())
                 }
             });
+        // Kept by the host itself, not edited here.
+        let on_disk = SettingsFile::load();
         let pairing = self.control.shared.pairing.lock();
         let file = SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
@@ -496,6 +498,7 @@ impl AnalyzerApp {
             feedback_sessions: self.feedback_ask.long_sessions,
             feedback_ask_done: self.feedback_ask.done,
             star_clicked: self.star_clicked,
+            display_profiles: on_disk.display_profiles,
         };
         file.save();
     }

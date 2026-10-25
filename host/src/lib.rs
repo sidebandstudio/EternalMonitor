@@ -9,6 +9,7 @@ pub mod console;
 pub mod control;
 pub mod diagnostics;
 pub mod discovery;
+pub mod display_profile;
 pub mod encoder;
 pub mod feedback;
 pub mod gui;
@@ -26,6 +27,8 @@ pub mod transport;
 pub mod updates;
 pub mod vdd;
 pub mod vdd_settings;
+#[cfg(any(target_os = "macos", test))]
+pub mod virtual_display;
 
 #[cfg(windows)]
 pub mod gpu;
