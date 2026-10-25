@@ -369,6 +369,15 @@ impl AnalyzerApp {
         };
         let mut action = None;
         match side {
+            // The Mac host has no updates to offer (no Windows installer, no
+            // download page for it): it says what is older, and that's all.
+            OlderSide::Pc if self.platform == Platform::Mac => {
+                widgets::banner(ui, WARNING, Icon::Warning, title, body, 60.0, |ui| {
+                    if widgets::button(ui, Tone::Secondary, None, "OK").clicked() {
+                        crate::updates::clear_mismatch();
+                    }
+                });
+            }
             OlderSide::Pc => {
                 let available = self.updates.available_version().is_some();
                 widgets::banner(ui, WARNING, Icon::Warning, title, body, 300.0, |ui| {
@@ -399,8 +408,19 @@ impl AnalyzerApp {
         ui.add_space(GAP - 10.0);
     }
 
-    /// The rows in Settings → General.
+    /// The rows in Settings → General. The Mac host shows only its version:
+    /// it has no updates yet.
     pub(super) fn update_settings(&mut self, ui: &mut Ui) {
+        if self.platform == Platform::Mac {
+            widgets::setting_row(
+                ui,
+                &format!("Version {}", env!("CARGO_PKG_VERSION")),
+                "This Mac doesn't update itself yet. Ask for a new build to update it.",
+                0.0,
+                |_| {},
+            );
+            return;
+        }
         let mut automatic = self.settings_check_updates;
         widgets::setting_row(
             ui,
@@ -470,8 +490,8 @@ enum Action {
 fn mac_mismatch_text(side: OlderSide) -> (&'static str, &'static str) {
     match side {
         OlderSide::Pc => (
-            "Update this Mac to connect your device",
-            "The app on your device is newer than EternalMonitor on this Mac, so they can't connect. Click Update now.",
+            "EternalMonitor on this Mac is out of date",
+            "The app on your iPhone or iPad is newer, so they can't connect. Ask for a new EternalMonitor build for this Mac.",
         ),
         OlderSide::Ipad => (
             "Update the app on your iPhone or iPad to connect",

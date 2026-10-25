@@ -16,7 +16,9 @@
 //! or iPad where the Windows window says PC and iPad ([`Platform::says`]).
 //! On Stream, a "Second screen" switch with its status line replaces the
 //! mirror / second screen choice, and the audio row says the stream is video
-//! only. Settings leaves out the Windows display driver's choices.
+//! only. Settings leaves out the Windows display driver's choices. It has
+//! no updates (`Updater::off`): no checks, banners or popup, and a version
+//! mismatch only says which side is older.
 
 mod feedback_panel;
 mod icons;
@@ -460,7 +462,11 @@ impl AnalyzerApp {
             }
         }
 
-        let updates = {
+        // The updater fetches and starts the Windows installer. The Mac host
+        // has no updates yet (plan point 8): it never checks or offers one.
+        let updates = if platform == Platform::Mac {
+            crate::updates::Updater::off()
+        } else {
             let ctx = cc.egui_ctx.clone();
             crate::updates::Updater::start(
                 persisted.check_for_updates,

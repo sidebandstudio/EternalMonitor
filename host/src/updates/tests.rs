@@ -1316,3 +1316,22 @@ fn mismatch_names_the_older_side() {
     log.clear();
     assert_eq!(log.recent(), None);
 }
+
+#[test]
+fn an_updater_that_is_off_never_checks_offers_or_installs() {
+    let updater = Updater::off();
+    assert_eq!(updater.notice(), None);
+    assert!(updater.popup().is_none());
+    assert_eq!(updater.available_version(), None);
+    assert!(!updater.installs_in_place());
+    // Every request goes nowhere: there is no worker to check, download or
+    // start Setup, and nothing is saved.
+    updater.set_auto(true);
+    updater.check_now();
+    updater.update_now();
+    updater.force_now();
+    assert!(!updater.tick(false));
+    assert_eq!(updater.notice(), None);
+    assert_eq!(updater.available_version(), None);
+    assert!(updater.path.is_none());
+}

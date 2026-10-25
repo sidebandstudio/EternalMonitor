@@ -1316,6 +1316,25 @@ impl Updater {
         }
     }
 
+    /// An updater that never runs: the Mac host's, until it has updates of
+    /// its own (plan point 8). There is no worker, so nothing is ever
+    /// checked, downloaded or installed, and no state file is read or
+    /// written; requests go nowhere. It has nothing to offer: no notice, no
+    /// popup, no version available.
+    pub fn off() -> Self {
+        let (tx, _) = mpsc::channel();
+        Self {
+            state: Arc::new(Mutex::new(State::new(
+                env!("CARGO_PKG_VERSION"),
+                false,
+                Saved::default(),
+            ))),
+            path: None,
+            tx,
+            in_place: false,
+        }
+    }
+
     /// `false` for a copy Setup would not replace: Update now opens the
     /// website instead.
     pub fn installs_in_place(&self) -> bool {

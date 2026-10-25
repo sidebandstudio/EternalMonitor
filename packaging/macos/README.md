@@ -25,4 +25,6 @@ The designated requirement pins the bundle ID and this certificate, so Screen Re
 
 `run-app.sh start` opens the app with `open` in the GUI session, so macOS attributes its permissions to the app itself. `run-app.sh stop` sends SIGTERM: the window closes and the host's usual teardown runs (the second screen's display is removed, mDNS says goodbye). Settings and logs are in `~/Library/Application Support/EternalMonitor/`.
 
+The Mac host has no updates yet: it never checks for, downloads or installs one, and Settings shows only its version. Rebuild to update it.
+
 Second screen is off by default. While it's off, the host streams a test picture and creates no display. The switch at the top of Stream writes `mac_second_screen` in `settings.json` and restarts the stream.

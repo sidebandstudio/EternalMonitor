@@ -572,6 +572,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     mac_second_screen(&shared, &dir, &mut results);
+    mac_updates_are_off(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
 }
@@ -696,6 +697,113 @@ fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.run_steps(4);
     window.get_by_role_and_label(Role::CheckBox, "Include app and Mac details");
     no_windows_wording(&mut window, "Send feedback");
+    results.extend_harness(&mut window);
+}
+
+/// The Mac host has no updates yet: its window never checks, offers or
+/// installs one, even with automatic checks on and a newer version cached,
+/// and a version mismatch only says which side is older.
+fn mac_updates_are_off(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    SettingsFile {
+        check_for_updates: true,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    let checked_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let state = dir.join("EternalMonitor/update-state.json");
+    std::fs::write(
+        &state,
+        serde_json::json!({
+            "checked_at": checked_at,
+            "latest": {
+                "version": "99.0.0",
+                "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v99.0.0/EternalMonitor-Setup.exe",
+                "sha256": "0".repeat(64),
+            },
+            "notified": "99.0.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let before = (
+        std::fs::read(&state).unwrap(),
+        std::fs::metadata(&state).unwrap().modified().unwrap(),
+    );
+    assert!(shared.session.lock().session_id().is_none());
+
+    let mut window = harness_for(shared, egui::vec2(1040.0, 720.0), 1.0, Platform::Mac);
+    // Longer than the popup's quiet period after launch.
+    no_popup_for(&mut window, POPUP_QUIET_MS + 1000, "the Mac has no updates");
+    assert!(window
+        .query_by_label("EternalMonitor 99.0.0 is available")
+        .is_none());
+    // The updater never started: it would have rewritten its state file.
+    assert_eq!(
+        (
+            std::fs::read(&state).unwrap(),
+            std::fs::metadata(&state).unwrap().modified().unwrap(),
+        ),
+        before,
+        "the update state was read or written"
+    );
+
+    nav(&mut window, "Settings");
+    window
+        .get_by_label("This Mac doesn't update itself yet. Ask for a new build to update it.")
+        .scroll_to_me();
+    window.run_steps(4);
+    for control in [
+        "Check for updates automatically",
+        "Automatic update checks",
+        "Check now",
+        "Update now",
+    ] {
+        assert!(window.query_by_label(control).is_none(), "{control}");
+    }
+
+    // This Mac is older than the app: it says so, with nothing to download.
+    nav(&mut window, "Stream");
+    eternal_host::updates::note_ipad_protocol(3, 3);
+    assert_eq!(
+        eternal_host::updates::recent_mismatch(),
+        Some(eternal_host::updates::OlderSide::Pc)
+    );
+    window.run_steps(4);
+    window.get_by_label("EternalMonitor on this Mac is out of date");
+    window.get_by_label(
+        "The app on your iPhone or iPad is newer, so they can't connect. Ask for a new EternalMonitor build for this Mac.",
+    );
+    for offer in [
+        "Download from the website",
+        "Update now",
+        "Check for updates",
+    ] {
+        assert!(window.query_by_label(offer).is_none(), "{offer}");
+    }
+    snapshot(&mut window, shared, "mac-version-mismatch");
+    window.get_by_role_and_label(Role::Button, "OK").click();
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("EternalMonitor on this Mac is out of date")
+        .is_none());
+
+    // The app is older than this Mac.
+    eternal_host::updates::note_ipad_protocol(1, 1);
+    window.run_steps(4);
+    window.get_by_label("Update the app on your iPhone or iPad to connect");
+    window.get_by_role_and_label(Role::Button, "OK").click();
+    window.run_steps(4);
+    assert_eq!(eternal_host::updates::recent_mismatch(), None);
+    no_windows_wording(&mut window, "Stream, after a mismatch");
     results.extend_harness(&mut window);
 }
 
