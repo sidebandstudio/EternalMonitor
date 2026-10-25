@@ -173,6 +173,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
+    // The Mac host captures no audio yet, and its stand-in source is a test
+    // tone. Video only, unless automation asks for a source by name.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("ETERNAL_AUDIO").is_none() {
+        info!("No audio capture on macOS yet; streaming video only");
+        shared
+            .audio_enabled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 
     {
         let mut stats = stats::PIPELINE_STATS.lock();
