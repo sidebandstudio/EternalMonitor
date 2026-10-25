@@ -547,10 +547,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn temp_dir(name: &str) -> PathBuf {
+        // Path-safe on every platform: no Debug output in the name.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "eternal-mac-screen-{name}-{}-{:?}",
+            "eternal-mac-screen-{name}-{}-{}",
             std::process::id(),
-            Instant::now()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
