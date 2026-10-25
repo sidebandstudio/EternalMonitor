@@ -17,14 +17,13 @@
 //! recording, as on every non-Windows host.
 
 use std::path::PathBuf;
-use std::sync::{mpsc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use objc2_core_graphics::CGMainDisplayID;
 use tracing::{info, warn};
 
-use super::sck::stream::DisplayChoice;
-use super::sck::CaptureFailure;
+use super::sck::{CaptureFailure, DisplayChoice, Worker, HEARTBEAT_SLICE, LIST_POLL};
 use super::FrameSlot;
 use crate::control::SharedControl;
 use crate::display_profile::{ClientScreen, ProfileStore};
@@ -37,71 +36,13 @@ use crate::virtual_display::{SecondScreenStatus, Want, Wanted};
 /// ScreenCaptureKit's list before the main display is mirrored instead
 /// (macOS 15.7 has been seen not to list a virtual display at all).
 const LIST_WAIT: Duration = Duration::from_secs(4);
-/// The pause between one listing answer and the next question.
-const LIST_POLL: Duration = Duration::from_millis(250);
 /// How often a display that was not listed is checked again.
 const LIST_RECHECK: Duration = Duration::from_secs(5);
-/// The longest the capture thread goes without a heartbeat while waiting.
-const HEARTBEAT_SLICE: Duration = Duration::from_millis(50);
 
 /// Whether ScreenCaptureKit offers a display. A call can block for many
-/// seconds, so it runs on a [`ListingWorker`], never the capture thread.
+/// seconds, so it runs on a [`Worker`], never the capture thread.
 pub(crate) trait ContentLister: Send {
     fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure>;
-}
-
-/// Runs listing calls one at a time on a thread of its own. A call still
-/// running is never joined by another, and its answer is collected
-/// whenever it arrives.
-struct ListingWorker {
-    questions: mpsc::Sender<u32>,
-    answers: mpsc::Receiver<(u32, bool)>,
-    outstanding: Option<u32>,
-}
-
-impl ListingWorker {
-    fn spawn(lister: Box<dyn ContentLister>) -> Self {
-        let (questions, incoming) = mpsc::channel::<u32>();
-        let (reply, answers) = mpsc::channel();
-        // Ends when the worker is dropped and any call in hand returns.
-        let spawned = std::thread::Builder::new()
-            .name("display-listing".into())
-            .spawn(move || {
-                for display_id in incoming {
-                    let listed = lister.is_listed(display_id).unwrap_or(false);
-                    if reply.send((display_id, listed)).is_err() {
-                        break;
-                    }
-                }
-            });
-        if let Err(error) = spawned {
-            warn!(%error, "Could not start the display listing thread");
-        }
-        Self {
-            questions,
-            answers,
-            outstanding: None,
-        }
-    }
-
-    /// Asks about `display_id`, unless a call is still running.
-    fn ask(&mut self, display_id: u32) {
-        if self.outstanding.is_none() && self.questions.send(display_id).is_ok() {
-            self.outstanding = Some(display_id);
-        }
-    }
-
-    fn busy(&self) -> bool {
-        self.outstanding.is_some()
-    }
-
-    /// The running call's answer, waiting up to `timeout` for it.
-    fn answer(&mut self, timeout: Duration) -> Option<(u32, bool)> {
-        self.outstanding?;
-        let answer = self.answers.recv_timeout(timeout).ok()?;
-        self.outstanding = None;
-        Some(answer)
-    }
 }
 
 struct ScreenCaptureKitLister;
@@ -265,7 +206,7 @@ pub(crate) struct Targets<'a> {
     settings_source: Box<dyn SettingsSource + 'a>,
     settings: SettingsFile,
     profiles: ProfileStore,
-    listing: ListingWorker,
+    listing: Worker<bool>,
     /// Stamps the stage's heartbeats while the capture thread waits.
     heartbeat: Box<dyn FnMut() + 'a>,
     main: u32,
@@ -291,7 +232,9 @@ impl<'a> Targets<'a> {
             settings_source,
             settings: SettingsFile::default(),
             profiles,
-            listing: ListingWorker::spawn(lister),
+            listing: Worker::spawn("display-listing", move |display_id| {
+                lister.is_listed(display_id).unwrap_or(false)
+            }),
             heartbeat,
             main,
             listed: None,

@@ -217,6 +217,147 @@ impl SparsePacing {
     }
 }
 
+/// Which display to capture, asked on every pass of the capture loop.
+pub trait DisplayChoice {
+    fn display(&mut self, now: Instant) -> u32;
+    /// ScreenCaptureKit does not offer `display_id`. Returns whether to
+    /// ask again (another display may be chosen) instead of failing.
+    fn not_listed(&mut self, display_id: u32, now: Instant) -> bool;
+}
+
+/// The longest the capture thread goes without a heartbeat while it waits
+/// on ScreenCaptureKit.
+pub(crate) const HEARTBEAT_SLICE: Duration = Duration::from_millis(50);
+/// The pause between one answer and the next question.
+pub(crate) const LIST_POLL: Duration = Duration::from_millis(250);
+/// How long, in wall-clock time, starting a stream may wait for
+/// ScreenCaptureKit to describe its display.
+pub(crate) const STARTUP_WAIT: Duration = Duration::from_secs(4);
+
+/// Runs blocking ScreenCaptureKit queries one at a time on a thread of its
+/// own, so the capture thread never blocks on one. A query still running is
+/// never joined by another, and its answer is collected whenever it
+/// arrives.
+pub(crate) struct Worker<A> {
+    questions: std::sync::mpsc::Sender<u32>,
+    answers: std::sync::mpsc::Receiver<(u32, A)>,
+    outstanding: Option<u32>,
+}
+
+impl<A: Send + 'static> Worker<A> {
+    pub(crate) fn spawn(name: &str, query: impl Fn(u32) -> A + Send + 'static) -> Self {
+        let (questions, incoming) = std::sync::mpsc::channel::<u32>();
+        let (reply, answers) = std::sync::mpsc::channel();
+        // Ends when the worker is dropped and any query in hand returns.
+        let spawned = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                for question in incoming {
+                    if reply.send((question, query(question))).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, name, "Could not start a ScreenCaptureKit query thread");
+        }
+        Self {
+            questions,
+            answers,
+            outstanding: None,
+        }
+    }
+
+    /// Asks about `display_id`, unless a query is still running.
+    pub(crate) fn ask(&mut self, display_id: u32) {
+        if self.outstanding.is_none() && self.questions.send(display_id).is_ok() {
+            self.outstanding = Some(display_id);
+        }
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
+    /// The running query's answer, waiting up to `timeout` for it.
+    pub(crate) fn answer(&mut self, timeout: Duration) -> Option<(u32, A)> {
+        self.outstanding?;
+        let answer = self.answers.recv_timeout(timeout).ok()?;
+        self.outstanding = None;
+        Some(answer)
+    }
+}
+
+/// Every display ScreenCaptureKit offers, by ID: one answer serves any
+/// display, including one asked about before.
+pub(crate) type Snapshot<T> = Result<Vec<(u32, T)>, CaptureFailure>;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum Lookup<T> {
+    Found(T),
+    /// Not offered, or no answer in time.
+    Missing,
+    Failed(CaptureFailure),
+}
+
+/// Waits up to `limit` of wall-clock time for ScreenCaptureKit to offer
+/// `display_id`, calling `heartbeat` at least every `HEARTBEAT_SLICE`.
+pub(crate) fn find_bounded<T: Send + 'static>(
+    worker: &mut Worker<Snapshot<T>>,
+    display_id: u32,
+    limit: Duration,
+    heartbeat: &mut dyn FnMut(),
+) -> Lookup<T> {
+    let deadline = Instant::now() + limit;
+    let mut ask_at = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Lookup::Missing;
+        }
+        if now >= ask_at {
+            worker.ask(display_id);
+        }
+        let slice = HEARTBEAT_SLICE.min(deadline - now);
+        match worker.answer(slice) {
+            Some((_, Ok(displays))) => {
+                match displays.into_iter().find(|(id, _)| *id == display_id) {
+                    Some((_, display)) => return Lookup::Found(display),
+                    None => ask_at = Instant::now() + LIST_POLL,
+                }
+            }
+            Some((_, Err(failure))) => return Lookup::Failed(failure),
+            None if !worker.busy() => std::thread::sleep(slice),
+            None => {}
+        }
+        heartbeat();
+    }
+}
+
+/// The display a stream starts on, and ScreenCaptureKit's description of
+/// it. A display that is not found in time is handed back to `choice`,
+/// which picks another (the main display) or gives up; giving up fails
+/// the stage, after heartbeats all the way.
+pub(crate) fn resolve_start<T: Send + 'static>(
+    choice: &mut dyn DisplayChoice,
+    worker: &mut Worker<Snapshot<T>>,
+    limit: Duration,
+    heartbeat: &mut dyn FnMut(),
+) -> Result<(u32, T), CaptureFailure> {
+    loop {
+        let display_id = choice.display(Instant::now());
+        match find_bounded(worker, display_id, limit, heartbeat) {
+            Lookup::Found(display) => return Ok((display_id, display)),
+            Lookup::Missing | Lookup::Failed(CaptureFailure::DisplayNotFound(_)) => {
+                if !choice.not_listed(display_id, Instant::now()) {
+                    return Err(CaptureFailure::DisplayNotFound(display_id));
+                }
+            }
+            Lookup::Failed(failure) => return Err(failure),
+        }
+    }
+}
+
 /// What the capture loop takes from ScreenCaptureKit's queue.
 #[derive(Debug, PartialEq)]
 pub enum Delivery<T> {
@@ -852,6 +993,119 @@ mod tests {
         mailbox.frame(2);
         assert_eq!(inbox.next(Duration::ZERO), Some(Delivery::Frame(1)));
         assert_eq!(inbox.next(Duration::ZERO), Some(Delivery::Frame(2)));
+    }
+
+    const VIRTUAL: u32 = 7;
+    const MAIN: u32 = 1;
+
+    /// Prefers the virtual display until told it is not offered.
+    #[derive(Default)]
+    struct PreferVirtual {
+        unlisted: bool,
+    }
+
+    impl DisplayChoice for PreferVirtual {
+        fn display(&mut self, _now: Instant) -> u32 {
+            if self.unlisted {
+                MAIN
+            } else {
+                VIRTUAL
+            }
+        }
+        fn not_listed(&mut self, display_id: u32, _now: Instant) -> bool {
+            self.unlisted = true;
+            display_id != MAIN
+        }
+    }
+
+    /// ScreenCaptureKit, faked: each query takes `delay` and offers `offered`.
+    fn slow_content(delay: Duration, offered: &'static [u32]) -> Worker<Snapshot<()>> {
+        Worker::spawn("test-content", move |_| {
+            std::thread::sleep(delay);
+            Ok(offered.iter().map(|&id| (id, ())).collect())
+        })
+    }
+
+    /// Runs `resolve_start` with the host's heartbeat on `shared`, and
+    /// returns its result, how long it took, and the longest heartbeat gap.
+    fn timed_start(
+        worker: &mut Worker<Snapshot<()>>,
+        shared: &crate::control::SharedControl,
+    ) -> (Result<(u32, ()), CaptureFailure>, Duration, Duration) {
+        let start = Instant::now();
+        let mut last = start;
+        let mut gap = Duration::ZERO;
+        let result = resolve_start(
+            &mut PreferVirtual::default(),
+            worker,
+            STARTUP_WAIT,
+            &mut || {
+                let now = Instant::now();
+                gap = gap.max(now - last);
+                last = now;
+                crate::capture::idle_heartbeat(shared, crate::clock::host_now_us() / 1000);
+            },
+        );
+        let end = Instant::now();
+        (result, end - start, gap.max(end - last))
+    }
+
+    fn quiet_watchdog(shared: &crate::control::SharedControl) -> bool {
+        crate::supervisor::wedge_reason_at(
+            shared,
+            &crate::supervisor::Machine::new(1),
+            crate::clock::host_now_us() / 1000,
+        )
+        .is_none()
+    }
+
+    #[test]
+    fn a_10_s_query_for_both_displays_fails_the_stage_with_heartbeats_all_the_way() {
+        let shared = crate::control::SharedControl::new(0, 15_000_000);
+        let mut worker = slow_content(Duration::from_secs(10), &[MAIN, VIRTUAL]);
+        let (result, took, gap) = timed_start(&mut worker, &shared);
+        // The virtual display's bound, then the main display's (the query
+        // still running is waited on, never joined by another).
+        assert_eq!(result, Err(CaptureFailure::DisplayNotFound(MAIN)));
+        assert!(
+            took >= STARTUP_WAIT * 2 && took < STARTUP_WAIT * 2 + Duration::from_millis(500),
+            "{took:?}"
+        );
+        assert!(gap < Duration::from_millis(500), "heartbeat gap {gap:?}");
+        assert!(quiet_watchdog(&shared));
+    }
+
+    #[test]
+    fn a_late_answer_for_the_virtual_display_lets_the_mirror_start() {
+        // 5 s: too late for the virtual display's bound, in time for the
+        // main display, which the same answer describes.
+        let shared = crate::control::SharedControl::new(0, 15_000_000);
+        let mut worker = slow_content(Duration::from_secs(5), &[MAIN, VIRTUAL]);
+        let (result, took, gap) = timed_start(&mut worker, &shared);
+        assert_eq!(result, Ok((MAIN, ())));
+        assert!(took < STARTUP_WAIT * 2, "{took:?}");
+        assert!(gap < Duration::from_millis(500), "heartbeat gap {gap:?}");
+        assert!(quiet_watchdog(&shared));
+    }
+
+    #[test]
+    fn a_prompt_answer_starts_on_the_virtual_display() {
+        let shared = crate::control::SharedControl::new(0, 15_000_000);
+        let mut worker = slow_content(Duration::ZERO, &[MAIN, VIRTUAL]);
+        let (result, took, _) = timed_start(&mut worker, &shared);
+        assert_eq!(result, Ok((VIRTUAL, ())));
+        assert!(took < Duration::from_secs(1));
+        // Not offered at all: the mirror after the bound.
+        let mut worker = slow_content(Duration::ZERO, &[MAIN]);
+        let (result, took, gap) = timed_start(&mut worker, &shared);
+        assert_eq!(result, Ok((MAIN, ())));
+        assert!(took >= STARTUP_WAIT && took < STARTUP_WAIT + Duration::from_secs(1));
+        assert!(gap < Duration::from_millis(500), "heartbeat gap {gap:?}");
+        // A permission failure is reported as it is.
+        let mut worker: Worker<Snapshot<()>> =
+            Worker::spawn("test-denied", |_| Err(CaptureFailure::PermissionDenied));
+        let (result, _, _) = timed_start(&mut worker, &shared);
+        assert_eq!(result, Err(CaptureFailure::PermissionDenied));
     }
 
     #[test]

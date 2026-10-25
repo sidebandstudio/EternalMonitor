@@ -31,8 +31,9 @@ use objc2_screen_capture_kit::{
 use tracing::{info, warn};
 
 use super::{
-    classify_error, is_from_display, mailbox, next_step, CaptureFailure, Delivery, FrameStatus,
-    Inbox, Mailbox, SparsePacing, Step, StreamSettings, Surface,
+    classify_error, is_from_display, mailbox, next_step, resolve_start, CaptureFailure, Delivery,
+    DisplayChoice, FrameStatus, Inbox, Mailbox, Snapshot, SparsePacing, Step, StreamSettings,
+    Surface, Worker, HEARTBEAT_SLICE, STARTUP_WAIT,
 };
 use crate::capture::{heartbeat, idle_heartbeat, FrameSlot, FrameUse, RawFrame};
 use crate::control::SharedControl;
@@ -183,21 +184,22 @@ impl CaptureOutput {
 
 /// ScreenCaptureKit objects are immutable descriptions, usable from any
 /// thread; this carries one out of a completion handler.
-struct Sendable<T>(T);
+pub(crate) struct Sendable<T>(T);
 // SAFETY: see above.
 unsafe impl<T> Send for Sendable<T> {}
 
-fn find_display(display_id: u32) -> Result<Retained<SCDisplay>, CaptureFailure> {
+/// Every display ScreenCaptureKit offers. Blocks for up to
+/// `CALL_TIMEOUT`, so it only runs on a `Worker` thread.
+pub(crate) fn shareable_displays() -> Snapshot<Sendable<Retained<SCDisplay>>> {
     let (tx, rx) = mpsc::channel();
     let handler = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
             // SAFETY: ScreenCaptureKit passes valid objects or null.
             let result = match unsafe { content.as_ref() } {
-                Some(content) => unsafe { content.displays() }
+                Some(content) => Ok(unsafe { content.displays() }
                     .iter()
-                    .find(|display| unsafe { display.displayID() } == display_id)
-                    .map(Sendable)
-                    .ok_or(CaptureFailure::DisplayNotFound(display_id)),
+                    .map(|display| (unsafe { display.displayID() }, Sendable(display)))
+                    .collect()),
                 None => Err(failure_from(unsafe { error.as_ref() })),
             };
             let _ = tx.send(result);
@@ -205,21 +207,17 @@ fn find_display(display_id: u32) -> Result<Retained<SCDisplay>, CaptureFailure> 
     );
     // SAFETY: the handler is a valid block of the declared type.
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    match rx.recv_timeout(CALL_TIMEOUT) {
-        Ok(result) => result.map(|display| display.0),
-        Err(_) => Err(CaptureFailure::Failed(
+    rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| {
+        Err(CaptureFailure::Failed(
             "ScreenCaptureKit did not list the displays in time".into(),
-        )),
-    }
+        ))
+    })
 }
 
-/// Whether ScreenCaptureKit offers `display_id` for capture now.
+/// Whether ScreenCaptureKit offers `display_id` for capture now. Blocks;
+/// for a `Worker` thread.
 pub fn display_listed(display_id: u32) -> Result<bool, CaptureFailure> {
-    match find_display(display_id) {
-        Ok(_) => Ok(true),
-        Err(CaptureFailure::DisplayNotFound(_)) => Ok(false),
-        Err(failure) => Err(failure),
-    }
+    shareable_displays().map(|displays| displays.iter().any(|(id, _)| *id == display_id))
 }
 
 /// A running capture of one display. Stops when dropped.
@@ -231,16 +229,21 @@ pub struct ScreenStream {
 }
 
 impl ScreenStream {
-    pub fn start(settings: StreamSettings) -> Result<Self, CaptureFailure> {
+    /// Starts capturing `display`, which ScreenCaptureKit already
+    /// described. Waits for the start in heartbeat slices.
+    pub fn start(
+        settings: StreamSettings,
+        display: &SCDisplay,
+        heartbeat: &mut dyn FnMut(),
+    ) -> Result<Self, CaptureFailure> {
         if !CGPreflightScreenCaptureAccess() {
             return Err(CaptureFailure::PermissionDenied);
         }
-        let display = find_display(settings.display_id)?;
         // SAFETY: plain ScreenCaptureKit object setup with valid arguments.
         let (filter, config) = unsafe {
             let filter = SCContentFilter::initWithDisplay_excludingWindows(
                 SCContentFilter::alloc(),
-                &display,
+                display,
                 &NSArray::new(),
             );
             let config = SCStreamConfiguration::new();
@@ -287,15 +290,23 @@ impl ScreenStream {
         });
         // SAFETY: a configured stream and a valid block.
         unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
-        match done.recv_timeout(CALL_TIMEOUT) {
-            Ok(None) => Ok(Self {
+        let deadline = Instant::now() + CALL_TIMEOUT;
+        let outcome = loop {
+            match done.recv_timeout(HEARTBEAT_SLICE) {
+                Ok(outcome) => break Some(outcome),
+                Err(_) if Instant::now() >= deadline => break None,
+                Err(_) => heartbeat(),
+            }
+        };
+        match outcome {
+            Some(None) => Ok(Self {
                 stream,
                 _output: output,
                 _queue: queue,
                 deliveries,
             }),
-            Ok(Some(failure)) => Err(failure),
-            Err(_) => Err(CaptureFailure::Failed(
+            Some(Some(failure)) => Err(failure),
+            None => Err(CaptureFailure::Failed(
                 "ScreenCaptureKit did not start in time".into(),
             )),
         }
@@ -336,14 +347,6 @@ fn publish_geometry(shared: &SharedControl, bounds: DisplayBounds, pixels: (u32,
     });
 }
 
-/// Which display to capture, asked on every pass of the capture loop.
-pub trait DisplayChoice {
-    fn display(&mut self, now: Instant) -> u32;
-    /// ScreenCaptureKit does not offer `display_id`. Returns whether to
-    /// ask again (another display may be chosen) instead of failing.
-    fn not_listed(&mut self, display_id: u32, now: Instant) -> bool;
-}
-
 /// Captures the chosen display into `slot` until the generation stops, or
 /// the stream fails (returned as the stage's error: a missing grant is a
 /// blocked state, anything else restarts the pipeline). When the choice
@@ -356,11 +359,19 @@ pub fn run_capture_loop(
     choice: &mut dyn DisplayChoice,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let empty = Arc::new(Vec::new());
+    // ScreenCaptureKit's display list is fetched off this thread; one
+    // answer describes every display, the main one included.
+    let mut content = Worker::spawn("display-lookup", |_| shareable_displays());
+    let keep_alive_shared = shared.clone();
+    let mut keep_alive =
+        move || idle_heartbeat(&keep_alive_shared, crate::clock::host_now_us() / 1000);
     'stream: loop {
-        let display_id = choice.display(Instant::now());
+        let (display_id, display) =
+            resolve_start(choice, &mut content, STARTUP_WAIT, &mut keep_alive)
+                .map_err(CaptureFailure::into_error)?;
         let (mut bounds, pixels) = display_geometry(display_id);
         let settings = StreamSettings::new(display_id, pixels, shared.effective_fps());
-        let stream = match ScreenStream::start(settings) {
+        let stream = match ScreenStream::start(settings, &display.0, &mut keep_alive) {
             Ok(stream) => stream,
             Err(CaptureFailure::DisplayNotFound(_))
                 if choice.not_listed(display_id, Instant::now()) =>
