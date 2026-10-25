@@ -24,6 +24,7 @@ pub const REPO_URL: &str = "https://github.com/sidebandstudio/EternalMonitor";
 
 const ASK_TITLE: &str = "How's EternalMonitor working for you? :)";
 const ASK_BODY: &str = "We're a small studio building EternalMonitor so students, and anyone with an iPad sitting around, can put it to work. We read every message, and your feedback shapes what we fix next.";
+const MAC_ASK_BODY: &str = "We're a small studio building EternalMonitor so students, and anyone with an iPhone or iPad sitting around, can put it to work. We read every message, and your feedback shapes what we fix next.";
 
 /// The Send feedback dialog while it is open.
 #[derive(Default)]
@@ -116,7 +117,8 @@ impl AnalyzerApp {
             return;
         }
         let (mut send, mut later) = (false, false);
-        widgets::banner(ui, ACCENT, Icon::Mail, ASK_TITLE, ASK_BODY, 230.0, |ui| {
+        let body = self.platform.says(ASK_BODY, MAC_ASK_BODY);
+        widgets::banner(ui, ACCENT, Icon::Mail, ASK_TITLE, body, 230.0, |ui| {
             later = widgets::button(ui, Tone::Ghost, None, "Not now").clicked();
             send = widgets::button(ui, Tone::Primary, None, "Send feedback").clicked();
         });
@@ -133,6 +135,9 @@ impl AnalyzerApp {
         let Some(mut draft) = self.feedback.take() else {
             return;
         };
+        let platform = self.platform;
+        let details_label =
+            platform.says("Include app and PC details", "Include app and Mac details");
         let details = details(
             self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL,
             client,
@@ -201,8 +206,8 @@ impl AnalyzerApp {
                         let mut include = !draft.exclude_details;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
-                            widgets::toggle(ui, &mut include, "Include app and PC details");
-                            ui.label(egui::RichText::new("Include app and PC details").color(TEXT));
+                            widgets::toggle(ui, &mut include, details_label);
+                            ui.label(egui::RichText::new(details_label).color(TEXT));
                         });
                         if include == draft.exclude_details {
                             draft.exclude_details = !include;
@@ -213,7 +218,10 @@ impl AnalyzerApp {
                         }
                         widgets::paragraph(
                             ui,
-                            faint("To include logs, click Copy with logs and paste into your email. Logs can include this PC's name and network addresses."),
+                            faint(platform.says(
+                                "To include logs, click Copy with logs and paste into your email. Logs can include this PC's name and network addresses.",
+                                "To include logs, click Copy with logs and paste into your email. Logs can include this Mac's name and network addresses.",
+                            )),
                         );
                     });
                 ui.add_space(10.0);
@@ -452,7 +460,10 @@ impl AnalyzerApp {
         } else {
             (
                 "Enjoying EternalMonitor?",
-                "A GitHub star helps others put a spare iPad to work",
+                self.platform.says(
+                    "A GitHub star helps others put a spare iPad to work",
+                    "A GitHub star helps others put a spare iPhone or iPad to work",
+                ),
             )
         };
         let width = ui.available_width();

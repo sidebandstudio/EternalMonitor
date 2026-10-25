@@ -25,6 +25,7 @@ impl AnalyzerApp {
         self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
         ui.add_space(GAP - 10.0);
+        let platform = self.platform;
         let wide = ui.available_width() >= 640.0;
         if wide {
             ui.columns(2, |cols| {
@@ -33,7 +34,7 @@ impl AnalyzerApp {
                     &mut left[0],
                     &mut right[0],
                     |ui| self.connect_card(ui, snap),
-                    |ui| client_card(ui, client, snap.pipeline_running),
+                    |ui| client_card(ui, client, snap.pipeline_running, platform),
                 );
             });
         } else {
@@ -44,7 +45,7 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
             widgets::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                client_card(ui, client, snap.pipeline_running);
+                client_card(ui, client, snap.pipeline_running, platform);
             });
         }
         ui.add_space(GAP - 10.0);
@@ -53,11 +54,17 @@ impl AnalyzerApp {
 
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
-        if let Some((title, body)) = usb_cable_notice(
-            snap.usb_service_reachable,
-            snap.usb_cabled_devices,
-            snap.apple_devices_installed,
-        ) {
+        let platform = self.platform;
+        // Apple Devices is how Windows reaches a cabled iPad; macOS has it built in.
+        let usb_notice = match platform {
+            Platform::Windows => usb_cable_notice(
+                snap.usb_service_reachable,
+                snap.usb_cabled_devices,
+                snap.apple_devices_installed,
+            ),
+            Platform::Mac => None,
+        };
+        if let Some((title, body)) = usb_notice {
             widgets::banner(ui, WARNING, Icon::Plug, title, body, 170.0, |ui| {
                 apple_devices_action(ui, snap.apple_devices_installed);
             });
@@ -76,9 +83,15 @@ impl AnalyzerApp {
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
                 if customized {
-                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
+                    platform.says(
+                        "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.",
+                        "The Mac's video encoder could not encode video with the options chosen in Settings, so the picture may lag and the Mac may run hot. Go back to the recommended options first.",
+                    )
                 } else {
-                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
+                    platform.says(
+                        "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.",
+                        "The picture may lag and the Mac may run hot. Click Restart to try the Mac's video encoder again.",
+                    )
                 },
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
@@ -163,7 +176,10 @@ impl AnalyzerApp {
             ACCENT,
             Icon::Refresh,
             "Restart the stream to apply your changes",
-            "These display and video changes apply when the stream restarts. The iPad reconnects by itself.",
+            self.platform.says(
+                "These display and video changes apply when the stream restarts. The iPad reconnects by itself.",
+                "These display and video changes apply when the stream restarts. Your device reconnects by itself.",
+            ),
             140.0,
             |ui| {
                 restart = widgets::button(ui, Tone::Primary, None, "Restart now").clicked();
@@ -177,6 +193,7 @@ impl AnalyzerApp {
 
     fn status_header(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         let state = StreamState::of(snap, client);
+        let platform = self.platform;
         let quality = self
             .quality
             .update(client.session_id, client.report.as_ref());
@@ -188,11 +205,22 @@ impl AnalyzerApp {
         let (title, subtitle) = match state {
             StreamState::Off => (
                 "Streaming is off".to_string(),
-                "Click Start streaming so your iPad can connect.".to_string(),
+                platform
+                    .says(
+                        "Click Start streaming so your iPad can connect.",
+                        "Click Start streaming so your iPhone or iPad can connect.",
+                    )
+                    .to_string(),
             ),
             StreamState::Ready => (
-                "Ready for your iPad".to_string(),
-                "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
+                platform
+                    .says("Ready for your iPad", "Ready for your iPhone or iPad")
+                    .to_string(),
+                platform
+                    .says(
+                        "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable.",
+                        "Open EternalMonitor on your iPhone or iPad and tap this Mac.",
+                    )
                     .to_string(),
             ),
             StreamState::Streaming => {
@@ -269,9 +297,10 @@ impl AnalyzerApp {
                                 action = Some(HeaderAction::Stop);
                             }
                             if widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
-                                .on_hover_text(
+                                .on_hover_text(platform.says(
                                     "Restart capture and encoding. The iPad reconnects on its own.",
-                                )
+                                    "Restart capture and encoding. Your device reconnects on its own.",
+                                ))
                                 .clicked()
                             {
                                 action = Some(HeaderAction::Restart);
@@ -322,7 +351,10 @@ impl AnalyzerApp {
                     )
                     .on_hover_text("Pictures per second. 60 looks smooth.");
                     widgets::metric(&mut cols[1], "Delay", &latency, "ms", 22.0)
-                        .on_hover_text("Time from this PC's screen to the picture on the iPad.");
+                        .on_hover_text(platform.says(
+                            "Time from this PC's screen to the picture on the iPad.",
+                            "Time from this Mac's screen to the picture on your device.",
+                        ));
                     widgets::metric(&mut cols[2], "Connection", quality, "", 22.0).on_hover_text(
                         "How well the picture is getting through. Performance has the details.",
                     );
@@ -407,15 +439,23 @@ impl AnalyzerApp {
     fn connect_card(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
         // detect_local_ip() reports "unknown:<port>" when no LAN adapter is up.
         let online = !snap.listen_addr.is_empty() && !snap.listen_addr.starts_with("unknown");
+        let platform = self.platform;
         let mut open_qr = false;
-        widgets::card_header(ui, "Connect an iPad", |ui| {
-            open_qr =
-                widgets::button_ex(ui, Tone::Secondary, Some(Icon::Qr), "QR code", online, 0.0)
-                    .clicked();
-        });
+        widgets::card_header(
+            ui,
+            platform.says("Connect an iPad", "Connect an iPhone or iPad"),
+            |ui| {
+                open_qr =
+                    widgets::button_ex(ui, Tone::Secondary, Some(Icon::Qr), "QR code", online, 0.0)
+                        .clicked();
+            },
+        );
         widgets::paragraph(
             ui,
-            muted("On your iPad, open EternalMonitor and tap this PC, or tap Scan QR code. Over a USB cable no code is needed."),
+            muted(platform.says(
+                "On your iPad, open EternalMonitor and tap this PC, or tap Scan QR code. Over a USB cable no code is needed.",
+                "On your iPhone or iPad, open EternalMonitor and tap this Mac, or tap Scan QR code. Over a USB cable no code is needed.",
+            )),
         );
         ui.add_space(8.0);
 
@@ -440,9 +480,10 @@ impl AnalyzerApp {
             ui.label(overline("Address"));
             widgets::paragraph(
                 ui,
-                RichText::new(
+                RichText::new(platform.says(
                     "No network found. Connect this PC to Wi-Fi or Ethernet, or use a USB cable.",
-                )
+                    "No network found. Connect this Mac to Wi-Fi or Ethernet, or use a USB cable.",
+                ))
                 .size(SMALL)
                 .color(WARNING),
             );
@@ -471,6 +512,7 @@ impl AnalyzerApp {
     }
 
     fn status_rows(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        let platform = self.platform;
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
 
@@ -483,9 +525,15 @@ impl AnalyzerApp {
                 if required { ACCENT } else { TEXT_MUTED },
                 "Pairing",
                 if required {
-                    "New iPads on Wi-Fi enter the pairing code once. USB needs no code."
+                    platform.says(
+                        "New iPads on Wi-Fi enter the pairing code once. USB needs no code.",
+                        "A new iPhone or iPad on Wi-Fi enters the pairing code once. USB needs no code.",
+                    )
                 } else {
-                    "Off. Any iPad on your network can connect without a code."
+                    platform.says(
+                        "Off. Any iPad on your network can connect without a code.",
+                        "Off. Any iPhone or iPad on your network can connect without a code.",
+                    )
                 },
                 64.0,
                 |ui| {
@@ -499,6 +547,7 @@ impl AnalyzerApp {
 
             // USB
             let usb = usb_summary(
+                platform,
                 snap.usb_service_reachable,
                 snap.usb_devices,
                 &snap.usb_link_state,
@@ -513,13 +562,14 @@ impl AnalyzerApp {
                 usb_color,
                 "USB connection",
                 &usb_text,
-                if snap.usb_service_reachable {
+                // Apple Devices is a Windows app; a Mac shows only the badge.
+                if snap.usb_service_reachable || platform == Platform::Mac {
                     110.0
                 } else {
                     170.0
                 },
                 |ui| {
-                    if snap.usb_service_reachable {
+                    if snap.usb_service_reachable || platform == Platform::Mac {
                         widgets::badge(ui, usb_badge, usb_color);
                     } else {
                         apple_devices_action(ui, snap.apple_devices_installed);
@@ -552,11 +602,15 @@ impl AnalyzerApp {
                 ui,
                 Icon::Speaker,
                 audio_color,
-                "PC audio",
+                platform.says("PC audio", "Mac audio"),
                 &audio_text,
                 64.0,
                 |ui| {
-                    widgets::toggle(ui, &mut audio_on, "Stream PC audio");
+                    widgets::toggle(
+                        ui,
+                        &mut audio_on,
+                        platform.says("Stream PC audio", "Stream Mac audio"),
+                    );
                 },
             );
             if audio_on != enabled {
@@ -792,27 +846,37 @@ fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut
     });
 }
 
-fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
+fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool, platform: Platform) {
     let link = client.link_name();
-    widgets::card_header(ui, "Connected iPad", |ui| {
-        if client.info.is_some() {
-            widgets::badge(ui, link, ACCENT);
-        }
-    });
+    widgets::card_header(
+        ui,
+        platform.says("Connected iPad", "Connected device"),
+        |ui| {
+            if client.info.is_some() {
+                widgets::badge(ui, link, ACCENT);
+            }
+        },
+    );
     let Some(info) = &client.info else {
         if streaming {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "Waiting for an iPad",
-                "It appears here as soon as it connects. If the iPad says this PC didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
+                platform.says("Waiting for an iPad", "Waiting for your iPhone or iPad"),
+                platform.says(
+                    "It appears here as soon as it connects. If the iPad says this PC didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
+                    "It appears here as soon as it connects. If it says this Mac didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
+                ),
             );
         } else {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "No iPad connected",
-                "Start streaming, then connect from your iPad.",
+                platform.says("No iPad connected", "No device connected"),
+                platform.says(
+                    "Start streaming, then connect from your iPad.",
+                    "Start streaming, then connect from your iPhone or iPad.",
+                ),
             );
         }
         return;
@@ -836,7 +900,10 @@ fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
     });
     ui.add_space(6.0);
     let Some(r) = client.report.as_ref() else {
-        ui.label(muted("Waiting for the first measurements from the iPad."));
+        ui.label(muted(platform.says(
+            "Waiting for the first measurements from the iPad.",
+            "Waiting for the first measurements from your device.",
+        )));
         return;
     };
     let total = f64::from(r.frags_received) + f64::from(r.frags_repaired) + f64::from(r.frags_lost);
@@ -927,12 +994,20 @@ pub(super) fn usb_cable_notice(
 /// What the USB row says. The Apple Devices hint appears only when Apple's
 /// device service cannot be reached.
 pub(super) fn usb_summary(
+    platform: Platform,
     reachable: bool,
     devices: usize,
     link_state: &str,
     cabled: usize,
     installed: bool,
 ) -> UsbSummary {
+    if !reachable && platform == Platform::Mac {
+        return UsbSummary {
+            text: "USB isn't available right now. Wi-Fi still works.".into(),
+            badge: "Unavailable",
+            available: false,
+        };
+    }
     if !reachable {
         let text = match (cabled > 0, installed) {
             (true, true) => "iPad plugged in. Open Apple Devices and keep it running to stream over the cable.",
@@ -948,15 +1023,30 @@ pub(super) fn usb_summary(
     }
     let (text, badge) = match link_state {
         "Connected" => (
-            "An iPad is streaming over the cable.".to_string(),
+            platform
+                .says(
+                    "An iPad is streaming over the cable.",
+                    "Your device is streaming over the cable.",
+                )
+                .to_string(),
             "Connected",
         ),
         "Waiting for the iPad app" => (
-            "iPad plugged in. Open EternalMonitor on it to connect.".to_string(),
+            platform
+                .says(
+                    "iPad plugged in. Open EternalMonitor on it to connect.",
+                    "iPhone or iPad plugged in. Open EternalMonitor on it to connect.",
+                )
+                .to_string(),
             "Ready",
         ),
         "Waiting for an iPad" => (
-            "Plug in your iPad to connect over USB.".to_string(),
+            platform
+                .says(
+                    "Plug in your iPad to connect over USB.",
+                    "Plug in your iPhone or iPad to connect over USB.",
+                )
+                .to_string(),
             "Ready",
         ),
         "Checking Apple device service" => (
@@ -965,7 +1055,9 @@ pub(super) fn usb_summary(
         ),
         other => {
             let plugged = match devices {
-                0 => "no iPad plugged in".to_string(),
+                0 => platform
+                    .says("no iPad plugged in", "no device plugged in")
+                    .to_string(),
                 1 => "1 device plugged in".to_string(),
                 n => format!("{n} devices plugged in"),
             };

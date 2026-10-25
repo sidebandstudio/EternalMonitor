@@ -38,33 +38,47 @@ fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
 
 #[test]
 fn usb_row_shows_install_hint_only_when_the_service_is_unavailable() {
-    let missing = usb_summary(false, 2, "Connected", 0, false);
+    let missing = usb_summary(Platform::Windows, false, 2, "Connected", 0, false);
     assert!(!missing.available);
     assert_eq!(missing.badge, "Unavailable");
     assert!(missing
         .text
         .contains("Install the Apple Devices app from the Microsoft Store to use USB"));
 
-    let connected = usb_summary(true, 1, "Connected", 0, false);
+    let connected = usb_summary(Platform::Windows, true, 1, "Connected", 0, false);
     assert!(connected.available);
     assert_eq!(connected.badge, "Connected");
     assert!(!connected.text.contains("Install"));
 
     // "Waiting for an iPad" must never become a whole label: UI Automation
     // reads that exact name as "no iPad connected".
-    let idle = usb_summary(true, 0, "Waiting for an iPad", 0, false);
+    let idle = usb_summary(Platform::Windows, true, 0, "Waiting for an iPad", 0, false);
     assert_eq!(idle.badge, "Ready");
     assert_ne!(idle.text, "Waiting for an iPad");
     assert!(idle.text.contains("Plug in your iPad"), "{}", idle.text);
 
-    let app_closed = usb_summary(true, 1, "Waiting for the iPad app", 0, false);
+    let app_closed = usb_summary(
+        Platform::Windows,
+        true,
+        1,
+        "Waiting for the iPad app",
+        0,
+        false,
+    );
     assert!(
         app_closed.text.contains("Open EternalMonitor"),
         "{}",
         app_closed.text
     );
 
-    let unknown = usb_summary(true, 2, "Waiting for direct test listener", 0, false);
+    let unknown = usb_summary(
+        Platform::Windows,
+        true,
+        2,
+        "Waiting for direct test listener",
+        0,
+        false,
+    );
     assert_eq!(
         unknown.text,
         "Waiting for direct test listener · 2 devices plugged in"
@@ -73,7 +87,14 @@ fn usb_row_shows_install_hint_only_when_the_service_is_unavailable() {
 
 #[test]
 fn usb_row_says_to_open_or_install_apple_devices() {
-    let closed = usb_summary(false, 0, "Apple device service unavailable", 0, true);
+    let closed = usb_summary(
+        Platform::Windows,
+        false,
+        0,
+        "Apple device service unavailable",
+        0,
+        true,
+    );
     assert!(!closed.available);
     assert!(
         closed.text.starts_with("Open Apple Devices"),
@@ -81,7 +102,14 @@ fn usb_row_says_to_open_or_install_apple_devices() {
         closed.text
     );
 
-    let plugged_closed = usb_summary(false, 0, "Apple device service unavailable", 1, true);
+    let plugged_closed = usb_summary(
+        Platform::Windows,
+        false,
+        0,
+        "Apple device service unavailable",
+        1,
+        true,
+    );
     assert!(
         plugged_closed
             .text
@@ -90,7 +118,14 @@ fn usb_row_says_to_open_or_install_apple_devices() {
         plugged_closed.text
     );
 
-    let plugged_missing = usb_summary(false, 0, "Apple device service unavailable", 1, false);
+    let plugged_missing = usb_summary(
+        Platform::Windows,
+        false,
+        0,
+        "Apple device service unavailable",
+        1,
+        false,
+    );
     assert!(
         plugged_missing.text.contains("not installed")
             && plugged_missing.text.contains("Microsoft Store"),

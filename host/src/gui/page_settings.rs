@@ -10,6 +10,7 @@ use crate::encoder::input::EncoderInput;
 
 impl AnalyzerApp {
     pub(super) fn settings_page(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        let platform = self.platform;
         page_header(ui, "Settings", "Changes save automatically.", |_| {});
         self.restart_notice(ui);
 
@@ -17,45 +18,52 @@ impl AnalyzerApp {
         widgets::section_label(ui, "Display");
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut refresh = false;
-            widgets::setting_row(
-                ui,
-                "How the iPad shows your PC",
-                "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
-                300.0,
-                |ui| {
-                    refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, "Refresh displays").clicked();
-                    self.display_picker(ui, 250.0);
-                },
-            );
-            if refresh {
-                self.refresh_outputs();
+            // The Mac host's second screen is the switch on Stream; these
+            // choices drive the Windows display driver.
+            if platform == Platform::Windows {
+                let mut refresh = false;
+                widgets::setting_row(
+                    ui,
+                    "How the iPad shows your PC",
+                    "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
+                    300.0,
+                    |ui| {
+                        refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, "Refresh displays").clicked();
+                        self.display_picker(ui, 250.0);
+                    },
+                );
+                if refresh {
+                    self.refresh_outputs();
+                }
+                widgets::divider(ui);
+                let mut vdd_match = self.settings_vdd_match;
+                let extending = self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL;
+                widgets::setting_row(
+                    ui,
+                    "Match the iPad's resolution",
+                    if extending {
+                        "Makes the second screen exactly as sharp and smooth as the iPad's display."
+                    } else {
+                        "Used by Second screen. Makes it exactly as sharp and smooth as the iPad's display."
+                    },
+                    64.0,
+                    |ui| {
+                        widgets::toggle(ui, &mut vdd_match, "Match the second screen to the iPad's resolution");
+                    },
+                );
+                if vdd_match != self.settings_vdd_match {
+                    self.set_vdd_match(vdd_match);
+                }
+                widgets::divider(ui);
             }
-            widgets::divider(ui);
-            let mut vdd_match = self.settings_vdd_match;
-            let extending = self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL;
-            widgets::setting_row(
-                ui,
-                "Match the iPad's resolution",
-                if extending {
-                    "Makes the second screen exactly as sharp and smooth as the iPad's display."
-                } else {
-                    "Used by Second screen. Makes it exactly as sharp and smooth as the iPad's display."
-                },
-                64.0,
-                |ui| {
-                    widgets::toggle(ui, &mut vdd_match, "Match the second screen to the iPad's resolution");
-                },
-            );
-            if vdd_match != self.settings_vdd_match {
-                self.set_vdd_match(vdd_match);
-            }
-            widgets::divider(ui);
             let mut fps = self.settings_fps_target;
             widgets::setting_row(
                 ui,
                 "Frame rate",
-                "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less.",
+                platform.says(
+                    "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less.",
+                    "Pictures per second. Higher feels smoother but needs a faster network. Your device can ask for less.",
+                ),
                 230.0,
                 |ui| {
                     widgets::segmented(ui, &mut fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120")]);
@@ -108,7 +116,10 @@ impl AnalyzerApp {
             widgets::setting_row(
                 ui,
                 "Require pairing",
-                "New iPads on Wi-Fi type the pairing code shown on the Stream page once. USB needs no code.",
+                platform.says(
+                    "New iPads on Wi-Fi type the pairing code shown on the Stream page once. USB needs no code.",
+                    "A new iPhone or iPad on Wi-Fi types the pairing code shown on the Stream page once. USB needs no code.",
+                ),
                 64.0,
                 |ui| {
                     widgets::toggle(ui, &mut require, "Require pairing");
@@ -121,11 +132,20 @@ impl AnalyzerApp {
             let mut forget = false;
             widgets::setting_row(
                 ui,
-                "Forget all iPads",
-                "Creates a new pairing key. Every iPad has to pair again.",
+                platform.says("Forget all iPads", "Forget all devices"),
+                platform.says(
+                    "Creates a new pairing key. Every iPad has to pair again.",
+                    "Creates a new pairing key. Every iPhone and iPad has to pair again.",
+                ),
                 170.0,
                 |ui| {
-                    forget = widgets::button(ui, Tone::Danger, None, "Forget all iPads").clicked();
+                    forget = widgets::button(
+                        ui,
+                        Tone::Danger,
+                        None,
+                        platform.says("Forget all iPads", "Forget all devices"),
+                    )
+                    .clicked();
                 },
             );
             if forget {
@@ -165,7 +185,7 @@ impl AnalyzerApp {
         widgets::section_label(ui, "Support diagnostics");
         widgets::list_card().show(ui, |ui| {
             let mut upload = crate::telemetry::enabled();
-            widgets::setting_row(ui, "Automatically share diagnostics", "Sends device details, errors and stream statistics to EternalMonitor support. Includes PC names and network addresses. Screen content, audio and pairing credentials are excluded.", 64.0, |ui| { widgets::toggle(ui, &mut upload, "Automatically share diagnostics"); });
+            widgets::setting_row(ui, "Automatically share diagnostics", platform.says("Sends device details, errors and stream statistics to EternalMonitor support. Includes PC names and network addresses. Screen content, audio and pairing credentials are excluded.", "Sends device details, errors and stream statistics to EternalMonitor support. Includes Mac names and network addresses. Screen content, audio and pairing credentials are excluded."), 64.0, |ui| { widgets::toggle(ui, &mut upload, "Automatically share diagnostics"); });
             if upload != crate::telemetry::enabled() { crate::telemetry::set_enabled(upload); }
             ui.label(muted(crate::telemetry::status()));
         });
@@ -201,10 +221,20 @@ impl AnalyzerApp {
             widgets::setting_row(
                 ui,
                 "Sharper video format (HEVC)",
-                "Experimental. Sharper at the same quality limit on iPads and graphics cards that support it; others keep the standard format.",
+                platform.says(
+                    "Experimental. Sharper at the same quality limit on iPads and graphics cards that support it; others keep the standard format.",
+                    "Experimental. Sharper at the same quality limit on devices that support it; others keep the standard format.",
+                ),
                 64.0,
                 |ui| {
-                    widgets::toggle(ui, &mut hevc, "Prefer HEVC (H.265) when the iPad supports it");
+                    widgets::toggle(
+                        ui,
+                        &mut hevc,
+                        platform.says(
+                            "Prefer HEVC (H.265) when the iPad supports it",
+                            "Prefer HEVC (H.265) when your device supports it",
+                        ),
+                    );
                 },
             );
             if hevc != self.settings_hevc_enabled {
@@ -235,7 +265,10 @@ impl AnalyzerApp {
             widgets::setting_row(
                 ui,
                 "Video encoder",
-                &format!("Automatic uses your graphics card when it can. Change this only if the picture is missing or broken. In use now: {detected}."),
+                &match platform {
+                    Platform::Windows => format!("Automatic uses your graphics card when it can. Change this only if the picture is missing or broken. In use now: {detected}."),
+                    Platform::Mac => format!("Automatic uses the Mac's video encoder when it can. Change this only if the picture is missing or broken. In use now: {detected}."),
+                },
                 200.0,
                 |ui| {
                     widgets::combo("encoder-override", &choice_label(&choice), 190.0).show_ui(

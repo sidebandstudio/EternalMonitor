@@ -9,7 +9,9 @@ use eframe::egui::{self, vec2, Color32, Frame, Margin, Rect, Sense, Stroke, Ui};
 use super::icons::{self, Icon};
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
-use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, StreamState};
+use super::{
+    update_toast, AnalyzerApp, ClientSnapshot, Page, Platform, StatsSnapshot, StreamState,
+};
 use crate::updates::{CheckStatus, Notice, OlderSide, IPAD_OUT_OF_DATE, WEBSITE_DOWNLOAD};
 
 /// The popup's last line: what Update now does from here.
@@ -96,6 +98,7 @@ impl AnalyzerApp {
         let Some(notice) = self.updates.notice() else {
             return;
         };
+        let platform = self.platform;
         let mut action = None;
         match &notice {
             Notice::Available(version) => widgets::banner(
@@ -106,7 +109,10 @@ impl AnalyzerApp {
                 if self.updates.installs_in_place() {
                     "Windows will ask for permission, then EternalMonitor restarts. Update the iPad app in TestFlight too."
                 } else {
-                    "Update now opens the download page. Install the new version, then open EternalMonitor again. Update the iPad app in TestFlight too."
+                    platform.says(
+                        "Update now opens the download page. Install the new version, then open EternalMonitor again. Update the iPad app in TestFlight too.",
+                        "Update now opens the download page. Install the new version, then open EternalMonitor again. Update the app on your iPhone or iPad in TestFlight too.",
+                    )
                 },
                 190.0,
                 |ui| {
@@ -123,7 +129,10 @@ impl AnalyzerApp {
                 ACCENT,
                 Icon::Download,
                 "The update will install when you stop streaming",
-                "Your iPad stays connected until then. Stop and update closes the stream now.",
+                platform.says(
+                    "Your iPad stays connected until then. Stop and update closes the stream now.",
+                    "Your device stays connected until then. Stop and update closes the stream now.",
+                ),
                 230.0,
                 |ui| {
                     if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
@@ -186,7 +195,10 @@ impl AnalyzerApp {
                 ACCENT,
                 Icon::Check,
                 &format!("EternalMonitor is updated to {version}"),
-                "If the iPad app asks for an update, open TestFlight on the iPad and tap Update.",
+                platform.says(
+                    "If the iPad app asks for an update, open TestFlight on the iPad and tap Update.",
+                    "If the app on your iPhone or iPad asks for an update, open TestFlight on it and tap Update.",
+                ),
                 60.0,
                 |ui| {
                     if widgets::button(ui, Tone::Secondary, None, "OK").clicked() {
@@ -322,7 +334,13 @@ impl AnalyzerApp {
         if !old_app || self.ipad_notice_dismissed {
             return;
         }
-        let (title, body) = IPAD_OUT_OF_DATE;
+        let (title, body) = match self.platform {
+            Platform::Windows => IPAD_OUT_OF_DATE,
+            Platform::Mac => (
+                "The app on your iPhone or iPad is out of date",
+                IPAD_OUT_OF_DATE.1,
+            ),
+        };
         widgets::banner(ui, ACCENT, Icon::Download, title, body, 60.0, |ui| {
             if widgets::button(ui, Tone::Secondary, None, "OK").clicked() {
                 self.ipad_notice_dismissed = true;
@@ -345,7 +363,10 @@ impl AnalyzerApp {
     }
 
     fn mismatch_banner(&mut self, ui: &mut Ui, side: OlderSide) {
-        let (title, body) = crate::updates::mismatch_text(side);
+        let (title, body) = match self.platform {
+            Platform::Windows => crate::updates::mismatch_text(side),
+            Platform::Mac => mac_mismatch_text(side),
+        };
         let mut action = None;
         match side {
             OlderSide::Pc => {
@@ -443,4 +464,18 @@ enum Action {
     Force,
     Cancel,
     Later,
+}
+
+/// The Mac window's [`crate::updates::mismatch_text`].
+fn mac_mismatch_text(side: OlderSide) -> (&'static str, &'static str) {
+    match side {
+        OlderSide::Pc => (
+            "Update this Mac to connect your device",
+            "The app on your device is newer than EternalMonitor on this Mac, so they can't connect. Click Update now.",
+        ),
+        OlderSide::Ipad => (
+            "Update the app on your iPhone or iPad to connect",
+            "The app on your iPhone or iPad is older than EternalMonitor on this Mac, so they can't connect. On it, open TestFlight and tap Update.",
+        ),
+    }
 }

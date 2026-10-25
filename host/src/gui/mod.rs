@@ -12,9 +12,11 @@
 //! - in the sidebar, "Send feedback" and the GitHub star card (see
 //!   `feedback_panel.rs`).
 //!
-//! The Mac host's window ([`Platform::Mac`]) differs only on Stream: a
-//! "Second screen" switch with its status line replaces the mirror / second
-//! screen choice, and the audio row says the stream is video only.
+//! The Mac host's window ([`Platform::Mac`]) names this Mac and the iPhone
+//! or iPad where the Windows window says PC and iPad ([`Platform::says`]).
+//! On Stream, a "Second screen" switch with its status line replaces the
+//! mirror / second screen choice, and the audio row says the stream is video
+//! only. Settings leaves out the Windows display driver's choices.
 
 mod feedback_panel;
 mod icons;
@@ -60,6 +62,16 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// The window's words on this host: `windows` exactly as the Windows
+    /// window has always said it, or the Mac window's, which names this Mac
+    /// and the iPhone or iPad.
+    fn says(self, windows: &'static str, mac: &'static str) -> &'static str {
+        match self {
+            Self::Windows => windows,
+            Self::Mac => mac,
+        }
+    }
+
     pub fn current() -> Self {
         if cfg!(target_os = "macos") {
             Self::Mac
@@ -920,7 +932,7 @@ impl AnalyzerApp {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
                     ui.add_space(6.0);
-                    sidebar_status(ui, snap, client);
+                    sidebar_status(ui, snap, client, self.platform);
                     ui.add_space(6.0);
                     if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
                         self.open_feedback();
@@ -1014,11 +1026,21 @@ impl AnalyzerApp {
     }
 }
 
-fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
+fn sidebar_status(
+    ui: &mut egui::Ui,
+    snap: &StatsSnapshot,
+    client: &ClientSnapshot,
+    platform: Platform,
+) {
     let state = StreamState::of(snap, client);
     let (title, detail) = match state {
         StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
-        StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
+        StreamState::Ready => (
+            "Ready".to_string(),
+            platform
+                .says("Waiting for an iPad", "Waiting for your device")
+                .to_string(),
+        ),
         StreamState::Streaming | StreamState::Paused => (
             if state == StreamState::Paused {
                 "Paused"
@@ -1032,7 +1054,7 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
                     .info
                     .as_ref()
                     .map(|i| i.device_name.as_str())
-                    .unwrap_or("iPad"),
+                    .unwrap_or(platform.says("iPad", "Device")),
                 client.link_name()
             ),
         ),
@@ -1118,6 +1140,7 @@ impl AnalyzerApp {
     }
 
     fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
+        let platform = self.platform;
         let listen_addr = if snap.listen_addr.is_empty() {
             self.control.shared.target_addr.lock().to_string()
         } else {
@@ -1173,9 +1196,10 @@ impl AnalyzerApp {
                             .color(TEXT),
                     );
                     ui.add(
-                        egui::Label::new(muted(
+                        egui::Label::new(muted(platform.says(
                             "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
-                        ))
+                            "On your iPhone or iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
+                        )))
                         .wrap(),
                     );
                     ui.add_space(12.0);
@@ -1216,9 +1240,10 @@ impl AnalyzerApp {
                     ui.add_space(12.0);
                     ui.label(mono(listen_addr.clone(), 14.0));
                     ui.add(
-                        egui::Label::new(faint(
+                        egui::Label::new(faint(platform.says(
                             "The code carries this PC's pairing key. Only show it to iPads you trust.",
-                        ))
+                            "The code carries this Mac's pairing key. Only show it to devices you trust.",
+                        )))
                         .wrap(),
                     );
                     ui.add_space(14.0);

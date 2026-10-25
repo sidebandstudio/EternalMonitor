@@ -22,7 +22,10 @@ impl AnalyzerApp {
         page_header(
             ui,
             "Performance",
-            "Live measurements from capture, encoding and the network on this PC.",
+            self.platform.says(
+                "Live measurements from capture, encoding and the network on this PC.",
+                "Live measurements from capture, encoding and the network on this Mac.",
+            ),
             |ui| {
                 let label = if copied { "Copied" } else { "Copy logs" };
                 let icon = if copied { Icon::Check } else { Icon::Logs };

@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use eframe::egui::accesskit::Role;
 use egui_kittest::{
-    kittest::{NodeT, Queryable},
+    kittest::{By, NodeT, Queryable},
     Harness, SnapshotResults,
 };
 use eternal_host::capture::recovery::CaptureBlock;
@@ -656,7 +656,67 @@ fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mu
     audio.click();
     window.run_steps(4);
     assert!(!shared.audio_enabled.load(Ordering::SeqCst));
+    no_windows_wording(&mut window, "Settings");
+    window.get_by_role_and_label(Role::Button, "Forget all devices");
+    assert!(window
+        .query_by_label("How the iPad shows your PC")
+        .is_none());
+    snapshot(&mut window, shared, "mac-settings");
+    window.get_by_label("Source code").scroll_to_me();
+    window.run_steps(4);
+    no_windows_wording(&mut window, "Settings, scrolled down");
+
+    nav(&mut window, "Performance");
+    no_windows_wording(&mut window, "Performance");
+
+    // Stream, with the device gone: the empty states and the QR dialog.
+    nav(&mut window, "Stream");
+    disconnect_ipad(shared);
+    PIPELINE_STATS.lock().usb_link_state = "Waiting for an iPad".into();
+    window.run_steps(4);
+    window.get_by_label("Plug in your iPhone or iPad to connect over USB.");
+    window.get_by_label("Connect an iPhone or iPad");
+    window.get_by_label("Connected device");
+    window.get_by_label("Waiting for your iPhone or iPad");
+    no_windows_wording(&mut window, "Stream, waiting");
+    snapshot(&mut window, shared, "mac-stream-waiting");
+    window
+        .get_by_role_and_label(Role::Button, "QR code")
+        .click();
+    window.run_steps(4);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+    window.run_steps(4);
+    no_windows_wording(&mut window, "QR code");
+    window.get_by_label("Done").click();
+    window.run_steps(4);
+
+    window
+        .get_by_role_and_label(Role::Button, "Send feedback")
+        .click();
+    window.run_steps(4);
+    window.get_by_role_and_label(Role::CheckBox, "Include app and Mac details");
+    no_windows_wording(&mut window, "Send feedback");
     results.extend_harness(&mut window);
+}
+
+/// Fails if the Mac window says "PC" or "Windows", or "iPad" without the
+/// iPhone: this computer is a Mac, and its client may be either.
+fn no_windows_wording(window: &mut Harness<'_, AnalyzerApp>, page: &str) {
+    fn windows_wording(text: &str) -> bool {
+        let words = text.split(|c: char| !c.is_alphanumeric());
+        let either = text
+            .replace("iPhone or iPad", "")
+            .replace("iPhone and iPad", "");
+        words
+            .into_iter()
+            .any(|word| word == "PC" || word == "Windows")
+            || either.contains("iPad")
+    }
+    let found: Vec<String> = window
+        .query_all(By::new().predicate(|node| node.label().is_some_and(|l| windows_wording(&l))))
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    assert!(found.is_empty(), "{page} says: {found:#?}");
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture
