@@ -108,9 +108,6 @@ pub(crate) trait SettingsSource {
     fn changed(&mut self) -> Option<SettingsFile>;
 }
 
-/// The last `settings.json` the capture path read successfully.
-static LAST_GOOD: parking_lot::Mutex<Option<SettingsFile>> = parking_lot::Mutex::new(None);
-
 /// Whether this generation should capture for real. A settings file that
 /// cannot be read right now (a partial write by another program) keeps the
 /// last good answer rather than reading as "off", which would remove the
@@ -120,17 +117,10 @@ pub(super) fn second_screen_wanted() -> bool {
         return false;
     };
     match SettingsFile::read(&path) {
-        Ok(settings) => {
-            let wanted = settings.mac_second_screen;
-            *LAST_GOOD.lock() = Some(settings);
-            wanted
-        }
+        Ok(settings) => settings.mac_second_screen,
         Err(error) => {
             warn!(%error, "settings.json cannot be read; keeping the last good settings");
-            LAST_GOOD
-                .lock()
-                .as_ref()
-                .is_some_and(|settings| settings.mac_second_screen)
+            SettingsFile::last_good(&path).is_some_and(|settings| settings.mac_second_screen)
         }
     }
 }
@@ -145,8 +135,6 @@ struct SettingsOnDisk {
     warned: Option<Option<SystemTime>>,
     /// Handed out if the very first read fails.
     fallback: Option<SettingsFile>,
-    /// Keep `LAST_GOOD` current (the live host; not tests).
-    share: bool,
 }
 
 impl SettingsOnDisk {
@@ -156,16 +144,15 @@ impl SettingsOnDisk {
             seen: None,
             warned: None,
             fallback: None,
-            share: false,
         }
     }
 
     /// The live host's reader, starting from the last good settings.
     fn live() -> Self {
+        let path = crate::settings::settings_path();
         Self {
-            fallback: LAST_GOOD.lock().clone(),
-            share: true,
-            ..Self::at(crate::settings::settings_path())
+            fallback: path.as_deref().and_then(SettingsFile::last_good),
+            ..Self::at(path)
         }
     }
 }
@@ -183,9 +170,6 @@ impl SettingsSource for SettingsOnDisk {
             Ok(settings) => {
                 self.seen = Some(modified);
                 self.fallback = None;
-                if self.share {
-                    *LAST_GOOD.lock() = Some(settings.clone());
-                }
                 Some(settings)
             }
             Err(error) => {

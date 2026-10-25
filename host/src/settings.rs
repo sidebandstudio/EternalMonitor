@@ -75,6 +75,16 @@ pub fn default_hevc_enabled() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// The last settings each file was read with successfully, by path.
+static LAST_GOOD: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, SettingsFile>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+fn remember_good(path: &std::path::Path, settings: &SettingsFile) {
+    LAST_GOOD
+        .lock()
+        .insert(path.to_path_buf(), settings.clone());
+}
+
 fn default_second_screen_grace_secs() -> u32 {
     60
 }
@@ -135,11 +145,33 @@ impl SettingsFile {
     /// cannot be read or parsed, so a live reader can keep what it had. A
     /// missing file is the defaults.
     pub fn read(path: &std::path::Path) -> Result<Self, String> {
-        match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error.to_string()),
-        }
+        let settings = match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => return Err(error.to_string()),
+        };
+        remember_good(path, &settings);
+        Ok(settings)
+    }
+
+    /// The last settings `path` was read with successfully in this process.
+    pub fn last_good(path: &std::path::Path) -> Option<Self> {
+        LAST_GOOD.lock().get(path).cloned()
+    }
+
+    /// The settings a save carries over for the fields its caller does not
+    /// edit: the file as it is, or, while it cannot be read (a partial or
+    /// broken write by another program), the last values it was read with.
+    /// Defaults only if it was never readable in this process.
+    pub fn current_or_last_good(path: &std::path::Path) -> Self {
+        Self::read(path).unwrap_or_else(|error| {
+            warn!(
+                path = %path.display(),
+                %error,
+                "settings.json cannot be read; keeping its last good values"
+            );
+            Self::last_good(path).unwrap_or_default()
+        })
     }
 
     /// `load` from a given file.
@@ -148,6 +180,7 @@ impl SettingsFile {
             Ok(text) => match serde_json::from_str::<SettingsFile>(&text) {
                 Ok(settings) => {
                     info!(path = %path.display(), "Loaded settings from disk");
+                    remember_good(path, &settings);
                     settings
                 }
                 Err(error) => {
@@ -167,6 +200,12 @@ impl SettingsFile {
         let Some(path) = settings_path() else {
             return;
         };
+        self.save_to(&path);
+    }
+
+    /// `save` to a given file.
+    pub fn save_to(&self, path: &std::path::Path) {
+        let path = path.to_path_buf();
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
                 warn!(
@@ -305,5 +344,81 @@ mod tests {
                 .unwrap()
                 .mac_second_screen
         );
+    }
+
+    fn temp_settings(name: &str) -> (PathBuf, PathBuf) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-settings-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SETTINGS_FILE_NAME);
+        (dir, path)
+    }
+
+    #[test]
+    fn a_gui_save_over_a_broken_file_keeps_the_hosts_own_fields() {
+        let (dir, path) = temp_settings("gui-save");
+        SettingsFile {
+            mac_second_screen: true,
+            mac_second_screen_grace_secs: 42,
+            ..Default::default()
+        }
+        .save_to(&path);
+        // The GUI reads the file at startup.
+        assert!(SettingsFile::load_from(&path).mac_second_screen);
+        // Another program leaves it half-written.
+        fs::write(&path, "{\"mac_second_screen\": tr").unwrap();
+        // A GUI save carries the fields it does not edit over, as
+        // `persist_settings` does, from the last good values.
+        let on_disk = SettingsFile::current_or_last_good(&path);
+        SettingsFile {
+            bitrate_mbps: 20.0,
+            mac_second_screen: on_disk.mac_second_screen,
+            mac_second_screen_grace_secs: on_disk.mac_second_screen_grace_secs,
+            ..Default::default()
+        }
+        .save_to(&path);
+        let saved = SettingsFile::read(&path).unwrap();
+        assert!(saved.mac_second_screen, "turned off by a GUI save");
+        assert_eq!(saved.mac_second_screen_grace_secs, 42);
+        assert_eq!(saved.bitrate_mbps, 20.0);
+        // A readable file is carried over as it is.
+        fs::write(
+            &path,
+            r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false,"mac_second_screen_grace_secs":7}"#,
+        )
+        .unwrap();
+        let on_disk = SettingsFile::current_or_last_good(&path);
+        assert!(!on_disk.mac_second_screen);
+        assert_eq!(on_disk.mac_second_screen_grace_secs, 7);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_never_read_falls_back_to_defaults_and_last_good_is_per_file() {
+        let (dir, path) = temp_settings("never-read");
+        fs::write(&path, "not json").unwrap();
+        assert!(SettingsFile::read(&path).is_err());
+        assert_eq!(
+            SettingsFile::last_good(&path).map(|s| s.mac_second_screen),
+            None
+        );
+        assert!(!SettingsFile::current_or_last_good(&path).mac_second_screen);
+        let (other_dir, other) = temp_settings("other");
+        SettingsFile {
+            mac_second_screen: true,
+            ..Default::default()
+        }
+        .save_to(&other);
+        assert!(SettingsFile::read(&other).unwrap().mac_second_screen);
+        assert!(
+            SettingsFile::last_good(&path).is_none(),
+            "another file's values never leak"
+        );
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other_dir).unwrap();
     }
 }

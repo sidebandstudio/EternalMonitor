@@ -471,8 +471,11 @@ impl AnalyzerApp {
                     Some((*ffmpeg).to_string())
                 }
             });
-        // Kept by the host itself, not edited here.
-        let on_disk = SettingsFile::load();
+        // Kept by the host itself, not edited here: carried over from the
+        // file, or from its last good values while it cannot be read.
+        let on_disk = crate::settings::settings_path()
+            .map(|path| SettingsFile::current_or_last_good(&path))
+            .unwrap_or_default();
         let pairing = self.control.shared.pairing.lock();
         let file = SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
