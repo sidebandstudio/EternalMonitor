@@ -13,14 +13,20 @@ final class KeyboardRelayTests: XCTestCase {
         app.launch()
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
-        // A runner starved while the stream starts can drop the first tap;
-        // tap again only while the button still offers the keyboard.
-        for _ in 0..<2 where !app.keyboards.firstMatch.exists {
-            if !keyboard.exists {
-                app.revealHUD(.threeFingerTap)
-                _ = keyboard.waitForExistence(timeout: 5)
+        // A runner starved while the stream starts can drop the first tap,
+        // and the HUD can hide between any two looks at the button. Each try
+        // lets the HUD hide, brings it back so its five seconds start now,
+        // reads the button's label and place in one snapshot, and touches
+        // that place at once, only while it still offers the keyboard.
+        for _ in 0..<3 where !app.keyboards.firstMatch.exists {
+            expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
+            waitForExpectations(timeout: 6)
+            revealHUD(app: app)
+            guard keyboard.waitForExistence(timeout: 5), let button = try? keyboard.snapshot() else { continue }
+            if button.label == "Keyboard" {
+                app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: button.frame.midX, dy: button.frame.midY)).tap()
             }
-            if keyboard.exists && keyboard.label == "Keyboard" { keyboard.tap() }
             _ = app.keyboards.firstMatch.waitForExistence(timeout: 5)
         }
         XCTAssertTrue(app.keyboards.firstMatch.exists)
