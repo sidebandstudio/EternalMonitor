@@ -12,8 +12,13 @@
 //! point 5.
 //!
 //! A saved profile wins over the size the client reports, so a device keeps
-//! the display its user last had. Profiles live in `settings.json`
-//! (`SettingsFile::display_profiles`).
+//! the display its user last had. Profiles live in their own file,
+//! `display-profiles.json` beside `settings.json` ([`ProfileStore`]), so
+//! the capture path that saves them never rewrites the user's settings.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +135,125 @@ pub fn fit(content: (u32, u32), screen: (u32, u32), mode: FitMode) -> Placement 
     }
 }
 
+/// The saved profiles, by `device_id` in hex.
+type Profiles = BTreeMap<String, DisplayProfile>;
+
+/// `display-profiles.json`: read when it changes, written atomically
+/// (temporary file, then rename). The capture path is its only writer.
+pub struct ProfileStore {
+    path: Option<PathBuf>,
+    cache: Profiles,
+    seen: Option<Option<SystemTime>>,
+}
+
+/// Serialises writers in this process.
+static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn key(device_id: u64) -> String {
+    format!("{device_id:016x}")
+}
+
+fn read(path: &Path) -> Result<Profiles, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Profiles::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+impl ProfileStore {
+    /// The store beside `settings.json`.
+    pub fn beside_settings() -> Self {
+        Self::at(crate::settings::app_data_dir().map(|dir| dir.join("display-profiles.json")))
+    }
+
+    pub fn at(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            cache: Profiles::new(),
+            seen: None,
+        }
+    }
+
+    /// Re-reads the file if it changed. A file that cannot be read or
+    /// parsed leaves the last good profiles in place.
+    fn refresh(&mut self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let modified = modified(path);
+        if self.seen == Some(modified) {
+            return;
+        }
+        match read(path) {
+            Ok(profiles) => {
+                self.cache = profiles;
+                self.seen = Some(modified);
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Could not read the saved display profiles");
+            }
+        }
+    }
+
+    /// The saved profile for a client device. Device 0 is a client that
+    /// sent no identity, which never has one.
+    pub fn get(&mut self, device_id: u64) -> Option<DisplayProfile> {
+        if device_id == 0 {
+            return None;
+        }
+        self.refresh();
+        self.cache.get(&key(device_id)).copied()
+    }
+
+    /// Saves `profile` for a client device if it differs. Returns whether
+    /// it was written.
+    pub fn remember(&mut self, device_id: u64, profile: DisplayProfile) -> bool {
+        if device_id == 0 || self.get(device_id) == Some(profile) {
+            return false;
+        }
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        let _write = WRITE.lock();
+        // Start from what is on disk now, not the cache.
+        let mut profiles = match read(&path) {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Not overwriting display profiles that cannot be read");
+                return false;
+            }
+        };
+        profiles.insert(key(device_id), profile);
+        let written = serde_json::to_string_pretty(&profiles)
+            .map_err(|error| error.to_string())
+            .and_then(|text| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, text)
+                    .and_then(|()| std::fs::rename(&tmp, &path))
+                    .map_err(|error| error.to_string())
+            });
+        match written {
+            Ok(()) => {
+                self.cache = profiles;
+                self.seen = Some(modified(&path));
+                true
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Could not save the display profile");
+                false
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +339,64 @@ mod tests {
                 (1.0, (0.0, 0.0), (0.0, 0.0))
             );
         }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-profiles-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn profiles_are_kept_per_device_in_their_own_file() {
+        let dir = temp_dir("store");
+        let path = dir.join("display-profiles.json");
+        let mut store = ProfileStore::at(Some(path.clone()));
+        let duo = ClientScreen {
+            device_id: 0x0123_4567_89ab_cdef,
+            screen_px: (1398, 2034),
+            refresh_hz: 120,
+        };
+        // A Duo that first connects folded still saves the inner size.
+        let profile = profile_for(duo, store.get(duo.device_id));
+        assert_eq!((profile.width_px, profile.height_px), (2670, 1878));
+        assert!(store.remember(duo.device_id, profile));
+        assert!(!store.remember(duo.device_id, profile));
+        // A client with no identity is never saved.
+        assert!(!store.remember(0, profile));
+        assert_eq!(store.get(0), None);
+        let ipad = DisplayProfile {
+            width_px: 2420,
+            height_px: 1668,
+            refresh_hz: 120,
+            hidpi: true,
+        };
+        store.remember(7, ipad);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"0123456789abcdef\""), "{text}");
+        assert!(!dir.join("display-profiles.json.tmp").exists());
+        // Another reader sees both, and the Duo coming back on its inner
+        // screen at 60 Hz keeps its saved profile.
+        let mut reader = ProfileStore::at(Some(path.clone()));
+        assert_eq!(reader.get(duo.device_id), Some(profile));
+        assert_eq!(reader.get(7), Some(ipad));
+        assert_eq!(reader.get(8), None);
+        let back = ClientScreen {
+            screen_px: (1878, 2670),
+            refresh_hz: 60,
+            ..duo
+        };
+        assert_eq!(profile_for(back, reader.get(back.device_id)), profile);
+        // A damaged file keeps the last good profiles and is not overwritten.
+        std::fs::write(&path, "{\"0123").unwrap();
+        assert_eq!(reader.get(7), Some(ipad));
+        assert!(!reader.remember(9, ipad));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"0123");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
