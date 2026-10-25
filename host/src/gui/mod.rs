@@ -1319,6 +1319,24 @@ pub fn detect_local_ip(listen_port: u16) -> String {
     format!("unknown:{listen_port}")
 }
 
+/// Set from a termination signal handler (async-signal-safe: a store). The
+/// window then closes as if its close button was clicked, so the host's
+/// usual teardown runs.
+pub static CLOSE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Closes the window once [`CLOSE_REQUESTED`] is set.
+fn close_when_requested(ctx: egui::Context) {
+    std::thread::spawn(move || {
+        while !CLOSE_REQUESTED.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        info!("Termination signal received — closing the window");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    });
+}
+
 /// Launch the GUI window. Blocks the calling thread.
 pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
@@ -1337,7 +1355,10 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     let result = eframe::run_native(
         "EternalMonitor",
         options,
-        Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
+        Box::new(|cc| {
+            close_when_requested(cc.egui_ctx.clone());
+            Ok(Box::new(AnalyzerApp::new(cc, control)))
+        }),
     );
     if result.is_ok() {
         renderer::window_closed();

@@ -237,8 +237,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::sync::atomic::AtomicBool::new(false);
     #[cfg(unix)]
     extern "C" fn on_terminate_signal(_signal: libc::c_int) {
-        // Async-signal-safe: only a flag store — the polling loop does the work.
+        // Async-signal-safe: only flag stores — the polling loop, or the
+        // window, does the work.
         SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        gui::CLOSE_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     #[cfg(windows)]
     unsafe extern "system" fn on_console_control(event: u32) -> windows::Win32::Foundation::BOOL {
@@ -257,19 +259,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mdns = discovery::advertise_service(listen_port);
 
+    let mut window_error = None;
+    // SIGTERM/SIGINT end a headless run, or close the window, through the
+    // same teardown as a quit from the window.
+    #[cfg(unix)]
+    unsafe {
+        let handler = on_terminate_signal as extern "C" fn(libc::c_int);
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+    }
     // Headless mode for automation (the iOS E2E harness runs the host without
     // a window): stream until SIGTERM/SIGINT, then fall through to the same
     // clean teardown as a GUI quit — mDNS goodbye, VDD disable, bounded
     // supervisor join. (Previously a kill skipped all of that.)
-    let mut window_error = None;
     if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
         info!("ETERNAL_HEADLESS=1 — running without GUI until terminated");
-        #[cfg(unix)]
-        unsafe {
-            let handler = on_terminate_signal as extern "C" fn(libc::c_int);
-            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
-            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-        }
         #[cfg(windows)]
         unsafe {
             eternal_host::console::ensure_console();
