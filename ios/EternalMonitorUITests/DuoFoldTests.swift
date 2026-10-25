@@ -194,11 +194,15 @@ final class DuoFoldTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)
         let later = Pixels(upright(screenshot(of: screen), like: window), window: window)
         let area = visiblePicture(picture, in: window)
-        let grid = (1...7).flatMap { x in (1...7).map { y in
-            CGPoint(x: area.minX + area.width * CGFloat(x) / 8, y: area.minY + area.height * CGFloat(y) / 8)
-        } }
-        XCTAssertTrue(grid.contains { abs(first.green(at: $0) - later.green(at: $0)) > 8 },
-                      "\(screen) \(name): the picture stopped moving", file: file, line: line)
+        var moved = false
+        for x in 1...7 {
+            for y in 1...7 {
+                let point = CGPoint(x: area.minX + area.width * CGFloat(x) / 8,
+                                    y: area.minY + area.height * CGFloat(y) / 8)
+                if abs(first.green(at: point) - later.green(at: point)) > 8 { moved = true }
+            }
+        }
+        XCTAssertTrue(moved, "\(screen) \(name): the picture stopped moving", file: file, line: line)
 
         // Two touches inside the picture, away from its edges and the HUD.
         let targets = [CGPoint(x: window.width * 0.3, y: window.height * 0.45),

@@ -124,7 +124,8 @@ jobs:
           UDID: ${{ steps.sim.outputs.udid }}
         run: |
           mkdir -p build/duo-app-log
-          DATA=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data)
+          # Nothing to keep when the tests never installed the app.
+          DATA=$(xcrun simctl get_app_container "$UDID" com.eternal.monitor data) || exit 0
           cp "$DATA/Library/Application Support/Diagnostics/"eternal-ipad.log* build/duo-app-log/ || true
       # The same groups the iPad runs (scripts/e2e_stream_ui.sh, then the
       # rest), so a saved host or setting from one can't change the other.
