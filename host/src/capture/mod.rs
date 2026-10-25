@@ -622,6 +622,9 @@ fn run_platform_loop(
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested || !mac_screen::second_screen_wanted() {
         mac_screen::second_screen_off();
+        // The test picture needs no Screen Recording, so a block left by
+        // screen capture no longer applies.
+        shared.capture_block.lock().take();
         synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
         mac_screen::run_capture_loop(slot, shared, generation, frame_number)
