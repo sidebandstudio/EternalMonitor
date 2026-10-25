@@ -31,8 +31,8 @@ use objc2_screen_capture_kit::{
 use tracing::{info, warn};
 
 use super::{
-    classify_error, is_from_display, CaptureFailure, FrameStatus, SparsePacing, StreamSettings,
-    Surface,
+    classify_error, is_from_display, mailbox, next_step, CaptureFailure, Delivery, FrameStatus,
+    Inbox, Mailbox, SparsePacing, Step, StreamSettings, Surface,
 };
 use crate::capture::{heartbeat, idle_heartbeat, FrameSlot, FrameUse, RawFrame};
 use crate::control::SharedControl;
@@ -77,11 +77,6 @@ pub struct Delivered {
     pub at: Instant,
 }
 
-pub enum Event {
-    Frame(Delivered),
-    Stopped(CaptureFailure),
-}
-
 /// Reads a sample buffer's frame status and screen rect.
 ///
 /// # Safety
@@ -123,7 +118,7 @@ fn failure_from(error: Option<&NSError>) -> CaptureFailure {
 }
 
 struct OutputIvars {
-    events: mpsc::SyncSender<Event>,
+    deliveries: Mailbox<Delivered>,
 }
 
 define_class!(
@@ -160,29 +155,27 @@ define_class!(
             };
             // A full queue means the loop is behind: drop this delivery
             // rather than hold more of ScreenCaptureKit's buffers.
-            let _ = self.ivars().events.try_send(Event::Frame(Delivered {
+            self.ivars().deliveries.frame(Delivered {
                 status,
                 surface,
                 screen_rect,
                 at: Instant::now(),
-            }));
+            });
         }
     }
 
     unsafe impl SCStreamDelegate for CaptureOutput {
         #[unsafe(method(stream:didStopWithError:))]
         fn did_stop(&self, _stream: &SCStream, error: &NSError) {
-            let _ = self
-                .ivars()
-                .events
-                .try_send(Event::Stopped(failure_from(Some(error))));
+            // Never queued behind frames: the loop always sees it.
+            self.ivars().deliveries.stop(failure_from(Some(error)));
         }
     }
 );
 
 impl CaptureOutput {
-    fn new(events: mpsc::SyncSender<Event>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(OutputIvars { events });
+    fn new(deliveries: Mailbox<Delivered>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(OutputIvars { deliveries });
         // SAFETY: NSObject's designated initialiser.
         unsafe { msg_send![super(this), init] }
     }
@@ -234,7 +227,7 @@ pub struct ScreenStream {
     stream: Retained<SCStream>,
     _output: Retained<CaptureOutput>,
     _queue: DispatchRetained<DispatchQueue>,
-    events: mpsc::Receiver<Event>,
+    deliveries: Inbox<Delivered>,
 }
 
 impl ScreenStream {
@@ -266,8 +259,8 @@ impl ScreenStream {
             config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
             (filter, config)
         };
-        let (events_tx, events) = mpsc::sync_channel(4);
-        let output = CaptureOutput::new(events_tx);
+        let (mailbox, deliveries) = mailbox(4);
+        let output = CaptureOutput::new(mailbox);
         let queue = DispatchQueue::new("com.sidebandstudio.eternalmonitor.capture", None);
         // SAFETY: as above; the output and queue outlive the stream (both
         // are held in `Self`).
@@ -299,7 +292,7 @@ impl ScreenStream {
                 stream,
                 _output: output,
                 _queue: queue,
-                events,
+                deliveries,
             }),
             Ok(Some(failure)) => Err(failure),
             Err(_) => Err(CaptureFailure::Failed(
@@ -308,8 +301,8 @@ impl ScreenStream {
         }
     }
 
-    pub fn next_event(&self, timeout: Duration) -> Option<Event> {
-        self.events.recv_timeout(timeout).ok()
+    pub fn deliveries(&self) -> &Inbox<Delivered> {
+        &self.deliveries
     }
 }
 
@@ -430,15 +423,22 @@ pub fn run_capture_loop(
             let wait = pacing
                 .keepalive_in(watching, cached.is_some(), now)
                 .map_or(POLL, |due| due.min(POLL));
-            if wait.is_zero() {
-                if let Some(surface) = cached.clone() {
-                    publish(surface, now, frame_number);
-                    pacing.resent(now);
+            match next_step(stream.deliveries(), wait.is_zero()) {
+                Step::Fail(failure) => {
+                    warn!(?failure, "ScreenCaptureKit stopped the stream");
+                    return Err(failure.into_error());
                 }
-                continue;
+                Step::Resend => {
+                    if let Some(surface) = cached.clone() {
+                        publish(surface, now, frame_number);
+                        pacing.resent(now);
+                    }
+                    continue;
+                }
+                Step::Wait => {}
             }
-            match stream.next_event(wait) {
-                Some(Event::Frame(delivered)) => {
+            match stream.deliveries().next(wait) {
+                Some(Delivery::Frame(delivered)) => {
                     if let Some(rect) = delivered.screen_rect {
                         if !is_from_display(rect, bounds) {
                             // The user may have moved the display; only a
@@ -467,7 +467,7 @@ pub fn run_capture_loop(
                         None => {}
                     }
                 }
-                Some(Event::Stopped(failure)) => {
+                Some(Delivery::Stopped(failure)) => {
                     warn!(?failure, "ScreenCaptureKit stopped the stream");
                     return Err(failure.into_error());
                 }

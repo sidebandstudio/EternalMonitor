@@ -16,6 +16,7 @@
 
 pub mod stream;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::recovery::{CaptureBlock, CaptureUnavailable};
@@ -213,6 +214,109 @@ impl SparsePacing {
     /// A viewer left: the next one gets the cached picture at once.
     pub fn viewer_left(&mut self) {
         self.last_sent = None;
+    }
+}
+
+/// What the capture loop takes from ScreenCaptureKit's queue.
+#[derive(Debug, PartialEq)]
+pub enum Delivery<T> {
+    Frame(T),
+    /// The stream stopped. Seen before any frame still queued.
+    Stopped(CaptureFailure),
+}
+
+struct MailboxState<T> {
+    frames: std::collections::VecDeque<T>,
+    stopped: Option<CaptureFailure>,
+}
+
+struct MailboxShared<T> {
+    state: parking_lot::Mutex<MailboxState<T>>,
+    changed: parking_lot::Condvar,
+    capacity: usize,
+}
+
+/// ScreenCaptureKit's side: frames go into a small queue and are dropped
+/// when the capture loop is behind (holding more would hold more of
+/// ScreenCaptureKit's buffers); the stream's stop is kept apart, so it can
+/// never be lost to a full queue.
+pub struct Mailbox<T>(Arc<MailboxShared<T>>);
+
+/// The capture loop's side.
+pub struct Inbox<T>(Arc<MailboxShared<T>>);
+
+pub fn mailbox<T>(capacity: usize) -> (Mailbox<T>, Inbox<T>) {
+    let shared = Arc::new(MailboxShared {
+        state: parking_lot::Mutex::new(MailboxState {
+            frames: std::collections::VecDeque::with_capacity(capacity),
+            stopped: None,
+        }),
+        changed: parking_lot::Condvar::new(),
+        capacity,
+    });
+    (Mailbox(Arc::clone(&shared)), Inbox(shared))
+}
+
+impl<T> Mailbox<T> {
+    /// Queues a frame; false if the queue was full and it was dropped.
+    pub fn frame(&self, frame: T) -> bool {
+        let mut state = self.0.state.lock();
+        if state.frames.len() >= self.0.capacity {
+            return false;
+        }
+        state.frames.push_back(frame);
+        self.0.changed.notify_one();
+        true
+    }
+
+    /// Records the stream's stop (the first one wins) and wakes the loop.
+    pub fn stop(&self, failure: CaptureFailure) {
+        let mut state = self.0.state.lock();
+        state.stopped.get_or_insert(failure);
+        self.0.changed.notify_one();
+    }
+}
+
+impl<T> Inbox<T> {
+    /// Whether the stream has stopped, without taking a frame.
+    pub fn stopped(&self) -> Option<CaptureFailure> {
+        self.0.state.lock().stopped.clone()
+    }
+
+    /// The stop if there is one, else the next frame, waiting up to
+    /// `timeout` for either.
+    pub fn next(&self, timeout: Duration) -> Option<Delivery<T>> {
+        let mut state = self.0.state.lock();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(failure) = &state.stopped {
+                return Some(Delivery::Stopped(failure.clone()));
+            }
+            if let Some(frame) = state.frames.pop_front() {
+                return Some(Delivery::Frame(frame));
+            }
+            if self.0.changed.wait_until(&mut state, deadline).timed_out() {
+                return None;
+            }
+        }
+    }
+}
+
+/// What the capture loop does next. A stopped stream ends the loop before
+/// anything else, so cached-frame keepalives never stand in for capture
+/// (and keep the watchdog quiet) after the stream is gone.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Step {
+    Fail(CaptureFailure),
+    Resend,
+    Wait,
+}
+
+pub(crate) fn next_step<T>(inbox: &Inbox<T>, keepalive_due: bool) -> Step {
+    match inbox.stopped() {
+        Some(failure) => Step::Fail(failure),
+        None if keepalive_due => Step::Resend,
+        None => Step::Wait,
     }
 }
 
@@ -697,6 +801,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_stop_behind_a_full_queue_still_ends_the_loop() {
+        let (mailbox, inbox) = mailbox::<u32>(4);
+        for frame in 0..4 {
+            assert!(mailbox.frame(frame));
+        }
+        assert!(!mailbox.frame(99), "a full queue drops frames");
+        let failure = CaptureFailure::Interrupted(-3821);
+        mailbox.stop(failure.clone());
+        // The stop comes first, and keeps coming: no queued frame or
+        // keepalive resend can follow it.
+        for _ in 0..3 {
+            assert_eq!(
+                inbox.next(Duration::ZERO),
+                Some(Delivery::Stopped(failure.clone()))
+            );
+        }
+        assert_eq!(next_step(&inbox, true), Step::Fail(failure.clone()));
+        // A later stop does not replace the first.
+        mailbox.stop(CaptureFailure::PermissionDenied);
+        assert_eq!(inbox.stopped(), Some(failure));
+    }
+
+    #[test]
+    fn a_stop_wakes_a_waiting_loop() {
+        let (mailbox, inbox) = mailbox::<u32>(4);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(50 * MS);
+            mailbox.stop(CaptureFailure::Interrupted(-3805));
+        });
+        let start = Instant::now();
+        assert_eq!(
+            inbox.next(Duration::from_secs(10)),
+            Some(Delivery::Stopped(CaptureFailure::Interrupted(-3805)))
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        stopper.join().unwrap();
+    }
+
+    #[test]
+    fn frames_flow_in_order_and_keepalives_run_while_the_stream_lives() {
+        let (mailbox, inbox) = mailbox::<u32>(4);
+        assert_eq!(inbox.next(MS), None);
+        assert_eq!(next_step(&inbox, false), Step::Wait);
+        assert_eq!(next_step(&inbox, true), Step::Resend);
+        mailbox.frame(1);
+        mailbox.frame(2);
+        assert_eq!(inbox.next(Duration::ZERO), Some(Delivery::Frame(1)));
+        assert_eq!(inbox.next(Duration::ZERO), Some(Delivery::Frame(2)));
     }
 
     #[test]
