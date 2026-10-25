@@ -220,6 +220,15 @@ fn find_display(display_id: u32) -> Result<Retained<SCDisplay>, CaptureFailure> 
     }
 }
 
+/// Whether ScreenCaptureKit offers `display_id` for capture now.
+pub fn display_listed(display_id: u32) -> Result<bool, CaptureFailure> {
+    match find_display(display_id) {
+        Ok(_) => Ok(true),
+        Err(CaptureFailure::DisplayNotFound(_)) => Ok(false),
+        Err(failure) => Err(failure),
+    }
+}
+
 /// A running capture of one display. Stops when dropped.
 pub struct ScreenStream {
     stream: Retained<SCStream>,

@@ -23,13 +23,35 @@ use objc2_core_graphics::CGMainDisplayID;
 use tracing::{info, warn};
 
 use super::sck::stream::DisplayChoice;
+use super::sck::CaptureFailure;
 use super::FrameSlot;
 use crate::control::SharedControl;
 use crate::display_profile::ClientScreen;
 use crate::settings::SettingsFile;
 use crate::virtual_display::mac::{CgVirtualDisplays, ModeChange};
 use crate::virtual_display::owner::DisplayOwner;
-use crate::virtual_display::{Want, Wanted};
+use crate::virtual_display::{SecondScreenStatus, Want, Wanted};
+
+/// How long a new display may take to appear in ScreenCaptureKit's list
+/// before the main display is mirrored instead (macOS 15.7 has been seen
+/// not to list a virtual display at all).
+const LIST_WAIT: Duration = Duration::from_secs(4);
+const LIST_POLL: Duration = Duration::from_millis(250);
+/// How often a display that was not listed is checked again.
+const LIST_RECHECK: Duration = Duration::from_secs(5);
+
+/// Whether ScreenCaptureKit offers a display.
+pub(crate) trait ContentLister {
+    fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure>;
+}
+
+struct ScreenCaptureKitLister;
+
+impl ContentLister for ScreenCaptureKitLister {
+    fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure> {
+        super::sck::stream::display_listed(display_id)
+    }
+}
 
 static OWNER: OnceLock<Option<DisplayOwner>> = OnceLock::new();
 
@@ -109,9 +131,14 @@ pub(crate) struct Targets<'a> {
     owner: &'a DisplayOwner,
     settings_source: Box<dyn SettingsSource + 'a>,
     settings: SettingsFile,
+    lister: Box<dyn ContentLister + 'a>,
+    /// Sleeps between listing checks, keeping the stage's heartbeats.
+    wait: Box<dyn FnMut(Duration) + 'a>,
     main: u32,
-    /// The last answer, to log only changes.
-    last: Option<u32>,
+    /// The display ScreenCaptureKit was last seen to offer.
+    listed: Option<u32>,
+    /// A display it did not offer, and when to check it again.
+    unlisted: Option<(u32, Instant)>,
 }
 
 impl<'a> Targets<'a> {
@@ -119,6 +146,8 @@ impl<'a> Targets<'a> {
         shared: SharedControl,
         owner: &'a DisplayOwner,
         settings_source: Box<dyn SettingsSource + 'a>,
+        lister: Box<dyn ContentLister + 'a>,
+        wait: Box<dyn FnMut(Duration) + 'a>,
         main: u32,
     ) -> Self {
         Self {
@@ -126,12 +155,70 @@ impl<'a> Targets<'a> {
             owner,
             settings_source,
             settings: SettingsFile::default(),
+            lister,
+            wait,
             main,
-            last: None,
+            listed: None,
+            unlisted: None,
         }
     }
 
-    fn choose(&mut self) -> u32 {
+    fn set_status(&self, status: SecondScreenStatus) {
+        let mut current = self.shared.second_screen.lock();
+        if *current == status {
+            return;
+        }
+        match &status {
+            SecondScreenStatus::Off => info!("Second screen off"),
+            SecondScreenStatus::Mirroring => {
+                info!("No client connected; mirroring the main display until one is")
+            }
+            SecondScreenStatus::Active(id) => info!(id, "Capturing the second-screen display"),
+            SecondScreenStatus::NotCapturable(id) => warn!(
+                id,
+                "macOS has not made the second-screen display available to capture; \
+                 mirroring the main display and checking again every few seconds"
+            ),
+            SecondScreenStatus::Unavailable(why) => {
+                warn!(%why, "Second screen unavailable; mirroring the main display")
+            }
+        }
+        *current = status;
+    }
+
+    /// Whether ScreenCaptureKit offers `id`: at once if it was seen before,
+    /// after a bounded wait for a display it has not been asked about, and
+    /// every `LIST_RECHECK` for one it did not offer.
+    fn capturable(&mut self, id: u32, now: Instant) -> bool {
+        if self.listed == Some(id) {
+            return true;
+        }
+        let listed = match self.unlisted {
+            Some((pending, next)) if pending == id && now < next => return false,
+            Some((pending, _)) if pending == id => self.lister.is_listed(id).unwrap_or(false),
+            _ => {
+                let mut listed = false;
+                let polls = LIST_WAIT.as_millis() / LIST_POLL.as_millis();
+                for poll in 0..=polls {
+                    listed = self.lister.is_listed(id).unwrap_or(false);
+                    if listed || poll == polls {
+                        break;
+                    }
+                    (self.wait)(LIST_POLL);
+                }
+                listed
+            }
+        };
+        if listed {
+            self.listed = Some(id);
+            self.unlisted = None;
+        } else {
+            self.unlisted = Some((id, now + LIST_RECHECK));
+        }
+        listed
+    }
+
+    fn choose(&mut self, now: Instant) -> u32 {
         if let Some(settings) = self.settings_source.changed() {
             self.settings = settings;
         }
@@ -141,6 +228,7 @@ impl<'a> Targets<'a> {
             if let Err(error) = self.owner.want(off()) {
                 warn!(%error, "The second-screen display did not go away");
             }
+            self.set_status(SecondScreenStatus::Off);
             return self.main;
         }
         let client = {
@@ -179,26 +267,20 @@ impl<'a> Targets<'a> {
                         self.settings_source.save(&self.settings);
                     }
                 }
-                if self.last != Some(second.id) {
-                    info!(
-                        id = second.id,
-                        bounds = ?second.bounds,
-                        profile = ?second.profile,
-                        "Capturing the second-screen display"
-                    );
+                if self.capturable(second.id, now) {
+                    self.set_status(SecondScreenStatus::Active(second.id));
+                    second.id
+                } else {
+                    self.set_status(SecondScreenStatus::NotCapturable(second.id));
+                    self.main
                 }
-                second.id
             }
             Ok(None) => {
-                if self.last != Some(self.main) {
-                    info!("No client connected; mirroring the main display until one is");
-                }
+                self.set_status(SecondScreenStatus::Mirroring);
                 self.main
             }
             Err(error) => {
-                if self.last != Some(self.main) {
-                    warn!(%error, "Second screen unavailable; mirroring the main display");
-                }
+                self.set_status(SecondScreenStatus::Unavailable(error.to_string()));
                 self.main
             }
         }
@@ -206,14 +288,23 @@ impl<'a> Targets<'a> {
 }
 
 impl DisplayChoice for Targets<'_> {
-    fn display(&mut self, _now: Instant) -> u32 {
-        let chosen = self.choose();
-        self.last = Some(chosen);
-        chosen
+    fn display(&mut self, now: Instant) -> u32 {
+        self.choose(now)
     }
 
-    fn not_listed(&mut self, _display_id: u32, _now: Instant) -> bool {
-        false
+    /// The stream could not find a display it was given. For the virtual
+    /// display that means mirroring until a later check finds it; it is
+    /// never a pipeline failure. For the main display it is.
+    fn not_listed(&mut self, display_id: u32, now: Instant) -> bool {
+        if display_id == self.main {
+            return false;
+        }
+        if self.listed == Some(display_id) {
+            self.listed = None;
+        }
+        self.unlisted = Some((display_id, now + LIST_RECHECK));
+        self.set_status(SecondScreenStatus::NotCapturable(display_id));
+        true
     }
 }
 
@@ -233,10 +324,20 @@ pub(super) fn run_capture_loop(
             &mut Fixed(main),
         );
     };
+    let wait_shared = shared.clone();
     let mut targets = Targets::new(
         shared.clone(),
         owner,
         Box::new(SettingsOnDisk::default()),
+        Box::new(ScreenCaptureKitLister),
+        Box::new(move |duration| {
+            // A bounded wait inside one capture pass: keep the stage alive.
+            let until = Instant::now() + duration;
+            while Instant::now() < until {
+                super::idle_heartbeat(&wait_shared, crate::clock::host_now_us() / 1000);
+                std::thread::sleep(Duration::from_millis(50).min(until - Instant::now()));
+            }
+        }),
         main,
     );
     super::sck::stream::run_capture_loop(slot, shared, generation, frame_number, &mut targets)
@@ -366,6 +467,50 @@ pub(crate) mod tests {
         (owner, ops)
     }
 
+    /// ScreenCaptureKit, faked: lists a display after so many checks.
+    pub(crate) struct FakeLister {
+        pub(crate) listed_after: Option<u32>,
+        pub(crate) checks: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl FakeLister {
+        pub(crate) fn listed() -> Self {
+            Self::after(Some(0))
+        }
+
+        pub(crate) fn after(listed_after: Option<u32>) -> Self {
+            Self {
+                listed_after,
+                checks: Default::default(),
+            }
+        }
+    }
+
+    impl ContentLister for FakeLister {
+        fn is_listed(&self, display_id: u32) -> Result<bool, CaptureFailure> {
+            assert_ne!(display_id, MAIN, "only virtual displays are checked");
+            let checks = self.checks.get();
+            self.checks.set(checks + 1);
+            Ok(self.listed_after.is_some_and(|after| checks >= after))
+        }
+    }
+
+    pub(crate) fn targets<'a>(
+        shared: &SharedControl,
+        owner: &'a DisplayOwner,
+        settings: Box<dyn SettingsSource + 'a>,
+        lister: FakeLister,
+    ) -> Targets<'a> {
+        Targets::new(
+            shared.clone(),
+            owner,
+            settings,
+            Box::new(lister),
+            Box::new(|_| {}),
+            MAIN,
+        )
+    }
+
     /// What the capture loop does with the answers: it starts a stream
     /// whenever the chosen display changes, within one generation.
     pub(crate) fn streams_started(answers: &[u32]) -> Vec<u32> {
@@ -385,14 +530,14 @@ pub(crate) mod tests {
             crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
         let (owner, ops) = fake_owner();
         let (saved_tx, saved) = mpsc::channel();
-        let mut targets = Targets::new(
-            shared.clone(),
+        let mut targets = targets(
+            &shared,
             &owner,
             Box::new(MemorySettings {
                 next: Some(enabled()),
                 saved: saved_tx,
             }),
-            MAIN,
+            FakeLister::listed(),
         );
         let now = Instant::now();
         let mut answers = Vec::new();
@@ -428,14 +573,14 @@ pub(crate) mod tests {
         let shared = SharedControl::new(0, 15_000_000);
         let (owner, ops) = fake_owner();
         let mut settings = enabled();
-        let mut targets = Targets::new(
-            shared.clone(),
+        let mut targets = targets(
+            &shared,
             &owner,
             Box::new(MemorySettings {
                 next: Some(settings.clone()),
                 saved: mpsc::channel().0,
             }),
-            MAIN,
+            FakeLister::listed(),
         );
         connect(&shared, 0xd0, (2670, 1878));
         let now = Instant::now();
@@ -468,14 +613,14 @@ pub(crate) mod tests {
     fn turning_second_screen_off_while_running_mirrors_and_removes_the_display() {
         let shared = SharedControl::new(0, 15_000_000);
         let (owner, ops) = fake_owner();
-        let mut targets = Targets::new(
-            shared.clone(),
+        let mut targets = targets(
+            &shared,
             &owner,
             Box::new(MemorySettings {
                 next: Some(enabled()),
                 saved: mpsc::channel().0,
             }),
-            MAIN,
+            FakeLister::listed(),
         );
         connect(&shared, 0xd0, (2670, 1878));
         let virtual_id = targets.display(Instant::now());
@@ -489,5 +634,121 @@ pub(crate) mod tests {
             matches!(ops[..], [Op::Create(_), Op::Remove(id)] if id == virtual_id),
             "{ops:?}"
         );
+    }
+    /// A lister whose answer can change, and the time a test has waited.
+    struct Scripted {
+        listed: std::rc::Rc<std::cell::Cell<bool>>,
+        checks: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl ContentLister for Scripted {
+        fn is_listed(&self, _display_id: u32) -> Result<bool, CaptureFailure> {
+            self.checks.set(self.checks.get() + 1);
+            Ok(self.listed.get())
+        }
+    }
+
+    #[test]
+    fn a_new_display_is_captured_once_screencapturekit_lists_it() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, _ops) = fake_owner();
+        let lister = FakeLister::after(Some(3));
+        let checks = lister.checks.clone();
+        let waited = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let waited_in = waited.clone();
+        let mut targets = Targets::new(
+            shared.clone(),
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+                saved: mpsc::channel().0,
+            }),
+            Box::new(lister),
+            Box::new(move |d| waited_in.set(waited_in.get() + d)),
+            MAIN,
+        );
+        connect(&shared, 0xd0, (2670, 1878));
+        let id = targets.display(Instant::now());
+        assert_ne!(id, MAIN);
+        assert_eq!(checks.get(), 4);
+        assert_eq!(waited.get(), LIST_POLL * 3);
+        assert_eq!(*shared.second_screen.lock(), SecondScreenStatus::Active(id));
+        // Seen once, never asked again.
+        targets.display(Instant::now());
+        assert_eq!(checks.get(), 4);
+    }
+
+    #[test]
+    fn a_display_screencapturekit_never_lists_falls_back_to_mirroring_and_is_kept() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner();
+        let listed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let waited = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let waited_in = waited.clone();
+        let mut targets = Targets::new(
+            shared.clone(),
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+                saved: mpsc::channel().0,
+            }),
+            Box::new(Scripted {
+                listed: listed.clone(),
+                checks: checks.clone(),
+            }),
+            Box::new(move |d| waited_in.set(waited_in.get() + d)),
+            MAIN,
+        );
+        connect(&shared, 0xd0, (2670, 1878));
+        let start = Instant::now();
+        // A bounded wait, then the main display.
+        assert_eq!(targets.display(start), MAIN);
+        assert_eq!(waited.get(), LIST_WAIT);
+        assert_eq!(checks.get(), 17);
+        let Ok(Op::Create(_)) = ops.try_recv() else {
+            panic!("the display was made")
+        };
+        let SecondScreenStatus::NotCapturable(id) = *shared.second_screen.lock() else {
+            panic!("a clear status")
+        };
+        // Until the recheck, capture stays on the main display and nothing
+        // waits or asks again.
+        assert_eq!(targets.display(start + Duration::from_secs(1)), MAIN);
+        assert_eq!(checks.get(), 17);
+        // A later check finds it: capture moves to it, the same display.
+        listed.set(true);
+        assert_eq!(targets.display(start + LIST_RECHECK), id);
+        assert_eq!(checks.get(), 18);
+        assert_eq!(waited.get(), LIST_WAIT, "rechecks do not wait");
+        assert!(ops.try_recv().is_err(), "kept, never removed or remade");
+    }
+
+    #[test]
+    fn a_stream_that_cannot_find_the_virtual_display_mirrors_instead_of_failing() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, _ops) = fake_owner();
+        let mut targets = targets(
+            &shared,
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+                saved: mpsc::channel().0,
+            }),
+            FakeLister::listed(),
+        );
+        connect(&shared, 0xd0, (2670, 1878));
+        let now = Instant::now();
+        let id = targets.display(now);
+        // The stream start reports the display missing: ask again, and get
+        // the main display, not a pipeline failure.
+        assert!(targets.not_listed(id, now));
+        assert_eq!(targets.display(now), MAIN);
+        assert_eq!(
+            *shared.second_screen.lock(),
+            SecondScreenStatus::NotCapturable(id)
+        );
+        // The main display missing is a real failure.
+        assert!(!targets.not_listed(MAIN, now));
     }
 }

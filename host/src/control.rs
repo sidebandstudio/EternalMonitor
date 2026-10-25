@@ -39,6 +39,9 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
+    /// macOS: what the second screen is doing, for the GUI and the logs.
+    #[cfg(target_os = "macos")]
+    pub second_screen: Arc<Mutex<crate::virtual_display::SecondScreenStatus>>,
     /// Serialize driver reconciliation across retiring capture generations.
     #[cfg(windows)]
     pub(crate) vdd_lifecycle: Arc<Mutex<()>>,
@@ -155,6 +158,8 @@ impl SharedControl {
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             capture_block: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            second_screen: Arc::new(Mutex::new(Default::default())),
             #[cfg(windows)]
             vdd_lifecycle: Arc::new(Mutex::new(())),
             #[cfg(windows)]

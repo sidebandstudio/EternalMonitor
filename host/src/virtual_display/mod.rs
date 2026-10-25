@@ -188,6 +188,24 @@ impl<M: VirtualDisplayManager> SecondScreen<M> {
     }
 }
 
+/// What the second screen is doing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SecondScreenStatus {
+    /// Second screen is off, or nothing has asked yet.
+    #[default]
+    Off,
+    /// No client: the main display is mirrored.
+    Mirroring,
+    /// Capturing this virtual display.
+    Active(u32),
+    /// The display exists but ScreenCaptureKit does not offer it yet. The
+    /// main display is mirrored meanwhile and the display is kept, so a
+    /// later check can switch to it.
+    NotCapturable(u32),
+    /// The display could not be made; the main display is mirrored.
+    Unavailable(String),
+}
+
 /// A client asking for its display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wanted {
