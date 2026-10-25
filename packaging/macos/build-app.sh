@@ -29,6 +29,9 @@ unset ETERNAL_DIAGNOSTICS_ENDPOINT ETERNAL_DIAGNOSTICS_INGEST_KEY
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/host/Cargo.toml" | head -1)
 [[ -n $version ]] || { echo "build-app.sh: no version in host/Cargo.toml" >&2; exit 1; }
 
+# Only the host: a workspace build unifies ffmpeg-next's features with the
+# spike crates', which brings avdevice and avfilter back (verify-app.sh
+# fails if they are bundled).
 MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --locked -p eternal-host --manifest-path "$root/Cargo.toml"
 
 rm -rf "$app"

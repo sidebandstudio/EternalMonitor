@@ -4,6 +4,7 @@
 #   - the hardened runtime and team on the app and on every bundled dylib;
 #   - no entitlements;
 #   - no Homebrew (/opt/homebrew) path in any load command or run path;
+#   - no libavdevice or libavfilter (the host builds ffmpeg-next without them);
 #   - the Info.plist keys the host needs, and that LSMinimumSystemVersion
 #     is no older than the newest minos of any Mach-O file in the app.
 #
@@ -47,6 +48,12 @@ for file in $machos; do
   fi
 done
 ok "${#machos} Mach-O files: team $team, hardened runtime, checked for Homebrew paths"
+unused=("$app"/Contents/Frameworks/lib{avdevice,avfilter}.*(N))
+if (( ${#unused} )); then
+  fail "bundles FFmpeg libraries the host doesn't use (built with the workspace's features?): ${unused[*]:t}"
+else
+  ok "no libavdevice or libavfilter bundled"
+fi
 
 plist=$app/Contents/Info.plist
 for key in CFBundleIdentifier CFBundleShortVersionString LSMinimumSystemVersion NSHighResolutionCapable \
