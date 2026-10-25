@@ -191,16 +191,20 @@ mod tests {
         let (ops_tx, ops) = mpsc::channel();
         let owner =
             DisplayOwner::spawn(move || Ok(Reporting(FakeDisplays::default(), ops_tx))).unwrap();
-        let first = owner
-            .want(want(true, Duration::from_millis(100)))
-            .unwrap()
-            .unwrap();
+        let tiny = Duration::from_millis(100);
+        let first = owner.want(want(true, tiny)).unwrap().unwrap();
         assert!(matches!(ops.recv().unwrap(), Op::Create(_)));
-        // Nothing asks again; the display still goes after the grace period.
+        // Connected: nothing expires, however long no one asks.
+        assert!(ops.recv_timeout(Duration::from_millis(300)).is_err());
+        // The client goes; nothing asks again, and the display still goes
+        // once the (minimum) grace period has passed.
+        let gone = std::time::Instant::now();
+        assert_eq!(owner.want(want(false, tiny)), Ok(Some(first)));
         assert_eq!(
-            ops.recv_timeout(Duration::from_secs(5)),
+            ops.recv_timeout(Duration::from_secs(10)),
             Ok(Op::Remove(first.id))
         );
+        assert!(gone.elapsed() >= super::super::MIN_GRACE);
     }
 
     #[test]

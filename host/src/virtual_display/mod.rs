@@ -225,9 +225,17 @@ pub struct Want {
     pub grace: Duration,
 }
 
+/// The shortest grace period. A pipeline restart passes through a moment
+/// with no client seen (`mac_screen` reports one when a capture generation
+/// ends), and a restart must never remove the display; a setting below
+/// this, including 0, is raised to it.
+pub const MIN_GRACE: Duration = Duration::from_secs(5);
+
 /// When a display goes away. A pipeline restart or a capture retry never
 /// removes it; only these do:
-/// - its client has been gone for the grace period;
+/// - its client has been gone for the grace period, counted from the
+///   disconnect (a connected client's display never expires, however long
+///   a request takes);
 /// - second screen is turned off;
 /// - the device's profile changes size (`SecondScreen::ensure`), or
 ///   another device takes over;
@@ -237,8 +245,9 @@ pub struct Want {
 /// so its windows stay where they were.
 pub struct Keeper<M: VirtualDisplayManager> {
     screen: SecondScreen<M>,
-    /// The last time a client was there for the active display.
-    last_present: Option<Instant>,
+    /// When the active display's client was first seen gone; `None` while
+    /// it is connected.
+    gone_since: Option<Instant>,
     grace: Duration,
 }
 
@@ -246,8 +255,8 @@ impl<M: VirtualDisplayManager> Keeper<M> {
     pub fn new(manager: M) -> Self {
         Self {
             screen: SecondScreen::new(manager),
-            last_present: None,
-            grace: Duration::ZERO,
+            gone_since: None,
+            grace: MIN_GRACE,
         }
     }
 
@@ -258,7 +267,7 @@ impl<M: VirtualDisplayManager> Keeper<M> {
         want: Want,
         now: Instant,
     ) -> Result<Option<VirtualDisplay>, DisplayError> {
-        self.grace = want.grace;
+        self.grace = want.grace.max(MIN_GRACE);
         if !want.enabled {
             if self.screen.active().is_some() {
                 tracing::info!("Second screen turned off; removing its display");
@@ -270,8 +279,12 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             let display = self
                 .screen
                 .ensure(wanted.client, &wanted.device_name, wanted.saved)?;
-            self.last_present = Some(now);
+            self.gone_since = None;
             return Ok(Some(display));
+        }
+        if self.screen.active().is_some() && self.gone_since.is_none() {
+            tracing::info!(grace = ?self.grace, "Second-screen client gone; keeping its display for the grace period");
+            self.gone_since = Some(now);
         }
         self.expire(now)?;
         Ok(self.screen.active().copied())
@@ -290,14 +303,15 @@ impl<M: VirtualDisplayManager> Keeper<M> {
         }
     }
 
-    /// When the active display will be removed if no client comes back.
+    /// When the active display will be removed if no client comes back;
+    /// `None` while its client is connected.
     pub fn expires_at(&self) -> Option<Instant> {
         self.screen.active()?;
-        self.last_present.map(|at| at + self.grace)
+        self.gone_since.map(|at| at + self.grace)
     }
 
     pub fn release(&mut self) -> Result<(), DisplayError> {
-        self.last_present = None;
+        self.gone_since = None;
         self.screen.release()
     }
 }
@@ -541,6 +555,10 @@ mod tests {
     const GRACE: Duration = Duration::from_secs(60);
 
     fn want(client: Option<ClientScreen>) -> Want {
+        want_with(client, GRACE)
+    }
+
+    fn want_with(client: Option<ClientScreen>, grace: Duration) -> Want {
         Want {
             enabled: true,
             client: client.map(|client| Wanted {
@@ -548,7 +566,7 @@ mod tests {
                 device_name: "Duo".into(),
                 saved: None,
             }),
-            grace: GRACE,
+            grace,
         }
     }
 
@@ -563,69 +581,110 @@ mod tests {
     }
 
     #[test]
-    fn restarts_and_short_disconnects_keep_the_same_display() {
+    fn a_connected_clients_display_never_expires_even_with_grace_0() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let display = keeper
+            .want(want_with(Some(duo), Duration::ZERO), start)
+            .unwrap()
+            .unwrap();
+        // Connected: no expiry is armed, whatever time passes between
+        // requests (a slow target check, a long stall).
+        assert_eq!(keeper.expires_at(), None);
+        for hours in [0, 1, 24] {
+            keeper
+                .expire(start + Duration::from_secs(hours * 3600))
+                .unwrap();
+        }
+        assert_eq!(
+            keeper.want(
+                want_with(Some(duo), Duration::ZERO),
+                start + Duration::from_secs(86_400)
+            ),
+            Ok(Some(display))
+        );
+        assert_eq!(removals(&keeper), 0);
+        // Grace 0 means the minimum, counted from the disconnect.
+        let gone = start + Duration::from_secs(90_000);
+        assert_eq!(
+            keeper.want(want_with(None, Duration::ZERO), gone),
+            Ok(Some(display))
+        );
+        assert_eq!(keeper.expires_at(), Some(gone + MIN_GRACE));
+    }
+
+    #[test]
+    fn a_slow_check_while_connected_keeps_the_display() {
         let start = Instant::now();
         let mut keeper = Keeper::new(FakeDisplays::default());
         let duo = client(DUO, (2670, 1878));
         let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
-        // The client drops; pipeline restarts and capture retries ask
-        // without a client for 59 s. The display stays and is captured.
-        for second in 1..60 {
-            let at = start + Duration::from_secs(second);
+        // The next request from a connected client arrives long after the
+        // grace period (the capture thread was busy): the display stays.
+        let late = start + GRACE * 3;
+        keeper.expire(late).unwrap();
+        assert_eq!(keeper.want(want(Some(duo)), late), Ok(Some(display)));
+        assert_eq!(removals(&keeper), 0);
+    }
+
+    #[test]
+    fn grace_counts_from_the_disconnect_and_then_removes_the_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        keeper.want(want(Some(duo)), start).unwrap();
+        // Connected for ten minutes, then gone.
+        let gone = start + Duration::from_secs(600);
+        keeper
+            .want(want(Some(duo)), gone - Duration::from_secs(1))
+            .unwrap();
+        keeper.want(want(None), gone).unwrap();
+        assert_eq!(keeper.expires_at(), Some(gone + GRACE));
+        // Later passes without the client do not move the start.
+        keeper
+            .want(want(None), gone + Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(keeper.expires_at(), Some(gone + GRACE));
+        // The owner's timer, with no request at all.
+        keeper
+            .expire(gone + GRACE - Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(removals(&keeper), 0);
+        keeper.expire(gone + GRACE).unwrap();
+        assert_eq!(removals(&keeper), 1);
+        assert!(keeper.screen.manager.online.is_empty());
+        assert_eq!(keeper.expires_at(), None);
+        assert_eq!(keeper.want(want(None), gone + GRACE * 2), Ok(None));
+    }
+
+    #[test]
+    fn a_reconnect_just_before_expiry_keeps_the_same_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        let gone = start + Duration::from_secs(5);
+        // Pipeline restarts and capture retries ask without a client.
+        for second in 0..60 {
+            let at = gone + Duration::from_secs(second);
             assert_eq!(keeper.want(want(None), at), Ok(Some(display)));
             keeper.expire(at).unwrap();
         }
-        // The client is back within the grace period: same display ID.
-        let back = keeper
-            .want(want(Some(duo)), start + Duration::from_secs(59))
-            .unwrap()
-            .unwrap();
-        assert_eq!(back.id, display.id);
+        let back = gone + GRACE - Duration::from_millis(1);
+        assert_eq!(keeper.want(want(Some(duo)), back), Ok(Some(display)));
+        assert_eq!(keeper.expires_at(), None, "connected again: disarmed");
+        keeper.expire(gone + GRACE * 2).unwrap();
         assert_eq!(removals(&keeper), 0);
         assert_eq!(
             keeper.screen.manager.ops.len(),
             1,
             "one create, nothing else"
         );
-    }
-
-    #[test]
-    fn a_client_gone_for_the_grace_period_loses_its_display() {
-        let start = Instant::now();
-        let mut keeper = Keeper::new(FakeDisplays::default());
-        keeper
-            .want(want(Some(client(DUO, (2670, 1878)))), start)
-            .unwrap();
-        assert_eq!(keeper.expires_at(), Some(start + GRACE));
-        // The owner's timer, with no request at all (no pipeline running).
-        keeper
-            .expire(start + GRACE - Duration::from_millis(1))
-            .unwrap();
-        assert_eq!(removals(&keeper), 0);
-        keeper.expire(start + GRACE).unwrap();
-        assert_eq!(removals(&keeper), 1);
-        assert!(keeper.screen.manager.online.is_empty());
-        assert_eq!(keeper.expires_at(), None);
-        // A request without a client after that mirrors.
-        assert_eq!(keeper.want(want(None), start + GRACE * 2), Ok(None));
-        // A setting change shortens the grace for the next display.
-        let short = Want {
-            grace: Duration::from_secs(5),
-            ..want(Some(client(DUO, (2670, 1878))))
-        };
-        let later = start + GRACE * 3;
-        keeper.want(short.clone(), later).unwrap();
-        assert_eq!(
-            keeper.want(
-                Want {
-                    client: None,
-                    ..short
-                },
-                later + Duration::from_secs(5)
-            ),
-            Ok(None)
-        );
-        assert_eq!(removals(&keeper), 2);
+        // A second disconnect starts a fresh grace period.
+        let again = back + Duration::from_secs(10);
+        keeper.want(want(None), again).unwrap();
+        assert_eq!(keeper.expires_at(), Some(again + GRACE));
     }
 
     #[test]
@@ -641,7 +700,6 @@ mod tests {
         };
         assert_eq!(keeper.want(off.clone(), start), Ok(None));
         assert_eq!(removals(&keeper), 1);
-        // Off with nothing to remove is a no-op.
         assert_eq!(keeper.want(off, start), Ok(None));
         assert_eq!(removals(&keeper), 1);
     }

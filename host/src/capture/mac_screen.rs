@@ -287,6 +287,25 @@ impl<'a> Targets<'a> {
     }
 }
 
+impl Targets<'_> {
+    /// This capture generation is over, so nothing watches the client any
+    /// more: start the grace period as if it had left. A restart's next
+    /// generation sees the client again well within it.
+    pub(crate) fn capture_ended(&mut self) {
+        if !self.settings.mac_second_screen {
+            return;
+        }
+        let unobserved = Want {
+            enabled: true,
+            client: None,
+            grace: Duration::from_secs(self.settings.mac_second_screen_grace_secs.into()),
+        };
+        if let Err(error) = self.owner.want(unobserved) {
+            warn!(%error, "Could not hand the second-screen display back to the owner");
+        }
+    }
+}
+
 impl DisplayChoice for Targets<'_> {
     fn display(&mut self, now: Instant) -> u32 {
         self.choose(now)
@@ -340,7 +359,10 @@ pub(super) fn run_capture_loop(
         }),
         main,
     );
-    super::sck::stream::run_capture_loop(slot, shared, generation, frame_number, &mut targets)
+    let result =
+        super::sck::stream::run_capture_loop(slot, shared, generation, frame_number, &mut targets);
+    targets.capture_ended();
+    result
 }
 
 /// The main display, when there is no display owner at all.
@@ -607,6 +629,30 @@ pub(crate) mod tests {
             matches!(ops[..], [Op::Create(_), Op::Remove(id), Op::Create(_)] if id == first),
             "{ops:?}"
         );
+    }
+
+    #[test]
+    fn a_restart_keeps_the_display_and_a_stopped_pipeline_starts_the_grace_period() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner();
+        let settings = || {
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+                saved: mpsc::channel().0,
+            })
+        };
+        connect(&shared, 0xd0, (2670, 1878));
+        let mut first = targets(&shared, &owner, settings(), FakeLister::listed());
+        let id = first.display(Instant::now());
+        // A restart: the generation ends, the next one sees the client.
+        first.capture_ended();
+        let mut second = targets(&shared, &owner, settings(), FakeLister::listed());
+        assert_eq!(second.display(Instant::now()), id);
+        let made: Vec<_> = ops.try_iter().collect();
+        assert!(matches!(made[..], [Op::Create(_)]), "{made:?}");
+        // Streaming stops: the owner's grace clock is running.
+        second.capture_ended();
+        assert!(ops.try_recv().is_err(), "kept for the grace period");
     }
 
     #[test]

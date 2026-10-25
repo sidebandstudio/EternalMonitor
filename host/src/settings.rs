@@ -65,8 +65,10 @@ pub struct SettingsFile {
     /// pattern, and nothing creates a display by itself.
     #[serde(default)]
     pub mac_second_screen: bool,
-    /// macOS: how long a second-screen display outlives its client, so a
-    /// short disconnect or restart leaves the user's windows where they are.
+    /// macOS: how long a second-screen display outlives its client, counted
+    /// from the disconnect, so a short disconnect or restart leaves the
+    /// user's windows where they are. At least 5 s (`MIN_GRACE`); 0 means
+    /// that minimum.
     #[serde(default = "default_second_screen_grace_secs")]
     pub mac_second_screen_grace_secs: u32,
 }
