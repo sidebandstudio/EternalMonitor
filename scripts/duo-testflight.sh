@@ -110,7 +110,6 @@ PY
     AUTH=(-allowProvisioningUpdates -allowProvisioningDeviceRegistration
         -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID"
         -authenticationKeyIssuerID "$ASC_ISSUER_ID")
-    ARCHIVE_ARGS+=("${AUTH[@]}")
     if [ -n "${IOS_DIST_P12_BASE64:-}" ]; then
         : "${IOS_DIST_P12_PASSWORD:?Set IOS_DIST_P12_PASSWORD for the fallback certificate}"
         python3 - "$TF_PRIVATE/distribution.p12" <<'PY'
@@ -159,6 +158,19 @@ print(installed)
 PYPROFILE
 )
         EXPORT_OPTIONS="$TF_PRIVATE/exportOptions.plist"
+    fi
+    if [ -n "$TF_PROFILE" ]; then
+        # Sign the archive as the upload is signed. Automatic signing asks
+        # Apple for a development certificate on every fresh runner, and the
+        # team's certificate limit stopped the archive.
+        PROFILE_UUID=$(python3 - "$EXPORT_OPTIONS" "$BUNDLE" <<'PY'
+import plistlib,sys
+print(plistlib.loads(open(sys.argv[1],'rb').read())['provisioningProfiles'][sys.argv[2]])
+PY
+)
+        ARCHIVE_ARGS+=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=Apple Distribution" "DUO_PROFILE_SPECIFIER=$PROFILE_UUID")
+    else
+        ARCHIVE_ARGS+=("${AUTH[@]}")
     fi
 fi
 BUILD="${BUILD:-1}"
