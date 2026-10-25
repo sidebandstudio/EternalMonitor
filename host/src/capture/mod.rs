@@ -620,7 +620,7 @@ fn run_platform_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
-    if synthetic_requested || !crate::settings::SettingsFile::load().mac_second_screen {
+    if synthetic_requested || !mac_screen::second_screen_wanted() {
         mac_screen::second_screen_off();
         synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {

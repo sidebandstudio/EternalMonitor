@@ -161,16 +161,65 @@ pub(crate) trait SettingsSource {
     fn changed(&mut self) -> Option<SettingsFile>;
 }
 
+/// The last `settings.json` the capture path read successfully.
+static LAST_GOOD: parking_lot::Mutex<Option<SettingsFile>> = parking_lot::Mutex::new(None);
+
+/// Whether this generation should capture for real. A settings file that
+/// cannot be read right now (a partial write by another program) keeps the
+/// last good answer rather than reading as "off", which would remove the
+/// display.
+pub(super) fn second_screen_wanted() -> bool {
+    let Some(path) = crate::settings::settings_path() else {
+        return false;
+    };
+    match SettingsFile::read(&path) {
+        Ok(settings) => {
+            let wanted = settings.mac_second_screen;
+            *LAST_GOOD.lock() = Some(settings);
+            wanted
+        }
+        Err(error) => {
+            warn!(%error, "settings.json cannot be read; keeping the last good settings");
+            LAST_GOOD
+                .lock()
+                .as_ref()
+                .is_some_and(|settings| settings.mac_second_screen)
+        }
+    }
+}
+
 /// `settings.json`, re-read when its modification time moves. Capture only
-/// reads it; the profiles it saves go to their own file.
+/// reads it; the profiles it saves go to their own file. A read or parse
+/// failure keeps the last valid settings and leaves that modification time
+/// unseen, so the next pass tries again.
 struct SettingsOnDisk {
     path: Option<PathBuf>,
     seen: Option<Option<SystemTime>>,
+    warned: Option<Option<SystemTime>>,
+    /// Handed out if the very first read fails.
+    fallback: Option<SettingsFile>,
+    /// Keep `LAST_GOOD` current (the live host; not tests).
+    share: bool,
 }
 
 impl SettingsOnDisk {
     fn at(path: Option<PathBuf>) -> Self {
-        Self { path, seen: None }
+        Self {
+            path,
+            seen: None,
+            warned: None,
+            fallback: None,
+            share: false,
+        }
+    }
+
+    /// The live host's reader, starting from the last good settings.
+    fn live() -> Self {
+        Self {
+            fallback: LAST_GOOD.lock().clone(),
+            share: true,
+            ..Self::at(crate::settings::settings_path())
+        }
     }
 }
 
@@ -183,8 +232,23 @@ impl SettingsSource for SettingsOnDisk {
         if self.seen == Some(modified) {
             return None;
         }
-        self.seen = Some(modified);
-        Some(SettingsFile::load_from(path))
+        match SettingsFile::read(path) {
+            Ok(settings) => {
+                self.seen = Some(modified);
+                self.fallback = None;
+                if self.share {
+                    *LAST_GOOD.lock() = Some(settings.clone());
+                }
+                Some(settings)
+            }
+            Err(error) => {
+                if self.warned != Some(modified) {
+                    self.warned = Some(modified);
+                    warn!(path = %path.display(), %error, "settings.json cannot be read; keeping the last good settings");
+                }
+                self.fallback.take()
+            }
+        }
     }
 }
 
@@ -434,7 +498,7 @@ pub(super) fn run_capture_loop(
     let mut targets = Targets::new(
         shared.clone(),
         owner,
-        Box::new(SettingsOnDisk::at(crate::settings::settings_path())),
+        Box::new(SettingsOnDisk::live()),
         ProfileStore::beside_settings(),
         Box::new(ScreenCaptureKitLister),
         // A bounded wait inside one capture pass: keep the stage alive.
@@ -809,6 +873,76 @@ pub(crate) mod tests {
             "{ops:?}"
         );
         assert!(!SettingsFile::load_from(&settings_path).mac_second_screen);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_settings_file_keeps_the_display_and_the_last_valid_settings() {
+        let dir = temp_dir("damaged");
+        let path = dir.join("settings.json");
+        let valid = |grace: u32, on: bool| SettingsFile {
+            mac_second_screen: on,
+            mac_second_screen_grace_secs: grace,
+            ..Default::default()
+        };
+        write_settings(&path, &valid(30, true));
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner();
+        let mut targets = Targets::new(
+            shared.clone(),
+            &owner,
+            Box::new(SettingsOnDisk::at(Some(path.clone()))),
+            ProfileStore::at(None),
+            Box::new(FakeLister::listed()),
+            Box::new(|| {}),
+            MAIN,
+        );
+        connect(&shared, 0xd0, (2670, 1878));
+        let id = targets.display(Instant::now());
+        assert_ne!(id, MAIN);
+        // Another program writes in place and is caught half-way, then
+        // leaves invalid JSON: each pass keeps the display and the values.
+        for broken in ["{\"mac_second_screen\": tr", "", "not json"] {
+            std::thread::sleep(Duration::from_millis(10));
+            std::fs::write(&path, broken).unwrap();
+            for _ in 0..3 {
+                assert_eq!(targets.display(Instant::now()), id, "{broken:?}");
+            }
+            assert!(targets.settings.mac_second_screen);
+            assert_eq!(targets.settings.mac_second_screen_grace_secs, 30);
+        }
+        // The next valid write is picked up.
+        std::thread::sleep(Duration::from_millis(10));
+        write_settings(&path, &valid(90, true));
+        assert_eq!(targets.display(Instant::now()), id);
+        assert_eq!(targets.settings.mac_second_screen_grace_secs, 90);
+        assert!(ops.try_iter().all(|op| !matches!(op, Op::Remove(_))));
+        std::thread::sleep(Duration::from_millis(10));
+        write_settings(&path, &valid(90, false));
+        assert_eq!(targets.display(Instant::now()), MAIN);
+        assert!(matches!(ops.try_recv(), Ok(Op::Remove(removed)) if removed == id));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_first_read_that_fails_starts_from_the_last_good_settings() {
+        let dir = temp_dir("first-read");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{").unwrap();
+        let mut reader = SettingsOnDisk {
+            fallback: Some(enabled()),
+            ..SettingsOnDisk::at(Some(path.clone()))
+        };
+        assert!(reader.changed().unwrap().mac_second_screen);
+        // Still broken: nothing new, and nothing marked as seen.
+        assert!(reader.changed().is_none());
+        std::thread::sleep(Duration::from_millis(10));
+        write_settings(&path, &SettingsFile::default());
+        assert!(!reader.changed().unwrap().mac_second_screen);
+        assert!(reader.changed().is_none(), "read once per change");
+        // A missing file is the defaults, not an error.
+        let mut missing = SettingsOnDisk::at(Some(dir.join("absent.json")));
+        assert!(!missing.changed().unwrap().mac_second_screen);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

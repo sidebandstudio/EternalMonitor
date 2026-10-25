@@ -131,6 +131,17 @@ impl SettingsFile {
         Self::load_from(&path)
     }
 
+    /// Reads a settings file strictly: an error instead of defaults when it
+    /// cannot be read or parsed, so a live reader can keep what it had. A
+    /// missing file is the defaults.
+    pub fn read(path: &std::path::Path) -> Result<Self, String> {
+        match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// `load` from a given file.
     pub fn load_from(path: &std::path::Path) -> Self {
         match fs::read_to_string(path) {
