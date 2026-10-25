@@ -6,7 +6,7 @@ use super::icons::Icon;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{
-    value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot, StreamState,
+    value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, Platform, StatsSnapshot, StreamState,
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::capture::recovery::CaptureBlock;
@@ -197,13 +197,7 @@ impl AnalyzerApp {
             ),
             StreamState::Streaming => {
                 let (w, h) = snap.capture_resolution;
-                let mode = if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL
-                    && *self.control.shared.vdd_status.lock() == VddStatus::Active
-                {
-                    CAPTURE_VIRTUAL_LABEL
-                } else {
-                    "Mirroring"
-                };
+                let mode = self.mode_label();
                 let mut parts = vec![client.link_name().to_string(), mode.to_string()];
                 if w > 0 && h > 0 {
                     parts.push(format!("{w} × {h}"));
@@ -213,7 +207,11 @@ impl AnalyzerApp {
             }
             StreamState::Paused => (
                 format!("Streaming to {device} is paused"),
-                "Windows stopped screen capture. See the message above.".to_string(),
+                match self.platform {
+                    Platform::Windows => "Windows stopped screen capture. See the message above.",
+                    Platform::Mac => "macOS stopped screen capture. See the message above.",
+                }
+                .to_string(),
             ),
         };
 
@@ -295,6 +293,13 @@ impl AnalyzerApp {
             ui.add_space(14.0);
             widgets::divider(ui);
             ui.add_space(12.0);
+            #[cfg(target_os = "macos")]
+            if self.platform == Platform::Mac {
+                self.mac_second_screen_row(ui, snap, client);
+            } else {
+                self.screen_mode_row(ui, snap.pipeline_running);
+            }
+            #[cfg(not(target_os = "macos"))]
             self.screen_mode_row(ui, snap.pipeline_running);
 
             if state == StreamState::Streaming {
@@ -331,6 +336,24 @@ impl AnalyzerApp {
                 None => {}
             }
         });
+    }
+
+    /// The header's word for what the iPad shows.
+    fn mode_label(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        if self.platform == Platform::Mac {
+            return super::mac_second_screen::mode_label(
+                self.settings_mac_second_screen,
+                &self.control.shared.second_screen.lock(),
+            );
+        }
+        if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL
+            && *self.control.shared.vdd_status.lock() == VddStatus::Active
+        {
+            CAPTURE_VIRTUAL_LABEL
+        } else {
+            "Mirroring"
+        }
     }
 
     /// Mirror or second screen, named as on the iPad. Always above the fold:
@@ -506,6 +529,18 @@ impl AnalyzerApp {
             widgets::divider(ui);
 
             // Audio
+            if self.platform == Platform::Mac {
+                widgets::icon_row(
+                    ui,
+                    Icon::Speaker,
+                    TEXT_MUTED,
+                    "Audio",
+                    "Video only for now. Your device plays no sound from this Mac.",
+                    0.0,
+                    |_| {},
+                );
+                return;
+            }
             let enabled = self
                 .control
                 .shared

@@ -8,11 +8,12 @@ use eframe::egui::accesskit::Role;
 use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
-use eternal_host::gui::AnalyzerApp;
+use eternal_host::gui::{AnalyzerApp, Platform};
 use eternal_host::settings::SettingsFile;
 use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
 use eternal_host::transport::link::PeerId;
 use eternal_host::transport::session::ConfigSource;
+use eternal_host::virtual_display::SecondScreenStatus;
 use eternal_wire::v2::control::{
     ByeReason, ControlMessage, Hello2, ReceiverReport, StreamConfig, FEATURE_CHECKS_UPDATES,
 };
@@ -270,10 +271,20 @@ fn pipeline_stats() -> PipelineStats {
     stats
 }
 
+/// The Windows host's window, which these references are for.
 fn harness(
     shared: &SharedControl,
     size: egui::Vec2,
     pixels_per_point: f32,
+) -> Harness<'static, AnalyzerApp> {
+    harness_for(shared, size, pixels_per_point, Platform::Windows)
+}
+
+fn harness_for(
+    shared: &SharedControl,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+    platform: Platform,
 ) -> Harness<'static, AnalyzerApp> {
     let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
     let control = GuiControl {
@@ -285,7 +296,7 @@ fn harness(
         .with_pixels_per_point(pixels_per_point)
         .with_theme(egui::Theme::Dark)
         .wgpu()
-        .build_eframe(|cc| AnalyzerApp::new(cc, control));
+        .build_eframe(|cc| AnalyzerApp::for_platform(cc, control, platform));
     harness.run_steps(4);
     harness
 }
@@ -541,8 +552,80 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     disconnect_ipad(&shared);
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
+    mac_second_screen(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// The Mac host's window: a Second screen switch, off by default, replaces
+/// the mirror / second screen choice, and the line under it says what the
+/// device shows. The switch saves `mac_second_screen`; nothing here creates
+/// a display or opens System Settings.
+fn mac_second_screen(shared: &SharedControl, dir: &std::path::Path, results: &mut SnapshotResults) {
+    let _ = std::fs::remove_file(dir.join("EternalMonitor/update-state.json"));
+    SettingsFile {
+        check_for_updates: false,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    {
+        let mut stats = PIPELINE_STATS.lock();
+        *stats = pipeline_stats();
+        stats.capture_resolution = (2670, 1878);
+        stats.gpu_name = "Apple M1 Max".into();
+        stats.codec_name = "h264_videotoolbox".into();
+    }
+    *shared.capture_block.lock() = None;
+    *shared.second_screen.lock() = SecondScreenStatus::Off;
+    connect_named(shared, "iPhone", 10, 20);
+    let mut window = harness_for(shared, egui::vec2(1040.0, 820.0), 1.0, Platform::Mac);
+    let second_screen_on = || SettingsFile::load().mac_second_screen;
+
+    assert!(!second_screen_on());
+    window.get_by_label("Off. Your device shows a test picture until you turn this on.");
+    window.get_by_label_contains("Test picture");
+    assert!(window.query_by_label("Use the iPad as").is_none());
+    assert!(window.query_by_label("Stream PC audio").is_none());
+    window.get_by_label("Video only for now. Your device plays no sound from this Mac.");
+
+    window
+        .get_by_role_and_label(Role::CheckBox, "Second screen")
+        .click();
+    window.run_steps(4);
+    assert!(second_screen_on(), "the switch saved the setting");
+
+    *shared.second_screen.lock() = SecondScreenStatus::Mirroring;
+    window.run_steps(4);
+    window.get_by_label("Mirroring your main display (no device connected)");
+    *shared.second_screen.lock() = SecondScreenStatus::NotCapturable(7);
+    window.run_steps(4);
+    window.get_by_label("Mirroring: macOS didn't list the new display yet");
+    *shared.second_screen.lock() = SecondScreenStatus::Active(7);
+    window.run_steps(4);
+    window.get_by_label("Second screen: on the iPhone (2670×1878)");
+    window.get_by_label_contains("Second screen  ·  2670 × 1878");
+    snapshot(&mut window, shared, "mac-second-screen");
+
+    // Without Screen Recording the line says so and offers System
+    // Settings. Not clicked here: it would open System Settings.
+    *shared.capture_block.lock() = Some(CaptureBlock::ScreenRecordingDenied);
+    window.run_steps(4);
+    window.get_by_label("Screen Recording is off: open System Settings");
+    window.get_by_role_and_label(Role::Button, "Open System Settings");
+    window.get_by_label("Streaming to iPhone is paused");
+    snapshot(&mut window, shared, "mac-screen-recording-off");
+    *shared.capture_block.lock() = None;
+    window.run_steps(4);
+    assert!(window.query_by_label("Open System Settings").is_none());
+
+    window
+        .get_by_role_and_label(Role::CheckBox, "Second screen")
+        .click();
+    window.run_steps(4);
+    assert!(!second_screen_on(), "the switch turned it off again");
+    results.extend_harness(&mut window);
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture

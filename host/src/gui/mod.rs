@@ -11,9 +11,15 @@
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
 //! - in the sidebar, "Send feedback" and the GitHub star card (see
 //!   `feedback_panel.rs`).
+//!
+//! The Mac host's window ([`Platform::Mac`]) differs only on Stream: a
+//! "Second screen" switch with its status line replaces the mirror / second
+//! screen choice, and the audio row says the stream is video only.
 
 mod feedback_panel;
 mod icons;
+#[cfg(target_os = "macos")]
+mod mac_second_screen;
 mod page_performance;
 mod page_settings;
 mod page_stream;
@@ -44,6 +50,24 @@ use eternal_wire::v2::control::ReceiverReport;
 use icons::Icon;
 use theme::*;
 use widgets::Tone;
+
+/// Which host the window is for. Chosen at run time rather than by `cfg`,
+/// because the snapshot tests render the Windows window on macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Windows,
+    Mac,
+}
+
+impl Platform {
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else {
+            Self::Windows
+        }
+    }
+}
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 enum Page {
@@ -277,6 +301,10 @@ enum Copied {
 
 pub struct AnalyzerApp {
     control: GuiControl,
+    platform: Platform,
+    /// `SettingsFile::mac_second_screen`, as the Stream switch shows it.
+    #[cfg(target_os = "macos")]
+    settings_mac_second_screen: bool,
     page: Page,
     settings_bitrate_mbps: f32,
     settings_fps_target: u32,
@@ -322,6 +350,14 @@ pub struct AnalyzerApp {
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
+        Self::for_platform(cc, control, Platform::current())
+    }
+
+    pub fn for_platform(
+        cc: &eframe::CreationContext<'_>,
+        control: GuiControl,
+        platform: Platform,
+    ) -> Self {
         theme::install(&cc.egui_ctx);
 
         // Load persisted settings first; values fall back to the live runtime state when the
@@ -389,10 +425,13 @@ impl AnalyzerApp {
             .shared
             .hevc_enabled
             .store(persisted.hevc_enabled, Ordering::SeqCst);
-        control
-            .shared
-            .audio_enabled
-            .store(persisted.stream_audio, Ordering::SeqCst);
+        // The Mac host has no audio capture yet; main.rs keeps it off.
+        if platform == Platform::Windows {
+            control
+                .shared
+                .audio_enabled
+                .store(persisted.stream_audio, Ordering::SeqCst);
+        }
 
         let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
             // Persisted state disagrees with the registry — trust the registry as ground truth.
@@ -433,6 +472,9 @@ impl AnalyzerApp {
             ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
+            platform,
+            #[cfg(target_os = "macos")]
+            settings_mac_second_screen: persisted.mac_second_screen,
             page: Page::Stream,
             settings_bitrate_mbps: bitrate_mbps,
             settings_fps_target: fps_target,
@@ -461,6 +503,11 @@ impl AnalyzerApp {
     }
 
     fn persist_settings(&self) {
+        self.settings_file().save();
+    }
+
+    /// The settings as the window would save them.
+    fn settings_file(&self) -> SettingsFile {
         let encoder_override = ENCODER_CHOICES
             .iter()
             .find(|(label, _)| *label == self.settings_encoder_choice)
@@ -477,7 +524,7 @@ impl AnalyzerApp {
             .map(|path| SettingsFile::current_or_last_good(&path))
             .unwrap_or_default();
         let pairing = self.control.shared.pairing.lock();
-        let file = SettingsFile {
+        SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
             max_dgram: self.settings_packet_size as u16,
@@ -503,8 +550,7 @@ impl AnalyzerApp {
             star_clicked: self.star_clicked,
             mac_second_screen: on_disk.mac_second_screen,
             mac_second_screen_grace_secs: on_disk.mac_second_screen_grace_secs,
-        };
-        file.save();
+        }
     }
 }
 
@@ -604,6 +650,25 @@ impl AnalyzerApp {
             return;
         }
         self.set_capture_display(display);
+        if running {
+            self.restart_stream();
+        }
+    }
+
+    /// The Mac host's Second screen switch. Every other save carries the
+    /// value on disk over; this is the one place the window changes it. A
+    /// running stream restarts: capture picks the display for a new
+    /// generation, and the device reconnects by itself.
+    #[cfg(target_os = "macos")]
+    fn set_mac_second_screen(&mut self, on: bool, running: bool) {
+        if self.settings_mac_second_screen == on {
+            return;
+        }
+        self.settings_mac_second_screen = on;
+        let mut file = self.settings_file();
+        file.mac_second_screen = on;
+        file.save();
+        info!(on, "Second screen switched from the window");
         if running {
             self.restart_stream();
         }
@@ -1286,6 +1351,23 @@ fn open_display_settings() {
         {
             warn!(error = %error, "Could not open Windows display settings");
         }
+    }
+}
+
+/// Opens System Settings at Privacy & Security › Screen & System Audio
+/// Recording. Asking for access first puts EternalMonitor in that list, so
+/// the user only switches it on; macOS shows its own prompt the first time.
+#[cfg(target_os = "macos")]
+fn open_screen_recording_settings() {
+    const PANE: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+    let granted = objc2_core_graphics::CGRequestScreenCaptureAccess();
+    info!(granted, "Asked macOS for Screen Recording");
+    if let Err(error) = std::process::Command::new("/usr/bin/open")
+        .arg(PANE)
+        .spawn()
+    {
+        warn!(error = %error, "Could not open the Screen Recording settings");
     }
 }
 

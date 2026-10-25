@@ -520,3 +520,70 @@ fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
     ));
     assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_second_screen_status_line_says_what_the_device_shows() {
+    use super::mac_second_screen::{mode_label, status_line};
+    use crate::virtual_display::SecondScreenStatus as S;
+    let text = |on, status: &S, block, device, size, running| {
+        status_line(on, status, block, device, size, running).text
+    };
+    let duo = Some("iPhone");
+    let size = (2670, 1878);
+
+    assert_eq!(
+        text(true, &S::Active(7), None, duo, size, true),
+        "Second screen: on the iPhone (2670×1878)"
+    );
+    // Before its first frame there is no size to show.
+    assert_eq!(
+        text(true, &S::Active(7), None, duo, (0, 0), true),
+        "Second screen: on the iPhone"
+    );
+    // Kept through the grace period after the device left.
+    assert!(text(true, &S::Active(7), None, None, size, true).contains("until it reconnects"));
+    assert_eq!(
+        text(true, &S::Mirroring, None, None, size, true),
+        "Mirroring your main display (no device connected)"
+    );
+    assert_eq!(
+        text(true, &S::NotCapturable(7), None, duo, size, true),
+        "Mirroring: macOS didn't list the new display yet"
+    );
+    assert!(
+        text(true, &S::Unavailable("x".into()), None, duo, size, true).starts_with("Mirroring:")
+    );
+    assert!(text(false, &S::Off, None, None, size, true).starts_with("Off."));
+    assert!(text(true, &S::Mirroring, None, None, size, false).starts_with("On."));
+
+    // Without Screen Recording nothing else matters, and only then is
+    // System Settings offered.
+    let denied = status_line(
+        true,
+        &S::Active(7),
+        Some(CaptureBlock::ScreenRecordingDenied),
+        duo,
+        size,
+        true,
+    );
+    assert_eq!(denied.text, "Screen Recording is off: open System Settings");
+    assert!(denied.open_settings);
+    assert!(!status_line(true, &S::Mirroring, None, None, size, true).open_settings);
+    // Switched off, the old capture state is not news.
+    assert!(
+        !status_line(
+            false,
+            &S::Off,
+            Some(CaptureBlock::ScreenRecordingDenied),
+            None,
+            size,
+            true
+        )
+        .open_settings
+    );
+
+    assert_eq!(mode_label(true, &S::Active(7)), "Second screen");
+    assert_eq!(mode_label(true, &S::NotCapturable(7)), "Mirroring");
+    assert_eq!(mode_label(false, &S::Active(7)), "Test picture");
+}
