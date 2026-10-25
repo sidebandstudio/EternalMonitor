@@ -4,7 +4,8 @@
 #   - the hardened runtime and team on the app and on every bundled dylib;
 #   - no entitlements;
 #   - no Homebrew (/opt/homebrew) path in any load command or run path;
-#   - the Info.plist keys the host needs.
+#   - the Info.plist keys the host needs, and that LSMinimumSystemVersion
+#     is no older than the newest minos of any Mach-O file in the app.
 #
 #   packaging/macos/verify-app.sh [APP]
 set -euo pipefail
@@ -18,8 +19,12 @@ failures=0
 fail() { echo "FAIL $*" >&2; failures=$(( failures + 1 )); }
 ok() { echo "ok   $*"; }
 
-codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | grep -v -e '--prepared:' -e '--validated:' | sed 's/^/     /'
-ok "codesign --verify --deep --strict"
+if signature=$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1); then
+  ok "codesign --verify --deep --strict"
+else
+  fail "codesign --verify --deep --strict"
+fi
+print -r -- "$signature" | grep -v -e '--prepared:' -e '--validated:' | sed 's/^/     /'
 requirement=$(codesign -d -r- "$app" 2>&1 | sed -n 's/^designated => //p')
 echo "     designated => $requirement"
 [[ $requirement == *"identifier \"$bundle_id\""* && $requirement == *"anchor apple generic"* ]] ||
@@ -51,7 +56,13 @@ for key in CFBundleIdentifier CFBundleShortVersionString LSMinimumSystemVersion 
 done
 echo "     NSBonjourServices = $(plutil -extract NSBonjourServices json -o - "$plist" 2>/dev/null)"
 [[ $(plutil -extract CFBundleIdentifier raw -o - "$plist") == "$bundle_id" ]] || fail "wrong bundle ID"
-[[ $(plutil -extract LSMinimumSystemVersion raw -o - "$plist") == 14.0 ]] || fail "minimum macOS is not 14.0"
+declared=$(plutil -extract LSMinimumSystemVersion raw -o - "$plist")
+needed=$("$here/scripts/min-macos.sh" "$app")
+if [[ $(print -l "$declared" "$needed" | sort -V | tail -1) == "$declared" ]]; then
+  ok "LSMinimumSystemVersion $declared covers every Mach-O file (newest needs $needed)"
+else
+  fail "LSMinimumSystemVersion is $declared, but bundled code needs macOS $needed: $("$here/scripts/min-macos.sh" --each "$app" | sort -V | tail -3 | tr '\n' ' ')"
+fi
 [[ $(plutil -extract NSBonjourServices json -o - "$plist") == '["_eternaldisplay._udp"]' ]] ||
   fail "NSBonjourServices does not match discovery.rs"
 

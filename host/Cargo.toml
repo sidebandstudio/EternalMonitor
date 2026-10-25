@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 eternal-wire = { path = "../proto" }
 eternal-updater = { path = "../updater" }
-ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
 libc = "0.2"
 getrandom = { version = "0.3.4", features = ["std"] }
 subtle = "2.6"
@@ -45,6 +44,20 @@ socket2 = "0.5"
 # Lets a release build obey ETERNAL_SIMULATE_STARTUP_FAILURE, for native
 # failure-path checks. Debug builds always do; shipped builds never do.
 fault-injection = []
+
+# FFmpeg. Windows (and Linux) link it as they always have, default features
+# included. The Mac host leaves out avdevice and avfilter, which it never
+# uses: they pull in Homebrew libraries the app would have to bundle (SDL,
+# whose initializer loads SDL3 by name, tesseract, libass, ...), several
+# built for a newer macOS than the host's. ffmpeg-next itself needs
+# "format" to build.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
+
+[target.'cfg(target_os = "macos")'.dependencies.ffmpeg-next]
+version = "7"
+default-features = false
+features = ["codec", "format", "software-scaling", "software-resampling"]
 
 [build-dependencies]
 winresource = "0.1"

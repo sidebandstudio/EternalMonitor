@@ -5,12 +5,13 @@
 ## What the build does
 
 1. `cargo build --release -p eternal-host` for macOS 14, with Homebrew's FFmpeg 7 (`PKG_CONFIG_PATH=/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig`).
-2. Lays out the bundle: the host as `Contents/MacOS/EternalMonitor`, `Info.plist` from `Info.plist.in` with the version from `host/Cargo.toml`, and an icon made from the window icon.
-3. `scripts/bundle-dylibs.py` copies every Homebrew library the host needs, directly or through another library, into `Contents/Frameworks`. Each gets the install name `@rpath/<name>`, every reference to it is rewritten to match, and the host gets the run path `@executable_path/../Frameworks`, so nothing is loaded from `/opt/homebrew`. sdl2-compat (pulled in by libavdevice) loads SDL3 by name from its initializer, so SDL3 is bundled too; without it macOS shows an error dialog before the host starts. The list of bundled libraries, with the licence Homebrew records for each, is written to `Contents/Resources/ThirdPartyLibraries.txt` and `target/macos/ThirdPartyLibraries.txt`.
-4. Signs every library, then the app, with the hardened runtime and `EternalMonitor.entitlements`, which is empty: the file says why each entitlement the host might seem to need isn't needed.
-5. `verify-app.sh` checks the signature (`--deep --strict`), the designated requirement, the team and hardened runtime on every Mach-O file, that no load command or run path names `/opt/homebrew`, and the Info.plist keys.
+2. Lays out the bundle: the host as `Contents/MacOS/EternalMonitor` and an icon made from the window icon.
+3. `scripts/bundle-dylibs.py` copies every Homebrew library the host needs, directly or through another library, into `Contents/Frameworks`. Each gets the install name `@rpath/<name>`, every reference to it is rewritten to match, and the host gets the run path `@executable_path/../Frameworks`, so nothing is loaded from `/opt/homebrew`. On macOS the host builds ffmpeg-next without avdevice and avfilter (`host/Cargo.toml`), which it never uses; that leaves out SDL, tesseract and about 25 other libraries. If a build ever links sdl2-compat again, the script bundles the SDL3 its initializer loads by name, because without it macOS shows an error dialog before the host starts. The list of bundled libraries, with the licence Homebrew records for each, is written to `Contents/Resources/ThirdPartyLibraries.txt` and `target/macos/ThirdPartyLibraries.txt`.
+4. Writes `Info.plist` from `Info.plist.in`: the version from `host/Cargo.toml`, and as `LSMinimumSystemVersion` the newest macOS any Mach-O file in the app was built for (`scripts/min-macos.sh`, never below 14.0). Homebrew builds its libraries for the macOS it runs on, so on devbox1 that is 15.0.
+5. Signs every library, then the app, with the hardened runtime and `EternalMonitor.entitlements`, which is empty: the file says why each entitlement the host might seem to need isn't needed.
+6. `verify-app.sh` checks the signature (`--deep --strict`), the designated requirement, the team and hardened runtime on every Mach-O file, that no load command or run path names `/opt/homebrew`, the Info.plist keys, and that `LSMinimumSystemVersion` is no older than any Mach-O file's minimum.
 
-Homebrew's FFmpeg is built with `--enable-gpl --enable-version3` and links x264, x265 and other GPL libraries, so this bundle is GPL-3.0-or-later as a whole and about 100 MB. A release build uses an LGPL FFmpeg with VideoToolbox only, which also drops most of these libraries.
+Homebrew's FFmpeg is built with `--enable-gpl --enable-version3` and links x264, x265 and other GPL libraries, so this bundle is GPL-3.0-or-later as a whole. A release build uses an LGPL FFmpeg with VideoToolbox only, which also drops most of these libraries.
 
 ## Signing
 

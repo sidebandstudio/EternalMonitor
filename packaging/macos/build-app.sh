@@ -34,8 +34,6 @@ MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --locked -p eternal-host --m
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
 cp "$root/target/release/eternal-host" "$exe"
-sed "s/@VERSION@/$version/g" "$here/Info.plist.in" > "$app/Contents/Info.plist"
-plutil -lint -s "$app/Contents/Info.plist"
 
 # The window icon, as the app icon. The source is 256 px, so the set stops there.
 iconset=$(mktemp -d /tmp/em-iconset.XXXXXX)/AppIcon.iconset
@@ -51,6 +49,12 @@ rm -rf "${iconset:h}"
 
 python3 -I "$here/scripts/bundle-dylibs.py" "$app" "$exe" "$prefix" "$app/Contents/Resources/ThirdPartyLibraries.txt"
 cp "$app/Contents/Resources/ThirdPartyLibraries.txt" "$out/"
+
+# The app can't run on a macOS older than its newest-built library needs
+# (Homebrew builds for the macOS it runs on), and never below 14.
+min_macos=$(print -l 14.0 "$("$here/scripts/min-macos.sh" "$app")" | sort -V | tail -1)
+sed -e "s/@VERSION@/$version/g" -e "s/@MIN_MACOS@/$min_macos/g" "$here/Info.plist.in" > "$app/Contents/Info.plist"
+plutil -lint -s "$app/Contents/Info.plist"
 
 if [[ ! -x $unlock || $here/scripts/keychain-unlock.c -nt $unlock ]]; then
   mkdir -p "${unlock:h}"

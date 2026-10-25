@@ -11,7 +11,8 @@
 	<key>CFBundleShortVersionString</key><string>@VERSION@</string>
 	<key>CFBundleVersion</key><string>@VERSION@</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<!-- build-app.sh: the newest macOS the executable or any bundled dylib needs. -->
+	<key>LSMinimumSystemVersion</key><string>@MIN_MACOS@</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
