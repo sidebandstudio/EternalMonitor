@@ -15,11 +15,14 @@ final class DuoFoldTests: XCTestCase {
     override func setUpWithError() throws {
         try XCTSkipUnless(EMHingeAvailable(), "Only the iPhone Duo has a hinge")
         continueAfterFailure = false
+        var error: NSString?
+        XCTAssertTrue(EMSkipSpringBoardAnimationWait(true, &error), error as String? ?? "")
     }
 
     override func tearDown() {
         // Every other test expects the folded, iPhone-sized screen.
         if EMHingeAvailable() { _ = EMSetHingeAngle(0, 5, nil) }
+        _ = EMSkipSpringBoardAnimationWait(false, nil)
     }
 
     func testConnectAndPairOnBothScreens() throws {
@@ -131,9 +134,11 @@ final class DuoFoldTests: XCTestCase {
         let submit = app.buttons["pairing.submit"], bar = app.buttons["pairing.submitBar"]
         let reachable = NSPredicate { _, _ in
             let top = keyboard.frame.minY
-            return (bar.exists && bar.frame.maxY <= top) || submit.frame.maxY <= top
+            return (bar.exists && bar.frame.maxY <= top) || (submit.exists && submit.frame.maxY <= top)
         }
-        let result = XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: reachable, object: nil)], timeout: 5)
+        // One look at the hierarchy can take seconds on the runner, while the
+        // pad is still sliding in.
+        let result = XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: reachable, object: nil)], timeout: 15)
         XCTAssertEqual(result, .completed, "Pair is under the number pad on the \(screen) screen", file: file, line: line)
     }
 

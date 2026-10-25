@@ -14,3 +14,10 @@ void EMTapFingers(NSArray<NSValue *> *points,
 // Duo's inner screen and fails.
 BOOL EMTapFingersFromElement(XCUIElement * _Nonnull element, NSArray<NSValue *> * _Nonnull offsets,
                              NSString * _Nullable * _Nullable error);
+// Before each event XCTest waits up to 60 s for SpringBoard's animations to
+// finish. After some folds the iPhone Duo simulator's SpringBoard never says
+// they did, so every touch then comes a minute late, after the HUD it was
+// meant for has hidden. While `skip` is set, XCTest still waits for
+// SpringBoard to idle but not for its animations; the tests wait for the
+// app themselves.
+BOOL EMSkipSpringBoardAnimationWait(BOOL skip, NSString * _Nullable * _Nullable error);

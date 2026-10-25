@@ -1,5 +1,6 @@
 #import "TouchSynthesis.h"
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
 // XCTest exposes taps with multiple touches but no public two-finger swipe.
 // Declare only the runtime selectors used to drive actual UIKit touch events.
@@ -92,5 +93,40 @@ BOOL EMTapFingersFromElement(XCUIElement *element, NSArray<NSValue *> *offsets, 
         }
         return record;
     }];
+    return YES;
+}
+
+static BOOL EMSkippingSpringBoardAnimations;
+static IMP EMOriginalQuiescenceWait;
+
+// -[XCUIApplicationProcess waitForQuiescenceIncludingAnimationsIdle:usingActivity:isPreEvent:]
+static void EMQuiescenceWait(id process, SEL selector, BOOL animations, BOOL activity, BOOL preEvent) {
+    if (EMSkippingSpringBoardAnimations && [[process valueForKey:@"bundleID"] isEqual:@"com.apple.springboard"]) {
+        animations = NO;
+    }
+    ((void (*)(id, SEL, BOOL, BOOL, BOOL))EMOriginalQuiescenceWait)(process, selector, animations, activity, preEvent);
+}
+
+BOOL EMSkipSpringBoardAnimationWait(BOOL skip, NSString **error) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Method method = class_getInstanceMethod(NSClassFromString(@"XCUIApplicationProcess"),
+            NSSelectorFromString(@"waitForQuiescenceIncludingAnimationsIdle:usingActivity:isPreEvent:"));
+        // Only a void method taking three BOOLs can be replaced safely.
+        char returns[8] = "", first[8] = "", second[8] = "", third[8] = "";
+        if (method && method_getNumberOfArguments(method) == 5) {
+            method_getReturnType(method, returns, sizeof returns);
+            method_getArgumentType(method, 2, first, sizeof first);
+            method_getArgumentType(method, 3, second, sizeof second);
+            method_getArgumentType(method, 4, third, sizeof third);
+        }
+        if (strcmp(returns, "v") || strcmp(first, "B") || strcmp(second, "B") || strcmp(third, "B")) method = NULL;
+        if (method) EMOriginalQuiescenceWait = method_setImplementation(method, (IMP)EMQuiescenceWait);
+    });
+    if (!EMOriginalQuiescenceWait) {
+        if (error) *error = @"This XCTest has no quiescence wait with the expected signature";
+        return NO;
+    }
+    EMSkippingSpringBoardAnimations = skip;
     return YES;
 }
