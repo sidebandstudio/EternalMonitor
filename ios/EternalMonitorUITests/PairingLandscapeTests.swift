@@ -9,11 +9,28 @@ final class PairingLandscapeTests: XCTestCase {
 
     /// XCUIDevice rotates every simulator but the iPhone Duo, which follows
     /// only Device Hub's orientation picker.
-    private func rotate(_ orientation: UIDeviceOrientation) {
+    private func rotate(_ orientation: UIDeviceOrientation, file: StaticString = #filePath, line: UInt = #line) {
         XCUIDevice.shared.orientation = orientation
         if EMHingeAvailable() {
-            _ = EMSetDeviceOrientation(orientation == .portrait ? "portrait" : "landscape-left", nil)
+            var error: NSString?
+            XCTAssertTrue(EMSetDeviceOrientation(orientation == .portrait ? "portrait" : "landscape-left", &error),
+                          "Device Hub's orientation event failed: \(error as String? ?? "")", file: file, line: line)
         }
+    }
+
+    /// A rotation that did nothing would test the other orientation's
+    /// layout, so the app's window must have turned before any check.
+    private func assertTurned(_ app: XCUIApplication, to orientation: UIDeviceOrientation,
+                              file: StaticString = #filePath, line: UInt = #line) {
+        let window = app.windows.firstMatch
+        let turned = NSPredicate { _, _ in
+            let size = window.frame.size
+            return size.width > 0 && (size.width > size.height) == orientation.isLandscape
+        }
+        let result = XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: turned, object: nil)], timeout: 5)
+        XCTAssertEqual(result, .completed, "Rotating to \(orientation.isLandscape ? "landscape" : "portrait") did nothing: "
+                       + "the window is \(window.frame.size), the device \(XCUIDevice.shared.orientation.rawValue)",
+                       file: file, line: line)
     }
 
     func testPairStaysReachableAboveTheNumberPad() throws {
@@ -25,6 +42,7 @@ final class PairingLandscapeTests: XCTestCase {
         app.launchEnvironment["EM_UI_PREVIEW"] = "pairing"
         app.launch()
         defer { app.terminate() }
+        assertTurned(app, to: .landscapeLeft)
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10))
         app.typeText("123456")
         let bar = app.buttons["pairing.submitBar"]
@@ -33,6 +51,7 @@ final class PairingLandscapeTests: XCTestCase {
         XCTAssertLessThan(bar.frame.maxY, app.keyboards.firstMatch.frame.minY)
 
         rotate(.portrait)
+        assertTurned(app, to: .portrait)
         let submit = app.buttons["pairing.submit"]
         XCTAssertTrue(submit.waitForExistence(timeout: 5))
         // The bar goes, unless the pad still covers the sheet's Pair, as on
@@ -55,6 +74,7 @@ final class PairingLandscapeTests: XCTestCase {
             app.launchArguments = ["-allowUSB", "NO", "-didSeeOnboarding", "YES"]
             app.launchEnvironment["EM_UI_PREVIEW"] = state
             app.launch()
+            assertTurned(app, to: .landscapeLeft)
             let keyboard = app.keyboards.firstMatch
             XCTAssertTrue(keyboard.waitForExistence(timeout: 10), state)
             let bar = app.buttons["pairing.submitBar"]
