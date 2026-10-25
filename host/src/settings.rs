@@ -335,15 +335,6 @@ mod tests {
         let parsed: SettingsFile = serde_json::from_str(old).unwrap();
         assert!(!parsed.mac_second_screen, "off unless asked for");
         assert_eq!(parsed.mac_second_screen_grace_secs, 60);
-        // Files from before profiles moved out still load.
-        let earlier = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false,
-            "display_profiles":{"00000000000000d0":{"width_px":2670,"height_px":1878,"refresh_hz":120,"hidpi":true}},
-            "mac_second_screen":true}"#;
-        assert!(
-            serde_json::from_str::<SettingsFile>(earlier)
-                .unwrap()
-                .mac_second_screen
-        );
     }
 
     fn temp_settings(name: &str) -> (PathBuf, PathBuf) {
@@ -420,5 +411,35 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(other_dir).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_display_profiles_key_is_ignored_and_dropped_on_save() {
+        // Profiles lived in settings.json on this branch for a few hours
+        // (unreleased); they are not migrated, and the key must do no harm.
+        let (dir, path) = temp_settings("leftover");
+        fs::write(
+            &path,
+            r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false,
+                "display_profiles":{"00000000000000d0":{"width_px":2034,"height_px":1398,"refresh_hz":60,"hidpi":true}},
+                "mac_second_screen":true,"mac_second_screen_grace_secs":30}"#,
+        )
+        .unwrap();
+        let settings = SettingsFile::read(&path).expect("the strict reader accepts it");
+        assert!(settings.mac_second_screen);
+        assert_eq!(settings.mac_second_screen_grace_secs, 30);
+        assert!(SettingsFile::load_from(&path).mac_second_screen);
+        assert!(SettingsFile::current_or_last_good(&path).mac_second_screen);
+        // The saved profile is not used: the profile store beside it has
+        // none for that device.
+        let mut profiles =
+            crate::display_profile::ProfileStore::at(Some(dir.join("display-profiles.json")));
+        assert_eq!(profiles.get(0xd0), None);
+        // The next save writes the file without it.
+        settings.save_to(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("display_profiles"), "{text}");
+        assert!(SettingsFile::read(&path).unwrap().mac_second_screen);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
