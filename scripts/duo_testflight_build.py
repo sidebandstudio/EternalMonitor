@@ -19,8 +19,6 @@ import time
 import urllib.error
 import urllib.request
 
-import jwt
-
 APP_ID = "6826678258"
 GROUP_ID = "6958e9f2-bb61-42f5-905b-5f810200cc0f"
 API = "https://api.appstoreconnect.apple.com/v1"
@@ -37,6 +35,9 @@ READY ={"READY_FOR_BETA_TESTING", "IN_BETA_TESTING"}
 
 
 def token():
+    # Imported here so the upload decision can be tested without PyJWT.
+    import jwt
+
     now = int(time.time())
     key = pathlib.Path(os.environ["ASC_KEY_PATH"]).read_text()
     return jwt.encode({"iss": os.environ["ASC_ISSUER_ID"], "iat": now, "exp": now + 900,
@@ -115,27 +116,38 @@ def uploaded_source():
     return found and (found[1], found[2])
 
 
-# Paths that never reach the app bundle. Anything else counts as an app
-# change, so a path this list doesn't know about still uploads.
-NOT_APP = re.compile(r"^(\.github/|scripts/|docs/|notes/|host/|installer/|updater/|proto/"
-                     r"|ios/EternalMonitorTests/|ios/EternalMonitorUITests/"
-                     r"|Cargo\.(toml|lock)$|rust-toolchain\.toml$|LICENSE$|\.gitignore$)"
+# Paths known not to reach the Duo app's binary: test sources, docs, the
+# workflows other than duo.yml, and the PC side, which the app target never
+# builds (project.yml gives it ios/EternalMonitor/ only). Anything else is an
+# app change, a path this list doesn't know included, so the Duo workflow and
+# scripts, project.yml, the Xcode project, entitlements, Info.plists and
+# export options all upload.
+NOT_APP = re.compile(r"^(ios/EternalMonitorTests/|ios/EternalMonitorUITests/|docs/|notes/"
+                     r"|\.github/workflows/(ci|release|testflight)\.yml$"
+                     r"|host/|installer/|updater/|proto/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|LICENSE$)"
                      # The app bundles whatever its source folder holds.
                      r"|^(?!ios/EternalMonitor/).*\.md$")
 
 
+def app_files(paths):
+    """The changed paths that may reach the app."""
+    return [path for path in paths if not NOT_APP.search(path)]
+
+
 def app_changes(commit, xcode):
     """Why HEAD's app may differ from the newest upload, or nothing when only
-    CI, scripts, docs, tests or the PC side changed."""
+    tests, docs, the other workflows or the PC side changed."""
     source = uploaded_source()
     if not source:
         return "the newest Duo build doesn't name the commit it came from"
     if source[1] != xcode:
         return f"the newest Duo build used Xcode {source[1]}, not {xcode}"
-    diff = subprocess.run(["git", "diff", "--name-only", source[0], commit], capture_output=True, text=True)
+    # A move lists both paths, so a file moved out of the app still counts.
+    diff = subprocess.run(["git", "diff", "--name-only", "--no-renames", source[0], commit],
+                          capture_output=True, text=True)
     if diff.returncode:
         return f"commit {source[0]} of the newest Duo build can't be compared here"
-    changed = [path for path in diff.stdout.splitlines() if not NOT_APP.search(path)]
+    changed = app_files(diff.stdout.splitlines())
     if changed:
         return f"{len(changed)} app files changed since {source[0][:7]}, such as {changed[0]}"
     return None

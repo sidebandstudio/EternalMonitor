@@ -25,6 +25,8 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+      - name: Test when a push uploads a Duo build
+        run: python3 -m unittest discover -s scripts -p 'test_duo_*.py' -v
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Create iPhone and iPad simulators
@@ -210,7 +212,8 @@ jobs:
         run: xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
       - name: Archive, upload, and prepare the build for Duo internal
         # The build number is one above App Store Connect's highest. When
-        # only CI, scripts, docs or tests changed, nothing is uploaded.
+        # only tests, docs, the other workflows or the PC side changed,
+        # nothing is uploaded; scripts/duo_testflight_build.py lists them.
         env:
           ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
           ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}

@@ -11,7 +11,7 @@ if [ "$#" != 0 ]; then echo "Usage: $0 [--dry-run]" >&2; exit 2; fi
 BUNDLE=com.eternal.monitor.duo
 # An upload takes the next build number from App Store Connect, so builds
 # only go up; BUILD names a dry run's build. An upload is skipped when only
-# files outside the app changed since the newest build.
+# files known not to reach the app changed since the newest build.
 BUILD="${BUILD:-}"
 # The Duo runs full screen only with the iOS 27.1 SDK; an older SDK shows a
 # centred window. DUO_MIN_SDK lowers this for a fallback build.
@@ -100,7 +100,7 @@ PY
         python3 - "$OUT/result.json" "$VERSION" "$COMMIT" <<'PY'
 import json,pathlib,sys
 result=dict(mode='skipped',version=sys.argv[2],commit=sys.argv[3],status='PASS',
-            reason='Only CI, scripts, docs, tests or the PC side changed since the newest Duo build')
+            reason='Only tests, docs, the other workflows or the PC side changed since the newest Duo build')
 pathlib.Path(sys.argv[1]).write_text(json.dumps(result,indent=2)+'\n')
 PY
         exit 0
