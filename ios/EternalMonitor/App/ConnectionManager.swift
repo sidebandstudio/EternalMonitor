@@ -72,7 +72,13 @@ struct ConnectionDebugState {
 
 @MainActor
 final class ConnectionManager: ObservableObject {
-    @Published var state: ConnectionState = .disconnected
+    @Published var state: ConnectionState = .disconnected {
+        didSet {
+            #if DEBUG
+            if UITestHooks.enabled && state == .connected && oldValue != .connected { signalHistory.connects += 1 }
+            #endif
+        }
+    }
     @Published var fps: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
@@ -99,7 +105,19 @@ final class ConnectionManager: ObservableObject {
     /// Live stream health for the HUD, recomputed at the 4 Hz flush.
     @Published private(set) var stats = StreamStats()
     /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
-    @Published private(set) var signalLost = false
+    @Published private(set) var signalLost = false {
+        didSet {
+            #if DEBUG
+            if UITestHooks.enabled && signalLost != oldValue {
+                if signalLost { signalHistory.signalLost += 1 } else { signalHistory.signalRecovered += 1 }
+            }
+            #endif
+        }
+    }
+    #if DEBUG
+    /// Counted only for UI tests launched with `-EMUITest YES`.
+    @Published private(set) var signalHistory = SignalHistory()
+    #endif
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -840,6 +858,9 @@ final class ConnectionManager: ObservableObject {
     }
 
     private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil) {
+        #if DEBUG
+        if UITestHooks.enabled { signalHistory.reconnects += 1 }
+        #endif
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
         // Support logs keep the original wording so reports stay comparable.

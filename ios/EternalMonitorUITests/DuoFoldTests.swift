@@ -82,8 +82,9 @@ final class DuoFoldTests: XCTestCase {
         fold(to: 0)
         let app = XCUIApplication()
         // Touches go to the PC; a three-finger tap brings the HUD back.
+        // -EMUITest shows the app's own signal history to the test.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-pictureFit", "fit"]
+                               "-playPCaudio", "NO", "-pictureFit", "fit", "-EMUITest", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         let logStart = (try? Data(contentsOf: URL(fileURLWithPath: log)).count) ?? 0
         app.launch()
@@ -192,13 +193,19 @@ final class DuoFoldTests: XCTestCase {
 
     /// The stream's session on the synthetic host. A stream that broke and
     /// came back leaves its trace in the host's log even when the picture
-    /// looks fine again: a second session, or the first one ending.
+    /// looks fine again: a second session, or the first one ending. A
+    /// signal lost and regained within the session shows only in the app's
+    /// own history, which counts every loss, recovery, reconnect and connect.
     private struct Stream {
         let app: XCUIApplication
         let log: String
         let offset: Int
         let sessionID: String
+        let history: XCUIElement
     }
+
+    /// One connect and nothing lost: the history a stream must keep.
+    private let cleanHistory = "connects=1 lost=0 recovered=0 reconnects=0"
 
     private func hostSession(app: XCUIApplication, log: String, after offset: Int,
                              file: StaticString = #filePath, line: UInt = #line) throws -> Stream {
@@ -210,13 +217,21 @@ final class DuoFoldTests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < deadline
         XCTAssertEqual(sessions.count, 1, "The host started sessions \(sessions) for one connect", file: file, line: line)
-        return Stream(app: app, log: log, offset: offset, sessionID: try XCTUnwrap(sessions.first, file: file, line: line))
+        let history = app.descendants(matching: .any)["uitest.signalHistory"]
+        XCTAssertTrue(history.waitForExistence(timeout: 5), "The app shows no signal history; was it launched with -EMUITest?",
+                      file: file, line: line)
+        XCTAssertEqual(history.value as? String, cleanHistory, "The stream started unsteadily", file: file, line: line)
+        return Stream(app: app, log: log, offset: offset, sessionID: try XCTUnwrap(sessions.first, file: file, line: line),
+                      history: history)
     }
 
-    /// Fails at once, without waiting for a recovery, if the app shows a
-    /// lost signal or a problem, is back on the connect screen, or the host
-    /// saw a new HELLO or the session end.
+    /// Fails at once, without waiting for a recovery, if the app lost the
+    /// signal at any time since the stream started, even for a moment
+    /// between two checks, shows a problem, is back on the connect screen,
+    /// or the host saw a new HELLO or the session end.
     private func assertUnbroken(_ stream: Stream, _ step: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(stream.history.value as? String, cleanHistory, "\(step): the app's signal history changed",
+                       file: file, line: line)
         let broken = stream.app.descendants(matching: .any).matching(NSPredicate(
             format: "label CONTAINS[c] 'reconnecting' OR identifier IN %@",
             ["connect.problemTitle", "connect.host", "connect.button"])).firstMatch
