@@ -20,6 +20,8 @@ use crate::control::{CaptureTarget, VddStatus};
 
 #[cfg(windows)]
 pub mod dxgi;
+#[cfg(target_os = "macos")]
+mod mac_screen;
 pub mod recovery;
 #[cfg(target_os = "macos")]
 pub mod sck;
@@ -606,7 +608,24 @@ fn run_platform_loop(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn run_platform_loop(
+    slot: &FrameSlot,
+    shared: SharedControl,
+    _adapter_index: u32,
+    generation: u64,
+    frame_number: &mut u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let synthetic_requested =
+        std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
+    if synthetic_requested || !crate::settings::SettingsFile::load().mac_second_screen {
+        synthetic::run_capture_loop(slot, shared, generation, frame_number)
+    } else {
+        mac_screen::run_capture_loop(slot, shared, generation, frame_number)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run_platform_loop(
     slot: &FrameSlot,
     shared: SharedControl,

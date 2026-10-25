@@ -21,6 +21,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+pub mod owner;
 
 use crate::display_profile::{profile_for, ClientScreen, DisplayProfile};
 use crate::input::mac::display::DisplayBounds;

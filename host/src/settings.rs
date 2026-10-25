@@ -59,6 +59,12 @@ pub struct SettingsFile {
     #[serde(default)]
     pub display_profiles:
         std::collections::BTreeMap<String, crate::display_profile::DisplayProfile>,
+    /// macOS: capture the real screen, on a second-screen virtual display
+    /// while a client is connected (mirroring the main display otherwise).
+    /// Off by default: the macOS host then streams its synthetic test
+    /// pattern, and nothing creates a display by itself.
+    #[serde(default)]
+    pub mac_second_screen: bool,
 }
 
 fn default_true() -> bool {
@@ -94,6 +100,7 @@ impl Default for SettingsFile {
             feedback_ask_done: false,
             star_clicked: false,
             display_profiles: Default::default(),
+            mac_second_screen: false,
         }
     }
 }
@@ -319,6 +326,7 @@ mod tests {
             hidpi: true,
         };
         settings.remember_display_profile(7, ipad);
+        assert!(!settings.mac_second_screen, "off unless asked for");
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"0123456789abcdef\""), "{json}");
         let parsed: SettingsFile = serde_json::from_str(&json).unwrap();

@@ -499,6 +499,7 @@ impl AnalyzerApp {
             feedback_ask_done: self.feedback_ask.done,
             star_clicked: self.star_clicked,
             display_profiles: on_disk.display_profiles,
+            mac_second_screen: on_disk.mac_second_screen,
         };
         file.save();
     }
