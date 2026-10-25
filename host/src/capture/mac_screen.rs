@@ -673,21 +673,12 @@ pub(crate) mod tests {
         // and its default profile is saved, once: later passes find it.
         connect(&shared, 0xd0, (1398, 2034));
         answers.push(targets.display(now));
-        let written = (
-            std::fs::read_to_string(&profiles).unwrap(),
-            std::fs::metadata(&profiles).unwrap().modified().unwrap(),
-        );
+        let written = saved_soon(&profiles);
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(10));
             answers.push(targets.display(now));
         }
-        assert_eq!(
-            (
-                std::fs::read_to_string(&profiles).unwrap(),
-                std::fs::metadata(&profiles).unwrap().modified().unwrap(),
-            ),
-            written
-        );
+        assert_eq!(on_disk(&profiles), written);
         let Ok(Op::Create(spec)) = ops.try_recv() else {
             panic!("expected the display to be made")
         };
@@ -795,6 +786,20 @@ pub(crate) mod tests {
         )
     }
 
+    /// `on_disk` once the owner's first-time save, which follows its
+    /// answer, has written the file.
+    fn saved_soon(path: &std::path::Path) -> (String, SystemTime) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the first profile was never saved"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        on_disk(path)
+    }
+
     #[test]
     fn stale_and_idle_passes_never_write_over_an_edited_profile() {
         // Sol's round 6. The owner's live session is the Duo's (B); `seen`
@@ -897,6 +902,7 @@ pub(crate) mod tests {
         let id = targets.display(Instant::now());
         assert_ne!(id, MAIN, "the display made before the edit is captured");
         // The profile was saved, and the user's edit was not overwritten.
+        saved_soon(&dir.join("display-profiles.json"));
         let on_disk = SettingsFile::load_from(&settings_path);
         assert!(!on_disk.mac_second_screen, "flipped back on");
         assert_eq!(

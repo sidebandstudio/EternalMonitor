@@ -149,7 +149,8 @@ pub struct ProfileStore {
     seen: Option<Option<SystemTime>>,
 }
 
-/// How long a writer waits for another, in any process, to finish.
+/// How long an explicit edit waits for another writer, in any process, to
+/// finish. A first-time save never waits ([`ProfileStore::save_if_absent`]).
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// The lock every writer of `path`, in any process, holds from reading the
@@ -244,22 +245,29 @@ impl ProfileStore {
         if device_id == 0 || self.get(device_id) == Some(profile) {
             return false;
         }
-        self.write(device_id, profile, true)
+        self.write(device_id, profile, true, LOCK_WAIT)
     }
 
     /// Saves `profile` for a device that has no saved profile, never
     /// replacing one: the file is read again under the write lock, and an
     /// entry found there (saved since this store last read it, by any
-    /// process) is kept. Returns whether it was written; if the lock is
-    /// busy for `LOCK_WAIT`, nothing is, and the next pass tries again.
+    /// process) is kept. Returns whether it was written. It tries the lock
+    /// once and never waits: if another writer holds it, nothing is
+    /// written, and the caller tries again later.
     pub fn save_if_absent(&mut self, device_id: u64, profile: DisplayProfile) -> bool {
         if device_id == 0 || self.get(device_id).is_some() {
             return false;
         }
-        self.write(device_id, profile, false)
+        self.write(device_id, profile, false, Duration::ZERO)
     }
 
-    fn write(&mut self, device_id: u64, profile: DisplayProfile, replace: bool) -> bool {
+    fn write(
+        &mut self,
+        device_id: u64,
+        profile: DisplayProfile,
+        replace: bool,
+        wait: Duration,
+    ) -> bool {
         let Some(path) = self.path.clone() else {
             return false;
         };
@@ -269,7 +277,7 @@ impl ProfileStore {
                 return false;
             }
         }
-        let _lock = match lock(&path, LOCK_WAIT) {
+        let _lock = match lock(&path, wait) {
             Ok(Some(lock)) => lock,
             Ok(None) => {
                 tracing::warn!(path = %path.display(), "Display profiles are busy; not saving this time");
@@ -626,13 +634,21 @@ mod tests {
             !host.save_if_absent(0xd0, EDIT),
             "skipped while another writer holds it"
         );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "a first save never waits: {:?}",
+            started.elapsed()
+        );
+        assert!(!path.exists());
+        // An explicit edit waits for the lock, but only so long.
+        let started = Instant::now();
+        assert!(!host.remember(7, EDIT));
         assert!(started.elapsed() >= LOCK_WAIT);
         assert!(
             started.elapsed() < LOCK_WAIT + Duration::from_secs(2),
             "bounded"
         );
         assert!(!path.exists());
-        assert!(!host.remember(7, EDIT), "explicit edits wait no longer");
         drop(held);
         assert!(host.save_if_absent(0xd0, EDIT), "the next attempt saves");
         assert_eq!(ProfileStore::at(Some(path)).get(0xd0), Some(EDIT));

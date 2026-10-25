@@ -23,6 +23,7 @@
 pub mod mac;
 pub mod owner;
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::display_profile::{profile_for, ClientScreen, DisplayProfile};
@@ -238,6 +239,10 @@ pub struct Want {
 /// raised to it, so a session that drops for a moment keeps its display.
 pub const MIN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long after a first-time save that did not happen (another writer
+/// held the profiles' lock) the same device's is tried again.
+pub const SAVE_RETRY: Duration = Duration::from_secs(5);
+
 /// When a display goes away. A pipeline restart or a capture retry never
 /// removes it; only these do:
 /// - its client's session has been gone for the grace period, counted from
@@ -260,6 +265,11 @@ pub struct Keeper<M: VirtualDisplayManager> {
     /// Saves the default profile of a device seen for the first time,
     /// never replacing a saved one.
     save_first: Box<dyn FnMut(u64, DisplayProfile)>,
+    /// The device whose own request was served with no saved profile, and
+    /// the profile its display was made in, until the store has one.
+    unsaved: Option<(u64, DisplayProfile)>,
+    /// When each device's first-time save may next be tried.
+    next_save: BTreeMap<u64, Instant>,
 }
 
 impl<M: VirtualDisplayManager> Keeper<M> {
@@ -269,12 +279,15 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             gone_since: None,
             grace: MIN_GRACE,
             save_first: Box::new(|_, _| {}),
+            unsaved: None,
+            next_save: BTreeMap::new(),
         }
     }
 
     /// Saves, through `save`, the profile a device with no saved profile
-    /// gets the first time its own request is served. Nothing else writes
-    /// profiles: a saved one changes only by an explicit edit.
+    /// gets the first time its own request is served
+    /// ([`Self::save_first_profile`]). Nothing else writes profiles: a
+    /// saved one changes only by an explicit edit.
     pub fn saving_first_profiles(
         mut self,
         save: impl FnMut(u64, DisplayProfile) + 'static,
@@ -310,7 +323,8 @@ impl<M: VirtualDisplayManager> Keeper<M> {
     /// session that ended less than the grace period ago, or mirror (the
     /// next pass, which sees the live device, gets its display). No request
     /// expires the display: only `observe` and `expire` do. Only a matching
-    /// request for a device with no saved profile saves one, its default.
+    /// request for a device with no saved profile marks one to be saved,
+    /// its default, and the answer never waits for it.
     fn answer(
         &mut self,
         want: Want,
@@ -332,7 +346,7 @@ impl<M: VirtualDisplayManager> Keeper<M> {
                     .ensure(live.client, &live.device_name, live.saved)?;
                 self.gone_since = None;
                 if live.saved.is_none() {
-                    (self.save_first)(live.client.device_id, display.profile);
+                    self.unsaved = Some((live.client.device_id, display.profile));
                 }
                 Ok(Some(display))
             }
@@ -349,6 +363,33 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             }
             None => Ok(current.map(|(_, display)| display)),
         }
+    }
+
+    /// Saves the profile a matching request marked, after the owner has
+    /// answered it. `live` is the session the turn was served against. The
+    /// save is tried only while that device is live with no saved profile,
+    /// and at most once every `SAVE_RETRY` per device: the store skips it
+    /// rather than wait for a busy lock, and a later turn of the owner
+    /// tries again. It is dropped once the store has a profile for the
+    /// device (saved here, or edited meanwhile) or another device is live.
+    pub fn save_first_profile(&mut self, live: Option<&LiveClient>, now: Instant) {
+        let Some((device_id, profile)) = self.unsaved else {
+            return;
+        };
+        match live {
+            Some(live) if live.client.device_id == device_id && live.saved.is_none() => {}
+            Some(_) => {
+                self.unsaved = None;
+                return;
+            }
+            None => return,
+        }
+        self.next_save.retain(|_, at| *at > now);
+        if self.next_save.contains_key(&device_id) {
+            return;
+        }
+        self.next_save.insert(device_id, now + SAVE_RETRY);
+        (self.save_first)(device_id, profile);
     }
 
     /// The transport's session state. An active session keeps the display;
@@ -644,14 +685,17 @@ mod tests {
         }
     }
 
-    /// One owner turn: the live session, a request, the display answered.
+    /// One owner turn: the live session, a request, the display answered,
+    /// then any first-time save.
     fn turn(
         keeper: &mut Keeper<FakeDisplays>,
         live: Option<&LiveClient>,
         want: Want,
         now: Instant,
     ) -> Result<Option<VirtualDisplay>, DisplayError> {
-        keeper.serve(live, Some(want), now).unwrap()
+        let answer = keeper.serve(live, Some(want), now).unwrap();
+        keeper.save_first_profile(live, now);
+        answer
     }
 
     fn removals(keeper: &Keeper<FakeDisplays>) -> usize {
@@ -1032,6 +1076,78 @@ mod tests {
             Ok(Some(display))
         );
         assert_eq!(saves.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_first_save_that_did_not_happen_is_retried_every_save_retry_until_saved() {
+        let start = Instant::now();
+        // The store's lock is busy: every attempt is recorded, none saves.
+        let (mut keeper, attempts) = recording();
+        let mut b = live(client(DUO, (1398, 2034)));
+        let a = live(client(IPAD, (1668, 2420)));
+        let display = turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(*attempts.borrow(), [(DUO, display.profile)]);
+        // Passes and idle turns within SAVE_RETRY answer as before and try
+        // nothing more.
+        for ms in [1, 100, 2_000, 4_999] {
+            let t = start + Duration::from_millis(ms);
+            assert_eq!(
+                turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), t),
+                Ok(Some(display))
+            );
+            keeper.serve(Some(&b), None, t);
+            keeper.save_first_profile(Some(&b), t);
+        }
+        assert_eq!(attempts.borrow().len(), 1);
+        // The owner's next turn after SAVE_RETRY tries again, even an idle
+        // one or one answering a stale request.
+        let t = start + SAVE_RETRY;
+        assert_eq!(
+            turn(&mut keeper, Some(&b), saw(Some(&a.client), GRACE), t),
+            Ok(Some(display))
+        );
+        assert_eq!(attempts.borrow().len(), 2);
+        keeper.serve(Some(&b), None, t + SAVE_RETRY);
+        keeper.save_first_profile(Some(&b), t + SAVE_RETRY);
+        assert_eq!(attempts.borrow().len(), 3);
+        // Not while the session is gone; nor once the store has a profile.
+        let later = t + SAVE_RETRY * 3;
+        keeper.serve(None, None, later);
+        keeper.save_first_profile(None, later);
+        assert_eq!(attempts.borrow().len(), 3);
+        b.saved = Some(display.profile);
+        for n in 4..8 {
+            turn(
+                &mut keeper,
+                Some(&b),
+                saw(Some(&b.client), GRACE),
+                start + SAVE_RETRY * n,
+            )
+            .unwrap();
+        }
+        assert_eq!(attempts.borrow().len(), 3);
+        assert_eq!(keeper.screen.manager.ops.len(), 1, "one display throughout");
+    }
+
+    #[test]
+    fn another_live_device_drops_a_first_save_that_did_not_happen() {
+        let start = Instant::now();
+        let (mut keeper, attempts) = recording();
+        let b = live(client(DUO, (1398, 2034)));
+        let a = live(client(IPAD, (1668, 2420)));
+        turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), start).unwrap();
+        // A takes over, with a saved profile: B's save is not tried for it.
+        let a = LiveClient {
+            saved: Some(profile_for(a.client, None)),
+            ..a
+        };
+        let t = start + SAVE_RETRY;
+        turn(&mut keeper, Some(&a), saw(Some(&b.client), GRACE), t).unwrap();
+        keeper.serve(Some(&a), None, t + SAVE_RETRY);
+        keeper.save_first_profile(Some(&a), t + SAVE_RETRY);
+        assert_eq!(attempts.borrow().len(), 1);
     }
 
     #[test]

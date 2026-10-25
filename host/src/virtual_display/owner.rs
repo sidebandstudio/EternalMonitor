@@ -48,7 +48,10 @@ impl DisplayOwner {
     ///
     /// `save_first` saves the default profile of a device that has none,
     /// without replacing one saved meanwhile. It is the only profile write
-    /// the owner makes, and capture makes none.
+    /// the owner makes, and capture makes none. It runs after the request
+    /// that called for it is answered, and must not wait for a busy store:
+    /// a save that did not happen is tried again on a later turn
+    /// (`Keeper::save_first_profile`).
     pub fn spawn<M, F>(
         make: F,
         mut live: impl FnMut() -> Option<LiveClient> + Send + 'static,
@@ -80,11 +83,12 @@ impl DisplayOwner {
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    let session = live();
                     match request {
                         Some(Request::Want { want, reply }) => {
                             let result = match &mut keeper {
                                 Ok(keeper) => keeper
-                                    .serve(live().as_ref(), Some(want), Instant::now())
+                                    .serve(session.as_ref(), Some(want), Instant::now())
                                     .expect("a request is answered"),
                                 Err(error) if want.enabled && want.device.is_some() => {
                                     Err(error.clone())
@@ -102,9 +106,13 @@ impl DisplayOwner {
                         }
                         None => {
                             if let Ok(keeper) = &mut keeper {
-                                keeper.serve(live().as_ref(), None, Instant::now());
+                                keeper.serve(session.as_ref(), None, Instant::now());
                             }
                         }
+                    }
+                    // Answered first: no reply waits for the store.
+                    if let Ok(keeper) = &mut keeper {
+                        keeper.save_first_profile(session.as_ref(), Instant::now());
                     }
                 }
                 if let Ok(keeper) = &mut keeper {
@@ -261,6 +269,87 @@ mod tests {
         };
         assert_eq!(owner.want(other), Ok(Some(first)));
         assert!(ops.try_recv().is_err(), "no create, remove or change");
+    }
+
+    #[test]
+    fn a_busy_profile_store_never_slows_the_answers_and_the_first_save_follows_once() {
+        use crate::display_profile::ProfileStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("eternal-owner-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("display-profiles.json");
+        // Another writer, in any process, holds the profiles' lock.
+        let held = std::fs::File::create(dir.join("display-profiles.json.lock")).unwrap();
+        held.lock().unwrap();
+        // Wired as the host wires it: the live session reads the store, and
+        // first saves go through a store of their own.
+        let (attempts, written) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let owner = DisplayOwner::spawn(
+            || Ok(FakeDisplays::default()),
+            {
+                let mut profiles = ProfileStore::at(Some(path.clone()));
+                move || {
+                    Some(LiveClient {
+                        saved: profiles.get(DUO),
+                        ..duo()
+                    })
+                }
+            },
+            {
+                let mut first_saves = ProfileStore::at(Some(path.clone()));
+                let (attempts, written) = (attempts.clone(), written.clone());
+                move |device_id, profile| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if first_saves.save_if_absent(device_id, profile) {
+                        written.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let grace = Duration::from_secs(60);
+        let mut display = None;
+        for pass in 0..10 {
+            let asked = Instant::now();
+            let answer = owner.want(want(true, grace)).unwrap();
+            assert!(
+                asked.elapsed() < Duration::from_millis(50),
+                "pass {pass} took {:?}",
+                asked.elapsed()
+            );
+            assert!(answer.is_some());
+            display = display.or(answer);
+            assert_eq!(answer, display);
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "tried once, then waits");
+        assert!(!path.exists(), "nothing written while the lock is held");
+        // The lock is released: the owner's next try saves, within
+        // SAVE_RETRY and a poll, whether or not capture asks meanwhile.
+        let released = Instant::now();
+        drop(held);
+        let deadline = released + super::super::SAVE_RETRY + Duration::from_secs(2);
+        while written.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "never saved");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(released.elapsed() <= super::super::SAVE_RETRY + PRESENCE_POLL * 2);
+        assert_eq!(
+            ProfileStore::at(Some(path.clone())).get(DUO),
+            display.map(|display| display.profile)
+        );
+        // Saved once: the store now has it, so later turns try nothing.
+        for _ in 0..5 {
+            assert_eq!(owner.want(want(true, grace)).unwrap(), display);
+            std::thread::sleep(PRESENCE_POLL / 2);
+        }
+        assert_eq!(
+            (
+                attempts.load(Ordering::SeqCst),
+                written.load(Ordering::SeqCst)
+            ),
+            (2, 1)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
