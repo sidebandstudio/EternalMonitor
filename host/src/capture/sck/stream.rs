@@ -334,21 +334,39 @@ fn publish_geometry(shared: &SharedControl, bounds: DisplayBounds, pixels: (u32,
     });
 }
 
-/// Captures `display_id` into `slot` until the generation stops, or the
-/// stream fails (returned as the stage's error: a missing grant is a
-/// blocked state, anything else restarts the pipeline).
+/// Which display to capture, asked on every pass of the capture loop.
+pub trait DisplayChoice {
+    fn display(&mut self, now: Instant) -> u32;
+    /// ScreenCaptureKit does not offer `display_id`. Returns whether to
+    /// ask again (another display may be chosen) instead of failing.
+    fn not_listed(&mut self, display_id: u32, now: Instant) -> bool;
+}
+
+/// Captures the chosen display into `slot` until the generation stops, or
+/// the stream fails (returned as the stage's error: a missing grant is a
+/// blocked state, anything else restarts the pipeline). When the choice
+/// changes, the stream moves to the new display within this generation.
 pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
     generation: u64,
     frame_number: &mut u64,
-    display_id: u32,
+    choice: &mut dyn DisplayChoice,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let empty = Arc::new(Vec::new());
     'stream: loop {
+        let display_id = choice.display(Instant::now());
         let (mut bounds, pixels) = display_geometry(display_id);
         let settings = StreamSettings::new(display_id, pixels, shared.effective_fps());
-        let stream = ScreenStream::start(settings).map_err(CaptureFailure::into_error)?;
+        let stream = match ScreenStream::start(settings) {
+            Ok(stream) => stream,
+            Err(CaptureFailure::DisplayNotFound(_))
+                if choice.not_listed(display_id, Instant::now()) =>
+            {
+                continue 'stream;
+            }
+            Err(failure) => return Err(failure.into_error()),
+        };
         info!(?settings, ?bounds, "ScreenCaptureKit capture started");
         publish_geometry(&shared, bounds, pixels);
 
@@ -379,6 +397,15 @@ pub fn run_capture_loop(
             }
             if shared.effective_fps() != settings.fps {
                 info!("Frame rate changed; restarting ScreenCaptureKit capture");
+                continue 'stream;
+            }
+            let chosen = choice.display(Instant::now());
+            if chosen != display_id {
+                info!(
+                    from = display_id,
+                    to = chosen,
+                    "Moving capture to another display"
+                );
                 continue 'stream;
             }
             heartbeat(&shared.hb_capture_loop_ms);

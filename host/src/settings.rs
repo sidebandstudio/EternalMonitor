@@ -180,6 +180,12 @@ impl SettingsFile {
         }
     }
 
+    /// When settings.json last changed, if it exists: lets a long-running
+    /// reader re-load only after a change.
+    pub fn modified() -> Option<std::time::SystemTime> {
+        fs::metadata(settings_path()?).ok()?.modified().ok()
+    }
+
     pub fn save(&self) {
         let Some(path) = settings_path() else {
             return;
