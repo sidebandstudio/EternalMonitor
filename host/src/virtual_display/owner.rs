@@ -10,7 +10,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{DisplayError, Keeper, VirtualDisplay, VirtualDisplayManager, Want};
+use super::{DisplayError, Keeper, LiveClient, Served, VirtualDisplayManager, Want};
 
 /// Covers a recreation: removal (2 s) and creation (3 s) with margin.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -22,7 +22,7 @@ const PRESENCE_POLL: Duration = Duration::from_millis(500);
 enum Request {
     Want {
         want: Want,
-        reply: mpsc::Sender<Result<Option<VirtualDisplay>, DisplayError>>,
+        reply: mpsc::Sender<Result<Option<Served>, DisplayError>>,
     },
     Release {
         reply: mpsc::Sender<Result<(), DisplayError>>,
@@ -36,13 +36,17 @@ pub struct DisplayOwner {
 impl DisplayOwner {
     /// Starts the owner thread. `make` runs on it, so the manager never
     /// crosses threads. If it fails, every request reports why.
-    /// `session_active` is the transport's session state; the thread
-    /// observes it every `PRESENCE_POLL` and removes a display whose
-    /// session has been gone for the grace period, whether or not anything
-    /// asks.
+    ///
+    /// `live` reads the transport's session as it is now: the connected
+    /// client and its saved profile, or `None`. The thread is the single
+    /// source of truth for which device it serves: it reads `live` at the
+    /// start of every turn (every request, and every `PRESENCE_POLL`
+    /// otherwise), and requests only carry a device hint. It removes a
+    /// display whose session has been gone for the grace period, whether or
+    /// not anything asks.
     pub fn spawn<M, F>(
         make: F,
-        session_active: impl Fn() -> bool + Send + 'static,
+        mut live: impl FnMut() -> Option<LiveClient> + Send + 'static,
     ) -> std::io::Result<Self>
     where
         M: VirtualDisplayManager + 'static,
@@ -69,16 +73,13 @@ impl DisplayOwner {
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
-                    // Every turn observes the live session before anything
-                    // else, so a request snapshotted before a reconnect
-                    // cannot remove the reconnected client's display.
                     match request {
                         Some(Request::Want { want, reply }) => {
                             let result = match &mut keeper {
                                 Ok(keeper) => keeper
-                                    .serve(session_active(), Some(want), Instant::now())
+                                    .serve(live().as_ref(), Some(want), Instant::now())
                                     .expect("a request is answered"),
-                                Err(error) if want.enabled && want.client.is_some() => {
+                                Err(error) if want.enabled && want.device.is_some() => {
                                     Err(error.clone())
                                 }
                                 Err(_) => Ok(None),
@@ -94,7 +95,7 @@ impl DisplayOwner {
                         }
                         None => {
                             if let Ok(keeper) = &mut keeper {
-                                keeper.serve(session_active(), None, Instant::now());
+                                keeper.serve(live().as_ref(), None, Instant::now());
                             }
                         }
                     }
@@ -116,8 +117,9 @@ impl DisplayOwner {
         answer.recv_timeout(REPLY_TIMEOUT).map_err(|_| gone())?
     }
 
-    /// The display to capture now (see `Keeper::want`); `None` to mirror.
-    pub fn want(&self, want: Want) -> Result<Option<VirtualDisplay>, DisplayError> {
+    /// The display to capture now, for the live session, and its device
+    /// (see `Keeper::serve`); `None` to mirror.
+    pub fn want(&self, want: Want) -> Result<Option<Served>, DisplayError> {
         self.ask(|reply| Request::Want { want, reply })
     }
 
@@ -130,23 +132,29 @@ impl DisplayOwner {
 #[cfg(test)]
 mod tests {
     use super::super::fake::{FakeDisplays, Op};
-    use super::super::Wanted;
     use super::*;
     use crate::display_profile::ClientScreen;
+    use std::sync::{Arc, Mutex};
 
-    fn want(client: bool, grace: Duration) -> Want {
+    const DUO: u64 = 0xd0;
+
+    fn duo() -> LiveClient {
+        LiveClient {
+            client: ClientScreen {
+                device_id: DUO,
+                screen_px: (1398, 2034),
+                refresh_hz: 120,
+            },
+            device_name: "Duo".into(),
+            saved: None,
+        }
+    }
+
+    fn want(saw_client: bool, grace: Duration) -> Want {
         Want {
             enabled: true,
-            client: client.then(|| Wanted {
-                client: ClientScreen {
-                    device_id: 0xd0,
-                    screen_px: (1398, 2034),
-                    refresh_hz: 120,
-                },
-                device_name: "Duo".into(),
-                saved: None,
-            }),
             grace,
+            device: saw_client.then_some(DUO),
         }
     }
 
@@ -157,65 +165,66 @@ mod tests {
         fn create(
             &mut self,
             spec: &super::super::DisplaySpec,
-        ) -> Result<VirtualDisplay, DisplayError> {
+        ) -> Result<super::super::VirtualDisplay, DisplayError> {
             let _ = self.1.send(Op::Create(spec.clone()));
             self.0.create(spec)
         }
         fn change_mode(
             &mut self,
-            display: &VirtualDisplay,
+            display: &super::super::VirtualDisplay,
             profile: crate::display_profile::DisplayProfile,
-        ) -> Result<VirtualDisplay, DisplayError> {
+        ) -> Result<super::super::VirtualDisplay, DisplayError> {
             self.0.change_mode(display, profile)
         }
-        fn remove(&mut self, display: &VirtualDisplay) -> Result<(), DisplayError> {
+        fn remove(&mut self, display: &super::super::VirtualDisplay) -> Result<(), DisplayError> {
             let _ = self.1.send(Op::Remove(display.id));
             self.0.remove(display)
         }
         fn bounds(
             &self,
-            display: &VirtualDisplay,
+            display: &super::super::VirtualDisplay,
         ) -> Option<crate::input::mac::display::DisplayBounds> {
             self.0.bounds(display)
         }
     }
 
-    #[test]
-    fn the_owner_keeps_the_display_across_requests_and_releases_it_on_quit() {
+    /// An owner over reporting fakes whose live session is `session`.
+    fn owner(session: Arc<Mutex<Option<LiveClient>>>) -> (DisplayOwner, mpsc::Receiver<Op>) {
         let (ops_tx, ops) = mpsc::channel();
         let owner = DisplayOwner::spawn(
             move || Ok(Reporting(FakeDisplays::default(), ops_tx)),
-            || true,
+            move || session.lock().unwrap().clone(),
         )
         .unwrap();
+        (owner, ops)
+    }
+
+    #[test]
+    fn the_owner_keeps_the_display_across_requests_and_releases_it_on_quit() {
+        let (owner, ops) = owner(Arc::new(Mutex::new(Some(duo()))));
         let grace = Duration::from_secs(60);
         let first = owner.want(want(true, grace)).unwrap().unwrap();
-        // A restart with no client yet keeps capturing the same display.
+        assert_eq!(first.device_id, DUO);
+        // A pass that saw no client keeps capturing the same display.
         assert_eq!(owner.want(want(false, grace)), Ok(Some(first)));
         assert_eq!(owner.want(want(true, grace)), Ok(Some(first)));
         owner.release().unwrap();
         owner.release().unwrap();
         let history: Vec<_> = ops.try_iter().collect();
         assert_eq!(history.len(), 2, "one create, one remove: {history:?}");
-        assert_eq!(history[1], Op::Remove(first.id));
+        assert_eq!(history[1], Op::Remove(first.display.id));
     }
 
     #[test]
     fn the_owner_keeps_a_connected_display_and_removes_it_after_the_session_ends() {
-        let (ops_tx, ops) = mpsc::channel();
-        let session = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observed = session.clone();
-        let owner = DisplayOwner::spawn(
-            move || Ok(Reporting(FakeDisplays::default(), ops_tx)),
-            move || observed.load(std::sync::atomic::Ordering::SeqCst),
-        )
-        .unwrap();
+        let session = Arc::new(Mutex::new(Some(duo())));
+        let (owner, ops) = owner(session.clone());
         let tiny = Duration::from_millis(100);
         let first = owner.want(want(true, tiny)).unwrap().unwrap();
         assert!(matches!(ops.recv().unwrap(), Op::Create(_)));
-        // Capture ends and nothing asks for longer than the grace period,
-        // but the session stays up: nothing is removed, and the next
-        // request gets the same display.
+        // Nothing asks for longer than the grace period, but the session
+        // stays up: nothing is removed, and the next request gets the same
+        // display.
         assert!(ops
             .recv_timeout(super::super::MIN_GRACE + Duration::from_secs(1))
             .is_err());
@@ -224,12 +233,27 @@ mod tests {
         // The session ends; nothing asks, and the display goes once the
         // (minimum) grace period has passed.
         let gone = std::time::Instant::now();
-        session.store(false, std::sync::atomic::Ordering::SeqCst);
+        *session.lock().unwrap() = None;
         assert_eq!(
             ops.recv_timeout(Duration::from_secs(10)),
-            Ok(Op::Remove(first.id))
+            Ok(Op::Remove(first.display.id))
         );
         assert!(gone.elapsed() >= super::super::MIN_GRACE);
+    }
+
+    #[test]
+    fn a_request_naming_another_device_than_the_live_one_changes_nothing() {
+        let session = Arc::new(Mutex::new(Some(duo())));
+        let (owner, ops) = owner(session.clone());
+        let grace = Duration::from_secs(60);
+        let first = owner.want(want(true, grace)).unwrap().unwrap();
+        assert!(matches!(ops.recv().unwrap(), Op::Create(_)));
+        let other = Want {
+            device: Some(7),
+            ..want(true, grace)
+        };
+        assert_eq!(owner.want(other), Ok(Some(first)));
+        assert!(ops.try_recv().is_err(), "no create, remove or change");
     }
 
     #[test]
@@ -238,7 +262,7 @@ mod tests {
             || -> Result<FakeDisplays, _> {
                 Err(DisplayError::Unavailable("no CGVirtualDisplay".into()))
             },
-            || true,
+            || Some(duo()),
         )
         .unwrap();
         for _ in 0..2 {

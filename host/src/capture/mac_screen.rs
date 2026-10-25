@@ -30,7 +30,7 @@ use crate::display_profile::{ClientScreen, ProfileStore};
 use crate::settings::SettingsFile;
 use crate::virtual_display::mac::{CgVirtualDisplays, ModeChange};
 use crate::virtual_display::owner::DisplayOwner;
-use crate::virtual_display::{SecondScreenStatus, Want, Wanted};
+use crate::virtual_display::{LiveClient, SecondScreenStatus, Want};
 
 /// How long, in wall-clock time, a new display may take to appear in
 /// ScreenCaptureKit's list before the main display is mirrored instead
@@ -56,15 +56,16 @@ impl ContentLister for ScreenCaptureKitLister {
 static OWNER: OnceLock<Option<DisplayOwner>> = OnceLock::new();
 
 /// The process's display owner, started on first use. It follows the
-/// transport's session state in `shared`, which alone decides when a
-/// client is gone.
+/// transport's session in `shared`, which alone decides which device is
+/// served and when a client is gone.
 fn owner(shared: &SharedControl) -> Option<&'static DisplayOwner> {
     OWNER
         .get_or_init(|| {
             let shared = shared.clone();
+            let mut profiles = ProfileStore::beside_settings();
             DisplayOwner::spawn(
                 || CgVirtualDisplays::new(ModeChange::Recreate),
-                move || shared.client_connected(),
+                move || live_client(&shared, &mut profiles),
             )
             .inspect_err(|error| warn!(%error, "Could not start the display owner"))
             .ok()
@@ -85,9 +86,35 @@ pub(super) fn second_screen_off() {
 fn off() -> Want {
     Want {
         enabled: false,
-        client: None,
         grace: Duration::ZERO,
+        device: None,
     }
+}
+
+/// The client of the transport's live session, if there is one.
+fn live_info(shared: &SharedControl) -> Option<crate::transport::session::ClientInfo> {
+    let session = shared.session.lock();
+    if session.is_active() {
+        session.client_info()
+    } else {
+        None
+    }
+}
+
+/// The live session as the display owner reads it on every turn: the
+/// connected client and the saved profile for its device.
+fn live_client(shared: &SharedControl, profiles: &mut ProfileStore) -> Option<LiveClient> {
+    let info = live_info(shared)?;
+    let client = ClientScreen {
+        device_id: info.device_id,
+        screen_px: info.screen_px,
+        refresh_hz: info.refresh_hz,
+    };
+    Some(LiveClient {
+        client,
+        device_name: info.device_name,
+        saved: profiles.get(client.device_id),
+    })
 }
 
 /// The host is quitting: remove the display rather than leave it to the
@@ -320,37 +347,17 @@ impl<'a> Targets<'a> {
             self.set_status(SecondScreenStatus::Off);
             return self.main;
         }
-        let client = {
-            let session = self.shared.session.lock();
-            if session.is_active() {
-                session.client_info()
-            } else {
-                None
-            }
-        };
-        let wanted = client.map(|info| {
-            let client = ClientScreen {
-                device_id: info.device_id,
-                screen_px: info.screen_px,
-                refresh_hz: info.refresh_hz,
-            };
-            Wanted {
-                client,
-                device_name: info.device_name,
-                saved: self.profiles.get(client.device_id),
-            }
-        });
-        let device_id = wanted.as_ref().map(|wanted| wanted.client.device_id);
+        // The owner reads the live session itself; the device this pass
+        // saw is only a hint, which a later session can make stale.
         let want = Want {
             enabled: true,
-            client: wanted,
             grace: Duration::from_secs(self.settings.mac_second_screen_grace_secs.into()),
+            device: live_info(&self.shared).map(|info| info.device_id),
         };
         match self.owner.want(want) {
-            Ok(Some(second)) => {
-                if let Some(device_id) = device_id {
-                    self.profiles.remember(device_id, second.profile);
-                }
+            Ok(Some(served)) => {
+                let second = served.display;
+                self.profiles.remember(served.device_id, second.profile);
                 if self.capturable(second.id, now) {
                     self.set_status(SecondScreenStatus::Active(second.id));
                     second.id
@@ -523,24 +530,18 @@ pub(crate) mod tests {
         assert!(shared.client_connected());
     }
 
-    /// A display owner over fake displays that reports what it does. Its
-    /// session is always active.
-    pub(crate) fn fake_owner() -> (DisplayOwner, mpsc::Receiver<Op>) {
-        fake_owner_with(|| {}, || true)
+    /// A display owner over fake displays that reports what it does. It
+    /// follows `shared`'s session as the host does, with no saved profiles.
+    pub(crate) fn fake_owner(shared: &SharedControl) -> (DisplayOwner, mpsc::Receiver<Op>) {
+        fake_owner_with(|| {}, shared, ProfileStore::at(None))
     }
 
-    /// The same, following `shared`'s session state as the host does.
-    pub(crate) fn fake_owner_following(
-        shared: &SharedControl,
-    ) -> (DisplayOwner, mpsc::Receiver<Op>) {
-        let shared = shared.clone();
-        fake_owner_with(|| {}, move || shared.client_connected())
-    }
-
-    /// The same, running `during_create` while a display is being made.
+    /// The same, reading saved profiles from `profiles` and running
+    /// `during_create` while a display is being made.
     pub(crate) fn fake_owner_with(
         during_create: impl Fn() + Send + 'static,
-        session_active: impl Fn() -> bool + Send + 'static,
+        shared: &SharedControl,
+        mut profiles: ProfileStore,
     ) -> (DisplayOwner, mpsc::Receiver<Op>) {
         use crate::virtual_display::{DisplayError, DisplaySpec, VirtualDisplay};
         let (ops_tx, ops) = mpsc::channel();
@@ -571,9 +572,10 @@ pub(crate) mod tests {
             }
         }
         let during_create: Box<dyn Fn() + Send> = Box::new(during_create);
+        let shared = shared.clone();
         let owner = DisplayOwner::spawn(
             move || Ok(Reporting(FakeDisplays::default(), ops_tx, during_create)),
-            session_active,
+            move || live_client(&shared, &mut profiles),
         )
         .expect("owner thread");
         (owner, ops)
@@ -640,7 +642,7 @@ pub(crate) mod tests {
         let shared = SharedControl::new(0, 15_000_000);
         let generation =
             crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner(&shared);
         let dir = temp_dir("connect");
         let profiles = dir.join("display-profiles.json");
         let mut targets = targets(
@@ -688,9 +690,10 @@ pub(crate) mod tests {
     #[test]
     fn a_changed_saved_profile_re_targets_to_the_new_display() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner();
         let dir = temp_dir("profile-change");
         let profiles = dir.join("display-profiles.json");
+        let (owner, ops) =
+            fake_owner_with(|| {}, &shared, ProfileStore::at(Some(profiles.clone())));
         let mut targets = targets(
             &shared,
             &owner,
@@ -728,7 +731,7 @@ pub(crate) mod tests {
     #[test]
     fn a_long_gap_between_generations_keeps_the_display_until_the_session_ends() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner_following(&shared);
+        let (owner, ops) = fake_owner(&shared);
         let settings = || {
             Box::new(MemorySettings {
                 next: Some(SettingsFile {
@@ -763,6 +766,59 @@ pub(crate) mod tests {
         assert!(gone.elapsed() >= crate::virtual_display::MIN_GRACE);
     }
 
+    #[test]
+    fn a_pass_that_saw_another_device_saves_nothing_for_it() {
+        // The owner's live session is the Duo's; a capture pass snapshotted
+        // an iPad that is no longer (or not yet) the live session.
+        let live = SharedControl::new(0, 15_000_000);
+        let seen = SharedControl::new(0, 15_000_000);
+        let dir = temp_dir("stale-device");
+        let path = dir.join("display-profiles.json");
+        let (owner, ops) = fake_owner(&live);
+        connect(&live, 0xd0, (2670, 1878));
+        connect(&seen, 0x1a, (1668, 2420));
+        let mut stale = targets(
+            &seen,
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            }),
+            FakeLister::listed(),
+        );
+        stale.profiles = ProfileStore::at(Some(path.clone()));
+        // No display for the live device yet: the stale pass mirrors and
+        // makes nothing.
+        assert_eq!(stale.display(Instant::now()), MAIN);
+        assert!(ops.try_recv().is_err());
+        // The live device's own pass makes its display.
+        let mut current = targets(
+            &live,
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            }),
+            FakeLister::listed(),
+        );
+        current.profiles = ProfileStore::at(Some(path.clone()));
+        let id = current.display(Instant::now());
+        assert_ne!(id, MAIN);
+        // The stale pass gets that same display, and saves its profile for
+        // the Duo it was made for, never for the iPad.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(stale.display(Instant::now()), id);
+        let mut saved = ProfileStore::at(Some(path));
+        assert_eq!(saved.get(0x1a), None);
+        assert_eq!(
+            saved.get(0xd0).map(|p| (p.width_px, p.height_px)),
+            Some((2670, 1878))
+        );
+        assert!(matches!(
+            ops.try_iter().collect::<Vec<_>>()[..],
+            [Op::Create(_)]
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Writes settings the way the host does: a temporary file, renamed.
     pub(crate) fn write_settings(path: &std::path::Path, settings: &SettingsFile) {
         let tmp = path.with_extension("json.tmp");
@@ -777,14 +833,15 @@ pub(crate) mod tests {
         write_settings(&settings_path, &enabled());
         let user_path = settings_path.clone();
         // The user turns second screen off while the display is being made.
+        let shared = SharedControl::new(0, 15_000_000);
         let (owner, ops) = fake_owner_with(
             move || {
                 std::thread::sleep(Duration::from_millis(20));
                 write_settings(&user_path, &SettingsFile::default());
             },
-            || true,
+            &shared,
+            ProfileStore::at(None),
         );
-        let shared = SharedControl::new(0, 15_000_000);
         let mut targets = Targets::new(
             shared.clone(),
             &owner,
@@ -829,7 +886,7 @@ pub(crate) mod tests {
         };
         write_settings(&path, &valid(30, true));
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner(&shared);
         let mut targets = Targets::new(
             shared.clone(),
             &owner,
@@ -891,7 +948,7 @@ pub(crate) mod tests {
     #[test]
     fn turning_second_screen_off_while_running_mirrors_and_removes_the_display() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner(&shared);
         let mut targets = targets(
             &shared,
             &owner,
@@ -971,7 +1028,7 @@ pub(crate) mod tests {
     #[test]
     fn a_new_display_is_captured_once_screencapturekit_lists_it() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, _ops) = fake_owner();
+        let (owner, _ops) = fake_owner(&shared);
         let lister = FakeLister::after(Some(3));
         let checks = lister.checks.clone();
         let mut targets = targets(
@@ -999,7 +1056,7 @@ pub(crate) mod tests {
     fn a_slow_lister_reaches_the_mirror_fallback_in_four_seconds_with_heartbeats() {
         let shared = SharedControl::new(0, 15_000_000);
         let machine = crate::supervisor::Machine::new(1);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner(&shared);
         // Every call takes 10 s, longer than the 3 s watchdog.
         let lister = Scripted {
             delay: Duration::from_secs(10),
@@ -1046,7 +1103,7 @@ pub(crate) mod tests {
     #[test]
     fn a_display_screencapturekit_never_lists_falls_back_to_mirroring_and_is_kept() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, ops) = fake_owner();
+        let (owner, ops) = fake_owner(&shared);
         let lister = Scripted::default();
         let beats = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut targets = scripted_targets(&shared, &owner, &lister, beats);
@@ -1093,7 +1150,7 @@ pub(crate) mod tests {
     #[test]
     fn a_stream_that_cannot_find_the_virtual_display_mirrors_instead_of_failing() {
         let shared = SharedControl::new(0, 15_000_000);
-        let (owner, _ops) = fake_owner();
+        let (owner, _ops) = fake_owner(&shared);
         let mut targets = targets(
             &shared,
             &owner,
