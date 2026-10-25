@@ -169,8 +169,16 @@ final class DuoFoldTests: XCTestCase {
         let label = fill ? "Show the whole picture" : "Fill the screen"
         let after = app.buttons.matching(NSPredicate(format: "identifier == 'display.pictureFit' AND label == %@", label)).firstMatch
         let control = app.buttons["display.pictureFit"]
+        let relay = app.otherElements["display.relay"]
         for _ in 0..<3 where !after.exists {
-            if !control.exists { app.otherElements["display.relay"].tap(withNumberOfTaps: 1, numberOfTouches: 3) }
+            if !control.exists {
+                // A three-finger tap brings the HUD back. XCUIElement's own
+                // misses on the inner screen, so it goes as touch offsets do.
+                let window = interfaceSize(app)
+                let fingers = [-60.0, 0, 60].map { NSValue(cgPoint: CGPoint(x: window.width / 2 + $0, y: window.height / 2)) }
+                var error: NSString?
+                XCTAssertTrue(EMTapFingersFromElement(relay, fingers, &error), error as String? ?? "", file: file, line: line)
+            }
             if control.waitForExistence(timeout: 5) && !after.exists { control.tap() }
             _ = after.waitForExistence(timeout: 5)
         }
