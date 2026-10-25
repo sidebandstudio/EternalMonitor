@@ -320,6 +320,8 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
+        #[cfg(target_os = "macos")]
+        CaptureBlock::ScreenRecordingDenied,
     ];
     assert!(capture_block_notice(None, true).is_none());
     let mut titles = Vec::new();

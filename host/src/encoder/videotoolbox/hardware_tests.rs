@@ -1247,6 +1247,8 @@ fn run_loop_with_bitrate_increase(
             data: Arc::new(frame.clone()),
             width,
             height,
+            #[cfg(target_os = "macos")]
+            surface: None,
         });
     }
     eprintln!(

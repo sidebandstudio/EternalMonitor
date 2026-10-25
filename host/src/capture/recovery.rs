@@ -28,6 +28,10 @@ pub enum CaptureBlock {
     TooManyCaptureApps,
     /// The Windows session is disconnected or remote.
     SessionDisconnected,
+    /// macOS: Screen Recording is off for EternalMonitor. It stays off
+    /// until the user turns it on in System Settings.
+    #[cfg(target_os = "macos")]
+    ScreenRecordingDenied,
 }
 
 impl CaptureBlock {

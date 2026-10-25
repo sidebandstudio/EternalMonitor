@@ -99,6 +99,8 @@ pub fn run_capture_loop(
             data,
             width,
             height,
+            #[cfg(target_os = "macos")]
+            surface: None,
         });
 
         next_deadline += frame_budget;

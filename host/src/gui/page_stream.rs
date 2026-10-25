@@ -700,6 +700,12 @@ pub(super) fn capture_block_notice(
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
         ),
+        #[cfg(target_os = "macos")]
+        CaptureBlock::ScreenRecordingDenied => (
+            Icon::Lock,
+            "Screen Recording is off for EternalMonitor",
+            "Open System Settings > Privacy & Security > Screen & System Audio Recording and turn on EternalMonitor. Then quit EternalMonitor and open it again.",
+        ),
     })
 }
 

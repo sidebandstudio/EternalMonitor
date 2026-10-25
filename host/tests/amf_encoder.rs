@@ -156,6 +156,8 @@ fn run_stage(
             data: Arc::new(data),
             width,
             height,
+            #[cfg(target_os = "macos")]
+            surface: None,
         });
         std::thread::sleep(FRAME_INTERVAL);
     }

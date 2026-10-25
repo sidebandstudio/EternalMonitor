@@ -58,13 +58,30 @@ core-foundation = "0.10"
 # CGEvent input (input/mac/cg.rs) and the private CGVirtualDisplay
 # (virtual_display/mac.rs). Same versions as the Mac spikes.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+# ScreenCaptureKit capture (capture/sck).
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "dispatch2",
+    "objc2-core-foundation",
+    "objc2-core-media",
+    "objc2-core-graphics",
+    "SCError",
+    "SCShareableContent",
+    "SCStream",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
     "CGDirectDisplay",
     "CGDisplayConfiguration",
+    "CGDisplayStream",
     "CGError",
+    "CGWindow",
     "libc",
     "CGEvent",
     "CGEventSource",

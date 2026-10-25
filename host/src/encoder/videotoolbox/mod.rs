@@ -354,7 +354,7 @@ pub(super) fn run_encode_loop(
                 return Err("injected encoder fault (ETERNAL_FAULT_ENCODER_AFTER)".into());
             }
         }
-        if raw_frame.data.is_empty() {
+        if raw_frame.data.is_empty() && raw_frame.surface.is_none() {
             warn!(
                 frame = raw_frame.frame_number,
                 "Skipping frame with empty data"
@@ -485,12 +485,21 @@ pub(super) fn run_encode_loop(
             captured: raw_frame.timestamp,
             frame_number: raw_frame.frame_number,
         };
-        let result = open.encode_bgra(
-            &raw_frame.data,
-            raw_frame.width as usize * 4,
-            info,
-            force_keyframe,
-        );
+        let result = match &raw_frame.surface {
+            // ScreenCaptureKit's 420v buffer goes in as is.
+            Some(surface) => {
+                // SAFETY: a valid CVPixelBuffer; `retained_raw` hands over a
+                // +1 reference that `PixelBuffer` releases.
+                let buffer = unsafe { session::PixelBuffer::from_owned(surface.retained_raw()) };
+                open.encode_pixel_buffer(&buffer, info, force_keyframe)
+            }
+            None => open.encode_bgra(
+                &raw_frame.data,
+                raw_frame.width as usize * 4,
+                info,
+                force_keyframe,
+            ),
+        };
         // The frame is in the session's own buffer now: recycle capture's.
         drop(raw_frame.data);
         match result {

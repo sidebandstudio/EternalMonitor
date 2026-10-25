@@ -21,6 +21,8 @@ use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
 pub mod dxgi;
 pub mod recovery;
+#[cfg(target_os = "macos")]
+pub mod sck;
 pub mod synthetic;
 pub(crate) mod timing;
 
@@ -33,7 +35,7 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 /// With nobody connected the cached picture is refreshed this often, so a new
@@ -42,7 +44,7 @@ pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 pub(crate) const IDLE_REFRESH: Duration = Duration::from_secs(1);
 
 /// What the capture loop does with a frame it acquired.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FrameUse {
     /// Read it back and hand it to the encoder.
@@ -58,13 +60,13 @@ pub(crate) enum FrameUse {
 /// DXGI reports a change only once, so a dropped frame left the cache stale
 /// until the desktop changed again. Every acquired frame is read back. The
 /// first one is published so the encoder opens before an iPad arrives.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) struct IdleGate {
     published_once: bool,
     last_refresh: Option<Instant>,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 impl IdleGate {
     pub(crate) fn new() -> Self {
         Self {
@@ -75,6 +77,7 @@ impl IdleGate {
 
     /// How long to wait before the next acquire. Changes made meanwhile stay
     /// pending in DXGI, so the next acquire returns the latest desktop.
+    #[cfg(any(windows, test))]
     pub(crate) fn wait_before_acquire(&self, watching: bool, now: Instant) -> Duration {
         match self.last_refresh {
             Some(at) if !watching && self.published_once => {
@@ -121,6 +124,10 @@ pub struct RawFrame {
     pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    /// ScreenCaptureKit's own buffer, for the direct VideoToolbox encoder
+    /// to take without a copy. `data` is empty when this is set.
+    #[cfg(target_os = "macos")]
+    pub surface: Option<sck::Surface>,
 }
 
 /// Latest-wins handoff from capture to encoder: a 1-deep mailbox. Publishing
@@ -296,7 +303,7 @@ fn wait_for_virtual_output(
 
 /// These timestamps measure stage liveness, not produced video. During the
 /// bounded driver attach wait, neither capture nor encode can produce a frame.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
     use std::sync::atomic::Ordering;
     shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
@@ -310,7 +317,7 @@ fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
 /// for 17458ms with a client connected", or "encoder silent while capture
 /// advances" right after the first keepalive) and restarted the pipeline
 /// under the new viewer. 0.3.1 had the same race on a static desktop.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn idle_heartbeat(shared: &SharedControl, now_ms: u64) {
     startup_heartbeat(shared, now_ms);
 }
