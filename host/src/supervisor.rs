@@ -333,6 +333,8 @@ pub fn run(
             Effect::StopPipeline => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                #[cfg(target_os = "macos")]
+                crate::capture::stream_stopped();
             }
             Effect::Restart | Effect::Start => {
                 shared.stop();

@@ -97,13 +97,36 @@ where
     Ok((owner, view))
 }
 
-/// Second screen was turned off: remove its display now. Starts nothing if
-/// no display was ever made.
-pub(super) fn second_screen_off() {
+/// Second screen was turned off, by capture or from the window: remove its
+/// display now, whether or not capture is running. Starts nothing if no
+/// display was ever made.
+pub fn second_screen_off() {
     if let Some(Some(owner)) = OWNER.get() {
-        if let Err(error) = owner.want(off()) {
-            warn!(%error, "The second-screen display did not go away");
-        }
+        turn_off(owner);
+    }
+}
+
+fn turn_off(owner: &DisplayOwner) {
+    if let Err(error) = owner.want(off()) {
+        warn!(%error, "The second-screen display did not go away");
+    }
+}
+
+/// The stream was stopped (Stop, or the supervisor giving up): remove the
+/// display now rather than after the grace period. With the transport
+/// down no device can come back within it, the stopped transport never
+/// ends the session, and a display nobody sees would keep the user's
+/// windows on it. Starting the stream again makes a new one, which macOS
+/// puts back where the user arranged it.
+pub fn stream_stopped() {
+    if let Some(Some(owner)) = OWNER.get() {
+        remove_for_stop(owner);
+    }
+}
+
+fn remove_for_stop(owner: &DisplayOwner) {
+    if let Err(error) = owner.release() {
+        warn!(%error, "The second-screen display did not go away when the stream stopped");
     }
 }
 
@@ -1049,6 +1072,77 @@ pub(crate) mod tests {
             "{ops:?}"
         );
     }
+    /// Stop ends capture, and the stopped transport never ends the session,
+    /// so no capture pass or grace period would remove the display.
+    fn connect_capture_then_stop(
+        shared: &SharedControl,
+        owner: &DisplayOwner,
+        ops: &mpsc::Receiver<Op>,
+    ) -> u32 {
+        connect(shared, 0xd0, (2670, 1878));
+        let mut capture = targets(
+            shared,
+            owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            }),
+            FakeLister::listed(),
+        );
+        let id = capture.display(Instant::now());
+        assert_ne!(id, MAIN);
+        assert!(matches!(
+            ops.try_iter().collect::<Vec<_>>()[..],
+            [Op::Create(_)]
+        ));
+        drop(capture);
+        shared.stop();
+        assert!(
+            shared.client_connected(),
+            "a stopped transport keeps the session"
+        );
+        id
+    }
+
+    #[test]
+    fn switching_second_screen_off_while_stopped_removes_the_display() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        let id = connect_capture_then_stop(&shared, &owner, &ops);
+        // The window's switch, with nothing capturing.
+        turn_off(&owner);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
+    }
+
+    #[test]
+    fn stopping_the_stream_removes_the_display_at_once_and_for_good() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        let id = connect_capture_then_stop(&shared, &owner, &ops);
+        let stopped = Instant::now();
+        remove_for_stop(&owner);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
+        assert!(stopped.elapsed() < crate::virtual_display::MIN_GRACE);
+        // Past the grace period the session still reads active, and the
+        // owner, polling it, brings nothing back.
+        std::thread::sleep(crate::virtual_display::MIN_GRACE + Duration::from_secs(1));
+        assert!(shared.client_connected());
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), []);
+        // Starting again makes a new display.
+        let mut capture = targets(
+            &shared,
+            &owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            }),
+            FakeLister::listed(),
+        );
+        assert_ne!(capture.display(Instant::now()), MAIN);
+        assert!(matches!(
+            ops.try_iter().collect::<Vec<_>>()[..],
+            [Op::Create(_)]
+        ));
+    }
+
     /// A lister whose answer can change, which can be slow, and which
     /// records how many calls ever ran at once.
     #[derive(Clone, Default)]
