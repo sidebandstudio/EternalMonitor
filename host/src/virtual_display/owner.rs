@@ -28,6 +28,12 @@ enum Request {
     Release {
         reply: mpsc::Sender<Result<(), DisplayError>>,
     },
+    /// Second screen off, if `current` still says so when the owner gets
+    /// to it.
+    Off {
+        current: Box<dyn FnOnce() -> bool + Send>,
+        reply: mpsc::Sender<Result<bool, DisplayError>>,
+    },
 }
 
 pub struct DisplayOwner {
@@ -100,6 +106,20 @@ impl DisplayOwner {
                             };
                             let _ = reply.send(result);
                         }
+                        Some(Request::Off { current, reply }) => {
+                            let result = match &mut keeper {
+                                Ok(keeper) if current() => keeper
+                                    .serve(session.as_ref(), Some(Want::off()), Instant::now())
+                                    .expect("a request is answered")
+                                    .map(|_| true),
+                                Ok(_) => {
+                                    tracing::info!("A second-screen off request was overtaken; keeping the display");
+                                    Ok(false)
+                                }
+                                Err(_) => Ok(false),
+                            };
+                            let _ = reply.send(result);
+                        }
                         Some(Request::Release { reply }) => {
                             let result = match &mut keeper {
                                 Ok(keeper) => keeper.release(),
@@ -139,6 +159,21 @@ impl DisplayOwner {
     /// `Keeper::serve`); `None` to mirror.
     pub fn want(&self, want: Want) -> Result<Option<VirtualDisplay>, DisplayError> {
         self.ask(|reply| Request::Want { want, reply })
+    }
+
+    /// Second screen was switched off at some point: remove the display,
+    /// but only if `current`, asked on the owner thread just before, says
+    /// that switch is still the latest. A request that waited while the
+    /// user switched on again (and a newer display was made) is ignored.
+    /// Returns whether it applied.
+    pub fn off_if_current(
+        &self,
+        current: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<bool, DisplayError> {
+        self.ask(|reply| Request::Off {
+            current: Box::new(current),
+            reply,
+        })
     }
 
     /// Removes the display now: the host is quitting.

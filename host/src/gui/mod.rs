@@ -659,7 +659,8 @@ impl AnalyzerApp {
     /// value on disk over; this is the one place the window changes it.
     /// Off removes the display at once, running or not (a stopped stream
     /// has no capture pass to do it), on its own thread so the window never
-    /// waits for macOS. A running stream restarts: capture picks the
+    /// waits for macOS. Each change is numbered, so an off request still on
+    /// its way when the user switches on again is ignored. A running stream restarts: capture picks the
     /// display for a new generation, and the device reconnects by itself.
     #[cfg(target_os = "macos")]
     fn set_mac_second_screen(&mut self, on: bool, running: bool) {
@@ -667,6 +668,7 @@ impl AnalyzerApp {
             return;
         }
         self.settings_mac_second_screen = on;
+        let revision = crate::capture::second_screen_switched();
         let mut file = self.settings_file();
         file.mac_second_screen = on;
         file.save();
@@ -674,7 +676,7 @@ impl AnalyzerApp {
         if !on {
             if let Err(error) = std::thread::Builder::new()
                 .name("second-screen-off".into())
-                .spawn(crate::capture::second_screen_off)
+                .spawn(move || crate::capture::second_screen_switched_off(revision))
             {
                 warn!(%error, "Could not remove the second-screen display");
             }

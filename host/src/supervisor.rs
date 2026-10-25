@@ -84,14 +84,34 @@ pub enum SupervisorState {
     ShutDown,
 }
 
+/// Why the pipeline stops. Anything that outlives a generation (the Mac
+/// host's second-screen display) is kept through an automatic restart and
+/// let go only when streaming is really over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The user stopped streaming.
+    User,
+    /// A stage failed; a restart follows after the backoff.
+    Recovering,
+    /// Too many failures: no restart until a manual Start.
+    GaveUp,
+}
+
+impl StopReason {
+    /// Whether streaming is over until the user starts it again.
+    pub fn ends_streaming(self) -> bool {
+        matches!(self, Self::User | Self::GaveUp)
+    }
+}
+
 /// What the runtime loop must do after an event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
     None,
     /// Join the current pipeline (bounded) and spawn a fresh generation.
     Restart,
-    /// Join the current pipeline; do not respawn.
-    StopPipeline,
+    /// Join the current pipeline; do not respawn now.
+    StopPipeline(StopReason),
     /// Spawn a fresh generation (from Stopped/Failed).
     Start,
     /// Join and exit the supervisor loop.
@@ -130,7 +150,7 @@ impl Machine {
             SupervisorCommand::Stop => match self.state {
                 SupervisorState::Running { .. } | SupervisorState::BackingOff { .. } => {
                     self.state = SupervisorState::Stopped;
-                    Effect::StopPipeline
+                    Effect::StopPipeline(StopReason::User)
                 }
                 _ => Effect::None,
             },
@@ -200,7 +220,7 @@ impl Machine {
             );
             error!("{message} — giving up until a manual Start");
             self.state = SupervisorState::Failed { reason: message };
-            return Effect::StopPipeline;
+            return Effect::StopPipeline(StopReason::GaveUp);
         }
         self.restarts.push(now);
         self.attempt += 1;
@@ -218,7 +238,7 @@ impl Machine {
             until: now + backoff,
             attempt: self.attempt,
         };
-        Effect::StopPipeline
+        Effect::StopPipeline(StopReason::Recovering)
     }
 
     /// Called on ticks while backing off; returns Start when the wait is over.
@@ -330,11 +350,13 @@ pub fn run(
 
         match effect {
             Effect::None => {}
-            Effect::StopPipeline => {
+            Effect::StopPipeline(reason) => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
                 #[cfg(target_os = "macos")]
-                crate::capture::stream_stopped();
+                crate::capture::stream_stopped(reason);
+                #[cfg(not(target_os = "macos"))]
+                let _ = reason;
             }
             Effect::Restart | Effect::Start => {
                 shared.stop();
@@ -536,7 +558,7 @@ mod tests {
                 &StageOutcome::Failed("encoder failed".into()),
                 Instant::now()
             ),
-            Effect::StopPipeline
+            Effect::StopPipeline(StopReason::Recovering)
         );
         assert!(matches!(
             machine.state,
@@ -593,7 +615,7 @@ mod tests {
         let t0 = Instant::now();
 
         let effect = machine.on_stage_exit(1, Stage::Capture, &failed("dxgi died"), t0);
-        assert_eq!(effect, Effect::StopPipeline);
+        assert_eq!(effect, Effect::StopPipeline(StopReason::Recovering));
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
 
         // Before the backoff elapses: no start.
@@ -629,7 +651,11 @@ mod tests {
         for i in 0..STORM_LIMIT {
             let at = t0 + Duration::from_secs(i as u64 * 5);
             let effect = machine.on_stage_exit(generation, Stage::Encoder, &failed("boom"), at);
-            assert_eq!(effect, Effect::StopPipeline, "failure {i}");
+            assert_eq!(
+                effect,
+                Effect::StopPipeline(StopReason::Recovering),
+                "failure {i}"
+            );
             generation += 1;
             machine.note_started(generation);
         }
@@ -640,7 +666,7 @@ mod tests {
             &failed("boom"),
             t0 + Duration::from_secs(30),
         );
-        assert_eq!(effect, Effect::StopPipeline);
+        assert_eq!(effect, Effect::StopPipeline(StopReason::GaveUp));
         assert!(matches!(machine.state, SupervisorState::Failed { .. }));
 
         // Ticks do nothing in Failed; a manual Start recovers.
@@ -653,7 +679,7 @@ mod tests {
         let mut machine = Machine::new(1);
         assert_eq!(
             machine.on_command(&SupervisorCommand::Stop),
-            Effect::StopPipeline
+            Effect::StopPipeline(StopReason::User)
         );
         assert!(matches!(machine.state, SupervisorState::Stopped));
         // Failures while stopped are ignored (they're the pipeline winding down).
@@ -668,7 +694,7 @@ mod tests {
     fn wedge_detection_restarts() {
         let mut machine = Machine::new(1);
         let effect = machine.on_wedged("no frames for 5s", Instant::now());
-        assert_eq!(effect, Effect::StopPipeline);
+        assert_eq!(effect, Effect::StopPipeline(StopReason::Recovering));
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
     }
 
@@ -698,7 +724,7 @@ mod tests {
             &failed("one more"),
             t0 + STORM_WINDOW + Duration::from_secs(1),
         );
-        assert_eq!(effect, Effect::StopPipeline);
+        assert_eq!(effect, Effect::StopPipeline(StopReason::Recovering));
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
     }
 }

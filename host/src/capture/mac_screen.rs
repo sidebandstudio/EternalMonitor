@@ -17,6 +17,7 @@
 //! recording, as on every non-Windows host.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -28,6 +29,7 @@ use super::FrameSlot;
 use crate::control::SharedControl;
 use crate::display_profile::{ClientScreen, ProfileIo, ProfileStore, ProfileView};
 use crate::settings::SettingsFile;
+use crate::supervisor::StopReason;
 use crate::virtual_display::mac::{CgVirtualDisplays, ModeChange};
 use crate::virtual_display::owner::DisplayOwner;
 use crate::virtual_display::{LiveClient, SecondScreenStatus, Want};
@@ -97,44 +99,60 @@ where
     Ok((owner, view))
 }
 
-/// Second screen was turned off, by capture or from the window: remove its
-/// display now, whether or not capture is running. Starts nothing if no
-/// display was ever made.
+/// Second screen is off for a new generation: remove its display now.
+/// Starts nothing if no display was ever made.
 pub fn second_screen_off() {
     if let Some(Some(owner)) = OWNER.get() {
-        turn_off(owner);
+        if let Err(error) = owner.want(Want::off()) {
+            warn!(%error, "The second-screen display did not go away");
+        }
     }
 }
 
-fn turn_off(owner: &DisplayOwner) {
-    if let Err(error) = owner.want(off()) {
+/// Every change of the window's Second screen switch, numbered.
+static SWITCH_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// The window's switch changed; returns this change's revision.
+pub fn second_screen_switched() -> u64 {
+    SWITCH_REVISION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// The window's switch went off at `revision`: remove the display at once,
+/// whether or not capture is running (a stopped stream has no capture pass
+/// to do it). The owner applies it only if the switch hasn't changed since,
+/// so a request that waited while the user switched back on, and a newer
+/// display was made, leaves that display alone.
+pub fn second_screen_switched_off(revision: u64) {
+    if let Some(Some(owner)) = OWNER.get() {
+        switched_off(owner, &SWITCH_REVISION, revision);
+    }
+}
+
+fn switched_off(owner: &DisplayOwner, revisions: &'static AtomicU64, revision: u64) {
+    if let Err(error) = owner.off_if_current(move || revisions.load(Ordering::SeqCst) == revision) {
         warn!(%error, "The second-screen display did not go away");
     }
 }
 
-/// The stream was stopped (Stop, or the supervisor giving up): remove the
-/// display now rather than after the grace period. With the transport
-/// down no device can come back within it, the stopped transport never
-/// ends the session, and a display nobody sees would keep the user's
-/// windows on it. Starting the stream again makes a new one, which macOS
-/// puts back where the user arranged it.
-pub fn stream_stopped() {
+/// The pipeline stopped. An automatic restart (`StopReason::Recovering`)
+/// keeps the display, so the user's windows stay where they are. When
+/// streaming is over (Stop, or the supervisor giving up) it goes at once
+/// rather than after the grace period: with the transport down no device
+/// can come back within it, the stopped transport never ends the session,
+/// and a display nobody sees would keep the user's windows on it. Starting
+/// again makes a new one, which macOS puts back where the user arranged it.
+pub fn stream_stopped(reason: StopReason) {
     if let Some(Some(owner)) = OWNER.get() {
-        remove_for_stop(owner);
+        after_stop(owner, reason);
     }
 }
 
-fn remove_for_stop(owner: &DisplayOwner) {
+fn after_stop(owner: &DisplayOwner, reason: StopReason) {
+    if !reason.ends_streaming() {
+        return;
+    }
     if let Err(error) = owner.release() {
         warn!(%error, "The second-screen display did not go away when the stream stopped");
-    }
-}
-
-fn off() -> Want {
-    Want {
-        enabled: false,
-        grace: Duration::ZERO,
-        device: None,
     }
 }
 
@@ -385,7 +403,7 @@ impl<'a> Targets<'a> {
         if !self.settings.mac_second_screen {
             // Turned off while running: remove the display now and mirror
             // until the next generation goes back to the synthetic source.
-            if let Err(error) = self.owner.want(off()) {
+            if let Err(error) = self.owner.want(Want::off()) {
                 warn!(%error, "The second-screen display did not go away");
             }
             self.set_status(SecondScreenStatus::Off);
@@ -491,7 +509,7 @@ impl DisplayChoice for Fixed {
 pub(crate) mod tests {
     use super::*;
     use crate::virtual_display::fake::{FakeDisplays, Op};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
 
     pub(crate) const MAIN: u32 = 1;
@@ -1109,7 +1127,41 @@ pub(crate) mod tests {
         let (owner, ops) = fake_owner(&shared);
         let id = connect_capture_then_stop(&shared, &owner, &ops);
         // The window's switch, with nothing capturing.
-        turn_off(&owner);
+        static REVISIONS: AtomicU64 = AtomicU64::new(0);
+        let off = REVISIONS.fetch_add(1, Ordering::SeqCst) + 1;
+        switched_off(&owner, &REVISIONS, off);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
+    }
+
+    #[test]
+    fn an_off_request_overtaken_by_switching_on_keeps_the_new_display() {
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        static REVISIONS: AtomicU64 = AtomicU64::new(0);
+        let next = || REVISIONS.fetch_add(1, Ordering::SeqCst) + 1;
+        // Off (revision 1); its worker is slow to reach the owner.
+        let off = next();
+        // On (revision 2), and Start: capture selects a display.
+        let _on = next();
+        connect(&shared, 0xd0, (2670, 1878));
+        let id = capture_again(&shared, &owner);
+        assert_ne!(id, MAIN);
+        assert!(matches!(
+            ops.try_iter().collect::<Vec<_>>()[..],
+            [Op::Create(_)]
+        ));
+        // Revision 1's request arrives at last: overtaken, it changes nothing.
+        assert_eq!(
+            owner.off_if_current(move || REVISIONS.load(Ordering::SeqCst) == off),
+            Ok(false)
+        );
+        switched_off(&owner, &REVISIONS, off);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), []);
+        assert_eq!(capture_again(&shared, &owner), id, "the same display");
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), []);
+        // The latest switch off still applies.
+        let latest = next();
+        switched_off(&owner, &REVISIONS, latest);
         assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
     }
 
@@ -1119,7 +1171,7 @@ pub(crate) mod tests {
         let (owner, ops) = fake_owner(&shared);
         let id = connect_capture_then_stop(&shared, &owner, &ops);
         let stopped = Instant::now();
-        remove_for_stop(&owner);
+        after_stop(&owner, StopReason::User);
         assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
         assert!(stopped.elapsed() < crate::virtual_display::MIN_GRACE);
         // Past the grace period the session still reads active, and the
@@ -1141,6 +1193,98 @@ pub(crate) mod tests {
             ops.try_iter().collect::<Vec<_>>()[..],
             [Op::Create(_)]
         ));
+    }
+
+    /// The supervisor's effect, applied as its runtime loop applies it.
+    fn apply(owner: &DisplayOwner, effect: crate::supervisor::Effect) {
+        if let crate::supervisor::Effect::StopPipeline(reason) = effect {
+            after_stop(owner, reason);
+        }
+    }
+
+    fn capture_again(shared: &SharedControl, owner: &DisplayOwner) -> u32 {
+        let mut capture = targets(
+            shared,
+            owner,
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            }),
+            FakeLister::listed(),
+        );
+        capture.display(Instant::now())
+    }
+
+    #[test]
+    fn an_automatic_restart_keeps_the_display_and_its_id() {
+        use crate::supervisor::{Effect, Machine, Stage, StageOutcome, StopReason};
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        let id = connect_capture_then_stop(&shared, &owner, &ops);
+        let mut machine = Machine::new(1);
+        let failed = Instant::now();
+        let effect = machine.on_stage_exit(
+            1,
+            Stage::Encoder,
+            &StageOutcome::Failed("encoder failed".into()),
+            failed,
+        );
+        assert_eq!(effect, Effect::StopPipeline(StopReason::Recovering));
+        apply(&owner, effect);
+        assert_eq!(
+            machine.on_tick(failed + Duration::from_secs(1)),
+            Effect::Start
+        );
+        machine.note_started(2);
+        assert_eq!(capture_again(&shared, &owner), id);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [], "kept, not remade");
+    }
+
+    #[test]
+    fn stopping_from_the_window_removes_the_display() {
+        use crate::control::SupervisorCommand;
+        use crate::supervisor::{Effect, Machine, StopReason};
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        let id = connect_capture_then_stop(&shared, &owner, &ops);
+        let effect = Machine::new(1).on_command(&SupervisorCommand::Stop);
+        assert_eq!(effect, Effect::StopPipeline(StopReason::User));
+        apply(&owner, effect);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
+    }
+
+    #[test]
+    fn giving_up_after_repeated_failures_removes_the_display() {
+        use crate::supervisor::{Effect, Machine, Stage, StageOutcome, StopReason};
+        let shared = SharedControl::new(0, 15_000_000);
+        let (owner, ops) = fake_owner(&shared);
+        let id = connect_capture_then_stop(&shared, &owner, &ops);
+        let mut machine = Machine::new(1);
+        let start = Instant::now();
+        let mut generation = 1;
+        let reason = loop {
+            let at = start + Duration::from_secs(generation);
+            let effect = machine.on_stage_exit(
+                generation,
+                Stage::Capture,
+                &StageOutcome::Failed("capture failed".into()),
+                at,
+            );
+            let Effect::StopPipeline(reason) = effect else {
+                panic!("{effect:?}");
+            };
+            apply(&owner, effect);
+            if reason == StopReason::GaveUp {
+                break reason;
+            }
+            assert_eq!(reason, StopReason::Recovering);
+            // Each automatic restart finds the same display.
+            assert_eq!(ops.try_iter().collect::<Vec<_>>(), []);
+            assert_eq!(capture_again(&shared, &owner), id);
+            generation += 1;
+            machine.note_started(generation);
+        };
+        assert_eq!(reason, StopReason::GaveUp);
+        assert_eq!(ops.try_iter().collect::<Vec<_>>(), [Op::Remove(id)]);
     }
 
     /// A lister whose answer can change, which can be slow, and which

@@ -235,6 +235,17 @@ pub struct Want {
     pub device: Option<u64>,
 }
 
+impl Want {
+    /// Second screen off: remove the display now.
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            grace: Duration::ZERO,
+            device: None,
+        }
+    }
+}
+
 /// The shortest grace period; a setting below this, including 0, is
 /// raised to it, so a session that drops for a moment keeps its display.
 pub const MIN_GRACE: Duration = Duration::from_secs(5);

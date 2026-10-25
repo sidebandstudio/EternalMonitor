@@ -24,7 +24,8 @@ pub mod dxgi;
 mod mac_screen;
 #[cfg(target_os = "macos")]
 pub use mac_screen::{
-    release_at_quit as release_second_screen_at_quit, second_screen_off, stream_stopped,
+    release_at_quit as release_second_screen_at_quit, second_screen_switched,
+    second_screen_switched_off, stream_stopped,
 };
 pub mod recovery;
 #[cfg(target_os = "macos")]
