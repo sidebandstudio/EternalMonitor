@@ -10,7 +10,8 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{DisplayError, Keeper, LiveClient, Served, VirtualDisplayManager, Want};
+use super::{DisplayError, Keeper, LiveClient, VirtualDisplay, VirtualDisplayManager, Want};
+use crate::display_profile::DisplayProfile;
 
 /// Covers a recreation: removal (2 s) and creation (3 s) with margin.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -22,7 +23,7 @@ const PRESENCE_POLL: Duration = Duration::from_millis(500);
 enum Request {
     Want {
         want: Want,
-        reply: mpsc::Sender<Result<Option<Served>, DisplayError>>,
+        reply: mpsc::Sender<Result<Option<VirtualDisplay>, DisplayError>>,
     },
     Release {
         reply: mpsc::Sender<Result<(), DisplayError>>,
@@ -44,9 +45,14 @@ impl DisplayOwner {
     /// otherwise), and requests only carry a device hint. It removes a
     /// display whose session has been gone for the grace period, whether or
     /// not anything asks.
+    ///
+    /// `save_first` saves the default profile of a device that has none,
+    /// without replacing one saved meanwhile. It is the only profile write
+    /// the owner makes, and capture makes none.
     pub fn spawn<M, F>(
         make: F,
         mut live: impl FnMut() -> Option<LiveClient> + Send + 'static,
+        save_first: impl FnMut(u64, DisplayProfile) + Send + 'static,
     ) -> std::io::Result<Self>
     where
         M: VirtualDisplayManager + 'static,
@@ -56,7 +62,8 @@ impl DisplayOwner {
         std::thread::Builder::new()
             .name("display-owner".into())
             .spawn(move || {
-                let mut keeper = make().map(Keeper::new);
+                let mut keeper =
+                    make().map(|manager| Keeper::new(manager).saving_first_profiles(save_first));
                 if let Err(error) = &keeper {
                     tracing::warn!(%error, "Second-screen displays are unavailable");
                 }
@@ -117,9 +124,9 @@ impl DisplayOwner {
         answer.recv_timeout(REPLY_TIMEOUT).map_err(|_| gone())?
     }
 
-    /// The display to capture now, for the live session, and its device
-    /// (see `Keeper::serve`); `None` to mirror.
-    pub fn want(&self, want: Want) -> Result<Option<Served>, DisplayError> {
+    /// The display to capture now, for the live session (see
+    /// `Keeper::serve`); `None` to mirror.
+    pub fn want(&self, want: Want) -> Result<Option<VirtualDisplay>, DisplayError> {
         self.ask(|reply| Request::Want { want, reply })
     }
 
@@ -165,24 +172,24 @@ mod tests {
         fn create(
             &mut self,
             spec: &super::super::DisplaySpec,
-        ) -> Result<super::super::VirtualDisplay, DisplayError> {
+        ) -> Result<VirtualDisplay, DisplayError> {
             let _ = self.1.send(Op::Create(spec.clone()));
             self.0.create(spec)
         }
         fn change_mode(
             &mut self,
-            display: &super::super::VirtualDisplay,
+            display: &VirtualDisplay,
             profile: crate::display_profile::DisplayProfile,
-        ) -> Result<super::super::VirtualDisplay, DisplayError> {
+        ) -> Result<VirtualDisplay, DisplayError> {
             self.0.change_mode(display, profile)
         }
-        fn remove(&mut self, display: &super::super::VirtualDisplay) -> Result<(), DisplayError> {
+        fn remove(&mut self, display: &VirtualDisplay) -> Result<(), DisplayError> {
             let _ = self.1.send(Op::Remove(display.id));
             self.0.remove(display)
         }
         fn bounds(
             &self,
-            display: &super::super::VirtualDisplay,
+            display: &VirtualDisplay,
         ) -> Option<crate::input::mac::display::DisplayBounds> {
             self.0.bounds(display)
         }
@@ -194,6 +201,7 @@ mod tests {
         let owner = DisplayOwner::spawn(
             move || Ok(Reporting(FakeDisplays::default(), ops_tx)),
             move || session.lock().unwrap().clone(),
+            |_, _| {},
         )
         .unwrap();
         (owner, ops)
@@ -204,7 +212,6 @@ mod tests {
         let (owner, ops) = owner(Arc::new(Mutex::new(Some(duo()))));
         let grace = Duration::from_secs(60);
         let first = owner.want(want(true, grace)).unwrap().unwrap();
-        assert_eq!(first.device_id, DUO);
         // A pass that saw no client keeps capturing the same display.
         assert_eq!(owner.want(want(false, grace)), Ok(Some(first)));
         assert_eq!(owner.want(want(true, grace)), Ok(Some(first)));
@@ -212,7 +219,7 @@ mod tests {
         owner.release().unwrap();
         let history: Vec<_> = ops.try_iter().collect();
         assert_eq!(history.len(), 2, "one create, one remove: {history:?}");
-        assert_eq!(history[1], Op::Remove(first.display.id));
+        assert_eq!(history[1], Op::Remove(first.id));
     }
 
     #[test]
@@ -236,7 +243,7 @@ mod tests {
         *session.lock().unwrap() = None;
         assert_eq!(
             ops.recv_timeout(Duration::from_secs(10)),
-            Ok(Op::Remove(first.display.id))
+            Ok(Op::Remove(first.id))
         );
         assert!(gone.elapsed() >= super::super::MIN_GRACE);
     }
@@ -263,6 +270,7 @@ mod tests {
                 Err(DisplayError::Unavailable("no CGVirtualDisplay".into()))
             },
             || Some(duo()),
+            |_, _| {},
         )
         .unwrap();
         for _ in 0..2 {

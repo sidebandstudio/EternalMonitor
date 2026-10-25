@@ -136,13 +136,11 @@ impl<M: VirtualDisplayManager> SecondScreen<M> {
     }
 
     /// The active display and the device it was made for.
-    pub fn active_for(&self) -> Option<Served> {
+    pub fn active_for(&self) -> Option<(u64, VirtualDisplay)> {
         self.active
-            .map(|(device_id, display)| Served { device_id, display })
     }
 
-    /// The display for `client`, made or reused, and the profile it uses
-    /// (for the caller to save). A device that reconnects keeps its display
+    /// The display for `client`, made or reused. A device that reconnects keeps its display
     /// whatever screen it reports now, so a Duo's fold never resizes it.
     /// Only a different saved profile changes it: a new refresh rate is a
     /// mode change, and a new size replaces the display.
@@ -236,14 +234,6 @@ pub struct Want {
     pub device: Option<u64>,
 }
 
-/// A display and the device it was made for, so the caller saves the
-/// profile for the device of the display it actually got.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Served {
-    pub device_id: u64,
-    pub display: VirtualDisplay,
-}
-
 /// The shortest grace period; a setting below this, including 0, is
 /// raised to it, so a session that drops for a moment keeps its display.
 pub const MIN_GRACE: Duration = Duration::from_secs(5);
@@ -267,6 +257,9 @@ pub struct Keeper<M: VirtualDisplayManager> {
     /// it is connected.
     gone_since: Option<Instant>,
     grace: Duration,
+    /// Saves the default profile of a device seen for the first time,
+    /// never replacing a saved one.
+    save_first: Box<dyn FnMut(u64, DisplayProfile)>,
 }
 
 impl<M: VirtualDisplayManager> Keeper<M> {
@@ -275,7 +268,19 @@ impl<M: VirtualDisplayManager> Keeper<M> {
             screen: SecondScreen::new(manager),
             gone_since: None,
             grace: MIN_GRACE,
+            save_first: Box::new(|_, _| {}),
         }
+    }
+
+    /// Saves, through `save`, the profile a device with no saved profile
+    /// gets the first time its own request is served. Nothing else writes
+    /// profiles: a saved one changes only by an explicit edit.
+    pub fn saving_first_profiles(
+        mut self,
+        save: impl FnMut(u64, DisplayProfile) + 'static,
+    ) -> Self {
+        self.save_first = Box::new(save);
+        self
     }
 
     /// One turn of the display owner, the single source of truth for
@@ -289,7 +294,7 @@ impl<M: VirtualDisplayManager> Keeper<M> {
         live: Option<&LiveClient>,
         want: Option<Want>,
         now: Instant,
-    ) -> Option<Result<Option<Served>, DisplayError>> {
+    ) -> Option<Result<Option<VirtualDisplay>, DisplayError>> {
         self.observe(live.is_some(), now);
         if let Err(error) = self.expire(now) {
             tracing::warn!(%error, "The second-screen display did not go away");
@@ -304,12 +309,13 @@ impl<M: VirtualDisplayManager> Keeper<M> {
     /// the current state: the live device's display, or the one kept for a
     /// session that ended less than the grace period ago, or mirror (the
     /// next pass, which sees the live device, gets its display). No request
-    /// expires the display: only `observe` and `expire` do.
+    /// expires the display: only `observe` and `expire` do. Only a matching
+    /// request for a device with no saved profile saves one, its default.
     fn answer(
         &mut self,
         want: Want,
         live: Option<&LiveClient>,
-    ) -> Result<Option<Served>, DisplayError> {
+    ) -> Result<Option<VirtualDisplay>, DisplayError> {
         self.grace = want.grace.max(MIN_GRACE);
         if !want.enabled {
             if self.screen.active().is_some() {
@@ -325,10 +331,10 @@ impl<M: VirtualDisplayManager> Keeper<M> {
                     .screen
                     .ensure(live.client, &live.device_name, live.saved)?;
                 self.gone_since = None;
-                Ok(Some(Served {
-                    device_id: live.client.device_id,
-                    display,
-                }))
+                if live.saved.is_none() {
+                    (self.save_first)(live.client.device_id, display.profile);
+                }
+                Ok(Some(display))
             }
             Some(live) => {
                 if want.device.is_some() {
@@ -337,9 +343,11 @@ impl<M: VirtualDisplayManager> Keeper<M> {
                         "A capture request for another device is stale; changing nothing"
                     );
                 }
-                Ok(current.filter(|served| served.device_id == live.client.device_id))
+                Ok(current
+                    .filter(|(device_id, _)| *device_id == live.client.device_id)
+                    .map(|(_, display)| display))
             }
-            None => Ok(current),
+            None => Ok(current.map(|(_, display)| display)),
         }
     }
 
@@ -643,10 +651,7 @@ mod tests {
         want: Want,
         now: Instant,
     ) -> Result<Option<VirtualDisplay>, DisplayError> {
-        keeper
-            .serve(live, Some(want), now)
-            .unwrap()
-            .map(|served| served.map(|served| served.display))
+        keeper.serve(live, Some(want), now).unwrap()
     }
 
     fn removals(keeper: &Keeper<FakeDisplays>) -> usize {
@@ -858,13 +863,7 @@ mod tests {
         // 3. A disconnects and B reconnects before that request arrives.
         // 4. It arrives with B live: nothing changes, B keeps its display.
         let answer = keeper.serve(Some(&b), Some(stale), t + Duration::from_secs(2));
-        assert_eq!(
-            answer,
-            Some(Ok(Some(Served {
-                device_id: DUO,
-                display
-            })))
-        );
+        assert_eq!(answer, Some(Ok(Some(display))));
         assert_eq!(
             keeper.screen.manager.ops.len(),
             1,
@@ -983,6 +982,101 @@ mod tests {
         keeper.release().unwrap();
         assert_eq!(removals(&keeper), 2);
         assert!(keeper.screen.manager.online.is_empty());
+    }
+
+    /// The first-time profile saves a keeper made.
+    type Saves = std::rc::Rc<std::cell::RefCell<Vec<(u64, DisplayProfile)>>>;
+
+    /// A keeper that records the first-time profile saves it makes.
+    fn recording() -> (Keeper<FakeDisplays>, Saves) {
+        let saves = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = saves.clone();
+        let keeper = Keeper::new(FakeDisplays::default())
+            .saving_first_profiles(move |device, profile| log.borrow_mut().push((device, profile)));
+        (keeper, saves)
+    }
+
+    #[test]
+    fn only_a_new_devices_own_request_saves_a_profile_and_only_its_default() {
+        let start = Instant::now();
+        let (mut keeper, saves) = recording();
+        let mut b = live(client(DUO, (1398, 2034)));
+        let a = live(client(IPAD, (1668, 2420)));
+        // Passes that do not match B's live session save nothing.
+        turn(&mut keeper, Some(&b), saw(None, GRACE), start).unwrap();
+        turn(&mut keeper, Some(&b), saw(Some(&a.client), GRACE), start).unwrap();
+        turn(&mut keeper, None, saw(Some(&b.client), GRACE), start).unwrap();
+        assert!(saves.borrow().is_empty());
+        // B's own first pass saves its default, the inner size.
+        let display = turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(*saves.borrow(), [(DUO, display.profile)]);
+        assert_eq!(
+            (display.profile.width_px, display.profile.height_px),
+            (2670, 1878)
+        );
+        // From then on the store has it: nothing more is saved, by matching
+        // passes, stale ones, or idle ones during grace.
+        b.saved = Some(display.profile);
+        turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), start).unwrap();
+        turn(&mut keeper, Some(&b), saw(Some(&a.client), GRACE), start).unwrap();
+        keeper.serve(None, None, start + Duration::from_secs(1));
+        assert_eq!(
+            turn(
+                &mut keeper,
+                None,
+                saw(None, GRACE),
+                start + Duration::from_secs(2)
+            ),
+            Ok(Some(display))
+        );
+        assert_eq!(saves.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_profile_survives_a_stale_request_and_applies_on_the_next_matching_pass() {
+        // Sol's round 6, variant 1.
+        let start = Instant::now();
+        let (mut keeper, saves) = recording();
+        let inner = profile_for(client(DUO, (2670, 1878)), None);
+        let mut b = LiveClient {
+            saved: Some(inner),
+            ..live(client(DUO, (2670, 1878)))
+        };
+        let a = live(client(IPAD, (1668, 2420)));
+        let first = turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), start)
+            .unwrap()
+            .unwrap();
+        // B's saved profile is edited to the outer size; a stale A request
+        // reaches the owner first and gets B's display, unchanged.
+        let outer = DisplayProfile {
+            width_px: 2034,
+            height_px: 1398,
+            ..inner
+        };
+        b.saved = Some(outer);
+        let t = start + Duration::from_secs(1);
+        assert_eq!(
+            turn(&mut keeper, Some(&b), saw(Some(&a.client), GRACE), t),
+            Ok(Some(first))
+        );
+        assert_eq!(keeper.screen.manager.ops.len(), 1);
+        // B's next own pass recreates at the edited size, once.
+        let second = turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), t)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.profile, outer);
+        assert_eq!(keeper.screen.manager.ops[1], Op::Remove(first.id));
+        assert_eq!(
+            turn(&mut keeper, Some(&b), saw(Some(&b.client), GRACE), t),
+            Ok(Some(second))
+        );
+        assert_eq!(keeper.screen.manager.ops.len(), 3);
+        assert!(
+            saves.borrow().is_empty(),
+            "a saved profile is never written"
+        );
     }
 
     #[test]

@@ -63,9 +63,13 @@ fn owner(shared: &SharedControl) -> Option<&'static DisplayOwner> {
         .get_or_init(|| {
             let shared = shared.clone();
             let mut profiles = ProfileStore::beside_settings();
+            let mut first_saves = ProfileStore::beside_settings();
             DisplayOwner::spawn(
                 || CgVirtualDisplays::new(ModeChange::Recreate),
                 move || live_client(&shared, &mut profiles),
+                move |device_id, profile| {
+                    first_saves.save_if_absent(device_id, profile);
+                },
             )
             .inspect_err(|error| warn!(%error, "Could not start the display owner"))
             .ok()
@@ -153,7 +157,7 @@ pub(super) fn second_screen_wanted() -> bool {
 }
 
 /// `settings.json`, re-read when its modification time moves. Capture only
-/// reads it; the profiles it saves go to their own file. A read or parse
+/// reads it; the display profiles are in their own file. A read or parse
 /// failure keeps the last valid settings and leaves that modification time
 /// unseen, so the next pass tries again.
 struct SettingsOnDisk {
@@ -216,7 +220,6 @@ pub(crate) struct Targets<'a> {
     owner: &'a DisplayOwner,
     settings_source: Box<dyn SettingsSource + 'a>,
     settings: SettingsFile,
-    profiles: ProfileStore,
     listing: Worker<bool>,
     /// Stamps the stage's heartbeats while the capture thread waits.
     heartbeat: Box<dyn FnMut() + 'a>,
@@ -232,7 +235,6 @@ impl<'a> Targets<'a> {
         shared: SharedControl,
         owner: &'a DisplayOwner,
         settings_source: Box<dyn SettingsSource + 'a>,
-        profiles: ProfileStore,
         lister: Box<dyn ContentLister>,
         heartbeat: Box<dyn FnMut() + 'a>,
         main: u32,
@@ -242,7 +244,6 @@ impl<'a> Targets<'a> {
             owner,
             settings_source,
             settings: SettingsFile::default(),
-            profiles,
             listing: Worker::spawn("display-listing", move |display_id| {
                 lister.is_listed(display_id).unwrap_or(false)
             }),
@@ -355,9 +356,9 @@ impl<'a> Targets<'a> {
             device: live_info(&self.shared).map(|info| info.device_id),
         };
         match self.owner.want(want) {
-            Ok(Some(served)) => {
-                let second = served.display;
-                self.profiles.remember(served.device_id, second.profile);
+            // Capture never writes profiles: the owner saves a new
+            // device's default, and only explicit edits change one.
+            Ok(Some(second)) => {
                 if self.capturable(second.id, now) {
                     self.set_status(SecondScreenStatus::Active(second.id));
                     second.id
@@ -420,7 +421,6 @@ pub(super) fn run_capture_loop(
         shared.clone(),
         owner,
         Box::new(SettingsOnDisk::live()),
-        ProfileStore::beside_settings(),
         Box::new(ScreenCaptureKitLister),
         // A bounded wait inside one capture pass: keep the stage alive.
         Box::new(move || {
@@ -531,17 +531,18 @@ pub(crate) mod tests {
     }
 
     /// A display owner over fake displays that reports what it does. It
-    /// follows `shared`'s session as the host does, with no saved profiles.
+    /// follows `shared`'s session as the host does, with no profile store.
     pub(crate) fn fake_owner(shared: &SharedControl) -> (DisplayOwner, mpsc::Receiver<Op>) {
-        fake_owner_with(|| {}, shared, ProfileStore::at(None))
+        fake_owner_with(|| {}, shared, None)
     }
 
-    /// The same, reading saved profiles from `profiles` and running
-    /// `during_create` while a display is being made.
+    /// The same, with its profile store at `profiles`, as the host's is
+    /// beside `settings.json`, running `during_create` while a display is
+    /// being made.
     pub(crate) fn fake_owner_with(
         during_create: impl Fn() + Send + 'static,
         shared: &SharedControl,
-        mut profiles: ProfileStore,
+        profiles: Option<PathBuf>,
     ) -> (DisplayOwner, mpsc::Receiver<Op>) {
         use crate::virtual_display::{DisplayError, DisplaySpec, VirtualDisplay};
         let (ops_tx, ops) = mpsc::channel();
@@ -575,7 +576,16 @@ pub(crate) mod tests {
         let shared = shared.clone();
         let owner = DisplayOwner::spawn(
             move || Ok(Reporting(FakeDisplays::default(), ops_tx, during_create)),
-            move || live_client(&shared, &mut profiles),
+            {
+                let mut profiles = ProfileStore::at(profiles.clone());
+                move || live_client(&shared, &mut profiles)
+            },
+            {
+                let mut first_saves = ProfileStore::at(profiles);
+                move |device_id, profile| {
+                    first_saves.save_if_absent(device_id, profile);
+                }
+            },
         )
         .expect("owner thread");
         (owner, ops)
@@ -618,7 +628,6 @@ pub(crate) mod tests {
             shared.clone(),
             owner,
             settings,
-            ProfileStore::at(None),
             Box::new(lister),
             Box::new(|| {}),
             MAIN,
@@ -642,9 +651,9 @@ pub(crate) mod tests {
         let shared = SharedControl::new(0, 15_000_000);
         let generation =
             crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-        let (owner, ops) = fake_owner(&shared);
         let dir = temp_dir("connect");
         let profiles = dir.join("display-profiles.json");
+        let (owner, ops) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
         let mut targets = targets(
             &shared,
             &owner,
@@ -653,7 +662,6 @@ pub(crate) mod tests {
             }),
             FakeLister::listed(),
         );
-        targets.profiles = ProfileStore::at(Some(profiles.clone()));
         let now = Instant::now();
         let mut answers = Vec::new();
         // Startup: no client, so the main display.
@@ -661,11 +669,25 @@ pub(crate) mod tests {
             answers.push(targets.display(now));
         }
         assert!(ops.try_recv().is_err(), "no display made without a client");
-        // The Duo connects, folded. The next pass captures its display.
+        // The Duo connects, folded. The next pass captures its display,
+        // and its default profile is saved, once: later passes find it.
         connect(&shared, 0xd0, (1398, 2034));
+        answers.push(targets.display(now));
+        let written = (
+            std::fs::read_to_string(&profiles).unwrap(),
+            std::fs::metadata(&profiles).unwrap().modified().unwrap(),
+        );
         for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(10));
             answers.push(targets.display(now));
         }
+        assert_eq!(
+            (
+                std::fs::read_to_string(&profiles).unwrap(),
+                std::fs::metadata(&profiles).unwrap().modified().unwrap(),
+            ),
+            written
+        );
         let Ok(Op::Create(spec)) = ops.try_recv() else {
             panic!("expected the display to be made")
         };
@@ -692,8 +714,7 @@ pub(crate) mod tests {
         let shared = SharedControl::new(0, 15_000_000);
         let dir = temp_dir("profile-change");
         let profiles = dir.join("display-profiles.json");
-        let (owner, ops) =
-            fake_owner_with(|| {}, &shared, ProfileStore::at(Some(profiles.clone())));
+        let (owner, ops) = fake_owner_with(|| {}, &shared, Some(profiles.clone()));
         let mut targets = targets(
             &shared,
             &owner,
@@ -702,22 +723,22 @@ pub(crate) mod tests {
             }),
             FakeLister::listed(),
         );
-        targets.profiles = ProfileStore::at(Some(profiles.clone()));
         connect(&shared, 0xd0, (2670, 1878));
         let now = Instant::now();
         let first = targets.display(now);
         // The outer size is saved for this device (the file's time moves).
         std::thread::sleep(Duration::from_millis(20));
-        assert!(ProfileStore::at(Some(profiles)).remember(
-            0xd0,
-            crate::display_profile::DisplayProfile {
-                width_px: 2034,
-                height_px: 1398,
-                refresh_hz: 120,
-                hidpi: true,
-            },
-        ));
+        let outer = crate::display_profile::DisplayProfile {
+            width_px: 2034,
+            height_px: 1398,
+            refresh_hz: 120,
+            hidpi: true,
+        };
+        assert!(ProfileStore::at(Some(profiles.clone())).remember(0xd0, outer));
         let second = targets.display(now);
+        assert_eq!(targets.display(now), second);
+        // The edit stands: nothing wrote the old size back.
+        assert_eq!(ProfileStore::at(Some(profiles)).get(0xd0), Some(outer));
         std::fs::remove_dir_all(dir).unwrap();
         assert_ne!(second, first);
         assert_ne!(second, MAIN);
@@ -766,56 +787,78 @@ pub(crate) mod tests {
         assert!(gone.elapsed() >= crate::virtual_display::MIN_GRACE);
     }
 
+    /// What is on disk, and when it was last written.
+    fn on_disk(path: &std::path::Path) -> (String, SystemTime) {
+        (
+            std::fs::read_to_string(path).unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    }
+
     #[test]
-    fn a_pass_that_saw_another_device_saves_nothing_for_it() {
-        // The owner's live session is the Duo's; a capture pass snapshotted
-        // an iPad that is no longer (or not yet) the live session.
+    fn stale_and_idle_passes_never_write_over_an_edited_profile() {
+        // Sol's round 6. The owner's live session is the Duo's (B); `seen`
+        // is what a stale capture pass snapshotted: an iPad (A).
         let live = SharedControl::new(0, 15_000_000);
         let seen = SharedControl::new(0, 15_000_000);
         let dir = temp_dir("stale-device");
         let path = dir.join("display-profiles.json");
-        let (owner, ops) = fake_owner(&live);
+        let (owner, ops) = fake_owner_with(|| {}, &live, Some(path.clone()));
+        let settings = || {
+            Box::new(MemorySettings {
+                next: Some(enabled()),
+            })
+        };
         connect(&live, 0xd0, (2670, 1878));
         connect(&seen, 0x1a, (1668, 2420));
-        let mut stale = targets(
-            &seen,
-            &owner,
-            Box::new(MemorySettings {
-                next: Some(enabled()),
-            }),
-            FakeLister::listed(),
-        );
-        stale.profiles = ProfileStore::at(Some(path.clone()));
-        // No display for the live device yet: the stale pass mirrors and
-        // makes nothing.
-        assert_eq!(stale.display(Instant::now()), MAIN);
-        assert!(ops.try_recv().is_err());
-        // The live device's own pass makes its display.
-        let mut current = targets(
-            &live,
-            &owner,
-            Box::new(MemorySettings {
-                next: Some(enabled()),
-            }),
-            FakeLister::listed(),
-        );
-        current.profiles = ProfileStore::at(Some(path.clone()));
-        let id = current.display(Instant::now());
-        assert_ne!(id, MAIN);
-        // The stale pass gets that same display, and saves its profile for
-        // the Duo it was made for, never for the iPad.
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(stale.display(Instant::now()), id);
-        let mut saved = ProfileStore::at(Some(path));
-        assert_eq!(saved.get(0x1a), None);
-        assert_eq!(
-            saved.get(0xd0).map(|p| (p.width_px, p.height_px)),
-            Some((2670, 1878))
-        );
+        let mut current = targets(&live, &owner, settings(), FakeLister::listed());
+        let mut stale = targets(&seen, &owner, settings(), FakeLister::listed());
+        let first = current.display(Instant::now());
+        assert_ne!(first, MAIN);
+        // 1. B's saved profile is edited to the outer size.
+        std::thread::sleep(Duration::from_millis(20));
+        let outer = crate::display_profile::DisplayProfile {
+            width_px: 2034,
+            height_px: 1398,
+            refresh_hz: 120,
+            hidpi: true,
+        };
+        assert!(ProfileStore::at(Some(path.clone())).remember(0xd0, outer));
+        let edited = on_disk(&path);
+        // 2. A stale A request arrives first: it gets B's display as it is,
+        //    and the store is not touched.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(stale.display(Instant::now()), first);
+        assert_eq!(on_disk(&path), edited);
+        // 3. B's session ends; an idle pass during grace keeps capturing
+        //    the kept display and does not touch the store either.
+        let _ = live
+            .session
+            .lock()
+            .link_lost(crate::transport::link::LinkId::Udp);
+        assert!(!live.client_connected());
+        for pass in [&mut current, &mut stale] {
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(pass.display(Instant::now()), first);
+        }
+        assert_eq!(on_disk(&path), edited);
         assert!(matches!(
             ops.try_iter().collect::<Vec<_>>()[..],
             [Op::Create(_)]
         ));
+        // 4. B reconnects: its next own pass recreates at the edited size.
+        connect(&live, 0xd0, (2670, 1878));
+        let second = current.display(Instant::now());
+        assert_ne!(second, first);
+        let ops: Vec<_> = ops.try_iter().collect();
+        assert!(
+            matches!(&ops[..], [Op::Remove(id), Op::Create(spec)] if *id == first && spec.profile == outer),
+            "{ops:?}"
+        );
+        let mut saved = ProfileStore::at(Some(path.clone()));
+        assert_eq!(saved.get(0xd0), Some(outer));
+        assert_eq!(saved.get(0x1a), None);
+        assert_eq!(on_disk(&path), edited);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -840,13 +883,12 @@ pub(crate) mod tests {
                 write_settings(&user_path, &SettingsFile::default());
             },
             &shared,
-            ProfileStore::at(None),
+            Some(dir.join("display-profiles.json")),
         );
         let mut targets = Targets::new(
             shared.clone(),
             &owner,
             Box::new(SettingsOnDisk::at(Some(settings_path.clone()))),
-            ProfileStore::at(Some(dir.join("display-profiles.json"))),
             Box::new(FakeLister::listed()),
             Box::new(|| {}),
             MAIN,
@@ -891,7 +933,6 @@ pub(crate) mod tests {
             shared.clone(),
             &owner,
             Box::new(SettingsOnDisk::at(Some(path.clone()))),
-            ProfileStore::at(None),
             Box::new(FakeLister::listed()),
             Box::new(|| {}),
             MAIN,
@@ -1004,7 +1045,6 @@ pub(crate) mod tests {
             Box::new(MemorySettings {
                 next: Some(enabled()),
             }),
-            ProfileStore::at(None),
             Box::new(lister.clone()),
             Box::new(move || {
                 beats.lock().push(Instant::now());

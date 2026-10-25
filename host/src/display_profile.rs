@@ -139,7 +139,9 @@ pub fn fit(content: (u32, u32), screen: (u32, u32), mode: FitMode) -> Placement 
 type Profiles = BTreeMap<String, DisplayProfile>;
 
 /// `display-profiles.json`: read when it changes, written atomically
-/// (temporary file, then rename). The capture path is its only writer.
+/// (temporary file, then rename). Only explicit edits change a saved
+/// profile ([`Self::remember`]); the display owner only adds one for a
+/// device seen for the first time ([`Self::save_if_absent`]).
 pub struct ProfileStore {
     path: Option<PathBuf>,
     cache: Profiles,
@@ -210,12 +212,27 @@ impl ProfileStore {
         self.cache.get(&key(device_id)).copied()
     }
 
-    /// Saves `profile` for a client device if it differs. Returns whether
-    /// it was written.
+    /// An explicit edit: saves `profile` for a client device if it
+    /// differs. Returns whether it was written.
     pub fn remember(&mut self, device_id: u64, profile: DisplayProfile) -> bool {
         if device_id == 0 || self.get(device_id) == Some(profile) {
             return false;
         }
+        self.write(device_id, profile, true)
+    }
+
+    /// Saves `profile` for a device that has no saved profile, never
+    /// replacing one: the file is read again under the write lock, and an
+    /// entry found there (saved since this store last read it) is kept.
+    /// Returns whether it was written.
+    pub fn save_if_absent(&mut self, device_id: u64, profile: DisplayProfile) -> bool {
+        if device_id == 0 || self.get(device_id).is_some() {
+            return false;
+        }
+        self.write(device_id, profile, false)
+    }
+
+    fn write(&mut self, device_id: u64, profile: DisplayProfile, replace: bool) -> bool {
         let Some(path) = self.path.clone() else {
             return false;
         };
@@ -228,6 +245,11 @@ impl ProfileStore {
                 return false;
             }
         };
+        if !replace && profiles.contains_key(&key(device_id)) {
+            self.cache = profiles;
+            self.seen = Some(modified(&path));
+            return false;
+        }
         profiles.insert(key(device_id), profile);
         let written = serde_json::to_string_pretty(&profiles)
             .map_err(|error| error.to_string())
@@ -398,6 +420,54 @@ mod tests {
         assert_eq!(reader.get(7), Some(ipad));
         assert!(!reader.remember(9, ipad));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"0123");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn racing_first_saves_for_a_device_keep_one_entry_and_never_overwrite() {
+        let dir = temp_dir("first-save");
+        let path = dir.join("display-profiles.json");
+        let profile = |width_px| DisplayProfile {
+            width_px,
+            height_px: 1878,
+            refresh_hz: 120,
+            hidpi: true,
+        };
+        // Two stores that both read the file before either saved.
+        let mut early = ProfileStore::at(Some(path.clone()));
+        let mut late = ProfileStore::at(Some(path.clone()));
+        assert_eq!((early.get(0xd0), late.get(0xd0)), (None, None));
+        assert!(early.save_if_absent(0xd0, profile(2670)));
+        assert!(!late.save_if_absent(0xd0, profile(2034)), "found on disk");
+        assert_eq!(late.get(0xd0), Some(profile(2670)));
+        // An explicit edit is never undone by a first-time save.
+        assert!(late.remember(0xd0, profile(2034)));
+        assert!(!early.save_if_absent(0xd0, profile(2670)));
+        assert_eq!(
+            ProfileStore::at(Some(path.clone())).get(0xd0),
+            Some(profile(2034))
+        );
+        // Many threads racing for a new device: exactly one writes.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let written: usize = (0..8u32)
+            .map(|n| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut store = ProfileStore::at(Some(path));
+                    assert_eq!(store.get(7), None);
+                    barrier.wait();
+                    store.save_if_absent(7, profile(2000 + n * 2))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| usize::from(racer.join().unwrap()))
+            .sum();
+        assert_eq!(written, 1);
+        let on_disk: Profiles =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 2);
+        assert_eq!(on_disk[&key(0xd0)], profile(2034));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
