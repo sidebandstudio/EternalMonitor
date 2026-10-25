@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The host runs with the hardened runtime and needs no exceptions or
+  entitlements. Each one it might seem to need, and why it doesn't:
+  - Network (com.apple.security.network.*): sandbox-only; the app is not
+    sandboxed, and the private CGVirtualDisplay API rules the sandbox out.
+    Local Network access is a privacy prompt (NSLocalNetworkUsageDescription).
+  - Screen Recording: a privacy grant (NSScreenCaptureUsageDescription), not
+    an entitlement.
+  - Microphone (com.apple.security.device.audio-input): there is no Mac audio
+    capture yet.
+  - com.apple.security.cs.disable-library-validation: every bundled dylib is
+    signed by the same team as the app, so library validation passes.
+  - com.apple.security.cs.allow-jit / allow-unsigned-executable-memory: no
+    code is generated at run time (FFmpeg, egui and wgpu don't).
+  - Accessibility, for posting input: a privacy grant too, and input is not
+    wired on the Mac yet.
+-->
+<plist version="1.0">
+<dict/>
+</plist>
