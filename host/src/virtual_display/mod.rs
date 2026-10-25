@@ -23,6 +23,8 @@
 pub mod mac;
 pub mod owner;
 
+use std::time::{Duration, Instant};
+
 use crate::display_profile::{profile_for, ClientScreen, DisplayProfile};
 use crate::input::mac::display::DisplayBounds;
 
@@ -135,8 +137,9 @@ impl<M: VirtualDisplayManager> SecondScreen<M> {
 
     /// The display for `client`, made or reused, and the profile it uses
     /// (for the caller to save). A device that reconnects keeps its display
-    /// whatever screen it reports now, so a Duo's fold never resizes it;
-    /// only a different saved profile changes its mode.
+    /// whatever screen it reports now, so a Duo's fold never resizes it.
+    /// Only a different saved profile changes it: a new refresh rate is a
+    /// mode change, and a new size replaces the display.
     pub fn ensure(
         &mut self,
         client: ClientScreen,
@@ -145,7 +148,12 @@ impl<M: VirtualDisplayManager> SecondScreen<M> {
     ) -> Result<VirtualDisplay, DisplayError> {
         let profile = profile_for(client, saved);
         if let Some((device_id, display)) = self.active {
-            if device_id == client.device_id {
+            let same_size = (
+                display.profile.width_px,
+                display.profile.height_px,
+                display.profile.hidpi,
+            ) == (profile.width_px, profile.height_px, profile.hidpi);
+            if device_id == client.device_id && same_size {
                 let display = if display.profile == profile {
                     display
                 } else {
@@ -177,6 +185,102 @@ impl<M: VirtualDisplayManager> SecondScreen<M> {
             Some((_, display)) => self.manager.remove(&display),
             None => Ok(()),
         }
+    }
+}
+
+/// A client asking for its display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    pub client: ClientScreen,
+    pub device_name: String,
+    pub saved: Option<DisplayProfile>,
+}
+
+/// What capture currently wants from the second screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Want {
+    /// `SettingsFile::mac_second_screen`.
+    pub enabled: bool,
+    /// The connected client, if one is.
+    pub client: Option<Wanted>,
+    /// How long a display outlives its client.
+    pub grace: Duration,
+}
+
+/// When a display goes away. A pipeline restart or a capture retry never
+/// removes it; only these do:
+/// - its client has been gone for the grace period;
+/// - second screen is turned off;
+/// - the device's profile changes size (`SecondScreen::ensure`), or
+///   another device takes over;
+/// - the host quits (`release`).
+///
+/// A client that reconnects within the grace period gets the same display,
+/// so its windows stay where they were.
+pub struct Keeper<M: VirtualDisplayManager> {
+    screen: SecondScreen<M>,
+    /// The last time a client was there for the active display.
+    last_present: Option<Instant>,
+    grace: Duration,
+}
+
+impl<M: VirtualDisplayManager> Keeper<M> {
+    pub fn new(manager: M) -> Self {
+        Self {
+            screen: SecondScreen::new(manager),
+            last_present: None,
+            grace: Duration::ZERO,
+        }
+    }
+
+    /// The display to capture: the client's, or the one kept for a client
+    /// that left less than the grace period ago. `None` means mirror.
+    pub fn want(
+        &mut self,
+        want: Want,
+        now: Instant,
+    ) -> Result<Option<VirtualDisplay>, DisplayError> {
+        self.grace = want.grace;
+        if !want.enabled {
+            if self.screen.active().is_some() {
+                tracing::info!("Second screen turned off; removing its display");
+            }
+            self.release()?;
+            return Ok(None);
+        }
+        if let Some(wanted) = want.client {
+            let display = self
+                .screen
+                .ensure(wanted.client, &wanted.device_name, wanted.saved)?;
+            self.last_present = Some(now);
+            return Ok(Some(display));
+        }
+        self.expire(now)?;
+        Ok(self.screen.active().copied())
+    }
+
+    /// Removes the display once its client has been gone for the grace
+    /// period. The owner calls this on its own timer too, so a display is
+    /// removed on time even while no pipeline runs.
+    pub fn expire(&mut self, now: Instant) -> Result<(), DisplayError> {
+        match self.expires_at() {
+            Some(at) if now >= at => {
+                tracing::info!(grace = ?self.grace, "Client gone for the grace period; removing its display");
+                self.release()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// When the active display will be removed if no client comes back.
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.screen.active()?;
+        self.last_present.map(|at| at + self.grace)
+    }
+
+    pub fn release(&mut self) -> Result<(), DisplayError> {
+        self.last_present = None;
+        self.screen.release()
     }
 }
 
@@ -328,11 +432,28 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_saved_profile_changes_the_mode_even_by_recreation() {
+    fn a_changed_saved_refresh_changes_the_mode_even_by_recreation() {
         let mut screen = SecondScreen::new(FakeDisplays {
             recreate_on_change: true,
             ..Default::default()
         });
+        let first = screen.ensure(client(DUO, (2670, 1878)), "", None).unwrap();
+        let at_60 = DisplayProfile {
+            refresh_hz: 60,
+            ..first.profile
+        };
+        let second = screen
+            .ensure(client(DUO, (2670, 1878)), "", Some(at_60))
+            .unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.profile, at_60);
+        assert_eq!(screen.active(), Some(&second));
+        assert_eq!(screen.manager.ops[1], Op::ChangeMode(first.id, at_60));
+    }
+
+    #[test]
+    fn a_saved_profile_of_another_size_replaces_the_display() {
+        let mut screen = SecondScreen::new(FakeDisplays::default());
         let first = screen.ensure(client(DUO, (2670, 1878)), "", None).unwrap();
         let outer = DisplayProfile {
             width_px: 2034,
@@ -345,8 +466,9 @@ mod tests {
             .unwrap();
         assert_ne!(second.id, first.id);
         assert_eq!(second.profile, outer);
-        assert_eq!(screen.active(), Some(&second));
-        assert_eq!(screen.manager.ops[1], Op::ChangeMode(first.id, outer));
+        assert_eq!(screen.manager.ops[1], Op::Remove(first.id));
+        assert!(matches!(screen.manager.ops[2], Op::Create(_)));
+        assert_eq!(screen.manager.online, [second]);
     }
 
     #[test]
@@ -396,6 +518,141 @@ mod tests {
         });
         screen.ensure(client(DUO, (2670, 1878)), "", None).unwrap();
         assert!(screen.ensure(client(7, (1668, 2420)), "", None).is_err());
+    }
+
+    const GRACE: Duration = Duration::from_secs(60);
+
+    fn want(client: Option<ClientScreen>) -> Want {
+        Want {
+            enabled: true,
+            client: client.map(|client| Wanted {
+                client,
+                device_name: "Duo".into(),
+                saved: None,
+            }),
+            grace: GRACE,
+        }
+    }
+
+    fn removals(keeper: &Keeper<FakeDisplays>) -> usize {
+        keeper
+            .screen
+            .manager
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Remove(_)))
+            .count()
+    }
+
+    #[test]
+    fn restarts_and_short_disconnects_keep_the_same_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let display = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        // The client drops; pipeline restarts and capture retries ask
+        // without a client for 59 s. The display stays and is captured.
+        for second in 1..60 {
+            let at = start + Duration::from_secs(second);
+            assert_eq!(keeper.want(want(None), at), Ok(Some(display)));
+            keeper.expire(at).unwrap();
+        }
+        // The client is back within the grace period: same display ID.
+        let back = keeper
+            .want(want(Some(duo)), start + Duration::from_secs(59))
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.id, display.id);
+        assert_eq!(removals(&keeper), 0);
+        assert_eq!(
+            keeper.screen.manager.ops.len(),
+            1,
+            "one create, nothing else"
+        );
+    }
+
+    #[test]
+    fn a_client_gone_for_the_grace_period_loses_its_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        keeper
+            .want(want(Some(client(DUO, (2670, 1878)))), start)
+            .unwrap();
+        assert_eq!(keeper.expires_at(), Some(start + GRACE));
+        // The owner's timer, with no request at all (no pipeline running).
+        keeper
+            .expire(start + GRACE - Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(removals(&keeper), 0);
+        keeper.expire(start + GRACE).unwrap();
+        assert_eq!(removals(&keeper), 1);
+        assert!(keeper.screen.manager.online.is_empty());
+        assert_eq!(keeper.expires_at(), None);
+        // A request without a client after that mirrors.
+        assert_eq!(keeper.want(want(None), start + GRACE * 2), Ok(None));
+        // A setting change shortens the grace for the next display.
+        let short = Want {
+            grace: Duration::from_secs(5),
+            ..want(Some(client(DUO, (2670, 1878))))
+        };
+        let later = start + GRACE * 3;
+        keeper.want(short.clone(), later).unwrap();
+        assert_eq!(
+            keeper.want(
+                Want {
+                    client: None,
+                    ..short
+                },
+                later + Duration::from_secs(5)
+            ),
+            Ok(None)
+        );
+        assert_eq!(removals(&keeper), 2);
+    }
+
+    #[test]
+    fn turning_second_screen_off_removes_the_display_at_once() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        keeper
+            .want(want(Some(client(DUO, (2670, 1878)))), start)
+            .unwrap();
+        let off = Want {
+            enabled: false,
+            ..want(Some(client(DUO, (2670, 1878))))
+        };
+        assert_eq!(keeper.want(off.clone(), start), Ok(None));
+        assert_eq!(removals(&keeper), 1);
+        // Off with nothing to remove is a no-op.
+        assert_eq!(keeper.want(off, start), Ok(None));
+        assert_eq!(removals(&keeper), 1);
+    }
+
+    #[test]
+    fn a_size_change_and_quitting_remove_the_display() {
+        let start = Instant::now();
+        let mut keeper = Keeper::new(FakeDisplays::default());
+        let duo = client(DUO, (2670, 1878));
+        let first = keeper.want(want(Some(duo)), start).unwrap().unwrap();
+        let outer = Want {
+            client: Some(Wanted {
+                client: duo,
+                device_name: "Duo".into(),
+                saved: Some(DisplayProfile {
+                    width_px: 2034,
+                    height_px: 1398,
+                    refresh_hz: 120,
+                    hidpi: true,
+                }),
+            }),
+            ..want(None)
+        };
+        let second = keeper.want(outer, start).unwrap().unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(removals(&keeper), 1);
+        keeper.release().unwrap();
+        assert_eq!(removals(&keeper), 2);
+        assert!(keeper.screen.manager.online.is_empty());
     }
 
     #[test]

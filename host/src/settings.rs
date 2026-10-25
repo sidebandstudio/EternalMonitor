@@ -65,6 +65,10 @@ pub struct SettingsFile {
     /// pattern, and nothing creates a display by itself.
     #[serde(default)]
     pub mac_second_screen: bool,
+    /// macOS: how long a second-screen display outlives its client, so a
+    /// short disconnect or restart leaves the user's windows where they are.
+    #[serde(default = "default_second_screen_grace_secs")]
+    pub mac_second_screen_grace_secs: u32,
 }
 
 fn default_true() -> bool {
@@ -73,6 +77,10 @@ fn default_true() -> bool {
 
 pub fn default_hevc_enabled() -> bool {
     cfg!(target_os = "macos")
+}
+
+fn default_second_screen_grace_secs() -> u32 {
+    60
 }
 
 fn default_max_dgram() -> u16 {
@@ -101,6 +109,7 @@ impl Default for SettingsFile {
             star_clicked: false,
             display_profiles: Default::default(),
             mac_second_screen: false,
+            mac_second_screen_grace_secs: default_second_screen_grace_secs(),
         }
     }
 }
@@ -327,6 +336,7 @@ mod tests {
         };
         settings.remember_display_profile(7, ipad);
         assert!(!settings.mac_second_screen, "off unless asked for");
+        assert_eq!(settings.mac_second_screen_grace_secs, 60);
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"0123456789abcdef\""), "{json}");
         let parsed: SettingsFile = serde_json::from_str(&json).unwrap();

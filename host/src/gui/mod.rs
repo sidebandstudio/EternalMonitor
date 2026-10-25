@@ -500,6 +500,7 @@ impl AnalyzerApp {
             star_clicked: self.star_clicked,
             display_profiles: on_disk.display_profiles,
             mac_second_screen: on_disk.mac_second_screen,
+            mac_second_screen_grace_secs: on_disk.mac_second_screen_grace_secs,
         };
         file.save();
     }

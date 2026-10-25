@@ -22,6 +22,8 @@ use crate::control::{CaptureTarget, VddStatus};
 pub mod dxgi;
 #[cfg(target_os = "macos")]
 mod mac_screen;
+#[cfg(target_os = "macos")]
+pub use mac_screen::release_at_quit as release_second_screen_at_quit;
 pub mod recovery;
 #[cfg(target_os = "macos")]
 pub mod sck;
@@ -619,6 +621,7 @@ fn run_platform_loop(
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested || !crate::settings::SettingsFile::load().mac_second_screen {
+        mac_screen::second_screen_off();
         synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
         mac_screen::run_capture_loop(slot, shared, generation, frame_number)

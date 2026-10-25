@@ -305,6 +305,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // EternalMonitor is actively using it. If it may still be on, the failure reporter
         // turns it off after this process exits.
         eternal_host::startup::display_off_at_quit(vdd::disable);
+        #[cfg(target_os = "macos")]
+        eternal_host::capture::release_second_screen_at_quit();
     };
     // A window error is saved first and shown after the cleanup, as a panic is.
     match window_error {
