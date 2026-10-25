@@ -169,6 +169,24 @@ fn run_encode_loop(
             }
         }
 
+        // ScreenCaptureKit frames carry only their pixel buffer, which the
+        // direct VideoToolbox encoder takes as is. This path takes BGRA.
+        #[cfg(target_os = "macos")]
+        let raw_frame = match raw_frame.surface.as_ref() {
+            Some(surface) if raw_frame.data.is_empty() => match surface.to_bgra() {
+                Ok(bgra) => crate::capture::RawFrame {
+                    data: std::sync::Arc::new(bgra),
+                    surface: None,
+                    ..raw_frame
+                },
+                Err(error) => {
+                    warn!(frame = raw_frame.frame_number, %error, "Skipping a capture frame the encoder cannot read");
+                    continue;
+                }
+            },
+            _ => raw_frame,
+        };
+
         if raw_frame.data.is_empty() {
             warn!(
                 frame = raw_frame.frame_number,

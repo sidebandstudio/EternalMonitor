@@ -231,7 +231,45 @@ mod surface_ffi {
     extern "C" {
         pub fn CVPixelBufferGetWidth(buffer: *mut c_void) -> usize;
         pub fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
+        pub fn CVPixelBufferGetPixelFormatType(buffer: *mut c_void) -> u32;
+        pub fn CVPixelBufferLockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+        pub fn CVPixelBufferUnlockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+        pub fn CVPixelBufferGetBaseAddress(buffer: *mut c_void) -> *mut u8;
+        pub fn CVPixelBufferGetBytesPerRow(buffer: *mut c_void) -> usize;
+        pub fn CVPixelBufferGetBaseAddressOfPlane(buffer: *mut c_void, plane: usize) -> *mut u8;
+        pub fn CVPixelBufferGetBytesPerRowOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+        pub fn CVPixelBufferCreate(
+            allocator: *const c_void,
+            width: usize,
+            height: usize,
+            format: u32,
+            attributes: *const c_void,
+            buffer: *mut *mut c_void,
+        ) -> i32;
     }
+    /// `kCVPixelBufferLock_ReadOnly`.
+    pub const LOCK_READ_ONLY: u64 = 1;
+}
+
+/// `kCVPixelFormatType_32BGRA`.
+pub const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+/// `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`.
+pub const PIXEL_FORMAT_420F: u32 = u32::from_be_bytes(*b"420f");
+
+/// One BT.709 YCbCr sample as BGRA, from video (16..235) or full range.
+fn bt709_to_bgra(y: u8, cb: u8, cr: u8, full_range: bool) -> [u8; 4] {
+    let (y, cb, cr) = (f32::from(y), f32::from(cb) - 128.0, f32::from(cr) - 128.0);
+    let (y, chroma) = if full_range {
+        (y, 1.0)
+    } else {
+        ((y - 16.0) * 255.0 / 219.0, 255.0 / 224.0)
+    };
+    let (cb, cr) = (cb * chroma, cr * chroma);
+    let r = y + 1.5748 * cr;
+    let g = y - 0.1873 * cb - 0.4681 * cr;
+    let b = y + 1.8556 * cb;
+    let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    [byte(b), byte(g), byte(r), 255]
 }
 
 // SAFETY: a CVPixelBuffer is a reference-counted CF object. Retain and
@@ -261,6 +299,119 @@ impl Surface {
         // SAFETY: valid for our lifetime; the caller owns the new reference.
         unsafe { surface_ffi::CFRetain(self.0.as_ptr()) };
         self.0.as_ptr()
+    }
+
+    /// The picture as packed BGRA, for an encoder that takes CPU frames
+    /// (the FFmpeg path). Copies BGRA buffers row by row and converts
+    /// ScreenCaptureKit's 420v (or 420f) with BT.709, the matrix capture
+    /// asks for.
+    pub fn to_bgra(&self) -> Result<Vec<u8>, String> {
+        use surface_ffi::*;
+        let raw = self.0.as_ptr();
+        let (width, height) = self.size();
+        let (w, h) = (width as usize, height as usize);
+        // SAFETY: a valid pixel buffer, locked read-only for the reads below
+        // and unlocked before returning; every read stays inside the rows
+        // and planes CoreVideo reports.
+        unsafe {
+            let format = CVPixelBufferGetPixelFormatType(raw);
+            if CVPixelBufferLockBaseAddress(raw, LOCK_READ_ONLY) != 0 {
+                return Err("could not lock the capture buffer".into());
+            }
+            let mut out = vec![0u8; w * h * 4];
+            let result = match format {
+                PIXEL_FORMAT_BGRA => {
+                    let base = CVPixelBufferGetBaseAddress(raw);
+                    let stride = CVPixelBufferGetBytesPerRow(raw);
+                    for row in 0..h {
+                        let src = std::slice::from_raw_parts(base.add(row * stride), w * 4);
+                        out[row * w * 4..(row + 1) * w * 4].copy_from_slice(src);
+                    }
+                    Ok(())
+                }
+                PIXEL_FORMAT_420V | PIXEL_FORMAT_420F => {
+                    let full_range = format == PIXEL_FORMAT_420F;
+                    let luma = CVPixelBufferGetBaseAddressOfPlane(raw, 0);
+                    let luma_stride = CVPixelBufferGetBytesPerRowOfPlane(raw, 0);
+                    let chroma = CVPixelBufferGetBaseAddressOfPlane(raw, 1);
+                    let chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(raw, 1);
+                    for row in 0..h {
+                        let y_row = std::slice::from_raw_parts(luma.add(row * luma_stride), w);
+                        let c_row = std::slice::from_raw_parts(
+                            chroma.add((row / 2) * chroma_stride),
+                            w.div_ceil(2) * 2,
+                        );
+                        let out_row = &mut out[row * w * 4..(row + 1) * w * 4];
+                        let (pixels, _) = out_row.as_chunks_mut::<4>();
+                        for (column, (&luma, pixel)) in
+                            y_row.iter().zip(pixels.iter_mut()).enumerate()
+                        {
+                            let pair = (column / 2) * 2;
+                            *pixel = bt709_to_bgra(luma, c_row[pair], c_row[pair + 1], full_range);
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(format!(
+                    "capture buffer format {:?} is not BGRA or 420v",
+                    other.to_be_bytes().map(char::from)
+                )),
+            };
+            CVPixelBufferUnlockBaseAddress(raw, LOCK_READ_ONLY);
+            result.map(|()| out)
+        }
+    }
+
+    /// A new BGRA pixel buffer holding `bgra` (tightly packed). Tests and
+    /// tools build capture-like frames with this.
+    #[doc(hidden)]
+    pub fn from_bgra(width: u32, height: u32, bgra: &[u8]) -> Option<Self> {
+        Self::filled(width, height, PIXEL_FORMAT_BGRA, |raw| {
+            // SAFETY: a locked BGRA buffer of this size.
+            unsafe {
+                let base = surface_ffi::CVPixelBufferGetBaseAddress(raw);
+                let stride = surface_ffi::CVPixelBufferGetBytesPerRow(raw);
+                let row_bytes = width as usize * 4;
+                for row in 0..height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        bgra[row * row_bytes..].as_ptr(),
+                        base.add(row * stride),
+                        row_bytes,
+                    );
+                }
+            }
+        })
+    }
+
+    fn filled(
+        width: u32,
+        height: u32,
+        format: u32,
+        fill: impl FnOnce(*mut std::ffi::c_void),
+    ) -> Option<Self> {
+        use surface_ffi::*;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: plain creation; the +1 result is owned by the Surface.
+        unsafe {
+            if CVPixelBufferCreate(
+                std::ptr::null(),
+                width as usize,
+                height as usize,
+                format,
+                std::ptr::null(),
+                &mut raw,
+            ) != 0
+            {
+                return None;
+            }
+            let surface = Self(std::ptr::NonNull::new(raw)?);
+            if CVPixelBufferLockBaseAddress(raw, 0) != 0 {
+                return None;
+            }
+            fill(raw);
+            CVPixelBufferUnlockBaseAddress(raw, 0);
+            Some(surface)
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -491,6 +642,61 @@ mod tests {
         );
         // Without a cached picture there is nothing to resend.
         assert_eq!(SparsePacing::new().keepalive_in(true, false, start), None);
+    }
+
+    /// A 420v buffer of one colour, as ScreenCaptureKit delivers.
+    fn nv12(width: u32, height: u32, (y, cb, cr): (u8, u8, u8)) -> Surface {
+        Surface::filled(width, height, PIXEL_FORMAT_420V, |raw| unsafe {
+            let luma = surface_ffi::CVPixelBufferGetBaseAddressOfPlane(raw, 0);
+            let luma_stride = surface_ffi::CVPixelBufferGetBytesPerRowOfPlane(raw, 0);
+            let chroma = surface_ffi::CVPixelBufferGetBaseAddressOfPlane(raw, 1);
+            let chroma_stride = surface_ffi::CVPixelBufferGetBytesPerRowOfPlane(raw, 1);
+            for row in 0..height as usize {
+                std::ptr::write_bytes(luma.add(row * luma_stride), y, width as usize);
+            }
+            for row in 0..(height as usize).div_ceil(2) {
+                for pair in 0..(width as usize).div_ceil(2) {
+                    *chroma.add(row * chroma_stride + pair * 2) = cb;
+                    *chroma.add(row * chroma_stride + pair * 2 + 1) = cr;
+                }
+            }
+        })
+        .expect("pixel buffer")
+    }
+
+    #[test]
+    fn bgra_buffers_copy_out_exactly_whatever_their_row_padding() {
+        // 37 px wide: CoreVideo pads each row past 148 bytes.
+        let (width, height) = (37, 5);
+        let bgra: Vec<u8> = (0..width * height * 4)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        let surface = Surface::from_bgra(width, height, &bgra).unwrap();
+        assert_eq!(surface.size(), (width, height));
+        assert_eq!(surface.to_bgra().unwrap(), bgra);
+    }
+
+    #[test]
+    fn video_range_420v_converts_with_bt709() {
+        for ((y, cb, cr), bgra) in [
+            ((16, 128, 128), [0, 0, 0, 255]),
+            ((235, 128, 128), [255, 255, 255, 255]),
+            // BT.709 red, green and blue at video range.
+            ((63, 102, 240), [0, 0, 255, 255]),
+            ((173, 42, 26), [0, 255, 0, 255]),
+            ((32, 240, 118), [255, 0, 0, 255]),
+        ] {
+            let pixels = nv12(6, 4, (y, cb, cr)).to_bgra().unwrap();
+            assert_eq!(pixels.len(), 6 * 4 * 4);
+            for pixel in pixels.chunks(4) {
+                for (got, want) in pixel.iter().zip(bgra) {
+                    assert!(
+                        got.abs_diff(want) <= 2,
+                        "{y},{cb},{cr}: {pixel:?} vs {bgra:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
