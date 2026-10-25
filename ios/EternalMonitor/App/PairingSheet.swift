@@ -10,6 +10,11 @@ struct PairingSheet: View {
     @State private var appeared = false
     // Counts wrong codes; each one shakes the field once.
     @State private var shakes: CGFloat = 0
+    // Where the number pad starts and the sheet's Pair button ends, in
+    // window points, and whether the pad covered the button.
+    @State private var keyboardTop = CGFloat.infinity
+    @State private var pairBottom: CGFloat = 0
+    @State private var pairCovered = false
 
     var body: some View {
         NavigationStack {
@@ -32,8 +37,8 @@ struct PairingSheet: View {
                         Text("Pair with your PC")
                             .font(.app(24, .semibold, relativeTo: .title2))
                             .foregroundStyle(Theme.text)
-                        // A phone in landscape: below the field is under the
-                        // number pad, so an error takes the instructions' place.
+                        // Below the field is under the number pad, so an
+                        // error takes the instructions' place.
                         if compact, let error = model.error {
                             errorRow(error)
                         } else {
@@ -92,6 +97,10 @@ struct PairingSheet: View {
                         .frame(maxWidth: 320)
                         .disabled(model.submitting || remaining > 0)
                         .accessibilityIdentifier("pairing.submit")
+                        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { bottom in
+                            pairBottom = bottom
+                            notePairCovered()
+                        }
                     }
 
                     Text("Can't see a code? Open EternalMonitor on the PC and look on the Stream page, or connect with a USB cable instead.")
@@ -121,7 +130,7 @@ struct PairingSheet: View {
                         .foregroundStyle(Theme.text)
                         .accessibilityIdentifier("pairing.cancel")
                 }
-                // A phone in landscape: the number pad covers the Pair button.
+                // The number pad covers the sheet's Pair button.
                 if compact {
                     ToolbarItem(placement: .confirmationAction) {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -145,12 +154,30 @@ struct PairingSheet: View {
                 focused = true
                 appeared = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+                keyboardTop = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)?.minY ?? .infinity
+                notePairCovered()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                keyboardTop = .infinity
+                pairCovered = false
+            }
+            // Folding, unfolding or rotating measures again. The pad changes
+            // only the height, so a change of width is one of those.
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { _ in pairCovered = false }
         }
         .presentationBackground(Theme.canvas)
     }
 
-    /// A phone in landscape.
-    private var compact: Bool { verticalSizeClass == .compact }
+    /// Once the pad covers Pair, the layout stays compact until the pad or
+    /// the sheet's size changes, so moving the error up can't switch it back.
+    private func notePairCovered() {
+        if UIDevice.current.userInterfaceIdiom == .phone && keyboardTop < pairBottom { pairCovered = true }
+    }
+
+    /// A phone in landscape, or a short one such as the folded iPhone Duo,
+    /// where the number pad covers the sheet's Pair button.
+    private var compact: Bool { verticalSizeClass == .compact || pairCovered }
 
     private func errorRow(_ error: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
