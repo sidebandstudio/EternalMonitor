@@ -32,6 +32,8 @@ enum Feedback {
         var pcVersion: String?
         /// "USB" or "Wi-Fi" while connected.
         var connection: String?
+        /// The diagnostics upload ID, which finds this iPad's rows.
+        var supportID: String? = nil
 
         @MainActor static func current(pcVersion: String?, connection: String?) -> Context {
             let info = Bundle.main.infoDictionary
@@ -41,7 +43,8 @@ enum Feedback {
                 systemVersion: UIDevice.current.systemVersion,
                 model: modelIdentifier(),
                 pcVersion: pcVersion,
-                connection: connection
+                connection: connection,
+                supportID: DiagnosticsUpload.shared.installationID
             )
         }
 
@@ -73,6 +76,9 @@ enum Feedback {
     /// report attached, the email says so first.
     static func body(_ kind: Kind, _ context: Context, attachesDiagnostics: Bool = false) -> String {
         var lines: [String] = []
+        if let supportID = context.supportID {
+            lines.append("Support ID: \(supportID)")
+        }
         if case .problem(let title) = kind {
             lines.append("Problem: \(title)")
         }

@@ -317,6 +317,7 @@ or an email to [hello@sideband.studio](mailto:hello@sideband.studio).
 Say what you tried, what you saw, your iPad model, and whether you used Wi-Fi or
 USB. On iPad, open **Settings → Support → Diagnostics**, then **Export diagnostics**
 for a text file or **Copy diagnostics**. Include both reports when possible.
+If you can't attach the report, copy the **Support ID** from the same screen into your message.
 
 Reports include Windows build, CPU, GPU and driver details; iPad hardware,
 iPadOS and app build; encoder/decoder setup, connection events and periodic

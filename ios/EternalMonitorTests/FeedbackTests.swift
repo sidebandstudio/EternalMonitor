@@ -39,6 +39,20 @@ final class FeedbackTests: XCTestCase {
         XCTAssertFalse(text.contains("Problem:"), text)
     }
 
+    func testTheSupportIDComesFirstInTheDetails() {
+        var withID = context
+        withID.supportID = "5A1E0C3B-7D2F-4E8A-9B6C-0F1D2E3A4B5C"
+        let body = Feedback.body(.problem("Your PC didn't answer"), withID)
+        XCTAssertTrue(body.contains("--\nSupport ID: 5A1E0C3B-7D2F-4E8A-9B6C-0F1D2E3A4B5C\nProblem: Your PC didn't answer\n"), body)
+    }
+
+    @MainActor
+    func testTheSupportIDIsTheDiagnosticsUploadID() {
+        let current = Feedback.Context.current(pcVersion: nil, connection: nil)
+        XCTAssertEqual(current.supportID, DiagnosticsUpload.shared.installationID)
+        XCTAssertEqual(UUID(uuidString: current.supportID ?? "")?.uuidString, current.supportID)
+    }
+
     func testAProblemCardNamesItsProblem() {
         let body = Feedback.body(.problem(ConnectionProblem.noReply(usb: false).title), context)
         XCTAssertTrue(body.contains("--\nProblem: Your PC didn't answer\nApp:"), body)

@@ -18,12 +18,33 @@ struct DiagnosticsView: View {
     @State private var preparing = false
     @State private var error: String?
     @State private var copied = false
+    @State private var supportIDCopied = false
+    private let supportID = DiagnosticsUpload.shared.installationID
     @AppStorage(DiagnosticsUpload.enabledKey) private var uploadEnabled = true
     @State private var uploadStatus = "Checking automatic upload"
 
 
     var body: some View {
         Form {
+            Section {
+                LabeledContent("Support ID") {
+                    Text(supportID)
+                        .font(.footnote.monospaced())
+                        .textSelection(.enabled)
+                }
+                .accessibilityIdentifier("diagnostics.supportID")
+                Button {
+                    UIPasteboard.general.string = supportID
+                    supportIDCopied = true
+                } label: {
+                    Label(supportIDCopied ? "Support ID copied" : "Copy Support ID", systemImage: "doc.on.doc")
+                }
+                .accessibilityIdentifier("diagnostics.copySupportID")
+            } footer: {
+                Text("Include this ID when you write to us, so we can find the diagnostics this iPad shared.")
+            }
+            .listRowBackground(Theme.surfaceRaised)
+
             Section {
                 Toggle("Automatically share diagnostics", isOn: $uploadEnabled)
                     .accessibilityIdentifier("diagnostics.automaticUpload")

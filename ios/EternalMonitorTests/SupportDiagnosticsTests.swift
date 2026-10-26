@@ -25,6 +25,10 @@ final class SupportDiagnosticsTests: XCTestCase {
         XCTAssertTrue(report.contains("VTDecodeFrame status=-12909"))
         XCTAssertTrue(report.contains("new launch"))
         XCTAssertTrue(report.contains("Storage error: none"))
+        // The Support ID is the upload's installation_id, near the top.
+        let header = report.components(separatedBy: "\n").prefix(2)
+        XCTAssertEqual(header.last, "Support ID: \(DiagnosticsUpload.shared.installationID)", report)
+        XCTAssertTrue(report.contains("installation_id=\(DiagnosticsUpload.shared.installationID);"))
         let export = try await second.export()
         XCTAssertTrue(try String(contentsOf: export).contains("VTDecodeFrame status=-12909"))
     }
