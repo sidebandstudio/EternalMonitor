@@ -13,33 +13,39 @@ function Reset-State {
             [pscustomobject]@{InstanceId='DISPLAY\MTT1337\1&2&3&UID256';HardwareIds=@('MONITOR\MTT1337');Problem=24;Status='Unknown';Inf='monitor.inf';Children=@()}
         ) }
 }
+function Find-Device($InstanceId) { $global:EMVddTestState.Devices | Where-Object InstanceId -eq $InstanceId }
+# Like the real cmdlets, each takes several instance IDs or keys at once.
 function Get-PnpDevice {
-    param($Class, [switch]$PresentOnly, $InstanceId)
+    param($Class, [switch]$PresentOnly, [string[]]$InstanceId)
+    $global:EMVddTestState.Calls += 'get'
     $global:EMVddTestState.Devices | Where-Object {
-        ($InstanceId -and $_.InstanceId -eq $InstanceId) -or (!$InstanceId -and $_.InstanceId -notlike 'DISPLAY\*')
+        ($InstanceId -and $InstanceId -contains $_.InstanceId) -or (!$InstanceId -and $_.InstanceId -notlike 'DISPLAY\*')
     }
 }
 function Get-PnpDeviceProperty {
-    param($InstanceId, $KeyName)
-    $device = Get-PnpDevice -InstanceId $InstanceId
-    $data = switch ($KeyName) {
-        'DEVPKEY_Device_HardwareIds' { $device.HardwareIds }
-        'DEVPKEY_Device_DriverInfPath' { $device.Inf }
-        'DEVPKEY_Device_Children' { $device.Children }
-        default { throw "Unexpected property $KeyName" }
+    param($InstanceId, [string[]]$KeyName)
+    $global:EMVddTestState.Calls += 'property'
+    $device = Find-Device $InstanceId
+    foreach ($key in $KeyName) {
+        $data = switch ($key) {
+            'DEVPKEY_Device_HardwareIds' { $device.HardwareIds }
+            'DEVPKEY_Device_DriverInfPath' { $device.Inf }
+            'DEVPKEY_Device_Children' { $device.Children }
+            default { throw "Unexpected property $key" }
+        }
+        [pscustomobject]@{KeyName=$key; Data=$data}
     }
-    [pscustomobject]@{Data=$data}
 }
 function Enable-PnpDevice {
     param($InstanceId, $Confirm)
     if ($global:EMVddTestState.Fail) { throw 'mock driver failure' }
     $global:EMVddTestState.Calls += "enable:$InstanceId"
     if ($global:EMVddTestState.Ignore) { return }
-    $device = Get-PnpDevice -InstanceId $InstanceId
+    $device = Find-Device $InstanceId
     $enabled = $global:EMVddTestState.Enabled
     $device.Problem = $enabled.Problem
     $device.Status = $enabled.Status
-    $monitor = Get-PnpDevice -InstanceId 'DISPLAY\MTT1337\1&2&3&UID256'
+    $monitor = Find-Device 'DISPLAY\MTT1337\1&2&3&UID256'
     if ($enabled.Monitor) {
         $device.Children = @($monitor.InstanceId)
         $monitor.Status = $enabled.Monitor
@@ -48,7 +54,7 @@ function Enable-PnpDevice {
 function Disable-PnpDevice {
     param($InstanceId, $Confirm)
     $global:EMVddTestState.Calls += "disable:$InstanceId"
-    $device = Get-PnpDevice -InstanceId $InstanceId
+    $device = Find-Device $InstanceId
     $device.Problem = 22
     $device.Status = 'Error'
     $device.Children = @()
@@ -71,11 +77,20 @@ try {
     & $toggle -Action enable | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "A disabled device was not re-enabled: exit $LASTEXITCODE" }
     & $toggle -Action disable | Out-Null
-    if (($global:EMVddTestState.Calls -join ',') -ne 'enable:ROOT\DISPLAY\0007,disable:ROOT\DISPLAY\0007') {
+    if ((($global:EMVddTestState.Calls | Where-Object { $_ -like '*:*' }) -join ',') -ne 'enable:ROOT\DISPLAY\0007,disable:ROOT\DISPLAY\0007') {
         throw 'The toggle selected another GPU or a different virtual driver'
     }
     $vdd = Get-PnpDevice -InstanceId 'ROOT\DISPLAY\0007'
     if ($vdd.Problem -ne 22) { throw 'Disable did not leave code 22' }
+
+    # Each PnP call costs about half a second while the device starts: a ready device is checked
+    # with two after Enable-PnpDevice.
+    Reset-State
+    & $toggle -Action enable | Out-Null
+    $calls = $global:EMVddTestState.Calls
+    $after = $calls[([array]::IndexOf($calls, 'enable:ROOT\DISPLAY\0007') + 1)..($calls.Count - 1)]
+    if (($after -join ',') -ne 'property,get') { throw "A ready device took these calls to check: $($after -join ',')" }
+    & $toggle -Action disable | Out-Null
 
     $global:EMVddTestState.Fail = $true
     Expect-Failure { & $toggle -Action enable } 'mock driver failure'
@@ -123,7 +138,7 @@ try {
     $global:LASTEXITCODE = 0
     & $toggle -Action disable | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Disabling an absent device failed' }
-    Write-Output 'VDD toggle checks passed: selection, re-enable after code 22, still disabled, problem codes, not started, no monitor, late monitor, unbound driver, absent device'
+    Write-Output 'VDD toggle checks passed: selection, re-enable after code 22, two calls per check, still disabled, problem codes, not started, no monitor, late monitor, unbound driver, absent device'
     # The failure cases leave their exit codes behind; CI ends with this one.
     $global:LASTEXITCODE = 0
 } finally {

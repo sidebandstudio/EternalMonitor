@@ -17,8 +17,9 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('enable', 'disable')]
     [string]$Action,
-    # How long an enabled device may take to start and add its monitor.
-    [int]$StartSeconds = 8
+    # How long an enabled device may take to start and add its monitor. Where the display works,
+    # the monitor is there when Enable-PnpDevice returns.
+    [int]$StartSeconds = 4
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,17 +35,21 @@ if ($devices.Count -eq 0) {
     exit 2
 }
 
-# Why an enabled device cannot show a display yet, or $null when it can.
+# Why an enabled device cannot show a display yet, or $null when it can. Each PnP call takes about
+# half a second while the device starts, so the check makes two: the device's properties, then the
+# device and its monitors together.
 function Get-EnableProblem($instance) {
-    $inf = (Get-PnpDeviceProperty -InstanceId $instance -KeyName 'DEVPKEY_Device_DriverInfPath').Data
+    $properties = @(Get-PnpDeviceProperty -InstanceId $instance -KeyName 'DEVPKEY_Device_DriverInfPath', 'DEVPKEY_Device_Children')
+    $inf = ($properties | Where-Object KeyName -eq 'DEVPKEY_Device_DriverInfPath').Data
     if ($inf -notmatch '^oem[0-9]+\.inf$') { return @{Code=3; Text="$instance has no driver bound"} }
-    $device = Get-PnpDevice -InstanceId $instance
+    $children = @(($properties | Where-Object KeyName -eq 'DEVPKEY_Device_Children').Data | Where-Object { $_ })
+    $found = @(Get-PnpDevice -InstanceId (@($instance) + $children))
+    $device = $found | Where-Object InstanceId -eq $instance
     if ([int]$device.Problem -ne 0) {
         return @{Code=100 + [int]$device.Problem; Text="$instance reports problem code $([int]$device.Problem)"}
     }
     if ($device.Status -ne 'OK') { return @{Code=4; Text="$instance has not started"} }
-    $children = @((Get-PnpDeviceProperty -InstanceId $instance -KeyName 'DEVPKEY_Device_Children').Data)
-    $monitor = $children | Where-Object { $_ } | Where-Object { (Get-PnpDevice -InstanceId $_).Status -eq 'OK' }
+    $monitor = $found | Where-Object { $_.InstanceId -ne $instance -and $_.Status -eq 'OK' }
     if (!$monitor) { return @{Code=5; Text="$instance started, but no monitor arrived"} }
     return $null
 }
