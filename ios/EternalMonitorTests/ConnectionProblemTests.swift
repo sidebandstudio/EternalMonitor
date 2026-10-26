@@ -14,6 +14,62 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
+    /// PCs on 0.3.1 and 0.3.2 answer but send no picture in Second screen
+    /// mode. The card says to mirror, naming the choice as both versions do.
+    func testNoPictureSaysToMirrorTheScreen() {
+        let detail = ConnectionProblem.noPicture.detail
+        XCTAssertTrue(detail.hasPrefix("The PC's second screen didn't start."), detail)
+        XCTAssertTrue(detail.contains("choose Mirror my screen") && detail.contains("Main display (mirror)"), detail)
+        XCTAssertTrue(detail.contains("try again"), detail)
+        XCTAssertEqual(ConnectionProblem.noPicture.actions, [.retry])
+        XCTAssertTrue(ConnectionProblem.noPicture.canReport)
+    }
+
+    func testNoPictureTimeoutsCountPerPCUpToTheLimit() {
+        var streak = NoPictureStreak()
+        XCTAssertEqual(NoPictureStreak.limit, 2)
+        XCTAssertEqual(streak.timedOut(.noPicture, target: "192.168.1.20:9876"), .noPicture)
+        XCTAssertFalse(streak.stopsReconnecting, "one timeout gets another attempt")
+        // Other failures don't count.
+        for other: ConnectionProblem in [.receiverNotReady, .noReply(usb: false), .couldNotConnect] {
+            _ = streak.timedOut(other, target: "192.168.1.20:9876")
+            XCTAssertEqual(streak.timeouts, 1, "\(other)")
+        }
+        _ = streak.timedOut(.noPicture, target: "192.168.1.20:9876")
+        XCTAssertTrue(streak.stopsReconnecting)
+        // Try again starts a new count.
+        streak.restartCount()
+        XCTAssertFalse(streak.stopsReconnecting)
+        _ = streak.timedOut(.noPicture, target: "192.168.1.20:9876")
+        XCTAssertFalse(streak.stopsReconnecting)
+        // Another PC, or the cable, starts its own count.
+        _ = streak.timedOut(.noPicture, target: "USB:9877")
+        XCTAssertEqual(streak.timeouts, 1)
+        XCTAssertEqual(streak.target, "USB:9877")
+    }
+
+    func testAPCThatAnsweredInTheSeriesKeepsTheNoPictureMessage() {
+        var streak = NoPictureStreak()
+        // Nothing answered yet: the usual messages.
+        XCTAssertEqual(streak.timedOut(.noReply(usb: false), target: "192.168.1.1:9876"), .noReply(usb: false))
+        XCTAssertEqual(streak.timedOut(.routerAddress, target: "192.168.1.1:9876"), .routerAddress)
+        _ = streak.timedOut(.noPicture, target: "192.168.1.1:9876")
+        // Silent while EternalMonitor restarts on the PC that answered.
+        XCTAssertEqual(streak.timedOut(.noReply(usb: false), target: "192.168.1.1:9876"), .noPicture)
+        XCTAssertEqual(streak.timedOut(.routerAddress, target: "192.168.1.1:9876"), .noPicture)
+        XCTAssertEqual(streak.timeouts, 1, "a silent attempt isn't a no-picture timeout")
+        // Try again keeps it: the PC still answered before.
+        streak.restartCount()
+        XCTAssertEqual(streak.timedOut(.noReply(usb: false), target: "192.168.1.1:9876"), .noPicture)
+        // Something the user must fix still shows as itself.
+        XCTAssertEqual(streak.timedOut(.receiverNotReady, target: "192.168.1.1:9876"), .receiverNotReady)
+        // Another PC never answered.
+        XCTAssertEqual(streak.timedOut(.noReply(usb: false), target: "192.168.1.30:9876"), .noReply(usb: false))
+        // The cable, after it answered.
+        _ = streak.timedOut(.noPicture, target: "USB:9877")
+        XCTAssertEqual(streak.timedOut(.noReply(usb: true), target: "USB:9877"), .noPicture)
+    }
+
     func testAPairingCodeTypedAsTheAddressIsCaughtBeforeConnecting() {
         for typed in ["390756", "390 756", " 390756 "] {
             XCTAssertEqual(ConnectionProblem.typedAddress(typed), .pairingCodeAsAddress, typed)

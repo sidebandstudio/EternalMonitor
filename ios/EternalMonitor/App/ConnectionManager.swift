@@ -149,6 +149,13 @@ final class ConnectionManager: ObservableObject {
     // Whether we've already granted the one-time timeout extension that fires when datagrams
     // start arriving (so a slow/jittery network gets a fresh window to finish reassembly+decode).
     private var didExtendTimeout = false
+    /// No-picture timeouts in a row at one PC; at the limit, attempts that
+    /// start by themselves stop.
+    private var noPictureStreak = NoPictureStreak()
+    /// System uptime when the current attempt started, and when its PC
+    /// accepted the session, for the support log's timings.
+    private var attemptStartedAt: TimeInterval = 0
+    private var sessionAcceptedAt: TimeInterval?
 
     let frameSlot = FrameSlot()
     /// Lets hot-path closures reach the CURRENT control channel without
@@ -232,6 +239,7 @@ final class ConnectionManager: ObservableObject {
     }
 
     func resumeUSBConnections() {
+        noPictureStreak.restartCount()
         usbPaused = false
         refreshUSBAvailability()
     }
@@ -345,6 +353,8 @@ final class ConnectionManager: ObservableObject {
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
+        attemptStartedAt = ProcessInfo.processInfo.systemUptime
+        sessionAcceptedAt = nil
         videoSize = .zero
         let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
         sessionDrawingMode = drawing.enabled
@@ -392,8 +402,9 @@ final class ConnectionManager: ObservableObject {
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
-                    self.record(.info, "decode", "First frame decoded successfully")
+                    self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
                     self.timeoutTask?.cancel()
+                    self.noPictureStreak = NoPictureStreak()
                     self.state = .connected
                     self.streamingSince = Date()
                     // A reconnect attempt that streams ends its cycle.
@@ -503,8 +514,10 @@ final class ConnectionManager: ObservableObject {
             assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
+            let acceptedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.sessionAcceptedAt = acceptedAt
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
                 if self.awaitingPairing {
@@ -902,6 +915,17 @@ final class ConnectionManager: ObservableObject {
         reconnectAttempt = 0
     }
 
+    /// The session and how long the current attempt has taken, appended to
+    /// the support log's first-frame and timeout lines.
+    private var attemptTimings: String {
+        let now = ProcessInfo.processInfo.systemUptime
+        var text = ""
+        if let session = hostInfo?.sessionId { text += " session_id=\(session)" }
+        text += " ms_since_start=\(Int((now - attemptStartedAt) * 1000))"
+        if let accepted = sessionAcceptedAt { text += " ms_since_accept=\(Int((now - accepted) * 1000))" }
+        return text
+    }
+
     /// (Re)arm the connect-timeout watchdog. Cancels any existing timer and starts a fresh one;
     /// if we're still `.connecting` when it fires, surface a diagnostic and disconnect.
     private func armConnectTimeout(seconds: Double) {
@@ -911,13 +935,30 @@ final class ConnectionManager: ObservableObject {
             if !Task.isCancelled && self.state == .connecting {
                 let debug = self.debugState
                 let handshakeDone = self.hostInfo != nil
-                self.record(.error, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone))
-                self.problem = .timeout(
+                let isUSB = self.transportMode == "USB"
+                self.record(.error, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
+                self.problem = self.noPictureStreak.timedOut(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
-                    isUSB: self.transportMode == "USB", host: debug.host)
-                self.disconnect()
+                    isUSB: isUSB, host: debug.host), target: "\(debug.host):\(debug.port)")
+                // The app gave up, not the user: the PC's log tells them apart.
+                self.disconnect(reason: .error)
+                if self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
             }
+        }
+    }
+
+    /// The PC answers but never sends a picture: stop the attempts that
+    /// start by themselves, the reconnect cycle and the cable the PC
+    /// connects again, and leave the problem card with Try again up.
+    private func stopAutomaticAttempts(isUSB: Bool) {
+        record(.warning, "connection", "Stopped reconnecting after \(noPictureStreak.timeouts) no-picture timeouts in a row")
+        endReconnectCycle()
+        if isUSB {
+            usbPaused = true
+            usbListener?.stop()
+            usbListener = nil
+            usbStatus = "USB: disconnected"
         }
     }
 
@@ -940,6 +981,7 @@ final class ConnectionManager: ObservableObject {
         guard state == .disconnected else { return }
         let cable = transportMode == "USB" || problem == .usbFailed
         endReconnectCycle()
+        noPictureStreak.restartCount()
         problem = nil
         connectionError = nil
         if cable {

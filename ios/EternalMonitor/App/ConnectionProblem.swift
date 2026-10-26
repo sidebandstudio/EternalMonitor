@@ -88,8 +88,8 @@ enum ConnectionProblem: Equatable {
         case .noReply(usb: true):
             return "Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again."
         case .noPicture:
-            return "EternalMonitor on the PC couldn't send its screen. Look there for a message and follow it, click Restart, then try again. "
-                + "If it keeps happening, send us Settings, Diagnostics from this iPad and Performance, Copy logs from the PC."
+            return "The PC's second screen didn't start. On the PC, choose Mirror my screen (called Main display (mirror) in version 0.3.1), "
+                + "then try again. If it already mirrors, click Restart on the PC first."
         case .receiverNotReady:
             return "Close EternalMonitor on this iPad and open it again."
         case .badAddress(let host):
@@ -244,6 +244,54 @@ enum ConnectionProblem: Equatable {
     /// (EHOSTUNREACH, ENETUNREACH) usually means the PC is asleep or
     /// elsewhere while Wi-Fi works, so it gets the general advice.
     private static let offline: Set<POSIXErrorCode> = [.ENETDOWN]
+}
+
+/// Connect attempts in a row that timed out at one PC without a picture.
+/// A PC on 0.3.1 or 0.3.2 in Second screen mode answers, then can take
+/// longer than this iPad waits to send its first picture, and every new
+/// attempt restarts its second screen. Over the cable the PC connects again
+/// by itself a second later, so without a limit the attempts never end and
+/// the PC's screen blinks with each one.
+struct NoPictureStreak: Equatable {
+    /// Attempts that start by themselves stop at this many no-picture
+    /// timeouts. One more attempt lets a PC that was only slow the first
+    /// time (a busy PC, a second screen that starts once) show its picture;
+    /// a second timeout means it fails the same way every time.
+    static let limit = 2
+
+    /// The PC as "address:port", or "USB:9877" for the cable.
+    private(set) var target: String?
+    private(set) var timeouts = 0
+    /// The PC answered at least once in this series.
+    private(set) var answered = false
+
+    var stopsReconnecting: Bool { timeouts >= Self.limit }
+
+    /// Counts an attempt at `target` that timed out with `problem`, and
+    /// returns the problem to show. A PC that answered earlier in the series
+    /// and is silent now is most likely restarting EternalMonitor, so it
+    /// keeps the advice about the picture.
+    mutating func timedOut(_ problem: ConnectionProblem, target: String) -> ConnectionProblem {
+        if target != self.target {
+            self = NoPictureStreak()
+            self.target = target
+        }
+        switch problem {
+        case .noPicture:
+            answered = true
+            timeouts += 1
+            return problem
+        case .noReply, .routerAddress:
+            return answered ? .noPicture : problem
+        default:
+            return problem
+        }
+    }
+
+    /// Try again: the user starts a new count. The PC still answered before.
+    mutating func restartCount() {
+        timeouts = 0
+    }
 }
 
 /// What the USB cable card says for each listener status.

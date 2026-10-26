@@ -52,15 +52,20 @@ final class FakeUDPHost: @unchecked Sendable {
             guard let (data, from, length) = receive() else { continue }
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
-            let ack = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
-                status: status, acceptedVersion: acceptedVersion, clientNonce: hello.clientNonce, sessionId: status == .ok ? 41 : 0,
-                heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
-                streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0)))
             client = (from, length)
-            send(ack)
+            send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion))
             return true
         }
         return false
+    }
+
+    /// The HELLO_ACK for the attempt with `nonce`: session 41, unless
+    /// `status` refuses it.
+    static func ack(nonce: UInt32, status: HelloStatus = .ok, acceptedVersion: UInt8 = 2) -> Data {
+        Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
+            status: status, acceptedVersion: acceptedVersion, clientNonce: nonce, sessionId: status == .ok ? 41 : 0,
+            heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
+            streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0)))
     }
 
     private func send(_ datagram: Data) {
