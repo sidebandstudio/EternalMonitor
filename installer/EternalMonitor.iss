@@ -23,7 +23,7 @@ AppId={{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}
 AppName=EternalMonitor
 AppVersion={#AppVersion}
 AppVerName=EternalMonitor {#AppVersion}
-AppPublisher=Ali Younes
+AppPublisher=Sideband Studio
 AppPublisherURL=https://github.com/sidebandstudio/EternalMonitor
 AppSupportURL=https://github.com/sidebandstudio/EternalMonitor
 AppUpdatesURL=https://github.com/sidebandstudio/EternalMonitor/releases
@@ -53,6 +53,11 @@ SetupLogging=yes
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; The same requirements the website, README and SETUP.md list.
+WinVersionTooLowError=EternalMonitor needs Windows 10 version 1809 or later, or Windows 11. Update Windows, then run this installer again.
+OnlyOnTheseArchitectures=EternalMonitor needs a 64-bit PC with Windows 10 version 1809 or later, or Windows 11.
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 ; Autostart is handled inside the app (Settings -> "Start with Windows",
@@ -67,6 +72,7 @@ Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignore
 Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
 Source: "{#StagingDir}\LICENSE";                 DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\QUICKSTART.txt";          DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#StagingDir}\Geist-OFL.txt";           DestDir: "{app}"; Flags: ignoreversion
 #ifdef IncludeDriver
 ; Third-party Virtual Display Driver setup, bundled so the tester never touches GitHub.
 Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion recursesubdirs

@@ -5,7 +5,7 @@ final class StreamDiagnosticsTests: XCTestCase {
     func testQualityPopoverShowsRepairsAndJitter() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = "127.0.0.1:19875"
         app.launchEnvironment["EM_UDP_BACKEND"] = "bsd"
         app.launch()

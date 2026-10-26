@@ -228,10 +228,7 @@ fn run(_args: &[String]) -> i32 {
 fn run(args: &[String]) -> i32 {
     use std::io::Write;
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_INFORMATION,
-        PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
-    };
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
     let [pid, start, directory, launch_id] = args else {
         return 2;
@@ -242,24 +239,7 @@ fn run(args: &[String]) -> i32 {
     let owner = ProcessId { pid, start };
     let directory = PathBuf::from(directory);
     let file = |kind| owner_file(&directory, owner, kind);
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            false,
-            owner.pid,
-        )
-    };
-    // Opened after the host ended, the id could belong to another process.
-    let process = match process {
-        Ok(handle) if owner.is_running() => Some(handle),
-        Ok(handle) => {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            None
-        }
-        Err(_) => None,
-    };
+    let process = open_host(owner);
     let _ = fs::write(file(READY), ProcessId::current().to_string());
 
     // Each message on its own thread: an open message never holds the
@@ -409,6 +389,33 @@ fn run(args: &[String]) -> i32 {
 #[cfg(any(windows, test))]
 pub(super) fn cleans_up(exit_code: Option<u32>, display_left: bool) -> bool {
     exit_code != Some(0) || display_left
+}
+
+/// The host's process, to watch it and read its exit code. A host that ended
+/// before this process opened it still counts while someone holds it open:
+/// its exit code may be a crash's. Matching the start time keeps a later
+/// process with the same id out.
+#[cfg(windows)]
+fn open_host(owner: ProcessId) -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
+    };
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            owner.pid,
+        )
+    }
+    .ok()?;
+    if super::process::created_at(process) == Some(owner.start) {
+        return Some(process);
+    }
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    None
 }
 
 /// Turn the virtual display off after `owner` ended, if it still should be,
@@ -597,6 +604,44 @@ mod tests {
             after_exit(Some(crash), true, Some(1), false, false),
             Some(crash)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_reporter_that_opens_its_host_after_a_fail_fast_exit_still_reads_the_code() {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        // Waits for its input, then ends with __fastfail's code.
+        let mut child = std::process::Command::new("cmd")
+            .raw_arg("/c set /p line= & exit -1073740791")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let host = ProcessId {
+            pid: child.id(),
+            start: super::super::process::start_time(child.id()).unwrap(),
+        };
+        drop(child.stdin.take());
+        assert_eq!(child.wait().unwrap().code(), Some(0xC000_0409_u32 as i32));
+        // `child` still holds its handle, so the ended host can be opened.
+        let process = open_host(host).expect("the ended host");
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(process, &mut code) }.unwrap();
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        let record = after_exit(None, false, Some(code), true, false).unwrap();
+        let outcome = super::super::Outcome::new(record, None, false);
+        assert_eq!((record.code, outcome.level()), (0xC000_0409, "error"));
+        // A process created at another time is not the host.
+        assert!(open_host(ProcessId {
+            start: host.start + 1,
+            ..host
+        })
+        .is_none());
+        drop(child);
     }
 
     #[test]

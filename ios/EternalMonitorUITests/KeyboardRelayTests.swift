@@ -7,7 +7,7 @@ final class KeyboardRelayTests: XCTestCase {
         let path = try XCTUnwrap(environment["EM_INPUT_HOST_LOG"])
         let before = (try? Data(contentsOf: URL(fileURLWithPath: path)).count) ?? 0
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()

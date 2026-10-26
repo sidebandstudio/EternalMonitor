@@ -1,28 +1,50 @@
 import CoreGraphics
 import Foundation
 
+/// How the PC picture sits on the iPad screen. Fit shows the whole picture,
+/// with bars when the shapes differ; Fill scales it up evenly until it
+/// covers the screen and trims the edges that don't fit. Never stretches.
+enum PictureFit: String {
+    case fit
+    case fill
+}
+
 /// Maps view-space touch points onto the displayed video's content rect and
 /// normalizes them to the wire's 0...65535 space. Pure and unit-tested — the
-/// letterbox math must mirror `MetalRenderer.aspectFitScale`.
+/// letterbox math must mirror `MetalRenderer.aspectFitScale`, and Fill must
+/// mirror `MetalRenderer.aspectFillScale`.
 struct ContentRectMapper {
     var viewSize: CGSize
     var videoSize: CGSize
+    var fit: PictureFit = .fit
 
-    /// The aspect-fit rectangle (in view coordinates) the video occupies.
+    /// The rectangle (in view coordinates) the whole video occupies. In Fill
+    /// it is larger than the view and its edges lie off screen.
     var contentRect: CGRect {
         guard viewSize.width > 0, viewSize.height > 0,
               videoSize.width > 0, videoSize.height > 0 else { return .zero }
         let videoAspect = videoSize.width / videoSize.height
         let viewAspect = viewSize.width / viewSize.height
-        if videoAspect > viewAspect {
-            // Video wider than view: full width, letterboxed top/bottom.
+        let fullWidth = fit == .fill ? videoAspect <= viewAspect : videoAspect > viewAspect
+        if fullWidth {
+            // Fit: video wider than view, letterboxed top/bottom.
+            // Fill: video taller than view, top/bottom trimmed.
             let height = viewSize.width / videoAspect
             return CGRect(x: 0, y: (viewSize.height - height) / 2, width: viewSize.width, height: height)
         } else {
-            // Video taller: full height, pillarboxed left/right.
+            // Fit: video taller, pillarboxed left/right.
+            // Fill: video wider, left/right trimmed.
             let width = viewSize.height * videoAspect
             return CGRect(x: (viewSize.width - width) / 2, y: 0, width: width, height: viewSize.height)
         }
+    }
+
+    /// The part of the video that is on screen. Fit: all of it. Fill: the
+    /// whole view; the trimmed edges can't be reached.
+    var visibleRect: CGRect {
+        let rect = contentRect
+        guard fit == .fill, rect.width > 0, rect.height > 0 else { return rect }
+        return CGRect(origin: .zero, size: viewSize)
     }
 
     /// Normalize a view point. Returns nil while no video is up, or when the
@@ -30,7 +52,15 @@ struct ContentRectMapper {
     func normalize(_ point: CGPoint) -> (x: UInt16, y: UInt16)? {
         let rect = contentRect
         guard rect.width > 0, rect.height > 0 else { return nil }
-        guard rect.insetBy(dx: -1, dy: -1).contains(point) else { return nil }
+        let visible = visibleRect
+        guard visible.insetBy(dx: -1, dy: -1).contains(point) else { return nil }
+        var point = point
+        if fit == .fill {
+            // A touch on the screen's very edge stays on the visible picture
+            // instead of reaching into the trimmed part.
+            point.x = Swift.min(visible.maxX, Swift.max(visible.minX, point.x))
+            point.y = Swift.min(visible.maxY, Swift.max(visible.minY, point.y))
+        }
         let nx = (point.x - rect.minX) / rect.width
         let ny = (point.y - rect.minY) / rect.height
         return (

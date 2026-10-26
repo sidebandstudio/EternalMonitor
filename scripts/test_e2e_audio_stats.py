@@ -1,5 +1,10 @@
+import datetime
 import unittest
-from e2e_audio_stats import measure
+from e2e_audio_stats import IncompleteEvidence, measure
+
+STAMP = datetime.datetime(2026, 10, 21, 17, 34, 28, 124881)
+# The app log froze half a second after the host's first stats line.
+FROZEN = (STAMP + datetime.timedelta(seconds=0.5)).replace(tzinfo=datetime.timezone.utc).timestamp()
 
 
 def sample(decoded=100, lost=0, tone=-12, rms=0.177, first=None, after=None, session=7, epoch=3):
@@ -10,14 +15,15 @@ def sample(decoded=100, lost=0, tone=-12, rms=0.177, first=None, after=None, ses
     return line + '\n'
 
 
-def host(stale=0, queue=0, oversized=0, send_failed=0, late=None, failed='none', stream=1, wire='7/3'):
+def host(stale=0, queue=0, oversized=0, send_failed=0, late=None, failed='none', stream=1, wire='7/3', at=0):
     # The host writes tracing fields with ANSI styling around each name.
     fields = dict(dropped=stale + queue + oversized + send_failed, capture_queue_dropped=queue,
                   stale_dropped=stale, oversized_dropped=oversized, send_failed=send_failed)
     if late is not None:
         fields.update(late_seqs=late, failed_seqs=failed, audio_stream=stream, wire_stream=wire)
     styled = ' '.join(f'\x1b[3m{key}\x1b[0m\x1b[2m=\x1b[0m{value}' for key, value in fields.items())
-    return f'\x1b[2m2026-10-21T17:34:28.124881Z\x1b[0m \x1b[32m INFO\x1b[0m Audio stream stats {styled}\n'
+    stamp = (STAMP + datetime.timedelta(seconds=at)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    return f'\x1b[2m{stamp}\x1b[0m \x1b[32m INFO\x1b[0m Audio stream stats {styled}\n'
 
 
 # CI run 39643467699 (pr65b): the stalled host dropped sequence 0 before the
@@ -75,6 +81,23 @@ class AudioMeasurementTests(unittest.TestCase):
                 measure(app, PR65B_HOST, gate)
         with self.assertRaisesRegex(ValueError, '1 audio packets lost after'):
             measure(sample(400, lost=1, first=0) * 2, host(late='none'), 'record')
+
+    def test_only_host_stats_logged_after_the_app_log_froze_attribute_loss(self):
+        # Sol's case: the host log is still live. Its last line was snapshotted
+        # before the transport dropped startup sequence 230, which the iPad had
+        # already counted. That is incomplete evidence, not network loss.
+        app = sample(200, first=0) + sample(240, lost=1, first=0)
+        before = host(late='none')
+        for gate in ('enforce', 'record'):
+            with self.subTest(gate=gate), self.assertRaisesRegex(IncompleteEvidence, 'incomplete'):
+                measure(app, before, gate, FROZEN)
+        # The first line emitted after the freeze may hold an older snapshot;
+        # the next line from the same stage cannot.
+        after = host(stale=1, late='230', at=1)
+        with self.assertRaisesRegex(IncompleteEvidence, '1 audio stats line'):
+            measure(app, before + after, 'record', FROZEN)
+        result = measure(app, before + after + host(stale=1, late='230', at=2), 'enforce', FROZEN)
+        self.assertEqual(result['audio_host_late_seqs'], '230')
 
     def test_a_host_drop_the_receiver_never_missed_fails(self):
         with self.assertRaisesRegex(ValueError, 'iPad counted 0 losses'):

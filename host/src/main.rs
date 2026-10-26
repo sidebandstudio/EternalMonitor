@@ -1,3 +1,8 @@
+// A GUI program, so Windows opens no console window next to the app. Debug
+// builds too: CI checks the build it makes, and a terminal still shows the
+// log because the host joins its console (`console::join_parent_console`).
+#![windows_subsystem = "windows"]
+
 use std::sync::mpsc;
 
 use eternal_host::control::{GuiControl, SharedControl};
@@ -14,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host it watches and must never be turned away as a second instance,
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
+    eternal_host::console::join_parent_console();
 
     // Before any DXGI query or window: monitor rects and injected input must
     // be physical pixels from the start, not only once the GUI's event loop
@@ -75,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
     // the virtual display down before the process unwinds, so a crash can't strand a phantom
     // monitor. A panic or native crash that ends the process is also shown to the user and
-    // queued for support instead of closing the console window without a word.
+    // queued for support instead of the window closing without a word.
     eternal_host::startup::install_failure_hooks();
     eternal_host::startup::take_previous_crashes();
 
@@ -258,6 +264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(windows)]
         unsafe {
+            eternal_host::console::ensure_console();
             if let Err(error) = windows::Win32::System::Console::SetConsoleCtrlHandler(
                 Some(on_console_control),
                 true,

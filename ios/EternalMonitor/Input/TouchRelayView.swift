@@ -23,6 +23,7 @@ struct TouchRelayView: UIViewRepresentable {
 
     func updateUIView(_ view: RelayTouchUIView, context: Context) {
         view.videoSize = connectionManager.videoSize
+        view.pictureFit = settings.pictureFit
         view.onToggleHUD = onToggleHUD
         view.commandAsControl = settings.commandAsControl
         view.keyboardSupported = connectionManager.sessionHasKeyboard
@@ -47,9 +48,14 @@ final class RelayTouchUIView: UIView {
     var onToggleHUD: (() -> Void)?
     var videoSize: CGSize = .zero {
         didSet {
-            if oldValue != videoSize && pencil.isDown { cancelInput() }
+            // A new PC resolution moves the picture or changes what it maps to.
+            if oldValue != videoSize { pictureMoved() }
             machine.videoPixelSize = videoSize
         }
+    }
+    /// Must match the renderer's mode so a touch lands under the finger.
+    var pictureFit: PictureFit = .fit {
+        didSet { if oldValue != pictureFit { pictureMoved() } }
     }
 
     private var machine = TouchRelayMachine()
@@ -108,7 +114,7 @@ final class RelayTouchUIView: UIView {
     }
 
     private var mapper: ContentRectMapper {
-        ContentRectMapper(viewSize: bounds.size, videoSize: videoSize)
+        ContentRectMapper(viewSize: bounds.size, videoSize: videoSize, fit: pictureFit)
     }
 
     private func norm(_ touch: UITouch) -> TouchRelayMachine.Point? {
@@ -153,9 +159,9 @@ final class RelayTouchUIView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        // Rotation changes the mapping under a held tip. Release before a
-        // subsequent sample could draw a line across the newly fitted image.
-        if inputBounds != bounds.size && pencil.isDown { cancelInput() }
+        // Rotation changes the mapping under every held contact. Release
+        // before a later sample could click or draw across the new picture.
+        if inputBounds != bounds.size { pictureMoved() }
         inputBounds = bounds.size
     }
 
@@ -220,6 +226,23 @@ final class RelayTouchUIView: UIView {
         machine = TouchRelayMachine()
         machine.videoPixelSize = videoSize
         keyboardInput.updateSticky(keyboard.sticky)
+    }
+
+    /// The picture moved under the contacts: Fit or Fill changed, the iPad
+    /// rotated, or the PC changed resolution. End every gesture where it was,
+    /// as a three-finger tap does: a pending tap never clicks, a held button
+    /// is cancelled at the last point sent, and fingers still down are
+    /// ignored until they all lift.
+    /// Keys stay held; they don't depend on the picture.
+    private func pictureMoved() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        // Keep tracking a cancelled tip until it lifts: its samples send
+        // nothing more, and palms that land meanwhile are still rejected.
+        onEvents?(pointer.ended(at: nil) + pencil.cancel())
+        run(machine.threeFingerTap(timeUs: ControlChannel.clientNowUs()).filter {
+            if case .toggleHUD = $0 { return false }; return true
+        })
     }
 
     private func modifierBits(_ flags: UIKeyModifierFlags) -> UInt8 {
@@ -303,7 +326,7 @@ final class RelayTouchUIView: UIView {
         }
         for touch in touches {
             if touch.type == .pencil && (nativePenSupported || drawingMode) { continue }
-            if touch.type != .indirectPointer && (drawingMode || pencil.isDown || ignoredTouches.contains(touch)) {
+            if touch.type != .indirectPointer && (drawingMode || pencilTouch != nil || ignoredTouches.contains(touch)) {
                 ignoredTouches.insert(touch)
                 continue
             }
@@ -405,7 +428,7 @@ final class RelayTouchUIView: UIView {
     private func pencilReading(_ touch: UITouch, clamp: Bool = false) -> PencilReading? {
         var location = touch.preciseLocation(in: self)
         if clamp {
-            let rect = mapper.contentRect
+            let rect = mapper.visibleRect
             guard rect.width > 0, rect.height > 0 else { return nil }
             location.x = min(rect.maxX, max(rect.minX, location.x))
             location.y = min(rect.maxY, max(rect.minY, location.y))

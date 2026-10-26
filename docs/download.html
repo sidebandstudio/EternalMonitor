@@ -3,190 +3,202 @@
 <head>
   <meta charset="UTF-8">
   <script>document.documentElement.className = 'js';</script>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Download EternalMonitor</title>
-  <meta name="description" content="Download EternalMonitor v0.3.1, the current stable Windows release, with the matching iPad TestFlight build 166.">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Download EternalMonitor for Windows and iPad</title>
+  <meta name="description" content="Get the EternalMonitor Windows installer and the iPad app from TestFlight. Free and open source. Tell us what you think.">
+  <link rel="canonical" href="https://eternalmonitor.dev/download.html">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="EternalMonitor">
   <meta property="og:title" content="Download EternalMonitor">
-  <meta property="og:description" content="Your iPad as a second screen for Windows. Free and open source.">
+  <meta property="og:description" content="The Windows installer and the iPad TestFlight beta. Free and open source.">
   <meta property="og:url" content="https://eternalmonitor.dev/download.html">
   <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Download EternalMonitor">
-  <meta name="twitter:description" content="Your iPad as a second screen for Windows. Free and open source.">
+  <meta name="twitter:description" content="The Windows installer and the iPad TestFlight beta. Free and open source.">
   <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
-  <link rel="canonical" href="https://eternalmonitor.dev/download.html">
-  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <meta name="author" content="Sideband Studio">
   <meta name="theme-color" content="#0a0a0b">
   <link rel="icon" type="image/png" href="assets/favicon.png">
   <link rel="apple-touch-icon" href="assets/icon.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="preload" href="assets/fonts/Geist-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
 
-  <nav class="nav" aria-label="Main">
-    <div class="container nav-inner">
-      <a href="index.html" class="nav-brand" aria-label="EternalMonitor home">
-        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
+  <header class="nav">
+    <nav class="container nav-inner" aria-label="Main">
+      <a href="./" class="brand" aria-label="EternalMonitor home">
+        <img src="assets/icon.png" alt="" width="26" height="26">
         <span>EternalMonitor</span>
       </a>
       <div class="nav-links">
-        <a href="index.html#features" class="nav-link hide-sm">Features</a>
-        <a href="index.html#faq" class="nav-link hide-sm">FAQ</a>
-        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener" class="nav-link" aria-label="GitHub repository">
+        <a href="./#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm">Updates</a>
+        <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-          <span class="nav-link-label">GitHub</span>
+          <span>GitHub</span>
+          <span class="count" data-stars></span>
         </a>
+        <a href="#feedback" class="btn btn-secondary btn-sm">Feedback</a>
       </div>
-    </div>
-  </nav>
+    </nav>
+  </header>
 
   <main id="main">
-    <section class="download-hero">
+    <section class="page-head">
       <div class="container">
-        <h1>Download EternalMonitor</h1>
-        <p>v0.3.1 is the current stable release. Install it on Windows with iPad v0.3.1, TestFlight build 166. The iPad beta is open to everyone through TestFlight.</p>
-        <p>Both apps automatically share device details, errors and stream statistics with support, including PC names and network addresses. Screen content, audio and pairing credentials are excluded. You can turn sharing off in Settings. <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#automatic-diagnostics" target="_blank" rel="noopener">About automatic diagnostics</a>.</p>
-        <p>New to EternalMonitor? The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> walks through every step, including USB with Apple Devices. Found a bug? <a href="#feedback">Tell us below</a>.</p>
+        <h1>Download</h1>
+        <p class="lead">Install both apps from the same version. Stuck? The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> has every step.</p>
       </div>
     </section>
 
-    <section>
-      <div class="container download-grid reveal reveal-stagger">
-        <!-- Windows -->
-        <article class="download-card download-card--primary card">
-          <div class="download-card-header">
-            <span class="platform-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
-            <h2>Windows</h2>
-            <span class="badge badge-accent" id="release-version">v0.3.1</span>
-          </div>
-          <p>Current stable. Stream your desktop over Wi-Fi or USB with PC audio, pairing, keyboard control and Apple Pencil drawing through Windows Ink.</p>
-          <ul class="spec-list" aria-label="Requirements">
-            <li>Windows 10 version 1809 or later, or Windows 11, 64-bit</li>
-            <li>NVIDIA, AMD or Intel GPU</li>
-          </ul>
-          <div class="download-btn-wrap">
-            <a href="https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.1/EternalMonitor-Setup.exe" id="download-btn" class="btn btn-primary btn-block" target="_blank" rel="noopener">Download for Windows</a>
-            <p class="download-meta" id="release-meta">EternalMonitor-Setup.exe · 59.6 MB</p>
-          </div>
-          <div class="sha256">
-            <span class="sha256-label">SHA-256</span>
-            <code id="sha256-value">b276602bd54a0eec9459b9f6d91f67669fa533600d47456f30cabb36449cf0a5</code>
-          </div>
-          <p class="download-note"><a href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1" target="_blank" rel="noopener">Release notes and known issues</a> · <a href="#feedback">Report a problem</a></p>
-        </article>
-
-        <!-- iPad -->
-        <article class="download-card card">
-          <div class="download-card-header">
-            <span class="platform-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
-            <h2>iPad</h2>
-            <span class="badge badge-accent">TestFlight beta</span>
-          </div>
-          <p>v0.3.1, build 166. Shows your PC's screen and sends touch, Apple Pencil pressure and tilt, and keyboard input back. Use Drawing mode for Pencil input with palm rejection.</p>
-          <ul class="spec-list" aria-label="Requirements">
-            <li>iPadOS 17 or later</li>
-            <li>TestFlight from the App Store</li>
-          </ul>
-          <div class="download-btn-wrap">
-            <p id="testflight-status" class="testflight-status testflight-status--open"><span class="eyebrow-dot" aria-hidden="true"></span><span>Build 166 passed Apple's beta review. Anyone with the link can install it now.</span></p>
-            <a href="https://testflight.apple.com/join/ppc9QfXc" id="testflight-link" class="btn btn-primary btn-block" target="_blank" rel="noopener">Join the TestFlight beta</a>
-          </div>
-          <ol class="install-steps" aria-label="How to install on the iPad">
-            <li>Install <strong>TestFlight</strong> from the App Store on your iPad.</li>
-            <li>Open the invite on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</li>
-            <li>Open EternalMonitor and pair it with your PC.</li>
-          </ol>
-          <a class="feedback-callout" href="#feedback">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5h14v9H8.5L5 16.5v-3H3z"/><path d="M7 8.5h6M7 11h3.5"/></svg>
-            <span><strong>Testing the beta?</strong> Send bugs and feedback with the form below, or email hello@sideband.studio.</span>
+    <section class="container dl-grid reveal" aria-label="Downloads">
+      <article class="card dl-card" id="windows">
+        <div class="card-head">
+          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+          <h2>Windows</h2>
+          <span class="badge badge-accent" id="release-version" data-win-version>v0.3.2</span>
+        </div>
+        <ul class="specs" aria-label="Requirements">
+          <li>Windows 10 (1809 or later) or 11, 64-bit</li>
+          <li>NVIDIA, AMD or Intel graphics</li>
+          <li>For USB: Apple's free <a href="https://apps.microsoft.com/detail/9np83lwlpz9k" target="_blank" rel="noopener">Apple Devices</a> app, open while you stream (Windows 10 22H2 or 11)</li>
+        </ul>
+        <div class="dl-actions">
+          <a href="https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.2/EternalMonitor-Setup.exe" id="download-btn" class="btn btn-primary btn-block btn-lg">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg>
+            Download for Windows
           </a>
-          <p class="download-note">Developers can also <a href="https://github.com/sidebandstudio/EternalMonitor/tree/main/ios" target="_blank" rel="noopener">build it from source</a>.</p>
-        </article>
-      </div>
+          <p class="dl-meta"><span id="release-meta">EternalMonitor-Setup.exe · 59.9 MB</span> · <a id="release-notes-link" href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.2" target="_blank" rel="noopener">Release notes</a> · <a href="known-issues.html">Known issues</a></p>
+        </div>
+        <div class="sha">
+          <div class="sha-label"><span>SHA-256</span><button type="button" class="btn btn-secondary btn-sm" data-copy="sha256-value">Copy</button></div>
+          <code id="sha256-value">0c55e07884405cc32a660c7c657e745adbbc9bc429837cd989c0c818625d54a9</code>
+        </div>
+        <div class="notice" style="margin-top:18px">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5 18 16.5H2z"/><path d="M10 8v3.5"/><circle cx="10" cy="14" r=".6" fill="currentColor"/></svg>
+          <span>Not code-signed yet: on <strong>Windows protected your PC</strong>, click <strong>More info</strong>, then <strong>Run anyway</strong>. The SHA-256 above lets you check the file.</span>
+        </div>
+      </article>
+
+      <article class="card dl-card" id="ipad">
+        <div class="card-head">
+          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
+          <h2>iPad</h2>
+          <span class="badge badge-accent">TestFlight beta</span>
+        </div>
+        <ul class="specs" aria-label="Requirements">
+          <li>An iPad with iPadOS 17 or later</li>
+          <li>TestFlight, free from the App Store</li>
+                  </ul>
+        <div class="dl-actions">
+          <a href="https://testflight.apple.com/join/ppc9QfXc" id="testflight-link" class="btn btn-primary btn-block btn-lg" target="_blank" rel="noopener">Join the TestFlight beta</a>
+          <p class="dl-meta">Matching build: <span data-ipad-version>v0.3.2, build 316</span>. Open to everyone.</p>
+        </div>
+        <ol class="install-steps" aria-label="How to install on the iPad">
+          <li>Install <strong>TestFlight</strong> from the App Store on your iPad.</li>
+          <li>Open the invite link on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</li>
+          <li>Open EternalMonitor. Tap your PC when it appears, scan its QR code, or plug in a cable.</li>
+        </ol>
+      </article>
     </section>
 
-    <section class="feedback-section" id="feedback">
+    <section class="section" id="feedback" aria-labelledby="feedback-title">
       <div class="container">
-        <div class="feedback-card card reveal">
+        <div class="feedback reveal">
           <div class="feedback-intro">
-            <span class="feedback-kicker">Beta feedback</span>
-            <h2>Report a bug or share feedback</h2>
-            <p>Everything you send here goes to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>. Sending opens your mail app with the message filled in, so you can attach screenshots or the host log before it goes out.</p>
-            <p>Prefer GitHub? <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new/choose" target="_blank" rel="noopener">Open an issue</a> instead. TestFlight's own <strong>Send Beta Feedback</strong> works too.</p>
-            <div class="status-note">
+            <h2 id="feedback-title">Tell us how it went :)</h2>
+            <p>We read every message, and your feedback shapes what we fix next. Bugs, ideas, or what you use your iPad for.</p>
+            <p>It opens your mail app, addressed to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>.</p>
+            <ul class="ways">
+              <li><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5h14v9H8.5L5 16.5v-3H3z"/></svg><span>Prefer GitHub? <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new/choose" target="_blank" rel="noopener">Open an issue</a>. TestFlight's own <strong>Send Beta Feedback</strong> reaches us too.</span></li>
+              <li><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.3l2.3 4.8 5.3.7-3.9 3.7.9 5.2L10 14.2l-4.6 2.5.9-5.2L2.4 7.8l5.3-.7z"/></svg><span>Like it? <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">A star on GitHub</a> helps other people find it.</span></li>
+            </ul>
+            <div class="notice">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5 18 16.5H2z"/><path d="M10 8v3.5"/><circle cx="10" cy="14" r=".6" fill="currentColor"/></svg>
               <span>Leave out pairing codes and QR codes. If you paste the host log, click <strong>New code</strong> in the PC window afterwards.</span>
             </div>
           </div>
 
-          <form id="feedback-form" class="feedback-form" action="mailto:hello@sideband.studio" method="post" enctype="text/plain" data-release="Windows v0.3.1 · iPad v0.3.1, TestFlight build 166">
-            <fieldset class="field field--choice">
-              <legend>What is this about?</legend>
-              <div class="choice-group">
-                <label class="choice"><input type="radio" name="kind" value="Bug" checked><span>Bug report</span></label>
-                <label class="choice"><input type="radio" name="kind" value="Feedback"><span>General feedback</span></label>
+          <form id="feedback-form" action="mailto:hello@sideband.studio" method="post" enctype="text/plain" data-release="Windows v0.3.2 · iPad v0.3.2, TestFlight build 316">
+            <fieldset class="field">
+              <legend>What is it about?</legend>
+              <div class="chips">
+                <label class="chip"><input type="radio" name="kind" value="Bug" checked><span>Something broke</span></label>
+                <label class="chip"><input type="radio" name="kind" value="Idea"><span>An idea</span></label>
+                <label class="chip"><input type="radio" name="kind" value="Hello"><span>Just saying hi</span></label>
               </div>
             </fieldset>
             <div class="field">
-              <label for="fb-message">What happened, or what do you think?</label>
-              <textarea id="fb-message" name="message" rows="5" required placeholder="What you expected, what you saw instead, and any error message word for word."></textarea>
+              <label for="fb-message">Your message</label>
+              <textarea id="fb-message" name="message" rows="5" required placeholder="What you expected, what happened instead, and any message word for word."></textarea>
             </div>
             <div class="field" id="fb-steps-field">
-              <label for="fb-steps">Steps to reproduce <span class="optional">optional</span></label>
+              <label for="fb-steps">Steps to reproduce <span class="opt">optional</span></label>
               <textarea id="fb-steps" name="steps" rows="3" placeholder="1. Connect over USB&#10;2. Click Second screen on the Stream page&#10;3. ..."></textarea>
             </div>
             <div class="field-row">
               <div class="field">
-                <label for="fb-ipad">iPad model and iPadOS</label>
-                <input id="fb-ipad" name="ipad" type="text" placeholder="iPad Pro 12.9-inch (M2), iPadOS 26.2" autocomplete="off">
+                <label for="fb-ipad">iPad and iPadOS <span class="opt">optional</span></label>
+                <input id="fb-ipad" name="ipad" type="text" placeholder="iPad Air 11-inch (M2), iPadOS 26.2" autocomplete="off">
               </div>
               <div class="field">
-                <label for="fb-pc">Windows version and GPU</label>
+                <label for="fb-pc">Windows and graphics card <span class="opt">optional</span></label>
                 <input id="fb-pc" name="pc" type="text" placeholder="Windows 11 24H2, GeForce RTX 4070" autocomplete="off">
               </div>
-              <div class="field">
-                <label for="fb-connection">Connection</label>
-                <select id="fb-connection" name="connection">
-                  <option value="">Not sure</option>
-                  <option>Wi-Fi</option>
-                  <option>USB cable</option>
-                  <option>Both</option>
-                </select>
-              </div>
             </div>
-            <div class="feedback-actions">
-              <button type="submit" class="btn btn-primary" id="feedback-send">
+            <div class="field">
+              <label for="fb-connection">Connection</label>
+              <select id="fb-connection" name="connection">
+                <option value="">Not sure</option>
+                <option>Wi-Fi</option>
+                <option>USB cable</option>
+                <option>Both</option>
+              </select>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary btn-lg" id="feedback-send">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3 3 8.5l6.5 2 2 6.5z"/><path d="M17 3 9.5 10.5"/></svg>
                 Send to hello@sideband.studio
               </button>
-              <p class="download-note">The release versions are added for you.</p>
+              <p class="caption">The app versions are added for you.</p>
+            </div>
+            <div class="fallback" id="feedback-fallback" hidden>
+              <p><strong>Your mail app should have opened.</strong> If it didn't, copy the message and send it to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a> from anywhere.</p>
+              <pre id="feedback-preview"></pre>
+              <div class="fallback-actions">
+                <button type="button" class="btn btn-secondary btn-sm" data-copy="feedback-preview">Copy message</button>
+              </div>
             </div>
           </form>
-
-          <div class="feedback-fallback" id="feedback-fallback" hidden>
-            <p><strong>Your mail app should have opened.</strong> If it didn't, copy the message below and send it to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>.</p>
-            <pre><code id="feedback-preview"></code></pre>
-            <div class="feedback-fallback-actions">
-              <button type="button" class="btn btn-secondary btn-sm" id="feedback-copy">Copy message</button>
-              <span class="download-note" id="feedback-copied" role="status" hidden>Copied</span>
-            </div>
-          </div>
         </div>
       </div>
     </section>
 
-    <section class="build-section">
-      <div class="container">
-        <details class="build-details card reveal">
+    <section class="section" aria-labelledby="diag-title">
+      <div class="narrow">
+        <div class="notice">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 9v5M10 6.5v.2"/></svg>
+          <span id="diag-title">Both apps send diagnostics while they run, including PC names and network addresses. Never your screen, audio or pairing codes. Turn it off in Settings. <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#automatic-diagnostics" target="_blank" rel="noopener">Details</a>.</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section source" aria-label="Build from source">
+      <div class="narrow">
+        <details class="reveal">
           <summary>Build from source</summary>
-          <div class="build-content">
+          <div class="source-body">
             <h3>Requirements</h3>
             <ul>
-              <li>Rust stable with the MSVC toolchain</li>
+              <li>Windows 10 version 1809 or later, or Windows 11</li>
+              <li>Rust 1.98.0 with the MSVC toolchain (pinned by <code>rust-toolchain.toml</code>), and LLVM/libclang</li>
               <li>FFmpeg 7.1 shared SDK (set <code>FFMPEG_DIR</code>)</li>
               <li>A GPU with a hardware encoder (NVIDIA, AMD or Intel), or the software fallback</li>
             </ul>
@@ -199,6 +211,7 @@ cargo build --release -p eternal-host</code></pre>
             <pre><code>cd ios
 xcodegen generate
 # Open EternalMonitor.xcodeproj in Xcode and build for your iPad</code></pre>
+            <p style="margin-top:14px">The <a href="https://github.com/sidebandstudio/EternalMonitor#build-from-source" target="_blank" rel="noopener">README</a> has the macOS development loop and the test suites.</p>
           </div>
         </details>
       </div>
@@ -207,19 +220,18 @@ xcodegen generate
 
   <footer class="footer">
     <div class="container footer-inner">
-      <a href="index.html" class="footer-brand">
-        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
-        EternalMonitor
-      </a>
-      <p class="footer-copy">Built by whoisaldo · Open source under MIT</p>
-      <div class="footer-links">
-        <a href="index.html">Home</a>
+      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="./">Home</a>
+        <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
-        <a href="mailto:hello@sideband.studio">Contact</a>
-      </div>
+        <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
+      </nav>
     </div>
   </footer>
 
-  <script src="script.js"></script>
+  <script src="script.js" defer></script>
 </body>
 </html>

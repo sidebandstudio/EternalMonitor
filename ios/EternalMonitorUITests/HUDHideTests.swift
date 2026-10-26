@@ -11,7 +11,7 @@ final class HUDHideTests: XCTestCase {
         let app = XCUIApplication()
         // A ten-second slide keeps the HUD leaving while every tap lands.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-hudHideSeconds", "10"]
+                               "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launch()
         defer { app.terminate() }
@@ -54,7 +54,7 @@ final class HUDHideTests: XCTestCase {
         let environment = ProcessInfo.processInfo.environment
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-assumeVoiceOver", "YES"]
+                               "-playPCaudio", "NO", "-assumeVoiceOver", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launch()
         defer { app.terminate() }

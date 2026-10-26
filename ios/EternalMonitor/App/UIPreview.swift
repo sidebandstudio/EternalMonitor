@@ -4,13 +4,33 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|recent`.
+/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
+/// Launch with `-feedbackLongSessions 3` to show the one-time feedback card.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
     static var showsBackdrop: Bool { mode == "display" || mode == "quality" }
     static var opensQuality: Bool { mode == "quality" }
-    static var opensSettings: Bool { mode == "settings" }
+    static var opensSettings: Bool { mode == "settings" || mode == "settings-about" }
+    /// Scrolls Settings to Support and About.
+    static var scrollsToAbout: Bool { mode == "settings-about" }
+    /// Taps Send feedback. Simulators have no Mail, so this shows the copy sheet.
+    static var opensFeedback: Bool { mode == "feedback" }
+    /// `EM_FEEDBACK_PREPARE_MS` stretches the wait before the feedback sheet,
+    /// as collecting diagnostics for Mail can on a real iPad.
+    static func feedbackPreparation() async {
+        if let ms = Int(ProcessInfo.processInfo.environment["EM_FEEDBACK_PREPARE_MS"] ?? "") {
+            try? await Task.sleep(for: .milliseconds(ms))
+        }
+    }
+    /// The Bonjour error every search fails with.
+    static var searchErrorCode: Int? {
+        switch mode {
+        case "searchFailed": return -72000
+        case "searchBlocked": return -65570
+        default: return nil
+        }
+    }
 
     @MainActor static func apply(to manager: ConnectionManager) {
         switch mode {

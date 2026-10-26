@@ -73,12 +73,13 @@ UI changes.
 
 ## Maintainer review
 
-Pull requests into `main` require an approving review from
-[Ali Younes, @whoisaldo](https://github.com/whoisaldo), the current maintainer
-and code owner. New commits dismiss earlier approvals. The rule also applies
-to other administrators. Only Ali has a review bypass, so he can merge his own
-changes while he is the sole maintainer. All changes to `main` must still go
-through a pull request.
+EternalMonitor is maintained by Sideband Studio (hello@sideband.studio). Pull
+requests into `main` require an approving review from a code owner listed in
+[`.github/CODEOWNERS`](.github/CODEOWNERS), currently
+[@whoisaldo](https://github.com/whoisaldo). New commits dismiss earlier
+approvals. The rule also applies to other administrators. Only the maintainer
+account has a review bypass, for its own changes while it is the sole
+maintainer. All changes to `main` must still go through a pull request.
 
 By contributing, you agree that your work is released under the
 [MIT License](LICENSE).

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="UTF-8">
+  <script>document.documentElement.className = 'js';</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Updates | EternalMonitor</title>
+  <meta name="description" content="What's new in each EternalMonitor release, and what it fixes.">
+  <link rel="canonical" href="https://eternalmonitor.dev/updates.html">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="EternalMonitor">
+  <meta property="og:title" content="Updates | EternalMonitor">
+  <meta property="og:description" content="What's new in each EternalMonitor release, and what it fixes.">
+  <meta property="og:url" content="https://eternalmonitor.dev/updates.html">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Updates | EternalMonitor">
+  <meta name="twitter:description" content="What's new in each EternalMonitor release, and what it fixes.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta name="author" content="Sideband Studio">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
+  <link rel="preload" href="assets/fonts/Geist-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <nav class="container nav-inner" aria-label="Main">
+      <a href="./" class="brand" aria-label="EternalMonitor home">
+        <img src="assets/icon.png" alt="" width="26" height="26">
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="./#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm" aria-current="page">Updates</a>
+        <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span>GitHub</span>
+          <span class="count" data-stars></span>
+        </a>
+        <a href="download.html" class="btn btn-primary btn-sm">Download</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="page-head">
+      <div class="container">
+        <h1>Updates</h1>
+        <p class="lead">What's new in each release, and what it fixes.</p>
+      </div>
+    </section>
+
+    <section class="container posts">
+      <article class="post" id="v0-3-2" aria-labelledby="v0-3-2-title">
+        <p class="post-meta"><a href="#v0-3-2" class="post-version">0.3.2</a><time datetime="2026-10-23">October 23, 2026</time></p>
+        <h2 id="v0-3-2-title">Apple Pencil lands under the tip, and the iPad can fill its screen.</h2>
+        <ul class="post-list">
+          <li>Apple Pencil lands right under the tip, even with another monitor to the left of or above your main one.</li>
+          <li>New <strong>Fill</strong> option: the PC picture can cover the whole iPad screen. <strong>Fit</strong> still shows all of it.</li>
+          <li>Clearer messages when something goes wrong, each with a button to fix it, like <strong>Try again</strong>.</li>
+          <li><strong>Send feedback</strong> from either app. It writes the email for you, and nothing is sent until you press Send.</li>
+          <li>A popup tells you when a new version is out. On Windows, <strong>Update now</strong> installs it for you.</li>
+          <li>No more black console window next to the app on Windows.</li>
+          <li>The PC app opens on graphics drivers that made 0.3.1 crash at startup.</li>
+          <li>Steadier USB and Wi-Fi: a USB connection stays up when the stream restarts, and the picture comes back by itself after the lock screen.</li>
+        </ul>
+        <div class="post-update">
+          <h3>How to update</h3>
+          <dl>
+            <div><dt>Windows</dt><dd>Download Setup from the <a href="download.html">download page</a> and run it. From 0.3.2 on, <strong>Update now</strong> in the app does this for you.</dd></div>
+            <div><dt>iPad</dt><dd>Open TestFlight and tap <strong>Update</strong>. The iPad update rolls out through TestFlight.</dd></div>
+          </dl>
+        </div>
+      </article>
+
+      <article class="post" id="v0-3-1" aria-labelledby="v0-3-1-title">
+        <p class="post-meta"><a href="#v0-3-1" class="post-version">0.3.1</a><time datetime="2026-10-18">October 18, 2026</time></p>
+        <h2 id="v0-3-1-title">Better on Intel and AMD graphics.</h2>
+        <ul class="post-list">
+          <li>PCs with Intel graphics encode the picture in hardware, and try the other options before falling back to the processor.</li>
+          <li>On AMD graphics, the picture recovers faster after a lost frame.</li>
+          <li>Less dropped sound while a lot of video is moving.</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="./">Home</a>
+        <a href="download.html">Download</a>
+        <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>

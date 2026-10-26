@@ -1,7 +1,7 @@
 //! An exclusive lock on a small state file, shared by every EternalMonitor
 //! process of the user. The lock belongs to the open handle, so a holder that
-//! crashes releases it. Nobody waits for it: a caller that finds it taken
-//! tries again later.
+//! crashes releases it. Callers only try it; one that finds it taken tries
+//! again later.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;

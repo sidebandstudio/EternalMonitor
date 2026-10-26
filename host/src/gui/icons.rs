@@ -3,7 +3,7 @@
 use std::f32::consts::PI;
 
 use eframe::egui::{
-    pos2, vec2, Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+    self, pos2, vec2, Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub enum Icon {
     Logs,
     Download,
     Chevron,
+    Mail,
 }
 
 /// Paint `icon` centred in `rect`.
@@ -177,10 +178,48 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Chevron => {
             line(vec![p(4.0, 6.0), p(8.0, 10.0), p(12.0, 6.0)]);
         }
+        Icon::Mail => {
+            outline(r(1.8, 3.5, 14.2, 12.5), 1.8);
+            line(vec![p(2.6, 4.6), p(8.0, 8.8), p(13.4, 4.6)]);
+        }
         Icon::Download => {
             line(vec![p(8.0, 2.0), p(8.0, 10.5)]);
             line(vec![p(4.5, 7.0), p(8.0, 10.5), p(11.5, 7.0)]);
             line(vec![p(2.5, 13.5), p(13.5, 13.5)]);
         }
     }
+}
+
+/// A five-pointed star of outer `radius` around `center`, turned by `turn`
+/// radians: outlined, or filled when `filled`. Kept apart from [`paint`] so
+/// the GitHub card can tilt it on hover.
+pub fn paint_star(
+    painter: &Painter,
+    center: Pos2,
+    radius: f32,
+    turn: f32,
+    color: Color32,
+    filled: bool,
+) {
+    let points: Vec<Pos2> = (0..10)
+        .map(|i| {
+            let r = if i % 2 == 0 { radius } else { radius * 0.45 };
+            let a = turn - PI / 2.0 + i as f32 * PI / 5.0;
+            center + vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    if filled {
+        // A star isn't convex, but every point sees the centre: fan from it.
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(center, color);
+        for point in &points {
+            mesh.colored_vertex(*point, color);
+        }
+        for i in 0..10u32 {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 10);
+        }
+        painter.add(Shape::mesh(mesh));
+    }
+    let width = (radius * 0.2).clamp(1.1, 1.6);
+    painter.add(Shape::closed_line(points, Stroke::new(width, color)));
 }

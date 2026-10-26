@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use eternal_updater::quote_arg;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,8 @@ const CHECK_INTERVAL: u64 = 24 * 60 * 60;
 /// loop or repeated restarts cannot hammer the website.
 const STARTUP_INTERVAL: u64 = 60 * 60;
 const LATER_INTERVAL: u64 = 24 * 60 * 60;
+/// A closed update popup stays away this long for the same version.
+const POPUP_INTERVAL: u64 = 3 * 24 * 60 * 60;
 /// The stream must stay off this long before a waiting update starts, so a
 /// quick reconnect does not close the app under the user.
 const STREAM_IDLE: Duration = Duration::from_secs(3);
@@ -111,8 +114,19 @@ pub struct Release {
     pub version: String,
     pub installer: String,
     pub sha256: String,
+    /// `false` softens the popup's wording. Missing means recommended.
+    #[serde(default = "recommended")]
+    pub recommended: bool,
+    /// One short sentence the popup shows under its message.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
+fn recommended() -> bool {
+    true
+}
+
+/// Unknown fields are ignored, so a newer manifest still parses here.
 #[derive(Deserialize)]
 struct Manifest {
     schema: u32,
@@ -124,6 +138,23 @@ struct ManifestWindows {
     version: String,
     installer: String,
     sha256: String,
+    /// Optional, and read leniently: a wrong type must not stop the update.
+    #[serde(default)]
+    recommended: serde_json::Value,
+    #[serde(default)]
+    note: serde_json::Value,
+}
+
+const MAX_NOTE_CHARS: usize = 200;
+
+/// A note the popup can show: one trimmed line, not empty and not too long.
+/// Anything else is dropped rather than failing the check.
+fn short_note(note: Option<&str>) -> Option<String> {
+    let note = note?.trim();
+    let fits = !note.is_empty()
+        && note.chars().count() <= MAX_NOTE_CHARS
+        && !note.chars().any(char::is_control);
+    fits.then(|| note.to_string())
 }
 
 pub fn parse_manifest(data: &[u8], endpoints: &Endpoints) -> Result<Release, UpdateError> {
@@ -150,6 +181,8 @@ pub fn parse_manifest(data: &[u8], endpoints: &Endpoints) -> Result<Release, Upd
         version: version.to_string(),
         installer: expected,
         sha256,
+        recommended: windows.recommended.as_bool().unwrap_or(true),
+        note: short_note(windows.note.as_str()),
     })
 }
 
@@ -455,6 +488,69 @@ fn installed_helper(app: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
+/// The host exe Setup installs (`installer/EternalMonitor.iss`).
+const INSTALLED_EXE: &str = "EternalMonitor-host.exe";
+
+/// Setup replaces `EternalMonitor-host.exe` in the folder it installed into
+/// before (Program Files the first time), and the helper starts the exe that
+/// asked for the update again. So only that exe updates itself. A portable,
+/// renamed or self-built copy would come back as the old version, and Setup
+/// would point the firewall rules away from it; Update now opens the website
+/// for those.
+fn installs_in_place(exe: &Path, install_dir: Option<&Path>) -> bool {
+    let Some(install_dir) = install_dir else {
+        return false;
+    };
+    // Final paths where the files exist, so short (8.3) names are expanded.
+    let plain = |path: &Path| {
+        let path = crate::single_instance::canonical(path)
+            .to_string_lossy()
+            .to_lowercase();
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    };
+    plain(exe) == plain(&install_dir.join(INSTALLED_EXE))
+}
+
+/// Setup's uninstall entry for a per-machine 64-bit install. The .iss writes
+/// `AppId={{...}}`, and Inno unescapes only the `{{`, so every installed
+/// AppId ends in `}}`.
+#[cfg(any(windows, test))]
+const UNINSTALL_KEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}_is1";
+
+/// The folder Setup reads from its uninstall entry to install an update into.
+/// `None` when EternalMonitor was never installed.
+#[cfg(windows)]
+fn install_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut value = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&value) as u32;
+    let key: Vec<u16> = UNINSTALL_KEY.encode_utf16().chain([0]).collect();
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            w!("Inno Setup: App Path"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if result.is_err() {
+        return None;
+    }
+    let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+    Some(std::ffi::OsString::from_wide(&value[..length]).into())
+}
+
+#[cfg(not(windows))]
+fn install_dir() -> Option<PathBuf> {
+    None
+}
+
 /// Copies the helper out of the install folder, which Setup replaces, and
 /// returns the copy held open so it cannot change before it starts. The copy
 /// must hash the same as the installed helper.
@@ -522,6 +618,8 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         installer: setup.to_path_buf(),
         sha256: release.sha256.clone(),
         app,
+        // The listen port, if one was given, survives the restart.
+        app_args: std::env::args_os().skip(1).collect(),
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };
@@ -590,33 +688,6 @@ pub fn helper_command_line(helper: &Path, args: &eternal_updater::HelperArgs) ->
     line
 }
 
-/// Quotes one argument for the Windows CRT's command-line parser.
-fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return arg.to_string();
-    }
-    let mut out = String::from("\"");
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.push_str(&"\\".repeat(backslashes * 2 + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                out.push_str(&"\\".repeat(backslashes));
-                out.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    out.push_str(&"\\".repeat(backslashes * 2));
-    out.push('"');
-    out
-}
-
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// Kept in `update-state.json` next to settings.json.
@@ -628,6 +699,8 @@ struct Saved {
     later: Option<(String, u64)>,
     /// The last version announced by a Windows notification.
     notified: Option<String>,
+    /// The update popup was closed for one version, at this time.
+    popup: Option<(String, u64)>,
     /// Written just before Setup starts: `(from, to)`.
     pending: Option<(String, String)>,
 }
@@ -667,6 +740,28 @@ pub enum Notice {
     Updated(String),
 }
 
+/// The popup shown over the window when an automatic check finds an update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Popup {
+    pub version: String,
+    pub recommended: bool,
+    pub note: Option<String>,
+}
+
+impl Popup {
+    pub fn title(&self) -> String {
+        format!("EternalMonitor {} is ready", self.version)
+    }
+
+    pub fn message(&self) -> &'static str {
+        if self.recommended {
+            "Updating is highly recommended."
+        } else {
+            "An update is available."
+        }
+    }
+}
+
 pub enum Command {
     Check { manual: bool },
     Download(Release),
@@ -678,6 +773,10 @@ pub struct State {
     auto: bool,
     manual_check: bool,
     saved: Saved,
+    /// The release being downloaded, waited for or installed. A check that
+    /// finds a newer one meanwhile leaves it alone: the helper checks the
+    /// file against this release's hash.
+    chosen: Option<Release>,
     phase: Phase,
     check: CheckStatus,
     updated: Option<String>,
@@ -696,6 +795,7 @@ impl State {
             auto,
             manual_check: false,
             saved,
+            chosen: None,
             phase: Phase::Idle,
             check: CheckStatus::NotChecked,
             updated: None,
@@ -790,9 +890,9 @@ impl State {
 
     pub fn notice(&self, now: u64) -> Option<Notice> {
         let version = || {
-            self.saved
-                .latest
+            self.chosen
                 .as_ref()
+                .or(self.saved.latest.as_ref())
                 .map_or_else(String::new, |r| r.version.clone())
         };
         match &self.phase {
@@ -813,6 +913,36 @@ impl State {
             .then(|| Notice::Available(release.version.clone()))
     }
 
+    /// Once per version while the banner offers it, then at most every
+    /// three days after it is closed. Never when automatic checks are off.
+    fn popup(&mut self, now: u64) -> Option<Popup> {
+        // Closed "in the future" means the clock was set back: count it as
+        // closed now, so the next reminder is three days from this clock,
+        // neither at once nor never.
+        if let Some((_, at)) = self.saved.popup.as_mut() {
+            *at = (*at).min(now);
+        }
+        if !self.auto || !matches!(self.notice(now), Some(Notice::Available(_))) {
+            return None;
+        }
+        let release = self.available()?;
+        let closed =
+            self.saved.popup.as_ref().is_some_and(|(version, at)| {
+                *version == release.version && now - at < POPUP_INTERVAL
+            });
+        (!closed).then(|| Popup {
+            version: release.version.clone(),
+            recommended: release.recommended,
+            note: release.note.clone(),
+        })
+    }
+
+    fn popup_closed(&mut self, now: u64) {
+        if let Some(version) = self.available().map(|r| r.version.clone()) {
+            self.saved.popup = Some((version, now));
+        }
+    }
+
     fn later(&mut self, now: u64) {
         if let Some(version) = self.available().map(|r| r.version.clone()) {
             self.saved.later = Some((version, now));
@@ -830,6 +960,7 @@ impl State {
         }
         let release = self.available()?.clone();
         self.force = false;
+        self.chosen = Some(release.clone());
         if streaming {
             self.phase = Phase::Queued(None);
             self.idle_since = None;
@@ -856,7 +987,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
             other => {
                 self.phase = other;
@@ -895,7 +1027,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
         }
     }
@@ -927,7 +1060,7 @@ impl State {
             return None;
         }
         let path = path.clone();
-        let release = self.saved.latest.clone()?;
+        let release = self.chosen.clone()?;
         self.phase = Phase::Installing;
         self.saved.pending = Some((self.current.clone(), release.version.clone()));
         Some((path, release))
@@ -957,6 +1090,20 @@ impl State {
         self.phase = Phase::Failed(error.message().into());
     }
 }
+
+// ── An older iPad app ───────────────────────────────────────────────────────
+
+/// A connected iPad whose app is older than 0.3.2: it streams, but it can't
+/// tell its user about updates, so the PC does.
+pub fn ipad_app_out_of_date(feature_caps: u16) -> bool {
+    feature_caps & eternal_wire::v2::control::FEATURE_CHECKS_UPDATES == 0
+}
+
+/// Title and body of the PC's notice for [`ipad_app_out_of_date`].
+pub const IPAD_OUT_OF_DATE: (&str, &str) = (
+    "Your iPad app is out of date",
+    "Update it in TestFlight. It's highly recommended.",
+);
 
 // ── Version mismatch ────────────────────────────────────────────────────────
 
@@ -1129,6 +1276,7 @@ pub struct Updater {
     state: Arc<Mutex<State>>,
     path: Option<PathBuf>,
     tx: mpsc::Sender<Command>,
+    in_place: bool,
 }
 
 impl Updater {
@@ -1158,7 +1306,20 @@ impl Updater {
         {
             tracing::warn!(%error, "Could not start the update worker");
         }
-        Self { state, path, tx }
+        let in_place = std::env::current_exe()
+            .is_ok_and(|exe| installs_in_place(&exe, install_dir().as_deref()));
+        Self {
+            state,
+            path,
+            tx,
+            in_place,
+        }
+    }
+
+    /// `false` for a copy Setup would not replace: Update now opens the
+    /// website instead.
+    pub fn installs_in_place(&self) -> bool {
+        self.in_place
     }
 
     fn with<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
@@ -1173,6 +1334,15 @@ impl Updater {
 
     pub fn notice(&self) -> Option<Notice> {
         self.state.lock().notice(now_secs())
+    }
+
+    pub fn popup(&self) -> Option<Popup> {
+        self.with(|state| state.popup(now_secs()))
+    }
+
+    /// Later, Update now or closing the popup.
+    pub fn popup_closed(&self) {
+        self.with(|state| state.popup_closed(now_secs()));
     }
 
     pub fn check_status(&self) -> CheckStatus {

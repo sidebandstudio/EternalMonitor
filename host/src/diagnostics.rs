@@ -107,6 +107,22 @@ fn log_stream_summary(shared: &SharedControl) {
         "Support stream summary");
 }
 
+/// The Windows release for a feedback email, e.g. "Windows 11 24H2 (build
+/// 26100.2894)". None off Windows or when the registry can't be read.
+pub fn windows_version() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let os_key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        crate::feedback::windows_label(
+            &registry_string(os_key, "DisplayVersion"),
+            &registry_string(os_key, "CurrentBuildNumber"),
+            &registry_dword(os_key, "UBR"),
+        )
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 #[cfg(windows)]
 fn windows_system_report() -> Vec<String> {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};

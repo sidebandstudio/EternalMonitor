@@ -131,6 +131,20 @@ enum ConnectionProblem: Equatable {
         }
     }
 
+    /// Whether the card offers Report this problem. Not on cards that only
+    /// say what is happening or what the user did: a reconnect or an update
+    /// still under way, the cable pulled out, USB turned off, the PC busy
+    /// with another device, or the pairing code typed as the address.
+    var canReport: Bool {
+        switch self {
+        case .reconnecting, .pcUpdating(.reconnecting), .pcUpdating(.manual),
+             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress:
+            return false
+        default:
+            return true
+        }
+    }
+
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]
@@ -226,7 +240,10 @@ enum ConnectionProblem: Equatable {
         }
     }
 
-    private static let offline: Set<POSIXErrorCode> = [.ENETDOWN, .ENETUNREACH, .EHOSTUNREACH]
+    /// This iPad's own network is down. No route to a host or network
+    /// (EHOSTUNREACH, ENETUNREACH) usually means the PC is asleep or
+    /// elsewhere while Wi-Fi works, so it gets the general advice.
+    private static let offline: Set<POSIXErrorCode> = [.ENETDOWN]
 }
 
 /// What the USB cable card says for each listener status.

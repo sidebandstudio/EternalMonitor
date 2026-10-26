@@ -232,6 +232,20 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
 
 /// Text link that opens `url` in the browser.
 pub fn link(ui: &mut Ui, label: &str, url: &str) -> Response {
+    let response = link_like(ui, label, Icon::External, WidgetType::Link);
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    response.on_hover_text(url)
+}
+
+/// Looks like [`link`] with `icon` after the text, but only reports the
+/// click, for actions that open something inside the window.
+pub fn link_button(ui: &mut Ui, label: &str, icon: Icon) -> Response {
+    link_like(ui, label, icon, WidgetType::Button)
+}
+
+fn link_like(ui: &mut Ui, label: &str, icon: Icon, role: WidgetType) -> Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         FontId::new(SMALL, medium()),
@@ -239,10 +253,7 @@ pub fn link(ui: &mut Ui, label: &str, url: &str) -> Response {
     );
     let size = galley.size() + vec2(16.0 + 5.0, 0.0);
     let (rect, response) = ui.allocate_exact_size(vec2(size.x, size.y.max(20.0)), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, label));
-    if response.clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-    }
+    response.widget_info(|| WidgetInfo::labeled(role, true, label));
     if ui.is_rect_visible(rect) {
         let hover =
             ui.ctx()
@@ -257,14 +268,12 @@ pub fn link(ui: &mut Ui, label: &str, url: &str) -> Response {
                 pos2(rect.left() + text_width + 5.0 + 6.0, rect.center().y),
                 vec2(11.0, 11.0),
             ),
-            Icon::External,
+            icon,
             color,
         );
         focus_ring(ui, &response, rect.expand(3.0), 6.0);
     }
-    response
-        .on_hover_text(url)
-        .on_hover_cursor(CursorIcon::PointingHand)
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: f32) {

@@ -85,6 +85,13 @@ final class ConnectionManager: ObservableObject {
     /// Set with `connectionError` when the PC and iPad versions differ.
     @Published var versionMismatch: VersionMismatch?
     @Published var pairingPrompt: PairingSheetModel?
+
+    /// HELLO2 feature bits. Every build says it checks for its own updates,
+    /// so the PC tells only older iPad apps to update.
+    nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
+        (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
+            | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates
+    }
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
     private let pairingStore = PairingStore.shared
@@ -95,6 +102,13 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var signalLost = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
+
+    /// Settled on the Connect screen: no attempt under way, no reconnect
+    /// cycle waiting between attempts, and no problem card or error. An
+    /// error such as a version mismatch says what to do, so it stays in view.
+    var isIdleOnConnect: Bool {
+        state == .disconnected && problem == nil && connectionError == nil && reconnectAttempt == 0
+    }
     /// Decoded video dimensions in pixels — the touch relay maps gestures
     /// through the same aspect-fit rect the renderer draws.
     @Published private(set) var videoSize: CGSize = .zero
@@ -106,6 +120,10 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
     @Published private(set) var hostInfo: ControlChannel.SessionInfo?
+    /// The one-time feedback card's progress, kept in UserDefaults.
+    @Published private(set) var feedbackAsk = FeedbackAsk()
+    /// When the current session's first frame arrived.
+    private var streamingSince: Date?
     /// The host's live stream parameters — from the ACK, then refreshed by
     /// every heartbeat (so ABR bitrate changes and codec switches show up).
     @Published private(set) var hostStreamConfig: StreamConfig?
@@ -377,6 +395,7 @@ final class ConnectionManager: ObservableObject {
                     self.record(.info, "decode", "First frame decoded successfully")
                     self.timeoutTask?.cancel()
                     self.state = .connected
+                    self.streamingSince = Date()
                     // A reconnect attempt that streams ends its cycle.
                     self.endReconnectCycle()
                     self.transportMode = isUSB ? "USB" : "WiFi"
@@ -622,8 +641,7 @@ final class ConnectionManager: ObservableObject {
             screenPtH: UInt16(clamping: Int(screen.bounds.height)),
             refreshHz: UInt8(clamping: screen.maximumFramesPerSecond),
             decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
-            featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
-                | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
+            featureCaps: Self.featureCaps(wantsInput: wantsInput, wantsAudio: wantsAudio, isUSB: isUSB),
             deviceId: DeviceIdentity.load(),
             preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),
             authToken: pairingToken
@@ -916,13 +934,15 @@ final class ConnectionManager: ObservableObject {
     }
 
     /// Try the last connection again: the cable when that is what failed,
-    /// otherwise the last PC address.
+    /// otherwise the last PC address. Cable advice kept after a Wi-Fi
+    /// fallback ran out still means the cable, though Wi-Fi was tried last.
     func retry() {
         guard state == .disconnected else { return }
+        let cable = transportMode == "USB" || problem == .usbFailed
         endReconnectCycle()
         problem = nil
         connectionError = nil
-        if transportMode == "USB" {
+        if cable {
             resumeUSBConnections()
         } else if let target = lastTarget {
             connect(host: target.host, port: target.port)
@@ -1020,6 +1040,19 @@ final class ConnectionManager: ObservableObject {
         connect(host: target.host, port: target.port)
     }
 
+    /// Send feedback or Not now on the one-time card.
+    func finishFeedbackAsk() {
+        feedbackAsk.finish()
+    }
+
+    /// The details a feedback email carries about this connection.
+    var feedbackContext: Feedback.Context {
+        Feedback.Context.current(
+            pcVersion: PCVersions.version(address: lastTarget?.host, name: hostInfo?.hostName),
+            connection: state == .disconnected ? nil : (transportMode == "USB" ? "USB" : "Wi-Fi")
+        )
+    }
+
     func disconnect(reason: ByeReason = .userDisconnect) {
         if state != .disconnected {
             recordStreamSummary(reason: "disconnect=\(reason)")
@@ -1054,6 +1087,10 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = false
         audioStats = AudioStats()
 
+        if state == .connected, let since = streamingSince {
+            feedbackAsk.sessionEnded(after: Date().timeIntervalSince(since))
+        }
+        streamingSince = nil
         state = .disconnected
         fps = 0
         lagMs = 0
@@ -1254,6 +1291,10 @@ final class AppSettings: ObservableObject {
     @Published var targetFPS: Int {
         didSet { UserDefaults.standard.set(targetFPS, forKey: "targetFPS") }
     }
+    /// Fit (default) shows the whole PC picture; Fill covers the iPad.
+    @Published var pictureFit: PictureFit {
+        didSet { UserDefaults.standard.set(pictureFit.rawValue, forKey: "pictureFit") }
+    }
     // last successfully-connected host+port for pre-fill on relaunch.
     @Published var lastHost: String {
         didSet { UserDefaults.standard.set(lastHost, forKey: "lastHost") }
@@ -1275,6 +1316,7 @@ final class AppSettings: ObservableObject {
         self.commandAsControl = defaults.flag(forKey: "commandAsControl")
         self.autoReconnect = defaults.flag(forKey: "autoReconnect")
         self.targetFPS = defaults.frameRatePreference()
+        self.pictureFit = PictureFit(rawValue: defaults.string(forKey: "pictureFit") ?? "") ?? .fit
         self.lastHost = defaults.object(forKey: "lastHost") as? String ?? ""
         let port = defaults.integer(forKey: "lastPort")
         self.lastPort = UInt16(clamping: port)

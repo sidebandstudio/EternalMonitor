@@ -69,7 +69,7 @@ fn children_inherit_only_what_they_are_given() {
     // The helper starting the app again: nothing at all.
     let relaunched = dir.join("relaunched.txt");
     std::env::set_var(PROBE, probe(&relaunched));
-    eternal_updater::relaunch(&exe).unwrap();
+    eternal_updater::relaunch(&exe, &[]).unwrap();
 
     let answers = (answer(&helper), answer(&relaunched));
     assert_eq!(

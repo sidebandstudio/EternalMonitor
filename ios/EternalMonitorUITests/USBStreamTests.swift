@@ -44,7 +44,7 @@ final class USBStreamTests: XCTestCase {
 
     private func launchApp(autoconnect: String = "") -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "YES", "-autoReconnect", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "YES", "-autoReconnect", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = autoconnect
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()

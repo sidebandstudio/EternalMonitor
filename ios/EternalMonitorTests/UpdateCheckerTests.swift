@@ -20,6 +20,137 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertNil(UpdateManifest.parse(Data("<html>".utf8)))
     }
 
+    private func ipadManifest(_ extra: String) -> Data {
+        Data("""
+        {"schema":1,"windows":{"version":"0.3.2","installer":"x","sha256":"y","note":"PC only"},
+         "ipad":{"version":"0.3.2","build":170,"channel":"beta"\(extra)},"future":{"a":1}}
+        """.utf8)
+    }
+
+    func testManifestReadsTheOptionalRecommendedFlagAndNote() throws {
+        // Missing: recommended, no note. Unknown keys are ignored.
+        let plain = try XCTUnwrap(UpdateManifest.parse(ipadManifest("")))
+        XCTAssertEqual(plain, UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil))
+        XCTAssertTrue(plain.isRecommended)
+        XCTAssertNil(plain.note)
+
+        let soft = try XCTUnwrap(UpdateManifest.parse(ipadManifest(#","recommended":false,"note":"  Fixes Pencil pressure.  ""#)))
+        XCTAssertFalse(soft.isRecommended)
+        XCTAssertEqual(soft.note, "Fixes Pencil pressure.")
+
+        // A note that isn't one short line, or a field of the wrong type, is
+        // dropped instead of hiding the update.
+        let long = String(repeating: "x", count: 201)
+        for extra in [#","note":"""#, #","note":"   ""#, #","note":"Two\nlines""#, #","note":"\#(long)""#,
+                      #","note":7,"recommended":"yes""#, #","note":null,"recommended":null"#] {
+            let parsed = try XCTUnwrap(UpdateManifest.parse(ipadManifest(extra)), extra)
+            XCTAssertNil(parsed.note, extra)
+            XCTAssertTrue(parsed.isRecommended, extra)
+        }
+        let longest = String(repeating: "x", count: 200)
+        XCTAssertEqual(UpdateManifest.parse(ipadManifest(#","note":"\#(longest)""#))?.note?.count, 200)
+    }
+
+    func testPopupShowsOncePerBuildThenAtMostEveryThreeDays() {
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let available = UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let day: TimeInterval = 86_400
+        let make = { (available: UpdateManifest.IPad?, closed: (build: Int, at: Date)?, at: Date) in
+            UpdatePopupModel.make(available: available, installed: installed, automatic: true, closed: closed, now: at)
+        }
+        let popup = make(available, nil, now)
+        XCTAssertEqual(popup, UpdatePopupModel(version: "0.3.2", build: 170, recommended: true, note: nil))
+        XCTAssertEqual(popup?.title, "A new version of EternalMonitor is ready")
+        XCTAssertEqual(popup?.message, "Updating is highly recommended.")
+
+        let closed = (build: 170, at: now)
+        XCTAssertNil(make(available, closed, now.addingTimeInterval(3 * day - 1)))
+        XCTAssertNotNil(make(available, closed, now.addingTimeInterval(3 * day)))
+        // A clock set back counts as closed now: not at once, and back three days from this clock.
+        let rolledBack = now.addingTimeInterval(-1)
+        XCTAssertNil(make(available, closed, rolledBack), "a clock set back must not show it at once")
+        XCTAssertNil(make(available, closed, now.addingTimeInterval(-60)))
+        let next = UpdateManifest.IPad(version: "0.3.2", build: 171, testflight: nil)
+        XCTAssertNotNil(make(next, closed, now), "a newer build shows at once")
+        XCTAssertNil(make(nil, nil, now))
+        XCTAssertNil(make(UpdateManifest.IPad(version: "0.3.1", build: 166, testflight: nil), nil, now))
+        XCTAssertNil(UpdatePopupModel.make(available: available, installed: installed, automatic: false, closed: nil, now: now))
+
+        let soft = UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil, recommended: false, note: "Fixes Pencil pressure.")
+        XCTAssertEqual(make(soft, nil, now)?.message, "An update is available.")
+        XCTAssertEqual(make(soft, nil, now)?.note, "Fixes Pencil pressure.")
+    }
+
+    @MainActor
+    func testCheckerRemembersThePopupAndTheNote() throws {
+        let suite = "UpdateCheckerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let data = Data(#"{"schema":1,"ipad":{"version":"0.3.2","build":170,"recommended":false,"note":"Fixes Pencil pressure."}}"#.utf8)
+        let checker = UpdateChecker(defaults: defaults, source: .injected(data), installed: installed)
+        checker.checkIfDue()
+        let now = Date()
+        XCTAssertEqual(checker.popup(now: now)?.note, "Fixes Pencil pressure.")
+        checker.closePopup(now: now)
+        XCTAssertNil(checker.popup(now: now))
+        XCTAssertNotNil(checker.banner, "Later on the popup leaves the banner")
+
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed)
+        XCTAssertNil(relaunched.popup(now: now.addingTimeInterval(60)))
+        let later = relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval))
+        XCTAssertEqual(later?.message, "An update is available.")
+        XCTAssertEqual(later?.note, "Fixes Pencil pressure.")
+    }
+
+    @MainActor
+    func testAClockSetBackOrFarAheadWaitsThreeDaysFromNow() throws {
+        let suite = "UpdateCheckerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let data = Data(#"{"schema":1,"ipad":{"version":"0.3.2","build":170}}"#.utf8)
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let checker = UpdateChecker(defaults: defaults, source: .injected(data), installed: installed, now: now)
+        checker.checkIfDue(now: now)
+
+        // Closed, then the clock goes back one second.
+        checker.closePopup(now: now)
+        let back = now.addingTimeInterval(-1)
+        checker.checkIfDue(now: back)
+        XCTAssertNil(checker.popup(now: back))
+        XCTAssertNil(checker.popup(now: back.addingTimeInterval(UpdatePopupModel.closeInterval - 1)))
+        XCTAssertNotNil(checker.popup(now: back.addingTimeInterval(UpdatePopupModel.closeInterval)))
+
+        // Closed while the clock was ten years ahead, then corrected: three days at most.
+        checker.closePopup(now: now.addingTimeInterval(10 * 365 * 86_400))
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed, now: now)
+        XCTAssertEqual(relaunched.popupClosed?.at, now, "rewritten as closed now")
+        XCTAssertEqual(defaults.object(forKey: "updatePopupClosedAt") as? Date, now)
+        XCTAssertNil(relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval - 1)))
+        XCTAssertNotNil(relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval)))
+    }
+
+    func testThisAppTellsThePCItChecksForUpdates() {
+        // 0.3.1 sent only bits 0 to 2, so the PC reads a missing bit 4 as an older app.
+        XCTAssertEqual(Hello2.featureChecksUpdates, 1 << 4)
+        for bit in [Hello2.featureWantsInput, Hello2.featureWantsAudio, Hello2.featureSupportsNack] {
+            XCTAssertEqual(bit & Hello2.featureChecksUpdates, 0)
+        }
+        for input in [false, true] {
+            for audio in [false, true] {
+                for usb in [false, true] {
+                    let caps = ConnectionManager.featureCaps(wantsInput: input, wantsAudio: audio, isUSB: usb)
+                    XCTAssertNotEqual(caps & Hello2.featureChecksUpdates, 0)
+                    XCTAssertEqual(caps & Hello2.featureWantsInput != 0, input)
+                    XCTAssertEqual(caps & Hello2.featureWantsAudio != 0, audio)
+                    XCTAssertEqual(caps & Hello2.featureSupportsNack != 0, !usb)
+                }
+            }
+        }
+    }
+
     func testVersionCompare() {
         XCTAssertLessThan(AppVersion("0.3.9")!, AppVersion("0.3.10")!)
         XCTAssertLessThan(AppVersion("0.9.0")!, AppVersion("1.0.0")!)

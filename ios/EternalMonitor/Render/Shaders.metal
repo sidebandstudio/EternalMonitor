@@ -2,7 +2,7 @@
 using namespace metal;
 
 struct DisplayUniforms {
-    float2 scale;        // aspect-fit scale applied to the fullscreen quad
+    float2 scale;        // aspect-fit or aspect-fill scale applied to the fullscreen quad
     uint   matrixIndex;  // 0 = BT.709, 1 = BT.601 (video range)
 };
 
@@ -14,6 +14,7 @@ struct VertexOut {
 // Generates an aspect-fit quad from vertex_id (no vertex buffer needed).
 // Draw with .triangleStrip, vertexCount: 4. `scale` shrinks the quad on one
 // axis to letterbox/pillarbox; the pass clear color shows through around it.
+// For Fill, `scale` grows one axis past 1 and clipping trims those edges.
 vertex VertexOut fullscreen_vertex(uint vid [[vertex_id]],
                                    constant DisplayUniforms &uniforms [[buffer(0)]]) {
     const float2 positions[4] = {

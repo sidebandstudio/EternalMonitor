@@ -13,12 +13,12 @@ and control the PC with touch, a keyboard or Apple Pencil.
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
 
-[Download](#download) · [Setup guide](SETUP.md) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
+[Download](#download) · [Setup guide](SETUP.md) · [Known issues](https://eternalmonitor.dev/known-issues.html) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
 
 </div>
 
 <p align="center">
-  <img src="docs/assets/og.png" width="860" alt="The EternalMonitor Windows app streaming a desktop to an iPad Pro">
+  <img src="docs/assets/og.png" width="860" alt="The EternalMonitor Windows app streaming to an iPad, which shows the PC's picture">
 </p>
 
 EternalMonitor streams your Windows desktop to an iPad and sends your input back.
@@ -40,9 +40,11 @@ the MIT license, and needs no account.
 - **Touch, keyboard and pointer.** Tap to click, drag, scroll with two fingers and
   hold to right-click. Hardware keyboards, trackpads and mice work too, with
   sticky modifiers and middle-click.
-- **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt.
-  Drawing mode ignores your palm on the canvas, and Clip Studio Paint works with
-  its Tablet PC setting.
+- **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt,
+  and the pen lands under the tip on any monitor layout. Drawing mode ignores your
+  palm on the canvas, and Clip Studio Paint works with its Tablet PC setting.
+- **Fit or fill.** Fit shows the whole PC picture, with bars where the shapes
+  differ. Fill uses the iPad's entire screen and trims the edges that don't fit.
 - **PC audio.** Sound plays on the iPad as Opus, with a jitter buffer and loss
   concealment. You can mute it without stopping the video.
 - **Loss repair for real Wi-Fi.** When a packet goes missing, the iPad asks for
@@ -52,6 +54,14 @@ the MIT license, and needs no account.
   H.264 by default, or HEVC if you prefer it, at 30, 60, 90 or 120 fps.
 - **Pairing.** The first Wi-Fi connection asks for a six-digit code or a QR scan.
   After that the iPad remembers the PC. USB needs no code.
+- **Recovers and explains.** The picture comes back by itself after the lock
+  screen, a display change or a stream restart. When something does go wrong,
+  both apps say what happened and what to do, and **Send feedback** writes an
+  email to the studio with your setup filled in.
+- **Updates in one click.** A popup tells you when a new version is out. On
+  Windows, **Update now** checks the download and installs it with one Windows
+  prompt; the iPad app opens TestFlight. The Windows app runs without a console
+  window.
 
 <br clear="right">
 
@@ -59,8 +69,8 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1) (v0.3.1 current stable) |
-| **iPad** | iPadOS 17 or later | [TestFlight v0.3.1, build 166](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
+| **Windows** | Windows 10 version 1809 or later, or Windows 11, 64-bit, with NVIDIA, AMD or Intel graphics | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.2) (v0.3.2 current stable) |
+| **iPad** | iPadOS 17 or later | [TestFlight v0.3.2, build 316](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
 Install both apps from the same version. The older v0.1 releases use a different
 protocol and cannot connect to the v0.3 iPad app.
@@ -74,7 +84,9 @@ SHA-256 matches the one on the [release page](https://github.com/sidebandstudio/
 
 For USB you also need Apple's free [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k)
 app, open while you stream. Windows can only reach an iPad over a cable through
-it, and EternalMonitor tells you when it is closed or missing.
+it, and EternalMonitor tells you when it is closed or missing. Apple Devices
+needs Windows 10 version 22H2 (build 19045) or Windows 11, so on older Windows 10
+connect over Wi-Fi.
 
 **Next, follow the [setup guide](SETUP.md).** It walks through installing both
 apps, pairing, USB, the extended display and drawing, with the exact button names
@@ -82,19 +94,20 @@ you will see.
 
 ## Status
 
-v0.3.1 includes Intel Quick Sync startup fixes, hardware encoder fallback,
-audio scheduling improvements and automatic support diagnostics. Install it
-with iPad TestFlight v0.3.1, build 166.
+v0.3.2 places Apple Pencil correctly on PCs with more than one monitor, adds
+Fill, plain-language messages, Send feedback and one-click Windows updates, and
+opens on graphics drivers that crashed 0.3.1 at startup. Install it with iPad
+TestFlight v0.3.2, build 316.
 
 Windows and iPad diagnostics include device details, app errors and stream
 statistics. Reports include PC names and network addresses, but exclude screen
 content, audio and pairing credentials. Disable automatic sharing in Settings.
 On iPad, open Settings > Support > Diagnostics to copy or export a report.
 
-All six release preparation checks passed, including Windows, macOS and iPad
-simulator streaming. The affected Windows 10 / Intel Iris Xe device and physical
-iPad Pro M5 still need customer testing. Earlier physical-device results remain
-in [docs/hardware-verification.md](docs/hardware-verification.md).
+The release checks passed on Windows, macOS and iPad simulators. Problems we
+know about are on the [Known issues](https://eternalmonitor.dev/known-issues.html)
+page, and earlier physical-device results remain in
+[docs/hardware-verification.md](docs/hardware-verification.md).
 
 Known limits:
 
@@ -104,31 +117,25 @@ Known limits:
   but there it streams a test pattern instead of your screen.
 - Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.
 
+[Known issues](https://eternalmonitor.dev/known-issues.html) lists every problem we know about, with what
+to do about each one.
+
 ## How it works
 
-```mermaid
-flowchart RL
-  subgraph pc [Windows PC]
-    direction TB
-    capture[Desktop capture] --> encode[GPU encoder]
-    inject[Input injection]
-  end
-  subgraph ipad [iPad]
-    direction TB
-    repair[Reassembly and repair] --> decode[VideoToolbox decode] --> show[Metal display]
-    touch[Touch, keyboard, Pencil]
-  end
-  pc -- "video and audio over Wi-Fi or USB" --> ipad
-  ipad -- "input and repair requests" --> pc
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/how-it-works-dark.svg">
+  <img src="docs/assets/readme/how-it-works-light.svg" width="1120" alt="The Windows PC captures the desktop, encodes the video on the GPU and sends it over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is captured with WASAPI, encoded as Opus and played on the iPad. Touch, Pencil, keyboard and trackpad input travels back to the PC, which injects it.">
+</picture>
 
 The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
 the GPU through FFmpeg, and sends each frame as numbered UDP fragments. Over USB
 the same messages travel through a framed tunnel that Apple's device service
-provides. The iPad app is native Swift. It reassembles fragments, requests any
-that are missing, decodes with VideoToolbox and renders with Metal. Input and
-receiver reports go back on the same session, and the host uses those reports
-to adapt the bitrate.
+provides. The iPad app is native Swift. It reassembles fragments, decodes with
+VideoToolbox and renders with Metal. On Wi-Fi it also requests any fragments
+that are missing. PC audio is captured with WASAPI and sent as Opus, and the
+iPad conceals lost audio instead of requesting it again. Input and receiver
+reports go back on the same session, and the host uses those reports to adapt
+the bitrate.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) describes the pipeline and protocol v2, and
 [docs/decisions.md](docs/decisions.md) explains why each part works the way it
@@ -152,6 +159,13 @@ $env:FFMPEG_DIR = "C:\ffmpeg"
 cargo build --release -p eternal-host
 .\target\release\eternal-host.exe          # optional port argument, default 9876
 ```
+
+The host is a Windows GUI program, so it opens no console window. Started
+from a terminal it prints its log there, but the prompt returns at once;
+`cargo run -p eternal-host` waits for it. With `ETERNAL_HEADLESS=1` and output
+redirected (`> host.log`) it gets its own console, so Ctrl+C in the terminal
+can't reach it: press Ctrl+C in that console's window, or use Task Manager.
+`scripts\win\Stop-Host.ps1` stops only hosts that `remote.sh run-host` started.
 
 `scripts\build-installer.ps1` builds the full Setup.exe with Inno Setup and the
 same `FFMPEG_DIR`. `scripts\package.ps1` builds a bare zip.
@@ -237,6 +251,7 @@ streaming system test on every pull request.
 | Document | What it covers |
 | --- | --- |
 | [SETUP.md](SETUP.md) | Step-by-step setup for anyone, including USB and drawing |
+| [Known issues](https://eternalmonitor.dev/known-issues.html) | Problems we know about, and what to do about each (`docs/known-issues.html`) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The pipeline, protocol v2 and each component |
 | [docs/decisions.md](docs/decisions.md) | Why things are the way they are, with measurements |
 | [docs/pencil-drawing.md](docs/pencil-drawing.md) | Apple Pencil, Windows Ink and Clip Studio Paint |
@@ -258,10 +273,10 @@ described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-EternalMonitor is released under the [MIT License](LICENSE), © 2026 Ali Younes.
+EternalMonitor is released under the [MIT License](LICENSE), © 2026 Sideband Studio.
 The Windows installer also ships third-party components under their own licenses,
 including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 and FFmpeg.
 
-Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)). Questions go to
+Built by [Sideband Studio](https://sideband.studio). Questions go to
 [hello@sideband.studio](mailto:hello@sideband.studio).

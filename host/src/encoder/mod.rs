@@ -1294,19 +1294,22 @@ fn validate_capture_with_ffmpeg(capture_path: &std::path::Path) {
             return;
         };
 
-        match Command::new(&ffmpeg_path)
-            .args([
-                "-hide_banner",
-                "-v",
-                "error",
-                "-i",
-                capture_path.to_string_lossy().as_ref(),
-                "-f",
-                "null",
-                "-",
-            ])
-            .output()
-        {
+        let mut command = Command::new(&ffmpeg_path);
+        command.args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-i",
+            capture_path.to_string_lossy().as_ref(),
+            "-f",
+            "null",
+            "-",
+        ]);
+        // ffmpeg.exe is a console program. The host has no console, so
+        // without CREATE_NO_WINDOW Windows would open a console window for it.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
+        match command.output() {
             Ok(output) if output.status.success() => {
                 info!(
                     capture = %capture_path.display(),

@@ -1,13 +1,13 @@
 {
   "schema": 1,
   "windows": {
-    "version": "0.3.1",
-    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.1/EternalMonitor-Setup.exe",
-    "sha256": "b276602bd54a0eec9459b9f6d91f67669fa533600d47456f30cabb36449cf0a5"
+    "version": "0.3.2",
+    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.2/EternalMonitor-Setup.exe",
+    "sha256": "0c55e07884405cc32a660c7c657e745adbbc9bc429837cd989c0c818625d54a9"
   },
   "ipad": {
-    "version": "0.3.1",
-    "build": 166,
+    "version": "0.3.2",
+    "build": 316,
     "testflight": "https://testflight.apple.com/join/ppc9QfXc"
   }
 }

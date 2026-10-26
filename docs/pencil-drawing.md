@@ -103,7 +103,9 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   never dropped this way: an up Windows is owed goes where the Pencil lifted
   once Windows takes it (or, if that is off the virtual screen after a
   display change, ends the contact where Windows has it), and a mouse release
-  stays owed while Windows holds the button.
+  stays owed while Windows holds the button. A mouse press that went stale is
+  pressed again only at a later down or move of the same stroke, so ending a
+  stroke Windows never saw pressed never clicks.
 - Native input is stuck when Windows has accepted no frame for a second
   while ink waits, or 1.2 s while it holds a contact. The host then
   recreates the pen device once; if the new one accepts nothing within

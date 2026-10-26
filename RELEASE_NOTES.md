@@ -1,97 +1,7 @@
-## EternalMonitor (unreleased)
+## Next Windows release
 
-Apple Pencil placement on PCs with more than one monitor, plain-language setup
-and problem messages in both apps, in-app updates, and Windows reliability and
-startup fixes from 0.3.1 support diagnostics. iPads on 0.3.1 work with the
-Windows changes.
+Not released yet.
 
-### What changed
-
-- Apple Pencil lands under the tip when another monitor sits to the left of or
-  above the main display, including an extended iPad display placed there.
-  Previously the pen moved left or up by that monitor's size, and strokes near
-  the far edge stopped with "Windows rejected native pen input".
-- After Windows cancels a pen contact, for example when a display changes mode,
-  the stroke continues from the same Pencil sample instead of being dropped
-  until the Pencil lifts. A Pencil held still follows a display that moves.
-- The Windows host uses physical pixels from startup on scaled displays, and
-  touch clicks land on the exact pixel on every monitor layout, including very
-  wide desktops.
-- If Windows cannot create its pen device, Pencil outside Drawing mode works as
-  a mouse instead of doing nothing.
-- The host log records the input mapping geometry for each session.
-- The Windows Stream page asks **Use the iPad as** with **Mirror my screen**
-  and **Second screen** at the top, above the fold. A change applies straight
-  away: a running stream restarts and the iPad reconnects by itself. The iPad
-  app uses the same names and explains that the choice is made on the PC.
-- The iPad looks for PCs as soon as it opens, and tapping a found or recent PC
-  connects. Connection problems say what happened and what to do, with
-  **Try again** or **Open Settings**: the PC didn't answer (including the
-  firewall case), the PC answered but sent no picture, the connection was lost,
-  the cable was unplugged, and Local Network access is off. Technical detail
-  stays in Connection details and the support log.
-- Windows notices for the CPU encoder fallback and a second screen that
-  couldn't start use plain words and offer **Use recommended settings**,
-  **Try again** or **Download installer**. Encoder, packet size, HEVC and the
-  quality limit moved under **Advanced** in Settings.
-- Drawing mode is explained in one sentence, and **Reconnect now to apply**
-  appears when it changes mid-session.
-- Windows shows a banner on every page and one notification when a new
-  version is ready. **Update now** downloads the installer, checks it against
-  the SHA-256 published with the release, installs it with only the Windows
-  permission prompt and a progress window, and restarts EternalMonitor. If an
-  iPad is streaming, the update waits until streaming stops, or until you
-  click **Stop and update**. If anything fails, the current version keeps
-  running and the banner links to the website.
-- Windows Settings has **Check for updates automatically** and **Check now**.
-  **Later** hides the banner for that version for a day.
-- Opening EternalMonitor on the PC while it is already running brings its
-  window to the front instead of starting a second copy.
-- After **Stop and update** on the PC, the iPad says the PC is updating
-  EternalMonitor. With Auto-reconnect on it connects again once the new
-  version is running; otherwise, or if the PC takes longer, it says to try
-  again once EternalMonitor has opened on the PC.
-- The iPad connect screen and Settings say when a newer build is ready in
-  TestFlight, with an **Open TestFlight** button.
-- When the PC and iPad cannot connect because one is older, both apps say which
-  one to update and how.
-- Both apps read https://eternalmonitor.dev/latest.json, which is published
-  only after Apple approves the matching iPad build. Requests carry no
-  identifiers.
-- The Windows Stream page says why the picture stopped while Windows keeps
-  the screen from EternalMonitor: the lock screen or a permission prompt, a
-  display change, another app recording the screen, a disconnected Remote
-  Desktop session, or a laptop graphics setting, with the Windows setting to
-  change. A second screen that fails because the display driver stopped
-  responding asks for a Windows restart; one whose driver is missing links to
-  the installer. Each message goes away when the problem ends.
-- The iPad says when the typed address is the pairing code, and when nothing
-  answers at an address ending in .1, which usually belongs to the router.
-- With VoiceOver running, the iPad's stream controls stay on screen until you
-  hide them.
-- The Windows window no longer closes without a word on PCs whose graphics
-  driver crashes while it starts, such as Intel UHD 620 with a 2018 driver.
-  The host prefers a fully supported graphics backend on the same GPU, usually
-  DirectX 12 where the Vulkan driver is incomplete. If a launch still closes
-  before its window appears, the next launch uses another backend.
-- When the Windows host cannot start, or stops unexpectedly, it shows a message
-  with the error and the path of the log file. The error is written to the log
-  and queued for automatic support diagnostics before the process ends. A
-  small second EternalMonitor process reports crashes and turns the virtual
-  display off if the app itself cannot.
-- A USB cable connection now stays up when the PC restarts its stream, for
-  example after a settings change or when the extended display turns on. In
-  0.3.1 each restart dropped the cable connection, and with the extended
-  display selected the iPad could keep reconnecting without ever showing a
-  picture.
-- When Windows blocks screen capture (lock screen, UAC prompt, display mode
-  change, or a laptop GPU it will not capture from), the host keeps retrying
-  by itself instead of stopping the stream until someone clicks Start. A
-  connected iPad keeps the last picture meanwhile. The retries back off
-  instead of running in a tight loop that filled the logs.
-- Turning on the extended display no longer triggers repeated stream restarts
-  while Windows runs the display task. When that task hangs or is missing, the
-  host mirrors the main screen immediately instead of waiting for it each time.
 - When the second screen doesn't appear, the Windows Stream page says why and
   what to do: the display driver isn't installed (run Setup again), Windows
   couldn't verify the driver's signature, the driver stopped with an error
@@ -103,7 +13,8 @@ Windows changes.
   when the display cannot appear. After any failed attempt the support
   diagnostics and **Copy logs** hold a display snapshot: the device state, the
   graphics cards and the display paths Windows reports. The snapshot leaves out
-  the PC's name and the user's name; the rest of the log still contains them. In 0.3.1 every case read "no display appeared in time".
+  the PC's name and the user's name; the rest of the log still contains them.
+  Before, every case read "no display appeared in time".
 - The second screen is drawn by the graphics card that drives the main screen,
   whether or not **Match the iPad's resolution** is on. Before, the driver
   chose the card with the most memory, which on laptops with Intel and NVIDIA
@@ -124,45 +35,79 @@ Windows changes.
 - Running EternalMonitor-Setup.exe again repairs a virtual display driver that
   Setup installed when none of its devices works, for example after the device
   was removed in Device Manager. Working devices are never removed, and a
-  driver another app installed is left alone with a message saying so. In
-  0.3.1 Setup kept the existing driver and stopped with "Windows did not finish
+  driver another app installed is left alone with a message saying so. Before,
+  Setup kept the existing driver and stopped with "Windows did not finish
   installing the virtual display driver".
 - Support diagnostics name Windows 11 from the build number. Windows 11 keeps
-  "Windows 10" in the registry, which 0.3.1 reported as the system.
-- With no iPad connected, the PC no longer encodes its screen. It reads the
-  screen at most once a second, so an iPad that connects still sees the
-  current desktop.
-- PC audio no longer turns off for the rest of a session after a single large
-  sound packet.
-- PC audio starts cleanly when the iPad connects, without a short burst of
-  stale sound or a gap in the first second.
-- The installer also allows display traffic on domain (work or school)
-  networks.
-- A log line repeated many times in a row is written once, followed by a
-  line with the repeat count and the first and last times. The count appears
-  about 30 seconds after the burst starts, or when the app quits, so logs and
-  support reports keep the lines that explain a problem.
-- The host log and support diagnostics keep their final lines when the app
-  quits normally, so a normal quit can be told apart from a crash. Quitting
-  waits at most two seconds for uploads; the rest are sent on the next launch.
+  "Windows 10" in the registry, which earlier versions reported as the system.
+
+## EternalMonitor v0.3.2
+
+Released October 22, 2026. Install the Windows and iPad 0.3.2 updates together;
+an iPad on 0.3.1 still works with the Windows changes.
+
+### What changed
+
+- Apple Pencil lands under the tip when another monitor sits left of or above
+  the main display, a cancelled stroke resumes instead of dropping, and Pencil
+  works as a mouse if Windows cannot create its pen device.
+- The iPad can fill its whole screen: choose **Picture: Fill** in Settings or
+  tap the arrows next to the settings button. Fill trims the edges of the PC
+  picture that don't fit; **Fit** still shows all of it, with bars.
+- Plain-language messages in both apps say what happened and what to do, with
+  **Try again**, **Search again** or **Open Settings**. The iPad looks for PCs
+  as soon as it opens and spots a pairing code or router address typed as the
+  PC's address. The PC's Stream page asks **Use the iPad as** (**Mirror my
+  screen** or **Second screen**) and says why the picture paused while Windows
+  withholds the screen.
+- Windows updates itself: **Update now** checks the installer's SHA-256,
+  installs it and reopens EternalMonitor, waiting for streaming to stop or for
+  **Stop and update**. The iPad says when the PC is updating and when a new
+  TestFlight build is ready. Both apps say which one to update when versions
+  differ. A popup recommends each new version, and the PC says when the iPad
+  app is outdated.
+- The PC window opens on graphics drivers that crashed 0.3.1 at startup. If
+  the host can't start or stops unexpectedly, it names the error and log file,
+  and a helper process reports the crash and tries to turn the second screen
+  off. Opening EternalMonitor again brings the running window to the front.
+- EternalMonitor no longer opens a black console window next to the app.
+- A USB connection stays up when the stream restarts. Capture blocked by the
+  lock screen or a display change retries by itself. A hung or missing display
+  task no longer stalls the stream. At quit, EternalMonitor tries to turn the
+  second screen off even while Windows' display task is slow, and if it can't,
+  a helper process tries again.
+- PC audio starts cleanly and survives a large packet. With no iPad connected
+  the PC stops encoding its screen.
+- The installer allows display traffic on work or school networks and names
+  the Windows version needed on older Windows. With VoiceOver on, the iPad's
+  stream controls stay until you hide them.
+- Logs collapse repeated lines and keep their last lines at quit. A Known
+  issues page and the setup guide's tables list every message and what to do.
+- **Send feedback** in both apps writes an email to the studio with the app
+  versions and setup filled in; nothing is sent until you press Send. The iPad
+  attaches its Diagnostics report, which you can remove, and problem cards
+  offer **Report this problem**. Without an email app, **Copy message** works
+  instead. After a few long sessions each app asks once how it's going, and
+  the PC sidebar has a card for starring EternalMonitor on GitHub.
 
 ### What to test
 
-On a PC where EternalMonitor 0.3.1 opened a console window that closed after a
-few seconds, install this build and open EternalMonitor. The window should
-appear. If it does not, a message names the error and the log file; send that
-file with the time you opened the app.
+On a PC where 0.3.1 closed right after opening, install this build: the window
+should appear, or a message should name the error and log file. Send that file
+with the time.
 
-Install the previous version on Windows, then click **Update now** when the
-banner appears. Approve the Windows prompt and check that EternalMonitor opens
-again on the new version. Try it once while streaming. On the iPad, tap
-**Open TestFlight** from the banner.
+On a PC with 0.3.1, download the 0.3.2 installer and run it over 0.3.1;
+0.3.1's banner only offers **View release**. From 0.3.2 on, **Update now**
+installs a later build in place: once one is out, click it, approve the
+prompt, and check that the new version opens, once while streaming with
+**Stop and update**. On the iPad, tap **Open TestFlight** from the banner.
 
-With two monitors, place the second one to the left of the main display in
-Windows Display settings. Mirror the main display, then touch each corner and
-the centre of the iPad picture with Apple Pencil; the pointer should appear
-under the tip each time. Repeat with the extended iPad display placed to the
-left of and above the main display, and with display scaling at 125%.
+With a second monitor left of the main display, touch each corner of the iPad
+picture with Apple Pencil; the pointer should be under the tip. Repeat with the
+extended iPad display and with 125% scaling.
+
+Tap **Send feedback** in Settings on the iPad and click it in the PC's sidebar:
+check the email it writes, and tell us what you think.
 
 ## EternalMonitor v0.3.1
 

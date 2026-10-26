@@ -22,14 +22,13 @@ https://testflight.apple.com/join/ppc9QfXc
 ### Current setup
 
 The App Store Connect app and CI signing credentials are configured for
-`sidebandstudio/EternalMonitor`. iPad v0.3.1, build 166, is the current update.
-Apple approved it for external testing, verified on October 19, 2026. Its
-external state is `IN_BETA_TESTING`. It belongs to `FriendsExternal`, whose
+`sidebandstudio/EternalMonitor`. iPad v0.3.2, build 316, is the current update.
+Apple approved it for external testing. It belongs to `FriendsExternal`, whose
 public link and automatic tester notification are enabled. The matching Windows installer is
-[v0.3.1](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1).
+[v0.3.2](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.2).
 
-Build 143 was the previous 0.3.0 release. It does not include the Intel startup
-fix or automatic support diagnostics. Verify App Store Connect's external build
+Build 166 was the previous 0.3.1 release. It does not include the Apple Pencil
+placement fix, Fill or in-app updates. Verify App Store Connect's external build
 state before describing any new upload as available to external testers.
 
 ### Automated archive and upload
@@ -40,8 +39,8 @@ unsigned Release archive as a compile check. This archive cannot be installed
 through TestFlight. A signed workflow exports directly to App Store Connect.
 
 Every workflow run uses build number `100 + GITHUB_RUN_NUMBER`; Xcode's automatic
-build-number rewriting is disabled. A tag such as `v0.3.1-rc.1` must match
-`MARKETING_VERSION: "0.3.1"`. To upload again, start a new workflow dispatch rather
+build-number rewriting is disabled. A tag such as `v0.3.2-rc.1` must match
+`MARKETING_VERSION: "0.3.2"`. To upload again, start a new workflow dispatch rather
 than rerunning an already uploaded build number.
 
 Add these repository Actions secrets in GitHub Settings:
@@ -155,10 +154,10 @@ for people you want inside the developer account.
 
 Two links, and they must match:
 
-- The v0.3.1 Windows installer from the release page or
+- The v0.3.2 Windows installer from the release page or
   eternalmonitor.dev/download.html.
-- The TestFlight public link for iPad v0.3.1, build 166. Apple approved it;
-  its external state was verified as `IN_BETA_TESTING` on October 19, 2026.
+- The TestFlight public link for iPad v0.3.2, build 316, which Apple approved
+  for external testing.
 
 Tell them where feedback goes: the form at
 https://eternalmonitor.dev/download.html#feedback (it opens their mail app

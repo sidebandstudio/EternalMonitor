@@ -159,6 +159,39 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
     })
 }
 
+/// The names of the PC's graphics cards, as Windows lists them, without the
+/// software renderer or repeats. Empty if DXGI can't be asked.
+pub fn adapter_names() -> Vec<String> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut index = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+        index += 1;
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if desc.Flags & FLAG_SOFTWARE != 0 {
+            continue;
+        }
+        let name = String::from_utf16_lossy(
+            &desc
+                .Description
+                .iter()
+                .copied()
+                .take_while(|&c| c != 0)
+                .collect::<Vec<_>>(),
+        )
+        .trim()
+        .to_string();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Walk a vendor-preferred fallback chain and return the first encoder
 /// that is compiled into the linked FFmpeg build.
 fn resolve_encoder(vendor: GpuVendor) -> (String, String) {

@@ -3,323 +3,378 @@
 <head>
   <meta charset="UTF-8">
   <script>document.documentElement.className = 'js';</script>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EternalMonitor | Your iPad as a second screen for Windows</title>
-  <meta name="description" content="Use your iPad as a second monitor for your Windows PC. Extend or mirror your desktop, and control it with touch and Apple Pencil. Free and open source.">
-  <meta property="og:title" content="EternalMonitor | Your iPad as a second screen for Windows">
-  <meta property="og:description" content="Extend or mirror your Windows desktop onto an iPad. Free and open source, no account needed.">
-  <meta property="og:url" content="https://eternalmonitor.dev">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EternalMonitor: your iPad as a second screen for your Windows PC</title>
+  <meta name="description" content="Mirror your Windows PC or add the iPad as a real second screen, over USB or Wi-Fi. Apple Pencil, touch and keyboard go back to the PC. Free and open source.">
+  <link rel="canonical" href="https://eternalmonitor.dev/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="EternalMonitor">
+  <meta property="og:title" content="EternalMonitor: your iPad as a second screen for Windows">
+  <meta property="og:description" content="Mirror your PC or add a real second screen, over USB or Wi-Fi. Pencil, touch and keyboard go back to the PC. Free and open source.">
+  <meta property="og:url" content="https://eternalmonitor.dev/">
   <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="EternalMonitor">
-  <meta name="twitter:description" content="Your iPad as a second screen for Windows. Free and open source.">
+  <meta name="twitter:description" content="Your iPad as a second screen for your Windows PC. Free and open source.">
   <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
-  <link rel="canonical" href="https://eternalmonitor.dev">
-  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <meta name="author" content="Sideband Studio">
   <meta name="theme-color" content="#0a0a0b">
   <link rel="icon" type="image/png" href="assets/favicon.png">
   <link rel="apple-touch-icon" href="assets/icon.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="preload" href="assets/fonts/Geist-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "EternalMonitor",
+    "operatingSystem": "Windows, iPadOS",
+    "applicationCategory": "UtilitiesApplication",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "license": "https://github.com/sidebandstudio/EternalMonitor/blob/main/LICENSE",
+    "url": "https://eternalmonitor.dev/",
+    "author": { "@type": "Organization", "name": "Sideband Studio", "url": "https://sideband.studio", "email": "hello@sideband.studio" }
+  }
+  </script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
 
-  <nav class="nav" aria-label="Main">
-    <div class="container nav-inner">
-      <a href="index.html" class="nav-brand" aria-label="EternalMonitor home">
-        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
+  <header class="nav">
+    <nav class="container nav-inner" aria-label="Main">
+      <a href="./" class="brand" aria-label="EternalMonitor home">
+        <img src="assets/icon.png" alt="" width="26" height="26">
         <span>EternalMonitor</span>
       </a>
       <div class="nav-links">
-        <a href="#features" class="nav-link hide-sm">Features</a>
-        <a href="#how-it-works" class="nav-link hide-sm">How it works</a>
-        <a href="#faq" class="nav-link hide-sm">FAQ</a>
-        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener" class="nav-link" aria-label="GitHub repository">
+        <a href="#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm">Updates</a>
+        <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-          <span class="nav-link-label">GitHub</span>
+          <span>GitHub</span>
+          <span class="count" data-stars></span>
         </a>
         <a href="download.html" class="btn btn-primary btn-sm">Download</a>
       </div>
-    </div>
-  </nav>
+    </nav>
+  </header>
 
   <main id="main">
-    <!-- Hero -->
-    <section class="hero">
-      <div class="container">
-        <span class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>v0.3.1 · Current stable · Free and open source</span>
-        <h1><span class="w" style="--i:0">Turn</span> <span class="w" style="--i:1">your</span> <span class="w" style="--i:2">iPad</span> <span class="w" style="--i:3">into</span> <span class="w" style="--i:4">a</span> <span class="accent"><span class="w" style="--i:5">second</span> <span class="w" style="--i:6">screen</span></span> <span class="w" style="--i:7">for</span> <span class="w" style="--i:8">Windows.</span></h1>
-        <p class="hero-subtitle">Extend or mirror your desktop onto an iPad, then tap, drag and draw on it to control your PC. Free, with no account or subscription.</p>
-        <div class="hero-actions">
-          <a href="download.html" class="btn btn-primary">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg>
-            Download for Windows
-          </a>
-          <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener" class="btn btn-secondary">View on GitHub</a>
-        </div>
-        <div class="hero-meta">
-          <span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.2l2.8 2.8 6.2-6.3"/></svg>Windows 10 and 11</span>
-          <span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.2l2.8 2.8 6.2-6.3"/></svg>iPadOS 17 or later</span>
-          <span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.2l2.8 2.8 6.2-6.3"/></svg>NVIDIA, AMD or Intel GPU</span>
-        </div>
-      </div>
 
-      <div class="showcase reveal reveal-showcase">
-        <figure class="showcase-window">
-          <div class="showcase-titlebar" aria-hidden="true">
-            <span class="title"><img src="assets/icon.png" alt="" width="16" height="16">EternalMonitor</span>
-            <span class="window-controls">
-              <span><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg></span>
-              <span><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg></span>
-              <span><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-            </span>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="container">
+        <div class="hero-text">
+          <h1 id="hero-title">Your Windows PC, on your iPad.</h1>
+          <p class="lead">Mirror it, extend it, draw on it with Apple Pencil.</p>
+          <div class="hero-actions">
+            <a href="download.html" class="btn btn-primary btn-lg">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg>
+              Download for Windows
+            </a>
+            <a href="download.html#ipad" class="btn btn-secondary btn-lg">Get the iPad app</a>
           </div>
-          <img src="assets/host-app.webp" width="2000" height="1280" alt="The EternalMonitor Windows app streaming to an iPad Pro over USB at 60 frames per second, with its address, pairing code and connection status.">
-        </figure>
-        <p class="showcase-label" aria-hidden="true">EternalMonitor for Windows</p>
-        <figure class="showcase-ipad">
-          <img src="assets/ipad-app.webp" width="1032" height="1376" alt="The EternalMonitor iPad app's connect screen, with fields for the PC's address, a Connect button, QR scanning and a USB status row.">
-          <figcaption class="showcase-label" aria-hidden="true">EternalMonitor for iPad</figcaption>
-        </figure>
-      </div>
-    </section>
+          <p class="hero-meta">
+            <span>Free and open source</span>
+            <span>Windows 10 and 11</span>
+            <span>iPadOS 17 or later</span>
+          </p>
+        </div>
 
-    <!-- Launch film -->
-    <section class="section section--watch" id="watch">
-      <div class="container">
-        <div class="section-header reveal">
-          <span class="kicker">Watch</span>
-          <h2>Twenty seconds, both apps</h2>
-          <p id="launch-description">Connect over Wi-Fi or USB, pair once, and stream.</p>
-        </div>
-        <figure class="launch reveal">
-          <div class="launch-frame">
-            <video id="launch-video" controls playsinline preload="metadata" poster="assets/launch-poster.jpg" aria-describedby="launch-description">
-              <source src="assets/launch.mp4" type="video/mp4">
-            </video>
-            <button type="button" class="launch-play" id="launch-play" aria-label="Play the film" hidden>
-              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
-            </button>
-          </div>
-        </figure>
-      </div>
-    </section>
-
-    <!-- Features -->
-    <section class="section" id="features">
-      <div class="container">
-        <div class="section-header reveal">
-          <span class="kicker">Features</span>
-          <h2>What it does</h2>
-          <p>Mirror or extend, then work on the iPad as if it were part of your PC. If the Wi-Fi drops, the stream reconnects by itself.</p>
-        </div>
-        <div class="features-grid reveal reveal-stagger">
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="13" height="10" rx="2"/><rect x="16" y="7" width="6" height="11" rx="1.5"/><path d="M6 18h5M8.5 14v4"/></svg></div>
-            <h3>Second screen or mirror</h3>
-            <p>Use the iPad as a second screen, or mirror a screen you already have. Pick one at the top of the PC app and the iPad reconnects by itself.</p>
-          </article>
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11V5.5a1.5 1.5 0 0 1 3 0V11"/><path d="M12 10.5V4.5a1.5 1.5 0 0 1 3 0v6"/><path d="M15 10.5v-4a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-.6a6 6 0 0 1-4.9-2.6L3.3 15a1.6 1.6 0 0 1 2.6-1.9L9 16V11"/></svg></div>
-            <h3>Touch, Pencil and keyboard</h3>
-            <p>Tap, scroll and type to control your PC. Draw with Apple Pencil pressure and tilt through Windows Ink. Drawing mode ignores fingers on the canvas.</p>
-          </article>
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5a10 10 0 0 1 14 0M8 15.5a5.5 5.5 0 0 1 8 0"/><circle cx="12" cy="18.5" r="1"/><path d="M9 3.5h6"/></svg></div>
-            <h3>Wi-Fi or USB <span class="tag">v0.3</span></h3>
-            <p>Stream over your home network, or plug in a cable for a steadier link. USB takes over a Wi-Fi session automatically.</p>
-          </article>
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/></svg></div>
-            <h3>PC audio <span class="tag">v0.3</span></h3>
-            <p>Your PC's sound plays on the iPad, streamed with Opus next to the video. Mute it from either side.</p>
-          </article>
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2.5 5 13.5h6l-1 8 8-11h-6z"/></svg></div>
-            <h3>Fast, and quick to recover</h3>
-            <p>Hardware H.264 on NVIDIA, AMD and Intel GPUs, with HEVC as an option. Packet repair helps the picture recover when Wi-Fi drops data.</p>
-          </article>
-          <article class="feature card">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.2"/></svg></div>
-            <h3>Pairing <span class="tag">v0.3</span></h3>
-            <p>A six-digit code keeps other devices on your network out. USB connections are trusted automatically.</p>
-          </article>
-        </div>
-      </div>
-    </section>
-
-    <!-- How it works -->
-    <section class="section" id="how-it-works">
-      <div class="container">
-        <div class="section-header reveal">
-          <span class="kicker">How it works</span>
-          <h2>Three steps, about a minute</h2>
-          <p>One installer sets up everything on the PC. There's no account to create.</p>
-        </div>
-        <ol class="steps reveal reveal-stagger">
-          <li class="step card">
-            <div class="step-number" aria-hidden="true">1</div>
-            <h3>Install on your PC</h3>
-            <p>Run the installer. It sets up the EternalMonitor app and the driver that lets the iPad be a second screen.</p>
-          </li>
-          <li class="step card">
-            <div class="step-number" aria-hidden="true">2</div>
-            <h3>Open the iPad app</h3>
-            <p>Tap your PC when it appears, scan the QR code it shows, or plug in a USB cable.</p>
-          </li>
-          <li class="step card">
-            <div class="step-number" aria-hidden="true">3</div>
-            <h3>Pair once, then stream</h3>
-            <p>Enter the six-digit code the first time you connect over Wi-Fi. Your screen is mirrored at first; click Second screen in the PC app to extend it.</p>
-          </li>
-        </ol>
-      </div>
-    </section>
-
-    <!-- Requirements -->
-    <section class="section" id="requirements">
-      <div class="container">
-        <div class="section-header reveal">
-          <span class="kicker">Requirements</span>
-          <h2>What you need</h2>
-        </div>
-        <div class="requirements-grid reveal reveal-stagger">
-          <div class="req-card card">
-            <h3>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-              Windows PC
-            </h3>
-            <ul class="check-list">
-              <li>Windows 10 or 11, 64-bit</li>
-              <li>NVIDIA, AMD or Intel GPU with a hardware video encoder</li>
-              <li>A network you trust, plus the Apple Devices app for USB</li>
-            </ul>
-          </div>
-          <div class="req-card card">
-            <h3>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg>
-              iPad
-            </h3>
-            <ul class="check-list">
-              <li>iPadOS 17 or later</li>
-              <li>iPad Pro, iPad Air, iPad mini or iPad</li>
-              <li>The iPad app build that matches your PC's version</li>
-            </ul>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Status -->
-    <section class="section" id="status">
-      <div class="container">
-        <div class="status-card card reveal">
-          <div>
-            <span class="badge badge-accent">v0.3.1</span>
-            <h2>Current stable</h2>
-            <p>Version 0.3.1 fixes Intel hardware encoder startup and adds automatic support diagnostics. Install the Windows release with iPad v0.3.1, TestFlight build 166. The iPad beta is open to everyone, and both are on the <a href="download.html">download page</a>, along with a form for <a href="download.html#feedback">bug reports and feedback</a>.</p>
-            <p>See the <a href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1" target="_blank" rel="noopener">release notes</a> for setup details and known issues.</p>
-            <div class="status-note">
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5 18 16.5H2z"/><path d="M10 8v3.5"/><circle cx="10" cy="14" r=".6" fill="currentColor"/></svg>
-              <span>Use a network you trust. Pairing keeps other devices out, but the stream itself is not encrypted.</span>
+        <figure class="stage" aria-label="The Windows app streaming over USB or Wi-Fi to the iPad, which shows the PC's picture">
+          <div class="stage-pc">
+            <div class="pc-window">
+              <div class="pc-titlebar" aria-hidden="true">
+                <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+              </div>
+              <img src="assets/hero-pc.webp" srcset="assets/hero-pc.webp 1040w, assets/hero-pc@2x.webp 2080w" sizes="(max-width: 720px) 92vw, 600px" width="2080" height="1233" fetchpriority="high" decoding="async" alt="The Windows app streaming to an iPad over USB, mirroring the screen at 60 fps, with the connected iPad's details, Send feedback and a GitHub star card in the sidebar.">
             </div>
           </div>
-          <ol class="timeline reveal-stagger" aria-label="Release progress">
-            <li class="milestone milestone--done">
-              <span class="milestone-dot" aria-hidden="true"></span>
-              <span><span class="milestone-version">v0.1.0</span><span class="milestone-name">Mirror</span></span>
-              <span class="badge badge-accent">Done</span>
+          <div class="stage-link" aria-hidden="true">
+            <span class="stage-line"></span>
+            <span class="stage-chip">USB or Wi-Fi</span>
+          </div>
+          <div class="stage-ipad">
+            <div class="tablet">
+              <div class="screen">
+                <img src="assets/hero-ipad.webp" srcset="assets/hero-ipad.webp 1009w, assets/hero-ipad@2x.webp 2018w" sizes="(max-width: 720px) 70vw, 460px" width="2018" height="1300" decoding="async" alt="The iPad showing the PC's picture full screen.">
+              </div>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="features" aria-labelledby="features-title">
+      <div class="container">
+        <h2 id="features-title" class="visually-hidden">Features</h2>
+
+        <article class="show reveal" aria-labelledby="f-screen">
+          <div class="show-head">
+            <h3 id="f-screen">Mirror my screen, or a real second screen.</h3>
+          </div>
+          <div class="switch-demo">
+            <input type="radio" name="mode" id="mode-mirror" class="sw-input">
+            <input type="radio" name="mode" id="mode-second" class="sw-input" checked>
+            <div class="sw" role="group" aria-label="Use the iPad as">
+              <label for="mode-mirror">Mirror my screen</label>
+              <label for="mode-second">Second screen</label>
+            </div>
+            <div class="modes">
+              <div class="pc-window modes-pc">
+                <div class="pc-titlebar" aria-hidden="true">
+                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+                </div>
+                <div class="swap">
+                  <img class="swap-a" src="assets/mode-mirror.webp" srcset="assets/mode-mirror.webp 1040w, assets/mode-mirror@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Mirror my screen: the iPad shows the same picture as your main screen.">
+                  <img class="swap-b" src="assets/mode-second.webp" srcset="assets/mode-second.webp 1040w, assets/mode-second@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Second screen: the iPad becomes an extra screen next to your main one.">
+                </div>
+              </div>
+              <div class="displays" aria-hidden="true">
+                <div class="d-monitor"><span class="d-stand"></span></div>
+                <div class="d-ipad"></div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="show reveal" aria-labelledby="f-fill">
+          <div class="show-head">
+            <h3 id="f-fill">Fit the picture, or fill the iPad.</h3>
+          </div>
+          <div class="switch-demo">
+            <input type="radio" name="picture" id="pic-fit" class="sw-input">
+            <input type="radio" name="picture" id="pic-fill" class="sw-input" checked>
+            <div class="sw" role="group" aria-label="Picture">
+              <label for="pic-fit">Fit</label>
+              <label for="pic-fill">Fill</label>
+            </div>
+            <div class="tablet fill-tablet">
+              <div class="screen swap">
+                <img class="swap-a" src="assets/ipad-fit.webp" srcset="assets/ipad-fit.webp 1180w, assets/ipad-fit@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fit: the whole PC picture, with black bars where the shapes differ.">
+                <img class="swap-b" src="assets/ipad-fill.webp" srcset="assets/ipad-fill.webp 1180w, assets/ipad-fill@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fill: the PC picture covers the whole iPad screen.">
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="show show-split reveal" aria-labelledby="f-pencil">
+          <div class="show-head">
+            <h3 id="f-pencil">Apple Pencil, like a real pen.</h3>
+            <p>Pressure and tilt, tuned with care, because we care about drawing.</p>
+          </div>
+          <div class="tablet">
+            <div class="screen">
+              <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
+            </div>
+          </div>
+        </article>
+
+        <article class="show show-split flip reveal" aria-labelledby="f-link">
+          <div class="show-head">
+            <h3 id="f-link">USB or Wi-Fi. Pair once.</h3>
+            <p>Or scan the QR code and skip the code.</p>
+          </div>
+            <div class="pair">
+              <div class="dialog-shot">
+                <img src="assets/host-qr.webp" srcset="assets/host-qr.webp 374w, assets/host-qr@2x.webp 748w" sizes="(max-width: 860px) 50vw, 280px" width="748" height="1050" loading="lazy" decoding="async" alt="The Windows app's Scan to connect dialog, with a QR code and the PC's address under it.">
+              </div>
+              <div class="tablet portrait">
+                <div class="screen">
+                  <img src="assets/ipad-pairing.webp" srcset="assets/ipad-pairing.webp 834w, assets/ipad-pairing@2x.webp 1668w" sizes="(max-width: 860px) 38vw, 210px" width="1668" height="2420" loading="lazy" decoding="async" alt="The iPad app's Pair with your PC sheet, with a six-digit code field, a Pair iPad button and the number keyboard.">
+                </div>
+              </div>
+            </div>
+        </article>
+
+        <div class="tiles reveal">
+          <article class="tile">
+            <h3>Your graphics card does the work.</h3>
+            <p>NVIDIA, AMD or Intel, in H.264 or HEVC.</p>
+            <div class="pc-window">
+              <div class="pc-titlebar" aria-hidden="true">
+                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+                </div>
+              <img src="assets/host-performance.webp" srcset="assets/host-performance.webp 1040w, assets/host-performance@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1095" loading="lazy" decoding="async" alt="The Windows app's Performance page: capture, encode and send rates, bandwidth, and a chart of encode time per frame.">
+            </div>
+          </article>
+          <article class="tile">
+            <h3>Send feedback from either app.</h3>
+            <p>One-click updates on the PC. The iPad updates through TestFlight.</p>
+            <div class="tile-shot">
+              <img src="assets/ipad-feedback.webp" srcset="assets/ipad-feedback.webp 580w, assets/ipad-feedback@2x.webp 1160w" sizes="(max-width: 860px) 92vw, 520px" width="1160" height="1114" loading="lazy" decoding="async" alt="The iPad app's settings: Send feedback, Check for updates automatically, and About with the version, source code, Star EternalMonitor on GitHub and Contact.">
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section numbers" aria-label="In numbers">
+      <div class="container">
+        <dl class="facts reveal">
+          <div class="fact"><dt>Up to</dt><dd class="n">120<small>fps*</small></dd></div>
+          <div class="fact"><dt>Adaptive bitrate</dt><dd class="n">4–50<small>Mbps</small></dd></div>
+          <div class="fact"><dt>Open source</dt><dd class="n">Free<small>MIT</small></dd></div>
+        </dl>
+        <p class="footnote">*On iPads with ProMotion. The lower of the PC's and the iPad's frame rate wins.</p>
+      </div>
+    </section>
+
+    <section class="section" id="how" aria-labelledby="how-title">
+      <div class="container">
+        <div class="section-head reveal">
+          <h2 id="how-title">Three steps.</h2>
+        </div>
+        <div class="how reveal">
+          <figure class="clip">
+            <div class="tablet">
+              <div class="screen">
+                <video id="clip" controls muted playsinline loop preload="none"
+                       poster="assets/connect-clip-poster.jpg" width="1210" height="834"
+                      >
+                  <source src="assets/connect-clip.mp4" type="video/mp4">
+                  <source src="assets/connect-clip.webm" type="video/webm">
+                  <a href="assets/connect-clip.mp4">Download the clip (MP4)</a>
+                </video>
+              </div>
+            </div>
+            <div class="clip-controls">
+              <button type="button" class="btn btn-secondary" id="clip-play" aria-pressed="false">
+                <svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+                <svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
+                <span class="label">Play</span>
+              </button>
+            </div>
+          </figure>
+          <ol class="steps">
+            <li class="step">
+              <h3>Install on your PC</h3>
+              <p>From the <a href="download.html">download page</a>.</p>
             </li>
-            <li class="milestone milestone--done">
-              <span class="milestone-dot" aria-hidden="true"></span>
-              <span><span class="milestone-version">v0.2.0</span><span class="milestone-name">Extend and control</span></span>
-              <span class="badge badge-accent">Done</span>
+            <li class="step">
+              <h3>Open the iPad app</h3>
+              <p>Tap your PC, scan its QR code, or plug in a cable.</p>
             </li>
-            <li class="milestone milestone--current">
-              <span class="milestone-dot" aria-hidden="true"></span>
-              <span><span class="milestone-version">v0.3.1</span><span class="milestone-name">Intel fixes and diagnostics</span></span>
-              <span class="badge badge-accent">Current stable</span>
-            </li>
-            <li class="milestone">
-              <span class="milestone-dot" aria-hidden="true"></span>
-              <span><span class="milestone-version">v1.0.0</span><span class="milestone-name">Full release</span></span>
-              <span class="badge badge-muted">Upcoming</span>
+            <li class="step">
+              <h3>Pair once</h3>
+              <p>Type the six-digit code the first time on Wi-Fi. The QR code skips it.</p>
             </li>
           </ol>
         </div>
       </div>
     </section>
 
-    <!-- FAQ -->
-    <section class="section" id="faq">
+    <section class="section" id="get" aria-labelledby="get-title">
       <div class="container">
-        <div class="section-header reveal">
-          <span class="kicker">FAQ</span>
-          <h2>Questions</h2>
+        <div class="section-head reveal">
+          <h2 id="get-title">Two apps, both free.</h2>
         </div>
-        <div class="faq reveal reveal-stagger">
+        <div class="get reveal">
+          <article class="card">
+            <div class="card-head">
+              <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+              <h3>Windows</h3>
+            </div>
+            <p>It isn\'t code-signed yet, so Windows asks before it runs.</p>
+            <ul class="specs">
+              <li>Windows 10 (1809 or later) or 11, 64-bit</li>
+              <li>NVIDIA, AMD or Intel graphics</li>
+              <li>For USB: Apple's free <strong>Apple Devices</strong> app (Windows 10 22H2 or 11)</li>
+            </ul>
+            <a href="download.html" class="btn btn-primary">Download for Windows</a>
+          </article>
+          <article class="card">
+            <div class="card-head">
+              <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
+              <h3>iPad</h3>
+            </div>
+            <p>A public TestFlight beta, open to everyone.</p>
+            <ul class="specs">
+              <li>iPadOS 17 or later</li>
+              <li>Apple Pencil for pressure and tilt</li>
+            </ul>
+            <a href="download.html#ipad" class="btn btn-secondary">Join the TestFlight beta</a>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="faq" aria-labelledby="faq-title">
+      <div class="narrow">
+        <div class="section-head reveal">
+          <h2 id="faq-title">Before you install</h2>
+        </div>
+        <div class="faq reveal">
           <details>
             <summary>Is it really free?</summary>
-            <p>Yes. EternalMonitor is open source under the MIT license. There's no account, subscription or ads.</p>
+            <div><p>Yes. Free, open source under MIT, with no account.</p></div>
           </details>
           <details>
             <summary>Does it work with a Mac?</summary>
-            <p>No, the host runs on Windows. On a Mac, <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> already turns an iPad into a second display.</p>
+            <div><p>No, the PC app is for Windows. Macs have Apple\'s <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>.</p></div>
           </details>
           <details>
-            <summary>Should I use Wi-Fi or USB?</summary>
-            <p>Wi-Fi is the easiest way to start. A USB cable gives a steadier link, and plugging one in takes over the Wi-Fi session automatically. USB needs the Apple Devices app from the Microsoft Store, open on the PC while you stream; EternalMonitor tells you if it is closed or missing. The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> walks through Wi-Fi and USB step by step.</p>
+            <summary>USB or Wi-Fi?</summary>
+            <div><p>Wi-Fi to start. A cable gives a steadier picture and charges the iPad; it needs Apple's free Apple Devices app open on the PC (Windows 10 22H2 or 11).</p></div>
           </details>
           <details>
             <summary>Is the stream encrypted?</summary>
-            <p>Not yet. Pairing stops other devices from connecting, but the video travels unencrypted, so stream at home or on another network you trust rather than on public Wi-Fi.</p>
+            <div><p>Not yet. Pairing keeps other devices out, so use a network you trust. Over a cable, the stream stays on the cable.</p></div>
           </details>
           <details>
-            <summary>Where do I get the iPad app?</summary>
-            <p>The iPad app is distributed through TestFlight, and the v0.3.1 beta (build 166) is open to everyone. Install the TestFlight app on your iPad, then open the public invite from the <a href="download.html">download page</a>. Install it with the v0.3.1 Windows release. Developers can also build it from source.</p>
+            <summary>Which iPads and Pencils?</summary>
+            <div><p>An iPad with iPadOS 17 or later. Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.</p></div>
           </details>
           <details>
-            <summary>Found a bug, or have feedback?</summary>
-            <p>Use the <a href="download.html#feedback">feedback form</a> on the download page. It sends your report to hello@sideband.studio with the version details filled in. Bug reports are also welcome as <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new/choose" target="_blank" rel="noopener">GitHub issues</a>.</p>
+            <summary>Does it send anything to you?</summary>
+            <div><p>Yes, diagnostics while the apps run: device details, errors and stream stats, including PC names and network addresses. Never your screen, audio or pairing codes. Turn it off in Settings. <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#automatic-diagnostics" target="_blank" rel="noopener">Details</a>.</p></div>
+          </details>
+          <details>
+            <summary>Something isn't working</summary>
+            <div><p>See <a href="known-issues.html">known issues</a> and the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">setup guide</a>, or <a href="download.html#feedback">tell us</a>.</p></div>
           </details>
         </div>
       </div>
     </section>
 
-    <!-- Closing call to action -->
-    <section class="section section--flush">
+    <section class="section" id="studio" aria-labelledby="studio-title">
       <div class="container">
-        <div class="cta card reveal">
-          <img class="logo" src="assets/icon.png" alt="" width="56" height="56">
-          <h2>Put your iPad to work</h2>
-          <p>Download the Windows app, open the iPad app, and you're a minute away from a second screen.</p>
-          <div class="hero-actions">
-            <a href="download.html" class="btn btn-primary">Download for Windows</a>
-            <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener" class="btn btn-secondary">View on GitHub</a>
+        <div class="studio reveal">
+          <h2 id="studio-title">Made by a small studio.</h2>
+          <p><a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a> builds EternalMonitor for students and anyone with a spare iPad. We read every message, and your feedback shapes what we fix next :)</p>
+          <div class="studio-actions">
+            <a href="download.html#feedback" class="btn btn-primary">Send feedback</a>
+            <a href="https://github.com/sidebandstudio/EternalMonitor" class="btn btn-secondary" target="_blank" rel="noopener">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>
+              Star on GitHub <span class="count" data-stars></span>
+            </a>
           </div>
         </div>
       </div>
     </section>
+
   </main>
 
   <footer class="footer">
     <div class="container footer-inner">
-      <a href="index.html" class="footer-brand">
-        <img class="logo" src="assets/icon.png" alt="" width="28" height="28">
-        EternalMonitor
-      </a>
-      <p class="footer-copy">Built by whoisaldo · Open source under MIT</p>
-      <div class="footer-links">
+      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer">
         <a href="download.html">Download</a>
+        <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
-        <a href="mailto:hello@sideband.studio">Contact</a>
-      </div>
+        <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
+      </nav>
     </div>
   </footer>
 
-  <script src="script.js"></script>
+  <script src="script.js" defer></script>
 </body>
 </html>

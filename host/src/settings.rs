@@ -40,6 +40,17 @@ pub struct SettingsFile {
     #[serde(default = "default_true")]
     pub vdd_match_resolution: bool,
     pub start_on_boot: bool,
+    /// Streaming sessions of five minutes or more, counted up to the
+    /// one-time "How's EternalMonitor working for you?" card.
+    #[serde(default)]
+    pub feedback_sessions: u32,
+    /// The card was answered (Send feedback or Not now), or feedback was
+    /// sent another way. It never shows again.
+    #[serde(default)]
+    pub feedback_ask_done: bool,
+    /// The sidebar's GitHub star card was clicked; it says thank you since.
+    #[serde(default)]
+    pub star_clicked: bool,
 }
 
 fn default_true() -> bool {
@@ -67,6 +78,9 @@ impl Default for SettingsFile {
             auth_token_hex: String::new(),
             vdd_match_resolution: true,
             start_on_boot: false,
+            feedback_sessions: 0,
+            feedback_ask_done: false,
+            star_clicked: false,
         }
     }
 }
@@ -208,5 +222,31 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    #[test]
+    fn star_and_feedback_ask_persist_and_default_off() {
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert!(!parsed.star_clicked);
+        assert!(!parsed.feedback_ask_done);
+        assert_eq!(parsed.feedback_sessions, 0);
+
+        let dir = std::env::temp_dir().join(format!("eternal-star-{}", std::process::id()));
+        let path = dir.join(SETTINGS_FILE_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        let settings = SettingsFile {
+            star_clicked: true,
+            feedback_sessions: 2,
+            feedback_ask_done: true,
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        let parsed: SettingsFile =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.star_clicked);
+        assert!(parsed.feedback_ask_done);
+        assert_eq!(parsed.feedback_sessions, 2);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

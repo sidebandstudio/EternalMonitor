@@ -322,6 +322,18 @@ struct DisplayView: View {
                 .accessibilityIdentifier("display.keyboard")
             }
 
+            Button {
+                settings.pictureFit = settings.pictureFit == .fit ? .fill : .fit
+            } label: {
+                Image(systemName: settings.pictureFit == .fit
+                    ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 40, height: 40)
+            }
+            .buttonStyle(PillButtonStyle())
+            .accessibilityLabel(settings.pictureFit == .fit ? "Fill the screen" : "Show the whole picture")
+            .accessibilityIdentifier("display.pictureFit")
+
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 15, weight: .medium))

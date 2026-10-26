@@ -50,10 +50,11 @@ Movement explains state; it never decorates. Everything settles in well under
 half a second, continuous effects run only while something is live or waiting,
 and every surface honours the system's reduce-motion setting.
 
-- Website: `docs/style.css` keeps the keyframes and the `.reveal` /
-  `.reveal-stagger` scroll reveals; `docs/script.js` adds `.visible`, the nav
-  scroll state and the card spotlight. The hero and showcase enter on load.
-  Nothing is hidden without JavaScript (`html.no-js`).
+- Website: `docs/style.css` keeps the `.reveal` scroll reveal (a short fade
+  and 14 px rise); `docs/script.js` adds `.visible` and the nav's scroll
+  state. The hero film plays silently only when it is in view and the
+  visitor has not asked for reduced motion. Nothing is hidden without
+  JavaScript (`html.no-js`).
 - iPad: `Motion` in `ios/EternalMonitor/App/DesignSystem.swift` holds the shared
   springs. `entrance(_:delay:)` staggers the connect screen, `PulseRings` waits
   for a PC, `StatusDot(pulses:)` breathes while live, `Shake` rejects a wrong

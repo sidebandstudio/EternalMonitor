@@ -36,6 +36,7 @@ fn case(name: &str, installer: &str) -> Case {
             installer: setup,
             sha256,
             app,
+            app_args: Vec::new(),
             // A host that closes on its own shortly after the helper starts.
             host_pid: closing_host(),
             log: dir.join("update.log"),

@@ -178,7 +178,7 @@ def main(args):
            "$info=$line | ConvertFrom-Json; if ($info.event -ne 'Ready') { throw 'Probe is not ready' }; "
            "Get-Process -Id $info.pid -ErrorAction Stop | Out-Null; Write-Output $line")
     elif action == "probe-arm" and not args:
-        # The host's startup console and VDD task can take focus. Arm only
+        # The host's window (non-headless runs) and VDD task can take focus. Arm only
         # after capture opens; no test input runs until the probe confirms focus.
         log = quote(ROOT + r"\input-probe.log")
         ps("$deadline=(Get-Date).AddSeconds(30); while (!(Select-String -Path " +

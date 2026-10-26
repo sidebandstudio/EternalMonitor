@@ -10,7 +10,7 @@ final class InputGestureTests: XCTestCase {
         let width = Double(environment["EM_INPUT_WIDTH"] ?? "640") ?? 640
         let height = Double(environment["EM_INPUT_HEIGHT"] ?? "360") ?? 360
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()

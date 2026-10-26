@@ -73,3 +73,8 @@ impl GpuInfo {
         }
     }
 }
+
+/// No graphics card names off Windows; a feedback email leaves the line out.
+pub fn adapter_names() -> Vec<String> {
+    Vec::new()
+}

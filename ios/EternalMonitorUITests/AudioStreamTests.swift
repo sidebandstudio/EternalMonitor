@@ -4,7 +4,7 @@ final class AudioStreamTests: XCTestCase {
     func testAudioStatusAndLiveMuteKeepVideoConnected() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()
@@ -34,6 +34,10 @@ final class AudioStreamTests: XCTestCase {
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio playing")
         capture("audio-playing-hud", app: app)
+        // The test pins Fit; scrolling Settings must not have chosen Fill.
+        let picture = app.buttons["display.pictureFit"]
+        revealControls(app, showing: picture)
+        XCTAssertTrue(appears(picture, where: "label == %@", "Fill the screen", within: 5), picture.debugDescription)
         app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
         app.terminate()
     }

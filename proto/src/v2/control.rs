@@ -37,6 +37,9 @@ pub const CAP_DECODE_HEVC_10BIT: u16 = 1 << 2;
 pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
 pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
+/// The iPad app checks for its own updates (0.3.2 and later), so a HELLO2
+/// without it comes from 0.3.1 or older. Older hosts ignore it.
+pub const FEATURE_CHECKS_UPDATES: u16 = 1 << 4;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;

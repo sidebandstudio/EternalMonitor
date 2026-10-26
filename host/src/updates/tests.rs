@@ -25,6 +25,8 @@ fn release(version: &str) -> Release {
         version: version.into(),
         installer: production_installer(version),
         sha256: SHA.into(),
+        recommended: true,
+        note: None,
     }
 }
 
@@ -93,6 +95,72 @@ fn manifest_must_name_a_stable_github_installer_with_a_sha256() {
             String::from_utf8_lossy(&data)
         );
     }
+}
+
+#[test]
+fn manifest_reads_the_optional_recommended_flag_and_note() {
+    let endpoints = Endpoints::production();
+    let with = |windows: serde_json::Value| {
+        let mut entry = serde_json::json!({
+            "version": "0.3.2",
+            "installer": production_installer("0.3.2"),
+            "sha256": SHA,
+        });
+        for (key, value) in windows.as_object().unwrap() {
+            entry[key] = value.clone();
+        }
+        let data = serde_json::json!({ "schema": 1, "windows": entry, "ipad": { "later": 1 } });
+        parse_manifest(data.to_string().as_bytes(), &endpoints).unwrap()
+    };
+    // Missing: recommended, no note. Unknown fields are ignored.
+    let plain = with(serde_json::json!({ "channel": "stable", "size": 9 }));
+    assert_eq!(plain, release("0.3.2"));
+    let soft = with(serde_json::json!({
+        "recommended": false,
+        "note": "  Fixes the second screen on laptops.  ",
+    }));
+    assert!(!soft.recommended);
+    assert_eq!(
+        soft.note.as_deref(),
+        Some("Fixes the second screen on laptops.")
+    );
+    // A note that isn't one short line, or a field of the wrong type, is
+    // dropped instead of stopping the update.
+    for bad in [
+        serde_json::json!({ "note": "" }),
+        serde_json::json!({ "note": "   " }),
+        serde_json::json!({ "note": "Two\nlines" }),
+        serde_json::json!({ "note": "x".repeat(201) }),
+        serde_json::json!({ "note": 7, "recommended": "yes" }),
+        serde_json::json!({ "note": null, "recommended": null }),
+    ] {
+        assert_eq!(with(bad.clone()), release("0.3.2"), "{bad}");
+    }
+    assert_eq!(
+        with(serde_json::json!({ "note": "x".repeat(200) }))
+            .note
+            .map(|n| n.len()),
+        Some(200)
+    );
+}
+
+/// `update-state.json` written by a build without the new fields still loads.
+#[test]
+fn saved_state_from_before_the_popup_still_loads() {
+    let old = serde_json::json!({
+        "checked_at": 10,
+        "latest": {
+            "version": "0.3.3",
+            "installer": production_installer("0.3.3"),
+            "sha256": SHA,
+        },
+        "later": null,
+        "notified": "0.3.3",
+        "pending": null,
+    });
+    let saved: Saved = serde_json::from_value(old).unwrap();
+    assert_eq!(saved.latest, Some(release("0.3.3")));
+    assert_eq!(saved.popup, None);
 }
 
 fn github(tag: &str, body: &str, url: &str, size: u64, extra: serde_json::Value) -> Vec<u8> {
@@ -188,6 +256,45 @@ fn github_release_must_publish_the_same_sha256_and_installer() {
             String::from_utf8_lossy(&data)
         );
     }
+}
+
+/// The release workflow publishes `.github/release-body.md` with the hash in
+/// it. People arriving from 0.3.0 and 0.3.1's "View release" read it, and
+/// this updater must still find the hash.
+#[test]
+fn the_published_release_body_carries_the_installer_hash() {
+    // A Windows checkout (core.autocrlf) has CRLF line endings. release.yml
+    // turns them back into LF before publishing; compare the same text here.
+    let template = include_str!("../../../.github/release-body.md").replace("\r\n", "\n");
+    assert_eq!(template.matches("{{SHA256}}").count(), 1);
+    // Get-FileHash prints uppercase hex. The parser must also take CRLF.
+    let body = template.replace("{{SHA256}}", &SHA.to_uppercase());
+    let release = release("0.3.2");
+    for body in [body.clone(), body.replace('\n', "\r\n")] {
+        assert_eq!(published_sha256(&body).as_deref(), Some(SHA));
+        let data = github(
+            "v0.3.2",
+            &body,
+            &release.installer,
+            9,
+            serde_json::json!({}),
+        );
+        assert_eq!(check_github_release(&data, &release), Ok(9));
+    }
+    // The label comes before any other 64-digit hex the page might show.
+    assert_eq!(template.matches("SHA-256").count(), 1);
+    assert!(template.contains("**EternalMonitor-Setup.exe SHA-256:**\n```\n{{SHA256}}\n```"));
+    for words in [
+        "**Recommended update.** Updating is highly recommended for everyone.",
+        "download **EternalMonitor-Setup.exe** below and run it",
+        "It installs over your current version and keeps your settings.",
+        "open TestFlight and tap **Update**",
+        "(https://eternalmonitor.dev/download.html)",
+        "RELEASE_NOTES.md",
+    ] {
+        assert!(template.contains(words), "{words}");
+    }
+    assert!(!template.contains("Protocol v2"), "stale v0.1.x note");
 }
 
 #[test]
@@ -305,6 +412,7 @@ fn fake_release(published: &[u8], served: Vec<u8>, redirect: Option<&str>) -> (E
         version: "0.3.2".into(),
         installer: format!("{base}/releases/download/v0.3.2/EternalMonitor-Setup.exe"),
         sha256: sha,
+        ..release("0.3.2")
     };
     (endpoints, release)
 }
@@ -544,6 +652,109 @@ fn later_is_remembered_per_version_for_a_day() {
 }
 
 #[test]
+fn popup_shows_once_per_version_then_at_most_every_three_days() {
+    let mut s = state(Saved::default());
+    assert_eq!(s.popup(1000), None, "nothing found yet");
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    let shown = s.popup(1000).unwrap();
+    assert_eq!(shown.title(), "EternalMonitor 0.3.2 is ready");
+    assert_eq!(shown.message(), "Updating is highly recommended.");
+    assert_eq!(shown.note, None);
+    // Later (or Update now, or Escape) closes it for three days, across
+    // restarts, while the banner stays.
+    s.popup_closed(2000);
+    assert_eq!(s.popup(2000), None);
+    assert_eq!(s.notice(2000), Some(Notice::Available("0.3.2".into())));
+    let mut restarted = state(s.saved.clone());
+    assert_eq!(restarted.popup(2000 + 3 * DAY - 1), None);
+    assert!(restarted.popup(2000 + 3 * DAY).is_some());
+    restarted.popup_closed(2000 + 3 * DAY);
+    assert_eq!(restarted.popup(2000 + 5 * DAY), None);
+    assert!(restarted.popup(2000 + 6 * DAY).is_some());
+    // A newer version shows at once.
+    restarted.finish_check(2000 + 6 * DAY, false, Ok(release("0.3.3")));
+    assert_eq!(
+        restarted.popup(2000 + 6 * DAY).map(|p| p.version),
+        Some("0.3.3".into())
+    );
+}
+
+/// A close time ahead of the clock counts as closed now: the next popup is
+/// three days from the current clock, never at once and never "not for years".
+#[test]
+fn a_clock_set_back_or_far_ahead_waits_three_days_from_now() {
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    s.popup_closed(10 * DAY);
+    // The clock goes back one second.
+    assert_eq!(s.popup(10 * DAY - 1), None);
+    assert_eq!(s.saved.popup, Some(("0.3.2".into(), 10 * DAY - 1)));
+    assert_eq!(s.popup(13 * DAY - 2), None);
+    assert!(s.popup(13 * DAY - 1).is_some());
+    // Closed while the clock was years ahead, then corrected.
+    s.saved.popup = Some(("0.3.2".into(), u64::MAX / 2));
+    assert_eq!(s.popup(20 * DAY), None);
+    // Saved that way, so a restart keeps the same three days.
+    let mut restarted = state(s.saved.clone());
+    assert_eq!(restarted.saved.popup, Some(("0.3.2".into(), 20 * DAY)));
+    assert_eq!(restarted.popup(23 * DAY - 1), None);
+    assert!(restarted.popup(23 * DAY).is_some());
+}
+
+#[test]
+fn popup_follows_the_banner_and_the_manifest_wording() {
+    let mut s = state(Saved::default());
+    let soft = Release {
+        recommended: false,
+        note: Some("Fixes audio on some PCs.".into()),
+        ..release("0.3.2")
+    };
+    s.finish_check(1000, false, Ok(soft));
+    let popup = s.popup(1000).unwrap();
+    assert_eq!(popup.message(), "An update is available.");
+    assert_eq!(popup.note.as_deref(), Some("Fixes audio on some PCs."));
+    // The banner's Later hides the popup with it for that day.
+    s.later(1000);
+    assert_eq!(s.popup(1000 + DAY - 1), None);
+    assert!(s.popup(1000 + DAY).is_some());
+    // Not while an update is already under way.
+    s.update_now(true);
+    assert_eq!(s.popup(1000 + DAY), None);
+    s.cancel();
+    assert!(s.popup(1000 + DAY).is_some());
+    // Up to date: nothing.
+    s.finish_check(1000 + DAY, false, Ok(release("0.3.1")));
+    assert_eq!(s.popup(1000 + DAY), None);
+
+    // With automatic checks off, Check now shows the banner but no popup.
+    let mut off = State::new("0.3.1", false, Saved::default());
+    off.begin_check(true);
+    off.finish_check(1000, true, Ok(release("0.3.2")));
+    assert!(off.notice(1000).is_some());
+    assert_eq!(off.popup(1000), None);
+}
+
+#[test]
+fn an_ipad_app_older_than_0_3_2_is_told_to_update() {
+    use eternal_wire::v2::control::{
+        FEATURE_CHECKS_UPDATES, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_AUDIO, FEATURE_WANTS_INPUT,
+    };
+    // Every bit an 0.3.1 iPad sends, and none.
+    let old = FEATURE_WANTS_INPUT | FEATURE_WANTS_AUDIO | FEATURE_SUPPORTS_NACK;
+    assert!(ipad_app_out_of_date(old));
+    assert!(ipad_app_out_of_date(0));
+    assert!(!ipad_app_out_of_date(old | FEATURE_CHECKS_UPDATES));
+    assert!(!ipad_app_out_of_date(FEATURE_CHECKS_UPDATES));
+    assert_eq!(
+        IPAD_OUT_OF_DATE,
+        (
+            "Your iPad app is out of date",
+            "Update it in TestFlight. It's highly recommended."
+        )
+    );
+}
+
+#[test]
 fn update_waits_for_the_stream_to_stop() {
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(release("0.3.2")));
@@ -579,6 +790,43 @@ fn update_waits_for_the_stream_to_stop() {
     );
     assert_eq!(s.phase, Phase::Installing);
     assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+}
+
+/// A check can find a newer release while one is downloading or waiting for a
+/// stream to end. The file must still go to the helper with its own hash,
+/// which the helper checks, not the newer release's.
+#[test]
+fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
+    let a = release("0.3.2");
+    let b = Release {
+        sha256: "1".repeat(64),
+        ..release("0.3.3")
+    };
+    let path_a = PathBuf::from("setup-0.3.2.exe");
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.begin_check(false);
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r == a));
+    s.finish_check(1001, false, Ok(b.clone()));
+    assert_eq!(
+        s.notice(1001),
+        Some(Notice::Downloading("0.3.2".into(), None))
+    );
+    s.download_finished(Ok(path_a.clone()));
+    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
+    assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.update_now(false);
+    s.download_finished(Ok(path_a.clone()));
+    assert!(s.take_ready(true).is_none(), "waits for the stream");
+    s.finish_check(1001, false, Ok(b));
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert_eq!(s.take_ready(false), Some((path_a, a)));
 }
 
 #[test]
@@ -716,6 +964,117 @@ fn the_app_closes_only_after_the_helper_takes_over() {
     );
 }
 
+/// Setup installs into its own folder and the helper starts the exe that
+/// asked, so a copy anywhere else would come back as the old version.
+#[test]
+fn the_install_lookup_uses_the_app_id_setup_records() {
+    // Inno turns `{{` into `{` and keeps the rest of AppId as written.
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let app_id = iss
+        .lines()
+        .find_map(|line| line.strip_prefix("AppId="))
+        .expect("EternalMonitor.iss sets AppId")
+        .trim()
+        .replace("{{", "{");
+    assert!(
+        UNINSTALL_KEY.ends_with(&format!("\\{app_id}_is1")),
+        "{UNINSTALL_KEY} is not Setup's entry for AppId {app_id}"
+    );
+}
+
+#[test]
+fn the_installed_host_is_the_exe_setup_installs() {
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let source = format!(r#"Source: "{{#StagingDir}}\{INSTALLED_EXE}"; DestDir: "{{app}}";"#);
+    assert!(
+        iss.lines().any(|line| line.starts_with(&source)),
+        "EternalMonitor.iss does not install {INSTALLED_EXE} into {{app}}"
+    );
+}
+
+#[test]
+fn only_the_installed_copy_installs_updates_in_place() {
+    let installed = Path::new("C:\\")
+        .join("Program Files")
+        .join("EternalMonitor");
+    let exe = installed.join("EternalMonitor-host.exe");
+    assert!(installs_in_place(&exe, Some(&installed)));
+    let trailing = PathBuf::from(format!(
+        "{}{}",
+        installed.display(),
+        std::path::MAIN_SEPARATOR
+    ));
+    assert!(installs_in_place(&exe, Some(&trailing)));
+    let other_case = PathBuf::from(installed.to_string_lossy().to_uppercase());
+    assert!(installs_in_place(&exe, Some(&other_case)));
+
+    // A renamed copy beside the installed host: Setup replaces
+    // EternalMonitor-host.exe, and the helper would start this one again.
+    let renamed = installed.join("EternalMonitor-host-old.exe");
+    assert!(!installs_in_place(&renamed, Some(&installed)));
+    // A build from source copied into the install folder.
+    let other_name = installed.join("eternal-host.exe");
+    assert!(!installs_in_place(&other_name, Some(&installed)));
+    // Setup's own exe, spelled differently.
+    assert!(installs_in_place(
+        &installed.join("ETERNALMONITOR-HOST.EXE"),
+        Some(&installed)
+    ));
+    let verbatim = PathBuf::from(format!(r"\\?\{}", exe.display()));
+    assert!(installs_in_place(&verbatim, Some(&installed)));
+
+    // The zip from the release page, unpacked in Downloads.
+    let portable = Path::new("C:\\")
+        .join("Users")
+        .join("A B")
+        .join("Downloads")
+        .join("EternalMonitor")
+        .join("EternalMonitor-host.exe");
+    assert!(!installs_in_place(&portable, Some(&installed)));
+    // A build from source.
+    let built = Path::new("C:\\")
+        .join("src")
+        .join("target")
+        .join("release")
+        .join("eternal-host.exe");
+    assert!(!installs_in_place(&built, Some(&installed)));
+    // Never installed: Setup would install into Program Files.
+    assert!(!installs_in_place(&portable, None));
+    assert!(!installs_in_place(&exe, None));
+}
+
+/// The registry can record the install folder by its short (8.3) name.
+#[cfg(windows)]
+#[test]
+fn a_short_install_folder_name_matches_the_installed_host() {
+    use std::os::windows::process::CommandExt;
+    let installed =
+        std::env::temp_dir().join(format!("EternalMonitor install {}", std::process::id()));
+    std::fs::create_dir_all(&installed).unwrap();
+    let exe = installed.join("EternalMonitor-host.exe");
+    std::fs::write(&exe, b"").unwrap();
+    std::fs::write(installed.join("EternalMonitor-host-old.exe"), b"").unwrap();
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/c for %I in (\"{}\") do @echo %~sI",
+            installed.display()
+        ))
+        .output()
+        .unwrap();
+    let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let results = [
+        installs_in_place(&exe, Some(&short)),
+        installs_in_place(&short.join("EternalMonitor-host.exe"), Some(&installed)),
+        installs_in_place(&short.join("EternalMonitor-host-old.exe"), Some(&installed)),
+    ];
+    std::fs::remove_dir_all(&installed).unwrap();
+    if short == installed {
+        eprintln!("8.3 names are off for {}; skipped", installed.display());
+        return;
+    }
+    assert_eq!(results, [true, true, false], "{}", short.display());
+}
+
 #[test]
 fn helper_arguments_survive_windows_quoting() {
     let args = eternal_updater::HelperArgs {
@@ -724,6 +1083,7 @@ fn helper_arguments_survive_windows_quoting() {
         ),
         sha256: "0".repeat(64),
         app: PathBuf::from(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+        app_args: Vec::new(),
         host_pid: 42,
         log: PathBuf::from(r"C:\Users\A B\x\"),
     };

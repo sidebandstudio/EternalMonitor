@@ -65,6 +65,69 @@ struct UpdateBanner: View {
     }
 }
 
+/// Connect screen: a small card over the screen when a newer build is ready.
+/// `allowed` is false while the user is busy (connecting, typing, or in a
+/// sheet). The Connect screen is never on screen during a stream.
+struct UpdatePopup: View {
+    @ObservedObject private var updates = UpdateChecker.shared
+    let allowed: Bool
+
+    var body: some View {
+        ZStack {
+            if allowed, let popup = updates.popup {
+                Color.black.opacity(0.55)
+                    .ignoresSafeArea()
+                    .onTapGesture { close() }
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 18) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(Theme.accent)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(popup.title)
+                            .font(.app(20, .semibold, relativeTo: .title3))
+                            .foregroundStyle(Theme.text)
+                        Text(popup.message)
+                            .font(.app(15, .medium, relativeTo: .body))
+                            .foregroundStyle(Theme.text)
+                        if let note = popup.note {
+                            Text(note)
+                                .font(.app(14, relativeTo: .callout))
+                                .foregroundStyle(Theme.textMuted)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        Spacer(minLength: 0)
+                        Button("Later") { close() }
+                            .buttonStyle(PillButtonStyle())
+                            .accessibilityIdentifier("updatePopup.later")
+                        Button("Open TestFlight") {
+                            close()
+                            TestFlightLink.open()
+                        }
+                        .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                        .accessibilityIdentifier("updatePopup.openTestFlight")
+                    }
+                }
+                .card(padding: 24)
+                .frame(maxWidth: 420)
+                .padding(24)
+                .accessibilityElement(children: .contain)
+                .accessibilityAddTraits(.isModal)
+                .accessibilityIdentifier("update.popup")
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: allowed && updates.popup != nil)
+    }
+
+    private func close() {
+        updates.closePopup()
+    }
+}
+
 /// Settings: automatic checks and, when there is one, the waiting update.
 struct UpdateSettingsSection: View {
     @ObservedObject private var updates = UpdateChecker.shared

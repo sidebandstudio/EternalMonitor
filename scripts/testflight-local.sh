@@ -6,7 +6,7 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Develope
 MODE=auto
 if [ "${1:-}" = --dry-run ]; then MODE=dry; shift; fi
 if [ "$#" != 0 ]; then echo "Usage: $0 [--dry-run]" >&2; exit 2; fi
-BUILD="${BUILD:-6}"
+BUILD="${BUILD:-7}"
 [[ "$BUILD" =~ ^[0-9]+$ ]] && [ "$BUILD" -gt 5 ] || { echo "BUILD must be an integer above 5" >&2; exit 2; }
 OUT="${EM_TF_OUTPUT_DIR:-$ROOT/build/testflight}"
 mkdir -p "$OUT"

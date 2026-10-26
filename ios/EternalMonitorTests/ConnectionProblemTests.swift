@@ -66,7 +66,6 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(wifi(LinkError(.connectionFailed, "UDP connection failed: PolicyDenied", underlying: NWError.dns(-65570))), .localNetworkBlocked)
         // Offline.
         XCTAssertEqual(wifi(LinkError(.pathUnavailable, "UDP path not ready: Network is down", underlying: NWError.posix(.ENETDOWN))), .noNetwork)
-        XCTAssertEqual(wifi(LinkError(.receive, "UDP receive error: No route to host", underlying: POSIXError(.EHOSTUNREACH))), .noNetwork)
         // Unknown failures get general advice, never the raw error.
         let unknown = LinkError(.connectionFailed, "UDP socket failed: Address already in use", underlying: POSIXError(.EADDRINUSE))
         XCTAssertEqual(wifi(unknown), .couldNotConnect)
@@ -82,6 +81,18 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertTrue(usb.detail.contains("cable") && usb.detail.contains("Apple Devices"), usb.detail)
         XCTAssertFalse(usb.detail.contains("Wi-Fi"), usb.detail)
         XCTAssertEqual(usb.actions, [.retry])
+    }
+
+    /// No route to the PC, or to its network, while this iPad's own network
+    /// works: a PC that is asleep or on another network. Not an offline iPad.
+    func testAnUnreachablePCIsNotAnOfflineIPad() {
+        let wifi = { (error: LinkError) in ConnectionProblem.linkFailure(error, isUSB: false, host: "studio-pc") }
+        for code: POSIXErrorCode in [.EHOSTUNREACH, .ENETUNREACH] {
+            XCTAssertEqual(wifi(LinkError(.connectionFailed, "UDP connection failed",
+                underlying: NWError.posix(code))), .couldNotConnect, "\(code)")
+            XCTAssertEqual(wifi(LinkError(.receive, "UDP receive error",
+                underlying: POSIXError(code))), .couldNotConnect, "\(code)")
+        }
     }
 
     func testGivingUpOnReconnectingKeepsASpecificLastFailure() {

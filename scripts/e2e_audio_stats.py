@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Assert decoded packet count, loss and tone in the rendered audio output."""
 import argparse
+import datetime
 import json
 import pathlib
 import re
+import time
 
 # CI runs dropped late packets only in the first 0.3-4.1 s of audio (by
 # sequence, never past about 210). The waiver covers the stream's first 250
@@ -11,6 +13,10 @@ import re
 # starved host numbers fewer packets per second. That still leaves at least
 # 4 s of each CI run strictly checked.
 STARTUP_SEQS = 250
+
+
+class IncompleteEvidence(ValueError):
+    """The live host log has no stats yet that cover the iPad's range."""
 
 
 def seq_ranges(text):
@@ -52,6 +58,10 @@ def host_stats(text):
         values = dict(re.findall(r'\b(\w+)=(\d+)\b', line))
         drops = {key: int(values.get(key, 0)) for key in (
             'dropped', 'stale_dropped', 'capture_queue_dropped', 'oversized_dropped', 'send_failed')}
+        # tracing stamps each line in UTC as the host emits it.
+        stamp = re.match(r'\s*(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6})Z', line)
+        drops['at'] = datetime.datetime.strptime(stamp.group(1), '%Y-%m-%dT%H:%M:%S.%f').replace(
+            tzinfo=datetime.timezone.utc).timestamp() if stamp else 0.0
         fields = dict(re.findall(r'\b(late_seqs|failed_seqs|wire_stream)=(\S+)', line))
         if len(fields) == 3 and 'audio_stream' in values:
             drops['late'], late_truncated = seq_ranges(fields['late_seqs'])
@@ -86,7 +96,7 @@ def stream_stats(host, session, epoch, errors):
     return [line for line in host if line.get('stream') == stream][-1]
 
 
-def attribute(samples, host_lines, scheduling_gate, errors, notes):
+def attribute(samples, host_lines, scheduling_gate, errors, notes, frozen_at=None):
     """Match every iPad loss to a host drop by sequence number."""
     last = samples[-1]
     first, after_last = int(last['first_seq']), int(last['next_seq'])
@@ -119,6 +129,17 @@ def attribute(samples, host_lines, scheduling_gate, errors, notes):
     host = stream_stats(host_lines, session, epoch, errors)
     if host is None:
         return None
+    if frozen_at is not None:
+        # A live host logs stats once a second. The iPad had received a packet
+        # at or past next_seq - 1 before its log froze, and the transport
+        # settles every earlier packet before sending a later one, so a line
+        # snapshotted after the freeze covers the range. The first line
+        # emitted after it may hold an older snapshot; the stage's next cannot.
+        later = sum(line['at'] > frozen_at for line in host_lines if line.get('stream') == host['stream'])
+        if later < 2:
+            raise IncompleteEvidence(
+                f'incomplete audio evidence: host logged {later} audio stats line{"" if later == 1 else "s"} '
+                f'after the app log froze; 2 are needed to cover sequences {first}-{after_last - 1}')
     if host['truncated']:
         errors.append('host audio drop list was truncated')
         return None
@@ -154,7 +175,7 @@ def attribute(samples, host_lines, scheduling_gate, errors, notes):
                 audio_first_seq=first, audio_next_seq=after_last)
 
 
-def measure(text, host_text=None, scheduling_gate='enforce'):
+def measure(text, host_text=None, scheduling_gate='enforce', frozen_at=None):
     samples = []
     for line in text.splitlines():
         if 'E2E_AUDIO ' not in line:
@@ -181,7 +202,7 @@ def measure(text, host_text=None, scheduling_gate='enforce'):
         # deadline because its sender did not get the CPU measure the
         # machine, but only while the app launches.
         if not errors:
-            attributed = attribute(samples, host, scheduling_gate, errors, notes)
+            attributed = attribute(samples, host, scheduling_gate, errors, notes, frozen_at)
     else:
         # Evidence from builds without stream identity: no loss can be
         # attributed, and no drop is waived. Host numbering starts at 0, so
@@ -213,11 +234,23 @@ def main():
     # `record` notes startup deadline drops without failing on them, for
     # runners where the launching simulator app starves the host of CPU.
     parser.add_argument('--scheduling-gate', choices=['enforce', 'record'], default='enforce')
+    # For a host log that is still being written: the Unix time the app log
+    # was copied, and how long to wait for host stats that cover it.
+    parser.add_argument('--frozen-at', type=float)
+    parser.add_argument('--host-wait', type=float, default=0)
     args = parser.parse_args()
     result = json.loads(args.output.read_text())
+    deadline = time.monotonic() + args.host_wait
     try:
-        host_text = args.host_log.read_text(errors='replace') if args.host_log else None
-        measured = measure(args.log.read_text(), host_text, args.scheduling_gate)
+        while True:
+            host_text = args.host_log.read_text(errors='replace') if args.host_log else None
+            try:
+                measured = measure(args.log.read_text(), host_text, args.scheduling_gate, args.frozen_at)
+                break
+            except IncompleteEvidence:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
     except ValueError as error:
         result['status'] = 'FAIL'
         result.setdefault('errors', []).append(str(error))

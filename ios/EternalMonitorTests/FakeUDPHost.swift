@@ -47,13 +47,13 @@ final class FakeUDPHost: @unchecked Sendable {
 
     /// Answers the next HELLO2 attempt, with session 41 unless `status`
     /// refuses it. False after ten quiet seconds.
-    func acceptSession(status: HelloStatus = .ok) -> Bool {
+    func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2) -> Bool {
         for _ in 0..<33 {
             guard let (data, from, length) = receive() else { continue }
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
             let ack = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
-                status: status, acceptedVersion: 2, clientNonce: hello.clientNonce, sessionId: status == .ok ? 41 : 0,
+                status: status, acceptedVersion: acceptedVersion, clientNonce: hello.clientNonce, sessionId: status == .ok ? 41 : 0,
                 heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
                 streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0)))
             client = (from, length)

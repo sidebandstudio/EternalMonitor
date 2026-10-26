@@ -9,7 +9,7 @@ final class StreamLifecycleTests: XCTestCase {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO",
-            "-playPCaudio", "NO", "-autoReconnect", "YES", "-autoResumeOnForeground", "YES", "-targetFPS", "60"]
+            "-playPCaudio", "NO", "-autoReconnect", "YES", "-autoResumeOnForeground", "YES", "-targetFPS", "60", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = ProcessInfo.processInfo.environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()

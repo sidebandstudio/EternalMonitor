@@ -15,6 +15,10 @@ struct ConnectView: View {
     @State private var didPrefillFromLastHost = false
     @State private var showQRScanner = false
     @State private var showDetails = false
+    @State private var feedbackRequest: FeedbackRequest?
+    /// Send feedback was tapped and its sheet is on the way (Mail first
+    /// collects diagnostics). Nothing else may open meanwhile.
+    @State private var preparingFeedback = false
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -39,6 +43,12 @@ struct ConnectView: View {
               value > 0
         else { return nil }
         return value
+    }
+
+    /// The one-time feedback ask is on screen (see `body`).
+    private var showsFeedbackAsk: Bool {
+        connectionManager.problem == nil && connectionManager.connectionError == nil && !isConnecting
+            && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected)
     }
 
     private var canConnect: Bool {
@@ -69,6 +79,15 @@ struct ConnectView: View {
                                 problemBanner(problem)
                             } else if let error = connectionManager.connectionError {
                                 errorBanner(error)
+                            } else if !isConnecting
+                                        && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected) {
+                                FeedbackAskCard(
+                                    send: {
+                                        withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() }
+                                        startFeedback(.general)
+                                    },
+                                    notNow: { withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() } }
+                                )
                             }
 
                             if isConnecting {
@@ -110,6 +129,14 @@ struct ConnectView: View {
                     }
                     .scrollDismissesKeyboard(.interactively)
                 }
+
+                // One thing at a time: not while connecting or reconnecting,
+                // over a problem card or an error such as a version mismatch,
+                // while typing, over a sheet (Settings, QR scanner, pairing,
+                // Mail or the feedback copy sheet) or next to the feedback ask.
+                UpdatePopup(allowed: connectionManager.isIdleOnConnect && focusedField == nil
+                    && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil
+                    && feedbackRequest == nil && !preparingFeedback && !showsFeedbackAsk)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -132,6 +159,7 @@ struct ConnectView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .feedbackSheet($feedbackRequest)
             .sheet(isPresented: $showQRScanner) {
                 QRScannerView(
                     onScan: { value in
@@ -145,6 +173,7 @@ struct ConnectView: View {
                 appeared = true
                 #if DEBUG
                 if UIPreview.opensSettings { showSettings = true }
+                if UIPreview.opensFeedback { startFeedback(.general) }
                 #endif
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
@@ -296,6 +325,18 @@ struct ConnectView: View {
                     }
                     .padding(.top, 4)
                 }
+                if problem.canReport {
+                    Button {
+                        startFeedback(.problem(problem.title))
+                    } label: {
+                        Label("Report this problem", systemImage: "envelope")
+                            .font(.app(13.5, .medium, relativeTo: .footnote))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
+                    .accessibilityIdentifier("connect.reportProblem")
+                }
             }
 
             Spacer(minLength: 0)
@@ -313,6 +354,20 @@ struct ConnectView: View {
         .accessibilityElement(children: .contain)
         .card(padding: 16, tint: Theme.warning)
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// Mail with the details and diagnostics, or the copy sheet.
+    private func startFeedback(_ kind: Feedback.Kind) {
+        let context = connectionManager.feedbackContext
+        preparingFeedback = true
+        Task {
+            // Cleared in the same turn the sheet is set, or if this ends early.
+            defer { preparingFeedback = false }
+            #if DEBUG
+            await UIPreview.feedbackPreparation()
+            #endif
+            feedbackRequest = await FeedbackRequest.make(kind, context: context)
+        }
     }
 
     private func openAppSettings() {
@@ -530,19 +585,26 @@ struct ConnectView: View {
     // MARK: - Scan results
 
     private var scanEmptyState: some View {
-        HStack(alignment: .top, spacing: 12) {
+        let advice = Self.scanEmptyAdvice(scanner.searchProblem)
+        return HStack(alignment: .top, spacing: 12) {
             Image(systemName: "wifi.exclamationmark")
                 .foregroundStyle(Theme.textMuted)
                 .font(.system(size: 16))
             VStack(alignment: .leading, spacing: 10) {
-                Text(scanner.searchBlocked
-                    ? "EternalMonitor can't look for PCs. Turn on Local Network for EternalMonitor in Settings."
-                    : "No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.")
-                    .font(.app(14, relativeTo: .callout))
-                    .foregroundStyle(Theme.textMuted)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("connect.scanEmpty")
-                if scanner.searchBlocked {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let title = advice.title {
+                        Text(title)
+                            .font(.app(16, .semibold, relativeTo: .headline))
+                            .foregroundStyle(Theme.text)
+                            .accessibilityIdentifier("connect.scanProblemTitle")
+                    }
+                    Text(advice.detail)
+                        .font(.app(14, relativeTo: .callout))
+                        .foregroundStyle(Theme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.scanEmpty")
+                }
+                if scanner.searchProblem == .localNetworkOff {
                     Button("Open Settings") { openAppSettings() }
                         .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                 } else {
@@ -554,6 +616,23 @@ struct ConnectView: View {
         }
         .card(padding: 16)
         .transition(.opacity)
+    }
+
+    /// What an empty search says: what went wrong if the search itself
+    /// failed, and what to do.
+    static func scanEmptyAdvice(_ problem: NetworkScanner.SearchProblem?) -> (title: String?, detail: String) {
+        switch problem {
+        case .localNetworkOff:
+            return ("EternalMonitor can't look for PCs", "Turn on Local Network for EternalMonitor in Settings.")
+        case .couldNotSearch:
+            // NetServiceBrowser can report Local Network being off this way
+            // too, so the Settings advice stays as the last resort.
+            return ("Couldn't search for PCs",
+                "Search again, or scan the QR code or type the Address shown on the PC. "
+                    + "If it keeps failing, turn on Local Network for EternalMonitor in Settings.")
+        case nil:
+            return (nil, "No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.")
+        }
     }
 
     private var discoveredSection: some View {

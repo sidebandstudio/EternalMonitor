@@ -10,6 +10,7 @@ import os
 /// free-running at 120 Hz re-encoding the same texture.
 struct MetalView: UIViewRepresentable {
     @EnvironmentObject var connectionManager: ConnectionManager
+    @EnvironmentObject var settings: AppSettings
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView()
@@ -27,6 +28,7 @@ struct MetalView: UIViewRepresentable {
         view.clearColor = MTLClearColor(red: 0.024, green: 0.027, blue: 0.031, alpha: 1)
 
         let renderer = MetalRenderer(device: device, view: view)
+        renderer.pictureFit = settings.pictureFit
         context.coordinator.renderer = renderer
         context.coordinator.frameSlot = connectionManager.frameSlot
         context.coordinator.attach(view: view)
@@ -38,6 +40,11 @@ struct MetalView: UIViewRepresentable {
     func updateUIView(_ uiView: MTKView, context: Context) {
         // Draw-on-demand makes preferredFramesPerSecond irrelevant: presentation
         // cadence follows decoded frames (naturally capped by the stream fps).
+        // Fit or Fill changed: redraw the held frame now, not at the next one.
+        if let renderer = context.coordinator.renderer, renderer.pictureFit != settings.pictureFit {
+            renderer.pictureFit = settings.pictureFit
+            uiView.setNeedsDisplay()
+        }
     }
 
     static func dismantleUIView(_ uiView: MTKView, coordinator: Coordinator) {
@@ -130,6 +137,8 @@ final class MetalRenderer {
     private let pipelineState: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
     private var currentFrame: FrameTextures?
+    /// Read on the main thread, where the paused MTKView draws.
+    var pictureFit: PictureFit = .fit
 
     init(device: MTLDevice, view: MTKView) {
         self.device = device
@@ -184,7 +193,8 @@ final class MetalRenderer {
         }
 
         var uniforms = DisplayUniforms(
-            scale: Self.aspectFitScale(
+            scale: Self.scale(
+                pictureFit,
                 video: CGSize(width: frame.width, height: frame.height),
                 drawable: view.drawableSize
             ),
@@ -223,6 +233,31 @@ final class MetalRenderer {
         } else {
             // Video is taller: full height, shrink width (pillarbox).
             return SIMD2<Float>(Float(videoAspect / drawableAspect), 1)
+        }
+    }
+
+    /// Scale that covers `drawable` with `video` preserving aspect ratio: one
+    /// axis grows past 1 and the rasterizer clips the quad, trimming those
+    /// edges. Pure and unit-tested against `ContentRectMapper`.
+    static func aspectFillScale(video: CGSize, drawable: CGSize) -> SIMD2<Float> {
+        guard video.width > 0, video.height > 0, drawable.width > 0, drawable.height > 0 else {
+            return SIMD2<Float>(1, 1)
+        }
+        let videoAspect = video.width / video.height
+        let drawableAspect = drawable.width / drawable.height
+        if videoAspect > drawableAspect {
+            // Video is wider: full height, grow width (sides trimmed).
+            return SIMD2<Float>(Float(videoAspect / drawableAspect), 1)
+        } else {
+            // Video is taller: full width, grow height (top/bottom trimmed).
+            return SIMD2<Float>(1, Float(drawableAspect / videoAspect))
+        }
+    }
+
+    static func scale(_ fit: PictureFit, video: CGSize, drawable: CGSize) -> SIMD2<Float> {
+        switch fit {
+        case .fit: return aspectFitScale(video: video, drawable: drawable)
+        case .fill: return aspectFillScale(video: video, drawable: drawable)
         }
     }
 

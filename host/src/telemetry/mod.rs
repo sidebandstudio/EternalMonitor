@@ -15,6 +15,9 @@ const MAX_FILES: usize = 512;
 const BATCH_SIZE: usize = 4;
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// After that, how long a quit waits for the last queued lines to reach the
+/// outbox. A few small files take milliseconds.
+const FINAL_WRITE_WAIT: Duration = Duration::from_millis(250);
 /// Events another process adds to a launch number from here, clear of the
 /// launch's own sequence, which the backend keeps unique per launch.
 pub const FOREIGN_SEQUENCE_BASE: u64 = 1 << 40;
@@ -178,11 +181,9 @@ pub struct UploadGuard {
     _uploader: Option<Uploader>,
 }
 
-/// The upload thread. Dropping it waits up to [`SHUTDOWN_WAIT`] for the thread
-/// to finish, which bounds the wait for a request in flight. If the thread has
-/// not finished by then, the queued lines are written to the outbox from here,
-/// after any final write the thread has begun; those disk writes are not
-/// bounded.
+/// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`] and
+/// [`FINAL_WRITE_WAIT`]; if a request is still in flight, another thread
+/// writes the queued lines to the outbox.
 struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
     /// Wakes a thread waiting for lines, so an idle quit does not wait out
@@ -229,18 +230,43 @@ impl Drop for Uploader {
             }
             return;
         }
-        // The thread is inside a request and holds no lock; keep what it has
-        // not written yet and let the process exit without it.
+        // The thread is stuck in a request or a write. Keep what it has not
+        // written yet, but from another thread: the disk can stall as well,
+        // and writing here made the quit last as long as the stall.
         #[cfg(test)]
         tests::GAVE_UP.with(|gave_up| gave_up.set(true));
-        let Ok(receiver) = self.receiver.lock() else {
-            return;
-        };
-        let events: Vec<Event> = events(receiver.try_iter()).collect();
-        for chunk in events.chunks(BATCH_SIZE) {
-            if let Ok(batch) = batch(chunk.to_vec()) {
-                let _ = persist(&self.directory, &batch);
+        let (receiver, directory, sharing) =
+            (self.receiver.clone(), self.directory.clone(), enabled());
+        let (written_tx, written) = mpsc::channel();
+        let _ = std::thread::Builder::new().spawn(move || {
+            keep_queued(&receiver, &directory, sharing);
+            let _ = written_tx.send(());
+        });
+        let _ = written.recv_timeout(FINAL_WRITE_WAIT);
+    }
+}
+/// The quit's fallback: writes the lines still queued, or clears everything
+/// pending when sharing is off. If the upload thread is writing the queue
+/// itself, this waits for it and finds nothing left.
+fn keep_queued(receiver: &Mutex<mpsc::Receiver<Queued>>, directory: &Path, sharing: bool) {
+    let Ok(receiver) = receiver.lock() else {
+        return;
+    };
+    if !sharing {
+        // Sharing was turned off during the stalled request. Clear what is
+        // pending, as the thread does.
+        if let Ok(paths) = files(directory) {
+            for path in paths {
+                let _ = fs::remove_file(path);
             }
+        }
+        while receiver.try_recv().is_ok() {}
+        return;
+    }
+    let events: Vec<Event> = events(receiver.try_iter()).collect();
+    for chunk in events.chunks(BATCH_SIZE) {
+        if let Ok(batch) = batch(chunk.to_vec()) {
+            let _ = persist(directory, &batch);
         }
     }
 }
@@ -428,6 +454,8 @@ fn persist(directory: &Path, batch: &Batch) -> std::io::Result<()> {
     let _guard = PERSIST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    tests::stall_while_held(directory);
     let bytes = serde_json::to_vec(batch)?;
     let path = directory.join(format!("{}-{}.json", batch.events[0].at_ms, batch.batch_id));
     let temp = path.with_extension("tmp");
@@ -569,8 +597,8 @@ fn run(
     Ok(())
 }
 /// Writes the events this thread holds and those still queued, all under the
-/// receiver lock. The shutdown fallback takes that lock, so it cannot find the
-/// queue empty and let the process exit while drained events are unwritten.
+/// receiver lock. The quit's fallback takes the same lock, so each queued
+/// line is written once.
 fn finish(
     directory: &Path,
     receiver: &Mutex<mpsc::Receiver<Queued>>,
@@ -677,9 +705,20 @@ mod tests {
         directory
     }
 
+    /// The sharing setting is process-wide. Tests that need it on hold this;
+    /// a test that turns it off holds it exclusively. So does a test that
+    /// stalls the outbox, which holds every outbox write in the process.
+    static SHARING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    fn sharing_on() -> std::sync::RwLockReadGuard<'static, ()> {
+        SHARING
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Quit as main does while the first upload is in flight. Returns how long
     /// the quit took and whether it stopped waiting for the upload thread.
     fn quit_waits(delay: Duration) -> (Duration, PathBuf, bool) {
+        let _sharing = sharing_on();
         let directory = outbox_with_batches(8);
         let (endpoint, arrived) = slow_server(delay);
         let config = Config {
@@ -706,6 +745,25 @@ mod tests {
         (waited, directory, GAVE_UP.with(|gave_up| gave_up.get()))
     }
 
+    /// The outbox's messages once `kept` holds for them, or after 10 s. The
+    /// quit's fallback writes on its own thread and may finish after it.
+    fn outbox_messages_once(directory: &Path, kept: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let messages = outbox_messages(directory);
+            if kept(&messages) || std::time::Instant::now() >= deadline {
+                return messages;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn shut_down(messages: &[String]) -> bool {
+        messages
+            .iter()
+            .any(|m| m.ends_with("EternalMonitor shutting down"))
+    }
+
     fn outbox_messages(directory: &Path) -> Vec<String> {
         files(directory)
             .unwrap()
@@ -727,10 +785,9 @@ mod tests {
             waited < Duration::from_millis(2500),
             "quit waited {waited:?}"
         );
-        let messages = outbox_messages(&directory);
-        assert!(messages
-            .iter()
-            .any(|m| m.ends_with("EternalMonitor shutting down")));
+        // A slow runner can still be writing when the bounded quit returns.
+        let messages = outbox_messages_once(&directory, shut_down);
+        assert!(shut_down(&messages), "{messages:?}");
         // At most the request in flight was sent; the rest wait for next launch.
         assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
         fs::remove_dir_all(directory).unwrap();
@@ -748,8 +805,67 @@ mod tests {
         }
     }
 
+    /// Outbox whose writes block, holding the write lock, while a test
+    /// keeps it here: a stalled disk.
+    static STALLED_OUTBOX: Mutex<Option<PathBuf>> = Mutex::new(None);
+    pub(super) fn stall_while_held(directory: &Path) {
+        while STALLED_OUTBOX.lock().unwrap().as_deref() == Some(directory) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn quitting_while_an_outbox_write_stalls_is_bounded() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        // The worker's first write stalls while it holds the outbox lock.
+        *STALLED_OUTBOX.lock().unwrap() = Some(directory.clone());
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        sender
+            .send(Queued::Line("2026-10-21T17:11:31Z  INFO first line".into()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        sender
+            .send(Queued::Line("2026-10-21T17:11:31Z  INFO last line".into()))
+            .unwrap();
+        // The disk recovers long after the quit should have returned.
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            *STALLED_OUTBOX.lock().unwrap() = None;
+        });
+        let started = std::time::Instant::now();
+        drop(uploader);
+        let waited = started.elapsed();
+        assert!(
+            STALLED_OUTBOX.lock().unwrap().is_some(),
+            "quit waited for the stalled write: {waited:?}"
+        );
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
+            "quit waited {waited:?}"
+        );
+        release.join().unwrap();
+        let messages = outbox_messages_once(&directory, |messages| {
+            ["first line", "last line"]
+                .iter()
+                .all(|line| messages.iter().any(|m| m.ends_with(line)))
+        });
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn quitting_near_the_deadline_keeps_every_drained_event() {
+        let _sharing = sharing_on();
         let directory = outbox_with_batches(1);
         let config = Config {
             endpoint: slow_server(Duration::from_millis(1700)).0,
@@ -759,7 +875,8 @@ mod tests {
         };
         // The acknowledgement arrives just before the deadline, and the
         // worker is still writing the drained queue when the wait runs out.
-        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_millis(1500)));
+        // The write stalls far longer than a quit may wait.
+        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_secs(5)));
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
         std::thread::sleep(Duration::from_millis(300));
         for index in 0..10 {
@@ -769,20 +886,58 @@ mod tests {
                 )))
                 .unwrap();
         }
+        let started = std::time::Instant::now();
         drop(uploader);
-        let messages = outbox_messages(&directory);
-        let kept = (0..10)
-            .filter(|index| {
-                let line = format!("last line {index}");
-                messages.iter().any(|m| m.ends_with(&line))
-            })
-            .count();
-        assert_eq!(kept, 10, "{messages:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
+            "quit waited {waited:?}"
+        );
+        // Whoever drained the queue writes all of it.
+        let kept = |messages: &[String]| {
+            (0..10)
+                .filter(|index| {
+                    let line = format!("last line {index}");
+                    messages.iter().any(|m| m.ends_with(&line))
+                })
+                .count()
+        };
+        let messages = outbox_messages_once(&directory, |messages| kept(messages) == 10);
+        assert_eq!(kept(&messages), 10, "{messages:?}");
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
+    fn quitting_with_sharing_off_during_a_stalled_upload_keeps_nothing() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = outbox_with_batches(1);
+        let (sender, receiver) = mpsc::sync_channel(256);
+        sender
+            .send(Queued::Line("2026-10-21T17:11:31Z  INFO last line".into()))
+            .unwrap();
+        // The request in flight never finishes, so the quit wait runs out.
+        let (_request, done) = mpsc::channel();
+        let uploader = Uploader {
+            stop: std::sync::Arc::new(AtomicBool::new(false)),
+            wake: sender,
+            receiver: std::sync::Arc::new(Mutex::new(receiver)),
+            directory: directory.clone(),
+            done,
+            thread: None,
+        };
+        ENABLED.store(false, Ordering::Relaxed);
+        drop(uploader);
+        ENABLED.store(true, Ordering::Relaxed);
+        let messages = outbox_messages_once(&directory, |messages| messages.is_empty());
+        assert!(messages.is_empty(), "{messages:?}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn an_empty_log_line_is_an_event_and_not_the_shutdown_wake() {
+        let _sharing = sharing_on();
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
         let config = Config {
@@ -838,10 +993,8 @@ mod tests {
         // the outbox writes after the wait took 2.7 s. The quits this guards
         // against took 12.9 s and 30 s.
         assert!(waited < Duration::from_secs(10), "quit waited {waited:?}");
-        let messages = outbox_messages(&directory);
-        assert!(messages
-            .iter()
-            .any(|m| m.ends_with("EternalMonitor shutting down")));
+        let messages = outbox_messages_once(&directory, shut_down);
+        assert!(shut_down(&messages), "{messages:?}");
         assert_eq!(messages.iter().filter(|m| *m == "queued").count(), 8);
         let _ = fs::remove_dir_all(directory);
     }

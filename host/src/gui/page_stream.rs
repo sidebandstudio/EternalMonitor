@@ -22,6 +22,8 @@ impl AnalyzerApp {
         client: &ClientSnapshot,
     ) {
         self.notices(ui, snap);
+        self.ipad_update_notice(ui, client);
+        self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
         ui.add_space(GAP - 10.0);
         let wide = ui.available_width() >= 640.0;
@@ -216,6 +218,10 @@ impl AnalyzerApp {
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
+            StreamState::Paused => (
+                format!("Streaming to {device} is paused"),
+                "Windows stopped screen capture. See the message above.".to_string(),
+            ),
         };
 
         widgets::card().show(ui, |ui| {

@@ -253,6 +253,8 @@ struct Hello2: Equatable {
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
     static let featureSupportsNack: UInt16 = 1 << 2
+    /// This app checks for its own updates, so the PC need not tell the user. 0.3.1 and older never set it.
+    static let featureChecksUpdates: UInt16 = 1 << 4
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2

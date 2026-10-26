@@ -51,6 +51,7 @@ pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
@@ -59,7 +60,6 @@ pub fn run_capture_loop(
     // allocations so a delayed consumer never discards a busy spare and causes
     // a fresh full-frame allocation on the next tick.
     let mut buffers = std::array::from_fn(|_| Arc::new(vec![0u8; frame_bytes]));
-    let mut frame_number: u64 = 0;
 
     info!(width, height, "Synthetic capture source active");
     *shared.capture_geometry.lock() = Some(crate::input::CaptureGeometry {
@@ -87,14 +87,14 @@ pub fn run_capture_loop(
 
         heartbeat(&shared.hb_capture_loop_ms);
 
-        frame_number += 1;
-        let data = render_next_frame(&mut buffers, width, height, frame_number);
+        *frame_number += 1;
+        let data = render_next_frame(&mut buffers, width, height, *frame_number);
 
         PIPELINE_STATS.lock().record_capture(width, height);
         heartbeat(&shared.hb_capture_frame_ms);
 
         slot.publish(RawFrame {
-            frame_number,
+            frame_number: *frame_number,
             timestamp: frame_start,
             data,
             width,

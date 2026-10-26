@@ -114,6 +114,45 @@ fn cable_notice_appears_only_for_a_plugged_in_ipad_without_the_service() {
 }
 
 #[test]
+fn a_connected_ipad_without_a_picture_is_not_shown_as_streaming() {
+    let mut snap = StatsSnapshot::take();
+    snap.pipeline_running = true;
+    let mut client = ClientSnapshot {
+        info: Some(ClientInfo {
+            device_name: "iPad".into(),
+            device_id: 1,
+            screen_px: (2388, 1668),
+            refresh_hz: 120,
+            preferred_fps: 60,
+            decoder_caps: 1,
+            feature_caps: 0,
+            connected_at: Instant::now(),
+        }),
+        peer: None,
+        session_id: None,
+        report: None,
+        capture_block: Some(CaptureBlock::UnsupportedOnThisGpu),
+    };
+    // Capture retries this forever while heartbeats stay current.
+    assert!(StreamState::of(&snap, &client) == StreamState::Paused);
+    let (_, title, body) = capture_block_notice(client.capture_block, true).unwrap();
+    assert!(title.contains("graphics card"), "{title}");
+    assert!(body.contains("Power saving"), "{body}");
+
+    client.capture_block = None;
+    assert!(StreamState::of(&snap, &client) == StreamState::Streaming);
+    assert!(capture_block_notice(None, true).is_none());
+}
+
+#[test]
+fn a_stopped_stream_does_not_promise_the_picture_will_come_back() {
+    let block = Some(CaptureBlock::DisplayChanging);
+    assert!(capture_block_notice(block, true).is_some());
+    // Stop leaves the last block recorded, but nothing retries any more.
+    assert!(capture_block_notice(block, false).is_none());
+}
+
+#[test]
 fn codec_names_read_as_codec_and_engine() {
     assert_eq!(friendly_codec("h264_nvenc"), "H.264 · NVENC");
     assert_eq!(friendly_codec("hevc_amf"), "HEVC · AMF");
@@ -430,4 +469,137 @@ fn the_resolution_match_says_when_a_change_applies() {
         );
     }
     assert!(vdd_match_description(true).contains("when the iPad connects again"));
+}
+
+#[test]
+fn the_update_popup_says_what_update_now_does_from_here() {
+    use super::update_banner::popup_hint;
+    assert_eq!(
+        popup_hint(true),
+        "Windows will ask for permission, then EternalMonitor restarts."
+    );
+    // A copy Setup would not replace only opens the website.
+    assert_eq!(popup_hint(false), "Update now opens the download page.");
+}
+
+/// The popup never covers a picture the iPad is showing, or another dialog.
+#[test]
+fn the_update_popup_waits_for_the_stream_and_other_dialogs() {
+    use super::update_banner::PopupGate::{self, *};
+    // (open, connected, other dialog, on Stream, busy)
+    assert_eq!(PopupGate::of(false, false, false, true, false), Show);
+    assert_eq!(
+        PopupGate::of(true, false, false, false, true),
+        Show,
+        "stays"
+    );
+    assert_eq!(PopupGate::of(false, false, false, false, false), Wait);
+    assert_eq!(PopupGate::of(false, false, false, true, true), Wait);
+    for open in [false, true] {
+        for (connected, other) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(PopupGate::of(open, connected, other, true, false), Hide);
+        }
+    }
+}
+
+#[test]
+fn feedback_details_leave_out_names_and_addresses() {
+    use crate::feedback::{body, mailto, Kind};
+    let client = ClientSnapshot {
+        info: Some(ClientInfo {
+            device_name: "Jane Doe's iPad".into(),
+            device_id: 0x5EC2E7,
+            screen_px: (2420, 1668),
+            refresh_hz: 120,
+            preferred_fps: 60,
+            decoder_caps: 1,
+            feature_caps: 0,
+            connected_at: Instant::now(),
+        }),
+        peer: Some(PeerId::usb(7)),
+        session_id: Some(3),
+        report: None,
+        capture_block: None,
+    };
+    let details = super::feedback_panel::details(true, &client);
+    let text = body(Kind::Problem, "It froze", Some(&details));
+    assert!(
+        text.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"),
+        "{text}"
+    );
+    let (url, _) = mailto(Kind::Problem, "It froze", Some(&details));
+    let mut private = vec![
+        "Jane".to_string(),
+        "iPad Pro".to_string(),
+        "5EC2E7".to_string(),
+        "192.".to_string(),
+        "10.0.".to_string(),
+        "USB device 7".to_string(),
+        detect_local_ip(9876),
+    ];
+    // Whatever this machine's user and computer are called.
+    for var in ["USER", "USERNAME", "COMPUTERNAME", "HOSTNAME", "LOGNAME"] {
+        if let Ok(value) = std::env::var(var) {
+            if value.len() > 2 {
+                private.push(value);
+            }
+        }
+    }
+    for secret in &private {
+        assert!(!text.contains(secret.as_str()), "{secret} in {text}");
+        assert!(!url.contains(secret.as_str()), "{secret} in {url}");
+    }
+    // Disconnected: no iPad line at all.
+    let idle = super::feedback_panel::details(
+        false,
+        &ClientSnapshot {
+            info: None,
+            peer: None,
+            session_id: None,
+            report: None,
+            capture_block: None,
+        },
+    );
+    assert!(body(Kind::Idea, "", Some(&idle)).contains("Setup: Mirror, no iPad connected"));
+}
+
+/// A session counts as nearby, and so does one that ended less than the
+/// quiet period ago, so a reconnecting iPad never flashes the popup.
+#[test]
+fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
+    use super::update_banner::{ipad_nearby, POPUP_QUIET};
+    assert!(POPUP_QUIET >= Duration::from_secs(15) && POPUP_QUIET <= Duration::from_secs(30));
+    let quiet = Duration::from_secs(20);
+    let start = Instant::now();
+    let mut last = None;
+    assert!(
+        !ipad_nearby(false, &mut last, start, quiet),
+        "never connected"
+    );
+    assert!(ipad_nearby(true, &mut last, start, quiet));
+    // Three drops and reconnects, a few seconds apart.
+    for cycle in 1..=3u64 {
+        let lost = start + Duration::from_secs(5 * cycle);
+        assert!(ipad_nearby(true, &mut last, lost, quiet));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_millis(1),
+            quiet
+        ));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_secs(3),
+            quiet
+        ));
+    }
+    let gone = start + Duration::from_secs(15);
+    assert!(ipad_nearby(
+        false,
+        &mut last,
+        gone + quiet - Duration::from_millis(1),
+        quiet
+    ));
+    assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
 }

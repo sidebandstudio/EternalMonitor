@@ -52,13 +52,15 @@ pub struct HelperArgs {
     pub sha256: String,
     /// The installed host, started again at the end.
     pub app: PathBuf,
+    /// The host's own arguments (its listen port), passed on to that start.
+    pub app_args: Vec<OsString>,
     pub host_pid: u32,
     pub log: PathBuf,
 }
 
 impl HelperArgs {
     pub fn to_args(&self) -> Vec<OsString> {
-        vec![
+        let mut args: Vec<OsString> = vec![
             "--installer".into(),
             self.installer.clone().into(),
             "--sha256".into(),
@@ -69,13 +71,19 @@ impl HelperArgs {
             self.host_pid.to_string().into(),
             "--log".into(),
             self.log.clone().into(),
-        ]
+        ];
+        for arg in &self.app_args {
+            args.push("--app-arg".into());
+            args.push(arg.clone());
+        }
+        args
     }
 
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut args = args.into_iter();
         let (mut installer, mut sha256, mut app, mut host_pid, mut log) =
             (None, None, None, None, None);
+        let mut app_args = Vec::new();
         while let Some(name) = args.next() {
             let value = args
                 .next()
@@ -84,6 +92,7 @@ impl HelperArgs {
                 Some("--installer") => installer = Some(PathBuf::from(value)),
                 Some("--sha256") => sha256 = value.into_string().ok(),
                 Some("--app") => app = Some(PathBuf::from(value)),
+                Some("--app-arg") => app_args.push(value),
                 Some("--host-pid") => host_pid = value.to_str().and_then(|v| v.parse().ok()),
                 Some("--log") => log = Some(PathBuf::from(value)),
                 _ => return Err(format!("unknown argument {name:?}")),
@@ -97,6 +106,7 @@ impl HelperArgs {
             installer: installer.ok_or("--installer is required")?,
             sha256,
             app: app.ok_or("--app is required")?,
+            app_args,
             host_pid: host_pid.ok_or("--host-pid is required")?,
             log: log.ok_or("--log is required")?,
         })
@@ -220,7 +230,7 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
         log.note("cannot wait for EternalMonitor to close; not starting it again");
         return 6;
     }
-    match relaunch(&args.app) {
+    match relaunch(&args.app, &args.app_args) {
         Ok(()) => {
             log.note("EternalMonitor started");
             0
@@ -411,16 +421,56 @@ fn run_setup(args: &HelperArgs, _installer: &File) -> Result<i32, String> {
     Ok(status.code().unwrap_or(-1))
 }
 
-/// Starts the installed app again, passing on none of this helper's handles.
-#[cfg(windows)]
-pub fn relaunch(app: &Path) -> io::Result<()> {
-    win::start(app)
+/// The app's command line: its path, then `args` quoted the way the CRT
+/// splits them.
+pub fn app_command_line(app: &Path, args: &[OsString]) -> String {
+    let mut line = format!("\"{}\"", app.display());
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote_arg(&arg.to_string_lossy()));
+    }
+    line
 }
 
-/// Starts the installed app again.
+/// Quotes one argument for the Windows CRT's command-line parser.
+pub fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Starts the installed app again with the host's arguments, passing on none
+/// of this helper's handles.
+#[cfg(windows)]
+pub fn relaunch(app: &Path, args: &[OsString]) -> io::Result<()> {
+    win::start(app, &app_command_line(app, args))
+}
+
+/// Starts the installed app again with the host's arguments.
 #[cfg(not(windows))]
-pub fn relaunch(app: &Path) -> io::Result<()> {
+pub fn relaunch(app: &Path, args: &[OsString]) -> io::Result<()> {
     let mut command = Command::new(app);
+    command.args(args);
     if let Some(dir) = app.parent() {
         command.current_dir(dir);
     }
@@ -472,6 +522,7 @@ mod tests {
             installer: PathBuf::from(r"C:\Users\A B\EternalMonitor-Setup-0.3.2.exe"),
             sha256: HELLO_SHA.into(),
             app: PathBuf::from(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+            app_args: vec!["9877".into(), "--log".into(), "".into()],
             host_pid: 42,
             log: PathBuf::from("update.log"),
         };
@@ -483,6 +534,30 @@ mod tests {
         missing.truncate(8);
         assert!(HelperArgs::parse(missing).is_err());
         assert!(HelperArgs::parse(vec!["--other".into(), "x".into()]).is_err());
+    }
+
+    /// The host takes its listen port as an argument; the restarted app must
+    /// get it back, each argument intact.
+    #[test]
+    fn the_app_restarts_with_the_hosts_arguments() {
+        let app = Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe");
+        assert_eq!(
+            app_command_line(app, &[]),
+            r#""C:\Program Files\EternalMonitor\EternalMonitor-host.exe""#
+        );
+        let args = [
+            "9877".into(),
+            r"C:\Users\A B\port file.txt".into(),
+            r#"say "hi""#.into(),
+            r"C:\A B\".into(),
+            "".into(),
+        ];
+        assert_eq!(
+            app_command_line(app, &args),
+            r#""C:\Program Files\EternalMonitor\EternalMonitor-host.exe" 9877 "C:\Users\A B\port file.txt" "say \"hi\"" "C:\A B\\" """#
+        );
+        assert_eq!(quote_arg(r"C:\no\spaces\"), r"C:\no\spaces\");
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
     }
 
     #[test]
@@ -567,6 +642,7 @@ mod tests {
             installer,
             sha256,
             app,
+            app_args: Vec::new(),
             host_pid: old.id(),
             log: dir.join("update.log"),
         };
@@ -642,6 +718,7 @@ touch '{d}/setup-ran'
             installer,
             sha256,
             app,
+            app_args: Vec::new(),
             host_pid: 0,
             log: dir.join("update.log"),
         };

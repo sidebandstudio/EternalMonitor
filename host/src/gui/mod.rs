@@ -9,7 +9,10 @@
 //!   (or "Waiting for an iPad" when nobody is connected);
 //! - on Settings, the "Encoder input" row;
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
+//! - in the sidebar, "Send feedback" and the GitHub star card (see
+//!   `feedback_panel.rs`).
 
+mod feedback_panel;
 mod icons;
 mod page_performance;
 mod page_settings;
@@ -29,6 +32,7 @@ use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
+use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::settings::SettingsFile;
@@ -127,6 +131,8 @@ struct ClientSnapshot {
     peer: Option<PeerId>,
     session_id: Option<u32>,
     report: Option<ReceiverReport>,
+    /// Why Windows is withholding the screen from it, if it is.
+    capture_block: Option<CaptureBlock>,
 }
 
 impl ClientSnapshot {
@@ -137,6 +143,7 @@ impl ClientSnapshot {
             peer: session.peer(),
             session_id: session.session_id(),
             report: session.last_report(),
+            capture_block: *control.shared.capture_block.lock(),
         }
     }
 
@@ -158,16 +165,21 @@ enum StreamState {
     Off,
     Ready,
     Streaming,
+    /// An iPad is connected, but Windows withholds the screen, so its
+    /// picture is frozen. Capture retries until Windows allows it again.
+    Paused,
 }
 
 impl StreamState {
     fn of(snap: &StatsSnapshot, client: &ClientSnapshot) -> Self {
         if !snap.pipeline_running {
             StreamState::Off
-        } else if client.info.is_some() {
-            StreamState::Streaming
-        } else {
+        } else if client.info.is_none() {
             StreamState::Ready
+        } else if client.capture_block.is_some() {
+            StreamState::Paused
+        } else {
+            StreamState::Streaming
         }
     }
 
@@ -175,12 +187,13 @@ impl StreamState {
         match self {
             StreamState::Off => TEXT_FAINT,
             StreamState::Ready | StreamState::Streaming => ACCENT,
+            StreamState::Paused => WARNING,
         }
     }
 
     fn dot(self) -> widgets::Dot {
         match self {
-            StreamState::Off => widgets::Dot::Idle,
+            StreamState::Off | StreamState::Paused => widgets::Dot::Idle,
             StreamState::Ready => widgets::Dot::Ready,
             StreamState::Streaming => widgets::Dot::Live,
         }
@@ -259,6 +272,7 @@ impl History {
 enum Copied {
     Address,
     Logs,
+    Email,
 }
 
 pub struct AnalyzerApp {
@@ -269,6 +283,14 @@ pub struct AnalyzerApp {
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
     updates: crate::updates::Updater,
+    /// The update popup is on screen; it stays until a button is chosen.
+    update_popup_open: bool,
+    /// When an iPad last had a session, for the popup's quiet period. Starts
+    /// at launch: after a login start, a USB iPad connects within seconds.
+    ipad_last_seen: Option<Instant>,
+    popup_quiet: Duration,
+    /// "Your iPad app is out of date" was dismissed for this run.
+    ipad_notice_dismissed: bool,
     settings_packet_size: u32,
     /// Last settings error worth showing (the autostart registry write or a
     /// pairing reset).
@@ -289,6 +311,10 @@ pub struct AnalyzerApp {
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
     copied: Option<(Copied, Instant)>,
+    /// The Send feedback dialog, while open.
+    feedback: Option<feedback_panel::Draft>,
+    feedback_ask: crate::feedback::Ask,
+    star_clicked: bool,
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
@@ -401,6 +427,10 @@ impl AnalyzerApp {
             settings_encoder_input: encoder_input,
             settings_check_updates: persisted.check_for_updates,
             updates,
+            update_popup_open: false,
+            ipad_last_seen: Some(Instant::now()),
+            popup_quiet: popup_quiet(),
+            ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
             page: Page::Stream,
@@ -418,6 +448,12 @@ impl AnalyzerApp {
             show_qr_modal: false,
             qr_cache: None,
             copied: None,
+            feedback: None,
+            feedback_ask: crate::feedback::Ask::new(
+                persisted.feedback_sessions,
+                persisted.feedback_ask_done,
+            ),
+            star_clicked: persisted.star_clicked,
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
@@ -457,6 +493,9 @@ impl AnalyzerApp {
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
+            feedback_sessions: self.feedback_ask.long_sessions,
+            feedback_ask_done: self.feedback_ask.done,
+            star_clicked: self.star_clicked,
         };
         file.save();
     }
@@ -692,6 +731,7 @@ impl eframe::App for AnalyzerApp {
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
+        self.observe_session(&client);
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;
@@ -734,7 +774,23 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
+        self.update_popup(&ctx, &client);
+        self.draw_feedback_panel(&ctx, &client);
     }
+}
+
+/// [`update_banner::POPUP_QUIET`]. Debug builds only:
+/// `ETERNAL_UPDATE_POPUP_QUIET_MS` shortens it for the GUI tests.
+fn popup_quiet() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("ETERNAL_UPDATE_POPUP_QUIET_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+    }
+    update_banner::POPUP_QUIET
 }
 
 // ── Sidebar ─────────────────────────────────────────────────────────────────
@@ -780,6 +836,12 @@ impl AnalyzerApp {
                     ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
+                    ui.add_space(6.0);
+                    if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
+                        self.open_feedback();
+                    }
+                    ui.add_space(2.0);
+                    self.star_card(ui);
                 });
             });
     }
@@ -872,8 +934,13 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
     let (title, detail) = match state {
         StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
         StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
-        StreamState::Streaming => (
-            "Streaming".to_string(),
+        StreamState::Streaming | StreamState::Paused => (
+            if state == StreamState::Paused {
+                "Paused"
+            } else {
+                "Streaming"
+            }
+            .to_string(),
             format!(
                 "{} · {}",
                 client

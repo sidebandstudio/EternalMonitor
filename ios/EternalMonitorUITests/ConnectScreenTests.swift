@@ -34,25 +34,76 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertTrue(app.buttons["settings.done"].exists)
         let allowUSB = app.switches["settings.allowUSB"]
         XCTAssertTrue(allowUSB.exists)
-        XCTAssertEqual(allowUSB.value as? String, "1")
+        // Start from USB on. The setting is saved, so a run that failed
+        // between the two taps below left it off for every later run. A
+        // launch argument can't set it: it would shadow the toggle.
+        if allowUSB.value as? String == "0" {
+            allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        }
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "settings"
         screenshot.lifetime = .keepAlways
         add(screenshot)
         // SwiftUI exposes the whole form row as a switch. Tap its thumb.
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(allowUSB.value as? String, "0")
+        // The switch's value can update a moment after the tap returns.
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "0"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
         XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "Off. Turn on to connect with a cable.")
         settings.tap()
         XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(allowUSB.value as? String, "1")
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
         waitForExpectations(timeout: 5)
+    }
+
+    /// A flick or drag that starts on the Picture row scrolls Settings and
+    /// leaves the choice alone; only choosing from its menu changes it.
+    func testScrollingFromThePictureRowKeepsTheChoice() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-pictureFit", "fit"]
+        app.launch()
+        let settings = app.buttons["settings.button"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        let picture = app.buttons["settings.pictureFit"]
+        for gesture in ["drag", "swipe"] {
+            settings.tap()
+            XCTAssertTrue(picture.waitForExistence(timeout: 5), gesture)
+            XCTAssertEqual(picture.value as? String, "Fit", gesture)
+            let top = picture.frame.minY
+            // Start over the value, where the old segmented control's Fill sat.
+            let start = picture.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+            if gesture == "drag" {
+                start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -300)),
+                            withVelocity: .slow, thenHoldForDuration: 0.3)
+            } else {
+                start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -300)),
+                            withVelocity: .fast, thenHoldForDuration: 0)
+            }
+            XCTAssertTrue(!picture.exists || picture.frame.minY < top - 100, "the \(gesture) did not scroll Settings")
+            XCTAssertFalse(app.buttons["Fill"].exists, "the \(gesture) opened the Picture menu")
+            app.buttons["settings.done"].tap()
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            settings.tap()
+            XCTAssertTrue(picture.waitForExistence(timeout: 5), gesture)
+            XCTAssertEqual(picture.value as? String, "Fit", "a \(gesture) that started on the Picture row changed it")
+            app.buttons["settings.done"].tap()
+        }
+        // The menu itself still works.
+        settings.tap()
+        XCTAssertTrue(picture.waitForExistence(timeout: 5))
+        picture.tap()
+        app.buttons["Fill"].tap()
+        XCTAssertEqual(picture.value as? String, "Fill")
+        picture.tap()
+        app.buttons["Fit"].tap()
+        XCTAssertEqual(picture.value as? String, "Fit")
+        app.buttons["settings.done"].tap()
     }
 
     /// The pairing code typed into Address is caught at once, instead of
@@ -69,6 +120,24 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertFalse(app.buttons["Cancel"].exists)
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "pairing-code-as-address"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    /// A search that fails for a reason other than Local Network access
+    /// offers Search again, not Settings.
+    func testAFailedSearchOffersSearchAgain() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "searchFailed"
+        app.launch()
+        let title = app.staticTexts["connect.scanProblemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertEqual(title.label, "Couldn't search for PCs")
+        XCTAssertTrue(app.buttons["Search again"].exists)
+        XCTAssertFalse(app.buttons["Open Settings"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "search-failed"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["Search again"].tap()
+        XCTAssertTrue(title.waitForExistence(timeout: 15))
     }
 
     /// An address where nothing answers ends in plain words and a retry,
@@ -154,5 +223,12 @@ final class ConnectScreenTests: XCTestCase {
         rate.tap()
         app.buttons["60 fps"].tap()
         app.buttons["settings.done"].tap()
+    }
+
+    /// Whether `element`'s value becomes `value` within five seconds.
+    private func switchValue(of element: XCUIElement, becomes value: String) -> Bool {
+        let changed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", value), object: element)
+        return XCTWaiter().wait(for: [changed], timeout: 5) == .completed
     }
 }

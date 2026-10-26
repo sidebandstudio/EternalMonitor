@@ -137,6 +137,70 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(attempts, 0)
     }
 
+    /// The update popup waits for Connect to settle: never between reconnect
+    /// attempts, where a tap meant for "Reconnecting" would hit its backdrop,
+    /// nor over the card the cycle ends with. Once that is dismissed, it may.
+    func testTheConnectScreenIsNotIdleDuringAReconnectCycle() async throws {
+        let previous = UserDefaults.standard.object(forKey: "autoReconnect")
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
+        let host = FakeUDPHost()
+        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
+            connectTimeoutSeconds: 0.5, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.4 }))
+        defer { manager.cancel() }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        XCTAssertFalse(manager.isIdleOnConnect)
+
+        // The PC goes away; nothing answers the reconnect attempts.
+        host.sendBye(.hostShuttingDown)
+        var betweenAttempts = 0
+        let deadline = Date().addingTimeInterval(20)
+        try await until("reconnecting") { manager.reconnectAttempt > 0 }
+        while manager.reconnectAttempt > 0, Date() < deadline {
+            if manager.state == .disconnected { betweenAttempts += 1 }
+            XCTAssertFalse(manager.isIdleOnConnect, "idle during attempt \(manager.reconnectAttempt)")
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThan(betweenAttempts, 0, "the cycle never waited between attempts")
+        XCTAssertEqual(manager.reconnectAttempt, 0, "the cycle never ended")
+        // It ends on a problem card: still not idle.
+        XCTAssertNotNil(manager.problem)
+        XCTAssertFalse(manager.isIdleOnConnect)
+        manager.problem = nil
+        XCTAssertTrue(manager.isIdleOnConnect)
+    }
+
+    /// A PC too old for this app turns it down. Its error says to update the
+    /// PC, so a pending update popup (which points to TestFlight) waits until
+    /// the error is dismissed.
+    func testAVersionMismatchErrorKeepsTheUpdatePopupAway() async throws {
+        let suite = "GoodbyeTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let manifest = Data(#"{"schema":1,"ipad":{"version":"9.9.9","build":999}}"#.utf8)
+        let updates = UpdateChecker(defaults: defaults, source: .injected(manifest),
+                                    installed: InstalledApp(version: "0.3.1", build: 166))
+        updates.checkIfDue()
+        XCTAssertNotNil(updates.popup, "an update is pending")
+
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let answered = await Task.detached { host.acceptSession(status: .versionUnsupported, acceptedVersion: 1) }.value
+        XCTAssertTrue(answered, "the iPad never sent HELLO2")
+        try await until("turned down") { manager.state == .disconnected && manager.connectionError != nil }
+        XCTAssertEqual(manager.versionMismatch, .pcOlder)
+        XCTAssertTrue(manager.connectionError?.contains("click Update now on the PC") == true, manager.connectionError ?? "")
+        XCTAssertNil(manager.problem)
+        XCTAssertFalse(manager.isIdleOnConnect && updates.popup != nil, "the popup must not cover the error")
+
+        // The user dismisses the error (ConnectView's close button).
+        manager.connectionError = nil
+        XCTAssertTrue(manager.isIdleOnConnect && updates.popup != nil, "then the popup shows")
+    }
+
     /// Disconnected from the PC's side: the iPad stays away.
     func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
         let host = FakeUDPHost()

@@ -166,8 +166,13 @@ final class USBLinkFailureTests: XCTestCase {
     }
 
     /// Every Wi-Fi fallback attempt times out: the user ends on the cable
-    /// advice and Try again, not "Couldn't reconnect".
+    /// advice and Try again, not "Couldn't reconnect". Try again then goes
+    /// back to the cable the advice is about, not to Wi-Fi.
     func testCableFailureAdviceSurvivesAnExhaustedWiFiFallback() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        // Try again must not open the app's real USB listener port.
+        UserDefaults.standard.set(false, forKey: "allowUSB")
         let wifi = FakeUDPHost()  // never answers
         enableWiFiFallback(to: wifi)
         let (manager, link) = try await connectOverCable(timing: fast)
@@ -182,6 +187,12 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
         XCTAssertEqual(manager.problem, .usbFailed)
         XCTAssertEqual(manager.problem?.actions, [.retry])
+        manager.retry()
+        XCTAssertEqual(manager.state, .disconnected, "Try again waits for the cable instead of connecting over Wi-Fi")
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.usbStatus, "USB: off", "Try again went back to the cable listener")
+        let retried = await Task.detached { wifi.helloAttempts(within: 1) }.value
+        XCTAssertEqual(retried, 0, "no Wi-Fi attempt under the cable advice")
     }
 
     /// A later, more specific failure (the saved address doesn't resolve)

@@ -55,17 +55,27 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
 /// `PROCESS_QUERY_LIMITED_INFORMATION`.
 #[cfg(windows)]
 pub(crate) fn start_time_of(process: windows::Win32::Foundation::HANDLE) -> Option<u64> {
-    use windows::Win32::Foundation::{FILETIME, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes};
+    use windows::Win32::Foundation::STILL_ACTIVE;
+    use windows::Win32::System::Threading::GetExitCodeProcess;
     let mut code = 0u32;
+    let alive =
+        unsafe { GetExitCodeProcess(process, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32;
+    if !alive {
+        return None;
+    }
+    created_at(process)
+}
+
+/// The start time of a process handle like [`start_time_of`]'s, also after
+/// the process has exited.
+#[cfg(windows)]
+pub(crate) fn created_at(process: windows::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetProcessTimes;
     let mut times = [FILETIME::default(); 4];
     let [created, exited, kernel, user] = &mut times;
-    let alive = unsafe {
-        GetExitCodeProcess(process, &mut code).is_ok()
-            && code == STILL_ACTIVE.0 as u32
-            && GetProcessTimes(process, created, exited, kernel, user).is_ok()
-    };
-    alive.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    unsafe { GetProcessTimes(process, created, exited, kernel, user) }.ok()?;
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 /// One argument quoted for a Windows command line, the way the C runtime
@@ -176,8 +186,8 @@ pub(crate) mod tests {
         assert_eq!(quote_arg("--failure-reporter"), "--failure-reporter");
         assert_eq!(quote_arg(""), "\"\"");
         assert_eq!(
-            quote_arg(r"C:\Users\Ali Younes\AppData\Roaming\EternalMonitor\crash"),
-            r#""C:\Users\Ali Younes\AppData\Roaming\EternalMonitor\crash""#
+            quote_arg(r"C:\Users\Example User\AppData\Roaming\EternalMonitor\crash"),
+            r#""C:\Users\Example User\AppData\Roaming\EternalMonitor\crash""#
         );
         // A trailing backslash must not escape the closing quote.
         assert_eq!(quote_arg(r"C:\a b\"), r#""C:\a b\\""#);

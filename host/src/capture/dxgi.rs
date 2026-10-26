@@ -109,6 +109,7 @@ pub fn run_capture_loop(
     shared: SharedControl,
     adapter_index: u32,
     generation: u64,
+    frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The capture adapter FOLLOWS the chosen output (which may differ from the
     // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
@@ -271,7 +272,6 @@ pub fn run_capture_loop(
     let mut last_frame: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_bytes]);
 
     // --- Capture loop state ---
-    let mut frame_number: u64 = 0;
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
     // Time of the last frame handed downstream — drives the idle keepalive (T1d).
@@ -360,7 +360,7 @@ pub fn run_capture_loop(
 
         match hr {
             Ok(()) => {
-                frame_number += 1;
+                *frame_number += 1;
 
                 // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
                 if frame_info.LastMouseUpdateTime != 0 {
@@ -397,7 +397,7 @@ pub fn run_capture_loop(
                 };
 
                 debug!(
-                    frame = frame_number,
+                    frame = *frame_number,
                     dirty_rects = dirty_count,
                     last_present = frame_info.LastPresentTime,
                     accumulated = frame_info.AccumulatedFrames,
@@ -502,7 +502,7 @@ pub fn run_capture_loop(
                         heartbeat(&shared.hb_capture_frame_ms);
 
                         slot.publish(RawFrame {
-                            frame_number,
+                            frame_number: *frame_number,
                             timestamp: now,
                             data: Arc::clone(&data),
                             width: tex_width,
@@ -536,7 +536,7 @@ pub fn run_capture_loop(
                     resend_last_frame(
                         slot,
                         &shared,
-                        &mut frame_number,
+                        frame_number,
                         &mut last_send,
                         &last_frame,
                         (tex_width, tex_height),
@@ -594,7 +594,7 @@ pub fn run_capture_loop(
                             resend_last_frame(
                                 slot,
                                 &shared,
-                                &mut frame_number,
+                                frame_number,
                                 &mut last_send,
                                 &last_frame,
                                 (tex_width, tex_height),

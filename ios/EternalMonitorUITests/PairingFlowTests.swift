@@ -8,7 +8,7 @@ final class PairingFlowTests: XCTestCase {
         let host = try XCTUnwrap(environment["EM_PAIRING_HOST"])
         XCTAssertEqual(code.count, 6)
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = host
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()
