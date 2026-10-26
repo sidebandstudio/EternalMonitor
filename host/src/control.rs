@@ -39,12 +39,16 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
-    /// Serialize driver reconciliation across retiring capture generations.
-    #[cfg(windows)]
+    /// Serialize driver changes across retiring capture generations and the
+    /// thread that turns the second screen on.
+    #[cfg(any(windows, test))]
     pub(crate) vdd_lifecycle: Arc<Mutex<()>>,
     /// Output owned by the enabled driver, retained across pipeline restarts.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) vdd_output: Arc<Mutex<Option<String>>>,
+    /// Second screen timing across pipeline restarts: the pending switch onto
+    /// it, the grace period after its viewer left, the last driver change.
+    pub(crate) second_screen: Arc<Mutex<crate::capture::second_screen::State>>,
     /// Watchdog heartbeats (ms on the process clock, relaxed): the capture
     /// loop's aliveness, the last produced frame, and the last encoded frame.
     /// The supervisor detects wedged/starved stages from these.
@@ -83,14 +87,15 @@ pub enum VddStatus {
     /// Virtual display requested but not yet active because no iPad has connected. The driver
     /// is deliberately left off until a receiver registers, so an idle PC shows no phantom monitor.
     WaitingForClient,
-    /// The first registration has claimed startup; reconnects must not restart it.
+    /// The display is being turned on while the iPad gets the mirror.
+    /// Reconnects and disconnects leave the start alone.
     Attaching,
     /// Virtual display enabled and being captured.
     Active,
-    /// Virtual display was requested but could not be enabled/attached — capture fell back to
-    /// the primary display.
+    /// Virtual display was requested but did not attach — capture fell back to the primary
+    /// display. Later connections mirror too, until the user tries again or changes the mode.
     Failed,
-    /// The installer-owned task itself failed to execute.
+    /// The installer-owned task itself failed to execute. Remembered like `Failed`.
     TaskFailed,
 }
 
@@ -149,10 +154,11 @@ impl SharedControl {
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             capture_block: Arc::new(Mutex::new(None)),
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             vdd_lifecycle: Arc::new(Mutex::new(())),
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             vdd_output: Arc::new(Mutex::new(None)),
+            second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
@@ -190,17 +196,13 @@ impl SharedControl {
         self.session.lock().is_active()
     }
 
-    /// Claim the single restart needed when a viewer arrives after idle capture.
-    pub(crate) fn begin_virtual_display_attach(&self) -> bool {
-        if *self.capture_target.lock() != CaptureTarget::VirtualExtended {
-            return false;
-        }
+    /// The user asked to try again: a second screen that failed to start is
+    /// tried once more at the next connection.
+    pub(crate) fn retry_second_screen(&self) {
         let mut status = self.vdd_status.lock();
-        if *status != VddStatus::WaitingForClient {
-            return false;
+        if matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
+            *status = VddStatus::WaitingForClient;
         }
-        *status = VddStatus::Attaching;
-        true
     }
 }
 
@@ -232,6 +234,7 @@ pub struct GuiControl {
 impl GuiControl {
     pub fn request_restart(&self) {
         crate::vdd::recheck_tasks();
+        self.shared.retry_second_screen();
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
             warn!(error = %error, "Failed to send restart command");
         }
@@ -245,6 +248,7 @@ impl GuiControl {
 
     pub fn request_start(&self) {
         crate::vdd::recheck_tasks();
+        self.shared.retry_second_screen();
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Start) {
             warn!(error = %error, "Failed to send start command");
         }
@@ -260,23 +264,6 @@ impl GuiControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn usb_reconnects_claim_only_one_virtual_display_start() {
-        let shared = SharedControl::new(9876, 15_000_000);
-        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
-        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
-        assert!(shared.begin_virtual_display_attach());
-        assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
-        for _ in 0..50 {
-            assert!(!shared.begin_virtual_display_attach());
-        }
-        *shared.vdd_status.lock() = VddStatus::Active;
-        assert!(!shared.begin_virtual_display_attach());
-        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
-        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
-        assert!(!shared.begin_virtual_display_attach());
-    }
 
     #[test]
     fn client_fps_caps_the_host_without_overwriting_its_preference() {
