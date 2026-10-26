@@ -512,6 +512,21 @@ fn log_failure_snapshot(device: crate::vdd::EnableReport, pin: &Result<String, &
     );
 }
 
+/// An attach the iPad or a restart ended after this long without a display
+/// is worth a snapshot: on PCs where it works, the display attaches within
+/// milliseconds of the Enable task.
+#[cfg(any(windows, test))]
+const CANCELLED_SNAPSHOT_AFTER: Duration = Duration::from_secs(2);
+
+/// Whether a cancelled attach that waited `waited` logs a snapshot: once per
+/// launch, since the iPad redials and the same attempt repeats. In 0.3.2 the
+/// iPad's own 10 s limit ended every attempt on PCs whose display never
+/// attached, so no failure snapshot was ever written.
+#[cfg(any(windows, test))]
+fn snapshot_cancelled_attach(waited: Duration, logged: &std::sync::atomic::AtomicBool) -> bool {
+    waited >= CANCELLED_SNAPSHOT_AFTER && !logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Debug builds only, to check the failure path on a PC whose virtual
 /// display works: `ETERNAL_SIMULATE_ATTACH_TIMEOUT=1` treats it as not
 /// attached after the normal wait.
@@ -675,8 +690,20 @@ pub(crate) fn reconcile_virtual_display(
                 startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
                 Some(enumerate_outputs())
             };
+            let waiting_since = Instant::now();
             let mut result =
                 wait_for_virtual_output(&before, timeout, poll, Instant::now, std::thread::sleep);
+            static CANCELLED_SNAPSHOT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if matches!(result, AttachResult::Cancelled)
+                && snapshot_cancelled_attach(waiting_since.elapsed(), &CANCELLED_SNAPSHOT)
+            {
+                info!(
+                    waited_ms = waiting_since.elapsed().as_millis() as u64,
+                    "Virtual display had not attached when the attempt ended"
+                );
+                log_failure_snapshot(Ok(crate::vdd_device::query()), &pin);
+            }
             if simulated_attach_timeout() && matches!(result, AttachResult::Attached(_)) {
                 result = AttachResult::TimedOut;
             }
@@ -1098,6 +1125,20 @@ mod tests {
             },
         );
         assert!(matches!(result, AttachResult::Cancelled));
+    }
+
+    /// The iPad left 5 s into the wait on a PC whose display never came, as
+    /// it did every 11 s on a 0.3.2 hybrid laptop: one snapshot, not one per
+    /// retry, and none for a restart right after the Enable.
+    #[test]
+    fn a_cancelled_attach_logs_one_snapshot_per_launch() {
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        assert!(!snapshot_cancelled_attach(
+            Duration::from_millis(300),
+            &logged
+        ));
+        assert!(snapshot_cancelled_attach(Duration::from_secs(5), &logged));
+        assert!(!snapshot_cancelled_attach(Duration::from_secs(5), &logged));
     }
 
     fn out(name: &str, left: i32, top: i32) -> OutputInfo {
