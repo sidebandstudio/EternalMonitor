@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 use tracing::error;
 #[cfg(windows)]
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::control::SharedControl;
 #[cfg(windows)]
