@@ -119,8 +119,15 @@ registers two SYSTEM scheduled tasks (enable/disable) that the host
 triggers via `schtasks`, avoiding a per-toggle UAC prompt.
 
 - Enabled only while an iPad is connected. Disabled on exit, target change,
-  startup, panic, and on client loss (the v2 liveness signal finally made
-  idle teardown possible).
+  startup, panic, and 10 s after client loss (the v2 liveness signal finally
+  made idle teardown possible; the grace period lets a quick reconnect keep it).
+- The iPad mirrors the primary display while the virtual display starts, and
+  the stream restarts onto it once it attaches. The iPad gives up 10 s after
+  the handshake without a frame, which a slow Enable task plus the attach wait
+  could exceed. A start that fails is remembered until the user clicks Try
+  again, restarts the stream or changes the mode, so reconnects mirror
+  instead of toggling the driver again. The host changes the driver at most
+  once per 10 s on its own.
 - Before enabling, the host writes `vdd_settings.xml` so the virtual
   display offers the iPad's native landscape resolution and refresh. There
   is an opt-out in Settings.
