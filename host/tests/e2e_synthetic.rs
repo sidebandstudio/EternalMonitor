@@ -257,45 +257,49 @@ fn usb_framed_stream_end_to_end() {
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
         eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
 
-        // A virtual-display startup restarts the pipeline once. The tunnel
-        // must survive that restart: 0.3.1 closed it, the iPad reconnected,
-        // and with Extended display selected the reconnect could trigger the
-        // next restart indefinitely.
+        // With the second screen selected, a connecting iPad gets the mirror
+        // from the running pipeline at once, while the virtual display starts
+        // beside it. 0.3.2 restarted the pipeline first and sent no video
+        // until the display had attached or a 10 s wait ran out; the iPad
+        // gives up 10 s after the handshake, and over USB it was dialed again
+        // into the same restart. Here the start fails at once (no driver
+        // with synthetic capture), and the reconnect after it mirrors too.
         use eternal_host::control::{CaptureTarget, VddStatus};
         use eternal_host::supervisor::CURRENT_GENERATION;
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         *shared.vdd_status.lock() = VddStatus::WaitingForClient;
         let original_generation = CURRENT_GENERATION.load(Ordering::SeqCst);
         let ControlMessage::Hello2(mut next_hello) = hello else { unreachable!() };
-        next_hello.client_nonce += 1;
-        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
-        let mut received_ack = false;
-        let mut frames = 0;
-        let mut new_epoch = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while frames < 30 || !received_ack {
-            assert!(Instant::now() < deadline, "media must resume on the same tunnel after the restart");
-            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream))
-                .await
-                .expect("tunnel stays open and active across the restart")
-                .expect("tunnel must not close during the restart");
-            if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) {
-                assert_eq!(ack.status, HelloStatus::Ok);
-                received_ack = true;
-            } else if let Ok((header, _)) = MediaHeader::decode(&bytes) {
-                if header.stream_epoch != epoch && header.frag_index == 0 {
-                    new_epoch = Some(header.stream_epoch);
-                    frames += 1;
+        for attempt in 1..=2 {
+            next_hello.client_nonce += 1;
+            let sent = Instant::now();
+            write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
+            let mut session = None;
+            let mut first_keyframe = None;
+            while first_keyframe.is_none() {
+                assert!(sent.elapsed() < Duration::from_secs(5), "attempt {attempt}: no mirror within 5 s");
+                let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream))
+                    .await
+                    .expect("the tunnel stays active")
+                    .expect("the tunnel stays open");
+                if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) {
+                    assert_eq!(ack.status, HelloStatus::Ok);
+                    session = Some(ack.session_id);
+                } else if let Ok((header, _)) = MediaHeader::decode(&bytes) {
+                    if Some(header.session_id) == session && header.is_keyframe && header.frag_index == 0 {
+                        assert_eq!(header.stream_epoch, epoch, "the mirror comes from the running pipeline");
+                        first_keyframe = Some(sent.elapsed());
+                    }
                 }
             }
+            assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), original_generation,
+                "attempt {attempt}: connecting must not restart the pipeline");
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::TaskFailed);
+            eprintln!("USB_SECOND_SCREEN_MIRROR attempt={attempt} first_keyframe_ms={}",
+                first_keyframe.unwrap().as_millis());
         }
-        assert!(new_epoch.is_some(), "the restarted pipeline streams with a new epoch");
-        assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), original_generation + 1,
-            "USB HELLO during attach must not restart capture again");
-        assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
         *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
         *shared.vdd_status.lock() = VddStatus::Inactive;
-        eprintln!("USB_VDD_RESTART_KEEPS_TUNNEL frames={frames} restarts=1");
         drop(stream);
         let disconnected = Instant::now();
         while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
