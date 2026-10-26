@@ -144,17 +144,26 @@ fn gpu_element(gpu: &str) -> String {
 }
 
 /// The graphics card to name for the driver: the one driving the main
-/// screen. The driver matches by description and takes the first match, so
-/// a name two adapters share is not pinned; the error says why for the log.
+/// screen. `adapters` are in DXGI order, as the driver enumerates them. The
+/// driver matches by description and takes the first match, so a name
+/// several adapters share is pinned only when the first of them is the one
+/// with screens and the others have none: Windows lists some laptops'
+/// integrated card twice. Otherwise the error says why for the log.
 pub fn gpu_to_pin<'a>(
     main_screen: Option<&'a str>,
-    adapters: &[String],
+    adapters: &[crate::vdd_snapshot::Adapter],
 ) -> Result<&'a str, &'static str> {
     let name = main_screen
         .filter(|name| !name.is_empty())
         .ok_or("no adapter drives the main screen")?;
-    if adapters.iter().filter(|adapter| *adapter == name).count() > 1 {
-        return Err("two graphics cards have the same name");
+    let mut named = adapters
+        .iter()
+        .filter(|adapter| adapter.description == name);
+    if let Some(first) = named.next() {
+        let mut rest = named.peekable();
+        if rest.peek().is_some() && (first.outputs == 0 || rest.any(|a| a.outputs > 0)) {
+            return Err("two graphics cards have the same name");
+        }
     }
     Ok(name)
 }
@@ -538,12 +547,28 @@ mod tests {
     /// The vendor's own file, as its installer leaves it (shortened).
     const VENDOR: &str = "<?xml version='1.0' encoding='utf-8'?>\r\n<vdd_settings>\r\n    <monitors>\r\n        <count>1</count>\r\n    </monitors>\r\n    <gpu>\r\n        <friendlyname>default</friendlyname>\r\n    </gpu>\r\n\t<global>\r\n\t\t<g_refresh_rate>60</g_refresh_rate>\r\n\t</global>\r\n\t<logging>\r\n\t\t<logging>true</logging>\r\n\t</logging>\r\n</vdd_settings>\r\n";
 
+    /// Adapters in DXGI order, as (description, vendor:device, outputs).
+    fn cards(list: &[(&str, (u32, u32), u32)]) -> Vec<crate::vdd_snapshot::Adapter> {
+        list.iter()
+            .enumerate()
+            .map(
+                |(index, &(name, (vendor_id, device_id), outputs))| crate::vdd_snapshot::Adapter {
+                    luid: 0x1000 + index as u64,
+                    description: name.into(),
+                    vendor_id,
+                    device_id,
+                    driver: String::new(),
+                    outputs,
+                },
+            )
+            .collect()
+    }
+
     #[test]
     fn the_main_screens_card_is_pinned_unless_its_name_is_shared() {
-        let adapters = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        let hybrid = adapters(&[
-            "Intel(R) Iris(R) Xe Graphics",
-            "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+        let hybrid = cards(&[
+            ("Intel(R) Iris(R) Xe Graphics", (0x8086, 0x46a6), 1),
+            ("NVIDIA GeForce RTX 3050 Ti Laptop GPU", (0x10de, 0x25a0), 0),
         ]);
         assert_eq!(
             gpu_to_pin(Some("Intel(R) Iris(R) Xe Graphics"), &hybrid),
@@ -551,10 +576,39 @@ mod tests {
         );
         // A 0.3.1 host listed "AMD Radeon 780M Graphics" twice; the driver
         // would take whichever it enumerates first.
-        let twins = adapters(&["AMD Radeon 780M Graphics", "AMD Radeon 780M Graphics"]);
+        let twins = cards(&[
+            ("AMD Radeon 780M Graphics", (0x1002, 0x15bf), 0),
+            ("AMD Radeon 780M Graphics", (0x1002, 0x15bf), 0),
+        ]);
         assert!(gpu_to_pin(Some("AMD Radeon 780M Graphics"), &twins).is_err());
         assert!(gpu_to_pin(None, &hybrid).is_err());
         assert!(gpu_to_pin(Some(""), &hybrid).is_err());
+    }
+
+    /// An Intel HD 630 + GTX 1050 laptop on 0.3.2 listed its Intel card
+    /// twice with the virtual display off. Only the first drives the panel,
+    /// and the driver takes the first match, so the name is pinned.
+    #[test]
+    fn a_card_listed_twice_is_pinned_when_only_the_first_drives_a_screen() {
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let listed = |outputs: [u32; 2]| {
+            cards(&[
+                (INTEL, (0x8086, 0x591b), outputs[0]),
+                ("NVIDIA GeForce GTX 1050", (0x10de, 0x1c8d), 0),
+                (INTEL, (0x8086, 0x591b), outputs[1]),
+            ])
+        };
+        assert_eq!(gpu_to_pin(Some(INTEL), &listed([1, 0])), Ok(INTEL));
+        // The driver would find the one without screens first.
+        assert!(gpu_to_pin(Some(INTEL), &listed([0, 1])).is_err());
+        // Both drive screens, or neither is known to: no telling which.
+        assert!(gpu_to_pin(Some(INTEL), &listed([1, 1])).is_err());
+        assert!(gpu_to_pin(Some(INTEL), &listed([0, 0])).is_err());
+        // The duplicate does not stop a pin to the other card.
+        assert_eq!(
+            gpu_to_pin(Some("NVIDIA GeForce GTX 1050"), &listed([1, 0])),
+            Ok("NVIDIA GeForce GTX 1050")
+        );
     }
 
     #[test]

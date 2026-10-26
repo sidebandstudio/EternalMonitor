@@ -19,7 +19,9 @@ Not released yet.
   whether or not **Match the iPad's resolution** is on. Before, the driver
   chose the card with the most memory, which on laptops with Intel and NVIDIA
   graphics drives no screen; in 0.3.1 diagnostics none of those laptops got the
-  second screen. When two cards have the same name, the driver still chooses.
+  second screen. A card Windows lists twice under one name, as on some
+  laptops, is still named when only its first listing drives a screen; when
+  two cards with one name could, the driver still chooses.
 - The second screen comes up at the iPad's resolution. Windows restores the
   size it last saved for the second screen, and in 0.3.1 diagnostics 4 of the 5
   PCs whose second screen appeared got a tiny, blurry 800×600 one. EternalMonitor

@@ -48,11 +48,11 @@ impl Target {
     }
 }
 
-/// The adapter names the driver can be pinned to, without the virtual
-/// display's own adapter. While the virtual display is on, DXGI lists that
-/// adapter under the name of the card rendering it, which would otherwise
-/// read as two cards with one name.
-pub fn render_adapter_names(adapters: &[Adapter], targets: &[Target]) -> Vec<String> {
+/// The adapters the driver can be pinned to, in DXGI order, without the
+/// virtual display's own adapter. While the virtual display is on, DXGI
+/// lists that adapter under the name of the card rendering it, which would
+/// otherwise read as two cards with one name.
+pub fn render_adapters(adapters: &[Adapter], targets: &[Target]) -> Vec<Adapter> {
     let vdd: Vec<u64> = targets
         .iter()
         .filter(|t| t.is_vdd())
@@ -61,7 +61,7 @@ pub fn render_adapter_names(adapters: &[Adapter], targets: &[Target]) -> Vec<Str
     adapters
         .iter()
         .filter(|a| !vdd.contains(&a.luid))
-        .map(|a| a.description.clone())
+        .cloned()
         .collect()
 }
 
@@ -441,17 +441,19 @@ mod tests {
             source: Some((0x11e00, 0)),
             ..snapshot().targets[0].clone()
         };
-        let names = render_adapter_names(&adapters, &[monitor.clone(), vdd]);
+        let cards = render_adapters(&adapters, &[monitor.clone(), vdd]);
+        let names: Vec<&str> = cards.iter().map(|a| a.description.as_str()).collect();
         assert_eq!(
             names,
             ["NVIDIA GeForce RTX 5080", "AMD Radeon(TM) Graphics"]
         );
         assert_eq!(
-            crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &names),
+            crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &cards),
             Ok("NVIDIA GeForce RTX 5080")
         );
-        // Two real cards with one name still are not pinned.
-        let twins = render_adapter_names(&adapters, &[monitor]);
+        // Two cards with one name, neither known to drive a screen, still
+        // are not pinned.
+        let twins = render_adapters(&adapters, &[monitor]);
         assert!(crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &twins).is_err());
     }
 
