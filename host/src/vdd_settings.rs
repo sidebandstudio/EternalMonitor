@@ -630,6 +630,24 @@ mod tests {
         assert_eq!(with_gpu("<other/>", "x"), None);
     }
 
+    /// 0.3.2 rewrote the file on every connect without a `<gpu>` element.
+    /// After an upgrade, with matching off, only the card is added.
+    #[test]
+    fn a_file_written_by_0_3_2_gets_the_card_and_keeps_its_modes() {
+        let v032 = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<vdd_settings>\n    <monitors>\n        <count>1</count>\n    </monitors>\n    <global>\n        <g_refresh_rate>60</g_refresh_rate>\n    </global>\n    <resolutions>\n        <resolution>\n            <width>2160</width>\n            <height>1620</height>\n            <refresh_rate>60</refresh_rate>\n        </resolution>\n    </resolutions>\n</vdd_settings>\n";
+        assert_eq!(
+            with_gpu(v032, "Intel(R) HD Graphics 630").as_deref(),
+            Some(
+                v032.replacen(
+                    "<vdd_settings>\n",
+                    "<vdd_settings>\n    <gpu>\n        <friendlyname>Intel(R) HD Graphics 630</friendlyname>\n    </gpu>\n",
+                    1
+                )
+                .as_str()
+            )
+        );
+    }
+
     #[test]
     fn the_card_goes_inside_a_compact_root() {
         // Sol's case: no newline inside the root, one after it.
