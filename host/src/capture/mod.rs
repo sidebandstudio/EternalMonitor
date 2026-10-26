@@ -421,7 +421,7 @@ pub(crate) fn reconcile_virtual_display(
             if connected {
                 // The transport's next tick starts the display beside this mirror.
                 *shared.vdd_output.lock() = None;
-                *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+                wait_for_client(shared);
                 return Some(CaptureTarget::PrimaryAuto);
             }
             info!(
@@ -430,13 +430,10 @@ pub(crate) fn reconcile_virtual_display(
             );
             let was_on = shared.vdd_output.lock().take().is_some();
             crate::vdd::set_enabled(false, progress);
-            {
-                let mut status = shared.vdd_status.lock();
-                *status = VddStatus::WaitingForClient;
-                if was_on {
-                    shared.second_screen.lock().note_toggle(Instant::now());
-                }
+            if was_on {
+                shared.second_screen.lock().note_toggle(Instant::now());
             }
+            wait_for_client(shared);
             capture_is_current(shared, generation).then_some(CaptureTarget::PrimaryAuto)
         }
         other => {
@@ -446,6 +443,16 @@ pub(crate) fn reconcile_virtual_display(
             *shared.vdd_status.lock() = VddStatus::Inactive;
             Some(other.clone())
         }
+    }
+}
+
+/// Leave the next start to the transport. A viewer that arrived during this
+/// reconcile may already have claimed it; one start runs at a time.
+#[cfg(windows)]
+fn wait_for_client(shared: &SharedControl) {
+    let mut status = shared.vdd_status.lock();
+    if *status != VddStatus::Attaching {
+        *status = VddStatus::WaitingForClient;
     }
 }
 
