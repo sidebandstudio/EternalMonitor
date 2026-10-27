@@ -178,6 +178,19 @@ fn windows_name(product: &str, build: &str) -> String {
 
 #[cfg(windows)]
 pub(crate) fn registry_string(key: &str, name: &str) -> String {
+    registry_sz(key, name).unwrap_or_else(|code| format!("unavailable({code})"))
+}
+
+/// A string value under HKLM, `None` when it is missing or empty.
+#[cfg(windows)]
+pub(crate) fn registry_value(key: &str, name: &str) -> Option<String> {
+    registry_sz(key, name)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(windows)]
+fn registry_sz(key: &str, name: &str) -> Result<String, String> {
     use windows::{
         core::PCWSTR,
         Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
@@ -198,11 +211,13 @@ pub(crate) fn registry_string(key: &str, name: &str) -> String {
         )
     };
     if result.is_err() {
-        return format!("unavailable({})", result.0);
+        return Err(result.0.to_string());
     }
-    String::from_utf16_lossy(&value[..value.iter().position(|c| *c == 0).unwrap_or(value.len())])
-        .trim()
-        .to_string()
+    Ok(String::from_utf16_lossy(
+        &value[..value.iter().position(|c| *c == 0).unwrap_or(value.len())],
+    )
+    .trim()
+    .to_string())
 }
 
 #[cfg(windows)]

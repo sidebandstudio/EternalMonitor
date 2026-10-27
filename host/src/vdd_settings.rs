@@ -474,12 +474,49 @@ pub enum PinOutcome {
 }
 
 /// Whether Setup installed the virtual display driver beside the app in
-/// `app_dir`; it records that in this marker (installer/EternalMonitor.iss).
+/// `app_dir`, and it is still that install. Setup records the driver's
+/// uninstaller and version in this marker (installer/EternalMonitor.iss);
+/// another app that replaced or upgraded the driver since changed its
+/// registration, and the marker no longer counts, as in
+/// installer/scripts/vdd-driver-remove.ps1.
 pub fn driver_owned(app_dir: &Path) -> bool {
-    app_dir
+    let marker = app_dir
         .join("driver")
-        .join("installed-by-eternalmonitor.txt")
-        .is_file()
+        .join("installed-by-eternalmonitor.txt");
+    let Ok(marker) = std::fs::read_to_string(marker) else {
+        return false;
+    };
+    driver_registration()
+        .is_some_and(|(location, version)| marker_matches(&marker, &location, &version))
+}
+
+/// Whether the marker records the driver registered at `location` with
+/// `version`: its uninstaller's path and the version on two lines, compared
+/// ignoring case as PowerShell's `-eq` does in the scripts.
+fn marker_matches(marker: &str, location: &str, version: &str) -> bool {
+    let location = location.strip_suffix('\\').unwrap_or(location);
+    let expected = format!("{location}\\unins000.exe\r\n{version}");
+    marker.to_lowercase() == expected.to_lowercase()
+}
+
+/// Where the driver's own setup registered it, and its version, as the
+/// scripts read it: the first uninstall entry with both.
+#[cfg(windows)]
+fn driver_registration() -> Option<(String, String)> {
+    [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VirtualDisplayDriver_is1",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\VirtualDisplayDriver_is1",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        let value = |name| crate::diagnostics::registry_value(key, name);
+        Some((value("InstallLocation")?, value("DisplayVersion")?))
+    })
+}
+
+#[cfg(not(windows))]
+fn driver_registration() -> Option<(String, String)> {
+    None
 }
 
 /// Remember the card this host last wrote into the settings file, or that
@@ -520,13 +557,27 @@ pub fn apply_pin(
         PinChange::Reset => ("default".to_string(), PinOutcome::Reset),
     };
     let updated = gpu_edit(&current, &name).map_err(invalid)?;
-    // Recorded first, so a name this host wrote is always one it knows.
-    remember_pin(
-        record,
-        (outcome == PinOutcome::Named).then_some(name.as_str()),
-    )?;
-    replace(path, &updated)?;
+    let new_record = (outcome == PinOutcome::Named).then_some(name.as_str());
+    record_around(record, new_record, ours.as_deref(), || {
+        replace(path, &updated)
+    })?;
     Ok(outcome)
+}
+
+/// Record `new` as this host's name, then `write` the settings file. The
+/// record comes first, so a name this host wrote is always one it knows;
+/// when the write fails, the record goes back to `old`, the name the file
+/// still holds, so a later attempt still knows that name as its own.
+fn record_around(
+    record: &Path,
+    new: Option<&str>,
+    old: Option<&str>,
+    write: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    remember_pin(record, new)?;
+    write().inspect_err(|_| {
+        let _ = remember_pin(record, old);
+    })
 }
 
 /// The name this host recorded writing last, if any.
@@ -538,8 +589,11 @@ fn recorded_pin(record: &Path) -> Option<String> {
 
 /// Write the whole settings file at `path` with `modes`, naming `wanted`
 /// under the rules of `pin_change`: a card someone else named stays named
-/// in the new file. A file that is missing or does not read as expected
-/// names no card. `record` holds the name this host wrote last.
+/// in the new file. A missing file names no card. A file this host cannot
+/// read may name anyone's card, so it is replaced only where any name may
+/// be, on a driver Setup installed and with a card to name; otherwise it is
+/// left as it is and the error says why. `record` holds the name this host
+/// wrote last.
 pub fn write_with_pin(
     path: &Path,
     record: &Path,
@@ -547,9 +601,15 @@ pub fn write_with_pin(
     modes: &[VddMode],
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
-    let named = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|current| named_gpu(&current).ok().flatten());
+    let named = match std::fs::read_to_string(path) {
+        Ok(current) => match named_gpu(&current) {
+            Ok(named) => named,
+            Err(_) if owned && wanted.is_some() => None,
+            Err(reason) => return Err(io::Error::new(io::ErrorKind::InvalidData, reason)),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     let ours = recorded_pin(record);
     let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours.as_deref()) {
         PinChange::Leave => (named, PinOutcome::Unchanged),
@@ -557,13 +617,12 @@ pub fn write_with_pin(
         PinChange::Write(card) => (Some(card), PinOutcome::Named),
         PinChange::Reset => (None, PinOutcome::Reset),
     };
-    // Recorded first, so a name this host wrote is always one it knows.
+    let write = || write_to(path, modes, name.as_deref());
     match outcome {
-        PinOutcome::Named => remember_pin(record, name.as_deref())?,
-        PinOutcome::Reset => remember_pin(record, None)?,
-        _ => {}
+        PinOutcome::Named => record_around(record, name.as_deref(), ours.as_deref(), write)?,
+        PinOutcome::Reset => record_around(record, None, ours.as_deref(), write)?,
+        _ => write()?,
     }
-    write_to(path, modes, name.as_deref())?;
     Ok(outcome)
 }
 
@@ -1024,29 +1083,129 @@ mod tests {
         );
         assert_eq!(named().as_deref(), Some(INTEL));
 
-        // A file that does not read as expected is replaced, naming the card.
+        // A file that does not read as expected is replaced, naming the
+        // card, only on a driver Setup installed.
         std::fs::write(&path, "<other/>").unwrap();
         assert_eq!(
-            write_with_pin(&path, &record, false, &modes, Some(INTEL)).unwrap(),
+            write_with_pin(&path, &record, true, &modes, Some(INTEL)).unwrap(),
             PinOutcome::Named
         );
         assert_eq!(named().as_deref(), Some(INTEL));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Review round 3, defect 2: a card named in a way this host does not
+    /// read (here CDATA, which the driver reads) counted as no card, and
+    /// Match the iPad's resolution replaced it on a driver another app
+    /// installed.
     #[test]
-    fn only_setups_marker_makes_the_driver_this_hosts() {
+    fn a_whole_file_rewrite_keeps_a_file_it_cannot_read() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let modes = default_modes();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let cdata = VENDOR.replace(">default<", "><![CDATA[NVIDIA GeForce GTX 1050]]><");
+        for document in [cdata.as_str(), "<other/>"] {
+            for wanted in [Some(INTEL), None] {
+                std::fs::write(&path, document).unwrap();
+                let written = write_with_pin(&path, &record, false, &modes, wanted);
+                assert!(written.is_err(), "{document:?} {wanted:?}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), document);
+                assert_eq!(
+                    pin_result(Ok(INTEL), &written),
+                    Err("the settings file was left as it is")
+                );
+                assert!(!record.exists());
+            }
+            // Nor is it replaced without a card to name on a driver Setup
+            // installed: the name in it may not be this host's.
+            let written = write_with_pin(&path, &record, true, &modes, None);
+            assert!(written.is_err(), "{document:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), document);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review round 3, defect 4: the record named the new card before the
+    /// file was replaced. When the replacement failed, the file still held
+    /// this host's earlier name, which the record no longer did, so every
+    /// later attempt refused to replace it.
+    #[test]
+    fn a_failed_write_keeps_this_hosts_earlier_name_its_own() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let named = || named_gpu(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // A directory where the new file is written first makes it fail.
+        let blocker = path.with_extension("xml.tmp");
+        let modes = default_modes();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const AMD: &str = "AMD Radeon(TM) Graphics";
+        type Pin<'a> = dyn Fn(Option<&str>) -> io::Result<PinOutcome> + 'a;
+        let edit: &Pin = &|wanted| apply_pin(&path, &record, false, wanted);
+        let rewrite: &Pin = &|wanted| write_with_pin(&path, &record, false, &modes, wanted);
+        for pin in [edit, rewrite] {
+            std::fs::write(&path, VENDOR).unwrap();
+            assert_eq!(pin(Some(INTEL)).unwrap(), PinOutcome::Named);
+            for wanted in [Some(AMD), None] {
+                std::fs::create_dir(&blocker).unwrap();
+                assert!(pin(wanted).is_err(), "{wanted:?}");
+                std::fs::remove_dir(&blocker).unwrap();
+                assert_eq!(named().as_deref(), Some(INTEL));
+                assert_eq!(std::fs::read_to_string(&record).unwrap(), INTEL);
+            }
+            // The next attempt replaces it.
+            assert_eq!(pin(Some(AMD)).unwrap(), PinOutcome::Named);
+            assert_eq!(named().as_deref(), Some(AMD));
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), AMD);
+            assert_eq!(pin(None).unwrap(), PinOutcome::Reset);
+            assert_eq!(named(), None);
+            assert!(!record.exists());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review round 3, defect 3: the marker counted whatever it said, after
+    /// another app replaced or upgraded the driver.
+    #[test]
+    fn only_setups_marker_for_the_registered_driver_makes_it_this_hosts() {
         let dir = std::env::temp_dir().join(format!("vdd-owned-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("driver")).unwrap();
         assert!(!driver_owned(&dir));
+        // A marker for no driver registered here.
         std::fs::write(
             dir.join("driver").join("installed-by-eternalmonitor.txt"),
-            "x",
+            "C:\\Elsewhere\\unins000.exe\r\n0.0.0",
         )
         .unwrap();
-        assert!(driver_owned(&dir));
+        assert!(!driver_owned(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
+
+        // What Setup writes, for the install the scripts find.
+        const LOCATION: &str = "C:\\VirtualDisplayDriver";
+        let setup = "C:\\VirtualDisplayDriver\\unins000.exe\r\n25.5.2";
+        assert!(marker_matches(setup, LOCATION, "25.5.2"));
+        assert!(marker_matches(
+            setup,
+            "C:\\VirtualDisplayDriver\\",
+            "25.5.2"
+        ));
+        assert!(marker_matches(&setup.to_uppercase(), LOCATION, "25.5.2"));
+        // Upgraded, or installed again elsewhere, by another app.
+        assert!(!marker_matches(setup, LOCATION, "25.7.23"));
+        assert!(!marker_matches(setup, "D:\\Tools\\VDD", "25.5.2"));
+        assert!(!marker_matches("x", LOCATION, "25.5.2"));
+        assert!(!marker_matches(&format!("{setup}\r\n"), LOCATION, "25.5.2"));
     }
 
     #[test]

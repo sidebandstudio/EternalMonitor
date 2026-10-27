@@ -415,7 +415,7 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
                 }
                 Err(error) => warn!(
                     %error,
-                    "Could not write vdd_settings.xml — driver default modes apply"
+                    "Could not write vdd_settings.xml — the modes the driver has apply"
                 ),
             }
             written
