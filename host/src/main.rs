@@ -74,8 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled
     // and shows up as a phantom monitor. Disabling it unconditionally at startup guarantees the
-    // managed display only ever exists while EternalMonitor is actively using it.
-    vdd::disable();
+    // managed display only ever exists while EternalMonitor is actively using it. It runs beside
+    // startup: a slow or hung task used to hold a Mirror stream's first frame for up to 30 s.
+    vdd::disable_in_background();
 
     // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
     // the virtual display down before the process unwinds, so a crash can't strand a phantom

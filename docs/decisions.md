@@ -135,7 +135,12 @@ triggers via `schtasks`, avoiding a per-toggle UAC prompt.
   once per 10 s on its own.
 - Before enabling, the host writes `vdd_settings.xml` so the virtual
   display offers the iPad's native landscape resolution and refresh. There
-  is an opt-out in Settings.
+  is an opt-out in Settings. The worker also names the main screen's
+  graphics card there just before each Enable, the driver's only way to pick
+  a card, and replaces only a name it may: on a driver Setup installed, an
+  empty or `default` one, or its own last one. A start that fails, and a
+  second screen that shows no picture, log a display snapshot while the
+  display is still on, with the card the driver rendered on.
 - A first-party signed display driver remains a long-term goal.
 
 ## Input relay

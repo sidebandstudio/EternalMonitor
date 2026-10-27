@@ -17,6 +17,8 @@ use tracing::{info, warn};
 use crate::control::SharedControl;
 #[cfg(any(windows, test))]
 use crate::control::{CaptureTarget, VddStatus};
+#[cfg(windows)]
+use crate::vdd_device::DeviceState;
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -340,6 +342,239 @@ fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
 }
 
 #[cfg(windows)]
+const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
+
+/// In the app data folder: the graphics card this host last named in the
+/// driver's settings file.
+#[cfg(windows)]
+const VDD_PIN_RECORD: &str = "vdd-pin.txt";
+
+/// What the host asked the driver for before an enable: the graphics card
+/// (or why none), and the mode the second screen should come up in (none
+/// when the user keeps the driver's modes).
+#[cfg(windows)]
+struct VddRequest {
+    pin: Result<String, &'static str>,
+    mode: Option<crate::vdd_settings::VddMode>,
+    /// The adapters' LUIDs before the Enable, to find the driver's own.
+    before: Vec<u64>,
+}
+
+/// Before each enable: name the main screen's graphics card for the driver
+/// to render on, and, when the user wants it, the iPad's modes, or a
+/// 1920x1080 default while the iPad's size is not known. Without a
+/// name the driver renders on the card with the most memory. In 0.3.1
+/// diagnostics no Intel + NVIDIA laptop got the second screen; that card
+/// choice is a suspect, not a confirmed cause. Failure is non-fatal — the
+/// driver's built-in choices apply. Returns the card asked for, or why none.
+#[cfg(windows)]
+fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRequest {
+    let main_screen = outputs
+        .iter()
+        .find(|output| output.is_primary)
+        .map(|output| output.adapter_name.as_str());
+    let adapters = crate::vdd_snapshot::adapters();
+    let before = adapters.iter().map(|adapter| adapter.luid).collect();
+    // The virtual display's own adapter, listed while it is on, is not a card.
+    let cards = crate::vdd_snapshot::render_adapters(&adapters, &crate::vdd_snapshot::targets());
+    let wanted = crate::vdd_settings::gpu_to_pin(main_screen, &cards);
+    if let Err(reason) = wanted {
+        info!(
+            reason,
+            main_screen, "Leaving the virtual display's graphics card to the driver"
+        );
+    }
+    let gpu = wanted.ok();
+    let record = crate::settings::app_data_dir().map(|dir| dir.join(VDD_PIN_RECORD));
+    let path = std::path::Path::new(VDD_SETTINGS_PATH);
+    // Change the card only where this host may replace the name.
+    let owned = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(crate::vdd_settings::driver_owned))
+        .unwrap_or(false);
+    let mut mode = None;
+    let applied = match &record {
+        None => Err(std::io::Error::other("no app data folder")),
+        Some(record) if crate::settings::SettingsFile::load().vdd_match_resolution => {
+            let client = shared.session.lock().client_info();
+            let modes = client.map_or_else(crate::vdd_settings::default_modes, |info| {
+                crate::vdd_settings::modes_for_client(
+                    info.screen_px.0,
+                    info.screen_px.1,
+                    info.refresh_hz,
+                )
+            });
+            let written = crate::vdd_settings::write_with_pin(path, record, owned, &modes, gpu);
+            match &written {
+                Ok(_) => {
+                    info!(
+                        ?modes,
+                        "Wrote virtual display mode list for the connected client"
+                    );
+                    mode = modes.first().copied();
+                }
+                Err(error) => warn!(
+                    %error,
+                    "Could not write vdd_settings.xml — the modes the driver has apply"
+                ),
+            }
+            written
+        }
+        // The modes in the file are the user's: change only the card.
+        Some(record) => crate::vdd_settings::apply_pin(path, record, owned, gpu),
+    };
+    match &applied {
+        Ok(crate::vdd_settings::PinOutcome::Named) => info!(
+            gpu,
+            "Pointed the virtual display at the main screen's graphics card"
+        ),
+        Ok(crate::vdd_settings::PinOutcome::Reset) => {
+            info!("Took back the graphics card this host named for the virtual display")
+        }
+        Ok(crate::vdd_settings::PinOutcome::Kept(reason)) => {
+            info!(
+                reason,
+                gpu, "Left the graphics card named in vdd_settings.xml"
+            )
+        }
+        Ok(crate::vdd_settings::PinOutcome::Unchanged) => {}
+        Err(error) if gpu.is_some() => {
+            warn!(%error, gpu, "Left vdd_settings.xml as it is; the driver chooses the graphics card")
+        }
+        Err(_) => {}
+    }
+    VddRequest {
+        pin: crate::vdd_settings::pin_result(wanted, &applied),
+        mode,
+        before,
+    }
+}
+
+/// Bring a freshly attached second screen to the mode asked for, when
+/// Windows restored another one for this set of displays, and log the mode
+/// it ends up in, once per attach. Only the virtual display changes.
+#[cfg(windows)]
+fn settle_vdd_mode(
+    chosen: OutputInfo,
+    requested: Option<crate::vdd_settings::VddMode>,
+    mut heartbeat: impl FnMut(),
+) -> OutputInfo {
+    let attached = format!("{}x{}", chosen.width, chosen.height);
+    let Some(mode) = crate::vdd_settings::mode_to_set(requested, (chosen.width, chosen.height))
+    else {
+        info!(
+            mode = %attached,
+            requested = %requested.map_or("the driver's modes".to_string(), |m| m.to_string()),
+            "Second screen mode"
+        );
+        return chosen;
+    };
+    let mut set = crate::vdd_device::set_display_mode(&chosen.device_name, mode);
+    let mut fallback = None;
+    if !set {
+        // The driver does not offer the iPad's mode: take the sharpest that fits.
+        let offered = crate::vdd_device::offered_modes(&chosen.device_name);
+        if let Some((width, height)) = crate::vdd_settings::best_offered(mode, &offered)
+            .filter(|&size| size != (chosen.width, chosen.height))
+        {
+            let size = crate::vdd_settings::VddMode {
+                width,
+                height,
+                ..mode
+            };
+            set = crate::vdd_device::set_display_mode(&chosen.device_name, size);
+            fallback = Some(size);
+        }
+    }
+    let target = fallback.unwrap_or(mode);
+    let mut now = chosen.clone();
+    // Windows applies the change asynchronously to DXGI's view of the output.
+    for _ in 0..30 {
+        heartbeat();
+        if let Some(output) = enumerate_outputs()
+            .into_iter()
+            .find(|output| output.device_name == chosen.device_name)
+        {
+            now = output;
+        }
+        if !set || (now.width, now.height) == (target.width, target.height) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    info!(
+        mode = %format!("{}x{}", now.width, now.height),
+        requested = %mode,
+        attached = %attached,
+        fallback = %fallback.map_or("none".to_string(), |m| m.to_string()),
+        set,
+        "Second screen mode"
+    );
+    now
+}
+
+/// Log how Windows sees the displays, before the Disable task removes the
+/// virtual one. One record per failure; see `vdd_snapshot`. `request` is
+/// what the worker asked of the driver before its Enable.
+#[cfg(windows)]
+fn log_failure_snapshot(device: crate::vdd::EnableReport, request: Option<&VddRequest>) {
+    let (pin, before) = request.map_or((Err("no settings prepared"), &[][..]), |request| {
+        (request.pin.clone(), &request.before[..])
+    });
+    let snapshot = crate::vdd_snapshot::collect(device, pin, before);
+    warn!(
+        "Virtual display failure snapshot {}",
+        crate::vdd_snapshot::line(&snapshot)
+    );
+}
+
+/// A start that a mode change ended after this long without a display is
+/// worth a snapshot: on PCs where it works, the display attaches within
+/// milliseconds of the Enable task.
+#[cfg(any(windows, test))]
+const CANCELLED_SNAPSHOT_AFTER: Duration = Duration::from_secs(2);
+
+/// Whether a cancelled attach that waited `waited` logs a snapshot: once per
+/// launch (`logged`). In 0.3.2 the iPad's own 10 s limit ended every attempt
+/// on PCs whose display never attached, so no failure snapshot was ever
+/// written. The iPad no longer ends a start, which times out and logs its
+/// own snapshot; the user choosing another mode while it waits still does.
+#[cfg(any(windows, test))]
+fn snapshot_cancelled_attach(waited: Duration, logged: &std::sync::atomic::AtomicBool) -> bool {
+    waited >= CANCELLED_SNAPSHOT_AFTER && !logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Debug builds only, to check the failure path on a PC whose virtual
+/// display works: `ETERNAL_SIMULATE_ATTACH_TIMEOUT=1` treats it as not
+/// attached after the normal wait.
+#[cfg(all(windows, debug_assertions))]
+fn simulated_attach_timeout() -> bool {
+    std::env::var_os("ETERNAL_SIMULATE_ATTACH_TIMEOUT").is_some()
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+const fn simulated_attach_timeout() -> bool {
+    false
+}
+
+/// Say why the second screen did not appear: on the Stream page each time,
+/// and in the log once per iPad session for each state, so diagnostics show
+/// it without repeating every retry.
+#[cfg(windows)]
+fn report_device(shared: &SharedControl, device: DeviceState) {
+    static LOGGED: Mutex<Vec<(Option<u32>, DeviceState)>> = Mutex::new(Vec::new());
+    let problem = device.problem();
+    *shared.vdd_problem.lock() = Some(problem);
+    let key = (shared.session.lock().session_id(), device);
+    let mut logged = LOGGED.lock();
+    logged.retain(|(session, _)| *session == key.0);
+    if !logged.contains(&key) {
+        logged.push(key);
+        warn!(vdd_device = %device, ?problem, "Virtual display device state");
+    }
+}
+
+#[cfg(windows)]
 fn vdd_attach_timeout() -> Duration {
     std::env::var("ETERNAL_VDD_TIMEOUT_SECS")
         .ok()
@@ -383,7 +618,7 @@ pub(crate) fn reconcile_virtual_display(
                     prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
                     "The virtual display showed no picture — mirroring the primary display instead"
                 );
-                second_screen::send(shared, second_screen::Command::Release);
+                second_screen::send(shared, second_screen::Command::Fallback(reason));
                 return Some(CaptureTarget::PrimaryAuto);
             }
             let connected = shared.client_connected();
@@ -887,6 +1122,20 @@ mod tests {
             },
         );
         assert!(matches!(result, AttachResult::Cancelled));
+    }
+
+    /// The iPad left 5 s into the wait on a PC whose display never came, as
+    /// it did every 11 s on a 0.3.2 hybrid laptop: one snapshot, not one per
+    /// retry, and none for a restart right after the Enable.
+    #[test]
+    fn a_cancelled_attach_logs_one_snapshot_per_launch() {
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        assert!(!snapshot_cancelled_attach(
+            Duration::from_millis(300),
+            &logged
+        ));
+        assert!(snapshot_cancelled_attach(Duration::from_secs(5), &logged));
+        assert!(!snapshot_cancelled_attach(Duration::from_secs(5), &logged));
     }
 
     fn out(name: &str, left: i32, top: i32) -> OutputInfo {
