@@ -17,7 +17,7 @@ jobs:
   archive:
     name: iPad Release archive and TestFlight
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       # App Store Connect has required the iOS 26 SDK since April 2026.
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
@@ -46,6 +46,16 @@ jobs:
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
           IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
         run: scripts/testflight-local.sh
+      - name: Submit the build for external TestFlight review
+        # Uploaded builds only: pull requests and dry runs record SKIPPED.
+        # Waits up to 30 minutes for processing; a rerun finishes the steps.
+        if: success()
+        timeout-minutes: 40
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: python3 scripts/testflight_review.py build/testflight/result.json ios/TESTFLIGHT_NOTES.md build/testflight/review.json
       - name: Check the build evidence for secret values
         # The repository is public and artifact files are not masked like the
         # job log, so logs and the archive never upload.
@@ -64,7 +74,7 @@ jobs:
         run: >-
           python3 scripts/artifact_secrets.py scan
           --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,ASC_KEY_ID,ASC_ISSUER_ID,ASC_KEY_P8,IOS_DIST_P12_BASE64,IOS_DIST_P12_PASSWORD,IOS_PROVISION_PROFILE_BASE64,GITHUB_TOKEN
-          build/testflight/result.json ios/TESTFLIGHT_NOTES.md
+          build/testflight/result.json build/testflight/review.json ios/TESTFLIGHT_NOTES.md
       - name: Retain build evidence
         if: always() && steps.evidence.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -72,6 +82,7 @@ jobs:
           name: EternalMonitor-iPad-${{ env.BUILD }}
           path: |
             build/testflight/result.json
+            build/testflight/review.json
             ios/TESTFLIGHT_NOTES.md
           retention-days: 14
       - name: Summarize the result
@@ -80,6 +91,8 @@ jobs:
           python3 - <<'PY'
           import json,os,pathlib
           result=json.loads(pathlib.Path('build/testflight/result.json').read_text())
+          review=json.loads(pathlib.Path('build/testflight/review.json').read_text())
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
               out.write(f"EternalMonitor {result['version']} ({result['build']}): {result['mode']} passed.\n")
+              out.write(f"External beta review: {review['status']} {review.get('reviewState') or review.get('reason', '')}\n")
           PY
