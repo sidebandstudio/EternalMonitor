@@ -64,7 +64,6 @@ checks = {
     "installer URL": (windows.get("installer"), installer),
     "download button": (windows.get("installer"), element(html, "download-btn", "href")),
     "SHA-256": (windows.get("sha256"), element(html, "sha256-value")),
-    "iPad version": (ipad.get("version"), published),
     "TestFlight link": (ipad.get("testflight"), element(html, "testflight-link", "href")),
 }
 build = re.search(r'data-release="[^"]*\bbuild (\d+)', html)
@@ -72,6 +71,16 @@ checks["TestFlight build"] = (ipad.get("build"), int(build[1]) if build else Non
 for name, (have, want) in checks.items():
     if have != want:
         fail(f"{name} is {have!r}; docs/download.html says {want!r}")
+# The iPad entry may trail Windows while its TestFlight build awaits Apple's
+# approval, but never lead it.
+ipad_version = ipad.get("version", "")
+if not re.fullmatch(r"\d+\.\d+\.\d+", ipad_version):
+    fail(f"invalid iPad version {ipad_version!r}")
+if tuple(map(int, ipad_version.split("."))) > tuple(map(int, published.split("."))):
+    fail(f"iPad {ipad_version} is newer than Windows {published}")
+shown = re.search(r"data-ipad-version>([^<]*)<", html)
+if not shown or shown[1] != f"v{ipad_version}, build {ipad.get('build')}":
+    fail(f"iPad {ipad_version} build {ipad.get('build')}; docs/download.html says {shown and shown[1]!r}")
 if not re.fullmatch(r"[0-9a-f]{64}", windows["sha256"]):
     fail("SHA-256 must be 64 lowercase hex digits")
 # The download page's script must take the release from latest.json, not a
@@ -82,5 +91,5 @@ if "fetch('latest.json'" not in script:
 pinned = re.findall(r"releases/(?:tags|download)/v\d+\.\d+\.\d+|['\"]v\d+\.\d+\.\d+['\"]", script)
 if pinned:
     fail(f"docs/script.js pins a release ({pinned[0]}); derive it from latest.json")
-print(f"Published update: Windows {published}, iPad {published} build {ipad['build']}")
+print(f"Published update: Windows {published}, iPad {ipad_version} build {ipad['build']}")
 PY

@@ -22,9 +22,8 @@ What you need
   needs Windows 10 version 22H2 (build 19045) or Windows 11. On older
   Windows 10, use Wi-Fi.
 
-Both apps must come from the same version of EternalMonitor. The download
-page always lists the matching pair:
-https://eternalmonitor.dev/download.html
+Install the Windows and iPad versions listed on eternalmonitor.dev/download.html.
+These versions work together even when their version numbers differ.
 
 1. Install the iPad app
 -----------------------

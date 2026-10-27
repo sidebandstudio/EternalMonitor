@@ -57,6 +57,39 @@ class CheckVersionsTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def set_ipad_version(self, version):
+        """Point latest.json and the download page at another iPad version."""
+        latest = self.tmp / "docs/latest.json"
+        old = re.search(r'"ipad": \{\s*"version": "([^"]+)"', latest.read_text())[1]
+        latest.write_text(latest.read_text().replace(
+            f'"version": "{old}",\n    "build"', f'"version": "{version}",\n    "build"'))
+        page = self.tmp / "docs/download.html"
+        page.write_text(page.read_text().replace(f"iPad v{old}", f"iPad v{version}")
+                        .replace(f"data-ipad-version>v{old}", f"data-ipad-version>v{version}"))
+
+    def test_windows_ahead_of_the_ipad_passes(self):
+        new = self.publish_next_release()
+        self.set_ipad_version(self.version)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Windows {new}, iPad {self.version}", result.stdout)
+
+    def test_ipad_ahead_of_windows_fails(self):
+        major, minor, patch = map(int, self.version.split("."))
+        self.set_ipad_version(f"{major}.{minor + 1}.0")
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("newer than Windows", result.stdout + result.stderr)
+
+    def test_page_showing_another_ipad_version_fails(self):
+        latest = self.tmp / "docs/latest.json"
+        text = latest.read_text()
+        old = re.search(r'"ipad": \{\s*"version": "([^"]+)"', text)[1]
+        latest.write_text(text.replace(f'"version": "{old}",\n    "build"', '"version": "0.0.1",\n    "build"'))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("docs/download.html says", result.stdout + result.stderr)
+
     def test_script_pinned_to_an_old_tag_fails(self):
         self.publish_next_release()
         script = self.tmp / "docs/script.js"

@@ -2,8 +2,8 @@
 //! threads: checks and downloads use one worker thread.
 //!
 //! The website's `latest.json` names the newest Windows release and iPad
-//! build. It is bumped only after Apple approves the matching TestFlight build,
-//! so the PC never offers an update the iPad cannot match yet. Before
+//! build. The PC reads only the Windows entry, which may be newer than the
+//! iPad's while its TestFlight build awaits Apple. Before
 //! installing, the installer's SHA-256 must match both that manifest and the
 //! GitHub release body, which are published by different steps.
 use std::io::{Read, Write};
