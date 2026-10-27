@@ -58,25 +58,22 @@
       </div>
     </section>
 
-    <!-- needs owner review: who is responsible for this data (the controller), and its legal name and contact. Sideband Studio and hello@sideband.studio are used below as the contact only. -->
     <section class="container posts policy">
       <article class="post" id="what-is-sent" aria-labelledby="what-is-sent-title">
         <h2 id="what-is-sent-title">What the apps send</h2>
-        <p>The Windows app and the iPad app send diagnostics to EternalMonitor support while they run:</p>
+        <p>Automatic sharing is on by default in both the Windows app and the iPad app. While the apps run, they send diagnostics to EternalMonitor support. If an upload can't get through, it is kept on the device and sent after reconnecting or the next time the app opens.</p>
         <ul class="post-list">
           <li>Device details, such as app version, iPad model, Windows version and graphics hardware.</li>
           <li>Errors and other lines from the apps' logs.</li>
           <li>Stream statistics, such as frame rate and dropped frames.</li>
-          <li>PC names and local network addresses, which appear in these logs.</li>
-          <li>A random ID the app creates when it is installed. It is your <strong>Support ID</strong>, and it lets us find your diagnostics.</li>
+          <li>Names and addresses that appear in these logs: your PC's name, your iPad's name, the names of audio devices, and local network addresses.</li>
+          <li>A random installation ID each app creates when it is installed, so we can find your diagnostics. The PC and the iPad each have their own.</li>
         </ul>
-        <!-- needs owner review: whether the upload server stores the sender's public IP address. -->
       </article>
 
       <article class="post" id="why" aria-labelledby="why-title">
         <h2 id="why-title">Why</h2>
-        <p>To run the app, find out why a connection or the picture fails, and make the app better.</p>
-        <!-- needs owner review: legal basis for processing, and whether EU users need a choice before the first upload (sharing is on by default today). -->
+        <p>To find out why a connection or the picture fails, and to make the apps more reliable. The apps work the same with sharing off.</p>
       </article>
 
       <article class="post" id="not-sent" aria-labelledby="not-sent-title">
@@ -91,7 +88,6 @@
       <article class="post" id="where" aria-labelledby="where-title">
         <h2 id="where-title">Where it is stored</h2>
         <p>Uploads use encrypted HTTPS. They pass through Vercel and are stored in a Supabase database in the US East region.</p>
-        <!-- needs owner review: the transfer of EU users' data to the US, and the processor agreements with Supabase and Vercel. -->
       </article>
 
       <article class="post" id="how-long" aria-labelledby="how-long-title">
@@ -112,8 +108,20 @@
 
       <article class="post" id="delete" aria-labelledby="delete-title">
         <h2 id="delete-title">Ask us to delete your diagnostics</h2>
-        <p>Email <a href="mailto:hello@sideband.studio">hello@sideband.studio</a> with the Support ID shown in the app's diagnostics settings. We'll delete everything stored under that ID. Copies in backups are gone within 7 days.</p>
-        <!-- needs owner review: the Windows app does not show its Support ID yet, how Windows-only users find it, and the response time and other rights (access, complaints to a data protection authority) to state here. -->
+        <p>First turn sharing off on every device whose diagnostics you want deleted, as above. Otherwise uploads waiting to retry can send new diagnostics after we delete the old ones.</p>
+        <p>Then find each device's ID. The PC and the iPad each have their own, so send both to delete both.</p>
+        <div class="post-update">
+          <dl>
+            <div><dt>Windows</dt><dd>In <strong>Settings</strong>, copy the <strong>installation_id</strong> value shown under <strong>Automatically share diagnostics</strong>.</dd></div>
+            <div><dt>iPad</dt><dd>Copy the <strong>Support ID</strong> in <strong>Settings</strong>, then <strong>Support</strong>, then <strong>Diagnostics</strong>, in versions that show it. Otherwise tap <strong>Copy diagnostics</strong> there and send that.</dd></div>
+          </dl>
+        </div>
+        <p>Email the IDs to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>. We'll delete everything stored under them. Copies in backups are gone within 7 days.</p>
+      </article>
+
+      <article class="post" id="contact" aria-labelledby="contact-title">
+        <h2 id="contact-title">Contact</h2>
+        <p>Questions about this page: <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>.</p>
       </article>
     </section>
   </main>
