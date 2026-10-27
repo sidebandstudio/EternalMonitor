@@ -277,6 +277,20 @@ pub fn note_attached(shared: &SharedControl, device_name: String) {
     state.proving = None;
 }
 
+/// [`note_attached`], unless the mode changed or quitting began. The mode
+/// is held while the display is recorded, so a mode change either comes
+/// first and is seen here, or comes after, and its capture generation finds
+/// the display to turn off.
+#[cfg(any(windows, test))]
+fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> bool {
+    let mode = shared.capture_target.lock();
+    if *mode != CaptureTarget::VirtualExtended || quitting(shared) {
+        return false;
+    }
+    note_attached(shared, device_name);
+    true
+}
+
 /// Capture `generation` streams the second screen from `now`. The first
 /// generation after the switch starts the [`PROVE_TIMEOUT`] deadline; a
 /// later one inherits it, and any capture failure, until an image arrives.
@@ -671,14 +685,23 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             disable(shared, driver);
         }
         AttachResult::Attached(chosen) => {
+            // Setting the mode can take seconds, and the user may choose
+            // another mode meanwhile.
             let chosen = driver.settle(chosen);
-            info!(
-                device = %chosen.device_name,
-                width = chosen.width,
-                height = chosen.height,
-                "Virtual display attached — capturing it"
-            );
-            note_attached(shared, chosen.device_name);
+            let (device, width, height) = (chosen.device_name.clone(), chosen.width, chosen.height);
+            if note_attached_if_selected(shared, chosen.device_name) {
+                info!(
+                    %device,
+                    width, height, "Virtual display attached — capturing it"
+                );
+            } else if quitting(shared) {
+                info!("Quitting while the virtual display started — the quit turns it off");
+            } else {
+                // Nothing records it as ours, so no capture generation turns
+                // it off: this does, after the gap, as for a cancelled start.
+                info!("Display mode changed while the virtual display's mode was set — turning it off");
+                disable(shared, driver);
+            }
         }
         AttachResult::TimedOut => {
             warn!(
@@ -926,11 +949,13 @@ mod tests {
     /// A driver on a paused clock. Enable takes `enable_takes`, and the
     /// display attaches `attach_after` later, or never. `on_sleep` sees the
     /// clock each time the host waits, as the transport's ticks would.
-    /// With `enable_fails`, the Enable task reports that instead.
+    /// With `enable_fails`, the Enable task reports that instead. Setting
+    /// the mode after the attach takes `settle_takes`.
     struct FakeDriver<'a> {
         start: Instant,
         elapsed: Cell<Duration>,
         enable_takes: Duration,
+        settle_takes: Duration,
         attach_after: Option<Duration>,
         on_since: Cell<Option<Duration>>,
         toggles: RefCell<Vec<(Duration, bool)>>,
@@ -949,6 +974,7 @@ mod tests {
                 start: Instant::now(),
                 elapsed: Cell::new(Duration::ZERO),
                 enable_takes,
+                settle_takes: Duration::ZERO,
                 attach_after,
                 on_since: Cell::new(None),
                 toggles: RefCell::new(Vec::new()),
@@ -996,6 +1022,7 @@ mod tests {
         }
 
         fn settle(&self, chosen: OutputInfo) -> OutputInfo {
+            self.sleep(self.settle_takes);
             self.calls.borrow_mut().push(Call::Settle);
             chosen
         }
@@ -1202,6 +1229,46 @@ mod tests {
         assert!(toggles[1].0 - toggles[0].0 >= MIN_TOGGLE_GAP, "{toggles:?}");
         assert_eq!(*shared.vdd_output.lock(), None);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert_eq!(next_step(&shared, driver.now()), Step::Nothing);
+    }
+
+    /// Review round 3, defect 1: Mirror chosen while the attached display's
+    /// mode was being set. Mirror's capture generation found no display to
+    /// turn off, and the start then recorded it as the active second screen.
+    #[test]
+    fn a_mode_change_while_the_mode_is_set_turns_the_display_back_off() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        let mirror = Once::at(secs(4.0));
+        let on_sleep = |elapsed: Duration| {
+            mirror.run(elapsed, || {
+                *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+                let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+                assert_eq!(
+                    reconcile_virtual_display(&CaptureTarget::PrimaryAuto, &shared, generation),
+                    Some(CaptureTarget::PrimaryAuto)
+                );
+            })
+        };
+        // Enable done at 3 s, attached at 3.5 s, the mode set by 6.5 s.
+        let driver = FakeDriver {
+            settle_takes: secs(3.0),
+            ..FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep)
+        };
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert!(mirror.done.get());
+        assert!(driver.calls().contains(&Call::Settle));
+        let toggles = driver.toggles.borrow().clone();
+        assert_eq!(
+            toggles.iter().map(|(_, on)| *on).collect::<Vec<_>>(),
+            [true, false],
+            "{toggles:?}"
+        );
+        assert!(toggles[1].0 - toggles[0].0 >= MIN_TOGGLE_GAP, "{toggles:?}");
+        assert_eq!(*shared.vdd_output.lock(), None);
+        assert_ne!(*shared.vdd_status.lock(), VddStatus::Active);
         assert_eq!(next_step(&shared, driver.now()), Step::Nothing);
     }
 
