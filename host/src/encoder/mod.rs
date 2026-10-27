@@ -1579,6 +1579,22 @@ mod tests {
         packets
     }
 
+    /// The value of an integer option on the opened encoder.
+    fn encoder_option(state: &EncoderState, option: &str) -> u64 {
+        let option = std::ffi::CString::new(option).unwrap();
+        let mut value = 0;
+        let result = unsafe {
+            ffmpeg_next::ffi::av_opt_get_int(
+                state.encoder.as_ptr().cast_mut().cast(),
+                option.as_ptr(),
+                ffmpeg_next::ffi::AV_OPT_SEARCH_CHILDREN,
+                &mut value,
+            )
+        };
+        assert_eq!(result, 0, "no option {option:?}");
+        value.try_into().unwrap()
+    }
+
     /// A viewer back within the second screen's grace period finds the
     /// encoder in the middle of a GOP, and a static second screen resends
     /// its picture every 750 ms. NVENC answered the session's keyframe
@@ -1628,15 +1644,21 @@ mod tests {
                     }
                 }
             }
-            // The requested frame itself opens the session; NVENC returns
-            // it at once, with no frames held back.
+            // The requested frame itself opens the session, as soon as the
+            // encoder's configured delay lets it out: at once on NVENC with
+            // delay=0 and libx264 with zerolatency, and once QSV has its
+            // async_depth frames queued (FFmpeg's default 4).
             let (submitted, sequence) =
                 first.unwrap_or_else(|| panic!("{name}: no frame could open the session"));
             assert_eq!(sequence, 40, "{name}: the session opened on a later frame");
-            let held = if name == "h264_nvenc" { 0 } else { 2 };
+            let held = match name {
+                "h264_nvenc" => encoder_option(&state, "delay"),
+                "h264_qsv" => encoder_option(&state, "async_depth") - 1,
+                _ => 0,
+            };
             assert!(
                 submitted - 40 <= held,
-                "{name}: frame 40 came out after frame {submitted}"
+                "{name}: frame 40 came out after frame {submitted}, more than {held} frames late"
             );
         }
         eprintln!("encoders tested: {tested:?}");
