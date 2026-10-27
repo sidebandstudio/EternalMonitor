@@ -3,7 +3,9 @@
   "windows": {
     "version": "0.3.3",
     "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe",
-    "sha256": "3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b"
+    "sha256": "3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b",
+    "recommended": true,
+    "note": "Fixes Second screen not starting on some PCs, especially laptops with Intel and NVIDIA graphics. Your iPad now shows your screen right away while the second screen starts."
   },
   "ipad": {
     "version": "0.3.2",
