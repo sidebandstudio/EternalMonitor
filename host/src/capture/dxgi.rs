@@ -16,9 +16,9 @@ use super::recovery::{
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
-    keepalive_allowed, read_back_image, reconcile_virtual_display, recovery_poll, resolve_target,
-    FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW,
-    IDLE_KEEPALIVE,
+    keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
+    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
+    FPS_WINDOW,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::stats::PIPELINE_STATS;
@@ -536,9 +536,14 @@ pub fn run_capture_loop(
                 // the iPad would sit on a black screen until it times out. While a client is
                 // connected, resend the last captured image so the encoder emits the pending IDR
                 // and the stream stays alive. pixel_buf holds the last composited frame (zeroed
-                // black before the first real frame, which is still a valid keyframe).
+                // black before the first real frame, which is still a valid keyframe). A
+                // pending keyframe request is answered without waiting for the keepalive.
                 if client_connected(&shared)
-                    && last_send.elapsed() >= IDLE_KEEPALIVE
+                    && keepalive_due(
+                        last_send.elapsed(),
+                        shared.force_next_idr.load(Ordering::SeqCst),
+                        seen_image,
+                    )
                     && keepalive_allowed(seen_image, second_screen)
                 {
                     resend_last_frame(
