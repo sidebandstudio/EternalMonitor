@@ -497,7 +497,7 @@ pub async fn start_sender(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum FirstFrame {
+pub(crate) enum FirstFrame {
     Send,
     Skip,
     SkipAndRequestKeyframe,
@@ -508,7 +508,7 @@ enum FirstFrame {
 /// NVENC kept the host's startup frame while the PC sat idle, and the next
 /// viewer received that old, blank keyframe as its first picture. A stale
 /// keyframe is skipped and a fresh one requested.
-fn first_frame_gate(
+pub(crate) fn first_frame_gate(
     is_keyframe: bool,
     captured: Instant,
     session_start: Option<Instant>,
