@@ -523,7 +523,8 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.sessionAcceptedAt = acceptedAt
-                self.noPictureStreak.answered(by: info.hostName, at: isUSB ? nil : "\(normalizedHost):\(port)")
+                self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
+                                              at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
                 if self.awaitingPairing {

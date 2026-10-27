@@ -59,14 +59,14 @@ final class FakeUDPHost: @unchecked Sendable {
         return false
     }
 
-    /// The HELLO_ACK for the attempt with `nonce` from the PC `hostName`:
-    /// session 41, unless `status` refuses it.
+    /// The HELLO_ACK for the attempt with `nonce` from the PC `hostName`
+    /// with pairing token `authToken`: session 41, unless `status` refuses it.
     static func ack(nonce: UInt32, status: HelloStatus = .ok, acceptedVersion: UInt8 = 2,
-                    hostName: String = "Test PC") -> Data {
+                    hostName: String = "Test PC", authToken: Data = Data(17...32)) -> Data {
         Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
             status: status, acceptedVersion: acceptedVersion, clientNonce: nonce, sessionId: status == .ok ? 41 : 0,
             heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
-            streamConfig: StreamConfig(), hostName: hostName, authToken: Data(17...32), hostCaps: 0)))
+            streamConfig: StreamConfig(), hostName: hostName, authToken: authToken, hostCaps: 0)))
     }
 
     private func send(_ datagram: Data) {

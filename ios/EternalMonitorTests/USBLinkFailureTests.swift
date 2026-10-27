@@ -366,8 +366,10 @@ final class USBLinkFailureTests: XCTestCase {
     // connects the cable again by itself a second later.
 
     /// Answers the iPad's HELLO2 on the cable's far end `fd` as the PC
-    /// `name`, then sends nothing more. False after five quiet seconds.
-    nonisolated private static func acceptSession(on fd: Int32, name: String = "Test PC") -> Bool {
+    /// `name` with pairing token `token`, then sends nothing more. False
+    /// after five quiet seconds.
+    nonisolated private static func acceptSession(on fd: Int32, name: String = "Test PC",
+                                                  token: Data = Data(17...32)) -> Bool {
         var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var framer = EMLinkFramer(expectsPreamble: false)
@@ -378,7 +380,8 @@ final class USBLinkFailureTests: XCTestCase {
             guard count > 0, let datagrams = try? framer.append(Data(buffer.prefix(count))) else { continue }
             for datagram in datagrams {
                 guard case .hello2(let hello) = Wire.parseControl(datagram)?.message,
-                      let framed = try? EMLinkFramer.encode(FakeUDPHost.ack(nonce: hello.clientNonce, hostName: name)) else { continue }
+                      let framed = try? EMLinkFramer.encode(FakeUDPHost.ack(nonce: hello.clientNonce, hostName: name,
+                                                                           authToken: token)) else { continue }
                 return framed.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) } == framed.count
             }
         }
@@ -435,10 +438,11 @@ final class USBLinkFailureTests: XCTestCase {
         return cable
     }
 
-    /// The PC `name` answers on the newest cable and sends no picture.
-    private func answer(as name: String = "Test PC") async {
+    /// The PC `name` with pairing token `token` answers on the newest cable
+    /// and sends no picture.
+    private func answer(as name: String = "Test PC", token: Data = Data(17...32)) async {
         let fd = peer
-        let accepted = await Task.detached { Self.acceptSession(on: fd, name: name) }.value
+        let accepted = await Task.detached { Self.acceptSession(on: fd, name: name, token: token) }.value
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
     }
 
@@ -522,23 +526,25 @@ final class USBLinkFailureTests: XCTestCase {
     }
 
     /// Two PCs on the cable, each without a picture once, don't add up: the
-    /// count belongs to the PC that answered, by the name it gives. A cable
-    /// on which nothing answers gets its own advice, since the cable doesn't
-    /// say which PC is at its other end, and doesn't end the count.
+    /// count belongs to the PC that answered, by its pairing token, even
+    /// when both PCs have the same name. A cable on which nothing answers
+    /// gets its own advice, since the cable doesn't say which PC is at its
+    /// other end, and doesn't end the count.
     func testPCsOnTheCableCountSeparately() async throws {
         let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
         defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
         UserDefaults.standard.set(false, forKey: "allowUSB")
+        let desk = Data(17...32), studio = Data(33...48)
         let (manager, first) = try await connectOverCable(timing: fast)
         var cables = [first]
         defer { cables.forEach { $0.stop() }; manager.cancel() }
-        await answer(as: "Desk PC")
+        await answer(token: desk)
         try await until("the first PC times out") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .noPicture)
 
         cables.append(try await plugIn(manager))
-        XCTAssertEqual(manager.state, .connecting, "another PC takes the cable")
-        await answer(as: "Studio PC")
+        XCTAssertEqual(manager.state, .connecting, "another PC with the same name takes the cable")
+        await answer(token: studio)
         try await until("the second PC times out") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .noPicture)
         XCTAssertNil(manager.diagnostics.first { $0.message.hasPrefix("Stopped reconnecting") },
@@ -551,10 +557,38 @@ final class USBLinkFailureTests: XCTestCase {
 
         cables.append(try await plugIn(manager))
         XCTAssertEqual(manager.state, .connecting)
-        await answer(as: "Studio PC")
+        await answer(token: studio)
         try await until("the second PC times out again") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .noPicture)
         XCTAssertEqual(manager.usbStatus, "USB: disconnected", "its second timeout stops the cable")
+    }
+
+    /// The PC answered over Wi-Fi without a picture, then over the cable.
+    /// Silent at its Wi-Fi address afterwards, it is most likely restarting
+    /// EternalMonitor: the cable doesn't erase where it answered.
+    func testAnAnswerOverTheCableKeepsThePCsWiFiAddress() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let wifi = FakeUDPHost()
+        let manager = ConnectionManager(timing: fast)
+        var cables: [FramedLink] = []
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: wifi.port)
+        let accepted = await Task.detached { wifi.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2 over Wi-Fi")
+        try await until("the Wi-Fi attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "the same PC's cable is taken")
+        await answer()
+        try await until("the cable attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+
+        manager.connect(host: "127.0.0.1", port: wifi.port)  // nothing answers now
+        try await until("the silent Wi-Fi attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture, "the PC answered at this address before")
     }
 
     // MARK: Answers from the PC during the fallback. Busy and a restart pass;

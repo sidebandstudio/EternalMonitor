@@ -25,16 +25,20 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertTrue(ConnectionProblem.noPicture.canReport)
     }
 
+    /// Pairing tokens two PCs give when pairing is on, and the token a PC
+    /// gives with pairing off.
+    private let desk = Data(17...32), studio = Data(33...48), unpaired = Data(count: 16)
+
     func testNoPictureAttemptsCountPerPCUpToTheLimit() {
         var streak = NoPictureStreak()
         XCTAssertEqual(NoPictureStreak.limit, 2)
         // Nothing answered: nothing to count.
         streak.endedWithoutPicture()
         XCTAssertEqual(streak.timeouts, 0)
-        streak.answered(by: "Desk PC", at: "192.168.1.20:9876")
+        streak.answered(by: "Desk PC", pairingToken: desk, at: "192.168.1.20:9876")
         streak.endedWithoutPicture()
         XCTAssertFalse(streak.stopsReconnecting, "one attempt without a picture gets another")
-        streak.answered(by: "Desk PC", at: "192.168.1.20:9876")
+        streak.answered(by: "Desk PC", pairingToken: desk, at: "192.168.1.20:9876")
         streak.endedWithoutPicture()
         XCTAssertTrue(streak.stopsReconnecting)
         // Try again starts a new count.
@@ -44,25 +48,32 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertFalse(streak.stopsReconnecting)
     }
 
-    /// The count belongs to the PC by the name it answers with, not to the
-    /// address or the cable: two PCs on one cable count separately, and one
-    /// PC at a new address or on the cable counts on.
+    /// The count belongs to the PC by its pairing token, not to its name,
+    /// the address or the cable: two PCs with one name count separately,
+    /// and one PC renamed, at a new address or on the cable counts on.
     func testNoPictureAttemptsCountByThePCThatAnswered() {
         var streak = NoPictureStreak()
-        streak.answered(by: "Desk PC", at: nil)
+        streak.answered(by: "PC", pairingToken: desk, at: nil)
         streak.endedWithoutPicture()
-        streak.answered(by: "Studio PC", at: nil)
-        XCTAssertEqual(streak.timeouts, 0, "another PC on the cable starts a new count")
+        streak.answered(by: "PC", pairingToken: studio, at: nil)
+        XCTAssertEqual(streak.timeouts, 0, "another PC with the same name starts a new count")
         streak.endedWithoutPicture()
         XCTAssertFalse(streak.stopsReconnecting)
-        streak.answered(by: "Studio PC", at: "192.168.1.40:9876")
+        streak.answered(by: "Studio PC", pairingToken: studio, at: "192.168.1.40:9876")
         streak.endedWithoutPicture()
-        XCTAssertTrue(streak.stopsReconnecting, "the same PC over Wi-Fi counts on")
-        // A PC without a name counts by its address.
+        XCTAssertTrue(streak.stopsReconnecting, "the same PC, renamed and over Wi-Fi, counts on")
+        // With pairing off a PC counts by its name, or its address without one.
+        var named = NoPictureStreak()
+        named.answered(by: "Desk PC", pairingToken: unpaired, at: nil)
+        named.endedWithoutPicture()
+        named.answered(by: "Desk PC", pairingToken: unpaired, at: "192.168.1.20:9876")
+        XCTAssertEqual(named.timeouts, 1)
+        named.answered(by: "Studio PC", pairingToken: unpaired, at: "192.168.1.20:9876")
+        XCTAssertEqual(named.timeouts, 0)
         var unnamed = NoPictureStreak()
-        unnamed.answered(by: "", at: "192.168.1.20:9876")
+        unnamed.answered(by: "", pairingToken: unpaired, at: "192.168.1.20:9876")
         unnamed.endedWithoutPicture()
-        unnamed.answered(by: "", at: "192.168.1.30:9876")
+        unnamed.answered(by: "", pairingToken: unpaired, at: "192.168.1.30:9876")
         XCTAssertEqual(unnamed.timeouts, 0)
     }
 
@@ -72,7 +83,7 @@ final class ConnectionProblemTests: XCTestCase {
         // Nothing answered yet: the usual messages.
         XCTAssertEqual(streak.shown(.noReply(usb: false), at: address), .noReply(usb: false))
         XCTAssertEqual(streak.shown(.routerAddress, at: address), .routerAddress)
-        streak.answered(by: "Desk PC", at: address)
+        streak.answered(by: "Desk PC", pairingToken: desk, at: address)
         XCTAssertEqual(streak.shown(.noReply(usb: false), at: address), .noReply(usb: false),
             "a PC that answered but hasn't failed yet")
         streak.endedWithoutPicture()
@@ -88,11 +99,14 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(streak.shown(.noReply(usb: false), at: "192.168.1.30:9876"), .noReply(usb: false))
         // The cable doesn't say which PC is on it, so a silent one keeps its own advice.
         XCTAssertEqual(streak.shown(.noReply(usb: true), at: nil), .noReply(usb: true))
-        streak.answered(by: "Desk PC", at: nil)
+        streak.answered(by: "Desk PC", pairingToken: desk, at: nil)
         streak.endedWithoutPicture()
         XCTAssertEqual(streak.shown(.noReply(usb: true), at: nil), .noReply(usb: true))
+        // The same PC answering over the cable keeps where it answered over Wi-Fi.
+        XCTAssertEqual(streak.address, address)
+        XCTAssertEqual(streak.shown(.noReply(usb: false), at: address), .noPicture)
         // Another PC answering ends the series.
-        streak.answered(by: "Studio PC", at: address)
+        streak.answered(by: "Desk PC", pairingToken: studio, at: address)
         XCTAssertEqual(streak.shown(.noReply(usb: false), at: address), .noReply(usb: false))
     }
 

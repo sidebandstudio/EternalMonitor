@@ -260,11 +260,18 @@ struct NoPictureStreak: Equatable {
     /// a second one means it fails the same way every time.
     static let limit = 2
 
-    /// The PC that answered: the name it gave when it answered, or its
-    /// address if it gave none.
-    private(set) var pc: String?
-    /// Where that PC last answered, as "address:port"; nil over the cable,
-    /// which doesn't say which PC is at its other end.
+    /// A PC by its pairing token, which it keeps across restarts and gives
+    /// over Wi-Fi and the cable alike. With pairing off it gives none, so
+    /// the name it gave, or its address if it gave none either.
+    enum PC: Equatable {
+        case paired(Data)
+        case named(String)
+    }
+
+    /// The PC that answered.
+    private(set) var pc: PC?
+    /// Where that PC last answered over Wi-Fi, as "address:port". The cable
+    /// doesn't say where the PC is on Wi-Fi, so an answer over it keeps this.
     private(set) var address: String?
     private(set) var timeouts = 0
     /// That PC answered and sent no picture in this series.
@@ -272,15 +279,16 @@ struct NoPictureStreak: Equatable {
 
     var stopsReconnecting: Bool { timeouts >= Self.limit }
 
-    /// The PC `name` answered at `address` (nil over the cable). Another PC
-    /// starts a new series.
-    mutating func answered(by name: String, at address: String?) {
-        let pc = name.isEmpty ? address ?? "USB" : name
+    /// The PC `name` with pairing token `pairingToken` answered at `address`
+    /// (nil over the cable). Another PC starts a new series.
+    mutating func answered(by name: String, pairingToken: Data, at address: String?) {
+        let pc: PC = PairingStore.valid(pairingToken) ? .paired(pairingToken)
+            : .named(name.isEmpty ? address ?? "USB" : name)
         if pc != self.pc {
             self = NoPictureStreak()
             self.pc = pc
         }
-        self.address = address
+        if let address { self.address = address }
     }
 
     /// The attempt the PC answered ended without a picture: the timeout
