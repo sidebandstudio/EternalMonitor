@@ -18,7 +18,7 @@ use crate::control::SharedControl;
 #[cfg(any(windows, test))]
 use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
-use crate::vdd_device::{DeviceState, VddProblem};
+use crate::vdd_device::DeviceState;
 
 #[cfg(windows)]
 pub mod dxgi;
@@ -341,11 +341,6 @@ fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
         && crate::supervisor::generation_is_current(generation)
 }
 
-/// How long the attempt after "kept your desktop off it" waits, while the
-/// user picks Extend with Windows key + P or in Settings.
-#[cfg(windows)]
-const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[cfg(windows)]
 const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 
@@ -536,26 +531,31 @@ fn settle_vdd_mode(
 }
 
 /// Log how Windows sees the displays, before the Disable task removes the
-/// virtual one. One record per failure; see `vdd_snapshot`.
+/// virtual one. One record per failure; see `vdd_snapshot`. `request` is
+/// what the worker asked of the driver before its Enable.
 #[cfg(windows)]
-fn log_failure_snapshot(device: crate::vdd::EnableReport, request: &VddRequest) {
-    let snapshot = crate::vdd_snapshot::collect(device, request.pin.clone(), &request.before);
+fn log_failure_snapshot(device: crate::vdd::EnableReport, request: Option<&VddRequest>) {
+    let (pin, before) = request.map_or((Err("no settings prepared"), &[][..]), |request| {
+        (request.pin.clone(), &request.before[..])
+    });
+    let snapshot = crate::vdd_snapshot::collect(device, pin, before);
     warn!(
         "Virtual display failure snapshot {}",
         crate::vdd_snapshot::line(&snapshot)
     );
 }
 
-/// An attach the iPad or a restart ended after this long without a display
-/// is worth a snapshot: on PCs where it works, the display attaches within
+/// A start that a mode change ended after this long without a display is
+/// worth a snapshot: on PCs where it works, the display attaches within
 /// milliseconds of the Enable task.
 #[cfg(any(windows, test))]
 const CANCELLED_SNAPSHOT_AFTER: Duration = Duration::from_secs(2);
 
 /// Whether a cancelled attach that waited `waited` logs a snapshot: once per
-/// launch, since the iPad redials and the same attempt repeats. In 0.3.2 the
-/// iPad's own 10 s limit ended every attempt on PCs whose display never
-/// attached, so no failure snapshot was ever written.
+/// launch (`logged`). In 0.3.2 the iPad's own 10 s limit ended every attempt
+/// on PCs whose display never attached, so no failure snapshot was ever
+/// written. The iPad no longer ends a start, which times out and logs its
+/// own snapshot; the user choosing another mode while it waits still does.
 #[cfg(any(windows, test))]
 fn snapshot_cancelled_attach(waited: Duration, logged: &std::sync::atomic::AtomicBool) -> bool {
     waited >= CANCELLED_SNAPSHOT_AFTER && !logged.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -635,7 +635,7 @@ pub(crate) fn reconcile_virtual_display(
                     prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
                     "The virtual display showed no picture — mirroring the primary display instead"
                 );
-                second_screen::send(shared, second_screen::Command::Release);
+                second_screen::send(shared, second_screen::Command::Fallback(reason));
                 return Some(CaptureTarget::PrimaryAuto);
             }
             let connected = shared.client_connected();

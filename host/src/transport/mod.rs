@@ -735,7 +735,7 @@ async fn execute_actions(
                 "The virtual display showed no picture — restarting pipeline to mirror the \
                  primary display instead"
             );
-            second_screen::send(shared, second_screen::Command::Release);
+            second_screen::send(shared, second_screen::Command::Fallback(reason));
             true
         }
     };
