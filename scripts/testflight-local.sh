@@ -74,7 +74,6 @@ PY
     AUTH=(-allowProvisioningUpdates -allowProvisioningDeviceRegistration
         -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID"
         -authenticationKeyIssuerID "$ASC_ISSUER_ID")
-    ARCHIVE_ARGS+=("${AUTH[@]}")
     if [ -n "${IOS_DIST_P12_BASE64:-}" ]; then
         : "${IOS_DIST_P12_PASSWORD:?Set IOS_DIST_P12_PASSWORD for the fallback certificate}"
         python3 - "$TF_PRIVATE/distribution.p12" <<'PY'
@@ -91,8 +90,6 @@ PY
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TF_KEYCHAIN_PASSWORD" "$TF_KEYCHAIN" >/dev/null
         security list-keychains -d user -s "$TF_KEYCHAIN" "${TF_OLD_KEYCHAINS[@]}"
         security find-identity -v -p codesigning "$TF_KEYCHAIN"
-        # Automatic archives use development signing. The imported distribution
-        # identity is selected during export, when the app is signed for upload.
     fi
     if [ -n "${IOS_PROVISION_PROFILE_BASE64:-}" ]; then
         : "${IOS_DIST_P12_BASE64:?A provisioning profile requires a distribution certificate}"
@@ -121,6 +118,23 @@ print(installed)
 PYPROFILE
 )
         EXPORT_OPTIONS="$TF_PRIVATE/exportOptions.plist"
+    fi
+    if [ -n "$TF_PROFILE" ]; then
+        # Sign the archive as the upload is signed. Automatic signing asks
+        # Apple for a development certificate on every fresh runner, and the
+        # team's certificate limit stopped the archive.
+        PROFILE=$(python3 - "$TF_PRIVATE/profile.plist" <<'PY'
+import plistlib,sys
+profile=plistlib.loads(open(sys.argv[1],'rb').read())
+print(profile['UUID'],profile['TeamIdentifier'][0])
+PY
+)
+        PROFILE_UUID=${PROFILE% *}
+        PROFILE_TEAM=${PROFILE#* }
+        ARCHIVE_ARGS+=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=Apple Distribution"
+            "DEVELOPMENT_TEAM=$PROFILE_TEAM" "ETERNAL_PROFILE_SPECIFIER=$PROFILE_UUID")
+    else
+        ARCHIVE_ARGS+=("${AUTH[@]}")
     fi
 fi
 if [ -n "${ETERNAL_DIAGNOSTICS_ENDPOINT:-}" ] || [ -n "${ETERNAL_DIAGNOSTICS_INGEST_KEY:-}" ]; then
