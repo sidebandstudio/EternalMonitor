@@ -65,12 +65,39 @@ pub fn render_adapters(adapters: &[Adapter], targets: &[Target]) -> Vec<Adapter>
         .collect()
 }
 
+/// The card the driver renders the virtual display on, as DXGI shows it:
+/// the driver's own adapter is listed under that card's name. It is the
+/// adapter holding the virtual display's path, or, before a monitor
+/// arrives, the one adapter that was not there before the Enable
+/// (`before`, by LUID). `None` when neither tells.
+pub fn driver_render_card<'a>(
+    adapters: &'a [Adapter],
+    targets: &[Target],
+    before: &[u64],
+) -> Option<&'a str> {
+    let on_path = targets
+        .iter()
+        .filter(|t| t.is_vdd())
+        .flat_map(|t| std::iter::once(t.adapter).chain(t.source.map(|(adapter, _)| adapter)))
+        .find_map(|luid| adapters.iter().find(|a| a.luid == luid));
+    let new = || {
+        let mut new = adapters.iter().filter(|a| !before.contains(&a.luid));
+        match (new.next(), new.next()) {
+            (Some(adapter), None) if !before.is_empty() => Some(adapter),
+            _ => None,
+        }
+    };
+    on_path.or_else(new).map(|a| a.description.as_str())
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// The device state, or why there is none.
     pub device: Result<DeviceState, &'static str>,
     /// The graphics card the host asked the driver for, or why it asked for none.
     pub pin: Result<String, &'static str>,
+    /// The card the driver renders on (`driver_render_card`).
+    pub render: Option<String>,
     /// `HwSchMode`: 2 hardware-accelerated GPU scheduling on, 1 off.
     pub hags: Option<u32>,
     /// Whether the driver reads its settings from `C:\VirtualDisplayDriver`.
@@ -101,10 +128,21 @@ pub fn line(snapshot: &Snapshot) -> String {
     };
     match &snapshot.pin {
         Ok(name) => {
-            let matched = snapshot.adapters.iter().any(|a| &a.description == name);
+            let matched = snapshot
+                .adapters
+                .iter()
+                .any(|a| crate::vdd_settings::same_card(&a.description, name));
             out += &format!(" pin=\"{}\" pin_matched={matched}", clean(name));
         }
         Err(reason) => out += &format!(" pin=none pin_reason=\"{}\"", clean(reason)),
+    }
+    match (&snapshot.render, &snapshot.pin) {
+        (Some(card), Ok(pin)) => {
+            let same = crate::vdd_settings::same_card(card, pin);
+            out += &format!(" render=\"{}\" render_is_pin={same}", clean(card));
+        }
+        (Some(card), Err(_)) => out += &format!(" render=\"{}\"", clean(card)),
+        (None, _) => out += " render=unknown",
     }
     out += match snapshot.hags {
         Some(2) => " hags=on",
@@ -177,17 +215,21 @@ pub fn line(snapshot: &Snapshot) -> String {
     out
 }
 
-/// Read the adapters, display paths and settings now.
+/// Read the adapters, display paths and settings now. `before` holds the
+/// adapters' LUIDs from before the Enable.
 #[cfg(windows)]
 pub fn collect(
     device: Result<DeviceState, &'static str>,
     pin: Result<String, &'static str>,
+    before: &[u64],
 ) -> Snapshot {
     let settings_key = r"SOFTWARE\MikeTheTech\VirtualDisplayDriver";
     let path = crate::diagnostics::registry_string(settings_key, "VDDPATH");
+    let (adapters, targets) = (adapters(), targets());
     Snapshot {
         device,
         pin,
+        render: driver_render_card(&adapters, &targets, before).map(str::to_string),
         hags: crate::diagnostics::registry_dword(
             r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
             "HwSchMode",
@@ -198,9 +240,15 @@ pub fn collect(
             path.trim_end_matches('\\')
                 .eq_ignore_ascii_case(r"C:\VirtualDisplayDriver")
         }),
-        adapters: adapters(),
-        targets: targets(),
+        adapters,
+        targets,
     }
+}
+
+/// `driver_render_card` read now.
+#[cfg(windows)]
+pub fn render_card_now(before: &[u64]) -> Option<String> {
+    driver_render_card(&adapters(), &targets(), before).map(str::to_string)
 }
 
 #[cfg(windows)]
@@ -343,6 +391,7 @@ mod tests {
         Snapshot {
             device: Ok(DeviceState::NoMonitor),
             pin: Ok("Intel(R) Iris(R) Xe Graphics".into()),
+            render: None,
             hags: Some(2),
             default_settings_path: Some(true),
             adapters: vec![
@@ -388,7 +437,7 @@ mod tests {
     fn the_snapshot_is_one_line_with_each_part() {
         assert_eq!(
             line(&snapshot()),
-            "device=no_monitor pin=\"Intel(R) Iris(R) Xe Graphics\" pin_matched=true hags=on \
+            "device=no_monitor pin=\"Intel(R) Iris(R) Xe Graphics\" pin_matched=true render=unknown hags=on \
              settings_path=default adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
              driver=32.0.101.7092 outputs=1 | 10000e5f0 \"NVIDIA GeForce RTX 3050 Ti Laptop GPU\" \
              10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 \
@@ -415,6 +464,61 @@ mod tests {
         let mut unmatched = snapshot();
         unmatched.pin = Ok("Intel(R) UHD Graphics".into());
         assert!(line(&unmatched).contains("pin_matched=false"));
+        // The driver compares names ignoring case.
+        let mut cased = snapshot();
+        cased.pin = Ok("intel(r) iris(r) xe graphics".into());
+        cased.render = Some("Intel(R) Iris(R) Xe Graphics".into());
+        let text = line(&cased);
+        assert!(
+            text.contains(
+                "pin_matched=true render=\"Intel(R) Iris(R) Xe Graphics\" render_is_pin=true"
+            ),
+            "{text}"
+        );
+        let mut elsewhere = snapshot();
+        elsewhere.render = Some("NVIDIA GeForce RTX 3050 Ti Laptop GPU".into());
+        assert!(line(&elsewhere).contains("render_is_pin=false"));
+        elsewhere.pin = Err("no adapter drives the main screen");
+        assert!(
+            line(&elsewhere).contains(" render=\"NVIDIA GeForce RTX 3050 Ti Laptop GPU\" hags=")
+        );
+    }
+
+    /// The driver's own adapter carries the render card's name: found by
+    /// the virtual display's path, or as the one adapter new since the
+    /// Enable when no monitor has arrived.
+    #[test]
+    fn the_render_card_is_the_drivers_adapter() {
+        let card = |luid, name: &str| Adapter {
+            luid,
+            description: name.into(),
+            vendor_id: 0,
+            device_id: 0,
+            driver: String::new(),
+            outputs: 0,
+        };
+        // mainpc with the driver named to its AMD iGPU.
+        let adapters = [
+            card(0x11e00, "NVIDIA GeForce RTX 5080"),
+            card(0x13c3b, "AMD Radeon(TM) Graphics"),
+            card(0x66f8f4a0, "AMD Radeon(TM) Graphics"),
+        ];
+        let mut vdd = snapshot().targets[1].clone();
+        (vdd.adapter, vdd.source) = (0x66f8f4a0, None);
+        let before = [0x11e00, 0x13c3b];
+        assert_eq!(
+            driver_render_card(&adapters, &[vdd.clone()], &[]),
+            Some("AMD Radeon(TM) Graphics")
+        );
+        // No monitor yet, so no path: the adapter that is new.
+        assert_eq!(
+            driver_render_card(&adapters, &[], &before),
+            Some("AMD Radeon(TM) Graphics")
+        );
+        // Nothing new, nothing known before, or more than one new: no telling.
+        assert_eq!(driver_render_card(&adapters[..2], &[], &before), None);
+        assert_eq!(driver_render_card(&adapters, &[], &[]), None);
+        assert_eq!(driver_render_card(&adapters, &[], &[0x11e00]), None);
     }
 
     #[test]
@@ -455,6 +559,15 @@ mod tests {
         // are not pinned.
         let twins = render_adapters(&adapters, &[monitor]);
         assert!(crate::vdd_settings::gpu_to_pin(Some("NVIDIA GeForce RTX 5080"), &twins).is_err());
+    }
+
+    /// Prints the card the driver renders on while the virtual display is
+    /// on: `cargo test -p eternal-host --lib native_render_card -- --ignored`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "reads this PC's adapters and display paths"]
+    fn native_render_card() {
+        println!("render={:?}", render_card_now(&[]));
     }
 
     #[test]

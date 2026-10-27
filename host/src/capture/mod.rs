@@ -348,6 +348,11 @@ const VDD_EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 
+/// In the app data folder: the graphics card this host last named in the
+/// driver's settings file.
+#[cfg(windows)]
+const VDD_PIN_RECORD: &str = "vdd-pin.txt";
+
 /// What the host asked the driver for before an enable: the graphics card
 /// (or why none), and the mode the second screen should come up in (none
 /// when the user keeps the driver's modes).
@@ -355,6 +360,8 @@ const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 struct VddRequest {
     pin: Result<String, &'static str>,
     mode: Option<crate::vdd_settings::VddMode>,
+    /// The adapters' LUIDs before the Enable, to find the driver's own.
+    before: Vec<u64>,
 }
 
 /// Before each enable: name the main screen's graphics card for the driver
@@ -370,19 +377,19 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         .iter()
         .find(|output| output.is_primary)
         .map(|output| output.adapter_name.as_str());
+    let adapters = crate::vdd_snapshot::adapters();
+    let before = adapters.iter().map(|adapter| adapter.luid).collect();
     // The virtual display's own adapter, listed while it is on, is not a card.
-    let cards = crate::vdd_snapshot::render_adapters(
-        &crate::vdd_snapshot::adapters(),
-        &crate::vdd_snapshot::targets(),
-    );
-    let pin = crate::vdd_settings::gpu_to_pin(main_screen, &cards);
-    if let Err(reason) = pin {
+    let cards = crate::vdd_snapshot::render_adapters(&adapters, &crate::vdd_snapshot::targets());
+    let wanted = crate::vdd_settings::gpu_to_pin(main_screen, &cards);
+    if let Err(reason) = wanted {
         info!(
             reason,
             main_screen, "Leaving the virtual display's graphics card to the driver"
         );
     }
-    let gpu = pin.ok();
+    let gpu = wanted.ok();
+    let record = crate::settings::app_data_dir().map(|dir| dir.join(VDD_PIN_RECORD));
     let matching = crate::settings::SettingsFile::load().vdd_match_resolution;
     let path = std::path::Path::new(VDD_SETTINGS_PATH);
     let mut mode = None;
@@ -403,6 +410,11 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
                     "Wrote virtual display mode list for the connected client"
                 );
                 mode = modes.first().copied();
+                if let Some(Err(error)) =
+                    record.map(|record| crate::vdd_settings::remember_pin(&record, gpu))
+                {
+                    warn!(%error, "Could not record the graphics card named for the virtual display");
+                }
             }
             Err(error) => {
                 warn!(
@@ -412,29 +424,50 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
                 return VddRequest {
                     pin: Err("the settings file could not be written"),
                     mode,
+                    before,
                 };
             }
         }
-    } else if let Some(gpu) = gpu {
-        // The modes in the file are the user's: change only the card.
-        match crate::vdd_settings::pin_gpu_in(path, gpu) {
-            Ok(true) => info!(
-                gpu,
-                "Pointed the virtual display at the main screen's graphics card"
-            ),
-            Ok(false) => {}
-            Err(error) => {
-                warn!(%error, gpu, "Left vdd_settings.xml as it is; the driver chooses the graphics card");
-                return VddRequest {
-                    pin: Err("the settings file was left as it is"),
-                    mode,
-                };
-            }
+        return VddRequest {
+            pin: wanted.map(str::to_string),
+            mode,
+            before,
+        };
+    }
+    // The modes in the file are the user's: change only the card, and only
+    // a name this host may replace.
+    let owned = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(crate::vdd_settings::driver_owned))
+        .unwrap_or(false);
+    let applied = match &record {
+        Some(record) => crate::vdd_settings::apply_pin(path, record, owned, gpu),
+        None => Err(std::io::Error::other("no app data folder")),
+    };
+    match &applied {
+        Ok(crate::vdd_settings::PinOutcome::Named) => info!(
+            gpu,
+            "Pointed the virtual display at the main screen's graphics card"
+        ),
+        Ok(crate::vdd_settings::PinOutcome::Reset) => {
+            info!("Took back the graphics card this host named for the virtual display")
         }
+        Ok(crate::vdd_settings::PinOutcome::Kept(reason)) => {
+            info!(
+                reason,
+                gpu, "Left the graphics card named in vdd_settings.xml"
+            )
+        }
+        Ok(crate::vdd_settings::PinOutcome::Unchanged) => {}
+        Err(error) if gpu.is_some() => {
+            warn!(%error, gpu, "Left vdd_settings.xml as it is; the driver chooses the graphics card")
+        }
+        Err(_) => {}
     }
     VddRequest {
-        pin: pin.map(str::to_string),
+        pin: crate::vdd_settings::pin_result(wanted, &applied),
         mode,
+        before,
     }
 }
 
@@ -504,8 +537,8 @@ fn settle_vdd_mode(
 /// Log how Windows sees the displays, before the Disable task removes the
 /// virtual one. One record per failure; see `vdd_snapshot`.
 #[cfg(windows)]
-fn log_failure_snapshot(device: crate::vdd::EnableReport, pin: &Result<String, &'static str>) {
-    let snapshot = crate::vdd_snapshot::collect(device, pin.clone());
+fn log_failure_snapshot(device: crate::vdd::EnableReport, request: &VddRequest) {
+    let snapshot = crate::vdd_snapshot::collect(device, request.pin.clone(), &request.before);
     warn!(
         "Virtual display failure snapshot {}",
         crate::vdd_snapshot::line(&snapshot)
@@ -649,7 +682,6 @@ pub(crate) fn reconcile_virtual_display(
             *shared.vdd_output.lock() = None;
 
             let request = prepare_vdd_settings(shared, &outputs);
-            let pin = request.pin;
 
             let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
             if !capture_is_current(shared, generation) {
@@ -675,7 +707,7 @@ pub(crate) fn reconcile_virtual_display(
                 }
                 // Every failed Enable, with or without a device state, and
                 // before the Disable below.
-                log_failure_snapshot(report, &pin);
+                log_failure_snapshot(report, &request);
                 // The task enabled a device that cannot show a display.
                 if report.is_ok_and(|device| device != DeviceState::Missing) {
                     crate::vdd::set_enabled(false, progress);
@@ -702,7 +734,7 @@ pub(crate) fn reconcile_virtual_display(
                     waited_ms = waiting_since.elapsed().as_millis() as u64,
                     "Virtual display had not attached when the attempt ended"
                 );
-                log_failure_snapshot(Ok(crate::vdd_device::query()), &pin);
+                log_failure_snapshot(Ok(crate::vdd_device::query()), &request);
             }
             if simulated_attach_timeout() && matches!(result, AttachResult::Attached(_)) {
                 result = AttachResult::TimedOut;
@@ -719,10 +751,12 @@ pub(crate) fn reconcile_virtual_display(
                     let chosen = settle_vdd_mode(chosen, request.mode, || {
                         startup_heartbeat(shared, crate::clock::host_now_us() / 1000)
                     });
+                    let render = crate::vdd_snapshot::render_card_now(&request.before);
                     info!(
                         device = %chosen.device_name,
                         width = chosen.width,
                         height = chosen.height,
+                        render = render.as_deref().unwrap_or("unknown"),
                         "Virtual display attached — capturing it"
                     );
                     *shared.vdd_output.lock() = Some(chosen.device_name.clone());
@@ -734,7 +768,7 @@ pub(crate) fn reconcile_virtual_display(
             warn!("Virtual display did not attach in time — capturing the primary display instead");
             if let Some(device) = device {
                 report_device(shared, device);
-                log_failure_snapshot(Ok(device), &pin);
+                log_failure_snapshot(Ok(device), &request);
             }
             // enable() succeeded but nothing attached: turn it back off so we don't strand a
             // half-enabled device as a phantom monitor.

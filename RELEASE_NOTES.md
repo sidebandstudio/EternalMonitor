@@ -10,7 +10,7 @@ Not released yet.
   off it, the page says to choose Extend with Windows key + P or in Display
   settings, and the next try waits 30 seconds for it. EternalMonitor does not
   change the display layout itself. The display task no longer reports success
-  when the display cannot appear. After any failed attempt the support
+  when the driver is missing or stopped with an error. After any failed attempt the support
   diagnostics and **Copy logs** hold a display snapshot: the device state, the
   graphics cards and the display paths Windows reports. The snapshot leaves out
   the PC's name and the user's name; the rest of the log still contains them.
@@ -21,7 +21,9 @@ Not released yet.
   graphics drives no screen; in 0.3.1 diagnostics none of those laptops got the
   second screen. A card Windows lists twice under one name, as on some
   laptops, is still named when only its first listing drives a screen; when
-  two cards with one name could, the driver still chooses.
+  two cards with one name could, the driver still chooses. When another app
+  installed the driver and the user or that app named a card, EternalMonitor
+  leaves that name alone. The log records which card the driver used.
 - The second screen comes up at the iPad's resolution. Windows restores the
   size it last saved for the second screen, and in 0.3.1 diagnostics 4 of the 5
   PCs whose second screen appeared got a tiny, blurry 800×600 one. EternalMonitor

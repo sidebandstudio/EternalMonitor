@@ -158,7 +158,7 @@ pub fn gpu_to_pin<'a>(
         .ok_or("no adapter drives the main screen")?;
     let mut named = adapters
         .iter()
-        .filter(|adapter| adapter.description == name);
+        .filter(|adapter| same_card(&adapter.description, name));
     if let Some(first) = named.next() {
         let mut rest = named.peekable();
         if rest.peek().is_some() && (first.outputs == 0 || rest.any(|a| a.outputs > 0)) {
@@ -399,6 +399,154 @@ pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Whether two graphics card names are one card to the driver, which
+/// compares them ignoring case.
+pub fn same_card(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// A name that leaves the card to the driver: none, empty or `default`.
+fn driver_chooses(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || name.eq_ignore_ascii_case("default")
+}
+
+/// The graphics card the document names, `None` when it leaves the card to
+/// the driver. `Err` when the document is not one this host edits.
+pub fn named_gpu(xml: &str) -> Result<Option<String>, &'static str> {
+    let body = xml.strip_prefix('\u{feff}').unwrap_or(xml);
+    match gpu_slot(body)? {
+        GpuSlot::Name(range) => {
+            let text = quick_xml::escape::unescape(&body[range])
+                .map_err(|_| "the graphics card name is not valid XML text")?;
+            Ok((!driver_chooses(&text)).then(|| text.trim().to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// What to do to the settings file's graphics card name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinChange {
+    /// Name this card.
+    Write(String),
+    /// Take back this host's earlier name: the driver chooses again.
+    Reset,
+    /// Nothing to change.
+    Leave,
+    /// Another app or the user named a card; it stays, and the driver
+    /// renders there.
+    Refuse(&'static str),
+}
+
+/// Why a card someone else named stays.
+pub const NAMED_ELSEWHERE: &str = "the settings file names a card this host did not";
+
+/// Whose name the file may hold: this host replaces a name only when it
+/// installed the driver (`owned`), when the file leaves the card to the
+/// driver, or when the name is the one it wrote last (`ours`). Other apps
+/// share this driver and its file. With no card to name (`wanted` is
+/// `None`), this host's own earlier name is taken back, so the file never
+/// keeps a pin the log says was not made.
+pub fn pin_change(
+    named: Option<&str>,
+    wanted: Option<&str>,
+    owned: bool,
+    ours: Option<&str>,
+) -> PinChange {
+    let is_ours = |name: &str| ours.is_some_and(|ours| same_card(ours, name));
+    match (wanted, named) {
+        (Some(card), Some(name)) if same_card(card, name) => PinChange::Leave,
+        (Some(_), Some(name)) if !owned && !is_ours(name) => PinChange::Refuse(NAMED_ELSEWHERE),
+        (Some(card), _) => PinChange::Write(card.to_string()),
+        (None, Some(name)) if is_ours(name) => PinChange::Reset,
+        (None, _) => PinChange::Leave,
+    }
+}
+
+/// What `apply_pin` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    Named,
+    Unchanged,
+    Reset,
+    Kept(&'static str),
+}
+
+/// Whether Setup installed the virtual display driver beside the app in
+/// `app_dir`; it records that in this marker (installer/EternalMonitor.iss).
+pub fn driver_owned(app_dir: &Path) -> bool {
+    app_dir
+        .join("driver")
+        .join("installed-by-eternalmonitor.txt")
+        .is_file()
+}
+
+/// Remember the card this host last wrote into the settings file, or that
+/// it wrote none.
+pub fn remember_pin(record: &Path, gpu: Option<&str>) -> io::Result<()> {
+    match gpu {
+        Some(gpu) => {
+            if let Some(parent) = record.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(record, gpu)
+        }
+        None => match std::fs::remove_file(record) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Make the settings file at `path` name `wanted`, changing only the card,
+/// under the rules of `pin_change`. `record` holds the name this host
+/// wrote last. A missing file stays missing, and one that does not parse
+/// as expected is left alone; the error says why.
+pub fn apply_pin(
+    path: &Path,
+    record: &Path,
+    owned: bool,
+    wanted: Option<&str>,
+) -> io::Result<PinOutcome> {
+    let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
+    let current = std::fs::read_to_string(path)?;
+    let named = named_gpu(&current).map_err(invalid)?;
+    let ours = std::fs::read_to_string(record).ok();
+    let ours = ours
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours) {
+        PinChange::Leave => return Ok(PinOutcome::Unchanged),
+        PinChange::Refuse(reason) => return Ok(PinOutcome::Kept(reason)),
+        PinChange::Write(card) => (card, PinOutcome::Named),
+        PinChange::Reset => ("default".to_string(), PinOutcome::Reset),
+    };
+    let updated = gpu_edit(&current, &name).map_err(invalid)?;
+    // Recorded first, so a name this host wrote is always one it knows.
+    remember_pin(
+        record,
+        (outcome == PinOutcome::Named).then_some(name.as_str()),
+    )?;
+    replace(path, &updated)?;
+    Ok(outcome)
+}
+
+/// What the snapshot reports as asked of the driver after `apply_pin`: the
+/// card the file names for this host, or why it names none.
+pub fn pin_result(
+    wanted: Result<&str, &'static str>,
+    applied: &io::Result<PinOutcome>,
+) -> Result<String, &'static str> {
+    match (wanted, applied) {
+        (Err(reason), _) => Err(reason),
+        (Ok(_), Ok(PinOutcome::Kept(reason))) => Err(reason),
+        (Ok(_), Err(_)) => Err("the settings file was left as it is"),
+        (Ok(card), Ok(_)) => Ok(card.to_string()),
+    }
+}
+
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
 /// Creates the directory if the driver hasn't made it yet.
 pub fn write_to(path: &Path, modes: &[VddMode], gpu: Option<&str>) -> io::Result<()> {
@@ -604,6 +752,9 @@ mod tests {
         // Both drive screens, or neither is known to: no telling which.
         assert!(gpu_to_pin(Some(INTEL), &listed([1, 1])).is_err());
         assert!(gpu_to_pin(Some(INTEL), &listed([0, 0])).is_err());
+        // The driver matches names ignoring case, so a listing in another
+        // case is the same card.
+        assert!(gpu_to_pin(Some("intel(r) hd graphics 630"), &listed([0, 1])).is_err());
         // The duplicate does not stop a pin to the other card.
         assert_eq!(
             gpu_to_pin(Some("NVIDIA GeForce GTX 1050"), &listed([1, 0])),
@@ -646,6 +797,155 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn a_name_is_replaced_only_when_this_host_may() {
+        use PinChange::*;
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const OTHER: &str = "NVIDIA GeForce GTX 1050";
+        let write = || Write(INTEL.to_string());
+        // The driver chooses: this host may name a card, owned or not.
+        for owned in [false, true] {
+            assert_eq!(pin_change(None, Some(INTEL), owned, None), write());
+        }
+        // A card another app or the user named stays on a driver Setup did
+        // not install, and is replaced on one it did.
+        assert_eq!(
+            pin_change(Some(OTHER), Some(INTEL), false, None),
+            Refuse(NAMED_ELSEWHERE)
+        );
+        assert_eq!(
+            pin_change(Some(OTHER), Some(INTEL), false, Some(INTEL)),
+            Refuse(NAMED_ELSEWHERE)
+        );
+        assert_eq!(pin_change(Some(OTHER), Some(INTEL), true, None), write());
+        // This host's own earlier name, in any case, is replaced.
+        assert_eq!(
+            pin_change(
+                Some("nvidia geforce gtx 1050"),
+                Some(INTEL),
+                false,
+                Some(OTHER)
+            ),
+            write()
+        );
+        // Already named, ignoring case.
+        assert_eq!(
+            pin_change(Some("intel(r) hd graphics 630"), Some(INTEL), false, None),
+            Leave
+        );
+        // No card to name: this host's earlier name is taken back, anyone
+        // else's stays.
+        assert_eq!(pin_change(Some(INTEL), None, false, Some(INTEL)), Reset);
+        assert_eq!(pin_change(Some(INTEL), None, true, None), Leave);
+        assert_eq!(pin_change(None, None, false, Some(INTEL)), Leave);
+    }
+
+    #[test]
+    fn the_named_card_is_read_back_as_the_driver_reads_it() {
+        let file = |name: &str| VENDOR.replace("default", name);
+        assert_eq!(named_gpu(VENDOR), Ok(None));
+        assert_eq!(named_gpu(&file(" DEFAULT ")), Ok(None));
+        assert_eq!(named_gpu(&file("")), Ok(None));
+        assert_eq!(named_gpu(&file("A&amp;B")), Ok(Some("A&B".to_string())));
+        assert_eq!(named_gpu("<vdd_settings></vdd_settings>"), Ok(None));
+        assert!(named_gpu("<other/>").is_err());
+    }
+
+    #[test]
+    fn apply_pin_records_its_own_name_and_takes_it_back() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let named = || named_gpu(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+
+        // The vendor's file, on a driver another app installed.
+        std::fs::write(&path, VENDOR).unwrap();
+        assert_eq!(
+            apply_pin(&path, &record, false, Some(INTEL)).unwrap(),
+            PinOutcome::Named
+        );
+        assert_eq!(named().as_deref(), Some(INTEL));
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), INTEL);
+        assert_eq!(
+            apply_pin(&path, &record, false, Some(INTEL)).unwrap(),
+            PinOutcome::Unchanged
+        );
+        // The pin is refused later: the name this host wrote goes, and so
+        // does the record.
+        assert_eq!(
+            apply_pin(&path, &record, false, None).unwrap(),
+            PinOutcome::Reset
+        );
+        assert_eq!(named(), None);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("<friendlyname>default</friendlyname>"));
+        assert!(!record.exists());
+
+        // A card the user or another app named stays, and is reported.
+        let theirs = VENDOR.replace("default", "NVIDIA GeForce GTX 1050");
+        std::fs::write(&path, &theirs).unwrap();
+        let applied = apply_pin(&path, &record, false, Some(INTEL));
+        assert_eq!(
+            applied.as_ref().unwrap(),
+            &PinOutcome::Kept(NAMED_ELSEWHERE)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        assert_eq!(pin_result(Ok(INTEL), &applied), Err(NAMED_ELSEWHERE));
+        assert_eq!(
+            apply_pin(&path, &record, false, None).unwrap(),
+            PinOutcome::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        // Setup installed this driver: the main screen's card wins.
+        assert_eq!(
+            apply_pin(&path, &record, true, Some(INTEL)).unwrap(),
+            PinOutcome::Named
+        );
+        assert_eq!(named().as_deref(), Some(INTEL));
+        assert_eq!(
+            pin_result(Ok(INTEL), &Ok(PinOutcome::Named)),
+            Ok(INTEL.to_string())
+        );
+
+        // A missing file stays missing.
+        std::fs::remove_file(&path).unwrap();
+        let applied = apply_pin(&path, &record, true, Some(INTEL));
+        assert!(applied.is_err() && !path.exists());
+        assert_eq!(
+            pin_result(Ok(INTEL), &applied),
+            Err("the settings file was left as it is")
+        );
+        assert_eq!(
+            pin_result(
+                Err("no adapter drives the main screen"),
+                &Ok(PinOutcome::Unchanged)
+            ),
+            Err("no adapter drives the main screen")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_setups_marker_makes_the_driver_this_hosts() {
+        let dir = std::env::temp_dir().join(format!("vdd-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("driver")).unwrap();
+        assert!(!driver_owned(&dir));
+        std::fs::write(
+            dir.join("driver").join("installed-by-eternalmonitor.txt"),
+            "x",
+        )
+        .unwrap();
+        assert!(driver_owned(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
