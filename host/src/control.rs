@@ -44,7 +44,6 @@ pub struct SharedControl {
     #[cfg(any(windows, test))]
     pub(crate) vdd_lifecycle: Arc<Mutex<()>>,
     /// Output owned by the enabled driver, retained across pipeline restarts.
-    #[cfg(any(windows, test))]
     pub(crate) vdd_output: Arc<Mutex<Option<String>>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
     /// it, the grace period after its viewer left, the last driver change.
@@ -156,7 +155,6 @@ impl SharedControl {
             capture_block: Arc::new(Mutex::new(None)),
             #[cfg(any(windows, test))]
             vdd_lifecycle: Arc::new(Mutex::new(())),
-            #[cfg(any(windows, test))]
             vdd_output: Arc::new(Mutex::new(None)),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
@@ -199,10 +197,7 @@ impl SharedControl {
     /// The user asked to try again: a second screen that failed to start is
     /// tried once more at the next connection.
     pub(crate) fn retry_second_screen(&self) {
-        let mut status = self.vdd_status.lock();
-        if matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
-            *status = VddStatus::WaitingForClient;
-        }
+        crate::capture::second_screen::retry(self);
     }
 }
 

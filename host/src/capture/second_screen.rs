@@ -9,10 +9,13 @@
 //! for every attempt.
 //!
 //! Now a connecting iPad gets the mirror at once, from the capture generation
-//! already running. The display is turned on by its own thread here, and the
-//! transport restarts the pipeline onto it once it exists. A start that
-//! failed is remembered: later connections stay on the mirror until the user
-//! clicks Try again, restarts the stream, or changes the mode.
+//! already running. Threads here turn the display on and off, so capture
+//! never waits for the driver. Once the display attaches the transport
+//! restarts the pipeline onto it, and the capture generation that streams it
+//! must deliver a real image within [`PROVE_TIMEOUT`]; otherwise the stream
+//! goes back to the mirror. A start that failed is remembered: later
+//! connections stay on the mirror until the user clicks Try again, restarts
+//! the stream, or changes the mode.
 
 use std::time::{Duration, Instant};
 
@@ -36,6 +39,12 @@ pub(crate) const RELEASE_GRACE: Duration = Duration::from_secs(10);
 #[cfg(any(windows, test))]
 pub(crate) const MIN_TOGGLE_GAP: Duration = Duration::from_secs(10);
 
+/// How long a capture generation streaming the second screen has to capture
+/// a real image of it. Until then the iPad keeps showing the last mirror
+/// frame; a display that fails to duplicate, or only ever times out, goes
+/// back to the mirror after this.
+pub const PROVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(any(windows, test))]
 const WAIT_STEP: Duration = Duration::from_millis(100);
 
@@ -55,6 +64,16 @@ pub(crate) enum Step {
     Switch,
     /// Nobody came back within the grace period: restart to turn it off.
     Release,
+    /// The display showed no picture: restart onto the mirror, turn it off.
+    Fallback(&'static str),
+}
+
+/// A capture generation streaming the second screen, before its first image.
+#[derive(Debug, Clone, Copy)]
+struct Proving {
+    generation: u64,
+    since: Instant,
+    capture_failed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +86,11 @@ pub(crate) struct State {
     release_requested: bool,
     /// When the host last turned the display on or off.
     last_toggle: Option<Instant>,
+    /// A thread is turning the display on.
+    attaching: bool,
+    proving: Option<Proving>,
+    /// Why the second screen last failed, for the log and the backend.
+    failure: Option<&'static str>,
 }
 
 impl State {
@@ -80,13 +104,34 @@ impl State {
         if !selected {
             *self = State {
                 last_toggle: self.last_toggle,
+                attaching: self.attaching,
                 ..State::default()
             };
             return Step::Nothing;
         }
+        if let Some(proving) = self.proving {
+            let reason = if proving.capture_failed {
+                Some("duplication_failed")
+            } else if now.duration_since(proving.since) >= PROVE_TIMEOUT {
+                Some("no_frames")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                *self = State {
+                    last_toggle: self.last_toggle,
+                    attaching: self.attaching,
+                    failure: Some(reason),
+                    ..State::default()
+                };
+                *status = VddStatus::Failed;
+                return Step::Fallback(reason);
+            }
+        }
         match *status {
             VddStatus::WaitingForClient if connected => {
                 *status = VddStatus::Attaching;
+                self.attaching = true;
                 Step::Attach
             }
             VddStatus::Active if connected => {
@@ -148,11 +193,64 @@ pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
 /// Why connections mirror instead of extending, after a failed start. The
 /// value appears as `second_screen_fallback=` in the log, which the
 /// diagnostics upload sends as is.
-pub(crate) fn remembered_failure(status: VddStatus) -> Option<&'static str> {
+pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str> {
+    let status = *shared.vdd_status.lock();
+    let failure = shared.second_screen.lock().failure;
     match status {
-        VddStatus::Failed => Some("attach_timeout"),
-        VddStatus::TaskFailed => Some("enable_failed"),
+        VddStatus::Failed => Some(failure.unwrap_or("attach_timeout")),
+        VddStatus::TaskFailed => Some(failure.unwrap_or("enable_failed")),
         _ => None,
+    }
+}
+
+/// The user asked to try again: a failed start, or one whose thread is gone,
+/// is tried once more at the next connection.
+pub(crate) fn retry(shared: &SharedControl) {
+    let mut status = shared.vdd_status.lock();
+    let mut state = shared.second_screen.lock();
+    let stale = *status == VddStatus::Attaching && !state.attaching;
+    if stale || matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
+        *status = VddStatus::WaitingForClient;
+        state.failure = None;
+    }
+}
+
+/// The display attached and is the stream's next source.
+pub fn note_attached(shared: &SharedControl, device_name: String) {
+    *shared.vdd_output.lock() = Some(device_name);
+    let mut status = shared.vdd_status.lock();
+    *status = VddStatus::Active;
+    shared.second_screen.lock().switch_pending = true;
+}
+
+/// Capture `generation` streams the second screen from `now`, and must
+/// capture an image of it within [`PROVE_TIMEOUT`].
+pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
+    shared.second_screen.lock().proving = Some(Proving {
+        generation,
+        since: now,
+        capture_failed: false,
+    });
+}
+
+/// Capture `generation` captured a real image.
+pub fn note_image(shared: &SharedControl, generation: u64) {
+    let mut state = shared.second_screen.lock();
+    if state.proving.is_some_and(|p| p.generation == generation) {
+        state.proving = None;
+        tracing::info!("Second screen captured its first image — streaming it");
+    }
+}
+
+/// Capture `generation` failed to open or read its display, for example
+/// DuplicateOutput returned DXGI_ERROR_UNSUPPORTED. On the second screen,
+/// before its first image, that ends the attempt at the next tick.
+pub fn note_capture_error(shared: &SharedControl, generation: u64) {
+    let mut state = shared.second_screen.lock();
+    if let Some(proving) = state.proving.as_mut() {
+        if proving.generation == generation {
+            proving.capture_failed = true;
+        }
     }
 }
 
@@ -173,7 +271,11 @@ pub(crate) fn start(shared: SharedControl) {
         if let Err(error) = spawned {
             warn!(%error, second_screen_fallback = "enable_failed",
                 "Could not start the second screen — mirroring the primary display instead");
-            *shared.vdd_status.lock() = VddStatus::TaskFailed;
+            let mut status = shared.vdd_status.lock();
+            *status = VddStatus::TaskFailed;
+            let mut state = shared.second_screen.lock();
+            state.attaching = false;
+            state.failure = Some("enable_failed");
         }
         return;
     }
@@ -181,7 +283,28 @@ pub(crate) fn start(shared: SharedControl) {
         second_screen_fallback = "no_driver",
         "No virtual display driver with this capture source — mirroring the primary display"
     );
-    *shared.vdd_status.lock() = VddStatus::TaskFailed;
+    let mut status = shared.vdd_status.lock();
+    *status = VddStatus::TaskFailed;
+    let mut state = shared.second_screen.lock();
+    state.attaching = false;
+    state.failure = Some("no_driver");
+}
+
+/// Turn the display off on its own thread, so capture never waits for the
+/// driver. Returns at once.
+pub(crate) fn turn_off(shared: SharedControl) {
+    #[cfg(windows)]
+    if !super::synthetic_requested() {
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("second-screen-off".into())
+            .spawn(move || release(&worker, &WindowsDriver { shared: &worker }));
+        if let Err(error) = spawned {
+            warn!(%error, "Could not turn the virtual display off");
+        }
+        return;
+    }
+    *shared.vdd_output.lock() = None;
 }
 
 /// What turning the display on needs from Windows, so tests can supply a
@@ -196,13 +319,30 @@ pub(crate) trait Driver {
     fn sleep(&self, duration: Duration);
 }
 
+/// However [`attach`] ends, its claim ends with it: a start that did not
+/// finish leaves the status for the next tick to claim again.
+#[cfg(any(windows, test))]
+struct AttachExit<'a>(&'a SharedControl);
+
+#[cfg(any(windows, test))]
+impl Drop for AttachExit<'_> {
+    fn drop(&mut self) {
+        let mut status = self.0.vdd_status.lock();
+        if *status == VddStatus::Attaching {
+            *status = VddStatus::WaitingForClient;
+        }
+        self.0.second_screen.lock().attaching = false;
+    }
+}
+
 /// Turn the display on, wait for it to attach, and record the result. A
 /// viewer leaving does not cancel it; only a change of mode does. Capture
 /// keeps mirroring throughout.
 #[cfg(any(windows, test))]
 pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Duration) {
+    let _exit = AttachExit(shared);
     let selected = || *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
-    // Capture generations turn the display off under the same lock.
+    // One driver change at a time, across the threads here.
     let _lifecycle = loop {
         if let Some(guard) = shared.vdd_lifecycle.try_lock_for(Duration::from_millis(50)) {
             break guard;
@@ -216,7 +356,6 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     }
     if !shared.client_connected() {
         info!("The iPad left before the virtual display was turned on — leaving it off");
-        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
         return;
     }
     // Quitting turns the display off once; an Enable after that would
@@ -225,14 +364,24 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     while !shared.running.load(std::sync::atomic::Ordering::SeqCst) {
         if driver.now().duration_since(stopped_at) >= STOPPED_WAIT {
             info!("The stream stopped before the virtual display was turned on — leaving it off");
-            *shared.vdd_status.lock() = VddStatus::WaitingForClient;
             return;
         }
         driver.sleep(WAIT_STEP);
     }
+    // Still on from before (its turn-off saw this start coming): reuse it.
+    let outputs = driver.outputs();
+    let owned = shared.vdd_output.lock().clone();
+    if let Some(name) = owned.filter(|name| {
+        outputs
+            .iter()
+            .any(|output| !output.is_primary && &output.device_name == name)
+    }) {
+        info!(device = %name, "Virtual display still attached — capturing it");
+        note_attached(shared, name);
+        return;
+    }
     driver.prepare();
-    let before: Vec<String> = driver
-        .outputs()
+    let before: Vec<String> = outputs
         .into_iter()
         .map(|output| output.device_name)
         .collect();
@@ -244,7 +393,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             "Virtual display could not be enabled (installer task missing?) — \
              capturing the primary display instead"
         );
-        *shared.vdd_status.lock() = VddStatus::TaskFailed;
+        let mut status = shared.vdd_status.lock();
+        *status = VddStatus::TaskFailed;
+        shared.second_screen.lock().failure = Some("enable_failed");
         return;
     }
     let result = wait_for_virtual_output(
@@ -255,8 +406,14 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         |duration| driver.sleep(duration),
     );
     match result {
-        // The user chose another mode; that generation turns the display off.
-        AttachResult::Cancelled => {}
+        AttachResult::Cancelled => {
+            // The user chose another mode while the display came up. Nothing
+            // records it as ours, so turn it off now.
+            info!("Display mode changed while the virtual display started — turning it off");
+            driver.set_enabled(false);
+            *shared.vdd_output.lock() = None;
+            shared.second_screen.lock().note_toggle(driver.now());
+        }
         AttachResult::Attached(chosen) => {
             info!(
                 device = %chosen.device_name,
@@ -264,10 +421,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 height = chosen.height,
                 "Virtual display attached — capturing it"
             );
-            *shared.vdd_output.lock() = Some(chosen.device_name);
-            let mut status = shared.vdd_status.lock();
-            *status = VddStatus::Active;
-            shared.second_screen.lock().switch_pending = true;
+            note_attached(shared, chosen.device_name);
         }
         AttachResult::TimedOut => {
             warn!(
@@ -281,9 +435,35 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             driver.set_enabled(false);
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
-            shared.second_screen.lock().note_toggle(driver.now());
+            let mut state = shared.second_screen.lock();
+            state.note_toggle(driver.now());
+            state.failure = Some("attach_timeout");
         }
     }
+}
+
+/// Turn off a display this host turned on, unless a viewer wants it again.
+#[cfg(any(windows, test))]
+pub(crate) fn release(shared: &SharedControl, driver: &impl Driver) {
+    let wanted = || {
+        *shared.capture_target.lock() == CaptureTarget::VirtualExtended
+            && matches!(
+                *shared.vdd_status.lock(),
+                VddStatus::Active | VddStatus::Attaching
+            )
+    };
+    let _lifecycle = shared.vdd_lifecycle.lock();
+    if shared.vdd_output.lock().is_none() || wanted() {
+        return;
+    }
+    wait_for_toggle_gap(shared, driver, &|| true);
+    if wanted() {
+        return;
+    }
+    driver.set_enabled(false);
+    *shared.vdd_output.lock() = None;
+    shared.second_screen.lock().note_toggle(driver.now());
+    info!("Virtual display turned off");
 }
 
 /// Wait out [`MIN_TOGGLE_GAP`]. False when the mode changed meanwhile.
@@ -367,9 +547,11 @@ impl Driver for WindowsDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::reconcile_virtual_display;
     use crate::capture::tests::connect_viewer;
     use crate::transport::link::LinkId;
     use std::cell::{Cell, RefCell};
+    use std::sync::atomic::Ordering;
 
     /// The iPad's connect timeout in 0.3.1 and 0.3.2: it disconnects when no
     /// frame has decoded this long after the handshake.
@@ -538,10 +720,7 @@ mod tests {
         assert_eq!(toggles[0], (secs(8.0), true));
         assert!(!toggles[1].1 && toggles[1].0 - toggles[0].0 >= MIN_TOGGLE_GAP);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
-        assert_eq!(
-            remembered_failure(*shared.vdd_status.lock()),
-            Some("attach_timeout")
-        );
+        assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
 
         // Reconnects for the next minute stay on the mirror.
         for second in 0..60 {
@@ -651,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_mode_ends_the_start_and_clears_the_timers() {
+    fn a_mode_change_after_the_enable_turns_the_display_back_off() {
         let shared = second_screen_selected();
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
@@ -668,7 +847,266 @@ mod tests {
             "{:?}",
             driver.elapsed.get()
         );
-        assert_eq!(driver.toggles.borrow().len(), 1, "only the Enable");
+        let toggles = driver.toggles.borrow().clone();
+        assert_eq!(
+            toggles.iter().map(|(_, on)| *on).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert_eq!(*shared.vdd_output.lock(), None);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
         assert_eq!(next_step(&shared, driver.now()), Step::Nothing);
+    }
+
+    /// Review round 1, defect 3: Mirror then Second screen again during the
+    /// start, before any capture generation reconciled Mirror. The start must
+    /// not stay claimed with nobody running it.
+    #[test]
+    fn a_mode_change_during_the_start_never_leaves_it_claimed() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        let on_sleep = |_| {};
+        let driver = FakeDriver::new(secs(3.0), None, &on_sleep);
+        // A change a moment ago: the start waits out the gap first.
+        shared.second_screen.lock().note_toggle(driver.now());
+        assert_eq!(next_step(&shared, driver.now()), Step::Attach);
+        let mirror = Once::at(secs(2.0));
+        let on_sleep = |elapsed: Duration| {
+            mirror.run(elapsed, || {
+                *shared.capture_target.lock() = CaptureTarget::PrimaryAuto
+            })
+        };
+        let driver = FakeDriver {
+            on_sleep: &on_sleep,
+            ..driver
+        };
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert!(mirror.done.get());
+        assert!(driver.toggles.borrow().is_empty());
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert_eq!(next_step(&shared, driver.now()), Step::Attach);
+    }
+
+    #[test]
+    fn try_again_recovers_a_start_whose_thread_is_gone() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        // Its thread is running: Try again leaves it alone.
+        shared.retry_second_screen();
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
+        // A claim with no thread behind it.
+        shared.second_screen.lock().attaching = false;
+        shared.retry_second_screen();
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+    }
+
+    /// Review round 1, defect 1: the switch happened, then the capture
+    /// generation streaming the display only ever timed out (or read the
+    /// black placeholder). It goes back to the mirror, and stays there.
+    #[test]
+    fn a_second_screen_that_never_shows_an_image_goes_back_to_the_mirror() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < PROVE_TIMEOUT {
+            assert_eq!(next_step(&shared, start + elapsed), Step::Nothing);
+            elapsed += secs(0.25);
+        }
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some("no_frames"));
+        // Acquisition only timing out never sends the black placeholder.
+        assert!(!super::super::keepalive_allowed(false, true));
+        assert!(super::super::keepalive_allowed(false, false));
+        assert!(super::super::keepalive_allowed(true, true));
+        // Later connections mirror without touching the driver.
+        for second in 1..30 {
+            disconnect(&shared);
+            connect_viewer(&shared);
+            let now = start + PROVE_TIMEOUT + Duration::from_secs(second);
+            assert_eq!(next_step(&shared, now), Step::Nothing);
+        }
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::PrimaryAuto)
+        );
+    }
+
+    #[test]
+    fn a_duplication_error_on_the_second_screen_goes_back_to_the_mirror_at_once() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        // An older generation's error is not this display's.
+        note_capture_error(&shared, 6);
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        // DuplicateOutput returned DXGI_ERROR_UNSUPPORTED.
+        note_capture_error(&shared, 7);
+        assert_eq!(
+            next_step(&shared, start),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(remembered_failure(&shared), Some("duplication_failed"));
+    }
+
+    #[test]
+    fn a_second_screen_that_shows_an_image_stays() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        note_image(&shared, 6);
+        note_image(&shared, 7);
+        note_capture_error(&shared, 7);
+        for second in 0..60 {
+            let now = start + Duration::from_secs(second);
+            assert_eq!(next_step(&shared, now), Step::Nothing);
+        }
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+    }
+
+    #[test]
+    fn a_fallback_turns_the_display_off_after_the_gap() {
+        let shared = second_screen_selected();
+        let on_sleep = |_| {};
+        let driver = FakeDriver::new(secs(3.0), Some(Duration::ZERO), &on_sleep);
+        note_attached(&shared, "virtual".into());
+        shared.second_screen.lock().note_toggle(driver.now());
+        *shared.vdd_status.lock() = VddStatus::Failed;
+        release(&shared, &driver);
+        assert_eq!(*driver.toggles.borrow(), vec![(MIN_TOGGLE_GAP, false)]);
+        assert_eq!(*shared.vdd_output.lock(), None);
+        // A second request finds nothing left to turn off.
+        release(&shared, &driver);
+        assert_eq!(driver.toggles.borrow().len(), 1);
+    }
+
+    /// Review round 1, defect 2: no capture generation may wait for the
+    /// driver lock, whatever the status, the mode or the viewer. Before, a
+    /// generation that read `WaitingForClient` (Try again had just reset it)
+    /// waited for the lock behind the attach thread's whole Enable.
+    #[test]
+    fn mirror_startup_never_waits_for_the_driver_lock() {
+        let shared = second_screen_selected();
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let _held = shared.vdd_lifecycle.lock();
+        for target in [
+            CaptureTarget::VirtualExtended,
+            CaptureTarget::PrimaryAuto,
+            CaptureTarget::Output("physical".into()),
+        ] {
+            for status in [
+                VddStatus::Inactive,
+                VddStatus::WaitingForClient,
+                VddStatus::Attaching,
+                VddStatus::Active,
+                VddStatus::Failed,
+                VddStatus::TaskFailed,
+            ] {
+                for connected in [false, true] {
+                    if connected != shared.client_connected() {
+                        if connected {
+                            connect_viewer(&shared);
+                        } else {
+                            disconnect(&shared);
+                        }
+                    }
+                    *shared.vdd_status.lock() = status;
+                    let (done, finished) = std::sync::mpsc::channel();
+                    let worker = shared.clone();
+                    let target = target.clone();
+                    std::thread::spawn(move || {
+                        let _ = done.send(reconcile_virtual_display(&target, &worker, generation));
+                    });
+                    let chosen = finished
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap_or_else(|_| panic!("{status:?} connected={connected} waited"));
+                    assert!(chosen.is_some(), "{status:?}");
+                }
+            }
+        }
+    }
+
+    /// The same, with the real attach thread: Try again after a failure, its
+    /// thread blocked in a slow Enable, and a new capture generation.
+    #[test]
+    fn try_again_during_a_slow_enable_still_mirrors_at_once() {
+        /// Blocks in Enable until released, on a paused clock otherwise.
+        struct SlowEnable {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            start: Instant,
+            elapsed: Cell<Duration>,
+        }
+        impl Driver for SlowEnable {
+            fn outputs(&self) -> Vec<OutputInfo> {
+                vec![output("primary", true)]
+            }
+            fn prepare(&self) {}
+            fn set_enabled(&self, enabled: bool) -> bool {
+                if enabled {
+                    let _ = self.entered.send(());
+                    let _ = self.release.recv();
+                }
+                true
+            }
+            fn now(&self) -> Instant {
+                self.start + self.elapsed.get()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.elapsed.set(self.elapsed.get() + duration);
+            }
+        }
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        *shared.vdd_status.lock() = VddStatus::Failed;
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let worker = shared.clone();
+        let attach_thread = std::thread::spawn(move || {
+            let driver = SlowEnable {
+                entered: entered_tx,
+                release: release_rx,
+                start: Instant::now(),
+                elapsed: Cell::new(Duration::ZERO),
+            };
+            attach(&worker, &driver, Duration::ZERO);
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let (done, finished) = std::sync::mpsc::channel();
+        let capture = shared.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(reconcile_virtual_display(
+                &CaptureTarget::VirtualExtended,
+                &capture,
+                generation,
+            ));
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Some(CaptureTarget::PrimaryAuto)
+        );
+        release.send(()).unwrap();
+        attach_thread.join().unwrap();
+        // No output ever appeared: the start failed and is remembered.
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
     }
 }

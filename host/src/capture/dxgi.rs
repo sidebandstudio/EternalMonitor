@@ -16,10 +16,10 @@ use super::recovery::{
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
-    reconcile_virtual_display, recovery_poll, resolve_target, FrameSlot, FrameUse, IdleGate,
-    OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
+    keepalive_allowed, reconcile_virtual_display, recovery_poll, resolve_target, FrameSlot,
+    FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
 };
-use crate::control::SharedControl;
+use crate::control::{CaptureTarget, SharedControl};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -121,6 +121,8 @@ pub fn run_capture_loop(
     let Some(target) = reconcile_virtual_display(&requested_target, &shared, generation) else {
         return Ok(());
     };
+    let second_screen = matches!(&target, CaptureTarget::Output(name)
+        if shared.vdd_output.lock().as_deref() == Some(name.as_str()));
     // DXGI factories snapshot adapters at creation. Enable the driver first,
     // then enumerate and open the chosen output from the same fresh factory.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -414,6 +416,9 @@ pub fn run_capture_loop(
                     }
                     continue;
                 }
+                if !seen_image {
+                    super::second_screen::note_image(&shared, generation);
+                }
                 seen_image = true;
 
                 let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
@@ -532,7 +537,10 @@ pub fn run_capture_loop(
                 // connected, resend the last captured image so the encoder emits the pending IDR
                 // and the stream stays alive. pixel_buf holds the last composited frame (zeroed
                 // black before the first real frame, which is still a valid keyframe).
-                if client_connected(&shared) && last_send.elapsed() >= IDLE_KEEPALIVE {
+                if client_connected(&shared)
+                    && last_send.elapsed() >= IDLE_KEEPALIVE
+                    && keepalive_allowed(seen_image, second_screen)
+                {
                     resend_last_frame(
                         slot,
                         &shared,
@@ -590,7 +598,9 @@ pub fn run_capture_loop(
                             return Ok(());
                         }
                         let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed()) {
+                        if recovery_poll(&shared, now_ms, last_send.elapsed())
+                            && keepalive_allowed(seen_image, second_screen)
+                        {
                             resend_last_frame(
                                 slot,
                                 &shared,

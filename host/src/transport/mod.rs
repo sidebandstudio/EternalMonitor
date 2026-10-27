@@ -663,8 +663,7 @@ async fn execute_actions(
             stats.reset_connection_stats();
         }
         if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
-            let status = *shared.vdd_status.lock();
-            if let Some(reason) = second_screen::remembered_failure(status) {
+            if let Some(reason) = second_screen::remembered_failure(shared) {
                 info!(
                     second_screen_fallback = reason,
                     "Client connected, but the second screen failed to start earlier — \
@@ -712,24 +711,35 @@ async fn execute_actions(
     }
 
     let restart = match second_screen::next_step(shared, Instant::now()) {
-        second_screen::Step::Nothing => None,
+        second_screen::Step::Nothing => false,
         second_screen::Step::Attach => {
             info!(
                 "Client connected with extended display selected — mirroring the primary \
                  display while the virtual display starts"
             );
             second_screen::start(shared.clone());
-            None
+            false
         }
         second_screen::Step::Switch => {
-            Some("Virtual display ready — restarting pipeline to stream it")
+            info!("Virtual display ready — restarting pipeline to stream it");
+            true
         }
         second_screen::Step::Release => {
-            Some("No iPad came back to the virtual display — restarting pipeline to turn it off")
+            info!("No iPad came back to the virtual display — restarting pipeline to turn it off");
+            true
+        }
+        second_screen::Step::Fallback(reason) => {
+            warn!(
+                second_screen_fallback = reason,
+                prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
+                "The virtual display showed no picture — restarting pipeline to mirror the \
+                 primary display instead"
+            );
+            second_screen::turn_off(shared.clone());
+            true
         }
     };
-    if let Some(reason) = restart {
-        info!("{reason}");
+    if restart {
         shared.stop();
         if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
             warn!(error = %error, "Failed to request pipeline restart for the virtual display");
