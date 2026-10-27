@@ -182,19 +182,30 @@ final class ConnectScreenTests: XCTestCase {
         let share = app.navigationBars["UIActivityContentView"]
         // On a cold simulator, Apple's remote share-sheet container can appear
         // before its contents finish loading. Still require the document and
-        // export actions once the remote interface is ready.
+        // export actions once the remote interface is ready. The waits are
+        // long because a loaded simulator is slow, not because speed is
+        // tested here.
         XCTAssertTrue(share.waitForExistence(timeout: 30), app.debugDescription)
-        XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
-        let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
-        XCTAssertTrue(documentType.waitForExistence(timeout: 5))
+        // The header names our file. Once the file's preview has loaded it
+        // shows the title over "Text Document"; while it hasn't, and on a
+        // loaded simulator it can stay that way, it shows the file name,
+        // whose extension names the type.
+        let title = "EternalMonitor-iPad-diagnostics"
+        let header = share.otherElements.matching(NSPredicate(
+            format: "label == %@ OR label == %@", title, "\(title).txt")).firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 30), app.debugDescription)
+        if header.label == title {
+            let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
+            XCTAssertTrue(documentType.waitForExistence(timeout: 30), app.debugDescription)
+        }
         let save = app.cells["Save to Files"]
-        XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(save.waitForExistence(timeout: 30), app.debugDescription)
         XCTAssertTrue(save.isEnabled)
         // Verify our exported attachment and share actions. The Files provider
         // can remain uninitialized on a fresh simulator after its picker opens.
         app.buttons["header.closeButton"].tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
-        waitForExpectations(timeout: 5)
+        waitForExpectations(timeout: 30)
         XCTAssertTrue(app.buttons["diagnostics.export"].isEnabled)
     }
 
