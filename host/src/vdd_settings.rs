@@ -512,12 +512,8 @@ pub fn apply_pin(
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
     let current = std::fs::read_to_string(path)?;
     let named = named_gpu(&current).map_err(invalid)?;
-    let ours = std::fs::read_to_string(record).ok();
-    let ours = ours
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours) {
+    let ours = recorded_pin(record);
+    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours.as_deref()) {
         PinChange::Leave => return Ok(PinOutcome::Unchanged),
         PinChange::Refuse(reason) => return Ok(PinOutcome::Kept(reason)),
         PinChange::Write(card) => (card, PinOutcome::Named),
@@ -530,6 +526,44 @@ pub fn apply_pin(
         (outcome == PinOutcome::Named).then_some(name.as_str()),
     )?;
     replace(path, &updated)?;
+    Ok(outcome)
+}
+
+/// The name this host recorded writing last, if any.
+fn recorded_pin(record: &Path) -> Option<String> {
+    let ours = std::fs::read_to_string(record).ok()?;
+    let ours = ours.trim();
+    (!ours.is_empty()).then(|| ours.to_string())
+}
+
+/// Write the whole settings file at `path` with `modes`, naming `wanted`
+/// under the rules of `pin_change`: a card someone else named stays named
+/// in the new file. A file that is missing or does not read as expected
+/// names no card. `record` holds the name this host wrote last.
+pub fn write_with_pin(
+    path: &Path,
+    record: &Path,
+    owned: bool,
+    modes: &[VddMode],
+    wanted: Option<&str>,
+) -> io::Result<PinOutcome> {
+    let named = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|current| named_gpu(&current).ok().flatten());
+    let ours = recorded_pin(record);
+    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours.as_deref()) {
+        PinChange::Leave => (named, PinOutcome::Unchanged),
+        PinChange::Refuse(reason) => (named, PinOutcome::Kept(reason)),
+        PinChange::Write(card) => (Some(card), PinOutcome::Named),
+        PinChange::Reset => (None, PinOutcome::Reset),
+    };
+    // Recorded first, so a name this host wrote is always one it knows.
+    match outcome {
+        PinOutcome::Named => remember_pin(record, name.as_deref())?,
+        PinOutcome::Reset => remember_pin(record, None)?,
+        _ => {}
+    }
+    write_to(path, modes, name.as_deref())?;
     Ok(outcome)
 }
 
@@ -930,6 +964,73 @@ mod tests {
             ),
             Err("no adapter drives the main screen")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Match the iPad's resolution rewrites the whole file, under the same
+    /// rule: on a driver Setup did not install, a card the user or another
+    /// app named stays named.
+    #[test]
+    fn a_whole_file_rewrite_keeps_a_card_someone_else_named() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let named = || named_gpu(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let modes = default_modes();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const OTHER: &str = "NVIDIA GeForce GTX 1050";
+
+        // No file yet: this host names the card and records it.
+        assert_eq!(
+            write_with_pin(&path, &record, false, &modes, Some(INTEL)).unwrap(),
+            PinOutcome::Named
+        );
+        assert_eq!(named().as_deref(), Some(INTEL));
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), INTEL);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("<width>1920</width>"));
+        // No card to name later: its own name goes, and so does the record.
+        assert_eq!(
+            write_with_pin(&path, &record, false, &modes, None).unwrap(),
+            PinOutcome::Reset
+        );
+        assert_eq!(named(), None);
+        assert!(!record.exists());
+
+        // Someone else's card stays, with or without a card to name.
+        std::fs::write(&path, VENDOR.replace("default", OTHER)).unwrap();
+        let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+        assert_eq!(
+            written.as_ref().unwrap(),
+            &PinOutcome::Kept(NAMED_ELSEWHERE)
+        );
+        assert_eq!(named().as_deref(), Some(OTHER));
+        assert_eq!(pin_result(Ok(INTEL), &written), Err(NAMED_ELSEWHERE));
+        assert_eq!(
+            write_with_pin(&path, &record, false, &modes, None).unwrap(),
+            PinOutcome::Unchanged
+        );
+        assert_eq!(named().as_deref(), Some(OTHER));
+        assert!(!record.exists());
+        // On a driver Setup installed, the main screen's card wins.
+        assert_eq!(
+            write_with_pin(&path, &record, true, &modes, Some(INTEL)).unwrap(),
+            PinOutcome::Named
+        );
+        assert_eq!(named().as_deref(), Some(INTEL));
+
+        // A file that does not read as expected is replaced, naming the card.
+        std::fs::write(&path, "<other/>").unwrap();
+        assert_eq!(
+            write_with_pin(&path, &record, false, &modes, Some(INTEL)).unwrap(),
+            PinOutcome::Named
+        );
+        assert_eq!(named().as_deref(), Some(INTEL));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

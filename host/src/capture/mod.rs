@@ -386,59 +386,42 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
     }
     let gpu = wanted.ok();
     let record = crate::settings::app_data_dir().map(|dir| dir.join(VDD_PIN_RECORD));
-    let matching = crate::settings::SettingsFile::load().vdd_match_resolution;
     let path = std::path::Path::new(VDD_SETTINGS_PATH);
-    let mut mode = None;
-    if matching {
-        let client = shared.session.lock().client_info();
-        let modes = client.map_or_else(crate::vdd_settings::default_modes, |info| {
-            crate::vdd_settings::modes_for_client(
-                info.screen_px.0,
-                info.screen_px.1,
-                info.refresh_hz,
-            )
-        });
-        match crate::vdd_settings::write_to(path, &modes, gpu) {
-            Ok(()) => {
-                info!(
-                    ?modes,
-                    gpu = gpu.unwrap_or("chosen by the driver"),
-                    "Wrote virtual display mode list for the connected client"
-                );
-                mode = modes.first().copied();
-                if let Some(Err(error)) =
-                    record.map(|record| crate::vdd_settings::remember_pin(&record, gpu))
-                {
-                    warn!(%error, "Could not record the graphics card named for the virtual display");
-                }
-            }
-            Err(error) => {
-                warn!(
-                    %error,
-                    "Could not write vdd_settings.xml — driver default modes apply"
-                );
-                return VddRequest {
-                    pin: Err("the settings file could not be written"),
-                    mode,
-                    before,
-                };
-            }
-        }
-        return VddRequest {
-            pin: wanted.map(str::to_string),
-            mode,
-            before,
-        };
-    }
-    // The modes in the file are the user's: change only the card, and only
-    // a name this host may replace.
+    // Change the card only where this host may replace the name.
     let owned = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(crate::vdd_settings::driver_owned))
         .unwrap_or(false);
+    let mut mode = None;
     let applied = match &record {
-        Some(record) => crate::vdd_settings::apply_pin(path, record, owned, gpu),
         None => Err(std::io::Error::other("no app data folder")),
+        Some(record) if crate::settings::SettingsFile::load().vdd_match_resolution => {
+            let client = shared.session.lock().client_info();
+            let modes = client.map_or_else(crate::vdd_settings::default_modes, |info| {
+                crate::vdd_settings::modes_for_client(
+                    info.screen_px.0,
+                    info.screen_px.1,
+                    info.refresh_hz,
+                )
+            });
+            let written = crate::vdd_settings::write_with_pin(path, record, owned, &modes, gpu);
+            match &written {
+                Ok(_) => {
+                    info!(
+                        ?modes,
+                        "Wrote virtual display mode list for the connected client"
+                    );
+                    mode = modes.first().copied();
+                }
+                Err(error) => warn!(
+                    %error,
+                    "Could not write vdd_settings.xml — driver default modes apply"
+                ),
+            }
+            written
+        }
+        // The modes in the file are the user's: change only the card.
+        Some(record) => crate::vdd_settings::apply_pin(path, record, owned, gpu),
     };
     match &applied {
         Ok(crate::vdd_settings::PinOutcome::Named) => info!(
