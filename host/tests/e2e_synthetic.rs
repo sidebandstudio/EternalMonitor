@@ -127,14 +127,8 @@ const WANT_DECODED_FRAMES: usize = 30;
 const DEADLINE: Duration = Duration::from_secs(30);
 /// Frames the host encodes while the USB reader stalls: 500 ms at 60 fps.
 /// Counting frames rather than waiting a fixed time gives every machine the
-/// same backlog to shed. A longer stall let the Windows runner's socket
-/// buffers take its tail without dropping anything, so the newest keyframe
-/// was older than the end of the stall.
+/// same backlog to shed.
 const STALL_FRAMES: u64 = 30;
-/// How far before the end of the stall the recovery keyframe may have been
-/// encoded. The link keeps two frames and asks for a keyframe each time it
-/// drops them, so its newest keyframe is at most three frames old.
-const RECOVERY_SLACK: u32 = 5;
 
 #[test]
 fn usb_framed_stream_end_to_end() {
@@ -213,18 +207,19 @@ fn usb_framed_stream_end_to_end() {
         let mut recovered = false;
         let mut recovery_ms = 0;
         let mut highest_seq = 0;
-        // The last frame read before the stall, and the frames read after it
-        // until the recovery keyframe.
-        let mut stall_seq = 0;
+        // The last whole frame read, the frames read after the stall until
+        // the recovery keyframe, and the first frame captured after it.
+        let mut last_complete = 0;
         let mut stale = 0;
+        let mut live_from = u32::MAX;
+        let mut caught_up = false;
         let mut epoch = ack.stream_config.stream_epoch;
         let encoded = || PIPELINE_STATS.lock().encode_frame_count;
-        while after_recovery < 30 || heartbeats == 0 {
+        while after_recovery < 30 || heartbeats == 0 || !caught_up {
             assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
             if decoded >= 30 && resumed.is_none() {
                 // Stop reading while the host encodes STALL_FRAMES frames.
                 // Reports still go out, so the session stays.
-                stall_seq = highest_seq;
                 let stall_from = encoded();
                 while encoded() < stall_from + STALL_FRAMES {
                     assert!(started.elapsed() < DEADLINE, "the host stopped encoding during the stall");
@@ -240,6 +235,7 @@ fn usb_framed_stream_end_to_end() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 resumed = Some(Instant::now());
+                live_from = PIPELINE_STATS.lock().capture_frame_count as u32;
             }
             if last_report.elapsed() >= Duration::from_millis(300) {
                 last_report = Instant::now();
@@ -266,15 +262,19 @@ fn usb_framed_stream_end_to_end() {
                     if let AddOutcome::Completed(frame) = reassembler.add_fragment(header.frame_seq,
                         header.frag_index, header.frag_count, header.stream_epoch, payload, Instant::now()) {
                         // How old a frame is depends on how fast this machine
-                        // encodes, so freshness is counted in frames: the
-                        // recovery keyframe is one encoded in the last
-                        // frames of the stall, and what is read before it
-                        // was already in the socket buffers, fewer frames
-                        // than the stall made. A link that replayed the
-                        // stall would deliver all of it first.
+                        // encodes, and how much of the stall the socket
+                        // buffers took depends on the OS, so recovery is
+                        // checked by frame numbers. What the socket buffers
+                        // held comes first, in order and fewer frames than
+                        // the stall made. Then frames the link dropped are
+                        // missing, and the stream resumes at a keyframe.
+                        // From there it reaches frames captured after the
+                        // reader resumed. A link that replayed the stall
+                        // would deliver all of it, with no gap.
                         if let Some(resumed) = resumed {
-                            if !recovered && header.is_keyframe
-                                && header.frame_seq + RECOVERY_SLACK >= stall_seq + STALL_FRAMES as u32 {
+                            if !recovered && header.frame_seq > last_complete + 1 {
+                                assert!(header.is_keyframe,
+                                    "USB resumed at frame {} after dropping from {last_complete}, not at a keyframe", header.frame_seq);
                                 recovered = true;
                                 recovery_ms = resumed.elapsed().as_millis();
                             } else if !recovered {
@@ -282,7 +282,9 @@ fn usb_framed_stream_end_to_end() {
                                 assert!(stale < STALL_FRAMES,
                                     "USB replayed the stall: {stale} old frames after it, the last {}", header.frame_seq);
                             }
+                            caught_up |= recovered && header.frame_seq >= live_from;
                         }
+                        last_complete = header.frame_seq;
                         let frames = decoder.decode(&frame);
                         for counter in &frames {
                             assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
