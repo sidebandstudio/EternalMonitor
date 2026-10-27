@@ -9,7 +9,8 @@
 //! for every attempt.
 //!
 //! Now a connecting iPad gets the mirror at once, from the capture generation
-//! already running. One worker thread here turns the display on and off, fed
+//! already running, so the display has up to 30 s to attach. One worker
+//! thread here turns the display on and off, fed
 //! by a queue, so capture never waits for the driver, and the gap between
 //! changes, a start cancelled by a mode change and quitting are decided in
 //! one place. Once the display attaches the transport restarts the pipeline
@@ -71,7 +72,9 @@ const STOPPED_WAIT: Duration = Duration::from_secs(6);
 
 /// How long the attempt after "kept your desktop off it" waits, while the
 /// user picks Extend with Windows key + P or in Settings. The iPad has the
-/// mirror meanwhile, so it stays connected.
+/// mirror meanwhile, so it stays connected. The usual wait is as long, so
+/// this only matters when `ETERNAL_VDD_TIMEOUT_SECS` sets a shorter one; the
+/// two are never added.
 #[cfg(any(windows, test))]
 pub(crate) const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -882,8 +885,11 @@ mod tests {
     /// The iPad's connect timeout in 0.3.1 and 0.3.2: it disconnects when no
     /// frame has decoded this long after the handshake.
     const IPAD_TIMEOUT: Duration = Duration::from_secs(10);
-    /// The 0.3.2 default attach wait after Enable.
-    const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The default attach wait after Enable.
+    const ATTACH_TIMEOUT: Duration =
+        Duration::from_secs(crate::capture::VDD_ATTACH_TIMEOUT_DEFAULT_SECS);
+    /// The attach wait in 0.3.2, now only through `ETERNAL_VDD_TIMEOUT_SECS`.
+    const SHORT_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn secs(seconds: f64) -> Duration {
         Duration::from_secs_f64(seconds)
@@ -1095,7 +1101,14 @@ mod tests {
         let toggles = driver.toggles.borrow().clone();
         assert_eq!(toggles.len(), 2, "{toggles:?}");
         assert_eq!(toggles[0], (secs(8.0), true));
-        assert!(!toggles[1].1 && toggles[1].0 - toggles[0].0 >= MIN_TOGGLE_GAP);
+        let waited = toggles[1].0 - toggles[0].0;
+        assert!(
+            !toggles[1].1 && waited >= ATTACH_TIMEOUT && waited < ATTACH_TIMEOUT + secs(1.0),
+            "{toggles:?}"
+        );
+        assert!(driver
+            .calls()
+            .contains(&Call::Report(Failure::AttachTimeout)));
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
         assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
 
@@ -1127,6 +1140,97 @@ mod tests {
         let now = driver.now();
         assert_eq!(next_step(&shared, now), Step::Switch);
         assert_eq!(next_step(&shared, now), Step::Nothing, "one switch");
+    }
+
+    /// A display that attaches 25 s after its Enable, past 0.3.2's 10 s
+    /// wait: the iPad mirrors throughout, then the stream moves onto it.
+    #[test]
+    fn a_display_that_attaches_after_25_s_still_becomes_the_second_screen() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let steps = RefCell::new(Vec::new());
+        let on_sleep =
+            |elapsed: Duration| steps.borrow_mut().push(next_step(&shared, start + elapsed));
+        let driver = FakeDriver::new(secs(3.0), Some(secs(25.0)), &on_sleep);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert!(steps.borrow().iter().all(|step| *step == Step::Nothing));
+        assert_eq!(driver.calls(), [Call::Prepare, Call::Enable, Call::Settle]);
+        assert!(driver.elapsed.get() < secs(28.0) + secs(0.2));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert_eq!(remembered_failure(&shared), None);
+        assert_eq!(next_step(&shared, driver.now()), Step::Switch);
+    }
+
+    /// Late in the 30 s wait, a mode change still ends the start at the
+    /// next poll and turns the display off, the gap since the Enable long
+    /// past, and quitting ends it leaving the Disable to the quit. Neither
+    /// records a failure.
+    #[test]
+    fn a_mode_change_or_a_quit_late_in_the_wait_ends_it_at_once() {
+        for quit in [false, true] {
+            let shared = second_screen_selected();
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+            let at = secs(3.0 + 25.0);
+            let end = Once::at(at);
+            let on_sleep = |elapsed: Duration| {
+                end.run(elapsed, || {
+                    if quit {
+                        shared.vdd_worker.queue.lock().quitting = true;
+                    } else {
+                        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+                    }
+                })
+            };
+            let driver = FakeDriver::new(secs(3.0), None, &on_sleep);
+            attach(&shared, &driver, ATTACH_TIMEOUT);
+            assert!(end.done.get());
+            let toggles = driver.toggles.borrow().clone();
+            assert_eq!(toggles[0], (secs(3.0), true));
+            if quit {
+                assert_eq!(toggles.len(), 1, "the quit turns it off: {toggles:?}");
+                assert!(driver.elapsed.get() < at + secs(0.2));
+            } else {
+                assert_eq!(toggles.len(), 2, "{toggles:?}");
+                assert!(
+                    !toggles[1].1 && toggles[1].0 < at + secs(0.2),
+                    "{toggles:?}"
+                );
+            }
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+            assert_eq!(remembered_failure(&shared), None);
+        }
+    }
+
+    /// The iPad left 5 s into a start whose display attached at 28 s: the
+    /// display stays on for one grace period from the attach, in case the
+    /// iPad comes back, then a single Release turns it off.
+    #[test]
+    fn a_viewer_gone_during_a_long_start_is_released_a_grace_period_after_the_attach() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let goodbye = Once::at(secs(5.0));
+        let steps = RefCell::new(Vec::new());
+        let on_sleep = |elapsed: Duration| {
+            goodbye.run(elapsed, || disconnect(&shared));
+            steps.borrow_mut().push(next_step(&shared, start + elapsed));
+        };
+        let driver = FakeDriver::new(secs(3.0), Some(secs(25.0)), &on_sleep);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert!(goodbye.done.get());
+        assert!(steps.borrow().iter().all(|step| *step == Step::Nothing));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        let attached = start + driver.elapsed.get();
+        assert_eq!(next_step(&shared, attached), Step::Nothing);
+        assert_eq!(
+            next_step(&shared, attached + RELEASE_GRACE - secs(0.25)),
+            Step::Nothing
+        );
+        assert_eq!(next_step(&shared, attached + RELEASE_GRACE), Step::Release);
     }
 
     #[test]
@@ -1795,6 +1899,70 @@ mod tests {
         assert_eq!(*toggles.lock(), vec![true]);
     }
 
+    /// Never attaches, and its clock stops 20 s into the wait, so the
+    /// worker polls until it is told to quit.
+    struct StuckWaiting {
+        toggles: std::sync::Arc<Mutex<Vec<bool>>>,
+        waiting: std::sync::mpsc::SyncSender<()>,
+        start: Instant,
+        elapsed: Cell<Duration>,
+    }
+
+    impl Driver for StuckWaiting {
+        fn outputs(&self) -> Vec<OutputInfo> {
+            vec![output("primary", true)]
+        }
+        fn prepare(&self, _: &[OutputInfo]) {}
+        fn set_enabled(&self, enabled: bool) -> bool {
+            self.toggles.lock().push(enabled);
+            true
+        }
+        fn now(&self) -> Instant {
+            self.start + self.elapsed.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            if self.elapsed.get() < secs(20.0) {
+                self.elapsed.set(self.elapsed.get() + duration);
+            } else {
+                let _ = self.waiting.try_send(());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Quitting 20 s into the 30 s wait, with the worker thread as the app
+    /// runs it: the worker stops within the quit's join bound and leaves the
+    /// Disable to the quit, and nothing is recorded as failed.
+    #[test]
+    fn quitting_during_a_long_wait_stops_the_worker_in_time() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        let (waiting_tx, waiting) = std::sync::mpsc::sync_channel(1);
+        let toggles = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worker, record, done) = (shared.clone(), toggles.clone(), exited.clone());
+        let handle = std::thread::spawn(move || {
+            let driver = StuckWaiting {
+                toggles: record,
+                waiting: waiting_tx,
+                start: Instant::now(),
+                elapsed: Cell::new(Duration::ZERO),
+            };
+            run(&worker, &driver, ATTACH_TIMEOUT, true);
+            done.store(true, Ordering::SeqCst);
+        });
+        *shared.vdd_worker.thread.lock() = Some(handle);
+        send(&shared, Command::Attach);
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let quit_at = Instant::now();
+        shut_down(&shared);
+        assert!(quit_at.elapsed() < QUIT_JOIN, "{:?}", quit_at.elapsed());
+        assert!(exited.load(Ordering::SeqCst), "the worker stopped");
+        assert_eq!(*toggles.lock(), vec![true]);
+        assert_eq!(remembered_failure(&shared), None);
+    }
+
     /// Review round 2, defect 4: the grace period ended and a capture
     /// generation asked for the display to be turned off, but the worker
     /// acted before the generation published the status. It read `Active`,
@@ -1932,21 +2100,29 @@ mod tests {
 
     /// "Windows added the second screen but kept your desktop off it": the
     /// iPad keeps the mirror, so after Try again the start waits 30 s for
-    /// the user to choose Extend. Any other failure waits the usual time.
+    /// the user to choose Extend, as long as the usual wait and never added
+    /// to it. With a shorter wait set, any other failure waits that.
     #[test]
     fn after_kept_off_the_desktop_the_next_start_waits_for_extend() {
         let on_sleep = |_| {};
-        for (problem, waits) in [
-            (Some(VddProblem::NotExtended), EXTEND_TIMEOUT),
-            (Some(VddProblem::NoDisplay), ATTACH_TIMEOUT),
-            (None, ATTACH_TIMEOUT),
+        assert_eq!(EXTEND_TIMEOUT, ATTACH_TIMEOUT);
+        for (problem, timeout, waits) in [
+            (
+                Some(VddProblem::NotExtended),
+                ATTACH_TIMEOUT,
+                EXTEND_TIMEOUT,
+            ),
+            (Some(VddProblem::NotExtended), SHORT_TIMEOUT, EXTEND_TIMEOUT),
+            (Some(VddProblem::NoDisplay), SHORT_TIMEOUT, SHORT_TIMEOUT),
+            (None, SHORT_TIMEOUT, SHORT_TIMEOUT),
+            (None, ATTACH_TIMEOUT, ATTACH_TIMEOUT),
         ] {
             let shared = second_screen_selected();
             *shared.vdd_problem.lock() = problem;
             connect_viewer(&shared);
             assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
             let driver = FakeDriver::new(secs(3.0), None, &on_sleep);
-            attach(&shared, &driver, ATTACH_TIMEOUT);
+            attach(&shared, &driver, timeout);
             let toggles = driver.toggles.borrow().clone();
             let waited = toggles[1].0 - toggles[0].0;
             assert!(

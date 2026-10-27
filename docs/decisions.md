@@ -129,9 +129,10 @@ triggers via `schtasks`, avoiding a per-toggle UAC prompt.
   driver: one worker thread makes every change, in order, and quitting stops
   it before its final Disable. The iPad gives up 10 s after
   the handshake without a frame, which a slow Enable task plus the attach wait
-  could exceed. A start that fails is remembered until the user clicks Try
-  again, restarts the stream or changes the mode, so reconnects mirror
-  instead of toggling the driver again. The host changes the driver at most
+  could exceed. With the mirror showing meanwhile, the display has 30 s to
+  attach after the Enable instead of 10 s. A start that fails is remembered
+  until the user clicks Try again, restarts the stream or changes the mode,
+  so reconnects mirror instead of toggling the driver again. The host changes the driver at most
   once per 10 s on its own.
 - Before enabling, the host writes `vdd_settings.xml` so the virtual
   display offers the iPad's native landscape resolution and refresh. There
