@@ -17,8 +17,11 @@
 //! onto it, and the second screen must deliver a real image within
 //! [`PROVE_TIMEOUT`] of that switch, across any restarts meanwhile;
 //! otherwise the stream goes back to the mirror. A start that failed is
-//! remembered: later connections stay on the mirror until the user clicks
-//! Try again, restarts the stream, or changes the mode.
+//! remembered, across app runs too ([`memory`]): later connections stay on
+//! the mirror until the wait after it ends, the user clicks Try again,
+//! restarts the stream, or changes the mode.
+
+mod memory;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,6 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
+use memory::{Hold, Memory};
 
 #[cfg(any(windows, test))]
 use super::{wait_for_virtual_output, AttachResult, OutputInfo};
@@ -124,6 +128,8 @@ pub(crate) struct State {
     proving: Option<Proving>,
     /// Why the second screen last failed, for the log and the backend.
     failure: Option<&'static str>,
+    /// The failure saved for later app runs.
+    memory: Memory,
 }
 
 impl State {
@@ -135,9 +141,16 @@ impl State {
         now: Instant,
     ) -> Step {
         if !selected {
+            if self.memory.forget() {
+                tracing::info!(
+                    "Another mode was chosen — the second screen is tried afresh when it is \
+                     chosen again"
+                );
+            }
             *self = State {
                 last_toggle: self.last_toggle,
                 attaching: self.attaching,
+                memory: std::mem::take(&mut self.memory),
                 ..State::default()
             };
             return Step::Nothing;
@@ -147,6 +160,12 @@ impl State {
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
+                if let Some(hold) = self.memory.hold(now) {
+                    *status = VddStatus::Failed;
+                    self.failure = Some(hold.reason);
+                    log_hold(hold);
+                    return Step::Nothing;
+                }
                 *status = VddStatus::Attaching;
                 self.attaching = true;
                 Step::Attach
@@ -189,10 +208,25 @@ impl State {
             last_toggle: self.last_toggle,
             attaching: self.attaching,
             failure: Some(reason),
+            memory: std::mem::take(&mut self.memory),
             ..State::default()
         };
         *status = VddStatus::Failed;
+        self.remember(reason, now);
         Some(reason)
+    }
+
+    /// Save the failure for later connections and app runs.
+    fn remember(&mut self, reason: &'static str, now: Instant) {
+        if let Some(hold) = self.memory.note_failure(reason, now) {
+            tracing::info!(
+                reason,
+                failures = hold.failures,
+                retry_in_s = hold.retry_in.as_secs(),
+                "Remembering that the second screen failed on this PC — Second screen sessions \
+                 mirror until it is tried again"
+            );
+        }
     }
 
     /// Whether a capture generation with no viewer should leave an attached
@@ -245,6 +279,75 @@ pub(crate) fn proving(shared: &SharedControl) -> bool {
     shared.second_screen.lock().proving.is_some()
 }
 
+/// The one log line for a connection that mirrors because the second screen
+/// failed on this PC before. Diagnostics count `second_screen_fallback=remembered`.
+fn log_hold(hold: Hold) {
+    tracing::info!(
+        second_screen_fallback = "remembered",
+        reason = hold.reason,
+        failures = hold.failures,
+        retry_in_s = hold.retry_in.as_secs(),
+        "The second screen failed on this PC before — mirroring the primary display until it \
+         is tried again later, or the user clicks Try again"
+    );
+}
+
+/// Read the failure an earlier app run saved, for this PC as it is now.
+#[cfg(windows)]
+pub fn load_memory(shared: &SharedControl) {
+    let Some(dir) = crate::settings::app_data_dir() else {
+        return;
+    };
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let memory = Memory::load(
+        dir.join(memory::FILE_NAME),
+        memory::Fingerprint::current(),
+        wall,
+        Instant::now(),
+    );
+    shared.second_screen.lock().memory = memory;
+}
+
+/// A new iPad session in Second screen mode. After a failed start it says
+/// why the iPad gets the mirror, or tries again once the wait after a saved
+/// failure is over.
+pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
+    let mut status = shared.vdd_status.lock();
+    let mut state = shared.second_screen.lock();
+    if *status == VddStatus::Failed && state.memory.saved() {
+        match state.memory.hold(now) {
+            Some(hold) => log_hold(hold),
+            None => {
+                tracing::info!(
+                    reason = state.failure.unwrap_or("attach_timeout"),
+                    "Client connected, and the wait after the second screen failed is over — \
+                     trying it again"
+                );
+                *status = VddStatus::WaitingForClient;
+                state.failure = None;
+            }
+        }
+        return;
+    }
+    drop((state, status));
+    if let Some(reason) = remembered_failure(shared) {
+        tracing::info!(
+            second_screen_fallback = reason,
+            "Client connected, but the second screen failed to start earlier — \
+             mirroring the primary display until the user clicks Try again"
+        );
+    }
+}
+
+/// Whether the host tries the failed second screen again by itself later.
+pub(crate) fn retries_later(shared: &SharedControl) -> bool {
+    let status = *shared.vdd_status.lock();
+    status == VddStatus::Failed && shared.second_screen.lock().memory.saved()
+}
+
 /// Why connections mirror instead of extending, after a failed start. The
 /// value appears as `second_screen_fallback=` in the log, which the
 /// diagnostics upload sends as is.
@@ -259,10 +362,14 @@ pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str>
 }
 
 /// The user asked to try again: a failed start, or one whose thread is gone,
-/// is tried once more at the next connection.
+/// is tried once more at the next connection, and a saved failure is
+/// forgotten.
 pub(crate) fn retry(shared: &SharedControl) {
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
+    if state.memory.forget() {
+        tracing::info!("Try again — the second screen is tried afresh at the next connection");
+    }
     let stale = *status == VddStatus::Attaching && !state.attaching;
     if stale || matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
         *status = VddStatus::WaitingForClient;
@@ -320,6 +427,9 @@ pub fn note_image(shared: &SharedControl, generation: u64) {
             after_ms = proving.since.elapsed().as_millis() as u64,
             "Second screen captured its first image — streaming it"
         );
+        if state.memory.forget() {
+            tracing::info!("The second screen works on this PC again — forgetting its failure");
+        }
     }
 }
 
@@ -718,7 +828,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             disable(shared, driver);
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
-            shared.second_screen.lock().failure = Some("attach_timeout");
+            let mut state = shared.second_screen.lock();
+            state.failure = Some("attach_timeout");
+            state.remember("attach_timeout", driver.now());
         }
     }
 }
