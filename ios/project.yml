@@ -35,6 +35,9 @@ targets:
         CURRENT_PROJECT_VERSION: "8"
         DEVELOPMENT_TEAM: "9X79V37Q89"
         CODE_SIGN_STYLE: Automatic
+        # Empty except in the TestFlight upload, which signs manually with the
+        # App Store profile (scripts/testflight-local.sh).
+        PROVISIONING_PROFILE_SPECIFIER: "$(ETERNAL_PROFILE_SPECIFIER)"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
       configs:
