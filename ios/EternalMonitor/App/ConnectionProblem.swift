@@ -246,43 +246,59 @@ enum ConnectionProblem: Equatable {
     private static let offline: Set<POSIXErrorCode> = [.ENETDOWN]
 }
 
-/// Connect attempts in a row that timed out at one PC without a picture.
-/// A PC on 0.3.1 or 0.3.2 in Second screen mode answers, then can take
-/// longer than this iPad waits to send its first picture, and every new
-/// attempt restarts its second screen. Over the cable the PC connects again
-/// by itself a second later, so without a limit the attempts never end and
-/// the PC's screen blinks with each one.
+/// Connect attempts in a row that one PC answered and that ended without a
+/// picture. A PC on 0.3.1 or 0.3.2 in Second screen mode answers, then can
+/// take longer than this iPad waits to send its first picture, and every new
+/// attempt restarts its second screen; on 0.3.1 that restart also closes the
+/// cable a few seconds in. Over the cable the PC connects again by itself a
+/// second later, so without a limit the attempts never end and the PC's
+/// screen blinks with each one.
 struct NoPictureStreak: Equatable {
-    /// Attempts that start by themselves stop at this many no-picture
-    /// timeouts. One more attempt lets a PC that was only slow the first
+    /// Attempts that start by themselves stop at this many attempts without
+    /// a picture. One more attempt lets a PC that was only slow the first
     /// time (a busy PC, a second screen that starts once) show its picture;
-    /// a second timeout means it fails the same way every time.
+    /// a second one means it fails the same way every time.
     static let limit = 2
 
-    /// The PC as "address:port", or "USB:9877" for the cable.
-    private(set) var target: String?
+    /// The PC that answered: the name it gave when it answered, or its
+    /// address if it gave none.
+    private(set) var pc: String?
+    /// Where that PC last answered, as "address:port"; nil over the cable,
+    /// which doesn't say which PC is at its other end.
+    private(set) var address: String?
     private(set) var timeouts = 0
-    /// The PC answered at least once in this series.
-    private(set) var answered = false
+    /// That PC answered and sent no picture in this series.
+    private(set) var answeredWithoutPicture = false
 
     var stopsReconnecting: Bool { timeouts >= Self.limit }
 
-    /// Counts an attempt at `target` that timed out with `problem`, and
-    /// returns the problem to show. A PC that answered earlier in the series
-    /// and is silent now is most likely restarting EternalMonitor, so it
-    /// keeps the advice about the picture.
-    mutating func timedOut(_ problem: ConnectionProblem, target: String) -> ConnectionProblem {
-        if target != self.target {
+    /// The PC `name` answered at `address` (nil over the cable). Another PC
+    /// starts a new series.
+    mutating func answered(by name: String, at address: String?) {
+        let pc = name.isEmpty ? address ?? "USB" : name
+        if pc != self.pc {
             self = NoPictureStreak()
-            self.target = target
+            self.pc = pc
         }
+        self.address = address
+    }
+
+    /// The attempt the PC answered ended without a picture: the timeout
+    /// fired, or the PC closed the connection first.
+    mutating func endedWithoutPicture() {
+        guard pc != nil else { return }
+        timeouts += 1
+        answeredWithoutPicture = true
+    }
+
+    /// The problem to show for a timeout at `address` (nil over the cable).
+    /// A PC that answered there earlier in the series and is silent now is
+    /// most likely restarting EternalMonitor, so it keeps the advice about
+    /// the picture.
+    func shown(_ problem: ConnectionProblem, at address: String?) -> ConnectionProblem {
         switch problem {
-        case .noPicture:
-            answered = true
-            timeouts += 1
-            return problem
-        case .noReply, .routerAddress:
-            return answered ? .noPicture : problem
+        case .noReply(usb: false), .routerAddress:
+            return answeredWithoutPicture && address != nil && address == self.address ? .noPicture : problem
         default:
             return problem
         }
