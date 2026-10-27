@@ -1179,7 +1179,16 @@ fn lossy_stream_recovers_and_adapts() {
     let mut nack_trace = Vec::new();
     let mut recovery_sequences = Vec::new();
     let mut bytes = [0; 2048];
-    while started.elapsed() < Duration::from_secs(15) {
+    // Fifteen seconds of stream, and on a slow machine as long as it takes
+    // to send the 600 packets that make it a sustained one, up to a minute.
+    let sent_so_far = || {
+        eternal_host::stats::PIPELINE_STATS
+            .lock()
+            .transport_packets_sent
+    };
+    while started.elapsed() < Duration::from_secs(15)
+        || (started.elapsed() < Duration::from_secs(60) && sent_so_far() < 600)
+    {
         #[cfg(target_os = "macos")]
         {
             use std::os::fd::AsRawFd;
