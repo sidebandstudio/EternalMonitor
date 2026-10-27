@@ -120,7 +120,7 @@ try {
     Expect-Enable 0 'no monitor yet'
     $global:EMVddTestState.Enabled = @{Problem=0; Status='OK'; Monitor='Error'}
     Expect-Enable 0 'monitor not ready yet'
-    if ((& $toggle -Action enable) -notmatch 'no monitor arrived yet') { throw 'A device without a monitor yet was not reported' }
+    if (((& $toggle -Action enable) -join ' ') -notmatch 'no monitor arrived yet') { throw 'A device without a monitor yet was not reported' }
 
     # No waiting: one check after Enable-PnpDevice, whatever it finds.
     $global:EMVddTestState.Calls = @()
