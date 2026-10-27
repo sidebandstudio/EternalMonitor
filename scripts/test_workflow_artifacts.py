@@ -47,6 +47,16 @@ class WorkflowArtifactsTest(unittest.TestCase):
                             self.assertIn(path, scanned)
         self.assertGreaterEqual(uploads, 5)
 
+    def test_testflight_review_runs_only_for_tags_and_manual_runs(self):
+        text = (WORKFLOWS / "testflight.yml").read_text()
+        review = next(job for job, _ in jobs(text) if job.startswith("  review:"))
+        condition = re.search(r"(?m)^    if: >-\n((?:^      .*\n)+)", review)
+        self.assertTrue(condition, "the review job needs a job-level if")
+        condition = " ".join(condition[1].split())
+        self.assertEqual(condition, "github.event_name == 'workflow_dispatch' || "
+                                    "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))")
+        self.assertIn("    needs: archive\n", review)
+
 
 if __name__ == "__main__":
     unittest.main()

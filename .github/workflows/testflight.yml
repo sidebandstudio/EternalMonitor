@@ -90,11 +90,15 @@ jobs:
           PY
 
   # Its own job, so "Re-run failed jobs" retries the review without uploading
-  # the same build number again, which App Store Connect refuses. Pull
-  # requests and dry runs record SKIPPED.
+  # the same build number again, which App Store Connect refuses. Only tag
+  # pushes and manual runs review, so pull requests never get the ASC
+  # secrets here; a manual run without them records SKIPPED.
   review:
     name: External TestFlight review
     needs: archive
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

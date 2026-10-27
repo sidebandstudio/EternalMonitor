@@ -121,7 +121,8 @@ the en-US "What to Test" from `ios/TESTFLIGHT_NOTES.md`, adds the build to
 every external group of the newest approved build and submits it for Beta App
 Review. If that build is in no external group, the new build joins none and
 is not submitted; `review.json` then says `NO_EXTERNAL_GROUP`. The job's
-`EternalMonitor-iPad-review-*` artifact holds `review.json`.
+`EternalMonitor-iPad-review-*` artifact holds `review.json`. Pull request runs
+skip the job.
 
 If only the review failed, choose **Re-run failed jobs** on the run, or re-run
 just the **External TestFlight review** job. That retries the review alone, and
