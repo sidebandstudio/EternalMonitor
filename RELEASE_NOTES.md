@@ -1,7 +1,8 @@
 ## EternalMonitor v0.3.3
 
-Released October 27, 2026. Install the Windows and iPad 0.3.3 updates together;
-each still works with the other app on 0.3.1 or 0.3.2.
+Released October 27, 2026. Install the Windows and iPad versions listed on
+eternalmonitor.dev/download.html. These versions work together even when their
+version numbers differ: each 0.3.3 app still works with the other on 0.3.1 or 0.3.2.
 
 This release fixes **Second screen** on PCs where it didn't start, most often
 laptops with Intel and NVIDIA graphics. The iPad then said **Your PC answered,

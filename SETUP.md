@@ -24,8 +24,8 @@ iPad. Then you connect them over Wi-Fi or with a USB cable.
   so on older Windows 10 connect over Wi-Fi. To see your version, open
   **Settings**, **System**, **About**.
 
-Both apps must come from the same version of EternalMonitor. If you update
-one, update the other.
+Install the Windows and iPad versions listed on eternalmonitor.dev/download.html.
+These versions work together even when their version numbers differ.
 
 ## Step 1: Install EternalMonitor on your PC
 

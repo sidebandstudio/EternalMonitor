@@ -72,8 +72,9 @@ the MIT license, and needs no account.
 | **Windows** | Windows 10 version 1809 or later, or Windows 11, 64-bit, with NVIDIA, AMD or Intel graphics | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) (v0.3.3 current stable) |
 | **iPad** | iPadOS 17 or later | [TestFlight v0.3.2, build 316](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
-Install both apps from the same version. The older v0.1 releases use a different
-protocol and cannot connect to the v0.3 iPad app.
+Install the Windows and iPad versions listed on eternalmonitor.dev/download.html.
+These versions work together even when their version numbers differ. The older
+v0.1 releases use a different protocol and cannot connect to the v0.3 iPad app.
 
 Testing it? Send bugs and feedback through the [form on the download page](https://eternalmonitor.dev/download.html#feedback),
 which emails hello@sideband.studio, or open a [GitHub issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose).
