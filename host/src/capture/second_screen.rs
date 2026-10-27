@@ -256,8 +256,9 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
 
 /// Turn the display on beside the mirror. Returns at once.
 pub(crate) fn start(shared: SharedControl) {
+    // Unit tests never reach the installed driver tasks.
     #[cfg(windows)]
-    if !super::synthetic_requested() {
+    if !cfg!(test) && !super::synthetic_requested() {
         let worker = shared.clone();
         let spawned = std::thread::Builder::new()
             .name("second-screen".into())
@@ -293,8 +294,9 @@ pub(crate) fn start(shared: SharedControl) {
 /// Turn the display off on its own thread, so capture never waits for the
 /// driver. Returns at once.
 pub(crate) fn turn_off(shared: SharedControl) {
+    // Unit tests never reach the installed driver tasks.
     #[cfg(windows)]
-    if !super::synthetic_requested() {
+    if !cfg!(test) && !super::synthetic_requested() {
         let worker = shared.clone();
         let spawned = std::thread::Builder::new()
             .name("second-screen-off".into())
