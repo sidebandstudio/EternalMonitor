@@ -125,10 +125,12 @@ const SYNTH_W: u32 = 640;
 const SYNTH_H: u32 = 360;
 const WANT_DECODED_FRAMES: usize = 30;
 const DEADLINE: Duration = Duration::from_secs(30);
-/// Frames the host encodes while the USB reader stalls: 1 s at 60 fps.
+/// Frames the host encodes while the USB reader stalls: 500 ms at 60 fps.
 /// Counting frames rather than waiting a fixed time gives every machine the
-/// same backlog to shed.
-const STALL_FRAMES: u64 = 60;
+/// same backlog to shed. A longer stall let the Windows runner's socket
+/// buffers take its tail without dropping anything, so the newest keyframe
+/// was older than the end of the stall.
+const STALL_FRAMES: u64 = 30;
 /// How far before the end of the stall the recovery keyframe may have been
 /// encoded. The link keeps two frames and asks for a keyframe each time it
 /// drops them, so its newest keyframe is at most three frames old.
@@ -266,10 +268,10 @@ fn usb_framed_stream_end_to_end() {
                         // How old a frame is depends on how fast this machine
                         // encodes, so freshness is counted in frames: the
                         // recovery keyframe is one encoded in the last
-                        // frames of the stall, and everything read before it
-                        // was already in the two 32 KiB socket buffers. A
-                        // link that replayed the stall would deliver all of
-                        // it first.
+                        // frames of the stall, and what is read before it
+                        // was already in the socket buffers, fewer frames
+                        // than the stall made. A link that replayed the
+                        // stall would deliver all of it first.
                         if let Some(resumed) = resumed {
                             if !recovered && header.is_keyframe
                                 && header.frame_seq + RECOVERY_SLACK >= stall_seq + STALL_FRAMES as u32 {
@@ -277,7 +279,7 @@ fn usb_framed_stream_end_to_end() {
                                 recovery_ms = resumed.elapsed().as_millis();
                             } else if !recovered {
                                 stale += 1;
-                                assert!(stale < STALL_FRAMES / 2,
+                                assert!(stale < STALL_FRAMES,
                                     "USB replayed the stall: {stale} old frames after it, the last {}", header.frame_seq);
                             }
                         }
