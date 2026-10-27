@@ -477,7 +477,9 @@ final class USBLinkFailureTests: XCTestCase {
                 if fails { injectFramingFailure() } else { XCTAssertEqual(shutdown(peer, SHUT_WR), 0) }
                 try await until("attempt \(attempt) ends") { manager.state == .disconnected }
                 if attempt < NoPictureStreak.limit {
-                    XCTAssertEqual(manager.reconnectAttempt, 1, "one attempt without a picture falls back as before, \(ending)")
+                    try await until("one attempt without a picture falls back as before, \(ending)") {
+                        manager.reconnectAttempt == 1
+                    }
                 }
             }
             XCTAssertEqual(manager.problem, .noPicture, ending)
