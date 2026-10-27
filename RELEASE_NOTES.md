@@ -1,52 +1,66 @@
-## Next Windows release
+## EternalMonitor v0.3.3
 
-Not released yet.
+Released October 27, 2026. Install the Windows and iPad 0.3.3 updates together;
+each still works with the other app on 0.3.1 or 0.3.2.
 
-- When the second screen doesn't appear, the Windows Stream page says why and
-  what to do: the display driver isn't installed (run Setup again), Windows
-  couldn't verify the driver's signature, the driver stopped with an error
-  (with the Windows code: restart, then run Setup again), or the driver ran but
-  Windows added no screen. When Windows adds the screen but keeps the desktop
-  off it, the page says to choose Extend with Windows key + P or in Display
-  settings, and the next try waits 30 seconds for it. EternalMonitor does not
-  change the display layout itself. The display task no longer reports success
-  when the driver is missing or stopped with an error. After any failed attempt the support
-  diagnostics and **Copy logs** hold a display snapshot: the device state, the
-  graphics cards and the display paths Windows reports. The snapshot leaves out
-  the PC's name and the user's name; the rest of the log still contains them.
-  Before, every case read "no display appeared in time".
-- The second screen has 30 seconds to appear instead of 10, while the iPad
-  shows the mirror. On some PCs Windows adds it only after more than 10 seconds,
-  and those connections stayed on the mirror.
-- The second screen is drawn by the graphics card that drives the main screen,
-  whether or not **Match the iPad's resolution** is on. Before, the driver
-  chose the card with the most memory, which on laptops with Intel and NVIDIA
-  graphics drives no screen; in 0.3.1 diagnostics none of those laptops got the
-  second screen. A card Windows lists twice under one name, as on some
-  laptops, is still named when only its first listing drives a screen; when
-  two cards with one name could, the driver still chooses. When another app
-  installed the driver and the user or that app named a card, EternalMonitor
-  leaves that name alone. The log records which card the driver used.
-- The second screen comes up at the iPad's resolution. Windows restores the
-  size it last saved for the second screen, and in 0.3.1 diagnostics 4 of the 5
-  PCs whose second screen appeared got a tiny, blurry 800×600 one. EternalMonitor
-  now sets the second screen's size itself, and only that display's: the
-  iPad's size, the sharpest size that fits when the driver doesn't offer it, or
-  1920×1080 while the iPad's size isn't known. The log records the size once.
-- A PC set to **Mirror my screen** shows the first picture without waiting for
-  the virtual display to be turned off at startup. A slow or stuck display task
-  held it for up to 19 s in 0.3.1, and about 2 s on a healthy PC.
-- Settings says that **Match the iPad's resolution** applies the next time the
-  second screen starts, when the iPad connects again. Before, changing it
-  seemed to do nothing.
-- Running EternalMonitor-Setup.exe again repairs a virtual display driver that
-  Setup installed when none of its devices works, for example after the device
-  was removed in Device Manager. Working devices are never removed, and a
-  driver another app installed is left alone with a message saying so. Before,
-  Setup kept the existing driver and stopped with "Windows did not finish
-  installing the virtual display driver".
-- Support diagnostics name Windows 11 from the build number. Windows 11 keeps
-  "Windows 10" in the registry, which earlier versions reported as the system.
+This release fixes **Second screen** on PCs where it didn't start, most often
+laptops with Intel and NVIDIA graphics. The iPad then said **Your PC answered,
+but no picture arrived**, and over USB the PC's screen blinked and Windows
+played its connect and disconnect sounds every few seconds until the cable was
+unplugged. Choosing **Mirror my screen** on the PC was the way around it.
+
+### What changed
+
+- The iPad shows the PC's main screen as soon as it connects, while the second
+  screen starts. Once Windows adds it, the PC switches to it; if it shows no
+  picture within 5 seconds, the iPad goes back to the mirror. Windows now gets
+  up to 30 seconds to add it, not 10; if it never does, the mirror stays. Either way the PC says the second screen
+  didn't start, and later connections mirror until you click **Try again**,
+  restart the stream or change the mode.
+- The PC turns the second screen on or off at most once every 10 seconds and
+  keeps it on for 10 seconds after the iPad leaves, so a quick reconnect reuses
+  it. The screen no longer blinks in a loop.
+- The PC tries to start the second screen on the graphics card that drives the
+  main screen. Before, the driver chose the card with the most memory, which on
+  Intel + NVIDIA laptops drives no screen. This should help those laptops; if
+  the second screen still doesn't start, **Mirror my screen** works. The driver
+  still chooses when two cards share a name, when the PC can't write the
+  driver's settings, or when another app installed the driver and chose a card.
+- With **Match the iPad's resolution** on, as it is by default, the second
+  screen starts at the iPad's resolution instead of a small, blurry 800×600.
+  When the driver doesn't offer that size, it uses the largest one that fits.
+- When the second screen doesn't appear, the PC's Stream page says why and what
+  to do: run Setup again, restart the PC, or choose Extend with Windows key + P.
+  Running Setup again repairs a display driver Setup installed whose device
+  was removed or stopped working.
+- The first picture arrives sooner on NVIDIA and Intel graphics, especially on
+  a still second screen. **Mirror my screen** no longer waits
+  for the second screen to turn off at startup.
+- After two attempts in a row where the PC answered but sent no picture, the
+  iPad stops reconnecting and says to choose **Mirror my screen** on the PC
+  (**Main display (mirror)** in 0.3.1). **Try again** starts over. This also
+  ends the blinking with PCs still on 0.3.1 or 0.3.2.
+- The iPad shows a **Support ID** in Settings > Diagnostics, with **Copy
+  Support ID**, and feedback emails include it. PC Settings says **Match the
+  iPad's resolution** applies the next time the second screen starts.
+- After a failed attempt, the support diagnostics and **Copy logs** hold a
+  display snapshot: why the second screen didn't start, and the graphics cards
+  and displays Windows reports. The snapshot leaves out the PC's name and the
+  user's name; the rest of the log still contains them. Diagnostics name
+  Windows 11 correctly.
+
+### What to test
+
+On a laptop with Intel and NVIDIA graphics, choose **Second screen** and connect
+the iPad over Wi-Fi, then over USB. The PC's screen should appear at once, then
+the second screen a few seconds later, at the iPad's resolution (or the largest
+size that fits) while **Match the iPad's resolution** is on. If the second
+screen doesn't come up, the iPad should keep the PC's screen with no blinking or
+connect sounds, and the PC should say why. Send the PC's **Copy logs** text with
+the time; it includes the PC's name.
+
+With the iPad on 0.3.3 and a PC on 0.3.2 whose second screen fails, the iPad
+should stop after two tries and say to choose **Mirror my screen**.
 
 ## EternalMonitor v0.3.2
 
