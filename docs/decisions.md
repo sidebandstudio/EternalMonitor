@@ -122,7 +122,10 @@ triggers via `schtasks`, avoiding a per-toggle UAC prompt.
   startup, panic, and 10 s after client loss (the v2 liveness signal finally
   made idle teardown possible; the grace period lets a quick reconnect keep it).
 - The iPad mirrors the primary display while the virtual display starts, and
-  the stream restarts onto it once it attaches. The iPad gives up 10 s after
+  the stream restarts onto it once it attaches. That capture must deliver a
+  real image within 5 s; a display that fails to duplicate or only times out
+  goes back to the mirror and counts as a failed start. Capture never waits
+  for the driver: separate threads turn the display on and off. The iPad gives up 10 s after
   the handshake without a frame, which a slow Enable task plus the attach wait
   could exceed. A start that fails is remembered until the user clicks Try
   again, restarts the stream or changes the mode, so reconnects mirror
