@@ -732,8 +732,8 @@ impl EncoderState {
     }
 
     /// Capture time and number of the frame in `self.packet`. An encoder
-    /// with output delay (NVENC holds one frame) returns an earlier frame
-    /// than the one just submitted.
+    /// with output delay (a hardware encoder can hold frames) returns an
+    /// earlier frame than the one just submitted.
     fn packet_origin(&mut self, just_submitted: (Instant, u64)) -> (Instant, u64) {
         self.in_flight
             .take(self.packet.pts())
@@ -906,6 +906,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("profile", "baseline");
             opts.set("zerolatency", "1");
             opts.set("rc", "cbr");
+            set_nvenc_keyframe_options(&mut opts);
         }
         "h264_amf" => {
             opts.set("usage", "lowlatency");
@@ -936,6 +937,8 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("preset", "veryfast");
             opts.set("profile", "baseline");
             opts.set("look_ahead", "0");
+            // Like NVENC, QSV makes a requested keyframe a plain I-frame.
+            opts.set("forced_idr", "1");
         }
         "libx264" => {
             opts.set("preset", "ultrafast");
@@ -950,6 +953,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("tune", "ll");
             opts.set("zerolatency", "1");
             opts.set("rc", "cbr");
+            set_nvenc_keyframe_options(&mut opts);
         }
         "hevc_amf" => {
             opts.set("usage", "lowlatency");
@@ -962,6 +966,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         }
         "hevc_qsv" => {
             opts.set("preset", "veryfast");
+            opts.set("forced_idr", "1");
         }
         "hevc_videotoolbox" => {
             opts.set("realtime", "1");
@@ -976,6 +981,18 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         }
     }
     opts
+}
+
+/// A new viewer, or one back within the second screen's grace period, can
+/// start only from an IDR. NVENC made a requested keyframe a plain I-frame,
+/// which the transport never starts a session from, so the viewer waited
+/// for the GOP's next IDR: up to 0.5 s at 60 fps, but up to 22 s on a static
+/// second screen resent at 1.3 fps, past the iPad's 10 s. NVENC also held
+/// each frame back two frames, another 1.5 s at that rate; without the delay
+/// it returns each frame as it is encoded.
+fn set_nvenc_keyframe_options(opts: &mut ffmpeg_next::Dictionary<'_>) {
+    opts.set("forced-idr", "1");
+    opts.set("delay", "0");
 }
 
 fn prepare_frame_for_encode(
@@ -1505,6 +1522,125 @@ mod tests {
         let mut second = open();
         let labels = run(&mut second, 480..490, false);
         assert_eq!(labels, (480..490).map(|n| (at(n), n)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn nvenc_and_qsv_make_a_requested_keyframe_an_idr() {
+        for (name, option) in [
+            ("h264_nvenc", "forced-idr"),
+            ("hevc_nvenc", "forced-idr"),
+            ("h264_qsv", "forced_idr"),
+            ("hevc_qsv", "forced_idr"),
+        ] {
+            assert_eq!(encoder_options(name).get(option), Some("1"), "{name}");
+        }
+        for name in ["h264_nvenc", "hevc_nvenc"] {
+            assert_eq!(encoder_options(name).get("delay"), Some("0"), "{name}");
+        }
+    }
+
+    /// Encodes frame `n` as the encode loop does, and returns each packet
+    /// that came out: whether the transport takes it as a keyframe, and the
+    /// capture time and number of its frame.
+    fn encode(
+        state: &mut EncoderState,
+        n: u64,
+        captured: Instant,
+        force_idr: bool,
+    ) -> Vec<(bool, Instant, u64)> {
+        let pts = state.next_pts(captured, n);
+        state.frame.set_pts(Some(pts));
+        prepare_frame_for_encode(
+            &mut state.frame,
+            n,
+            &state.opened_encoder,
+            &mut 0,
+            force_idr,
+        );
+        state.send_frame(pts, captured, n).unwrap();
+        let mut packets = Vec::new();
+        while state.encoder.receive_packet(&mut state.packet).is_ok() {
+            if state.h264.needs_parameter_sets() {
+                state
+                    .h264
+                    .refresh_parameter_sets_from_extradata(encoder_extradata(&state.encoder));
+            }
+            let packet_is_key = state.packet.is_key();
+            let (_, info) = normalize_h264_payload_with_info(
+                state.packet.data().unwrap_or_default(),
+                packet_is_key,
+                &mut state.h264,
+                &state.opened_encoder,
+            );
+            let is_keyframe = info.is_keyframe(packet_is_key, &state.opened_encoder);
+            let (origin, sequence) = state.packet_origin((captured, n));
+            packets.push((is_keyframe, origin, sequence));
+        }
+        packets
+    }
+
+    /// A viewer back within the second screen's grace period finds the
+    /// encoder in the middle of a GOP, and a static second screen resends
+    /// its picture every 750 ms. NVENC answered the session's keyframe
+    /// request with an I-frame the transport cannot start a session from,
+    /// so the first picture waited for the GOP's next IDR, 30 frames on:
+    /// 22 s, and the iPad gave up after 10. Runs each encoder that opens
+    /// here: NVENC on an NVIDIA PC, libx264 everywhere.
+    #[test]
+    fn a_viewer_back_mid_gop_starts_from_the_keyframe_it_asked_for() {
+        use crate::transport::{first_frame_gate, FirstFrame};
+        use std::time::Duration;
+        ffmpeg_next::init().unwrap();
+        let start = Instant::now();
+        let mut tested = Vec::new();
+        for name in ["h264_nvenc", "h264_qsv", "libx264"] {
+            let Ok(mut state) =
+                EncoderState::new(name, 1280, 720, 8_000_000, 60, EncoderInput::Yuv420)
+            else {
+                continue;
+            };
+            tested.push(name);
+            // The last viewer watched 40 frames at 60 fps and left.
+            for n in 0..40 {
+                encode(
+                    &mut state,
+                    n,
+                    start + Duration::from_micros(n * 16_667),
+                    n == 0,
+                );
+            }
+            // It comes back 5 s later; its session asks for a keyframe.
+            let back = start + Duration::from_secs(5);
+            let mut force_idr = true;
+            let mut first = None;
+            'frames: for n in 40..60 {
+                let captured = back + Duration::from_millis(10 + (n - 40) * 750);
+                for (is_keyframe, origin, sequence) in
+                    encode(&mut state, n, captured, std::mem::take(&mut force_idr))
+                {
+                    match first_frame_gate(is_keyframe, origin, Some(back)) {
+                        FirstFrame::Send => {
+                            first = Some((n, sequence));
+                            break 'frames;
+                        }
+                        FirstFrame::Skip => {}
+                        FirstFrame::SkipAndRequestKeyframe => force_idr = true,
+                    }
+                }
+            }
+            // The requested frame itself opens the session; NVENC returns
+            // it at once, with no frames held back.
+            let (submitted, sequence) =
+                first.unwrap_or_else(|| panic!("{name}: no frame could open the session"));
+            assert_eq!(sequence, 40, "{name}: the session opened on a later frame");
+            let held = if name == "h264_nvenc" { 0 } else { 2 };
+            assert!(
+                submitted - 40 <= held,
+                "{name}: frame 40 came out after frame {submitted}"
+            );
+        }
+        eprintln!("encoders tested: {tested:?}");
+        assert!(tested.contains(&"libx264"));
     }
 
     #[test]
