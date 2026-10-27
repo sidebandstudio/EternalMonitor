@@ -351,7 +351,11 @@ pub(crate) fn send(shared: &SharedControl, command: Command) {
     }
     shared.vdd_worker.wake.notify_one();
     // Unit tests run the queue themselves, with a fake driver.
-    #[cfg(all(windows, not(test)))]
+    #[cfg(windows)]
+    if cfg!(test) {
+        return;
+    }
+    #[cfg(windows)]
     if let Err(error) = spawn_worker(shared) {
         warn!(%error, "Could not start the virtual display worker");
         shared.vdd_worker.queue.lock().commands.clear();
@@ -399,7 +403,7 @@ fn fail_start(shared: &SharedControl, reason: &'static str) {
     state.failure = Some(reason);
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(windows)]
 fn spawn_worker(shared: &SharedControl) -> std::io::Result<()> {
     let mut thread = shared.vdd_worker.thread.lock();
     if thread.is_none() {

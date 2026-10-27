@@ -124,8 +124,10 @@ triggers via `schtasks`, avoiding a per-toggle UAC prompt.
 - The iPad mirrors the primary display while the virtual display starts, and
   the stream restarts onto it once it attaches. That capture must deliver a
   real image within 5 s; a display that fails to duplicate or only times out
-  goes back to the mirror and counts as a failed start. Capture never waits
-  for the driver: separate threads turn the display on and off. The iPad gives up 10 s after
+  goes back to the mirror and counts as a failed start. The 5 s run from the
+  switch, across any pipeline restart meanwhile. Capture never waits for the
+  driver: one worker thread makes every change, in order, and quitting stops
+  it before its final Disable. The iPad gives up 10 s after
   the handshake without a frame, which a slow Enable task plus the attach wait
   could exceed. A start that fails is remembered until the user clicks Try
   again, restarts the stream or changes the mode, so reconnects mirror
