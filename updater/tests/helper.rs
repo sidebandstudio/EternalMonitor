@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use eternal_updater::{sha256_hex, HelperArgs, READY};
@@ -12,6 +12,13 @@ use eternal_updater::{sha256_hex, HelperArgs, READY};
 struct Case {
     dir: PathBuf,
     args: HelperArgs,
+    host: Child,
+}
+
+impl Drop for Case {
+    fn drop(&mut self) {
+        close(&mut self.host);
+    }
 }
 
 fn script(path: &Path, body: &str) {
@@ -31,34 +38,36 @@ fn case(name: &str, installer: &str) -> Case {
         &format!("echo relaunched > '{}'", dir.join("relaunched").display()),
     );
     let sha256 = sha256_hex(&mut std::fs::File::open(&setup).unwrap()).unwrap();
+    let host = open_host();
     Case {
         args: HelperArgs {
             installer: setup,
             sha256,
             app,
             app_args: Vec::new(),
-            // A host that closes on its own shortly after the helper starts.
-            host_pid: closing_host(),
+            host_pid: host.id(),
             log: dir.join("update.log"),
         },
         dir,
+        host,
     }
 }
 
-/// A stand-in host that exits a moment after the helper opens it.
-fn closing_host() -> u32 {
-    let child = Command::new("sleep").arg("0.5").spawn().unwrap();
-    let pid = child.id();
-    // Reap it in the background so it doesn't linger as a zombie.
-    std::thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-    });
-    pid
+/// A stand-in host that stays open until the test closes it, as the real
+/// host does once the helper says it is ready. A host that closed on a timer
+/// could close before a slow machine had even started the helper.
+fn open_host() -> Child {
+    Command::new("sleep").arg("600").spawn().unwrap()
 }
 
-/// Starts the helper, returns its first line and exit code.
-fn run(case: &Case) -> (String, i32) {
+fn close(host: &mut Child) {
+    let _ = host.kill();
+    let _ = host.wait();
+}
+
+/// Starts the helper, returns its first line and exit code. Once the helper
+/// says it is ready, the host closes.
+fn run(case: &mut Case) -> (String, i32) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_eternal-updater"))
         .args(case.args.to_args())
         .stdout(Stdio::piped())
@@ -68,13 +77,18 @@ fn run(case: &Case) -> (String, i32) {
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
+    if line.trim() == READY {
+        close(&mut case.host);
+    }
     let code = child.wait().unwrap().code().unwrap();
     (line.trim().to_string(), code)
 }
 
-fn wait_for(path: &Path) -> bool {
+/// Whether `path` appears within `wait`. The relaunched app writes it on its
+/// own after the helper exits.
+fn appears(path: &Path, wait: Duration) -> bool {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < wait {
         if path.exists() {
             return true;
         }
@@ -85,22 +99,22 @@ fn wait_for(path: &Path) -> bool {
 
 #[test]
 fn verified_setup_runs_silently_then_the_app_starts() {
-    let c = case("ok", "echo \"$@\" > \"$(dirname \"$0\")/setup-args\"");
-    assert_eq!(run(&c), (READY.to_string(), 0));
+    let mut c = case("ok", "echo \"$@\" > \"$(dirname \"$0\")/setup-args\"");
+    assert_eq!(run(&mut c), (READY.to_string(), 0));
     let args = std::fs::read_to_string(c.dir.join("setup-args")).unwrap();
     for flag in eternal_updater::SETUP_FLAGS {
         assert!(args.contains(flag), "{flag} in {args}");
     }
-    assert!(wait_for(&c.dir.join("relaunched")));
+    assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
     let log = std::fs::read_to_string(&c.args.log).unwrap();
     assert!(log.contains("Setup exit code 0"), "{log}");
 }
 
 #[test]
 fn a_changed_installer_is_refused_before_ready() {
-    let c = case("swapped", "touch \"$(dirname \"$0\")/ran\"");
+    let mut c = case("swapped", "touch \"$(dirname \"$0\")/ran\"");
     std::fs::write(&c.args.installer, "#!/bin/sh\ntouch ran-evil\n").unwrap();
-    let (line, code) = run(&c);
+    let (line, code) = run(&mut c);
     assert!(
         line.starts_with("error:") && line.contains("SHA-256"),
         "{line}"
@@ -108,16 +122,16 @@ fn a_changed_installer_is_refused_before_ready() {
     assert_eq!(code, 3);
     assert!(!c.dir.join("ran").exists());
     // The host is still open, so the helper must not start a second copy.
-    assert!(!wait_for(&c.dir.join("relaunched")));
+    assert!(!appears(&c.dir.join("relaunched"), Duration::from_secs(5)));
 }
 
 #[test]
 fn a_setup_that_cannot_start_still_brings_the_app_back() {
-    let c = case("unrunnable", "exit 0");
+    let mut c = case("unrunnable", "exit 0");
     // Verified bytes, but not executable: spawning Setup fails after ready.
     std::fs::set_permissions(&c.args.installer, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(run(&c), (READY.to_string(), 0));
-    assert!(wait_for(&c.dir.join("relaunched")));
+    assert_eq!(run(&mut c), (READY.to_string(), 0));
+    assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
     let log = std::fs::read_to_string(&c.args.log).unwrap();
     assert!(log.contains("Setup did not run"), "{log}");
 }
@@ -126,7 +140,7 @@ fn a_setup_that_cannot_start_still_brings_the_app_back() {
 fn a_host_that_is_already_gone_is_refused_before_ready() {
     let mut c = case("gone", "touch \"$(dirname \"$0\")/ran\"");
     c.args.host_pid = 999_999;
-    let (line, code) = run(&c);
+    let (line, code) = run(&mut c);
     assert!(line.starts_with("error:"), "{line}");
     assert_eq!(code, 3);
     assert!(!c.dir.join("ran").exists());
@@ -134,9 +148,9 @@ fn a_host_that_is_already_gone_is_refused_before_ready() {
 
 #[test]
 fn a_failing_setup_still_brings_the_app_back() {
-    let c = case("fails", "exit 7");
-    assert_eq!(run(&c), (READY.to_string(), 0));
-    assert!(wait_for(&c.dir.join("relaunched")));
+    let mut c = case("fails", "exit 7");
+    assert_eq!(run(&mut c), (READY.to_string(), 0));
+    assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
     assert!(std::fs::read_to_string(&c.args.log)
         .unwrap()
         .contains("Setup exit code 7"));

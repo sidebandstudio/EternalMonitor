@@ -29,24 +29,44 @@ fn paths() -> Option<(PathBuf, PathBuf)> {
 /// quit with it.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The time the lock wait and the record retries read and sleep on, so
+/// tests can pause it.
+trait Clock {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&self, duration: std::time::Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
 /// Wait for the driver lock, calling `waiting` meanwhile. A lock that cannot
 /// be opened, or is still held after [`LOCK_WAIT`], does not stop the driver
 /// change, as a record that cannot be written does not.
-fn hold(lock: &Path, waiting: impl FnMut()) -> Option<super::lock::Locked> {
-    hold_for(lock, LOCK_WAIT, waiting)
+fn hold(clock: &impl Clock, lock: &Path, waiting: impl FnMut()) -> Option<super::lock::Locked> {
+    hold_for(clock, lock, LOCK_WAIT, waiting)
 }
 
 fn hold_for(
+    clock: &impl Clock,
     lock: &Path,
     wait: std::time::Duration,
     mut waiting: impl FnMut(),
 ) -> Option<super::lock::Locked> {
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = clock.now() + wait;
     loop {
         match super::lock::try_lock(lock) {
             Ok(locked) => return Some(locked),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
+                if clock.now() >= deadline {
                     tracing::warn!(
                         waited_ms = wait.as_millis() as u64,
                         "Another process held the virtual display driver lock; changing the driver without it"
@@ -54,7 +74,7 @@ fn hold_for(
                     return None;
                 }
                 waiting();
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                clock.sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
                 tracing::warn!(%error, "Could not lock the virtual display driver");
@@ -79,10 +99,21 @@ fn change_at<P: FnMut()>(
     path: &Path,
     lock: &Path,
     enabled: bool,
+    progress: P,
+    run: impl FnOnce(P) -> bool,
+) -> bool {
+    change_on(&SystemClock, path, lock, enabled, progress, run)
+}
+
+fn change_on<P: FnMut()>(
+    clock: &impl Clock,
+    path: &Path,
+    lock: &Path,
+    enabled: bool,
     mut progress: P,
     run: impl FnOnce(P) -> bool,
 ) -> bool {
-    let _driver = hold(lock, &mut progress);
+    let _driver = hold(clock, lock, &mut progress);
     if enabled {
         if let Err(error) = record(path, ProcessId::current()) {
             tracing::warn!(%error, "Could not record the virtual display's owner");
@@ -101,7 +132,7 @@ fn change_at<P: FnMut()>(
 fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
     let temp = path.with_extension(format!("{owner}.tmp"));
     fs::write(&temp, owner.to_string())?;
-    let replaced = with_retries(|| fs::rename(&temp, path));
+    let replaced = with_retries(&SystemClock, || fs::rename(&temp, path));
     if replaced.is_err() {
         let _ = fs::remove_file(&temp);
     }
@@ -111,13 +142,13 @@ fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
 /// A reporter holds the record open for a moment while it checks and deletes
 /// it. Where Windows cannot replace an open file (FAT volumes), the replace
 /// fails meanwhile; try again for a few milliseconds.
-fn with_retries(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+fn with_retries(clock: &impl Clock, mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut tries = 1;
     loop {
         match attempt() {
             Err(_) if tries < 10 => {
                 tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                clock.sleep(std::time::Duration::from_millis(2));
             }
             result => return result,
         }
@@ -168,7 +199,7 @@ fn disable_for_ended_at(
     // Again just before the driver changes: the process scan takes a while,
     // and a replacement host may have started or turned the display on. From
     // here a host that turns it on waits until the turn-off is done.
-    let _driver = hold(lock, || {});
+    let _driver = hold(&SystemClock, lock, || {});
     check(&mut other_host)?;
     let done = disable();
     if done {
@@ -540,14 +571,46 @@ mod tests {
         fs::remove_file(lock).unwrap();
     }
 
+    /// A clock that moves only when the code under test sleeps, so a wait's
+    /// length does not depend on how fast the machine runs.
+    struct PausedClock {
+        start: std::time::Instant,
+        elapsed: std::cell::Cell<std::time::Duration>,
+    }
+
+    impl PausedClock {
+        fn new() -> Self {
+            Self {
+                start: std::time::Instant::now(),
+                elapsed: std::cell::Cell::new(std::time::Duration::ZERO),
+            }
+        }
+
+        fn elapsed(&self) -> std::time::Duration {
+            self.elapsed.get()
+        }
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> std::time::Instant {
+            self.start + self.elapsed.get()
+        }
+
+        fn sleep(&self, duration: std::time::Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
     #[test]
     fn a_driver_lock_held_too_long_does_not_stop_the_change() {
         let lock = owner_file("held-lock");
         let held = super::super::lock::try_lock(&lock).unwrap();
-        let started = std::time::Instant::now();
+        let clock = PausedClock::new();
         let mut waits = 0;
-        let got = hold_for(&lock, std::time::Duration::from_millis(300), || waits += 1);
-        let waited = started.elapsed();
+        let got = hold_for(&clock, &lock, std::time::Duration::from_millis(300), || {
+            waits += 1
+        });
+        let waited = clock.elapsed();
         assert!(got.is_none(), "took a lock another holder has");
         assert!(waits > 0, "never reported the wait");
         assert!(
@@ -557,7 +620,9 @@ mod tests {
         );
         // Once the holder lets go, the lock is taken at once.
         drop(held);
-        assert!(hold_for(&lock, std::time::Duration::from_millis(300), || {}).is_some());
+        let clock = PausedClock::new();
+        assert!(hold_for(&clock, &lock, std::time::Duration::from_millis(300), || {}).is_some());
+        assert_eq!(clock.elapsed(), std::time::Duration::ZERO);
         assert_eq!(LOCK_WAIT, std::time::Duration::from_secs(5));
         fs::remove_file(lock).unwrap();
     }
@@ -568,9 +633,10 @@ mod tests {
         let lock = owner_file("hung-holder-lock");
         // Another process stuck in its own driver change.
         let _hung = super::super::lock::try_lock(&lock).unwrap();
-        let started = std::time::Instant::now();
+        let clock = PausedClock::new();
         let mut ran = false;
-        assert!(change_at(
+        assert!(change_on(
+            &clock,
             &path,
             &lock,
             false,
@@ -580,7 +646,7 @@ mod tests {
                 true
             }
         ));
-        let waited = started.elapsed();
+        let waited = clock.elapsed();
         assert!(ran, "the Disable never ran");
         assert!(
             waited >= LOCK_WAIT && waited < LOCK_WAIT + std::time::Duration::from_secs(2),
@@ -951,9 +1017,9 @@ mod tests {
 
     #[test]
     fn writing_a_record_tries_again_for_a_few_milliseconds() {
+        let clock = PausedClock::new();
         let mut failures = 3;
-        let started = std::time::Instant::now();
-        assert!(with_retries(|| {
+        assert!(with_retries(&clock, || {
             if failures == 0 {
                 Ok(())
             } else {
@@ -963,13 +1029,13 @@ mod tests {
         })
         .is_ok());
         let mut attempts = 0;
-        let result = with_retries(|| {
+        let result = with_retries(&clock, || {
             attempts += 1;
             Err(io::ErrorKind::PermissionDenied.into())
         });
         assert!(result.is_err());
         assert_eq!(attempts, 10);
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(clock.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[cfg(windows)]
