@@ -880,7 +880,7 @@ mod tests {
         }
     }
 
-    /// Joy's 0.3.2 log and the 0.3.1 field data: the display never attaches,
+    /// A 0.3.2 log and the 0.3.1 field data: the display never attaches,
     /// the iPad sends its goodbye at 10 s, and USB dials again 1 s later.
     /// Here no transport step restarts the pipeline while the display
     /// starts, so the running generation keeps mirroring to the iPad, with
