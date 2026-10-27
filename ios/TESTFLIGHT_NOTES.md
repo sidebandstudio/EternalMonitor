@@ -11,12 +11,12 @@ unplugged. Choosing **Mirror my screen** on the PC was the way around it.
 
 ### What changed
 
-- The iPad shows the PC's main screen as soon as it connects and keeps showing
-  it while the second screen starts. Once Windows adds the second screen, the
-  PC switches to it; if it shows no picture within 5 seconds, the iPad goes
-  back to the mirror. If Windows never adds it, the mirror stays. Either way
-  the PC says the second screen didn't start, and later connections mirror
-  until you click **Try again**, restart the stream or change the mode.
+- The iPad shows the PC's main screen as soon as it connects, while the second
+  screen starts. Once Windows adds it, the PC switches to it; if it shows no
+  picture within 5 seconds, the iPad goes back to the mirror. Windows now gets
+  up to 30 seconds to add it, not 10; if it never does, the mirror stays. Either way the PC says the second screen
+  didn't start, and later connections mirror until you click **Try again**,
+  restart the stream or change the mode.
 - The PC turns the second screen on or off at most once every 10 seconds and
   keeps it on for 10 seconds after the iPad leaves, so a quick reconnect reuses
   it. The screen no longer blinks in a loop.
@@ -31,10 +31,10 @@ unplugged. Choosing **Mirror my screen** on the PC was the way around it.
   When the driver doesn't offer that size, it uses the largest one that fits.
 - When the second screen doesn't appear, the PC's Stream page says why and what
   to do: run Setup again, restart the PC, or choose Extend with Windows key + P.
-  Running EternalMonitor-Setup.exe again repairs a display driver Setup
-  installed whose device was removed or stopped working.
-- The first picture arrives sooner on NVIDIA and Intel graphics, most of all
-  when the second screen isn't changing. **Mirror my screen** no longer waits
+  Running Setup again repairs a display driver Setup installed whose device
+  was removed or stopped working.
+- The first picture arrives sooner on NVIDIA and Intel graphics, especially on
+  a still second screen. **Mirror my screen** no longer waits
   for the second screen to turn off at startup.
 - After two attempts in a row where the PC answered but sent no picture, the
   iPad stops reconnecting and says to choose **Mirror my screen** on the PC

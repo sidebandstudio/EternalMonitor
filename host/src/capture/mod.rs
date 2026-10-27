@@ -259,9 +259,11 @@ pub(crate) fn resolve_target(
 }
 
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
-/// via `ETERNAL_VDD_TIMEOUT_SECS` for machines whose driver loads slowly.
-#[cfg(windows)]
-const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 10;
+/// via `ETERNAL_VDD_TIMEOUT_SECS`. The iPad mirrors meanwhile, so a longer wait costs the user
+/// nothing; it was 10 s while the iPad gave up 10 s after connecting, and on some PCs the
+/// display attaches only after that.
+#[cfg(any(windows, test))]
+const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 30;
 #[cfg(any(windows, test))]
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
@@ -1051,11 +1053,11 @@ mod tests {
         let before = vec!["primary".to_string(), "physical-secondary".to_string()];
         let result = wait_for_virtual_output(
             &before,
-            Duration::from_secs(10),
+            Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS),
             || {
                 startup_heartbeat(&shared, 1_000 + elapsed.get().as_millis() as u64);
                 let mut outputs = vec![out("primary", 0, 0), out("physical-secondary", 1920, 0)];
-                if elapsed.get() >= Duration::from_secs(6) {
+                if elapsed.get() >= Duration::from_secs(25) {
                     outputs.push(out("virtual", -1920, 0));
                 }
                 Some(outputs)
@@ -1094,20 +1096,21 @@ mod tests {
     fn virtual_attach_timeout_stays_bounded_and_cancellation_wins() {
         let start = Instant::now();
         let elapsed = Cell::new(Duration::ZERO);
+        let timeout = Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS);
         let result = wait_for_virtual_output(
             &[],
-            Duration::from_secs(10),
+            timeout,
             || Some(Vec::new()),
             || start + elapsed.get(),
             |duration| elapsed.set(elapsed.get() + duration),
         );
         assert!(matches!(result, AttachResult::TimedOut));
-        assert!(elapsed.get() < Duration::from_secs(10) + VDD_POLL_INTERVAL);
+        assert!(elapsed.get() >= timeout && elapsed.get() < timeout + VDD_POLL_INTERVAL);
 
         let cancelled_at = Cell::new(false);
         let result = wait_for_virtual_output(
             &[],
-            Duration::from_secs(10),
+            timeout,
             || {
                 if cancelled_at.get() {
                     None

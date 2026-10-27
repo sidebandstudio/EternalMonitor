@@ -238,7 +238,7 @@ streaming system test on every pull request.
 | `ETERNAL_AUDIO` | `synthetic` selects the deterministic audio test source |
 | `ETERNAL_HEADLESS` | `1` runs without the window; Ctrl+C shuts down cleanly |
 | `ETERNAL_ABR` | `0` disables adaptive bitrate |
-| `ETERNAL_VDD_TIMEOUT_SECS` | How long to wait for the virtual display to attach |
+| `ETERNAL_VDD_TIMEOUT_SECS` | How long to wait for the virtual display to attach (default 30) |
 | `ETERNAL_AMF_DIAG` | `1` writes AMF bitstream diagnostics |
 | `ETERNAL_LEGACY_PTS` | `1` restores the old frame-counter timestamps |
 | `ETERNAL_DROP`, `ETERNAL_REORDER`, `ETERNAL_JITTER_MS` | Test only: inject loss, reordering or jitter |
