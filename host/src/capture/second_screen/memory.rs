@@ -101,10 +101,16 @@ impl Fingerprint {
     }
 }
 
-/// The saved file.
+/// The saved file. Without a failure it says there is none, for when the
+/// file could not be removed.
+#[derive(Debug, Serialize, Deserialize)]
+struct File {
+    format: u32,
+    failure: Option<Record>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
-    format: u32,
     fingerprint: Fingerprint,
     reason: String,
     /// Consecutive failed attempts with this fingerprint.
@@ -196,15 +202,22 @@ impl Memory {
 
     fn wall(&self, now: Instant) -> Option<u64> {
         let store = self.store.as_ref()?;
-        Some(store.wall + now.saturating_duration_since(store.since).as_secs())
+        Some(
+            store
+                .wall
+                .saturating_add(now.saturating_duration_since(store.since).as_secs()),
+        )
     }
 
     /// The saved failure, while its wait lasts. A clock set back before the
-    /// failure tries again rather than waiting longer.
+    /// failure, or a time past the end of the clock, tries again rather than
+    /// waiting longer.
     pub(crate) fn hold(&self, now: Instant) -> Option<Hold> {
         let failed = self.failed?;
         let wall = self.wall(now)?;
-        let retry_at = failed.failed_at + backoff(failed.failures).as_secs();
+        let retry_at = failed
+            .failed_at
+            .checked_add(backoff(failed.failures).as_secs())?;
         (failed.failed_at..retry_at).contains(&wall).then(|| Hold {
             reason: failed.reason,
             failures: failed.failures,
@@ -226,13 +239,12 @@ impl Memory {
         let failures = self.failed.map_or(0, |f| f.failures).saturating_add(1);
         write(
             &store.path,
-            &Record {
-                format: FORMAT,
+            Some(Record {
                 fingerprint: store.fingerprint.clone(),
                 reason: reason.to_string(),
                 failures,
                 failed_at,
-            },
+            }),
         );
         self.failed = Some(Failed {
             reason,
@@ -242,13 +254,17 @@ impl Memory {
         self.hold(now)
     }
 
-    /// Forget the saved failure. Whether there was one.
+    /// Forget the saved failure. Whether there was one. A file that can't
+    /// be removed (another program holds it) is replaced by one that says
+    /// there is no failure, so the next app run doesn't hold either.
     pub(crate) fn forget(&mut self) -> bool {
         if self.failed.take().is_none() {
             return false;
         }
         if let Some(store) = &self.store {
-            remove(&store.path);
+            if !remove(&store.path) {
+                write(&store.path, None);
+            }
         }
         true
     }
@@ -263,8 +279,8 @@ fn remembered(reason: &str) -> Option<&'static str> {
     REMEMBERED.into_iter().find(|known| *known == reason)
 }
 
-/// The saved record and its reason. `Ok(None)` without a file; an error for
-/// one that cannot be used.
+/// The saved record and its reason. `Ok(None)` without a file or without a
+/// failure in it; an error for one that cannot be used.
 #[cfg(any(windows, test))]
 fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
     let data = match std::fs::read(path) {
@@ -272,10 +288,13 @@ fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    let record: Record = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
-    if record.format != FORMAT {
-        return Err(format!("format {}", record.format));
+    let file: File = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
+    if file.format != FORMAT {
+        return Err(format!("format {}", file.format));
     }
+    let Some(record) = file.failure else {
+        return Ok(None);
+    };
     if record.failures == 0 {
         return Err("no failures".to_string());
     }
@@ -285,11 +304,15 @@ fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
 
 /// Replace the file at once, as the settings file is: a crash leaves the old
 /// record or the new one.
-fn write(path: &Path, record: &Record) {
+fn write(path: &Path, failure: Option<Record>) {
+    let file = File {
+        format: FORMAT,
+        failure,
+    };
     let saved = path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| serde_json::to_vec_pretty(record).map_err(std::io::Error::other))
+        .and_then(|()| serde_json::to_vec_pretty(&file).map_err(std::io::Error::other))
         .and_then(|data| {
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path))
@@ -299,12 +322,14 @@ fn write(path: &Path, record: &Record) {
     }
 }
 
-fn remove(path: &Path) {
+/// Whether the file is gone.
+fn remove(path: &Path) -> bool {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             warn!(%error, "Could not remove the second screen record");
+            false
         }
-        _ => {}
+        _ => true,
     }
 }
 
@@ -447,9 +472,12 @@ mod tests {
         let driver = NeverAttaches::new(start);
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
-        assert_eq!(saved(&path)["reason"], "attach_timeout");
-        assert_eq!(saved(&path)["failures"], 1);
-        assert_eq!(saved(&path)["fingerprint"]["display_driver"], "25.7.23");
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+        assert_eq!(
+            saved(&path)["failure"]["fingerprint"]["display_driver"],
+            "25.7.23"
+        );
         assert!(retries_later(&shared));
 
         // The next app run, ten minutes later.
@@ -483,7 +511,7 @@ mod tests {
         let driver = NeverAttaches::new(later);
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert_eq!(driver.enables.get(), 1);
-        assert_eq!(saved(&path)["failures"], 2);
+        assert_eq!(saved(&path)["failure"]["failures"], 2);
         let hold = shared.second_screen.lock().memory.hold(driver.now());
         assert_eq!(hold.map(|h| h.retry_in), Some(hours(6)));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -503,7 +531,7 @@ mod tests {
             next_step(&shared, start + PROVE_TIMEOUT),
             Step::Fallback("no_frames")
         );
-        assert_eq!(saved(&path)["reason"], "no_frames");
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
 
         // An app run two hours later is past the hour: it tries, and this
         // time the picture comes.
@@ -617,10 +645,12 @@ mod tests {
         let record = |format: u32, reason: &str, failures: u32| {
             serde_json::json!({
                 "format": format,
-                "fingerprint": laptop(),
-                "reason": reason,
-                "failures": failures,
-                "failed_at": T0,
+                "failure": {
+                    "fingerprint": laptop(),
+                    "reason": reason,
+                    "failures": failures,
+                    "failed_at": T0,
+                },
             })
             .to_string()
         };
@@ -631,12 +661,20 @@ mod tests {
             "[]".to_string(),
             "null".to_string(),
             r#"{"format":1}"#.to_string(),
-            // An older layout without a fingerprint.
+            // Older layouts: without a fingerprint, and the flat one.
             r#"{"reason":"attach_timeout","failed_at":1800000000}"#.to_string(),
+            serde_json::json!({
+                "format": 1,
+                "fingerprint": laptop(),
+                "reason": "attach_timeout",
+                "failures": 1,
+                "failed_at": T0,
+            })
+            .to_string(),
             record(2, "attach_timeout", 1),
             record(1, "enable_failed", 1),
             record(1, "attach_timeout", 0),
-            r#"{"format":1,"fingerprint":{"app":7},"reason":"no_frames","failures":1,"failed_at":1}"#
+            r#"{"format":1,"failure":{"fingerprint":{"app":7},"reason":"no_frames","failures":1,"failed_at":1}}"#
                 .to_string(),
         ];
         for content in contents {
@@ -646,7 +684,6 @@ mod tests {
             let (mut memory, start) = app_run(&path, Duration::ZERO);
             assert_eq!(memory.hold(start), None, "{content}");
             assert!(!memory.saved(), "{content}");
-            assert!(!path.exists(), "{content}");
             // The next failure is saved as usual.
             memory.note_failure("no_frames", start).unwrap();
             let (reloaded, at) = app_run(&path, Duration::from_secs(1));
@@ -661,6 +698,96 @@ mod tests {
         std::fs::write(&path, record(1, "attach_timeout", 3)).unwrap();
         let (memory, start) = app_run(&path, Duration::ZERO);
         assert_eq!(memory.hold(start).map(|h| h.failures), Some(3));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Review round 1: a PC that works, waking to the lock screen (or a UAC
+    /// prompt) during the picture check, mirrored for an hour at the next
+    /// app run. A failure Windows' desktop explains is only for this run.
+    #[test]
+    fn a_blocked_desktop_falls_back_for_this_app_run_only() {
+        use crate::capture::recovery::{passing_error, CaptureBlock, CaptureUnavailable};
+        for reason in ["duplication_failed", "no_frames"] {
+            let path = temp_file("blocked");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Attach);
+            note_attached(&shared, "virtual".to_string());
+            assert_eq!(next_step(&shared, start), Step::Switch);
+            start_proving(&shared, 1, start);
+            // What the capture stage does with the lock screen's error, or
+            // with an ACCESS_LOST it keeps retrying.
+            let error: Box<dyn std::error::Error + Send + Sync> = Box::new(CaptureUnavailable {
+                block: CaptureBlock::SecureDesktop,
+                detail: String::new(),
+            });
+            assert!(passing_error(error.as_ref()));
+            super::super::note_interruption(&shared, 1);
+            if reason == "duplication_failed" {
+                super::super::note_capture_error(&shared, 1);
+            }
+            assert_eq!(
+                next_step(&shared, start + PROVE_TIMEOUT),
+                Step::Fallback(reason)
+            );
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+            assert!(!path.exists(), "{reason}: nothing saved");
+            assert!(!retries_later(&shared));
+            // This app run keeps mirroring until Try again, as in 0.3.3.
+            let later = start + hours(2);
+            reconnect(&shared, later);
+            assert_eq!(next_step(&shared, later), Step::Nothing);
+            // The next one tries at once.
+            let (memory, start) = app_run(&path, Duration::from_secs(60));
+            assert!(!memory.saved());
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Attach, "{reason}");
+        }
+    }
+
+    /// Review round 1: a success whose file could not be removed left the
+    /// failure for the next app run. The file then says there is none.
+    #[test]
+    fn a_cleared_record_loads_as_none() {
+        let path = temp_file("cleared");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("no_frames", start).unwrap();
+        write(&path, None);
+        let (memory, start) = app_run(&path, Duration::from_secs(60));
+        assert_eq!(memory.hold(start), None);
+        assert!(!memory.saved());
+        assert!(path.exists(), "a cleared file is not unreadable");
+        assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Review round 1: a corrupt time near the end of the clock overflowed.
+    #[test]
+    fn a_failure_at_the_end_of_the_clock_tries_again() {
+        let path = temp_file("overflow");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for failed_at in [u64::MAX, u64::MAX - 10] {
+            let file = serde_json::json!({
+                "format": 1,
+                "failure": {
+                    "fingerprint": laptop(),
+                    "reason": "attach_timeout",
+                    "failures": u32::MAX,
+                    "failed_at": failed_at,
+                },
+            });
+            std::fs::write(&path, file.to_string()).unwrap();
+            let start = Instant::now();
+            let mut memory = Memory::load(path.clone(), laptop(), u64::MAX - 5, start);
+            assert!(memory.saved());
+            assert_eq!(memory.hold(start), None);
+            assert_eq!(memory.hold(start + hours(1_000_000)), None);
+            let hold = memory.note_failure("attach_timeout", start + hours(1));
+            assert_eq!(hold, None, "the count saturates, the wait can't end");
+            assert_eq!(saved(&path)["failure"]["failures"], u32::MAX);
+        }
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

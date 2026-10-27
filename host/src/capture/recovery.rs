@@ -45,6 +45,27 @@ impl CaptureBlock {
     }
 }
 
+/// Errors a GPU reset or a display change raises while it lasts:
+/// DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET and _ACCESS_LOST.
+#[cfg(windows)]
+const PASSING_ERRORS: [u32; 4] = [0x887A_0005, 0x887A_0006, 0x887A_0007, 0x887A_0026];
+
+/// Whether a capture error comes from a state of Windows that passes (a
+/// secure screen, a display or mode change, a GPU reset, another capturing
+/// app, a disconnected session) rather than from the display itself. Such a
+/// second screen failure is not remembered for later app runs. A display
+/// Windows will not duplicate from this GPU is the PC's.
+pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() {
+        return unavailable.block != CaptureBlock::UnsupportedOnThisGpu;
+    }
+    #[cfg(windows)]
+    if let Some(error) = error.downcast_ref::<windows::core::Error>() {
+        return PASSING_ERRORS.contains(&(error.code().0 as u32));
+    }
+    false
+}
+
 /// The capture loop could not get at the desktop for a reason outside the
 /// app's control. The stage retries instead of failing the pipeline.
 #[derive(Debug)]
@@ -253,6 +274,29 @@ mod tests {
             Some(CaptureBlock::DisplayChanging)
         );
         assert_eq!(CaptureBlock::from_hresult(code(0x8007_000E)), None);
+    }
+
+    #[test]
+    fn only_a_display_this_gpu_cannot_duplicate_is_the_pcs_failure() {
+        let unavailable = |block| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(CaptureUnavailable {
+                block,
+                detail: String::new(),
+            })
+        };
+        for block in [
+            CaptureBlock::SecureDesktop,
+            CaptureBlock::DisplayChanging,
+            CaptureBlock::TooManyCaptureApps,
+            CaptureBlock::SessionDisconnected,
+        ] {
+            assert!(passing_error(unavailable(block).as_ref()), "{block:?}");
+        }
+        assert!(!passing_error(
+            unavailable(CaptureBlock::UnsupportedOnThisGpu).as_ref()
+        ));
+        let other: Box<dyn std::error::Error + Send + Sync> = "DuplicateOutput failed".into();
+        assert!(!passing_error(other.as_ref()));
     }
 
     fn blocked(block: CaptureBlock) -> Box<dyn std::error::Error + Send + Sync> {

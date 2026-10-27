@@ -575,6 +575,9 @@ pub fn run_capture_loop(
                 if !recovery.in_episode() {
                     warn!("Desktop duplication access lost — reinitializing");
                 }
+                // A second screen that shows no picture meanwhile failed
+                // for a passing reason.
+                super::second_screen::note_interruption(&shared, generation);
                 // Release the lost duplication before asking for a new one:
                 // Windows refuses a second duplication of the same output.
                 duplication = None;

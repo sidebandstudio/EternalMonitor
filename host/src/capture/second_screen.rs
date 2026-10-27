@@ -111,6 +111,9 @@ struct Proving {
     generation: u64,
     since: Instant,
     capture_failed: bool,
+    /// Windows lost or blocked the desktop meanwhile (a secure screen, a
+    /// display change, a GPU reset): a failure is not the PC's.
+    interrupted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -212,12 +215,22 @@ impl State {
             ..State::default()
         };
         *status = VddStatus::Failed;
-        self.remember(reason, now);
+        self.remember(reason, now, proving.interrupted);
         Some(reason)
     }
 
-    /// Save the failure for later connections and app runs.
-    fn remember(&mut self, reason: &'static str, now: Instant) {
+    /// Save the failure for later connections and app runs, unless
+    /// something that passes may explain it: then only this app run keeps
+    /// mirroring, as before.
+    fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool) {
+        if interrupted || desktop_away() {
+            tracing::info!(
+                reason,
+                "The second screen failed while Windows withheld the desktop or the display may \
+                 have been asleep — not remembering it beyond this app run"
+            );
+            return;
+        }
         if let Some(hold) = self.memory.note_failure(reason, now) {
             tracing::info!(
                 reason,
@@ -413,6 +426,7 @@ pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
                 generation,
                 since: now,
                 capture_failed: false,
+                interrupted: false,
             })
         }
     }
@@ -444,6 +458,74 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
             proving.capture_failed = true;
         }
     }
+}
+
+/// Capture `generation` lost the desktop for a passing reason (see
+/// [`super::recovery::passing_error`]). A second screen that fails its proof
+/// meanwhile is not remembered beyond this app run.
+pub fn note_interruption(shared: &SharedControl, generation: u64) {
+    let mut state = shared.second_screen.lock();
+    if let Some(proving) = state.proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = true;
+        }
+    }
+}
+
+/// Whether the user can't be seeing the desktop now: a secure screen (the
+/// lock screen, a UAC prompt, Ctrl+Alt+Del) is up, or nobody has used the PC
+/// for a minute, the shortest time after which Windows turns the displays off.
+/// The iPad's own input counts as use.
+#[cfg(all(windows, not(test)))]
+fn desktop_away() -> bool {
+    use windows::Win32::Foundation::{BOOL, HANDLE};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+        DESKTOP_READOBJECTS, UOI_NAME,
+    };
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    const DISPLAY_OFF_AFTER_MS: u32 = 60_000;
+    // The secure desktop cannot be opened from the user's session.
+    let Ok(desktop) =
+        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), BOOL(0), DESKTOP_READOBJECTS) })
+    else {
+        return true;
+    };
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    let named = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            std::mem::size_of_val(&name) as u32,
+            Some(&mut needed),
+        )
+    };
+    let _ = unsafe { CloseDesktop(desktop) };
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    if named.is_err() || String::from_utf16_lossy(&name[..length]) != "Default" {
+        return true;
+    }
+    let mut input = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if !unsafe { GetLastInputInfo(&mut input) }.as_bool() {
+        return false;
+    }
+    unsafe { GetTickCount() }.wrapping_sub(input.dwTime) >= DISPLAY_OFF_AFTER_MS
+}
+
+/// Unit tests and other platforms: the desktop is always there.
+#[cfg(any(not(windows), test))]
+fn desktop_away() -> bool {
+    false
 }
 
 /// What the virtual display worker is asked to do.
@@ -830,7 +912,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             *status = VddStatus::Failed;
             let mut state = shared.second_screen.lock();
             state.failure = Some("attach_timeout");
-            state.remember("attach_timeout", driver.now());
+            state.remember("attach_timeout", driver.now(), false);
         }
     }
 }
