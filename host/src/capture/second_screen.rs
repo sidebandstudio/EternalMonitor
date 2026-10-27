@@ -756,6 +756,8 @@ pub(crate) fn release(shared: &SharedControl, driver: &impl Driver) {
     if shared.vdd_output.lock().is_none() || wanted() {
         return;
     }
+    // Marks when the worker took the request, apart from when the task ran.
+    info!("Turning the virtual display off");
     if !wait_for_toggle_gap(shared, driver, &|| !wanted() && !quitting(shared)) {
         return;
     }

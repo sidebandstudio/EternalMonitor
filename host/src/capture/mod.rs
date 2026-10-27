@@ -684,6 +684,26 @@ pub(crate) fn keepalive_allowed(seen_image: bool, second_screen: bool) -> bool {
     seen_image || !second_screen
 }
 
+/// How long a keyframe request waits for the encoder to take the resent frame
+/// before the picture is resent again.
+#[cfg(any(windows, test))]
+const KEYFRAME_RESEND: Duration = Duration::from_millis(100);
+
+/// Whether an idle display's last picture is due to be resent to the viewer.
+/// A keyframe request (a viewer that joined or lost its picture) is answered
+/// at once when there is a real picture to send: a viewer back within the
+/// second screen's grace period otherwise waited for the next keepalive, up
+/// to 750 ms, before the encoder could start its session.
+#[cfg(any(windows, test))]
+pub(crate) fn keepalive_due(
+    since_send: Duration,
+    keyframe_requested: bool,
+    seen_image: bool,
+) -> bool {
+    since_send >= IDLE_KEEPALIVE
+        || (keyframe_requested && seen_image && since_send >= KEYFRAME_RESEND)
+}
+
 /// Reads back an acquired frame for the encoder. Only an image that was read
 /// back counts as the second screen's proof: when the readback fails, the
 /// proof stays pending for the capture error that follows.
@@ -930,6 +950,25 @@ mod tests {
         assert_eq!(wedge_reason_at(&shared, &machine, now + 30), None);
         // The next poll resends the last picture to it.
         assert!(recovery_poll(&shared, now + 50, Duration::from_secs(6)));
+    }
+
+    /// A viewer back within the second screen's grace period finds a static
+    /// picture that DXGI reports no change to. Its session's keyframe request
+    /// is answered at the next acquire timeout, not at the next keepalive.
+    #[test]
+    fn a_keyframe_request_on_a_static_display_is_answered_at_once() {
+        let ms = Duration::from_millis;
+        let first_resend = |requested: bool, seen_image: bool| {
+            (0..)
+                .map(|poll| ms(10 + 16 * poll))
+                .find(|&since_send| keepalive_due(since_send, requested, seen_image))
+                .unwrap()
+        };
+        assert_eq!(first_resend(false, true), ms(762));
+        assert!(first_resend(true, true) <= KEYFRAME_RESEND + ms(16));
+        // Before the display's first image only the black placeholder exists;
+        // the keepalive sends it on the mirror, and never on the second screen.
+        assert_eq!(first_resend(true, false), ms(762));
     }
 
     #[test]
