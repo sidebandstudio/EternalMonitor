@@ -39,10 +39,9 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
-    /// Serialize driver changes across retiring capture generations and the
-    /// thread that turns the second screen on.
-    #[cfg(any(windows, test))]
-    pub(crate) vdd_lifecycle: Arc<Mutex<()>>,
+    /// The one thread that turns the virtual display on and off, and its
+    /// queue.
+    pub(crate) vdd_worker: Arc<crate::capture::second_screen::Worker>,
     /// Output owned by the enabled driver, retained across pipeline restarts.
     pub(crate) vdd_output: Arc<Mutex<Option<String>>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
@@ -153,8 +152,7 @@ impl SharedControl {
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             capture_block: Arc::new(Mutex::new(None)),
-            #[cfg(any(windows, test))]
-            vdd_lifecycle: Arc::new(Mutex::new(())),
+            vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),

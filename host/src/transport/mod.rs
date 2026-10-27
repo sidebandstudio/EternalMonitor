@@ -717,7 +717,7 @@ async fn execute_actions(
                 "Client connected with extended display selected — mirroring the primary \
                  display while the virtual display starts"
             );
-            second_screen::start(shared.clone());
+            second_screen::send(shared, second_screen::Command::Attach);
             false
         }
         second_screen::Step::Switch => {
@@ -735,7 +735,7 @@ async fn execute_actions(
                 "The virtual display showed no picture — restarting pipeline to mirror the \
                  primary display instead"
             );
-            second_screen::turn_off(shared.clone());
+            second_screen::send(shared, second_screen::Command::Release);
             true
         }
     };

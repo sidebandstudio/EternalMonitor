@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 use tracing::error;
 #[cfg(any(windows, test))]
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::control::SharedControl;
 #[cfg(any(windows, test))]
@@ -361,7 +361,7 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
 /// a viewer is connected (or one left less than [`second_screen::RELEASE_GRACE`] ago), and
 /// mirrors `PrimaryAuto` otherwise: while [`second_screen`] turns the display on beside the
 /// mirror, after it failed to, and with nobody connected. Any other target turns the display
-/// off. Never waits for the driver: the [`second_screen`] threads change it, and the mirror
+/// off. Never waits for the driver: the [`second_screen`] worker changes it, and the mirror
 /// must not wait behind a slow Enable or attach.
 #[cfg(any(windows, test))]
 pub(crate) fn reconcile_virtual_display(
@@ -375,6 +375,17 @@ pub(crate) fn reconcile_virtual_display(
     let owned = shared.vdd_output.lock().clone();
     match target {
         CaptureTarget::VirtualExtended => {
+            // A restart must not erase a second screen that already failed
+            // to show an image: it goes back to the mirror now.
+            if let Some(reason) = second_screen::take_unproven(shared, Instant::now()) {
+                warn!(
+                    second_screen_fallback = reason,
+                    prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
+                    "The virtual display showed no picture — mirroring the primary display instead"
+                );
+                second_screen::send(shared, second_screen::Command::Release);
+                return Some(CaptureTarget::PrimaryAuto);
+            }
             let connected = shared.client_connected();
             let status = *shared.vdd_status.lock();
             if matches!(
@@ -399,29 +410,31 @@ pub(crate) fn reconcile_virtual_display(
                     return Some(CaptureTarget::Output(name));
                 }
             }
+            // The transport's next tick starts the display beside this mirror.
+            // A viewer that arrived meanwhile may already have claimed it.
+            {
+                let mut status = shared.vdd_status.lock();
+                if *status != VddStatus::Attaching {
+                    *status = VddStatus::WaitingForClient;
+                }
+            }
             if !connected {
                 info!(
                     "Extended display selected but no iPad has connected yet — leaving the \
                      virtual display off and mirroring the primary display until a client registers"
                 );
                 if owned.is_some() {
-                    second_screen::turn_off(shared.clone());
+                    second_screen::send(shared, second_screen::Command::Release);
                 }
-            }
-            // The transport's next tick starts the display beside this mirror.
-            // A viewer that arrived meanwhile may already have claimed it.
-            let mut status = shared.vdd_status.lock();
-            if *status != VddStatus::Attaching {
-                *status = VddStatus::WaitingForClient;
             }
             Some(CaptureTarget::PrimaryAuto)
         }
         other => {
             // Any non-virtual target: ensure the virtual display is off.
-            if owned.is_some() {
-                second_screen::turn_off(shared.clone());
-            }
             *shared.vdd_status.lock() = VddStatus::Inactive;
+            if owned.is_some() {
+                second_screen::send(shared, second_screen::Command::Release);
+            }
             Some(other.clone())
         }
     }
@@ -434,6 +447,23 @@ pub(crate) fn reconcile_virtual_display(
 #[cfg(any(windows, test))]
 pub(crate) fn keepalive_allowed(seen_image: bool, second_screen: bool) -> bool {
     seen_image || !second_screen
+}
+
+/// Reads back an acquired frame for the encoder. Only an image that was read
+/// back counts as the second screen's proof: when the readback fails, the
+/// proof stays pending for the capture error that follows.
+#[cfg(any(windows, test))]
+pub(crate) fn read_back_image<T, E>(
+    shared: &SharedControl,
+    generation: u64,
+    seen_image: &mut bool,
+    read: impl FnOnce() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let image = read()?;
+    if image.is_some() && !std::mem::replace(seen_image, true) {
+        second_screen::note_image(shared, generation);
+    }
+    Ok(image)
 }
 
 /// Runs the platform capture loop on the CURRENT thread until stop/close,
