@@ -25,6 +25,7 @@ class FakeAsc:
     def __init__(self):
         self.calls = []
         self.queued = {}
+        self.page_size = None
         self.groups = {"g-int": ("Friends", True), "g-ext": ("FriendsExternal", False)}
         self.builds = {
             "b365": dict(version="365", states=["NOT_FOUND", "PROCESSING", "VALID"], external="READY_FOR_BETA_SUBMISSION",
@@ -77,8 +78,12 @@ class FakeAsc:
             return 200, doc
         if (method, path) == ("GET", "builds"):
             assert query["sort"] == "-uploadedDate"
+            size, start = self.page_size or int(query["limit"]), int(query.get("cursor", 0))
+            page = list(self.builds)[start:start + size]
             doc = {}
-            doc["data"] = [self.resource(build_id, doc) for build_id in self.builds]
+            doc["data"] = [self.resource(build_id, doc) for build_id in page]
+            if start + size < len(self.builds):
+                doc["links"] = {"next": f"{tr.API}/builds?" + urllib.parse.urlencode({**query, "cursor": start + size})}
             return 200, doc
         if method == "GET" and path.endswith("/betaBuildLocalizations"):
             notes = self.builds[path.split("/")[1]]["notes"]
@@ -171,6 +176,45 @@ class TestFlightReviewTest(unittest.TestCase):
         review = self.run_review()
         self.assertEqual(review["groups"], {"OldExternal": "added"})
 
+    def test_newest_approved_build_without_external_groups_stops_there(self):
+        self.asc.groups["g-ret"] = ("RetiredExternal", False)
+        self.asc.builds["b316"]["groups"] = ["g-int"]
+        self.asc.builds["b300"] = dict(version="300", states=["VALID"], external="IN_BETA_TESTING",
+                                       groups=["g-int", "g-ret"], review="APPROVED", notes={})
+        review = self.run_review()
+        self.assertEqual((review["status"], review["groups"], review["review"], review["groupsFrom"]),
+                         ("NO_EXTERNAL_GROUP", {}, "not submitted", "316"))
+        self.assertIn("no external group to copy", review["reason"])
+        self.assertEqual(self.asc.writes(), [("PATCH", "betaBuildLocalizations/l1")])
+
+    def test_approved_build_lookup_follows_pages(self):
+        for n in range(5):
+            self.asc.builds[f"b37{n}"] = dict(version=f"37{n}", states=["VALID"], external="BETA_REJECTED",
+                                              groups=[], review="REJECTED", notes={})
+        self.asc.builds = {k: self.asc.builds[k] for k in ["b365", "b370", "b371", "b372", "b373", "b374", "b364", "b316"]}
+        self.asc.page_size = 2
+        review = self.run_review()
+        self.assertEqual((review["status"], review["groupsFrom"]), ("PASS", "316"))
+        pages = [q for m, p, q, _ in self.asc.calls if (m, p) == ("GET", "builds") and "sort" in q]
+        self.assertEqual([q.get("cursor") for q in pages], [None, "2", "4", "6"])
+
+    def test_approved_build_lookup_is_bounded(self):
+        self.asc.builds["b316"]["review"] = "REJECTED"
+        for n in range(30):
+            self.asc.builds[f"b2{n:02}"] = dict(version=f"2{n:02}", states=["VALID"], external="BETA_REJECTED",
+                                                groups=[], review="REJECTED", notes={})
+        self.asc.builds["b100"] = dict(version="100", states=["VALID"], external="IN_BETA_TESTING",
+                                       groups=["g-ext"], review="APPROVED", notes={})
+        self.asc.page_size = 3
+        with self.assertRaisesRegex(tr.AscError, "newest 10 pages"):
+            self.run_review()
+        self.assertEqual(sum(1 for m, p, q, _ in self.asc.calls if (m, p) == ("GET", "builds") and "sort" in q), 10)
+
+    def test_links_off_the_api_are_refused(self):
+        with self.assertRaisesRegex(tr.AscError, "outside the App Store Connect API"):
+            self.connect({}).call("GET", "https://example.com/v1/builds?cursor=2")
+        self.assertEqual(self.asc.calls, [])
+
     def test_missing_localization_is_created(self):
         self.asc.builds["b365"]["notes"] = {}
         self.assertEqual(self.run_review()["whatsNew"], "set")
@@ -212,7 +256,7 @@ class TestFlightReviewTest(unittest.TestCase):
 
     def test_no_approved_external_group_fails(self):
         self.asc.builds["b316"]["review"] = "REJECTED"
-        with self.assertRaisesRegex(tr.AscError, "No earlier approved build"):
+        with self.assertRaisesRegex(tr.AscError, "No earlier approved build in the newest 10 pages"):
             self.run_review()
 
     def test_rejected_build_fails(self):

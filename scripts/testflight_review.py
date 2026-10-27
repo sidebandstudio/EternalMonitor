@@ -8,7 +8,9 @@ wait up to 30 minutes for App Store Connect to process it, set its en-US
 What to Test to NOTES_MD, add it to every external group of the newest
 approved build and submit it for beta review. Each step accepts work already
 done, so a rerun finishes the job. Pull requests and dry runs skip it all.
-REVIEW_JSON records what happened; it never holds a key or token.
+When that newest approved build is in no external group, the build joins none
+and is not submitted (status NO_EXTERNAL_GROUP). REVIEW_JSON records what
+happened; it never holds a key or token.
 
 Needs ASC_KEY_ID, ASC_ISSUER_ID and either ASC_KEY_P8 (the base64 .p8, as
 testflight-local.sh takes it) or ASC_KEY_PATH.
@@ -33,6 +35,7 @@ LOCALE = "en-US"
 PROCESSING_TIMEOUT = 30 * 60
 POLL_SECONDS = 30
 MAX_NOTES = 4000
+MAX_PAGES = 10
 
 
 class AscError(Exception):
@@ -131,7 +134,10 @@ class AppStoreConnect:
         return self._token
 
     def call(self, method, path, params=None, body=None, ok=(200, 201, 204)):
-        url = f"{API}/{path}" + ("?" + urllib.parse.urlencode(params) if params else "")
+        """PATH is relative to the API, or a links.next URL from it."""
+        if "://" in path and not path.startswith(API + "/"):
+            raise AscError("refusing to send the token outside the App Store Connect API")
+        url = (path if "://" in path else f"{API}/{path}") + ("?" + urllib.parse.urlencode(params) if params else "")
         data = json.dumps(body).encode() if body is not None else None
         for attempt in range(4):
             headers = {"Authorization": "Bearer " + self.token(), "Content-Type": "application/json"}
@@ -207,19 +213,23 @@ def set_notes(asc, build_id, notes):
     return "set"
 
 
-def approved_external_groups(asc, build_id):
-    """The external groups of the newest other build Apple approved."""
-    doc = asc.call("GET", "builds", {
+def approved_external_groups(asc, build_id, pages=MAX_PAGES):
+    """The newest other build Apple approved and its external groups, which
+    may be none. Older approved builds are never consulted."""
+    path, params = "builds", {
         "filter[app]": APP_ID, "sort": "-uploadedDate", "limit": "30",
-        "include": "betaAppReviewSubmission,betaGroups", "fields[betaGroups]": "name,isInternalGroup"})
-    for item in doc.get("data", []):
-        review = related(doc, item, "betaAppReviewSubmission")
-        if item["id"] == build_id or not review or review[0].get("attributes", {}).get("betaReviewState") != "APPROVED":
-            continue
-        groups = [g for g in related(doc, item, "betaGroups") if g.get("attributes", {}).get("isInternalGroup") is False]
-        if groups:
-            return item["attributes"].get("version"), groups
-    raise AscError("No earlier approved build is in an external TestFlight group to copy")
+        "include": "betaAppReviewSubmission,betaGroups", "fields[betaGroups]": "name,isInternalGroup"}
+    for _ in range(pages):
+        doc = asc.call("GET", path, params)
+        for item in doc.get("data", []):
+            review = related(doc, item, "betaAppReviewSubmission")
+            if item["id"] != build_id and review and review[0].get("attributes", {}).get("betaReviewState") == "APPROVED":
+                return item["attributes"].get("version"), [
+                    g for g in related(doc, item, "betaGroups") if g.get("attributes", {}).get("isInternalGroup") is False]
+        path, params = doc.get("links", {}).get("next"), None
+        if not path:
+            break
+    raise AscError(f"No earlier approved build in the newest {pages} pages of builds")
 
 
 def add_to_groups(asc, doc, item, groups):
@@ -276,6 +286,12 @@ def run(result_path, notes_path, review, env=os.environ, connect=AppStoreConnect
     review["processing"] = item["attributes"]["processingState"]
     review["whatsNew"] = set_notes(asc, item["id"], notes)
     review["groupsFrom"], groups = approved_external_groups(asc, item["id"])
+    if not groups:
+        # Nothing to review for: no external tester could install the build.
+        review.update(groups={}, review="not submitted", status="NO_EXTERNAL_GROUP",
+                      reason=f"no external group to copy: approved build {review['groupsFrom']} is in none")
+        print(f"::warning::TestFlight build {build} was not submitted for external review: {review['reason']}")
+        return
     review["groups"] = add_to_groups(asc, doc, item, groups)
     review["review"], review["reviewState"] = submit_for_review(asc, doc, item)
     review["status"] = "PASS"

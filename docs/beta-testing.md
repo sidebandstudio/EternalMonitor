@@ -115,12 +115,19 @@ shell. Neither path switches the developer account used by this workspace.
 ### Then, in App Store Connect
 
 A tag or manual run of `.github/workflows/testflight.yml` does steps 1, 3 and
-4 itself with `scripts/testflight_review.py`: it waits up to 30 minutes for
-processing, sets the en-US "What to Test" from `ios/TESTFLIGHT_NOTES.md`, adds
-the build to every external group of the newest approved build and submits it
-for Beta App Review. The run's evidence artifact holds the outcome in
-`review.json`. Rerun the job if it stopped partway; finished steps pass. By
-hand, or for a first build:
+4 itself in its **External TestFlight review** job, with
+`scripts/testflight_review.py`: it waits up to 30 minutes for processing, sets
+the en-US "What to Test" from `ios/TESTFLIGHT_NOTES.md`, adds the build to
+every external group of the newest approved build and submits it for Beta App
+Review. If that build is in no external group, the new build joins none and
+is not submitted; `review.json` then says `NO_EXTERNAL_GROUP`. The job's
+`EternalMonitor-iPad-review-*` artifact holds `review.json`.
+
+If only the review failed, choose **Re-run failed jobs** on the run, or re-run
+just the **External TestFlight review** job. That retries the review alone, and
+finished steps pass. Do not re-run all jobs or the archive job: it would upload
+the same build number again, which App Store Connect refuses. By hand, or for
+a first build:
 
 1. TestFlight tab, wait for the build to finish processing (usually a few
    minutes; you get an email).
