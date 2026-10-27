@@ -15,6 +15,9 @@ Not released yet.
   graphics cards and the display paths Windows reports. The snapshot leaves out
   the PC's name and the user's name; the rest of the log still contains them.
   Before, every case read "no display appeared in time".
+- The second screen has 30 seconds to appear instead of 10, while the iPad
+  shows the mirror. On some PCs Windows adds it only after more than 10 seconds,
+  and those connections stayed on the mirror.
 - The second screen is drawn by the graphics card that drives the main screen,
   whether or not **Match the iPad's resolution** is on. Before, the driver
   chose the card with the most memory, which on laptops with Intel and NVIDIA
