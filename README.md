@@ -69,7 +69,7 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 version 1809 or later, or Windows 11, 64-bit, with NVIDIA, AMD or Intel graphics | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.2) (v0.3.2 current stable) |
+| **Windows** | Windows 10 version 1809 or later, or Windows 11, 64-bit, with NVIDIA, AMD or Intel graphics | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) (v0.3.3 current stable) |
 | **iPad** | iPadOS 17 or later | [TestFlight v0.3.2, build 316](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
 Install both apps from the same version. The older v0.1 releases use a different
@@ -94,10 +94,11 @@ you will see.
 
 ## Status
 
-v0.3.2 places Apple Pencil correctly on PCs with more than one monitor, adds
-Fill, plain-language messages, Send feedback and one-click Windows updates, and
-opens on graphics drivers that crashed 0.3.1 at startup. Install it with iPad
-TestFlight v0.3.2, build 316.
+v0.3.3 fixes **Second screen** on PCs where it didn't start, most often
+laptops with Intel and NVIDIA graphics. The iPad shows the PC's main screen
+while the second screen starts, and the PC's screen no longer blinks in a loop.
+The iPad 0.3.3 update is coming through TestFlight. Until then, use iPad
+TestFlight v0.3.2, build 316, which works with Windows 0.3.3.
 
 Windows and iPad diagnostics include device details, app errors and stream
 statistics. Reports include PC names and network addresses, but exclude screen
