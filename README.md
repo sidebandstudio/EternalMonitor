@@ -102,6 +102,9 @@ TestFlight v0.3.2, build 316.
 Windows and iPad diagnostics include device details, app errors and stream
 statistics. Reports include PC names and network addresses, but exclude screen
 content, audio and pairing credentials. Disable automatic sharing in Settings.
+Diagnostics are kept up to 30 days and may be removed sooner; deleted
+diagnostics can remain in daily backups for up to 7 more days. See
+[Automatic diagnostics](SETUP.md#automatic-diagnostics).
 On iPad, open Settings > Support > Diagnostics to copy or export a report.
 
 The release checks passed on Windows, macOS and iPad simulators. Problems we

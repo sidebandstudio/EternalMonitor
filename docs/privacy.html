@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="UTF-8">
+  <script>document.documentElement.className = 'js';</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy | EternalMonitor</title>
+  <meta name="description" content="What the EternalMonitor apps send, why, how long it is kept and how to turn it off.">
+  <link rel="canonical" href="https://eternalmonitor.dev/privacy.html">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="EternalMonitor">
+  <meta property="og:title" content="Privacy | EternalMonitor">
+  <meta property="og:description" content="What the EternalMonitor apps send, why, how long it is kept and how to turn it off.">
+  <meta property="og:url" content="https://eternalmonitor.dev/privacy.html">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Privacy | EternalMonitor">
+  <meta name="twitter:description" content="What the EternalMonitor apps send, why, how long it is kept and how to turn it off.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta name="author" content="Sideband Studio">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
+  <link rel="preload" href="assets/fonts/Geist-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <nav class="container nav-inner" aria-label="Main">
+      <a href="./" class="brand" aria-label="EternalMonitor home">
+        <img src="assets/icon.png" alt="" width="26" height="26">
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="./#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm">Updates</a>
+        <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span>GitHub</span>
+          <span class="count" data-stars></span>
+        </a>
+        <a href="download.html" class="btn btn-primary btn-sm">Download</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="page-head">
+      <div class="container">
+        <h1>Privacy</h1>
+        <p class="lead">What the EternalMonitor apps send, why, and how to turn it off.</p>
+      </div>
+    </section>
+
+    <!-- needs owner review: who is responsible for this data (the controller), and its legal name and contact. Sideband Studio and hello@sideband.studio are used below as the contact only. -->
+    <section class="container posts policy">
+      <article class="post" id="what-is-sent" aria-labelledby="what-is-sent-title">
+        <h2 id="what-is-sent-title">What the apps send</h2>
+        <p>The Windows app and the iPad app send diagnostics to EternalMonitor support while they run:</p>
+        <ul class="post-list">
+          <li>Device details, such as app version, iPad model, Windows version and graphics hardware.</li>
+          <li>Errors and other lines from the apps' logs.</li>
+          <li>Stream statistics, such as frame rate and dropped frames.</li>
+          <li>PC names and local network addresses, which appear in these logs.</li>
+          <li>A random ID the app creates when it is installed. It is your <strong>Support ID</strong>, and it lets us find your diagnostics.</li>
+        </ul>
+        <!-- needs owner review: whether the upload server stores the sender's public IP address. -->
+      </article>
+
+      <article class="post" id="why" aria-labelledby="why-title">
+        <h2 id="why-title">Why</h2>
+        <p>To run the app, find out why a connection or the picture fails, and make the app better.</p>
+        <!-- needs owner review: legal basis for processing, and whether EU users need a choice before the first upload (sharing is on by default today). -->
+      </article>
+
+      <article class="post" id="not-sent" aria-labelledby="not-sent-title">
+        <h2 id="not-sent-title">What is never sent</h2>
+        <ul class="post-list">
+          <li>What's on your screen.</li>
+          <li>Audio.</li>
+          <li>Pairing codes and tokens. They are removed before anything is saved or sent.</li>
+        </ul>
+      </article>
+
+      <article class="post" id="where" aria-labelledby="where-title">
+        <h2 id="where-title">Where it is stored</h2>
+        <p>Uploads use encrypted HTTPS. They pass through Vercel and are stored in a Supabase database in the US East region.</p>
+        <!-- needs owner review: the transfer of EU users' data to the US, and the processor agreements with Supabase and Vercel. -->
+      </article>
+
+      <article class="post" id="how-long" aria-labelledby="how-long-title">
+        <h2 id="how-long-title">How long</h2>
+        <p>Diagnostics are kept for up to 30 days and may be removed sooner when storage limits are reached. Deleted or expired diagnostics can remain in daily backups for up to 7 more days.</p>
+      </article>
+
+      <article class="post" id="turn-off" aria-labelledby="turn-off-title">
+        <h2 id="turn-off-title">Turn sharing off</h2>
+        <div class="post-update">
+          <dl>
+            <div><dt>Windows</dt><dd>Open <strong>Settings</strong>. Under <strong>Support diagnostics</strong>, turn off <strong>Automatically share diagnostics</strong>.</dd></div>
+            <div><dt>iPad</dt><dd>Open <strong>Settings</strong>, then <strong>Support</strong>, then <strong>Diagnostics</strong>, and turn off <strong>Automatically share diagnostics</strong>.</dd></div>
+          </dl>
+        </div>
+        <p>Turning it off clears anything waiting to upload. Diagnostics already sent are deleted on the schedule above. You can still export or copy a report yourself, and it only reaches us if you send it.</p>
+      </article>
+
+      <article class="post" id="delete" aria-labelledby="delete-title">
+        <h2 id="delete-title">Ask us to delete your diagnostics</h2>
+        <p>Email <a href="mailto:hello@sideband.studio">hello@sideband.studio</a> with the Support ID shown in the app's diagnostics settings. We'll delete everything stored under that ID. Copies in backups are gone within 7 days.</p>
+        <!-- needs owner review: the Windows app does not show its Support ID yet, how Windows-only users find it, and the response time and other rights (access, complaints to a data protection authority) to state here. -->
+      </article>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="./">Home</a>
+        <a href="download.html">Download</a>
+        <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
+        <a href="privacy.html" aria-current="page">Privacy</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>
