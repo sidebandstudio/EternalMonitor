@@ -184,8 +184,8 @@ final class ConnectScreenTests: XCTestCase {
         // before its contents finish loading. Still require the document and
         // export actions once the remote interface is ready. The waits are
         // long because a loaded simulator is slow, not because speed is
-        // tested here.
-        XCTAssertTrue(share.waitForExistence(timeout: 30), app.debugDescription)
+        // tested here: on a busy Mac the remote sheet took 78 s to draw.
+        XCTAssertTrue(share.waitForExistence(timeout: 120), app.debugDescription)
         // The header names our file. Once the file's preview has loaded it
         // shows the title over "Text Document"; while it hasn't, and on a
         // loaded simulator it can stay that way, it shows the file name,
