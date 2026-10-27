@@ -1,67 +1,56 @@
-# EternalMonitor 0.3.2: What to Test
+# EternalMonitor 0.3.3: What to Test
 
-Released October 22, 2026. Install the Windows and iPad 0.3.2 updates together;
-an iPad on 0.3.1 still works with the Windows changes.
+Released October 27, 2026. Install the Windows and iPad 0.3.3 updates together;
+each still works with the other app on 0.3.1 or 0.3.2.
+
+This release fixes **Second screen** on PCs where it didn't start, most often
+laptops with Intel and NVIDIA graphics. The iPad then said **Your PC answered,
+but no picture arrived**, and over USB the PC's screen blinked and Windows
+played its connect and disconnect sounds every few seconds until the cable was
+unplugged. Choosing **Mirror my screen** on the PC was the way around it.
 
 ### What changed
 
-- Apple Pencil lands under the tip when another monitor sits left of or above
-  the main display, a cancelled stroke resumes instead of dropping, and Pencil
-  works as a mouse if Windows cannot create its pen device.
-- The iPad can fill its whole screen: choose **Picture: Fill** in Settings or
-  tap the arrows next to the settings button. Fill trims the edges of the PC
-  picture that don't fit; **Fit** still shows all of it, with bars.
-- Plain-language messages in both apps say what happened and what to do, with
-  **Try again**, **Search again** or **Open Settings**. The iPad looks for PCs
-  as soon as it opens and spots a pairing code or router address typed as the
-  PC's address. The PC's Stream page asks **Use the iPad as** (**Mirror my
-  screen** or **Second screen**) and says why the picture paused while Windows
-  withholds the screen.
-- Windows updates itself: **Update now** checks the installer's SHA-256,
-  installs it and reopens EternalMonitor, waiting for streaming to stop or for
-  **Stop and update**. The iPad says when the PC is updating and when a new
-  TestFlight build is ready. Both apps say which one to update when versions
-  differ. A popup recommends each new version, and the PC says when the iPad
-  app is outdated.
-- The PC window opens on graphics drivers that crashed 0.3.1 at startup. If
-  the host can't start or stops unexpectedly, it names the error and log file,
-  and a helper process reports the crash and tries to turn the second screen
-  off. Opening EternalMonitor again brings the running window to the front.
-- EternalMonitor no longer opens a black console window next to the app.
-- A USB connection stays up when the stream restarts. Capture blocked by the
-  lock screen or a display change retries by itself. A hung or missing display
-  task no longer stalls the stream. At quit, EternalMonitor tries to turn the
-  second screen off even while Windows' display task is slow, and if it can't,
-  a helper process tries again.
-- PC audio starts cleanly and survives a large packet. With no iPad connected
-  the PC stops encoding its screen.
-- The installer allows display traffic on work or school networks and names
-  the Windows version needed on older Windows. With VoiceOver on, the iPad's
-  stream controls stay until you hide them.
-- Logs collapse repeated lines and keep their last lines at quit. A Known
-  issues page and the setup guide's tables list every message and what to do.
-- **Send feedback** in both apps writes an email to the studio with the app
-  versions and setup filled in; nothing is sent until you press Send. The iPad
-  attaches its Diagnostics report, which you can remove, and problem cards
-  offer **Report this problem**. Without an email app, **Copy message** works
-  instead. After a few long sessions each app asks once how it's going, and
-  the PC sidebar has a card for starring EternalMonitor on GitHub.
+- The iPad shows the PC's main screen as soon as it connects, then switches to
+  the second screen once that screen shows a picture. If none arrives within 5
+  seconds, the iPad keeps the mirror and the PC says the second screen didn't
+  start. Later connections mirror until you click **Try again**, restart the
+  stream or change the mode.
+- The PC turns the second screen on or off at most once every 10 seconds and
+  keeps it on for 10 seconds after the iPad leaves, so a quick reconnect reuses
+  it. The screen no longer blinks in a loop.
+- On laptops with two graphics chips, the second screen is drawn by the chip
+  that drives the main screen. Before, the driver chose the chip with the most
+  memory, which on Intel + NVIDIA laptops drives no screen. When another app
+  installed the driver and a chip was chosen there, EternalMonitor leaves it.
+- The second screen starts at the iPad's resolution instead of a small, blurry
+  800×600.
+- When the second screen doesn't appear, the PC's Stream page says why and what
+  to do: run Setup again, restart the PC, or choose Extend with Windows key + P.
+  Running EternalMonitor-Setup.exe again repairs a display driver Setup
+  installed whose device was removed or stopped working.
+- The first picture arrives sooner on NVIDIA and Intel graphics, most of all
+  when the second screen isn't changing. **Mirror my screen** no longer waits
+  for the second screen to turn off at startup.
+- After two attempts in a row where the PC answered but sent no picture, the
+  iPad stops reconnecting and says to choose **Mirror my screen** on the PC
+  (**Main display (mirror)** in 0.3.1). **Try again** starts over. This also
+  ends the blinking with PCs still on 0.3.1 or 0.3.2.
+- The iPad shows a **Support ID** in Settings > Diagnostics, with **Copy
+  Support ID**, and feedback emails include it. PC Settings says **Match the
+  iPad's resolution** applies the next time the second screen starts.
+- Diagnostics and **Copy logs** say why the second screen didn't start and list
+  the graphics chips and displays Windows reports, without the PC's or user's
+  name. They name Windows 11 correctly.
 
 ### What to test
 
-On a PC where 0.3.1 closed right after opening, install this build: the window
-should appear, or a message should name the error and log file. Send that file
-with the time.
+On a laptop with Intel and NVIDIA graphics, choose **Second screen** and connect
+the iPad over Wi-Fi, then over USB. The PC's screen should appear at once, then
+the second screen a few seconds later at the iPad's resolution. If the second
+screen doesn't come up, the iPad should keep the PC's screen with no blinking or
+connect sounds, and the PC should say why. Send the PC's **Copy logs** text with
+the time.
 
-On a PC with 0.3.1, download the 0.3.2 installer and run it over 0.3.1;
-0.3.1's banner only offers **View release**. From 0.3.2 on, **Update now**
-installs a later build in place: once one is out, click it, approve the
-prompt, and check that the new version opens, once while streaming with
-**Stop and update**. On the iPad, tap **Open TestFlight** from the banner.
-
-With a second monitor left of the main display, touch each corner of the iPad
-picture with Apple Pencil; the pointer should be under the tip. Repeat with the
-extended iPad display and with 125% scaling.
-
-Tap **Send feedback** in Settings on the iPad and click it in the PC's sidebar:
-check the email it writes, and tell us what you think.
+With the iPad on 0.3.3 and a PC on 0.3.2 whose second screen fails, the iPad
+should stop after two tries and say to choose **Mirror my screen**.

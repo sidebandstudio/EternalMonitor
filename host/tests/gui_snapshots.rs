@@ -871,7 +871,7 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.get_by_label("Copy message").click();
     window.step();
     let copied = copied_text(&window).expect("Copy message copies");
-    assert!(copied.starts_with("To: hello@sideband.studio\nSubject: EternalMonitor 0.3.2 for Windows: Something I like"), "{copied}");
+    assert!(copied.starts_with("To: hello@sideband.studio\nSubject: EternalMonitor 0.3.3 for Windows: Something I like"), "{copied}");
     assert!(copied.contains("Drawing on the iPad in Krita feels great."));
     assert!(copied.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"));
     assert!(!copied.contains("Test iPad Pro") && !copied.contains("192.0.2.10"));
@@ -885,7 +885,7 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     let url = opened_url(&window).expect("Open in my email app opens a mailto link");
     assert!(
         url.starts_with(
-            "mailto:hello@sideband.studio?subject=EternalMonitor%200.3.2%20for%20Windows"
+            "mailto:hello@sideband.studio?subject=EternalMonitor%200.3.3%20for%20Windows"
         ),
         "{url}"
     );
@@ -902,7 +902,7 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     let copied = copied_text(&window).unwrap();
     // The subject keeps the kind and version, for sorting mail.
     assert!(
-        copied.contains("Subject: EternalMonitor 0.3.2 for Windows: Something I like"),
+        copied.contains("Subject: EternalMonitor 0.3.3 for Windows: Something I like"),
         "{copied}"
     );
     assert!(
