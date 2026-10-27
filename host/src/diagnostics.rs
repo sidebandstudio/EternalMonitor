@@ -128,14 +128,17 @@ fn windows_system_report() -> Vec<String> {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let os_key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
     let cpu_key = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
+    let product = registry_string(os_key, "ProductName");
+    let build = registry_string(os_key, "CurrentBuildNumber");
     let mut lines = vec![format!(
-        // ProductName can retain "Windows 10" on Windows 11. Preserve its source
-        // instead of presenting that legacy registry label as the detected OS.
-        "Windows registry_product={} installation_type={} display_version={} build={}.{}",
-        registry_string(os_key, "ProductName"),
+        // ProductName can retain "Windows 10" on Windows 11. Name the OS from
+        // the build, and keep the registry label beside it as the source.
+        "Windows os={} registry_product={} installation_type={} display_version={} build={}.{}",
+        windows_name(&product, &build),
+        product,
         registry_string(os_key, "InstallationType"),
         registry_string(os_key, "DisplayVersion"),
-        registry_string(os_key, "CurrentBuildNumber"),
+        build,
         registry_dword(os_key, "UBR")
     )];
     lines.push(format!(
@@ -159,8 +162,35 @@ fn windows_system_report() -> Vec<String> {
     lines
 }
 
+/// The Windows name for a registry ProductName and build number. Windows 11
+/// starts at build 22000 but kept "Windows 10" in ProductName.
+#[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
+fn windows_name(product: &str, build: &str) -> String {
+    let windows_11 = build
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|build| build >= 22000);
+    match product.strip_prefix("Windows 10") {
+        Some(edition) if windows_11 => format!("Windows 11{edition}"),
+        _ => product.to_string(),
+    }
+}
+
 #[cfg(windows)]
-fn registry_string(key: &str, name: &str) -> String {
+pub(crate) fn registry_string(key: &str, name: &str) -> String {
+    registry_sz(key, name).unwrap_or_else(|code| format!("unavailable({code})"))
+}
+
+/// A string value under HKLM, `None` when it is missing or empty.
+#[cfg(windows)]
+pub(crate) fn registry_value(key: &str, name: &str) -> Option<String> {
+    registry_sz(key, name)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(windows)]
+fn registry_sz(key: &str, name: &str) -> Result<String, String> {
     use windows::{
         core::PCWSTR,
         Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
@@ -181,15 +211,17 @@ fn registry_string(key: &str, name: &str) -> String {
         )
     };
     if result.is_err() {
-        return format!("unavailable({})", result.0);
+        return Err(result.0.to_string());
     }
-    String::from_utf16_lossy(&value[..value.iter().position(|c| *c == 0).unwrap_or(value.len())])
-        .trim()
-        .to_string()
+    Ok(String::from_utf16_lossy(
+        &value[..value.iter().position(|c| *c == 0).unwrap_or(value.len())],
+    )
+    .trim()
+    .to_string())
 }
 
 #[cfg(windows)]
-fn registry_dword(key: &str, name: &str) -> String {
+pub(crate) fn registry_dword(key: &str, name: &str) -> String {
     use windows::{
         core::PCWSTR,
         Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},
@@ -213,5 +245,29 @@ fn registry_dword(key: &str, name: &str) -> String {
         format!("unavailable({})", result.0)
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_name;
+
+    #[test]
+    fn windows_11_is_named_from_its_build_not_its_registry_label() {
+        // The customer's PC: Windows 11 26H2 with the legacy label.
+        assert_eq!(windows_name("Windows 10 Home", "26300"), "Windows 11 Home");
+        assert_eq!(windows_name("Windows 10 Pro", "22000"), "Windows 11 Pro");
+        assert_eq!(
+            windows_name("Windows 10 Home China", "26200"),
+            "Windows 11 Home China"
+        );
+        assert_eq!(windows_name("Windows 10 Pro", "19045"), "Windows 10 Pro");
+        assert_eq!(windows_name("Windows 10 Pro", "21996"), "Windows 10 Pro");
+        // Already right, or unreadable: left as Windows reports it.
+        assert_eq!(windows_name("Windows 11 Pro", "26100"), "Windows 11 Pro");
+        assert_eq!(
+            windows_name("Windows 10 Home", "unavailable(2)"),
+            "Windows 10 Home"
+        );
     }
 }

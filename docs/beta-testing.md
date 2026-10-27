@@ -175,7 +175,8 @@ at the top of the host's Stream page, next to **Use the iPad as**, click **Secon
 Settings → How the iPad shows your PC). A running stream restarts by itself. Dragging a window past the edge of the main screen should
 land it on the iPad. The virtual monitor is created **on demand and only while the iPad is
 connected** — there is intentionally no second display when idle, so don't expect to see it in
-Windows Display settings before connecting. If the extended display can't start, the host shows an
+Windows Display settings before connecting. The iPad shows the mirrored main screen first and
+switches to the second screen once Windows has added it. If the extended display can't start, the host shows an
 amber "The second screen couldn't start" banner and mirrors the primary screen — re-run the installer
 so its display task is registered.
 

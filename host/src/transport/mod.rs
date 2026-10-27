@@ -23,6 +23,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::capture::second_screen;
 use crate::control::{CaptureTarget, SharedControl, SupervisorCommand, VddStatus};
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
@@ -496,7 +497,7 @@ pub async fn start_sender(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum FirstFrame {
+pub(crate) enum FirstFrame {
     Send,
     Skip,
     SkipAndRequestKeyframe,
@@ -507,7 +508,7 @@ enum FirstFrame {
 /// NVENC kept the host's startup frame while the PC sat idle, and the next
 /// viewer received that old, blank keyframe as its first picture. A stale
 /// keyframe is skipped and a fresh one requested.
-fn first_frame_gate(
+pub(crate) fn first_frame_gate(
     is_keyframe: bool,
     captured: Instant,
     session_start: Option<Instant>,
@@ -661,16 +662,13 @@ async fn execute_actions(
             stats.set_target_addr(target.to_string());
             stats.reset_connection_stats();
         }
-        // The virtual extended display is enabled lazily by the capture loop's
-        // reconcile step, which only acts while a client is connected. If the
-        // user selected it before any client existed, this first registration
-        // is the moment to bring it up — which needs a pipeline restart so the
-        // capture loop re-runs reconciliation.
-        if shared.begin_virtual_display_attach() {
-            info!("Client connected with extended display selected — restarting pipeline to enable it");
-            shared.stop();
-            if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
-                warn!(error = %error, "Failed to request pipeline restart for the virtual display");
+        if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
+            if let Some(reason) = second_screen::remembered_failure(shared) {
+                info!(
+                    second_screen_fallback = reason,
+                    "Client connected, but the second screen failed to start earlier — \
+                     mirroring the primary display until the user clicks Try again"
+                );
             }
         }
     }
@@ -694,21 +692,57 @@ async fn execute_actions(
             .lock()
             .set_target_addr("waiting for client".to_string());
 
-        // Tear the managed virtual display down when its viewer disappears —
-        // the capture reconcile disables it on restart once no client is
-        // connected. (This closes the docs/decisions.md "idle-disconnect teardown"
-        // item, which was blocked on exactly this liveness signal.)
-        let vdd_in_use = *shared.capture_target.lock() == CaptureTarget::VirtualExtended
-            && matches!(
-                *shared.vdd_status.lock(),
-                VddStatus::Active | VddStatus::Attaching
-            );
-        if vdd_in_use {
-            info!("Client gone while streaming the virtual display — restarting pipeline to tear it down");
-            shared.stop();
-            if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
-                warn!(error = %error, "Failed to request pipeline restart after client loss");
+        // The managed virtual display outlives its viewer by a grace period,
+        // so a quick reconnect finds it, and a start in progress finishes.
+        // `second_screen::next_step` turns it off once the grace period ends.
+        if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
+            match *shared.vdd_status.lock() {
+                VddStatus::Active => info!(
+                    grace_s = second_screen::RELEASE_GRACE.as_secs(),
+                    "Client gone while streaming the virtual display — keeping it on in case \
+                     the iPad reconnects"
+                ),
+                VddStatus::Attaching => {
+                    info!("Client gone while the virtual display starts — letting the start finish")
+                }
+                _ => {}
             }
+        }
+    }
+
+    let restart = match second_screen::next_step(shared, Instant::now()) {
+        second_screen::Step::Nothing => false,
+        second_screen::Step::Attach => {
+            info!(
+                "Client connected with extended display selected — mirroring the primary \
+                 display while the virtual display starts"
+            );
+            second_screen::send(shared, second_screen::Command::Attach);
+            false
+        }
+        second_screen::Step::Switch => {
+            info!("Virtual display ready — restarting pipeline to stream it");
+            true
+        }
+        second_screen::Step::Release => {
+            info!("No iPad came back to the virtual display — restarting pipeline to turn it off");
+            true
+        }
+        second_screen::Step::Fallback(reason) => {
+            warn!(
+                second_screen_fallback = reason,
+                prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
+                "The virtual display showed no picture — restarting pipeline to mirror the \
+                 primary display instead"
+            );
+            second_screen::send(shared, second_screen::Command::Fallback(reason));
+            true
+        }
+    };
+    if restart {
+        shared.stop();
+        if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+            warn!(error = %error, "Failed to request pipeline restart for the virtual display");
         }
     }
 }

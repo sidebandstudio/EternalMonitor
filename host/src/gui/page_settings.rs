@@ -37,11 +37,7 @@ impl AnalyzerApp {
             widgets::setting_row(
                 ui,
                 "Match the iPad's resolution",
-                if extending {
-                    "Makes the second screen exactly as sharp and smooth as the iPad's display."
-                } else {
-                    "Used by Second screen. Makes it exactly as sharp and smooth as the iPad's display."
-                },
+                vdd_match_description(extending),
                 64.0,
                 |ui| {
                     widgets::toggle(ui, &mut vdd_match, "Match the second screen to the iPad's resolution");
@@ -326,5 +322,16 @@ fn choice_label(label: &str) -> String {
         "QSV" => "Intel Quick Sync".into(),
         "x264" => "x264 (CPU)".into(),
         other => other.into(),
+    }
+}
+
+/// What "Match the iPad's resolution" does, and when a change applies: the
+/// driver reads the modes when the second screen starts, and restarting
+/// the stream keeps the second screen that is already there.
+pub(super) fn vdd_match_description(extending: bool) -> &'static str {
+    if extending {
+        "Makes the second screen exactly as sharp and smooth as the iPad's display. A change applies the next time the second screen starts, when the iPad connects again."
+    } else {
+        "Used by Second screen. Makes it exactly as sharp and smooth as the iPad's display. A change applies the next time the second screen starts."
     }
 }

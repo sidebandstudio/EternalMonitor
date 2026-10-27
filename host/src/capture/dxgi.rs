@@ -16,10 +16,11 @@ use super::recovery::{
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
-    reconcile_virtual_display, recovery_poll, resolve_target, FrameSlot, FrameUse, IdleGate,
-    OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
+    keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
+    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
+    FPS_WINDOW,
 };
-use crate::control::SharedControl;
+use crate::control::{CaptureTarget, SharedControl};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -121,6 +122,8 @@ pub fn run_capture_loop(
     let Some(target) = reconcile_virtual_display(&requested_target, &shared, generation) else {
         return Ok(());
     };
+    let second_screen = matches!(&target, CaptureTarget::Output(name)
+        if shared.vdd_output.lock().as_deref() == Some(name.as_str()));
     // DXGI factories snapshot adapters at creation. Enable the driver first,
     // then enumerate and open the chosen output from the same fresh factory.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -361,6 +364,9 @@ pub fn run_capture_loop(
         match hr {
             Ok(()) => {
                 *frame_number += 1;
+                if !super::second_screen::PROOF_NEEDS_IMAGE {
+                    super::second_screen::note_image(&shared, generation);
+                }
 
                 // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
                 if frame_info.LastMouseUpdateTime != 0 {
@@ -414,87 +420,86 @@ pub fn run_capture_loop(
                     }
                     continue;
                 }
-                seen_image = true;
-
-                let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
-                {
-                    match resource.cast::<ID3D11Texture2D>() {
-                        Ok(desktop_texture) => {
-                            unsafe {
-                                device_context.CopyResource(&staging_texture, &desktop_texture);
-                            }
-
-                            // Release acquired frame — staging texture has its own copy
-                            unsafe {
-                                dupl.ReleaseFrame()?;
-                            }
-
-                            let mut pixel_buf =
-                                match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
-                                    Some(buf) if buf.len() == frame_bytes => buf,
-                                    _ => vec![0u8; frame_bytes],
-                                };
-
-                            // Map staging texture for CPU read
-                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                            unsafe {
-                                device_context.Map(
-                                    &staging_texture,
-                                    0,
-                                    D3D11_MAP_READ,
-                                    0,
-                                    Some(&mut mapped),
-                                )?;
-                            }
-
-                            // Copy row-by-row (pitch may differ from width*4)
-                            let src_pitch = mapped.RowPitch as usize;
-                            let src_ptr = mapped.pData as *const u8;
-                            for row in 0..tex_height as usize {
-                                let src_offset = row * src_pitch;
-                                let dst_offset = row * row_bytes;
+                let frame_data = read_back_image(&shared, generation, &mut seen_image, || {
+                    windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
+                        match resource.cast::<ID3D11Texture2D>() {
+                            Ok(desktop_texture) => {
                                 unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src_ptr.add(src_offset),
-                                        pixel_buf.as_mut_ptr().add(dst_offset),
+                                    device_context.CopyResource(&staging_texture, &desktop_texture);
+                                }
+
+                                // Release acquired frame — staging texture has its own copy
+                                unsafe {
+                                    dupl.ReleaseFrame()?;
+                                }
+
+                                let mut pixel_buf =
+                                    match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
+                                        Some(buf) if buf.len() == frame_bytes => buf,
+                                        _ => vec![0u8; frame_bytes],
+                                    };
+
+                                // Map staging texture for CPU read
+                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                                unsafe {
+                                    device_context.Map(
+                                        &staging_texture,
+                                        0,
+                                        D3D11_MAP_READ,
+                                        0,
+                                        Some(&mut mapped),
+                                    )?;
+                                }
+
+                                // Copy row-by-row (pitch may differ from width*4)
+                                let src_pitch = mapped.RowPitch as usize;
+                                let src_ptr = mapped.pData as *const u8;
+                                for row in 0..tex_height as usize {
+                                    let src_offset = row * src_pitch;
+                                    let dst_offset = row * row_bytes;
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            src_ptr.add(src_offset),
+                                            pixel_buf.as_mut_ptr().add(dst_offset),
+                                            row_bytes,
+                                        );
+                                    }
+                                }
+
+                                unsafe {
+                                    device_context.Unmap(&staging_texture, 0);
+                                }
+
+                                // Composite the mouse cursor into the BGRA frame.
+                                if cursor_visible && cursor.has_shape {
+                                    draw_cursor(
+                                        &mut pixel_buf,
+                                        tex_width,
+                                        tex_height,
                                         row_bytes,
+                                        &cursor,
+                                        cursor_x,
+                                        cursor_y,
                                     );
                                 }
-                            }
 
-                            unsafe {
-                                device_context.Unmap(&staging_texture, 0);
+                                Some(Arc::new(pixel_buf))
                             }
-
-                            // Composite the mouse cursor into the BGRA frame.
-                            if cursor_visible && cursor.has_shape {
-                                draw_cursor(
-                                    &mut pixel_buf,
-                                    tex_width,
-                                    tex_height,
-                                    row_bytes,
-                                    &cursor,
-                                    cursor_x,
-                                    cursor_y,
-                                );
+                            Err(e) => {
+                                warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
+                                unsafe {
+                                    dupl.ReleaseFrame()?;
+                                }
+                                None
                             }
-
-                            Some(Arc::new(pixel_buf))
                         }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
-                            unsafe {
-                                dupl.ReleaseFrame()?;
-                            }
-                            None
+                    } else {
+                        unsafe {
+                            dupl.ReleaseFrame()?;
                         }
-                    }
-                } else {
-                    unsafe {
-                        dupl.ReleaseFrame()?;
-                    }
-                    None
-                };
+                        None
+                    })
+                })?;
 
                 if let Some(data) = frame_data {
                     if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
@@ -531,8 +536,16 @@ pub fn run_capture_loop(
                 // the iPad would sit on a black screen until it times out. While a client is
                 // connected, resend the last captured image so the encoder emits the pending IDR
                 // and the stream stays alive. pixel_buf holds the last composited frame (zeroed
-                // black before the first real frame, which is still a valid keyframe).
-                if client_connected(&shared) && last_send.elapsed() >= IDLE_KEEPALIVE {
+                // black before the first real frame, which is still a valid keyframe). A
+                // pending keyframe request is answered without waiting for the keepalive.
+                if client_connected(&shared)
+                    && keepalive_due(
+                        last_send.elapsed(),
+                        shared.force_next_idr.load(Ordering::SeqCst),
+                        seen_image,
+                    )
+                    && keepalive_allowed(seen_image, second_screen)
+                {
                     resend_last_frame(
                         slot,
                         &shared,
@@ -590,7 +603,9 @@ pub fn run_capture_loop(
                             return Ok(());
                         }
                         let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed()) {
+                        if recovery_poll(&shared, now_ms, last_send.elapsed())
+                            && keepalive_allowed(seen_image, second_screen)
+                        {
                             resend_last_frame(
                                 slot,
                                 &shared,

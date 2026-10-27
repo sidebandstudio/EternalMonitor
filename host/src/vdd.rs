@@ -59,18 +59,34 @@ enum TaskOutcome {
     Done,
     TimedOut,
     Missing,
-    Failed,
+    /// With the device state the Enable task found, when it said.
+    Failed(Option<crate::vdd_device::DeviceState>),
 }
+
+/// What a failed Enable can tell about the device: the state the task
+/// found, or why there is none.
+pub(crate) type EnableReport = Result<crate::vdd_device::DeviceState, &'static str>;
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
 impl TaskOutcome {
+    /// For an Enable task that ran and did not succeed.
+    fn report(self) -> EnableReport {
+        match self {
+            Self::Failed(Some(state)) => Ok(state),
+            Self::Failed(None) => Err("display task failed"),
+            Self::TimedOut => Err("display task timed out"),
+            Self::Missing => Err("display tasks missing"),
+            Self::Done => Err("display task finished"),
+        }
+    }
+
     fn from_stderr(stderr: &str) -> Self {
         if stderr.contains("timed out") {
             Self::TimedOut
         } else if stderr.contains("0x80070002") {
             Self::Missing
         } else {
-            Self::Failed
+            Self::Failed(crate::vdd_device::from_task_stderr(stderr))
         }
     }
 }
@@ -155,7 +171,7 @@ impl TaskGate {
                 self.stuck = Some((now, enabled));
             }
             TaskOutcome::Missing => self.health = VddTaskHealth::TasksMissing,
-            TaskOutcome::Failed => {}
+            TaskOutcome::Failed(_) => {}
         }
     }
 }
@@ -178,6 +194,10 @@ pub fn recheck_tasks() {
 struct DriverTasks {
     serial: parking_lot::Mutex<()>,
     gate: parking_lot::Mutex<TaskGate>,
+    /// Disables running or waiting for their turn. A pipeline's own Disable
+    /// does not queue behind one: the display ends up off either way, and
+    /// a Mirror stream need not wait for it to show its first frame.
+    disabling: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
@@ -186,6 +206,7 @@ impl DriverTasks {
         Self {
             serial: parking_lot::Mutex::new(()),
             gate: parking_lot::Mutex::new(TaskGate::new()),
+            disabling: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -193,19 +214,51 @@ impl DriverTasks {
         self.gate.lock().health
     }
 
+    #[cfg(test)]
     fn set_enabled(
         &self,
         enabled: bool,
         purpose: Purpose,
-        mut progress: impl FnMut(),
+        progress: impl FnMut(),
         run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
     ) -> bool {
+        self.set_enabled_on_turn(enabled, purpose, progress, || {}, run)
+    }
+
+    /// As `set_enabled`, calling `on_turn` once this request holds the turn:
+    /// every request made after that queues behind it.
+    fn set_enabled_on_turn(
+        &self,
+        enabled: bool,
+        purpose: Purpose,
+        mut progress: impl FnMut(),
+        on_turn: impl FnOnce(),
+        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
+    ) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Pending<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                if let Some(count) = self.0 {
+                    count.fetch_sub(1, SeqCst);
+                }
+            }
+        }
+        if !enabled {
+            if purpose == Purpose::Attempt && self.disabling.load(SeqCst) > 0 {
+                tracing::debug!("A Disable is already pending; not waiting for it");
+                return true;
+            }
+            self.disabling.fetch_add(1, SeqCst);
+        }
+        let _pending = Pending((!enabled).then_some(&self.disabling));
         let _serial = loop {
             if let Some(guard) = self.serial.try_lock_for(Duration::from_millis(50)) {
                 break guard;
             }
             progress();
         };
+        on_turn();
         // The gate guard ends with this statement. Logging below reads the
         // health through the same mutex, which deadlocked when the guard
         // lived through the whole match.
@@ -234,6 +287,11 @@ pub const TASK_DISABLE: &str = "EternalMonitor VDD Disable";
 #[cfg(windows)]
 fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
     use std::os::windows::process::CommandExt;
+    #[cfg(debug_assertions)]
+    if let Some(outcome) = simulated_enable_failure(task) {
+        warn!(task, ?outcome, "Simulating a failed VDD task");
+        return outcome;
+    }
     let started = Instant::now();
     // An Enable that timed out here can still be running in Task Scheduler;
     // each direction waits for the other first, so the last request wins.
@@ -265,7 +323,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
         Ok(child) => child,
         Err(error) => {
             warn!(task, %error, "Failed to invoke the VDD task");
-            return TaskOutcome::Failed;
+            return TaskOutcome::Failed(None);
         }
     };
     // vdd_task.ps1 waits up to 10 s for an earlier instance and 15 s for its own.
@@ -309,32 +367,90 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
         }
         Err(error) => {
             warn!(task, error = %error, "Failed to read the VDD task result");
-            TaskOutcome::Failed
+            TaskOutcome::Failed(None)
         }
+    }
+}
+
+/// Debug builds only, to check the failure paths on a PC whose tasks work:
+/// `ETERNAL_SIMULATE_ENABLE_FAILURE=missing|timeout|failed` makes the Enable
+/// task report that without running.
+#[cfg(all(windows, debug_assertions))]
+fn simulated_enable_failure(task: &str) -> Option<TaskOutcome> {
+    if task != TASK_ENABLE {
+        return None;
+    }
+    match std::env::var("ETERNAL_SIMULATE_ENABLE_FAILURE")
+        .ok()?
+        .as_str()
+    {
+        "missing" => Some(TaskOutcome::Missing),
+        "timeout" => Some(TaskOutcome::TimedOut),
+        "failed" => Some(TaskOutcome::Failed(None)),
+        _ => None,
     }
 }
 
 /// Complete one installer-owned driver action while capture reports startup progress.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
-    request(enabled, Purpose::Attempt, progress)
+    request(enabled, Purpose::Attempt, progress, &mut None)
 }
 
-fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
+/// Why an Enable the gate did not run failed.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+fn refused(health: VddTaskHealth) -> EnableReport {
+    Err(match health {
+        VddTaskHealth::TasksMissing => "display tasks missing",
+        VddTaskHealth::NotResponding => "display task not responding",
+        VddTaskHealth::Ok => "display task not run",
+    })
+}
+
+/// Turn the virtual display on. On failure, what the Enable task found
+/// wrong with the device, or why it could not say.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+pub(crate) fn enable(progress: impl FnMut()) -> Result<(), EnableReport> {
+    let mut ran = None;
+    if request(true, Purpose::Attempt, progress, &mut ran) {
+        Ok(())
+    } else {
+        Err(ran.map_or_else(|| refused(task_health()), TaskOutcome::report))
+    }
+}
+
+fn request(
+    enabled: bool,
+    purpose: Purpose,
+    progress: impl FnMut(),
+    ran: &mut Option<TaskOutcome>,
+) -> bool {
+    request_on_turn(enabled, purpose, progress, || {}, ran)
+}
+
+fn request_on_turn(
+    enabled: bool,
+    purpose: Purpose,
+    progress: impl FnMut(),
+    on_turn: impl FnOnce(),
+    ran: &mut Option<TaskOutcome>,
+) -> bool {
     #[cfg(windows)]
     {
-        TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
-            let mut outcome = TaskOutcome::Failed;
+        TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
+            let mut outcome = TaskOutcome::Failed(None);
             crate::startup::display::change(enabled, progress, |progress| {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
                 outcome == TaskOutcome::Done
             });
+            *ran = Some(outcome);
             outcome
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = (enabled, purpose, progress);
+        let _ = (enabled, purpose, progress, ran);
+        on_turn();
         false
     }
 }
@@ -344,7 +460,31 @@ fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
 /// it, and it waits for an Enable still running, within the task's bounds.
 /// True when the display is known to be off.
 pub fn disable() -> bool {
-    request(false, Purpose::Cleanup, || {})
+    request(false, Purpose::Cleanup, || {}, &mut None)
+}
+
+/// `disable` at startup, without holding up the first frame: the Disable
+/// runs on its own thread, and this returns once it holds the turn, so
+/// every later request (an Enable, the quit's Disable) still runs after it.
+/// A hung task no longer keeps a Mirror stream black for up to 30 s.
+pub fn disable_in_background() {
+    let (held, turn) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("vdd-startup-off".into())
+        .spawn(move || {
+            let on_turn = move || {
+                let _ = held.send(());
+            };
+            request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None)
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = turn.recv();
+        }
+        Err(_) => {
+            disable();
+        }
+    }
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
@@ -493,7 +633,7 @@ mod tests {
         let mut gate = TaskGate::new();
         let now = Instant::now();
         gate.after(false, TaskOutcome::Done, now);
-        gate.after(true, TaskOutcome::Failed, now);
+        gate.after(true, TaskOutcome::Failed(None), now);
         // A failed task leaves the device state unknown, so disable runs again.
         assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
         gate.after(false, TaskOutcome::Missing, now);
@@ -554,7 +694,7 @@ mod tests {
         // A failed Disable leaves the state unknown, so quit tries again.
         let mut gate = TaskGate::new();
         gate.after(true, TaskOutcome::Done, now);
-        gate.after(false, TaskOutcome::Failed, now);
+        gate.after(false, TaskOutcome::Failed(None), now);
         assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Run);
     }
 
@@ -710,6 +850,113 @@ mod tests {
     }
 
     #[test]
+    fn enable_failures_without_a_device_state_say_why() {
+        use crate::vdd_device::DeviceState;
+        assert_eq!(
+            TaskOutcome::Failed(Some(DeviceState::Problem(43))).report(),
+            Ok(DeviceState::Problem(43))
+        );
+        assert_eq!(
+            TaskOutcome::Failed(None).report(),
+            Err("display task failed")
+        );
+        assert_eq!(
+            TaskOutcome::TimedOut.report(),
+            Err("display task timed out")
+        );
+        assert_eq!(TaskOutcome::Missing.report(), Err("display tasks missing"));
+        // The gate refused to run the task at all.
+        assert_eq!(
+            refused(VddTaskHealth::TasksMissing),
+            Err("display tasks missing")
+        );
+        assert_eq!(
+            refused(VddTaskHealth::NotResponding),
+            Err("display task not responding")
+        );
+        assert_eq!(refused(VddTaskHealth::Ok), Err("display task not run"));
+    }
+
+    /// Runs `set_enabled` on a thread; `None` if it has not returned in 2 s.
+    fn returns_within(
+        tasks: &std::sync::Arc<DriverTasks>,
+        enabled: bool,
+        purpose: Purpose,
+        runs: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    ) -> Option<bool> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let tasks = std::sync::Arc::clone(tasks);
+        std::thread::spawn(move || {
+            let ran = tasks.set_enabled(
+                enabled,
+                purpose,
+                || {},
+                |e, _| {
+                    runs.lock().unwrap().push(e);
+                    TaskOutcome::Done
+                },
+            );
+            let _ = done_tx.send(ran);
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    #[test]
+    fn a_mirror_start_does_not_wait_behind_the_startup_disable() {
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+        let tasks = Arc::new(DriverTasks::new());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        // The startup Disable holds the turn: its task is hung.
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let startup = {
+            let tasks = Arc::clone(&tasks);
+            std::thread::spawn(move || {
+                tasks.set_enabled(
+                    false,
+                    Purpose::Cleanup,
+                    || {},
+                    |_, _| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        TaskOutcome::Done
+                    },
+                )
+            })
+        };
+        started_rx.recv().unwrap();
+        // The Mirror pipeline's Disable returns at once and runs nothing.
+        assert_eq!(
+            returns_within(&tasks, false, Purpose::Attempt, Arc::clone(&runs)),
+            Some(true),
+            "the pipeline waited behind the startup Disable"
+        );
+        // An Enable still waits its turn, then runs after the Disable.
+        let (enable_tx, enable_rx) = channel();
+        {
+            let (tasks, runs) = (Arc::clone(&tasks), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                let _ = enable_tx.send(returns_within(&tasks, true, Purpose::Attempt, runs));
+            });
+        }
+        assert!(
+            enable_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the Enable did not wait"
+        );
+        release_tx.send(()).unwrap();
+        assert!(startup.join().unwrap());
+        assert_eq!(enable_rx.recv().unwrap(), Some(true));
+        assert_eq!(*runs.lock().unwrap(), vec![true]);
+        // With nothing pending, a pipeline Disable runs again.
+        assert_eq!(
+            returns_within(&tasks, false, Purpose::Attempt, Arc::clone(&runs)),
+            Some(true)
+        );
+        assert_eq!(*runs.lock().unwrap(), vec![true, false]);
+    }
+
+    #[test]
     fn task_errors_are_classified_from_the_script_output() {
         assert_eq!(
             TaskOutcome::from_stderr("Previous VDD task timed out: EternalMonitor VDD Disable"),
@@ -723,7 +970,12 @@ mod tests {
         );
         assert_eq!(
             TaskOutcome::from_stderr("VDD task failed: x, result=1"),
-            TaskOutcome::Failed
+            TaskOutcome::Failed(None)
+        );
+        // The Enable task says what it found wrong with the device.
+        assert_eq!(
+            TaskOutcome::from_stderr("VDD task failed: EternalMonitor VDD Enable, result=5"),
+            TaskOutcome::Failed(Some(crate::vdd_device::DeviceState::NoMonitor))
         );
     }
 }
