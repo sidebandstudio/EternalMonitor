@@ -69,7 +69,8 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 One session owns the active link. Another device receives Busy; a reconnect from
 the same device supersedes its prior session. Duplicate accepted nonces replay
 the same ACK. All established-session traffic is session-id gated. Reports/input
-maintain liveness; expiry removes the client and its managed virtual display.
+maintain liveness; expiry removes the client, and 10 s later its managed
+virtual display unless the iPad has come back.
 
 UDP carries video, audio and control on the same socket. The iPad's established
 Network.framework backend remains the default. A selectable BSD backend uses a

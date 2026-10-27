@@ -392,9 +392,15 @@ pub(crate) fn wedge_reason_at(
 
     // A client is connected but no frame has been produced for 5s. Sound
     // because the idle keepalive guarantees a frame at least every ~750ms
-    // while a client is registered.
+    // while a client is registered. Not while the second screen proves
+    // itself: nothing is sent from it until its first image, and a restart
+    // here came before its own fallback.
     let client_connected = shared.client_connected();
-    if client_connected && frame_ms > 0 && now_ms.saturating_sub(frame_ms) > 5_000 {
+    if client_connected
+        && frame_ms > 0
+        && now_ms.saturating_sub(frame_ms) > 5_000
+        && !crate::capture::second_screen::proving(shared)
+    {
         return Some(format!(
             "no captured frame for {}ms with a client connected",
             now_ms.saturating_sub(frame_ms)

@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::error;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use tracing::{info, warn};
 
 use crate::control::SharedControl;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
 use crate::vdd_device::{DeviceState, VddProblem};
@@ -23,6 +23,7 @@ use crate::vdd_device::{DeviceState, VddProblem};
 #[cfg(windows)]
 pub mod dxgi;
 pub mod recovery;
+pub mod second_screen;
 pub mod synthetic;
 pub(crate) mod timing;
 
@@ -334,7 +335,7 @@ pub(crate) fn recovery_poll(shared: &SharedControl, now_ms: u64, since_send: Dur
     since_send >= IDLE_KEEPALIVE
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
     shared.running.load(std::sync::atomic::Ordering::SeqCst)
         && crate::supervisor::generation_is_current(generation)
@@ -608,182 +609,113 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
 }
 
 /// Reconcile the virtual display device to the requested target and return the concrete
-/// target to capture. `VirtualExtended` enables the bundled driver **only once an iPad is
-/// connected**, waits for a genuinely-new output to attach, and returns it as an `Output(name)`;
-/// any other target (and the no-client / failure / timeout cases) disables the driver so no
-/// phantom monitor lingers, falling back to `PrimaryAuto`.
-#[cfg(windows)]
+/// target to capture. `VirtualExtended` captures the virtual display once it is attached and
+/// a viewer is connected (or one left less than [`second_screen::RELEASE_GRACE`] ago), and
+/// mirrors `PrimaryAuto` otherwise: while [`second_screen`] turns the display on beside the
+/// mirror, after it failed to, and with nobody connected. Any other target turns the display
+/// off. Never waits for the driver: the [`second_screen`] worker changes it, and the mirror
+/// must not wait behind a slow Enable or attach.
+#[cfg(any(windows, test))]
 pub(crate) fn reconcile_virtual_display(
     target: &CaptureTarget,
     shared: &SharedControl,
     generation: u64,
 ) -> Option<CaptureTarget> {
-    let progress = || {
-        if capture_is_current(shared, generation) {
-            startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
-        }
-    };
-    // A previous capture thread may still be leaving its attach poll or a
-    // driver task (up to 30 s) when the supervisor starts the next generation.
-    // Only one may trigger driver tasks. Waiting here without heartbeats read
-    // as a wedged capture loop after 3 s, and each forced restart queued
-    // another generation behind the same lock.
-    let _lifecycle = loop {
-        if let Some(guard) = shared.vdd_lifecycle.try_lock_for(Duration::from_millis(50)) {
-            break guard;
-        }
-        if !capture_is_current(shared, generation) {
-            return None;
-        }
-        progress();
-    };
     if !capture_is_current(shared, generation) {
         return None;
     }
+    let owned = shared.vdd_output.lock().clone();
     match target {
         CaptureTarget::VirtualExtended => {
-            // Defer enabling the VDD until an iPad actually connects. The transport restarts the
-            // pipeline on the first receiver registration, so this runs again with a connected
-            // client at that point and the display comes up then — never while the PC sits idle.
-            let waiting_for_client = {
-                let session = shared.session.lock();
-                let waiting = !session.is_active();
-                *shared.vdd_status.lock() = if waiting {
-                    VddStatus::WaitingForClient
-                } else {
-                    VddStatus::Attaching
-                };
-                waiting
-            };
-            if waiting_for_client {
+            // A restart must not erase a second screen that already failed
+            // to show an image: it goes back to the mirror now.
+            if let Some(reason) = second_screen::take_unproven(shared, Instant::now()) {
+                warn!(
+                    second_screen_fallback = reason,
+                    prove_timeout_ms = second_screen::PROVE_TIMEOUT.as_millis() as u64,
+                    "The virtual display showed no picture — mirroring the primary display instead"
+                );
+                second_screen::send(shared, second_screen::Command::Release);
+                return Some(CaptureTarget::PrimaryAuto);
+            }
+            let connected = shared.client_connected();
+            let status = *shared.vdd_status.lock();
+            if matches!(
+                status,
+                VddStatus::Attaching | VddStatus::Failed | VddStatus::TaskFailed
+            ) {
+                return Some(CaptureTarget::PrimaryAuto);
+            }
+            // Settings and codec changes restart capture without removing the
+            // managed monitor, and the stream moves onto it this way once it
+            // attaches. Reuse that output rather than turning it on again.
+            let attached = owned.clone().filter(|name| {
+                enumerate_outputs()
+                    .iter()
+                    .any(|output| !output.is_primary && &output.device_name == name)
+            });
+            if let Some(name) = attached {
+                if status == VddStatus::Active
+                    && (connected || shared.second_screen.lock().keep_without_viewer())
+                {
+                    second_screen::start_proving(shared, generation, Instant::now());
+                    return Some(CaptureTarget::Output(name));
+                }
+            }
+            // The transport's next tick starts the display beside this mirror.
+            // A viewer that arrived meanwhile may already have claimed it.
+            {
+                let mut status = shared.vdd_status.lock();
+                if *status != VddStatus::Attaching {
+                    *status = VddStatus::WaitingForClient;
+                }
+            }
+            if !connected {
                 info!(
                     "Extended display selected but no iPad has connected yet — leaving the \
                      virtual display off and mirroring the primary display until a client registers"
                 );
-                crate::vdd::set_enabled(false, progress);
-                *shared.vdd_output.lock() = None;
-                return capture_is_current(shared, generation)
-                    .then_some(CaptureTarget::PrimaryAuto);
-            }
-
-            let outputs = enumerate_outputs();
-            // Settings and codec changes restart capture without removing the
-            // managed monitor. Reuse that output rather than waiting for it to
-            // appear a second time or selecting a physical secondary monitor.
-            if let Some(name) = shared.vdd_output.lock().as_ref() {
-                if outputs
-                    .iter()
-                    .any(|output| !output.is_primary && &output.device_name == name)
-                {
-                    *shared.vdd_status.lock() = VddStatus::Active;
-                    return Some(CaptureTarget::Output(name.clone()));
+                if owned.is_some() {
+                    second_screen::send(shared, second_screen::Command::Release);
                 }
             }
-            *shared.vdd_output.lock() = None;
-
-            let request = prepare_vdd_settings(shared, &outputs);
-
-            let before: Vec<String> = outputs.into_iter().map(|o| o.device_name).collect();
-            if !capture_is_current(shared, generation) {
-                return None;
-            }
-            startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
-            // After "kept your desktop off it" the user switches Windows to
-            // Extend while this attempt waits, so give them time to.
-            let timeout = match shared.vdd_problem.lock().take() {
-                Some(VddProblem::NotExtended) => VDD_EXTEND_TIMEOUT,
-                _ => vdd_attach_timeout(),
-            };
-            if let Err(report) = crate::vdd::enable(progress) {
-                if !capture_is_current(shared, generation) {
-                    return None;
-                }
-                warn!(
-                    "Virtual display could not be enabled (installer task missing?) — \
-                     capturing the primary display instead"
-                );
-                if let Ok(device) = report {
-                    report_device(shared, device);
-                }
-                // Every failed Enable, with or without a device state, and
-                // before the Disable below.
-                log_failure_snapshot(report, &request);
-                // The task enabled a device that cannot show a display.
-                if report.is_ok_and(|device| device != DeviceState::Missing) {
-                    crate::vdd::set_enabled(false, progress);
-                }
-                *shared.vdd_status.lock() = VddStatus::TaskFailed;
-                return Some(CaptureTarget::PrimaryAuto);
-            }
-            let poll = || {
-                if !capture_is_current(shared, generation) {
-                    return None;
-                }
-                startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
-                Some(enumerate_outputs())
-            };
-            let waiting_since = Instant::now();
-            let mut result =
-                wait_for_virtual_output(&before, timeout, poll, Instant::now, std::thread::sleep);
-            static CANCELLED_SNAPSHOT: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if matches!(result, AttachResult::Cancelled)
-                && snapshot_cancelled_attach(waiting_since.elapsed(), &CANCELLED_SNAPSHOT)
-            {
-                info!(
-                    waited_ms = waiting_since.elapsed().as_millis() as u64,
-                    "Virtual display had not attached when the attempt ended"
-                );
-                log_failure_snapshot(Ok(crate::vdd_device::query()), &request);
-            }
-            if simulated_attach_timeout() && matches!(result, AttachResult::Attached(_)) {
-                result = AttachResult::TimedOut;
-            }
-            // A device that is ready with its monitor means Windows left the
-            // desktop off it. The display layout stays the user's to change.
-            let device = matches!(result, AttachResult::TimedOut).then(crate::vdd_device::query);
-            if !capture_is_current(shared, generation) {
-                return None;
-            }
-            match result {
-                AttachResult::Cancelled => return None,
-                AttachResult::Attached(chosen) => {
-                    let chosen = settle_vdd_mode(chosen, request.mode, || {
-                        startup_heartbeat(shared, crate::clock::host_now_us() / 1000)
-                    });
-                    let render = crate::vdd_snapshot::render_card_now(&request.before);
-                    info!(
-                        device = %chosen.device_name,
-                        width = chosen.width,
-                        height = chosen.height,
-                        render = render.as_deref().unwrap_or("unknown"),
-                        "Virtual display attached — capturing it"
-                    );
-                    *shared.vdd_output.lock() = Some(chosen.device_name.clone());
-                    *shared.vdd_status.lock() = VddStatus::Active;
-                    return Some(CaptureTarget::Output(chosen.device_name));
-                }
-                AttachResult::TimedOut => {}
-            }
-            warn!("Virtual display did not attach in time — capturing the primary display instead");
-            if let Some(device) = device {
-                report_device(shared, device);
-                log_failure_snapshot(Ok(device), &request);
-            }
-            // enable() succeeded but nothing attached: turn it back off so we don't strand a
-            // half-enabled device as a phantom monitor.
-            crate::vdd::set_enabled(false, progress);
-            *shared.vdd_status.lock() = VddStatus::Failed;
             Some(CaptureTarget::PrimaryAuto)
         }
         other => {
             // Any non-virtual target: ensure the virtual display is off.
-            crate::vdd::set_enabled(false, progress);
-            *shared.vdd_output.lock() = None;
             *shared.vdd_status.lock() = VddStatus::Inactive;
+            if owned.is_some() {
+                second_screen::send(shared, second_screen::Command::Release);
+            }
             Some(other.clone())
         }
     }
+}
+
+/// Whether an idle keepalive may resend the last frame. Before the second
+/// screen has delivered an image, that frame is the black placeholder:
+/// sending it would replace the iPad's mirror with black, so the switch
+/// waits for a real picture, or falls back to the mirror.
+#[cfg(any(windows, test))]
+pub(crate) fn keepalive_allowed(seen_image: bool, second_screen: bool) -> bool {
+    seen_image || !second_screen
+}
+
+/// Reads back an acquired frame for the encoder. Only an image that was read
+/// back counts as the second screen's proof: when the readback fails, the
+/// proof stays pending for the capture error that follows.
+#[cfg(any(windows, test))]
+pub(crate) fn read_back_image<T, E>(
+    shared: &SharedControl,
+    generation: u64,
+    seen_image: &mut bool,
+    read: impl FnOnce() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let image = read()?;
+    if image.is_some() && !std::mem::replace(seen_image, true) {
+        second_screen::note_image(shared, generation);
+    }
+    Ok(image)
 }
 
 /// Runs the platform capture loop on the CURRENT thread until stop/close,
@@ -804,13 +736,17 @@ pub fn run_capture_stage(
     let result = recovery::run_until_unblocked(
         &shared,
         |frame_number| {
-            run_platform_loop(
+            let result = run_platform_loop(
                 &guard.0,
                 shared.clone(),
                 adapter_index,
                 generation,
                 frame_number,
-            )
+            );
+            if result.is_err() {
+                second_screen::note_capture_error(&shared, generation);
+            }
+            result
         },
         |delay| wait_while_blocked(&shared, generation, delay),
     );
@@ -850,6 +786,13 @@ pub fn frame_slot() -> (FrameSlot, FrameSlot) {
     (producer, consumer)
 }
 
+/// `ETERNAL_CAPTURE=synthetic`: the test pattern instead of the desktop, and
+/// no virtual display driver.
+#[cfg(windows)]
+pub(crate) fn synthetic_requested() -> bool {
+    std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"))
+}
+
 #[cfg(windows)]
 fn run_platform_loop(
     slot: &FrameSlot,
@@ -858,9 +801,7 @@ fn run_platform_loop(
     generation: u64,
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let synthetic_requested =
-        std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
-    if synthetic_requested {
+    if synthetic_requested() {
         synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
         dxgi::run_capture_loop(slot, shared, adapter_index, generation, frame_number)
@@ -900,7 +841,7 @@ mod tests {
         assert!(frame_has_image(0, true));
     }
 
-    fn connect_viewer(shared: &SharedControl) {
+    pub(super) fn connect_viewer(shared: &SharedControl) {
         use crate::transport::link::PeerId;
         use crate::transport::session::ConfigSource;
         use eternal_wire::v2::control::{ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264};
