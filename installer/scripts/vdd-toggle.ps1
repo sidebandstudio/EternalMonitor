@@ -8,18 +8,15 @@
 # VirtualDrivers/Virtual-Display-Driver enumerates under ROOT\DISPLAY and reports a friendly
 # name containing "Virtual Display", so we match on either — a real monitor is never ROOT\.
 #
-# Enable succeeds only when the display can appear: the device has its driver, no problem code,
-# is started, and its monitor has arrived. Otherwise the exit code says why, and the host reads
-# it as the task's result (host/src/vdd_device.rs):
-#   2 no device   3 no driver bound   4 not started   5 no monitor arrived
-#   100 + N       Windows problem code N (122: still disabled)
+# Enable fails when the display cannot appear: no device, no driver bound, or a Windows problem
+# code. The exit code says why, and the host reads it as the task's result (host/src/vdd_device.rs):
+#   2 no device   3 no driver bound   100 + N   Windows problem code N (122: still disabled)
+# A device that has not started yet or has no monitor yet still succeeds: its monitor can arrive
+# later, and the host waits for the display itself and reads the device's state if it never comes.
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('enable', 'disable')]
-    [string]$Action,
-    # How long an enabled device may take to start and add its monitor. Where the display works,
-    # the monitor is there when Enable-PnpDevice returns.
-    [int]$StartSeconds = 4
+    [string]$Action
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,11 +57,10 @@ foreach ($device in $devices) {
     if ($Action -eq 'enable') {
         # A device the Disable task turned off reports code 22 until this runs.
         Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
-        $deadline = (Get-Date).AddSeconds($StartSeconds)
-        while (($problem = Get-EnableProblem $device.InstanceId) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 200
-        }
-        if ($problem) {
+        $problem = Get-EnableProblem $device.InstanceId
+        if ($problem -and $problem.Code -in 4, 5) {
+            Write-Output "Virtual display enabled; $($problem.Text) yet"
+        } elseif ($problem) {
             [Console]::Error.WriteLine("Virtual display enable failed: $($problem.Text)")
             exit $problem.Code
         }

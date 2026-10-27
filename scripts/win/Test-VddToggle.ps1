@@ -67,7 +67,7 @@ function Expect-Failure([scriptblock]$Run, [string]$Message) {
 # Runs one enable with a short start wait, and checks its exit code.
 function Expect-Enable([int]$Code, [string]$Case) {
     $global:LASTEXITCODE = 0
-    & $toggle -Action enable -StartSeconds 0 2>$null | Out-Null
+    & $toggle -Action enable 2>$null | Out-Null
     if ($LASTEXITCODE -ne $Code) { throw "$Case`: expected exit $Code, got $LASTEXITCODE" }
 }
 try {
@@ -109,28 +109,28 @@ try {
         Expect-Enable (100 + $code) "problem $code"
     }
 
+    # Not started or no monitor yet: the monitor can still arrive, so Enable succeeds and the
+    # host's own wait decides. 0.3.2 works on PCs whose monitor arrives late.
     Reset-State
     $global:EMVddTestState.Enabled = @{Problem=0; Status='Unknown'; Monitor=$null}
-    Expect-Enable 4 'not started'
+    Expect-Enable 0 'not started yet'
 
     Reset-State
     $global:EMVddTestState.Enabled = @{Problem=0; Status='OK'; Monitor=$null}
-    Expect-Enable 5 'no monitor'
+    Expect-Enable 0 'no monitor yet'
     $global:EMVddTestState.Enabled = @{Problem=0; Status='OK'; Monitor='Error'}
-    Expect-Enable 5 'monitor with a problem'
+    Expect-Enable 0 'monitor not ready yet'
+    if ((& $toggle -Action enable) -notmatch 'no monitor arrived yet') { throw 'A device without a monitor yet was not reported' }
+
+    # No waiting: one check after Enable-PnpDevice, whatever it finds.
+    $global:EMVddTestState.Calls = @()
+    function Start-Sleep { throw 'Enable waited' }
+    & $toggle -Action enable | Out-Null
+    Remove-Item function:Start-Sleep
 
     Reset-State
     (Get-PnpDevice -InstanceId 'ROOT\DISPLAY\0007').Inf = $null
     Expect-Enable 3 'no driver bound'
-
-    # A monitor that arrives a moment after the device starts is waited for.
-    Reset-State
-    $global:EMVddTestState.Enabled = @{Problem=0; Status='OK'; Monitor='Unknown'}
-    function Start-Sleep { param($Milliseconds) (Get-PnpDevice -InstanceId 'DISPLAY\MTT1337\1&2&3&UID256').Status = 'OK' }
-    $global:LASTEXITCODE = 0
-    & $toggle -Action enable -StartSeconds 5 | Out-Null
-    Remove-Item function:Start-Sleep
-    if ($LASTEXITCODE -ne 0) { throw "A monitor that arrived during the wait failed: exit $LASTEXITCODE" }
 
     Reset-State
     $global:EMVddTestState.Devices = @($global:EMVddTestState.Devices[0])
@@ -138,7 +138,7 @@ try {
     $global:LASTEXITCODE = 0
     & $toggle -Action disable | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Disabling an absent device failed' }
-    Write-Output 'VDD toggle checks passed: selection, re-enable after code 22, two calls per check, still disabled, problem codes, not started, no monitor, late monitor, unbound driver, absent device'
+    Write-Output 'VDD toggle checks passed: selection, re-enable after code 22, two calls per check, still disabled, problem codes, not started or no monitor yet succeed, no waiting, unbound driver, absent device'
     # The failure cases leave their exit codes behind; CI ends with this one.
     $global:LASTEXITCODE = 0
 } finally {
