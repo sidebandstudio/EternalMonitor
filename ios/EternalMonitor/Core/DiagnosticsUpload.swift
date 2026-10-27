@@ -50,7 +50,8 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     private var nextAttempt = Date.distantPast
     private var backoff = 5.0
     private var statusText = "Automatic upload is not configured"
-    private let installationID: String
+    /// Shown to the user as the Support ID: support finds this iPad's uploaded rows by it.
+    let installationID: String
     private let launchID = UUID().uuidString
     private var dropped = 0
     private let lossLock = NSLock()

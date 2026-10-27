@@ -236,7 +236,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **Couldn't get its address. Type the Address shown on the PC.** under a found PC | The iPad saw the PC's name but not its address. | Type the **Address** shown in the PC window, then tap **Connect to PC**. |
 | **Your PC didn't answer** | Nothing came back from the PC. It may be closed, asleep, on another network, or blocked by a firewall. | Check that EternalMonitor is open on the PC and says **Ready for your iPad**, that the PC is awake, and that both are on the same Wi-Fi, not a guest network. If all of that is right, Windows Firewall or security software is probably blocking EternalMonitor: run EternalMonitor-Setup.exe again, or use a USB cable. Then tap **Try again**. |
 | **Your PC didn't answer over the cable** | The cable is connected, but EternalMonitor on the PC didn't reply through it. | Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again. |
-| **Your PC answered, but no picture arrived** | The connection worked, but the PC couldn't send its screen. | Look at EternalMonitor on the PC and follow any message it shows. Click **Restart** there, then tap **Try again** on the iPad. |
+| **Your PC answered, but no picture arrived** | The connection worked, but the PC's second screen didn't start, or the PC couldn't send its screen. | On the PC, choose **Mirror my screen** (**Main display (mirror)** in version 0.3.1), then tap **Try again** on the iPad. If the PC already mirrors, click **Restart** there first. After two attempts in a row end this way, the iPad stops reconnecting by itself until you tap **Try again**. |
 | **That looks like the pairing code, not the PC's address** | A six-digit number was typed where the address goes. | Type the **Address** from the PC window, for example 192.168.1.20. The iPad asks for the code after it connects. |
 | **That looks like your router's address, not your PC's** | Nothing answered at an address ending in .1, which is usually the Wi-Fi router. | Type the **Address** shown in the PC window. |
 | **That address doesn't look right** | The iPad couldn't find anything by that name. | Type the **Address** exactly as the PC window shows it. |
@@ -317,6 +317,7 @@ or an email to [hello@sideband.studio](mailto:hello@sideband.studio).
 Say what you tried, what you saw, your iPad model, and whether you used Wi-Fi or
 USB. On iPad, open **Settings → Support → Diagnostics**, then **Export diagnostics**
 for a text file or **Copy diagnostics**. Include both reports when possible.
+If you can't attach the report, copy the **Support ID** from the same screen into your message.
 
 Reports include Windows build, CPU, GPU and driver details; iPad hardware,
 iPadOS and app build; encoder/decoder setup, connection events and periodic

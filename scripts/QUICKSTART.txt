@@ -107,8 +107,9 @@ What the iPad says, and what to do:
   iPad", the PC is awake, and both are on the same Wi-Fi, not a guest
   network. If so, a firewall is probably blocking EternalMonitor: run
   EternalMonitor-Setup.exe again, or use a USB cable.
-- "Your PC answered, but no picture arrived": follow any message in this
-  window, click Restart, then tap Try again on the iPad.
+- "Your PC answered, but no picture arrived": choose Mirror my screen at
+  the top of the Stream page, then tap Try again on the iPad. If it
+  already mirrors, click Restart first.
 - "Lost the connection to your PC": wake the PC, check EternalMonitor is
   open, then tap Try again.
 - "That looks like the pairing code, not the PC's address": type the

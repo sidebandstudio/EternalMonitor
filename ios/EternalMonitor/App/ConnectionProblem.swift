@@ -88,8 +88,8 @@ enum ConnectionProblem: Equatable {
         case .noReply(usb: true):
             return "Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again."
         case .noPicture:
-            return "EternalMonitor on the PC couldn't send its screen. Look there for a message and follow it, click Restart, then try again. "
-                + "If it keeps happening, send us Settings, Diagnostics from this iPad and Performance, Copy logs from the PC."
+            return "The PC's second screen didn't start. On the PC, choose Mirror my screen (called Main display (mirror) in version 0.3.1), "
+                + "then try again. If it already mirrors, click Restart on the PC first."
         case .receiverNotReady:
             return "Close EternalMonitor on this iPad and open it again."
         case .badAddress(let host):
@@ -244,6 +244,78 @@ enum ConnectionProblem: Equatable {
     /// (EHOSTUNREACH, ENETUNREACH) usually means the PC is asleep or
     /// elsewhere while Wi-Fi works, so it gets the general advice.
     private static let offline: Set<POSIXErrorCode> = [.ENETDOWN]
+}
+
+/// Connect attempts in a row that one PC answered and that ended without a
+/// picture. A PC on 0.3.1 or 0.3.2 in Second screen mode answers, then can
+/// take longer than this iPad waits to send its first picture, and every new
+/// attempt restarts its second screen; on 0.3.1 that restart also closes the
+/// cable a few seconds in. Over the cable the PC connects again by itself a
+/// second later, so without a limit the attempts never end and the PC's
+/// screen blinks with each one.
+struct NoPictureStreak: Equatable {
+    /// Attempts that start by themselves stop at this many attempts without
+    /// a picture. One more attempt lets a PC that was only slow the first
+    /// time (a busy PC, a second screen that starts once) show its picture;
+    /// a second one means it fails the same way every time.
+    static let limit = 2
+
+    /// A PC by its pairing token, which it keeps across restarts and gives
+    /// over Wi-Fi and the cable alike. With pairing off it gives none, so
+    /// the name it gave, or its address if it gave none either.
+    enum PC: Equatable {
+        case paired(Data)
+        case named(String)
+    }
+
+    /// The PC that answered.
+    private(set) var pc: PC?
+    /// Where that PC last answered over Wi-Fi, as "address:port". The cable
+    /// doesn't say where the PC is on Wi-Fi, so an answer over it keeps this.
+    private(set) var address: String?
+    private(set) var timeouts = 0
+    /// That PC answered and sent no picture in this series.
+    private(set) var answeredWithoutPicture = false
+
+    var stopsReconnecting: Bool { timeouts >= Self.limit }
+
+    /// The PC `name` with pairing token `pairingToken` answered at `address`
+    /// (nil over the cable). Another PC starts a new series.
+    mutating func answered(by name: String, pairingToken: Data, at address: String?) {
+        let pc: PC = PairingStore.valid(pairingToken) ? .paired(pairingToken)
+            : .named(name.isEmpty ? address ?? "USB" : name)
+        if pc != self.pc {
+            self = NoPictureStreak()
+            self.pc = pc
+        }
+        if let address { self.address = address }
+    }
+
+    /// The attempt the PC answered ended without a picture: the timeout
+    /// fired, or the PC closed the connection first.
+    mutating func endedWithoutPicture() {
+        guard pc != nil else { return }
+        timeouts += 1
+        answeredWithoutPicture = true
+    }
+
+    /// The problem to show for a timeout at `address` (nil over the cable).
+    /// A PC that answered there earlier in the series and is silent now is
+    /// most likely restarting EternalMonitor, so it keeps the advice about
+    /// the picture.
+    func shown(_ problem: ConnectionProblem, at address: String?) -> ConnectionProblem {
+        switch problem {
+        case .noReply(usb: false), .routerAddress:
+            return answeredWithoutPicture && address != nil && address == self.address ? .noPicture : problem
+        default:
+            return problem
+        }
+    }
+
+    /// Try again: the user starts a new count. The PC still answered before.
+    mutating func restartCount() {
+        timeouts = 0
+    }
 }
 
 /// What the USB cable card says for each listener status.

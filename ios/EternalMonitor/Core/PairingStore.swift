@@ -69,7 +69,7 @@ final class PairingStore: ObservableObject {
         return "\(host.contains(":") ? "[\(host)]" : host):\(port)"
     }
 
-    static func valid(_ token: Data) -> Bool { token.count == 16 && token.contains(where: { $0 != 0 }) }
+    nonisolated static func valid(_ token: Data) -> Bool { token.count == 16 && token.contains(where: { $0 != 0 }) }
 
     func token(address: String) throws -> Data? {
         try storage.records().first { $0.account.hasSuffix("|\(address)") && Self.valid($0.token) }?.token

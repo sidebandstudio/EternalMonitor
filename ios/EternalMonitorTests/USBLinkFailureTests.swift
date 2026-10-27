@@ -362,6 +362,235 @@ final class USBLinkFailureTests: XCTestCase {
         }
     }
 
+    // MARK: A PC that answers over the cable but sends no picture, then
+    // connects the cable again by itself a second later.
+
+    /// Answers the iPad's HELLO2 on the cable's far end `fd` as the PC
+    /// `name` with pairing token `token`, then sends nothing more. False
+    /// after five quiet seconds.
+    nonisolated private static func acceptSession(on fd: Int32, name: String = "Test PC",
+                                                  token: Data = Data(17...32)) -> Bool {
+        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var framer = EMLinkFramer(expectsPreamble: false)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let count = recv(fd, &buffer, buffer.count, 0)
+            guard count > 0, let datagrams = try? framer.append(Data(buffer.prefix(count))) else { continue }
+            for datagram in datagrams {
+                guard case .hello2(let hello) = Wire.parseControl(datagram)?.message,
+                      let framed = try? EMLinkFramer.encode(FakeUDPHost.ack(nonce: hello.clientNonce, hostName: name,
+                                                                           authToken: token)) else { continue }
+                return framed.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) } == framed.count
+            }
+        }
+        return false
+    }
+
+    /// The loop that blinked the PC's screen: every timeout closed the cable,
+    /// the PC connected it again, and the iPad took it. At the limit the
+    /// iPad stops taking the cable until Try again.
+    func testRepeatedNoPictureOverTheCablePausesItUntilTryAgain() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        // Try again must not open the app's real USB listener port.
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        var cables: [FramedLink] = []
+        defer { cables.forEach { $0.stop() } }
+        let (manager, first) = try await connectOverCable(timing: fast)
+        defer { manager.cancel() }
+        cables.append(first)
+        for attempt in 1...NoPictureStreak.limit {
+            if attempt > 1 {
+                let cable = try await openCable()
+                cables.append(cable)
+                manager.acceptUSBLink(cable)
+                XCTAssertEqual(manager.state, .connecting, "attempt \(attempt) takes the cable")
+            }
+            let fd = peer
+            let accepted = await Task.detached { Self.acceptSession(on: fd) }.value
+            XCTAssertTrue(accepted, "attempt \(attempt) never sent HELLO2")
+            try await until("attempt \(attempt) times out") { manager.state == .disconnected }
+            XCTAssertEqual(manager.problem, .noPicture, "attempt \(attempt)")
+        }
+        XCTAssertEqual(manager.usbStatus, "USB: disconnected", "the cable is paused")
+        let refused = try await openCable()
+        cables.append(refused)
+        manager.acceptUSBLink(refused)
+        XCTAssertEqual(manager.state, .disconnected, "the PC's next cable connection is not taken")
+        XCTAssertEqual(manager.problem, .noPicture)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+
+        manager.retry()
+        XCTAssertNil(manager.problem)
+        let again = try await openCable()
+        cables.append(again)
+        manager.acceptUSBLink(again)
+        XCTAssertEqual(manager.state, .connecting, "Try again takes the cable again")
+    }
+
+    /// The PC connects the cable again, as it does a second after each
+    /// close, and offers it to the iPad.
+    private func plugIn(_ manager: ConnectionManager) async throws -> FramedLink {
+        let cable = try await openCable()
+        manager.acceptUSBLink(cable)
+        return cable
+    }
+
+    /// The PC `name` with pairing token `token` answers on the newest cable
+    /// and sends no picture.
+    private func answer(as name: String = "Test PC", token: Data = Data(17...32)) async {
+        let fd = peer
+        let accepted = await Task.detached { Self.acceptSession(on: fd, name: name, token: token) }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+    }
+
+    /// A PC on 0.3.1 restarts its stream when its second screen starts, and
+    /// that closed the cable a few seconds after it answered, before the
+    /// iPad's timeout; a second later it connected the cable again. Each of
+    /// those counts as a no-picture attempt, whether the cable closes or
+    /// fails, so the loop stops at the limit. A cable that ends before the
+    /// PC answers doesn't count.
+    func testAPCThatAnswersAndThenEndsTheCableStopsAtTheLimit() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        // Try again must not open the app's real USB listener port.
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        enableWiFiFallback(to: FakeUDPHost())  // the saved Wi-Fi PC, silent
+        // The cable comes back during the fallback's first wait, long before
+        // the connect timeout.
+        let timing = ConnectionManager.Timing(connectTimeoutSeconds: 5, reconnectGraceSeconds: 0.1,
+            reconnectBackoffSeconds: { _ in 1 })
+        for fails in [false, true] {
+            let manager = ConnectionManager(timing: timing)
+            var cables: [FramedLink] = []
+            defer { cables.forEach { $0.stop() }; manager.cancel() }
+            let ending = fails ? "fails" : "closes"
+            for attempt in 1...NoPictureStreak.limit {
+                cables.append(try await plugIn(manager))
+                XCTAssertEqual(manager.state, .connecting, "unanswered cable \(attempt) is taken, \(ending)")
+                if fails { injectFramingFailure() } else { XCTAssertEqual(shutdown(peer, SHUT_WR), 0) }
+                try await until("unanswered cable \(attempt) ends") { manager.state == .disconnected }
+            }
+            for attempt in 1...NoPictureStreak.limit {
+                cables.append(try await plugIn(manager))
+                XCTAssertEqual(manager.state, .connecting, "attempt \(attempt) takes the cable, \(ending)")
+                await answer()
+                try await until("attempt \(attempt) is accepted") { manager.hostInfo != nil }
+                if fails { injectFramingFailure() } else { XCTAssertEqual(shutdown(peer, SHUT_WR), 0) }
+                try await until("attempt \(attempt) ends") { manager.state == .disconnected }
+                if attempt < NoPictureStreak.limit {
+                    try await until("one attempt without a picture falls back as before, \(ending)") {
+                        manager.reconnectAttempt == 1
+                    }
+                }
+            }
+            XCTAssertEqual(manager.problem, .noPicture, ending)
+            XCTAssertEqual(manager.problem?.actions, [.retry])
+            XCTAssertEqual(manager.reconnectAttempt, 0, "no fallback after the limit, \(ending)")
+            XCTAssertEqual(manager.usbStatus, "USB: disconnected", "the cable is paused, \(ending)")
+            XCTAssertNotNil(manager.diagnostics.first { $0.message.hasPrefix("Stopped reconnecting after 2 no-picture") })
+            cables.append(try await plugIn(manager))
+            XCTAssertEqual(manager.state, .disconnected, "the PC's next cable connection is not taken, \(ending)")
+            XCTAssertEqual(manager.problem, .noPicture)
+        }
+    }
+
+    /// Leaving the app and coming back keeps the cable stopped: only Try
+    /// again takes it again.
+    func testTheCableStopOutlastsLeavingTheApp() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        // Foregrounding must not open the app's real USB listener port.
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let (manager, first) = try await connectOverCable(timing: fast)
+        var cables = [first]
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        for attempt in 1...NoPictureStreak.limit {
+            if attempt > 1 { cables.append(try await plugIn(manager)) }
+            await answer()
+            try await until("attempt \(attempt) times out") { manager.state == .disconnected }
+        }
+        XCTAssertEqual(manager.usbStatus, "USB: disconnected", "the cable is paused")
+        manager.handleAppBackgrounded()
+        manager.handleAppForegrounded()
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .disconnected, "the cable stays stopped after the app comes back")
+        XCTAssertEqual(manager.problem, .noPicture)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+
+        manager.retry()
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "Try again takes the cable again")
+    }
+
+    /// Two PCs on the cable, each without a picture once, don't add up: the
+    /// count belongs to the PC that answered, by its pairing token, even
+    /// when both PCs have the same name. A cable on which nothing answers
+    /// gets its own advice, since the cable doesn't say which PC is at its
+    /// other end, and doesn't end the count.
+    func testPCsOnTheCableCountSeparately() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let desk = Data(17...32), studio = Data(33...48)
+        let (manager, first) = try await connectOverCable(timing: fast)
+        var cables = [first]
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        await answer(token: desk)
+        try await until("the first PC times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "another PC with the same name takes the cable")
+        await answer(token: studio)
+        try await until("the second PC times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+        XCTAssertNil(manager.diagnostics.first { $0.message.hasPrefix("Stopped reconnecting") },
+            "one timeout at each of two PCs stops nothing")
+
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "the cable is still taken")
+        try await until("nothing answers on the cable") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noReply(usb: true), "a silent cable keeps its own advice")
+
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting)
+        await answer(token: studio)
+        try await until("the second PC times out again") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+        XCTAssertEqual(manager.usbStatus, "USB: disconnected", "its second timeout stops the cable")
+    }
+
+    /// The PC answered over Wi-Fi without a picture, then over the cable.
+    /// Silent at its Wi-Fi address afterwards, it is most likely restarting
+    /// EternalMonitor: the cable doesn't erase where it answered.
+    func testAnAnswerOverTheCableKeepsThePCsWiFiAddress() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let wifi = FakeUDPHost()
+        let manager = ConnectionManager(timing: fast)
+        var cables: [FramedLink] = []
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: wifi.port)
+        let accepted = await Task.detached { wifi.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2 over Wi-Fi")
+        try await until("the Wi-Fi attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "the same PC's cable is taken")
+        await answer()
+        try await until("the cable attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture)
+
+        manager.connect(host: "127.0.0.1", port: wifi.port)  // nothing answers now
+        try await until("the silent Wi-Fi attempt times out") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noPicture, "the PC answered at this address before")
+    }
+
     // MARK: Answers from the PC during the fallback. Busy and a restart pass;
     // the cycle keeps retrying.
 
