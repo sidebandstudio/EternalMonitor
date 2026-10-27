@@ -124,7 +124,9 @@ impl AnalyzerApp {
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
-        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem) {
+        let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
+        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
+        {
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -654,11 +656,13 @@ pub(super) struct SecondScreenNotice {
 }
 
 /// The notice for a second screen that could not start, by what the display
-/// driver tasks and its device report. `None` unless the second screen failed.
+/// driver tasks and its device report, and why the start failed (the
+/// `second_screen_fallback` reason). `None` unless the second screen failed.
 pub(super) fn second_screen_notice(
     status: VddStatus,
     health: VddTaskHealth,
     problem: Option<VddProblem>,
+    failure: Option<&str>,
 ) -> Option<SecondScreenNotice> {
     use VddStatus::{Failed, TaskFailed};
     let notice = |body: &str, retry, installer| {
@@ -712,6 +716,16 @@ pub(super) fn second_screen_notice(
             true,
             true,
         ),
+        // It attached, so it was not late: it showed no picture.
+        (Failed, VddTaskHealth::Ok, None)
+            if matches!(failure, Some("no_frames" | "duplication_failed")) =>
+        {
+            notice(
+                "Windows added the second screen, but EternalMonitor couldn't get a picture from it, so the iPad shows your main screen instead. Click Try again. If it keeps happening, restart the PC.",
+                true,
+                false,
+            )
+        }
         (Failed, VddTaskHealth::Ok, None) => notice(
             "Windows didn't add the second screen in time. Click Try again. If it keeps happening, run EternalMonitor-Setup.exe again to repair the display driver.",
             true,

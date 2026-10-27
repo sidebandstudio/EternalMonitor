@@ -362,28 +362,53 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
             VddTaskHealth::NotResponding,
             VddTaskHealth::TasksMissing,
         ] {
-            assert_eq!(second_screen_notice(status, health, None), None);
+            assert_eq!(second_screen_notice(status, health, None, None), None);
         }
     }
     for status in [VddStatus::Failed, VddStatus::TaskFailed] {
         // A hung driver needs a Windows restart; trying again cannot help.
-        let hung = second_screen_notice(status, VddTaskHealth::NotResponding, None).unwrap();
+        let hung = second_screen_notice(status, VddTaskHealth::NotResponding, None, None).unwrap();
         assert!(hung.body.contains("Restart the PC"), "{}", hung.body);
         assert!(!hung.retry && !hung.installer);
         // Missing driver tasks need the installer.
-        let missing = second_screen_notice(status, VddTaskHealth::TasksMissing, None).unwrap();
+        let missing =
+            second_screen_notice(status, VddTaskHealth::TasksMissing, None, None).unwrap();
         assert!(missing.body.contains("isn't installed"), "{}", missing.body);
         assert!(missing.retry && missing.installer);
     }
     // Without a known driver problem the earlier wording stays.
-    let task = second_screen_notice(VddStatus::TaskFailed, VddTaskHealth::Ok, None).unwrap();
+    let task = second_screen_notice(VddStatus::TaskFailed, VddTaskHealth::Ok, None, None).unwrap();
     assert!(task.body.starts_with("Part of the EternalMonitor install"));
     assert!(task.installer);
-    let slow = second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None).unwrap();
-    assert!(slow
-        .body
-        .starts_with("Windows didn't add the second screen in time"));
-    assert!(slow.retry && !slow.installer);
+    for failure in [None, Some("attach_timeout")] {
+        let slow =
+            second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None, failure).unwrap();
+        assert!(slow
+            .body
+            .starts_with("Windows didn't add the second screen in time"));
+        assert!(slow.retry && !slow.installer);
+    }
+}
+
+/// Review round 3, defect 5: a second screen that attached but showed no
+/// picture was said not to have been added in time.
+#[test]
+fn a_second_screen_without_a_picture_is_not_called_late() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    for failure in ["no_frames", "duplication_failed"] {
+        let blank = second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None, Some(failure))
+            .unwrap();
+        assert!(
+            blank
+                .body
+                .starts_with("Windows added the second screen, but EternalMonitor couldn't get a picture from it"),
+            "{}",
+            blank.body
+        );
+        assert!(!blank.body.contains("in time"), "{}", blank.body);
+        assert!(blank.retry && !blank.installer);
+    }
 }
 
 #[test]
@@ -392,7 +417,7 @@ fn the_second_screen_notice_says_what_to_do_about_the_driver_device() {
     use crate::vdd::VddTaskHealth;
     use crate::vdd_device::VddProblem;
     let notice = |status, problem| {
-        second_screen_notice(status, VddTaskHealth::Ok, Some(problem))
+        second_screen_notice(status, VddTaskHealth::Ok, Some(problem), None)
             .unwrap_or_else(|| panic!("no notice for {status:?} {problem:?}"))
     };
     for status in [VddStatus::Failed, VddStatus::TaskFailed] {
@@ -446,13 +471,14 @@ fn the_second_screen_notice_says_what_to_do_about_the_driver_device() {
         VddStatus::TaskFailed,
         VddTaskHealth::NotResponding,
         Some(VddProblem::NoDisplay),
+        None,
     )
     .unwrap();
     assert!(hung.body.contains("Restart the PC"), "{}", hung.body);
     // Nothing failed: no notice, whatever was last reported.
     for status in [VddStatus::Inactive, VddStatus::Active, VddStatus::Attaching] {
         assert_eq!(
-            second_screen_notice(status, VddTaskHealth::Ok, Some(VddProblem::NoDisplay)),
+            second_screen_notice(status, VddTaskHealth::Ok, Some(VddProblem::NoDisplay), None),
             None
         );
     }
