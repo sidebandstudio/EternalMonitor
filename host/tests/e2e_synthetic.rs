@@ -208,19 +208,24 @@ fn usb_framed_stream_end_to_end() {
         let mut recovery_ms = 0;
         let mut highest_seq = 0;
         // The last whole frame read, the frames read after the stall until
-        // the recovery keyframe, and the first frame captured after it.
+        // the recovery keyframe, and the number the frame captured as the
+        // reader resumed has.
         let mut last_complete = 0;
         let mut stale = 0;
         let mut live_from = u32::MAX;
         let mut caught_up = false;
         let mut epoch = ack.stream_config.stream_epoch;
         let encoded = || PIPELINE_STATS.lock().encode_frame_count;
+        // Earlier tests' pipelines count here too, so only differences mean
+        // anything. Synthetic frames are numbered by capture.
+        let captured = || PIPELINE_STATS.lock().capture_frame_count;
         while after_recovery < 30 || heartbeats == 0 || !caught_up {
             assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
             if decoded >= 30 && resumed.is_none() {
                 // Stop reading while the host encodes STALL_FRAMES frames.
                 // Reports still go out, so the session stays.
                 let stall_from = encoded();
+                let captured_before = captured();
                 while encoded() < stall_from + STALL_FRAMES {
                     assert!(started.elapsed() < DEADLINE, "the host stopped encoding during the stall");
                     if last_report.elapsed() >= Duration::from_millis(300) {
@@ -235,7 +240,7 @@ fn usb_framed_stream_end_to_end() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 resumed = Some(Instant::now());
-                live_from = PIPELINE_STATS.lock().capture_frame_count as u32;
+                live_from = last_complete + (captured() - captured_before) as u32;
             }
             if last_report.elapsed() >= Duration::from_millis(300) {
                 last_report = Instant::now();
