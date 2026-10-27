@@ -444,7 +444,7 @@ pub const NAMED_ELSEWHERE: &str = "the settings file names a card this host did 
 
 /// Whose name the file may hold: this host replaces a name only when it
 /// installed the driver (`owned`), when the file leaves the card to the
-/// driver, or when the name is the one it wrote last (`ours`). Other apps
+/// driver, or when the name is one it recorded writing (`ours`). Other apps
 /// share this driver and its file. With no card to name (`wanted` is
 /// `None`), this host's own earlier name is taken back, so the file never
 /// keeps a pin the log says was not made.
@@ -452,9 +452,9 @@ pub fn pin_change(
     named: Option<&str>,
     wanted: Option<&str>,
     owned: bool,
-    ours: Option<&str>,
+    ours: &[&str],
 ) -> PinChange {
-    let is_ours = |name: &str| ours.is_some_and(|ours| same_card(ours, name));
+    let is_ours = |name: &str| ours.iter().any(|ours| same_card(ours, name));
     match (wanted, named) {
         (Some(card), Some(name)) if same_card(card, name) => PinChange::Leave,
         (Some(_), Some(name)) if !owned && !is_ours(name) => PinChange::Refuse(NAMED_ELSEWHERE),
@@ -519,27 +519,26 @@ fn driver_registration() -> Option<(String, String)> {
     None
 }
 
-/// Remember the card this host last wrote into the settings file, or that
-/// it wrote none.
-pub fn remember_pin(record: &Path, gpu: Option<&str>) -> io::Result<()> {
-    match gpu {
-        Some(gpu) => {
-            if let Some(parent) = record.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(record, gpu)
-        }
-        None => match std::fs::remove_file(record) {
+/// Remember the cards this host may have written into the settings file
+/// last, one per line, or that it wrote none. The record is replaced as the
+/// settings file is, so a crash or power cut leaves the old or the new one.
+pub fn remember_pins(record: &Path, names: &[&str]) -> io::Result<()> {
+    if names.is_empty() {
+        return match std::fs::remove_file(record) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
-        },
+        };
     }
+    if let Some(parent) = record.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    replace(record, &names.join("\n"))
 }
 
 /// Make the settings file at `path` name `wanted`, changing only the card,
-/// under the rules of `pin_change`. `record` holds the name this host
-/// wrote last. A missing file stays missing, and one that does not parse
-/// as expected is left alone; the error says why.
+/// under the rules of `pin_change`. `record` holds the names this host
+/// recorded writing. A missing file stays missing, and one that does not
+/// parse as expected is left alone; the error says why.
 pub fn apply_pin(
     path: &Path,
     record: &Path,
@@ -549,8 +548,9 @@ pub fn apply_pin(
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
     let current = std::fs::read_to_string(path)?;
     let named = named_gpu(&current).map_err(invalid)?;
-    let ours = recorded_pin(record);
-    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours.as_deref()) {
+    let ours = recorded_pins(record);
+    let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, &ours) {
         PinChange::Leave => return Ok(PinOutcome::Unchanged),
         PinChange::Refuse(reason) => return Ok(PinOutcome::Kept(reason)),
         PinChange::Write(card) => (card, PinOutcome::Named),
@@ -558,33 +558,49 @@ pub fn apply_pin(
     };
     let updated = gpu_edit(&current, &name).map_err(invalid)?;
     let new_record = (outcome == PinOutcome::Named).then_some(name.as_str());
-    record_around(record, new_record, ours.as_deref(), || {
-        replace(path, &updated)
-    })?;
+    record_around(record, new_record, &ours, || replace(path, &updated))?;
     Ok(outcome)
 }
 
-/// Record `new` as this host's name, then `write` the settings file. The
-/// record comes first, so a name this host wrote is always one it knows;
-/// when the write fails, the record goes back to `old`, the name the file
-/// still holds, so a later attempt still knows that name as its own.
+/// `write` the settings file, `new` taking the place of `ours` as the names
+/// this host wrote, with the record true wherever a crash or power cut
+/// stops it: until the file is replaced it may hold either, so the record
+/// holds both; once it is, only `new`. With `new` as `None` the record
+/// keeps `ours` until the file no longer names them. When the write fails,
+/// the record goes back to `ours`.
 fn record_around(
     record: &Path,
     new: Option<&str>,
-    old: Option<&str>,
+    ours: &[&str],
     write: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    remember_pin(record, new)?;
+    let mut both = ours.to_vec();
+    both.extend(new.filter(|new| !ours.iter().any(|name| same_card(name, new))));
+    let grew = both.len() > ours.len();
+    if grew {
+        remember_pins(record, &both)?;
+    }
     write().inspect_err(|_| {
-        let _ = remember_pin(record, old);
-    })
+        if grew {
+            let _ = remember_pins(record, ours);
+        }
+    })?;
+    // A record left holding both is still true.
+    let _ = remember_pins(record, new.as_slice());
+    Ok(())
 }
 
-/// The name this host recorded writing last, if any.
-fn recorded_pin(record: &Path) -> Option<String> {
-    let ours = std::fs::read_to_string(record).ok()?;
-    let ours = ours.trim();
-    (!ours.is_empty()).then(|| ours.to_string())
+/// The names this host recorded writing: one, or more after a write that
+/// a crash or power cut stopped.
+fn recorded_pins(record: &Path) -> Vec<String> {
+    let Ok(ours) = std::fs::read_to_string(record) else {
+        return Vec::new();
+    };
+    ours.lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Write the whole settings file at `path` with `modes`, naming `wanted`
@@ -592,8 +608,8 @@ fn recorded_pin(record: &Path) -> Option<String> {
 /// in the new file. A missing file names no card. A file this host cannot
 /// read may name anyone's card, so it is replaced only where any name may
 /// be, on a driver Setup installed and with a card to name; otherwise it is
-/// left as it is and the error says why. `record` holds the name this host
-/// wrote last.
+/// left as it is and the error says why. `record` holds the names this
+/// host recorded writing.
 pub fn write_with_pin(
     path: &Path,
     record: &Path,
@@ -610,8 +626,9 @@ pub fn write_with_pin(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let ours = recorded_pin(record);
-    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, ours.as_deref()) {
+    let ours = recorded_pins(record);
+    let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+    let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, &ours) {
         PinChange::Leave => (named, PinOutcome::Unchanged),
         PinChange::Refuse(reason) => (named, PinOutcome::Kept(reason)),
         PinChange::Write(card) => (Some(card), PinOutcome::Named),
@@ -619,8 +636,8 @@ pub fn write_with_pin(
     };
     let write = || write_to(path, modes, name.as_deref());
     match outcome {
-        PinOutcome::Named => record_around(record, name.as_deref(), ours.as_deref(), write)?,
-        PinOutcome::Reset => record_around(record, None, ours.as_deref(), write)?,
+        PinOutcome::Named => record_around(record, name.as_deref(), &ours, write)?,
+        PinOutcome::Reset => record_around(record, None, &ours, write)?,
         _ => write()?,
     }
     Ok(outcome)
@@ -654,7 +671,9 @@ pub fn write_to(path: &Path, modes: &[VddMode], gpu: Option<&str>) -> io::Result
 /// interrupted write leaves the old file whole.
 fn replace(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("xml.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
@@ -900,39 +919,39 @@ mod tests {
         let write = || Write(INTEL.to_string());
         // The driver chooses: this host may name a card, owned or not.
         for owned in [false, true] {
-            assert_eq!(pin_change(None, Some(INTEL), owned, None), write());
+            assert_eq!(pin_change(None, Some(INTEL), owned, &[]), write());
         }
         // A card another app or the user named stays on a driver Setup did
         // not install, and is replaced on one it did.
         assert_eq!(
-            pin_change(Some(OTHER), Some(INTEL), false, None),
+            pin_change(Some(OTHER), Some(INTEL), false, &[]),
             Refuse(NAMED_ELSEWHERE)
         );
         assert_eq!(
-            pin_change(Some(OTHER), Some(INTEL), false, Some(INTEL)),
+            pin_change(Some(OTHER), Some(INTEL), false, &[INTEL]),
             Refuse(NAMED_ELSEWHERE)
         );
-        assert_eq!(pin_change(Some(OTHER), Some(INTEL), true, None), write());
+        assert_eq!(pin_change(Some(OTHER), Some(INTEL), true, &[]), write());
         // This host's own earlier name, in any case, is replaced.
         assert_eq!(
             pin_change(
                 Some("nvidia geforce gtx 1050"),
                 Some(INTEL),
                 false,
-                Some(OTHER)
+                &[OTHER]
             ),
             write()
         );
         // Already named, ignoring case.
         assert_eq!(
-            pin_change(Some("intel(r) hd graphics 630"), Some(INTEL), false, None),
+            pin_change(Some("intel(r) hd graphics 630"), Some(INTEL), false, &[]),
             Leave
         );
         // No card to name: this host's earlier name is taken back, anyone
         // else's stays.
-        assert_eq!(pin_change(Some(INTEL), None, false, Some(INTEL)), Reset);
-        assert_eq!(pin_change(Some(INTEL), None, true, None), Leave);
-        assert_eq!(pin_change(None, None, false, Some(INTEL)), Leave);
+        assert_eq!(pin_change(Some(INTEL), None, false, &[INTEL]), Reset);
+        assert_eq!(pin_change(Some(INTEL), None, true, &[]), Leave);
+        assert_eq!(pin_change(None, None, false, &[INTEL]), Leave);
     }
 
     #[test]
@@ -1170,6 +1189,102 @@ mod tests {
             assert_eq!(pin(None).unwrap(), PinOutcome::Reset);
             assert_eq!(named(), None);
             assert!(!record.exists());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Run a pin that a crash or power cut stops just before the settings
+    /// file is replaced: what stays on disk is the record as it stood then,
+    /// and the old file.
+    fn crash_before_replace(record: &Path, new: Option<&str>) {
+        let ours = recorded_pins(record);
+        let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+        let mut on_disk = None;
+        record_around(record, new, &ours, || {
+            on_disk = Some(std::fs::read_to_string(record).ok());
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(record);
+        if let Some(names) = on_disk.unwrap() {
+            std::fs::write(record, names).unwrap();
+        }
+    }
+
+    /// Review P3-1: the record named the new card before the settings file
+    /// held it, so a crash or power cut between the two left this host's own
+    /// name looking like another app's, and later attempts kept it.
+    #[test]
+    fn a_crash_before_a_new_name_is_written_keeps_the_old_one_this_hosts() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let named = || named_gpu(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let modes = default_modes();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const AMD: &str = "AMD Radeon(TM) Graphics";
+        type Pin<'a> = dyn Fn(Option<&str>) -> io::Result<PinOutcome> + 'a;
+        let edit: &Pin = &|wanted| apply_pin(&path, &record, false, wanted);
+        let rewrite: &Pin = &|wanted| write_with_pin(&path, &record, false, &modes, wanted);
+        for pin in [edit, rewrite] {
+            std::fs::write(&path, VENDOR).unwrap();
+            assert_eq!(pin(Some(INTEL)).unwrap(), PinOutcome::Named);
+            crash_before_replace(&record, Some(AMD));
+            assert_eq!(named().as_deref(), Some(INTEL));
+            // The next run still knows the name the file holds as its own.
+            assert_eq!(pin(Some(AMD)).unwrap(), PinOutcome::Named);
+            assert_eq!(named().as_deref(), Some(AMD));
+            // Once the file is replaced, the record holds only the new name.
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), AMD);
+            crash_before_replace(&record, Some(INTEL));
+            assert_eq!(pin(None).unwrap(), PinOutcome::Reset);
+            assert_eq!(named(), None);
+            assert!(!record.exists());
+        }
+        // Neither file is left half written beside the real one.
+        assert!(!record.with_extension("txt.tmp").exists());
+        assert!(!path.with_extension("xml.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review P3-1: taking the name back deleted the record before the
+    /// settings file was replaced, so a crash or power cut between the two
+    /// left the file naming a card this host no longer knew it wrote.
+    #[test]
+    fn a_crash_before_the_name_is_taken_back_keeps_it_this_hosts() {
+        let dir = std::env::temp_dir().join(format!("vdd-pin-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let named = || named_gpu(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let modes = default_modes();
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const AMD: &str = "AMD Radeon(TM) Graphics";
+        type Pin<'a> = dyn Fn(Option<&str>) -> io::Result<PinOutcome> + 'a;
+        let edit: &Pin = &|wanted| apply_pin(&path, &record, false, wanted);
+        let rewrite: &Pin = &|wanted| write_with_pin(&path, &record, false, &modes, wanted);
+        for pin in [edit, rewrite] {
+            std::fs::write(&path, VENDOR).unwrap();
+            assert_eq!(pin(Some(INTEL)).unwrap(), PinOutcome::Named);
+            crash_before_replace(&record, None);
+            assert_eq!(named().as_deref(), Some(INTEL));
+            // Still this host's: taken back on the next run.
+            assert_eq!(pin(None).unwrap(), PinOutcome::Reset);
+            assert_eq!(named(), None);
+            assert!(!record.exists());
+            // And replaced by another card.
+            assert_eq!(pin(Some(INTEL)).unwrap(), PinOutcome::Named);
+            crash_before_replace(&record, None);
+            assert_eq!(pin(Some(AMD)).unwrap(), PinOutcome::Named);
+            assert_eq!(named().as_deref(), Some(AMD));
+            assert_eq!(pin(None).unwrap(), PinOutcome::Reset);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
