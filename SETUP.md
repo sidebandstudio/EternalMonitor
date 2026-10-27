@@ -55,7 +55,7 @@ the Start menu. To have it open whenever you sign in to Windows, go to
 
 ## Step 2: Install EternalMonitor on your iPad
 
-The iPad app installs through Apple's TestFlight app. Use v0.3.2, build 316,
+The iPad app installs through Apple's TestFlight app. Use v0.3.3, build 364,
 with the current stable Windows release. The beta is open to anyone with the
 invite link.
 
