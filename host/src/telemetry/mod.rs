@@ -735,9 +735,14 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// How long a test waits for a step that takes milliseconds. Only a
+    /// hung test waits this long: a single small write on mainpc's shared
+    /// disk has taken 27 s.
+    const PATIENCE: Duration = Duration::from_secs(120);
+
     /// The upload thread is in its first request: the server has seen it.
     fn wait_for_upload(arrived: &std::sync::atomic::AtomicUsize) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + PATIENCE;
         while arrived.load(Ordering::SeqCst) == 0 {
             assert!(std::time::Instant::now() < deadline, "no upload started");
             std::thread::sleep(Duration::from_millis(10));
@@ -755,11 +760,11 @@ mod tests {
         });
     }
 
-    /// Whether the upload thread has ended, waiting at most 30 s. `queue` is
+    /// Whether the upload thread has ended, waiting at most [`PATIENCE`]. `queue` is
     /// a copy of its queue taken before the quit; the thread and the quit's
     /// fallback hold the only others.
     fn thread_ended(queue: &std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + PATIENCE;
         while std::sync::Arc::strong_count(queue) > 1 {
             if std::time::Instant::now() >= deadline {
                 return false;
@@ -815,10 +820,10 @@ mod tests {
         }
     }
 
-    /// The outbox's messages once `kept` holds for them, or after 30 s. The
+    /// The outbox's messages once `kept` holds for them, or after [`PATIENCE`]. The
     /// quit's fallback writes on its own thread and may finish after it.
     fn outbox_messages_once(directory: &Path, kept: impl Fn(&[String]) -> bool) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + PATIENCE;
         loop {
             let messages = outbox_messages(directory);
             if kept(&messages) || std::time::Instant::now() >= deadline {
@@ -896,9 +901,9 @@ mod tests {
         fn released(&self) -> bool {
             self.released.load(Ordering::SeqCst)
         }
-        /// Whether a thread got here, waiting at most 30 s.
+        /// Whether a thread got here, waiting at most [`PATIENCE`].
         fn wait_until_reached(&self) -> bool {
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + PATIENCE;
             while !self.reached.load(Ordering::SeqCst) {
                 if std::time::Instant::now() >= deadline {
                     return false;
@@ -974,7 +979,7 @@ mod tests {
         };
         // The worker's first write stalls while it holds the outbox lock.
         let stall = Hold::new(&directory);
-        stall.release_after(Duration::from_secs(30));
+        stall.release_after(PATIENCE);
         *STALLED_WRITE.lock().unwrap() = Some(stall.clone());
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
         sender
@@ -1027,7 +1032,7 @@ mod tests {
         // quit's deadline starts once the worker holds the drained queue,
         // and the write stalls until the quit has returned.
         let final_write = Hold::new(&directory);
-        final_write.release_after(Duration::from_secs(30));
+        final_write.release_after(PATIENCE);
         *PAUSED_FINAL_WRITE.lock().unwrap() = Some(final_write.clone());
         *QUIT_AFTER.lock().unwrap() = Some(final_write.clone());
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
