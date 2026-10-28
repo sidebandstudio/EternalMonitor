@@ -445,7 +445,14 @@ fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> boo
 pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
     let mut state = shared.second_screen.lock();
     match state.proving.as_mut() {
-        Some(proving) => proving.generation = generation,
+        // A call the earlier generation still waits on is not this one's,
+        // and its guard can no longer clear the flag.
+        Some(proving) => {
+            if proving.generation != generation {
+                proving.generation = generation;
+                proving.call_pending = false;
+            }
+        }
         None => {
             state.proving = Some(Proving {
                 generation,

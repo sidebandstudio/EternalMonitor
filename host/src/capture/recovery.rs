@@ -28,6 +28,9 @@ pub enum CaptureBlock {
     TooManyCaptureApps,
     /// The Windows session is disconnected or remote.
     SessionDisconnected,
+    /// A graphics driver call did not return in time (see `crate::stall`).
+    /// Capture waits for it and resumes by itself when it does.
+    DriverNotResponding,
 }
 
 impl CaptureBlock {
@@ -204,6 +207,8 @@ pub fn run_until_unblocked(
                     "A graphics driver call is stuck — retrying capture until it returns"
                 );
             }
+            // Tell the GUI why; the first working capture clears it.
+            *shared.capture_block.lock() = Some(CaptureBlock::DriverNotResponding);
             stalled += 1;
             if !wait(delay) {
                 return Ok(());
@@ -285,6 +290,10 @@ mod tests {
                 result.map_err(|stall: Stall| stall.into())
             },
             |delay| {
+                assert_eq!(
+                    *shared.capture_block.lock(),
+                    Some(CaptureBlock::DriverNotResponding)
+                );
                 waited += delay;
                 // Over a minute in, the driver returns the stuck call.
                 if waited >= Duration::from_secs(65) {
@@ -310,6 +319,12 @@ mod tests {
         assert_eq!(outcomes.last(), Some(&Ok(())));
         // At the blocked pace, not a spin: 5 s apart once settled.
         assert!(outcomes.len() < 25, "{} attempts", outcomes.len());
+        // The GUI said why throughout; frames flowing again clear it.
+        assert_eq!(
+            *shared.capture_block.lock(),
+            Some(CaptureBlock::DriverNotResponding)
+        );
+        note_capture_resumed(&shared);
         assert!(shared.capture_block.lock().is_none());
         // A real failure still goes straight to the supervisor's budget.
         let mut attempts = 0;

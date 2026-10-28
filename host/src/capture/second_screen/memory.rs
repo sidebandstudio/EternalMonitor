@@ -982,6 +982,45 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// PR #110, review 5: a restart during a time-limited call. The new
+    /// generation's own real failure is saved, the old call's guard cannot
+    /// cover it or clear the new generation's own call.
+    #[test]
+    fn a_call_from_before_a_restart_does_not_cover_the_new_generation() {
+        use super::super::{driver_call, note_capture_error, note_persistent_error};
+        let path = temp_file("call-across-restart");
+        let (shared, start) = proving_second_screen(&path);
+        let old_call = driver_call(&shared, 1);
+        // The supervisor restarts; generation 2 fails while opening the
+        // display, before any call of its own.
+        start_proving(&shared, 2, start + secs(1));
+        note_persistent_error(&shared, 2);
+        note_capture_error(&shared, 2);
+        assert_eq!(
+            next_step(&shared, start + secs(2)),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        drop(old_call);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // The old guard ending does not clear the new generation's call.
+        let path = temp_file("old-guard-new-call");
+        let (shared, start) = proving_second_screen(&path);
+        let old_call = driver_call(&shared, 1);
+        start_proving(&shared, 2, start + secs(1));
+        let _new_call = driver_call(&shared, 2);
+        drop(old_call);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(
+            !path.exists(),
+            "a failure during generation 2's call was saved"
+        );
+    }
+
     /// Round 4: a full window after the desktop came back, with no picture,
     /// is the PC's failure.
     #[test]
