@@ -45,6 +45,43 @@ impl CaptureBlock {
     }
 }
 
+/// Errors a GPU reset, a display change or a shortage of memory raises while
+/// it lasts: DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET,
+/// _ACCESS_LOST and E_OUTOFMEMORY. Freeing the memory changes nothing in a
+/// saved record's fingerprint, so saving it would keep a working PC on the
+/// mirror.
+const PASSING_ERRORS: [u32; 5] = [
+    0x887A_0005,
+    0x887A_0006,
+    0x887A_0007,
+    0x887A_0026,
+    0x8007_000E,
+];
+
+/// [`passing_error`] for a DXGI/Win32 HRESULT.
+pub fn passing_code(code: i32) -> bool {
+    match CaptureBlock::from_hresult(code) {
+        Some(block) => block != CaptureBlock::UnsupportedOnThisGpu,
+        None => PASSING_ERRORS.contains(&(code as u32)),
+    }
+}
+
+/// Whether a capture error comes from a state of Windows that passes (a
+/// secure screen, a display or mode change, a GPU reset, another capturing
+/// app, a disconnected session) rather than from the display itself. Such a
+/// second screen failure is not remembered for later app runs. A display
+/// Windows will not duplicate from this GPU is the PC's.
+pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() {
+        return unavailable.block != CaptureBlock::UnsupportedOnThisGpu;
+    }
+    #[cfg(windows)]
+    if let Some(error) = error.downcast_ref::<windows::core::Error>() {
+        return passing_code(error.code().0);
+    }
+    false
+}
+
 /// The capture loop could not get at the desktop for a reason outside the
 /// app's control. The stage retries instead of failing the pipeline.
 #[derive(Debug)]
@@ -253,6 +290,45 @@ mod tests {
             Some(CaptureBlock::DisplayChanging)
         );
         assert_eq!(CaptureBlock::from_hresult(code(0x8007_000E)), None);
+    }
+
+    #[test]
+    fn only_a_display_this_gpu_cannot_duplicate_is_the_pcs_failure() {
+        let unavailable = |block| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(CaptureUnavailable {
+                block,
+                detail: String::new(),
+            })
+        };
+        for block in [
+            CaptureBlock::SecureDesktop,
+            CaptureBlock::DisplayChanging,
+            CaptureBlock::TooManyCaptureApps,
+            CaptureBlock::SessionDisconnected,
+        ] {
+            assert!(passing_error(unavailable(block).as_ref()), "{block:?}");
+        }
+        assert!(!passing_error(
+            unavailable(CaptureBlock::UnsupportedOnThisGpu).as_ref()
+        ));
+        let other: Box<dyn std::error::Error + Send + Sync> = "DuplicateOutput failed".into();
+        assert!(!passing_error(other.as_ref()));
+        let code = |hresult: u32| hresult as i32;
+        for passing in [
+            0x8007_0005, // E_ACCESSDENIED
+            0x887A_0022, // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+            0x887A_0028, // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0005, // DXGI_ERROR_DEVICE_REMOVED
+            0x887A_0006, // DXGI_ERROR_DEVICE_HUNG
+            0x887A_0007, // DXGI_ERROR_DEVICE_RESET
+            0x887A_0026, // DXGI_ERROR_ACCESS_LOST
+            0x8007_000E, // E_OUTOFMEMORY, until another app frees memory
+        ] {
+            assert!(passing_code(code(passing)), "{passing:#x}");
+        }
+        for persistent in [0x887A_0004, 0x8007_0057, 0x8000_4005] {
+            assert!(!passing_code(code(persistent)), "{persistent:#x}");
+        }
     }
 
     fn blocked(block: CaptureBlock) -> Box<dyn std::error::Error + Send + Sync> {

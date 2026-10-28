@@ -629,3 +629,30 @@ fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
     ));
     assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
 }
+
+/// A second screen failure remembered for this PC is tried again later by
+/// itself; the notice says so beside Try again.
+#[test]
+fn a_remembered_second_screen_failure_says_it_tries_again_later() {
+    use super::page_stream::add_later_retry;
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    for failure in ["attach_timeout", "no_frames"] {
+        let notice = || {
+            second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None, Some(failure)).unwrap()
+        };
+        let mut later = notice();
+        add_later_retry(&mut later, true);
+        assert!(later.body.starts_with(&notice().body), "{}", later.body);
+        assert!(later.body.ends_with("tries again by itself later."));
+        assert!(later.retry);
+        let mut now = notice();
+        add_later_retry(&mut now, false);
+        assert_eq!(now, notice());
+    }
+    // A notice without Try again (restart the PC) is left alone.
+    let mut hung =
+        second_screen_notice(VddStatus::Failed, VddTaskHealth::NotResponding, None, None).unwrap();
+    add_later_retry(&mut hung, true);
+    assert!(!hung.body.contains("later"), "{}", hung.body);
+}

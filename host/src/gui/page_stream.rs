@@ -125,8 +125,13 @@ impl AnalyzerApp {
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
         let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
-        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
+        if let Some(mut notice) =
+            second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
         {
+            add_later_retry(
+                &mut notice,
+                crate::capture::second_screen::retries_later(&self.control.shared),
+            );
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -732,6 +737,16 @@ pub(super) fn second_screen_notice(
             false,
         ),
         _ => None,
+    }
+}
+
+/// Say that the host tries the second screen again by itself, after a
+/// failure it remembers for this PC.
+pub(super) fn add_later_retry(notice: &mut SecondScreenNotice, retries_later: bool) {
+    if retries_later && notice.retry {
+        notice
+            .body
+            .push_str(" EternalMonitor also tries again by itself later.");
     }
 }
 
