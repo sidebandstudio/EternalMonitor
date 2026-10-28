@@ -751,6 +751,8 @@ pub fn run_capture_stage(
             if let Err(error) = &result {
                 if recovery::passing_error(error.as_ref()) {
                     second_screen::note_interruption(&shared, generation);
+                } else {
+                    second_screen::note_persistent_error(&shared, generation);
                 }
                 second_screen::note_capture_error(&shared, generation);
             }

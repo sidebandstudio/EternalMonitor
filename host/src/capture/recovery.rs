@@ -47,8 +47,15 @@ impl CaptureBlock {
 
 /// Errors a GPU reset or a display change raises while it lasts:
 /// DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET and _ACCESS_LOST.
-#[cfg(windows)]
 const PASSING_ERRORS: [u32; 4] = [0x887A_0005, 0x887A_0006, 0x887A_0007, 0x887A_0026];
+
+/// [`passing_error`] for a DXGI/Win32 HRESULT.
+pub fn passing_code(code: i32) -> bool {
+    match CaptureBlock::from_hresult(code) {
+        Some(block) => block != CaptureBlock::UnsupportedOnThisGpu,
+        None => PASSING_ERRORS.contains(&(code as u32)),
+    }
+}
 
 /// Whether a capture error comes from a state of Windows that passes (a
 /// secure screen, a display or mode change, a GPU reset, another capturing
@@ -61,7 +68,7 @@ pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) ->
     }
     #[cfg(windows)]
     if let Some(error) = error.downcast_ref::<windows::core::Error>() {
-        return PASSING_ERRORS.contains(&(error.code().0 as u32));
+        return passing_code(error.code().0);
     }
     false
 }
@@ -297,6 +304,21 @@ mod tests {
         ));
         let other: Box<dyn std::error::Error + Send + Sync> = "DuplicateOutput failed".into();
         assert!(!passing_error(other.as_ref()));
+        let code = |hresult: u32| hresult as i32;
+        for passing in [
+            0x8007_0005, // E_ACCESSDENIED
+            0x887A_0022, // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+            0x887A_0028, // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0005, // DXGI_ERROR_DEVICE_REMOVED
+            0x887A_0006, // DXGI_ERROR_DEVICE_HUNG
+            0x887A_0007, // DXGI_ERROR_DEVICE_RESET
+            0x887A_0026, // DXGI_ERROR_ACCESS_LOST
+        ] {
+            assert!(passing_code(code(passing)), "{passing:#x}");
+        }
+        for persistent in [0x887A_0004, 0x8007_0057, 0x8000_4005] {
+            assert!(!passing_code(code(persistent)), "{persistent:#x}");
+        }
     }
 
     fn blocked(block: CaptureBlock) -> Box<dyn std::error::Error + Send + Sync> {

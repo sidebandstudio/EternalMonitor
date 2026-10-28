@@ -575,8 +575,8 @@ pub fn run_capture_loop(
                 if !recovery.in_episode() {
                     warn!("Desktop duplication access lost — reinitializing");
                 }
-                // A second screen that shows no picture meanwhile failed
-                // for a passing reason.
+                // A second screen that shows no picture before this is
+                // re-created failed for a passing reason.
                 super::second_screen::note_interruption(&shared, generation);
                 // Release the lost duplication before asking for a new one:
                 // Windows refuses a second duplication of the same output.
@@ -628,10 +628,18 @@ pub fn run_capture_loop(
                         Ok(d) => {
                             duplication = Some(d);
                             seen_image = false;
+                            super::second_screen::note_recovery(
+                                &shared,
+                                generation,
+                                Instant::now(),
+                            );
                         }
                         Err(retry_error) => {
                             debug!(error = %retry_error, "DuplicateOutput retry failed");
                             last_code = retry_error.code();
+                            if !super::recovery::passing_code(last_code.0) {
+                                super::second_screen::note_persistent_error(&shared, generation);
+                            }
                             // Tell the GUI why while the retries continue.
                             if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
                                 *shared.capture_block.lock() = Some(block);

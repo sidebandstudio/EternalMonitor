@@ -111,10 +111,21 @@ struct Proving {
     generation: u64,
     since: Instant,
     capture_failed: bool,
-    /// Windows lost or blocked the desktop meanwhile (a secure screen, a
-    /// display change, a GPU reset): a failure is not the PC's.
+    /// Windows lost or blocked the desktop (a secure screen, a display
+    /// change, a GPU reset), and capture hasn't got it back: a failure now is
+    /// not the PC's.
     interrupted: bool,
+    /// How often Windows lost the desktop during this proof.
+    losses: u32,
+    /// Since the last loss, getting the display back failed with an error
+    /// that does not pass, such as DXGI_ERROR_UNSUPPORTED.
+    persistent: bool,
 }
+
+/// A second screen that loses its desktop this often in one proof fails as
+/// the PC's, unless a secure screen is up: a display that keeps dropping out
+/// on its own is the hybrid-laptop failure, not a passing state.
+const REPEATED_LOSSES: u32 = 3;
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -200,10 +211,15 @@ impl State {
     /// no image within [`PROVE_TIMEOUT`] of the switch. Returns why.
     fn fail_unproven(&mut self, status: &mut VddStatus, now: Instant) -> Option<&'static str> {
         let proving = self.proving?;
+        let repeated = proving.losses >= REPEATED_LOSSES;
         let reason = if proving.capture_failed {
             "duplication_failed"
         } else if now.duration_since(proving.since) >= PROVE_TIMEOUT {
-            "no_frames"
+            if repeated || proving.persistent {
+                "duplication_failed"
+            } else {
+                "no_frames"
+            }
         } else {
             return None;
         };
@@ -215,7 +231,7 @@ impl State {
             ..State::default()
         };
         *status = VddStatus::Failed;
-        self.remember(reason, now, proving.interrupted);
+        self.remember(reason, now, proving.interrupted && !repeated);
         Some(reason)
     }
 
@@ -322,6 +338,8 @@ pub fn load_memory(shared: &SharedControl) {
         Instant::now(),
     );
     shared.second_screen.lock().memory = memory;
+    #[cfg(not(test))]
+    display_power::watch();
 }
 
 /// A new iPad session in Second screen mode. After a failed start it says
@@ -427,6 +445,8 @@ pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
                 since: now,
                 capture_failed: false,
                 interrupted: false,
+                losses: 0,
+                persistent: false,
             })
         }
     }
@@ -462,37 +482,75 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
 
 /// Capture `generation` lost the desktop for a passing reason (see
 /// [`super::recovery::passing_error`]). A second screen that fails its proof
-/// meanwhile is not remembered beyond this app run.
+/// before capture gets it back is not remembered beyond this app run.
 pub fn note_interruption(shared: &SharedControl, generation: u64) {
-    let mut state = shared.second_screen.lock();
-    if let Some(proving) = state.proving.as_mut() {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
         if proving.generation == generation {
             proving.interrupted = true;
+            proving.losses += 1;
+        }
+    }
+}
+
+/// Capture `generation` got the desktop back after an interruption: the
+/// proof starts over from `now`, unless it was lost [`REPEATED_LOSSES`]
+/// times.
+pub fn note_recovery(shared: &SharedControl, generation: u64, now: Instant) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation && proving.interrupted {
+            proving.interrupted = false;
+            proving.persistent = false;
+            if proving.losses < REPEATED_LOSSES {
+                proving.since = now;
+            }
+        }
+    }
+}
+
+/// Capture `generation` failed with an error that does not pass: whatever
+/// interrupted the proof before, a failure now is the PC's.
+pub fn note_persistent_error(shared: &SharedControl, generation: u64) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = false;
+            proving.persistent = true;
         }
     }
 }
 
 /// Whether the user can't be seeing the desktop now: a secure screen (the
-/// lock screen, a UAC prompt, Ctrl+Alt+Del) is up, or nobody has used the PC
-/// for a minute, the shortest time after which Windows turns the displays off.
-/// The iPad's own input counts as use.
+/// lock screen, a UAC prompt, Ctrl+Alt+Del) has the input, or Windows turned
+/// the displays off. How long the PC sat idle doesn't count: an iPad that
+/// connects sends Windows no input.
 #[cfg(all(windows, not(test)))]
 fn desktop_away() -> bool {
+    away(input_desktop().as_deref(), display_power::off())
+}
+
+/// Unit tests and other platforms: the desktop is always there.
+#[cfg(any(not(windows), test))]
+fn desktop_away() -> bool {
+    false
+}
+
+/// [`desktop_away`] from the input desktop's name (`None` when it can't be
+/// opened, as the secure desktop can't) and whether the displays are off
+/// (`None` before Windows has said).
+#[cfg(any(windows, test))]
+fn away(input_desktop: Option<&str>, displays_off: Option<bool>) -> bool {
+    input_desktop != Some("Default") || displays_off == Some(true)
+}
+
+/// The name of the desktop that has the input, `None` if it can't be opened.
+#[cfg(all(windows, not(test)))]
+fn input_desktop() -> Option<String> {
     use windows::Win32::Foundation::{BOOL, HANDLE};
     use windows::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
         DESKTOP_READOBJECTS, UOI_NAME,
     };
-    use windows::Win32::System::SystemInformation::GetTickCount;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-
-    const DISPLAY_OFF_AFTER_MS: u32 = 60_000;
-    // The secure desktop cannot be opened from the user's session.
-    let Ok(desktop) =
-        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), BOOL(0), DESKTOP_READOBJECTS) })
-    else {
-        return true;
-    };
+    let desktop =
+        unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), BOOL(0), DESKTOP_READOBJECTS) }.ok()?;
     let mut name = [0u16; 64];
     let mut needed = 0u32;
     let named = unsafe {
@@ -505,27 +563,87 @@ fn desktop_away() -> bool {
         )
     };
     let _ = unsafe { CloseDesktop(desktop) };
+    named.ok()?;
     let length = name
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(name.len());
-    if named.is_err() || String::from_utf16_lossy(&name[..length]) != "Default" {
-        return true;
-    }
-    let mut input = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    if !unsafe { GetLastInputInfo(&mut input) }.as_bool() {
-        return false;
-    }
-    unsafe { GetTickCount() }.wrapping_sub(input.dwTime) >= DISPLAY_OFF_AFTER_MS
+    Some(String::from_utf16_lossy(&name[..length]))
 }
 
-/// Unit tests and other platforms: the desktop is always there.
-#[cfg(any(not(windows), test))]
-fn desktop_away() -> bool {
-    false
+/// Whether Windows has the console's displays off, from its
+/// GUID_CONSOLE_DISPLAY_STATE notifications. Windows sends the current state
+/// as soon as the callback is registered, at app start.
+#[cfg(all(windows, not(test)))]
+mod display_power {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Once;
+
+    use windows::core::GUID;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+    use windows::Win32::System::Power::{
+        PowerSettingRegisterNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+        POWERBROADCAST_SETTING,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_POWERSETTINGCHANGE};
+
+    const CONSOLE_DISPLAY_STATE: GUID = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    const UNKNOWN: u8 = u8::MAX;
+    /// 0 off, 1 on, 2 dimmed.
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    unsafe extern "system" fn changed(
+        _context: *const core::ffi::c_void,
+        kind: u32,
+        setting: *const core::ffi::c_void,
+    ) -> u32 {
+        if kind == PBT_POWERSETTINGCHANGE && !setting.is_null() {
+            let setting = setting.cast::<POWERBROADCAST_SETTING>();
+            let header = unsafe { std::ptr::read_unaligned(setting) };
+            if header.PowerSetting == CONSOLE_DISPLAY_STATE && header.DataLength >= 4 {
+                let data = unsafe { std::ptr::addr_of!((*setting).Data) }.cast::<u32>();
+                let value = unsafe { std::ptr::read_unaligned(data) };
+                STATE.store(value.min(2) as u8, Ordering::Relaxed);
+            }
+        }
+        0
+    }
+
+    /// Start listening. Later calls do nothing.
+    pub(super) fn watch() {
+        static WATCH: Once = Once::new();
+        WATCH.call_once(|| {
+            // Windows keeps both for as long as the app runs.
+            let parameters = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                Callback: Some(changed),
+                Context: std::ptr::null_mut(),
+            }));
+            let mut registration = std::ptr::null_mut();
+            let result = unsafe {
+                PowerSettingRegisterNotification(
+                    &CONSOLE_DISPLAY_STATE,
+                    DEVICE_NOTIFY_CALLBACK,
+                    HANDLE((parameters as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS).cast()),
+                    &mut registration,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                tracing::warn!(
+                    error = result.0,
+                    "Could not watch the display power state; a failed second screen is \
+                     remembered whatever it is"
+                );
+            }
+        });
+    }
+
+    pub(super) fn off() -> Option<bool> {
+        watch();
+        match STATE.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            state => Some(state == 0),
+        }
+    }
 }
 
 /// What the virtual display worker is asked to do.
