@@ -38,11 +38,18 @@ struct UpdateManifest: Decodable, Equatable {
     }
 
     /// A note the popup can show: one trimmed line, not empty and not too
-    /// long. Anything else is dropped rather than failing the check.
+    /// long, without control, format (U+200B and the like) or line and
+    /// paragraph separator characters, as the PC and check-versions.sh
+    /// refuse them. Anything else is dropped rather than failing the check.
     static func shortNote(_ note: String?) -> String? {
         guard let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty,
               note.count <= maxNoteLength,
-              !note.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+              !note.unicodeScalars.contains(where: { scalar in
+                  switch scalar.properties.generalCategory {
+                  case .control, .format, .lineSeparator, .paragraphSeparator: return true
+                  default: return false
+                  }
+              })
         else { return nil }
         return note
     }

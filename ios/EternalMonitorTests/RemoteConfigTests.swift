@@ -86,7 +86,9 @@ final class RemoteConfigTests: XCTestCase {
     }
 
     func testTheFirstPictureWaitIsClamped() {
-        for (value, applied) in [("8", 8), ("10", 10), ("20", 20), ("7", nil), ("21", nil), ("0", nil), ("-12", nil),
+        // Never shorter than today's 10 s.
+        for (value, applied) in [("10", 10), ("15", 15), ("20", 20), ("9", nil), ("8", nil), ("7", nil), ("21", nil),
+                                 ("0", nil), ("-12", nil),
                                  ("12.5", nil), (#""12""#, nil), ("true", nil), ("null", nil)] as [(String, Int?)] {
             let settings = RemoteConfig.parse(ipad(#","config":{"schema":1,"first_frame_timeout_s":\#(value)}"#))
             XCTAssertEqual(settings, RemoteConfig.Settings(firstFrameTimeoutSeconds: applied, reason: nil), value)
@@ -114,6 +116,19 @@ final class RemoteConfigTests: XCTestCase {
         XCTAssertEqual(RemoteConfig.read(from: defaults, now: start), RemoteConfig.Settings(firstFrameTimeoutSeconds: nil, reason: nil))
         XCTAssertEqual(RemoteConfig.summary(RemoteConfig.read(from: defaults, now: start), rollout: nil),
                        "remote_config=applied rollout=none first_frame_s=default")
+    }
+
+    /// Notes with separators or invisible format characters are dropped, as
+    /// the PC and check-versions.sh refuse them.
+    func testANoteWithHiddenCharactersIsDropped() throws {
+        for note in ["Two\u{2028}lines", "Two\u{2029}paragraphs", "Zero\u{200B}width", "Reversed \u{202E}text",
+                     "Soft\u{00AD}hyphen", "\u{FEFF}Fixes audio.", "Bell\u{07}"] {
+            let escaped = String(data: try JSONSerialization.data(withJSONObject: [note], options: []), encoding: .utf8)!
+            let parsed = try XCTUnwrap(UpdateManifest.parse(ipad(#","note":"# + escaped.dropFirst().dropLast())), note)
+            XCTAssertNil(parsed.note, note.debugDescription)
+        }
+        XCTAssertEqual(UpdateManifest.parse(ipad(#","note":"Fixes Pencil pressure — and more.""#))?.note,
+                       "Fixes Pencil pressure — and more.")
     }
 
     /// 0.3.3's decoder, copied here, and this one read the example manifest

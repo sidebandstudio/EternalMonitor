@@ -10,7 +10,9 @@ import Foundation
 enum RemoteConfig {
     static let schema = 1
     static let maxRolloutDays = 14
-    static let firstFrameTimeoutRange = 8...20
+    /// Only ever longer than today's 10 s: a shorter wait would cut off a
+    /// slow first connection and could stop automatic reconnects.
+    static let firstFrameTimeoutRange = 10...20
     /// A saved config applies this long after the check that fetched it.
     static let maxAge: TimeInterval = 14 * 24 * 60 * 60
 
