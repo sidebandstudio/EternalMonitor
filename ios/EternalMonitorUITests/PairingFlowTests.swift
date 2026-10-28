@@ -1,6 +1,6 @@
 import XCTest
 
-final class PairingFlowTests: XCTestCase {
+final class PairingFlowTests: UITestCase {
     func testPairingFlow() throws {
         continueAfterFailure = false
         let environment = ProcessInfo.processInfo.environment
@@ -11,7 +11,7 @@ final class PairingFlowTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = host
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         let input = app.textFields["pairing.code"]
         XCTAssertTrue(input.waitForExistence(timeout: 10))
         input.tap()
@@ -36,7 +36,7 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(app.images["recent.paired"].firstMatch.exists)
         app.terminate()
         // A new process must obtain its token from Keychain and skip the sheet.
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         XCTAssertFalse(input.exists)
         capture("pairing-token-reconnect", app: app)
@@ -47,7 +47,7 @@ final class PairingFlowTests: XCTestCase {
         app.buttons["settings.done"].tap()
         disconnect(app)
         app.terminate()
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(input.waitForExistence(timeout: 10), "Forget paired hosts must require a code again")
         app.buttons["pairing.cancel"].tap()
         app.terminate()

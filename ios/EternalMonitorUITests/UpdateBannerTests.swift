@@ -2,7 +2,7 @@ import XCTest
 
 /// Debug builds read `EM_UPDATE_MANIFEST` instead of the website, so these
 /// tests never touch the network.
-final class UpdateBannerTests: XCTestCase {
+final class UpdateBannerTests: UITestCase {
     private let manifest = #"{"schema":1,"ipad":{"version":"9.9.9","build":999,"testflight":"https://testflight.apple.com/join/ppc9QfXc"}}"#
 
     override func setUpWithError() throws {
@@ -14,7 +14,7 @@ final class UpdateBannerTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-checkForUpdates", "YES"]
         if resetDismissal { app.launchArguments += ["-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0"] }
         if let manifest { app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest }
-        app.launch()
+        launchCleanly(app)
         // A new build opens the popup first; the banner tests close it.
         if resetDismissal, !keepPopup, manifest?.contains(#""build":999"#) == true {
             let later = app.buttons["updatePopup.later"]
@@ -66,7 +66,7 @@ final class UpdateBannerTests: XCTestCase {
                                "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0",
                                "-feedbackLongSessions", "3", "-feedbackAskDone", "NO"]
         app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
-        app.launch()
+        launchCleanly(app)
         let send = app.buttons["feedback.askSend"]
         XCTAssertTrue(send.waitForExistence(timeout: 10))
         let later = app.buttons["updatePopup.later"]
@@ -90,7 +90,7 @@ final class UpdateBannerTests: XCTestCase {
                                "-feedbackLongSessions", "3", "-feedbackAskDone", "NO"]
         app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
         app.launchEnvironment["EM_FEEDBACK_PREPARE_MS"] = "4000"
-        app.launch()
+        launchCleanly(app)
         let send = app.buttons["feedback.askSend"]
         XCTAssertTrue(send.waitForExistence(timeout: 10))
         send.tap()
@@ -111,7 +111,7 @@ final class UpdateBannerTests: XCTestCase {
                                "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0", "-feedbackAskDone", "YES"]
         app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
         app.launchEnvironment["EM_UI_PREVIEW"] = "feedback"
-        app.launch()
+        launchCleanly(app)
         let done = app.buttons["feedback.done"]
         XCTAssertTrue(done.waitForExistence(timeout: 15))
         let later = app.buttons["updatePopup.later"]
@@ -166,7 +166,7 @@ final class UpdateBannerTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "mismatch"
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["mismatch.openTestFlight"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Update the iPad app: open TestFlight")).firstMatch.exists)
         attach(app, "version-mismatch")

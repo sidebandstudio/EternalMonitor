@@ -1,6 +1,6 @@
 import XCTest
 
-final class ConnectScreenTests: XCTestCase {
+final class ConnectScreenTests: UITestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
@@ -8,7 +8,7 @@ final class ConnectScreenTests: XCTestCase {
     func testConnectControls() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.textFields["connect.port"].exists)
@@ -30,7 +30,7 @@ final class ConnectScreenTests: XCTestCase {
         // simulator's app, 9877 can be taken, and the card then says the
         // cable can't be used instead of asking for one.
         app.launchEnvironment["EM_USB_PORT"] = "0"
-        app.launch()
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         settings.tap()
@@ -68,7 +68,7 @@ final class ConnectScreenTests: XCTestCase {
     func testScrollingFromThePictureRowKeepsTheChoice() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-pictureFit", "fit"]
-        app.launch()
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         let picture = app.buttons["settings.pictureFit"]
@@ -112,7 +112,7 @@ final class ConnectScreenTests: XCTestCase {
     func testPairingCodeAsAddressIsExplainedAtOnce() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "390756", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -129,7 +129,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "searchFailed"
-        app.launch()
+        launchCleanly(app)
         let title = app.staticTexts["connect.scanProblemTitle"]
         XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
         XCTAssertEqual(title.label, "Couldn't search for PCs")
@@ -147,7 +147,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         // 192.0.2.1 is a documentation address: nothing ever answers.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "192.0.2.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -167,7 +167,7 @@ final class ConnectScreenTests: XCTestCase {
     func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let diagnostics = app.buttons["settings.diagnostics"]
@@ -213,7 +213,7 @@ final class ConnectScreenTests: XCTestCase {
     func testFrameRatePreference() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let rate = app.buttons["settings.targetFPS"]
@@ -227,7 +227,7 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "settings-fps120"; shot.lifetime = .keepAlways; add(shot)
         app.terminate()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         XCTAssertTrue(rate.waitForExistence(timeout: 5))
