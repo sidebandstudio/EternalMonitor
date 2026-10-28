@@ -326,8 +326,12 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
             return TaskOutcome::Failed(None);
         }
     };
-    // vdd_task.ps1 waits up to 10 s for an earlier instance and 15 s for its own.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let call = if task == TASK_ENABLE {
+        crate::stall::Call::VddEnable
+    } else {
+        crate::stall::Call::VddDisable
+    };
+    let deadline = Instant::now() + call.limits().limit;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -336,13 +340,18 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
                 std::thread::sleep(Duration::from_millis(50));
             }
             result => {
-                warn!(task, ?result, "VDD task runner failed or timed out");
+                if let Err(error) = result {
+                    warn!(task, %error, "VDD task runner failed");
+                } else {
+                    crate::stall::log_timed_out(call, started.elapsed());
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return TaskOutcome::TimedOut;
             }
         }
     }
+    crate::stall::note_finished(call, started.elapsed());
 
     match child.wait_with_output() {
         Ok(out) if out.status.success() => {
