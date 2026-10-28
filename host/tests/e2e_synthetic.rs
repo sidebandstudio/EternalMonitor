@@ -270,22 +270,22 @@ fn usb_framed_stream_end_to_end() {
                         // encodes, and how much of the stall the socket
                         // buffers took depends on the OS, so recovery is
                         // checked by frame numbers. What the socket buffers
-                        // held comes first, in order and fewer frames than
-                        // the stall made. Then frames the link dropped are
-                        // missing, and the stream resumes at a keyframe.
-                        // From there it reaches frames captured after the
-                        // reader resumed. A link that replayed the stall
-                        // would deliver all of it, with no gap.
+                        // held comes first, fewer frames than the stall made.
+                        // Then frames the link dropped are missing, and the
+                        // stream resumes at a keyframe. From there it
+                        // reaches frames captured after the reader resumed.
+                        // A link that replayed the stall would deliver all
+                        // of it, with no gap. Frames are numbered by
+                        // capture, and a loaded encoder skips captures, so
+                        // a gap before an ordinary frame is not a drop.
                         if let Some(resumed) = resumed {
-                            if !recovered && header.frame_seq > last_complete + 1 {
-                                assert!(header.is_keyframe,
-                                    "USB resumed at frame {} after dropping from {last_complete}, not at a keyframe", header.frame_seq);
+                            if !recovered && header.is_keyframe && header.frame_seq > last_complete + 1 {
                                 recovered = true;
                                 recovery_ms = resumed.elapsed().as_millis();
                             } else if !recovered {
                                 stale += 1;
                                 assert!(stale < STALL_FRAMES,
-                                    "USB replayed the stall: {stale} old frames after it, the last {}", header.frame_seq);
+                                    "USB did not drop the stall and resume at a keyframe: {stale} frames after it, the last {}", header.frame_seq);
                             }
                             caught_up |= recovered && header.frame_seq >= live_from;
                         }
