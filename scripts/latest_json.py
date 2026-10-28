@@ -235,6 +235,10 @@ def build_manifest(args, current, release, download, connect, root):
             build = args.build
             if build < old:
                 raise ManifestError(f"build {build} is older than the published build {old}; use rollback")
+            # The iPad app compares versions before builds, so an older version is never offered.
+            if version_key(args.ipad) < version_key(current["ipad"]["version"]):
+                raise ManifestError(f"iPad {args.ipad} is older than the published {current['ipad']['version']}; "
+                                    "use rollback")
             if asc is None:
                 raise ManifestError("publish --ipad checks App Store Connect: set ASC_KEY_ID and ASC_ISSUER_ID")
         if asc is not None:

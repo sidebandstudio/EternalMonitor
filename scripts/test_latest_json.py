@@ -197,6 +197,12 @@ class LatestJsonTest(unittest.TestCase):
         self.asc = FakeTestFlight()
         self.assertIn("use rollback", self.fails("publish", "--ipad", "0.3.4", "--build", "300"))
 
+    def test_publish_refuses_an_older_ipad_version_with_a_newer_build(self):
+        # The iPad app compares versions before builds, so 0.3.2 build 401 is older than 0.3.3 build 364.
+        self.bump_tree("0.3.4")
+        self.asc = FakeTestFlight()
+        self.assertIn("use rollback", self.fails("publish", "--ipad", "0.3.2", "--build", "401"))
+
     def test_publish_newer_than_the_tree_is_refused(self):
         self.assertIn("newer than this tree", self.fails("publish", "--windows", "0.3.4"))
 
