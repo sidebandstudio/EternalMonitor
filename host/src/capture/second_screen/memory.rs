@@ -10,6 +10,13 @@
 //! start in the mirror and the host tries again after [`BACKOFF`]. A second
 //! screen that shows a picture, a change in any of them, Try again, or
 //! another mode forgets the failure.
+//!
+//! The update manifest may also name hardware where the second screen is
+//! known not to start ([`crate::remote_config`]). On such a PC the first
+//! Second screen connection of an app run saves a `hardware_rule` failure
+//! without trying, so it is handled like any other: the mirror, the notice
+//! with Try again, and the same waits. Try again, or a picture the second
+//! screen shows, overrides the rule on this PC for good.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,6 +26,13 @@ use tracing::warn;
 
 #[cfg(any(windows, test))]
 pub(super) const FILE_NAME: &str = "second-screen-state.json";
+
+/// Where Try again, or a picture, overrides a manifest rule for this PC.
+#[cfg(any(windows, test))]
+pub(super) const RULE_FILE_NAME: &str = "second-screen-rule.json";
+
+/// Saved for a manifest rule: nothing was tried.
+const HARDWARE_RULE: &str = "hardware_rule";
 
 /// The file's layout. Another value is ignored, like an unreadable file.
 const FORMAT: u32 = 1;
@@ -46,8 +60,14 @@ const BACKOFF: [Duration; 5] = [
 
 /// The failures worth remembering: the driver was turned on and Windows gave
 /// no usable display. A failed Enable task is not one: its notice already
-/// says how to repair the install, and it costs no wait.
-const REMEMBERED: [&str; 3] = ["attach_timeout", "no_frames", "duplication_failed"];
+/// says how to repair the install, and it costs no wait. Nor is a manifest
+/// rule, but it is saved the same way.
+const REMEMBERED: [&str; 4] = [
+    "attach_timeout",
+    "no_frames",
+    "duplication_failed",
+    HARDWARE_RULE,
+];
 
 /// What decides whether the second screen can work on this PC. Every value
 /// is one the session log already holds.
@@ -99,6 +119,42 @@ impl Fingerprint {
         .filter_map(|(name, changed)| changed.then_some(name))
         .collect()
     }
+
+    /// Whether a rule in the update manifest names this PC.
+    #[cfg(any(windows, test))]
+    pub(crate) fn matches_rule(&self, config: &crate::remote_config::Applied) -> bool {
+        config.second_screen_rule(&self.graphics, &self.display_driver, &self.windows)
+    }
+
+    /// The graphics cards without their driver versions: a driver or
+    /// Windows update keeps an override of a manifest rule.
+    fn cards(&self) -> Vec<String> {
+        self.graphics
+            .iter()
+            .map(|card| {
+                card.rsplit_once(' ')
+                    .map_or(card.as_str(), |(name, _)| name)
+            })
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// `second-screen-rule.json`: the cards of a PC where Try again or a picture
+/// overrode a manifest rule.
+#[derive(Debug, Serialize, Deserialize)]
+struct Override {
+    format: u32,
+    cards: Vec<String>,
+}
+
+/// A manifest rule names this PC and nothing here overrode it.
+#[derive(Debug)]
+struct Rule {
+    path: PathBuf,
+    /// This app run saved its failure once already; after another mode or
+    /// the wait, it is tried like any failure.
+    applied: bool,
 }
 
 /// The saved file. Without a failure it says there is none, for when the
@@ -179,6 +235,7 @@ pub(crate) struct Memory {
     uncleared: Option<Instant>,
     /// Clearing failed and was logged once in this app run.
     clear_failure_logged: bool,
+    rule: Option<Rule>,
 }
 
 impl Memory {
@@ -221,6 +278,7 @@ impl Memory {
             failed,
             uncleared: None,
             clear_failure_logged: false,
+            rule: None,
         };
         if let Some(failed) = memory.failed {
             tracing::info!(
@@ -231,6 +289,81 @@ impl Memory {
             );
         }
         memory
+    }
+
+    /// Whether a manifest rule names this PC. Without one, a failure saved
+    /// for an earlier rule is forgotten: the second screen is tried at the
+    /// next connection. `path` holds an override of the rule.
+    #[cfg(any(windows, test))]
+    pub(crate) fn set_rule(&mut self, matched: bool, path: PathBuf) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let (since, cards) = (store.since, store.fingerprint.cards());
+        if !matched {
+            if self.failed.is_some_and(|f| f.reason == HARDWARE_RULE) {
+                tracing::info!(
+                    "The update manifest no longer names this PC's hardware — trying the \
+                     second screen at the next connection"
+                );
+                self.failed = None;
+                self.clear(since);
+            }
+            return;
+        }
+        let overridden = std::fs::read(&path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<Override>(&data).ok())
+            .is_some_and(|saved| saved.format == FORMAT && saved.cards == cards);
+        if overridden {
+            tracing::info!(
+                "The update manifest names this PC's hardware, but the second screen was \
+                 tried here — not applying the rule"
+            );
+            return;
+        }
+        self.rule = Some(Rule {
+            path,
+            applied: false,
+        });
+    }
+
+    /// A Second screen connection with nothing saved, on a PC a manifest rule
+    /// names: save its failure, once per app run, and hold like after any
+    /// failure.
+    pub(crate) fn hold_for_rule(&mut self, now: Instant) -> Option<Hold> {
+        let rule = self.rule.as_mut()?;
+        if rule.applied || self.failed.is_some() {
+            return None;
+        }
+        rule.applied = true;
+        self.note_failure(HARDWARE_RULE, now)
+    }
+
+    /// Try again, or a picture: the rule no longer applies on this PC, in
+    /// this app run or later ones.
+    fn override_rule(&mut self) {
+        let (Some(rule), Some(store)) = (self.rule.take(), &self.store) else {
+            return;
+        };
+        let saved = Override {
+            format: FORMAT,
+            cards: store.fingerprint.cards(),
+        };
+        let written = serde_json::to_vec_pretty(&saved)
+            .map_err(std::io::Error::other)
+            .and_then(|data| (store.io.replace)(&rule.path, &data));
+        match written {
+            Ok(()) => tracing::info!(
+                "The second screen was tried on this PC — the update manifest's rule for its \
+                 hardware no longer applies here"
+            ),
+            Err(error) => warn!(
+                %error,
+                "Could not save that the second screen was tried — the update manifest's rule \
+                 for this PC applies again at the next app run"
+            ),
+        }
     }
 
     fn wall(&self, now: Instant) -> Option<u64> {
@@ -294,6 +427,9 @@ impl Memory {
     /// [`Memory::uncleared`]. `now` paces those retries; `success` (a picture
     /// or Try again) retries at once.
     pub(crate) fn forget(&mut self, now: Instant, success: bool) -> bool {
+        if success {
+            self.override_rule();
+        }
         let forgot = self.failed.take().is_some();
         if forgot || (success && self.uncleared.is_some()) {
             self.clear(now);
@@ -1176,6 +1312,209 @@ mod tests {
             assert_eq!(hold, None, "the count saturates, the wait can't end");
             assert_eq!(saved(&path)["failure"]["failures"], u32::MAX);
         }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The example manifest's config: its first rule names [`laptop`].
+    fn example_config() -> crate::remote_config::Applied {
+        let example: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../proto/testdata/latest_remote_config.json"
+        ))
+        .unwrap();
+        crate::remote_config::Applied {
+            rollout: None,
+            config: crate::remote_config::parse_config(Some(&example["windows"]["config"])),
+        }
+    }
+
+    fn rule_file(path: &Path) -> PathBuf {
+        path.with_file_name(RULE_FILE_NAME)
+    }
+
+    /// An app run on a PC the manifest's rule names, or no longer names.
+    fn ruled_run(path: &Path, after: Duration, matched: bool) -> (Memory, Instant) {
+        let (mut memory, start) = app_run(path, after);
+        memory.set_rule(matched, rule_file(path));
+        (memory, start)
+    }
+
+    #[test]
+    fn the_example_rule_names_the_hybrid_laptop_only() {
+        let config = example_config();
+        assert!(laptop().matches_rule(&config));
+        let mut updated = laptop();
+        updated.display_driver = "25.11.3".into();
+        assert!(!updated.matches_rule(&config));
+        let mut desktop = laptop();
+        desktop.graphics = vec!["NVIDIA GeForce RTX 4080 32.0.15.6094".into()];
+        assert!(!desktop.matches_rule(&config));
+        assert!(!laptop().matches_rule(&crate::remote_config::read(
+            Path::new("/nonexistent/remote-config.json"),
+            T0
+        )));
+    }
+
+    /// The manifest names this PC: Second screen sessions start in the
+    /// mirror with the usual notice, and Try again works and is kept for
+    /// this PC's cards, through driver and Windows updates.
+    #[test]
+    fn a_manifest_rule_mirrors_until_try_again_overrides_it() {
+        let path = temp_file("rule");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+        assert_eq!(
+            memory.hold(start),
+            None,
+            "nothing saved before a connection"
+        );
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        note_connected(&shared, start);
+        assert_eq!(next_step(&shared, start), Step::Nothing, "no Enable");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some("hardware_rule"));
+        assert!(retries_later(&shared));
+        assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule");
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+
+        // The next app run holds the same way, without saving it again.
+        let (memory, start) = ruled_run(&path, Duration::from_secs(60), true);
+        assert_eq!(memory.hold(start).map(|h| h.reason), Some("hardware_rule"));
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, start), Step::Attach, "Try again works");
+        assert!(!path.exists());
+        assert!(rule_file(&path).exists());
+        // Later app runs try it, after a driver update too.
+        let (memory, start) = ruled_run(&path, Duration::from_secs(120), true);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let mut updated = laptop();
+        updated.graphics[1] = "NVIDIA GeForce RTX 3050 Laptop GPU 32.0.15.6099".into();
+        let at = Instant::now();
+        let mut memory = Memory::load(path.clone(), updated, T0 + 180, at);
+        memory.set_rule(true, rule_file(&path));
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, at), Step::Attach);
+        // A failure now is a real one, remembered as usual.
+        attach(&shared, &NeverAttaches::new(at), ATTACH_TIMEOUT);
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The rule's failure waits like any other, and a picture after the
+    /// wait overrides the rule.
+    #[test]
+    fn a_manifest_rule_is_tried_after_the_wait_and_a_picture_overrides_it() {
+        let path = temp_file("rule-wait");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        let later = start + hours(1);
+        reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, later), Step::Switch);
+        start_proving(&shared, 1, later);
+        note_image(&shared, 1);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert!(!path.exists() && rule_file(&path).exists());
+        let (memory, start) = ruled_run(&path, hours(2), true);
+        assert_eq!(memory.hold(start), None);
+        assert!(!memory.saved());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Mirror mode never sees the rule. Switching to another mode and back
+    /// tries the second screen, as after any failure.
+    #[test]
+    fn a_manifest_rule_never_touches_mirror_mode() {
+        let path = temp_file("rule-mirror");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+        let shared = second_screen_with(memory);
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        connect_viewer(&shared);
+        for tick in 0..10 {
+            assert_eq!(next_step(&shared, start + secs(tick)), Step::Nothing);
+        }
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert!(!path.exists(), "nothing saved in Mirror mode");
+        assert_eq!(remembered_failure(&shared), None);
+        // Second screen is still offered; choosing it applies the rule.
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        assert_eq!(remembered_failure(&shared), Some("hardware_rule"));
+        // Another mode forgets it; back in Second screen it is tried.
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        assert!(!path.exists());
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        assert!(!rule_file(&path).exists(), "no override without a try");
+    }
+
+    /// A PC the manifest doesn't name is tried as before, and a failure
+    /// saved for a rule the manifest dropped is forgotten at once.
+    #[test]
+    fn without_a_rule_the_second_screen_is_tried() {
+        let path = temp_file("rule-dropped");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, false);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+
+        let (mut memory, start) = ruled_run(&path, Duration::ZERO, true);
+        assert!(memory.hold_for_rule(start).is_some());
+        assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule");
+        let (memory, start) = ruled_run(&path, Duration::from_secs(60), false);
+        assert_eq!(memory.hold(start), None);
+        assert!(!memory.saved() && !path.exists());
+        // A real failure stays when the manifest has no rule.
+        let (mut memory, start) = ruled_run(&path, Duration::ZERO, false);
+        memory.note_failure("no_frames", start).unwrap();
+        let (memory, start) = ruled_run(&path, Duration::from_secs(60), false);
+        assert_eq!(memory.hold(start).map(|h| h.reason), Some("no_frames"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// An override that can't be read is no override; one that can't be
+    /// written still holds for this app run.
+    #[test]
+    fn an_unreadable_rule_override_is_ignored() {
+        let path = temp_file("rule-corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for content in [
+            "",
+            "{",
+            r#"{"format":2,"cards":[]}"#,
+            r#"{"format":1,"cards":["Other GPU"]}"#,
+        ] {
+            std::fs::write(rule_file(&path), content).unwrap();
+            let (mut memory, start) = ruled_run(&path, Duration::ZERO, true);
+            assert!(memory.hold_for_rule(start).is_some(), "{content}");
+            assert!(memory.forget(start, false));
+        }
+        let (mut memory, start) = ruled_run(&path, Duration::ZERO, true);
+        memory.store.as_mut().unwrap().io = Io {
+            remove: Io::FILES.remove,
+            replace: locked_write,
+            overwrite: locked_write,
+        };
+        assert!(memory.hold_for_rule(start).is_some(), "this app run holds");
+        memory.forget(start, true);
+        assert_eq!(memory.hold_for_rule(start), None, "this app run tries it");
+        let (mut memory, start) = ruled_run(&path, Duration::ZERO, true);
+        assert!(
+            memory.hold_for_rule(start).is_some(),
+            "the next one holds again"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

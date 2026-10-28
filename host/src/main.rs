@@ -168,8 +168,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     *shared.capture_target.lock() =
         eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
+    eternal_host::remote_config::load();
     #[cfg(windows)]
     eternal_host::capture::second_screen::load_memory(&shared);
+    eternal_host::remote_config::log_launch();
     shared
         .hevc_enabled
         .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);

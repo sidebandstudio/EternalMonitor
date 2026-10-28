@@ -637,7 +637,7 @@ fn a_remembered_second_screen_failure_says_it_tries_again_later() {
     use super::page_stream::add_later_retry;
     use crate::control::VddStatus;
     use crate::vdd::VddTaskHealth;
-    for failure in ["attach_timeout", "no_frames"] {
+    for failure in ["attach_timeout", "no_frames", "hardware_rule"] {
         let notice = || {
             second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None, Some(failure)).unwrap()
         };
@@ -650,6 +650,20 @@ fn a_remembered_second_screen_failure_says_it_tries_again_later() {
         add_later_retry(&mut now, false);
         assert_eq!(now, notice());
     }
+    // A manifest rule tried nothing: the notice doesn't say it failed.
+    let rule = second_screen_notice(
+        VddStatus::Failed,
+        VddTaskHealth::Ok,
+        None,
+        Some("hardware_rule"),
+    )
+    .unwrap();
+    assert!(
+        rule.body.starts_with("On PCs like this one"),
+        "{}",
+        rule.body
+    );
+    assert!(rule.retry && !rule.installer);
     // A notice without Try again (restart the PC) is left alone.
     let mut hung =
         second_screen_notice(VddStatus::Failed, VddTaskHealth::NotResponding, None, None).unwrap();

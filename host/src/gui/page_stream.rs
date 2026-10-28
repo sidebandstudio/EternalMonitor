@@ -721,6 +721,12 @@ pub(super) fn second_screen_notice(
             true,
             true,
         ),
+        // Nothing was tried: the update manifest names this PC's hardware.
+        (Failed, VddTaskHealth::Ok, None) if failure == Some("hardware_rule") => notice(
+            "On PCs like this one the second screen often doesn't start, so the iPad shows your main screen instead. Click Try again to use the second screen.",
+            true,
+            false,
+        ),
         // It attached, so it was not late: it showed no picture.
         (Failed, VddTaskHealth::Ok, None)
             if matches!(failure, Some("no_frames" | "duplication_failed")) =>

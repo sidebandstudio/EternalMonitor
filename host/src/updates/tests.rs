@@ -27,6 +27,7 @@ fn release(version: &str) -> Release {
         sha256: SHA.into(),
         recommended: true,
         note: None,
+        rollout: None,
     }
 }
 
@@ -732,6 +733,144 @@ fn popup_follows_the_banner_and_the_manifest_wording() {
     off.finish_check(1000, true, Ok(release("0.3.2")));
     assert!(off.notice(1000).is_some());
     assert_eq!(off.popup(1000), None);
+}
+
+/// The manifest's `windows.rollout` with the example's start,
+/// 2026-11-02T00:00:00Z, over a week.
+const ROLLOUT_START: u64 = 1_793_577_600;
+
+fn staged(version: &str) -> Release {
+    Release {
+        rollout: Some(Rollout {
+            start: ROLLOUT_START,
+            days: 7,
+        }),
+        ..release(version)
+    }
+}
+
+/// An install placed `share` of the way through the week's ramp.
+fn install_at(share: f64) -> Saved {
+    let id = (0u32..)
+        .map(|i| format!("{i:032x}"))
+        .find(|id| {
+            let at = crate::remote_config::bucket(id, "0.3.2") as f64 / u64::MAX as f64;
+            (at - share).abs() < 0.01
+        })
+        .unwrap();
+    Saved {
+        rollout_id: Some(id),
+        ..Saved::default()
+    }
+}
+
+/// A staged release reaches each install's banner, popup and notification
+/// on its day. Settings, Check now, Update now and a version mismatch never
+/// wait for it.
+#[test]
+fn a_staged_release_waits_only_for_the_automatic_prompt() {
+    let turn = ROLLOUT_START + 7 * DAY / 2;
+    let mut s = state(install_at(0.5));
+    assert_eq!(s.finish_check(turn - DAY, false, Ok(staged("0.3.2"))), None);
+    assert_eq!(s.check, CheckStatus::Available);
+    assert_eq!(s.notice(turn - DAY), None);
+    assert_eq!(s.popup(turn - DAY), None);
+    assert!(s.available().is_some(), "Settings says it is ready");
+    // Its turn comes between checks: the banner and popup show at once,
+    // the notification at the next check.
+    assert_eq!(s.notice(turn + 60), Some(Notice::Available("0.3.2".into())));
+    assert!(s.popup(turn + 60).is_some());
+    assert_eq!(
+        s.finish_check(turn + 60, false, Ok(staged("0.3.2"))),
+        Some("0.3.2".into())
+    );
+
+    // Check now shows it whatever the turn, and Update now works.
+    let mut asked = state(install_at(0.9));
+    asked.begin_check(true);
+    asked.finish_check(ROLLOUT_START, true, Ok(staged("0.3.2")));
+    assert_eq!(
+        asked.notice(ROLLOUT_START),
+        Some(Notice::Available("0.3.2".into()))
+    );
+    let mut waiting = state(install_at(0.9));
+    waiting.finish_check(ROLLOUT_START, false, Ok(staged("0.3.2")));
+    assert_eq!(waiting.notice(ROLLOUT_START), None);
+    assert!(matches!(
+        waiting.update_now(false),
+        Some(Command::Download(r)) if r.version == "0.3.2"
+    ));
+
+    // The last day: everyone.
+    let mut last = state(install_at(0.99));
+    let end = ROLLOUT_START + 7 * DAY;
+    assert_eq!(
+        last.finish_check(end, false, Ok(staged("0.3.2"))),
+        Some("0.3.2".into())
+    );
+    // Without a rollout, at once, as before.
+    let mut plain = state(install_at(0.99));
+    assert_eq!(
+        plain.finish_check(ROLLOUT_START, false, Ok(release("0.3.2"))),
+        Some("0.3.2".into())
+    );
+}
+
+/// Each install gets its id once, keeps it, and an older state file without
+/// one gets a new one.
+#[test]
+fn the_rollout_id_is_made_once_and_kept() {
+    let s = state(Saved::default());
+    let id = s.saved.rollout_id.clone().unwrap();
+    assert_eq!(id.len(), 32);
+    assert_eq!(state(s.saved.clone()).saved.rollout_id, Some(id.clone()));
+    assert_ne!(state(Saved::default()).saved.rollout_id, Some(id));
+}
+
+/// The example manifest with every new field, as 0.3.3's parser (copied
+/// here) and this one read it: old apps see the same release.
+#[test]
+fn todays_parser_still_reads_a_manifest_with_the_new_fields() {
+    #[derive(Deserialize)]
+    struct Manifest033 {
+        schema: u32,
+        windows: Option<Windows033>,
+    }
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct Windows033 {
+        version: String,
+        installer: String,
+        sha256: String,
+        #[serde(default)]
+        recommended: serde_json::Value,
+        #[serde(default)]
+        note: serde_json::Value,
+    }
+    let example = include_str!("../../../proto/testdata/latest_remote_config.json");
+    let old: Manifest033 = serde_json::from_str(example).unwrap();
+    let windows = old.windows.unwrap();
+    assert_eq!((old.schema, windows.version.as_str()), (1, "0.3.4"));
+    assert_eq!(windows.installer, production_installer("0.3.4"));
+
+    let parsed = parse_manifest(example.as_bytes(), &Endpoints::production()).unwrap();
+    assert_eq!(parsed.version, "0.3.4");
+    assert_eq!(
+        parsed.rollout,
+        Some(Rollout {
+            start: ROLLOUT_START,
+            days: 7
+        })
+    );
+    // A bad rollout is no rollout: the release itself still parses.
+    let mut bad: serde_json::Value = serde_json::from_str(example).unwrap();
+    bad["windows"]["rollout"] = serde_json::json!({ "start": "soon", "days": 99 });
+    let parsed = parse_manifest(bad.to_string().as_bytes(), &Endpoints::production()).unwrap();
+    assert_eq!(parsed.rollout, None);
+    // And today's live manifest has none.
+    let live = include_str!("../../../docs/latest.json");
+    let parsed = parse_manifest(live.as_bytes(), &Endpoints::production()).unwrap();
+    assert_eq!(parsed.rollout, None);
 }
 
 #[test]

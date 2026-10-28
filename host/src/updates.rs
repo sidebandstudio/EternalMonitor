@@ -15,6 +15,8 @@ use eternal_updater::quote_arg;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::remote_config::Rollout;
+
 /// Where people can always get the installer by hand.
 pub const WEBSITE_DOWNLOAD: &str = "https://eternalmonitor.dev/download.html";
 pub use eternal_updater::SETUP_FLAGS;
@@ -120,6 +122,10 @@ pub struct Release {
     /// One short sentence the popup shows under its message.
     #[serde(default)]
     pub note: Option<String>,
+    /// Spreads the automatic prompt for this release over a few days.
+    /// Missing means everyone at once.
+    #[serde(default)]
+    pub rollout: Option<Rollout>,
 }
 
 fn recommended() -> bool {
@@ -143,6 +149,8 @@ struct ManifestWindows {
     recommended: serde_json::Value,
     #[serde(default)]
     note: serde_json::Value,
+    #[serde(default)]
+    rollout: serde_json::Value,
 }
 
 const MAX_NOTE_CHARS: usize = 200;
@@ -183,6 +191,7 @@ pub fn parse_manifest(data: &[u8], endpoints: &Endpoints) -> Result<Release, Upd
         sha256,
         recommended: windows.recommended.as_bool().unwrap_or(true),
         note: short_note(windows.note.as_str()),
+        rollout: Rollout::parse(&windows.rollout),
     })
 }
 
@@ -703,6 +712,10 @@ struct Saved {
     popup: Option<(String, u64)>,
     /// Written just before Setup starts: `(from, to)`.
     pending: Option<(String, String)>,
+    /// A random id that places this install in staged rollouts. It never
+    /// leaves the PC.
+    #[serde(default)]
+    rollout_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -804,6 +817,12 @@ impl State {
             streaming: false,
             close: false,
         };
+        if state.saved.rollout_id.is_none() {
+            let mut random = [0u8; 16];
+            if getrandom::fill(&mut random).is_ok() {
+                state.saved.rollout_id = Some(hex(&random));
+            }
+        }
         // A previous run started Setup. The relaunched version tells us how it went.
         if let Some((from, to)) = state.saved.pending.take() {
             if newer_stable(&to, &state.current).is_none() {
@@ -824,6 +843,18 @@ impl State {
             .latest
             .as_ref()
             .filter(|latest| newer_stable(&latest.version, &self.current).is_some())
+    }
+
+    /// The available release is staged and this install's turn has not come:
+    /// automatic checks don't announce it yet. Asking always shows it.
+    fn held_back(&self, now: u64) -> bool {
+        let (Some(release), Some(id)) = (self.available(), &self.saved.rollout_id) else {
+            return false;
+        };
+        !self.manual_check
+            && release
+                .rollout
+                .is_some_and(|rollout| !rollout.shows(id, &release.version, now))
     }
 
     fn due(&self, now: u64, interval: u64) -> bool {
@@ -872,7 +903,11 @@ impl State {
             return None;
         }
         let version = self.available()?.version.clone();
-        if !self.auto || self.snoozed(now) || self.saved.notified.as_deref() == Some(&version) {
+        if !self.auto
+            || self.snoozed(now)
+            || self.held_back(now)
+            || self.saved.notified.as_deref() == Some(&version)
+        {
             return None;
         }
         self.saved.notified = Some(version.clone());
@@ -909,7 +944,7 @@ impl State {
             return Some(Notice::Updated(version.clone()));
         }
         let release = self.available()?;
-        ((self.auto || self.manual_check) && !self.snoozed(now))
+        ((self.auto || self.manual_check) && !self.snoozed(now) && !self.held_back(now))
             .then(|| Notice::Available(release.version.clone()))
     }
 
@@ -1434,7 +1469,12 @@ impl Worker {
                 Command::Check { manual } => {
                     self.state.lock().begin_check(manual);
                     (self.wake)(None);
-                    let result = fetch_manifest(&self.endpoints);
+                    let result =
+                        get_json(&self.endpoints.manifest, "application/json").and_then(|data| {
+                            // Per-PC settings apply from the next app run.
+                            crate::remote_config::save_fetched(&data);
+                            parse_manifest(&data, &self.endpoints)
+                        });
                     let notify =
                         self.update(|state| state.finish_check(now_secs(), manual, result));
                     (self.wake)(notify.as_deref());
