@@ -711,10 +711,9 @@ fn update_arrives_while_feedback_is_open(
     results: &mut SnapshotResults,
 ) {
     use std::io::{BufRead, BufReader, Write};
-    // A site that answers the check only when told to.
+    // A site that answers the check at once.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (answer, answered) = std::sync::mpsc::channel::<()>();
     let manifest = serde_json::json!({
         "schema": 1,
         "windows": {
@@ -731,7 +730,6 @@ fn update_arrives_while_feedback_is_open(
         while reader.read_line(&mut line).unwrap_or(0) > 2 {
             line.clear();
         }
-        let _ = answered.recv();
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
@@ -739,7 +737,10 @@ fn update_arrives_while_feedback_is_open(
         );
     });
     // Never checked, so the window checks as it opens; already announced,
-    // so no notification.
+    // so no notification. The check waits until Send feedback is open:
+    // its request times out after 10 s, which drawing the panel on a
+    // loaded machine can take.
+    eternal_host::updates::hold_checks(true);
     std::fs::write(
         dir.join("EternalMonitor/update-state.json"),
         serde_json::json!({ "notified": "99.1.0" }).to_string(),
@@ -762,9 +763,8 @@ fn update_arrives_while_feedback_is_open(
         .click();
     window.run_steps(4);
     window.get_by_label("Tell us how it's going");
-    answer.send(()).unwrap();
-    // Only a backstop: the check is a loopback request, but on a starved
-    // machine it took longer than 10 s.
+    eternal_host::updates::hold_checks(false);
+    // Only a backstop for a check that never finishes.
     let deadline = Instant::now() + Duration::from_secs(120);
     while window
         .query_by_label("EternalMonitor 99.1.0 is available")
@@ -775,12 +775,17 @@ fn update_arrives_while_feedback_is_open(
         window.run_steps(1);
     }
     window.run_steps(4);
-    assert!(
-        window
-            .query_by_role_and_label(Role::Dialog, "Update ready")
-            .is_none(),
-        "the popup must not open over Send feedback"
-    );
+    // Past the quiet period, so only the open panel keeps the popup away.
+    for _ in 0..(POPUP_QUIET_MS / FRAME_MS + 5) {
+        advance_popup_clock(FRAME_MS);
+        window.run_steps(1);
+        assert!(
+            window
+                .query_by_role_and_label(Role::Dialog, "Update ready")
+                .is_none(),
+            "the popup must not open over Send feedback"
+        );
+    }
     window.get_by_label("Close").click();
     wait_for_popup(&mut window);
     window
