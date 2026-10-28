@@ -59,7 +59,7 @@ final class NoPictureTimeoutTests: XCTestCase {
         let timeout = logged(manager, "Session accepted by 127.0.0.1:") ?? ""
         XCTAssertTrue(timeout.contains("no video datagrams arrived. session_id=41 ms_since_start="), timeout)
         XCTAssertTrue(timeout.contains(" ms_since_accept="), timeout)
-        XCTAssertNotNil(logged(manager, "Disconnect state=connecting reason=error"))
+        XCTAssertNotNil(logged(manager, "Disconnect state=connecting reason=connectTimeout"))
         XCTAssertNil(logged(manager, "Disconnect state=connecting reason=userDisconnect"))
     }
 

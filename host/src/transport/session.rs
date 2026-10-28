@@ -23,6 +23,22 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 pub const REPORT_INTERVAL_MS: u16 = 500;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
+/// Refused nonces remembered, and for how long: far past an iPad's 2 s of
+/// HELLO2 retransmits.
+const REFUSED_KEPT: usize = 64;
+const REFUSED_FOR: Duration = Duration::from_secs(60);
+/// Refused attempts summarized per minute. Unauthenticated traffic can't
+/// fill the support log: the rest are counted in one line a minute.
+const REFUSED_SUMMARIES: u32 = 20;
+const REFUSAL_MINUTE: Duration = Duration::from_secs(60);
+
+/// The refused attempts of the current minute.
+#[derive(Debug, Clone, Copy)]
+struct RefusalMinute {
+    since: Instant,
+    summarized: u32,
+    left_out: u32,
+}
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -51,6 +67,43 @@ pub struct Actions {
     /// An update stopped this client's stream: tell it, making sure the
     /// message leaves (see [`Session::begin_update`]).
     pub goodbye: Option<(PeerId, Vec<u8>)>,
+    /// A session, or a HELLO2 the host turned down, ended: its summary line
+    /// is due (`crate::diagnostics::log_session_end`).
+    pub ended: Option<SessionEnd>,
+}
+
+/// How far a session got and how it ended, for its support summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEnd {
+    /// `None` for a HELLO2 the host turned down.
+    pub session_id: Option<u32>,
+    /// The nonce of the client's HELLO2, which its own summary also names.
+    pub client_nonce: u32,
+    pub link: LinkId,
+    pub reason: EndReason,
+    /// From the session's start to the first video sent to it.
+    pub first_video: Option<Duration>,
+    /// The client's receiver reports counted complete frames.
+    pub frames_received: bool,
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// The HELLO2 was answered with this refusal.
+    Refused(HelloStatus),
+    /// The client said goodbye, including a Wi-Fi goodbye whose cable
+    /// takeover never came.
+    Goodbye(ByeReason),
+    Liveness,
+    /// The same device connected again.
+    Superseded,
+    /// An update stopped the stream, or the app quit.
+    Shutdown,
+    /// The session's link (the USB tunnel) closed.
+    LinkLost,
+    /// The pairing credentials changed.
+    Revoked,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +130,12 @@ struct ActiveSession {
     last_keyframe_grant: Option<Instant>,
     last_report: Option<ReceiverReport>,
     msg_seq_out: u32,
+    /// When the first video went to this session.
+    first_video_at: Option<Instant>,
+    /// A receiver report counted complete frames.
+    frames_received: bool,
+    /// A Wi-Fi goodbye while the cable takes over.
+    bye: Option<ByeReason>,
 }
 
 /// Provides the current stream parameters for HELLO_ACK/heartbeats.
@@ -92,31 +151,21 @@ pub trait ConfigSource {
     }
 }
 
-/// Why a session ended, as the host saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEnd {
-    /// The client said goodbye.
-    Bye(ByeReason),
-    /// The pairing token changed under it.
-    Revoked,
-    /// The client went silent for the liveness timeout.
-    LivenessExpired,
-    /// Its link closed (a USB tunnel's EOF).
-    LinkLost,
-    /// Stop and update stopped its stream.
-    StoppedForUpdate,
-}
-
 pub struct Session {
     active: Option<ActiveSession>,
     /// The last session that ended, and why.
-    last_end: Option<(u32, SessionEnd)>,
+    last_end: Option<(u32, EndReason)>,
     /// An update is taking over: new clients are turned away (`Busy`) until it
     /// either closes the host or gives up. Changed only under the session lock,
     /// together with the check that nobody is streaming.
     updating: bool,
     /// The goodbye for a stream an update stopped, sent by the next tick.
     goodbye: Option<(PeerId, Vec<u8>)>,
+    /// That stream's end, reported by the next tick or [`Self::shut_down`].
+    stopped: Option<SessionEnd>,
+    /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
+    refused: std::collections::VecDeque<(u32, Instant)>,
+    refusal_minute: Option<RefusalMinute>,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -130,6 +179,9 @@ impl Session {
             last_end: None,
             updating: false,
             goodbye: None,
+            stopped: None,
+            refused: std::collections::VecDeque::new(),
+            refusal_minute: None,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -140,15 +192,16 @@ impl Session {
     }
 
     /// The id of the last session that ended, and why it ended.
-    pub fn last_end(&self) -> Option<(u32, SessionEnd)> {
+    pub fn last_end(&self) -> Option<(u32, EndReason)> {
         self.last_end
     }
 
-    /// Ends the active session for `why`.
-    fn end(&mut self, why: SessionEnd) {
-        if let Some(session) = self.active.take() {
-            self.last_end = Some((session.session_id, why));
-        }
+    /// Ends the active session for `reason`: remembers why, and returns
+    /// its end for the summary line.
+    fn end(&mut self, reason: EndReason, now: Instant) -> Option<SessionEnd> {
+        let session = self.active.take()?;
+        self.last_end = Some((session.session_id, reason));
+        Some(session.end(reason, now))
     }
 
     /// Starts an update handoff. Atomic with admission: call with the session
@@ -169,7 +222,7 @@ impl Session {
                 peer,
                 eternal_wire::v2::control::encode_control(session_id, msg_seq, &bye),
             ));
-            self.end(SessionEnd::StoppedForUpdate);
+            self.stopped = self.end(EndReason::Shutdown, Instant::now());
         }
         self.updating = true;
         true
@@ -185,20 +238,39 @@ impl Session {
         self.updating = false;
     }
 
+    /// The app is quitting: the end of the stream it stops, or of one an
+    /// update stopped that no tick reported yet.
+    pub fn shut_down(&mut self, now: Instant) -> Option<SessionEnd> {
+        let active = self.end(EndReason::Shutdown, now);
+        self.stopped.take().or(active)
+    }
+
+    /// The first video went to `session_id`. Later calls change nothing.
+    pub fn note_video_sent(&mut self, session_id: u32, now: Instant) {
+        if let Some(session) = self.active.as_mut() {
+            if session.session_id == session_id {
+                session.first_video_at.get_or_insert(now);
+            }
+        }
+    }
+
     pub fn session_id(&self) -> Option<u32> {
         self.active.as_ref().map(|s| s.session_id)
     }
 
     pub fn link_lost(&mut self, link: LinkId) -> Actions {
-        let lost = self
+        let on_link = self
             .active
             .as_ref()
             .is_some_and(|session| session.peer.link == link);
-        if lost {
-            self.end(SessionEnd::LinkLost);
-        }
+        let lost = if on_link {
+            self.end(EndReason::LinkLost, Instant::now())
+        } else {
+            None
+        };
         Actions {
-            client_lost: lost,
+            client_lost: lost.is_some(),
+            ended: lost,
             ..Actions::default()
         }
     }
@@ -356,23 +428,14 @@ impl Session {
         // Version gate first.
         if hello.proto_min > 2 || hello.proto_max < 2 {
             crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
-            let ack = self.make_ack(
-                HelloStatus::VersionUnsupported,
-                hello.client_nonce,
-                0,
-                config,
-            );
-            actions.replies.push((source, ack));
-            return actions;
+            return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
         }
 
         // An update is about to close the host: don't start a stream it would cut.
         // The iPad shows Busy ("already streaming"); a retry after the restart works.
         if self.updating {
             info!(peer = %source, "Client turned away while an update starts");
-            let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
-            actions.replies.push((source, ack));
-            return actions;
+            return self.refuse(source, HelloStatus::Busy, &hello, config, now);
         }
 
         // Keep credentials locked through authorization, rotation and ACK creation:
@@ -396,9 +459,7 @@ impl Session {
         {
             Some(Ok(grant)) => grant,
             Some(Err(status)) => {
-                let ack = self.make_ack(status, hello.client_nonce, 0, config);
-                actions.replies.push((source, ack));
-                return actions;
+                return self.refuse(source, status, &hello, config, now);
             }
             None => crate::pairing::Grant {
                 token: [0; 16],
@@ -425,18 +486,14 @@ impl Session {
         if let Some(session) = self.active.as_ref() {
             if session.same_device(source, hello.device_id) {
                 if matches!(session.peer.link, LinkId::Usb { .. }) && source.link == LinkId::Udp {
-                    let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
-                    actions.replies.push((source, ack));
-                    return actions;
+                    return self.refuse(source, HelloStatus::Busy, &hello, config, now);
                 }
                 // Same device, new connect attempt: supersede in place.
                 info!(peer = %source, "Client reconnected — superseding session in place");
             } else {
                 // A different device while one is streaming: reject.
                 info!(peer = %source, "Second client rejected while a session is active");
-                let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
-                actions.replies.push((source, ack));
-                return actions;
+                return self.refuse(source, HelloStatus::Busy, &hello, config, now);
             }
         }
 
@@ -447,12 +504,11 @@ impl Session {
                 .rotate_code()
             {
                 warn!(%error, "Pairing code rotation failed");
-                let ack = self.make_ack(HelloStatus::Error, hello.client_nonce, 0, config);
-                actions.replies.push((source, ack));
-                return actions;
+                return self.refuse(source, HelloStatus::Error, &hello, config, now);
             }
         }
 
+        actions.ended = self.end(EndReason::Superseded, now);
         let session_id = self.allocate_session_id();
         info!(
             peer = %source,
@@ -487,6 +543,9 @@ impl Session {
             last_keyframe_grant: None,
             last_report: None,
             msg_seq_out: 0,
+            first_video_at: None,
+            frames_received: false,
+            bye: None,
         });
 
         let ack = self.make_ack_with_token(
@@ -521,10 +580,11 @@ impl Session {
             // over, with a short deadline if the new link never handshakes.
             session.awaiting_takeover = true;
             session.liveness_deadline = now + USB_TAKEOVER_TIMEOUT;
+            session.bye = Some(reason);
             info!(peer = %source, "Awaiting USB takeover after WiFi goodbye");
             return actions;
         }
-        self.end(SessionEnd::Bye(reason));
+        actions.ended = self.end(EndReason::Goodbye(reason), now);
         actions.client_lost = true;
         actions
     }
@@ -563,6 +623,7 @@ impl Session {
             if session_peer_matches(session, source) {
                 session.liveness_deadline = now + LIVENESS_TIMEOUT;
                 session.last_report = Some(report);
+                session.frames_received |= report.frames_complete > 0;
                 actions.report = Some(report);
             }
         }
@@ -619,10 +680,12 @@ impl Session {
         now: Instant,
     ) -> Actions {
         let mut actions = Actions::default();
+        self.close_refusal_minute(now);
         if let Some(goodbye) = self.take_goodbye() {
             actions.goodbye = Some(goodbye);
             actions.client_lost = self.active.is_none();
         }
+        actions.ended = self.stopped.take();
         let Some(session) = self.active.as_ref() else {
             return actions;
         };
@@ -633,7 +696,7 @@ impl Session {
         });
         if revoked {
             info!(peer = %session.peer, "Pairing credentials changed — reconnect required");
-            self.end(SessionEnd::Revoked);
+            actions.ended = self.end(EndReason::Revoked, now);
             actions.client_lost = true;
             return actions;
         }
@@ -644,7 +707,8 @@ impl Session {
                 device = %session.info.device_name,
                 "Client liveness expired — tearing session down"
             );
-            self.end(SessionEnd::LivenessExpired);
+            let reason = session.bye.map_or(EndReason::Liveness, EndReason::Goodbye);
+            actions.ended = self.end(reason, now);
             actions.client_lost = true;
             return actions;
         }
@@ -691,6 +755,76 @@ impl Session {
                 peer = %source,
                 "A v0.1.x iPad app tried to connect. Protocol v2 is a clean break — \
                  update the iPad app to stream again."
+            );
+        }
+    }
+
+    /// Answers `hello` with a refusal. The first refusal of a nonce ends
+    /// that attempt; a retransmit of it gets the answer again.
+    fn refuse(
+        &mut self,
+        source: PeerId,
+        status: HelloStatus,
+        hello: &eternal_wire::v2::control::Hello2,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let ack = self.make_ack(status, hello.client_nonce, 0, config);
+        self.refused
+            .retain(|(_, at)| now.saturating_duration_since(*at) < REFUSED_FOR);
+        let first = !self
+            .refused
+            .iter()
+            .any(|(nonce, _)| *nonce == hello.client_nonce);
+        if first {
+            if self.refused.len() == REFUSED_KEPT {
+                self.refused.pop_front();
+            }
+            self.refused.push_back((hello.client_nonce, now));
+        }
+        let summarized = first && self.summarize_refusal(now);
+        Actions {
+            replies: vec![(source, ack)],
+            ended: summarized.then_some(SessionEnd {
+                session_id: None,
+                client_nonce: hello.client_nonce,
+                link: source.link,
+                reason: EndReason::Refused(status),
+                first_video: None,
+                frames_received: false,
+                duration: Duration::ZERO,
+            }),
+            ..Actions::default()
+        }
+    }
+
+    /// Whether a new refused attempt gets a summary in this minute's budget.
+    fn summarize_refusal(&mut self, now: Instant) -> bool {
+        self.close_refusal_minute(now);
+        let minute = self.refusal_minute.get_or_insert(RefusalMinute {
+            since: now,
+            summarized: 0,
+            left_out: 0,
+        });
+        if minute.summarized < REFUSED_SUMMARIES {
+            minute.summarized += 1;
+            true
+        } else {
+            minute.left_out += 1;
+            false
+        }
+    }
+
+    /// Ends a minute of refusals that is over, saying how many it left out.
+    fn close_refusal_minute(&mut self, now: Instant) {
+        let over = self
+            .refusal_minute
+            .take_if(|minute| now.saturating_duration_since(minute.since) >= REFUSAL_MINUTE);
+        if let Some(minute) = over.filter(|minute| minute.left_out > 0) {
+            warn!(
+                left_out = minute.left_out,
+                summarized = minute.summarized,
+                "Turned down more connection attempts in a minute than the session summaries keep"
             );
         }
     }
@@ -742,6 +876,21 @@ impl Session {
 }
 
 impl ActiveSession {
+    fn end(&self, reason: EndReason, now: Instant) -> SessionEnd {
+        let start = self.info.connected_at;
+        SessionEnd {
+            session_id: Some(self.session_id),
+            client_nonce: self.accepted_hello.client_nonce,
+            link: self.peer.link,
+            reason,
+            first_video: self
+                .first_video_at
+                .map(|at| at.saturating_duration_since(start)),
+            frames_received: self.frames_received,
+            duration: now.saturating_duration_since(start),
+        }
+    }
+
     fn same_device(&self, source: PeerId, device_id: u64) -> bool {
         if self.info.device_id != 0 && device_id != 0 {
             self.info.device_id == device_id
@@ -855,7 +1004,7 @@ mod tests {
         assert!(!session.link_lost(LinkId::Udp).client_lost);
         let usb_id = session.session_id().unwrap();
         assert!(session.link_lost(usb.link).client_lost);
-        assert_eq!(session.last_end(), Some((usb_id, SessionEnd::LinkLost)));
+        assert_eq!(session.last_end(), Some((usb_id, EndReason::LinkLost)));
         let fallback = session.handle_control(wifi, 0, identified_hello(3, 77), &TestConfig, now);
         assert_eq!(fallback.new_target, Some(wifi));
     }
@@ -1220,7 +1369,7 @@ mod tests {
         assert!(!session.is_active());
         assert_eq!(
             session.last_end(),
-            Some((first, SessionEnd::Bye(ByeReason::UserDisconnect)))
+            Some((first, EndReason::Goodbye(ByeReason::UserDisconnect)))
         );
 
         // Re-establish, then let liveness lapse.
@@ -1231,7 +1380,7 @@ mod tests {
         assert!(!session.is_active());
         assert_eq!(
             session.last_end(),
-            Some((second, SessionEnd::LivenessExpired))
+            Some((second, EndReason::Liveness))
         );
     }
 
@@ -1592,7 +1741,7 @@ mod tests {
         assert!(!session.is_active());
         assert_eq!(
             session.last_end(),
-            Some((pair_ack(&reconnected).session_id, SessionEnd::Revoked))
+            Some((pair_ack(&reconnected).session_id, EndReason::Revoked))
         );
     }
 
@@ -1677,6 +1826,303 @@ mod tests {
             ))
             .status,
             HelloStatus::Ok
+        );
+    }
+
+    fn ended(actions: &Actions) -> SessionEnd {
+        actions.ended.clone().expect("a session end")
+    }
+
+    #[test]
+    fn a_goodbye_ends_the_session_with_its_nonce_first_video_and_length() {
+        let mut session = Session::new(500);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let accepted = session.handle_control(peer, 0, hello(0xA1, 50000), &TestConfig, now);
+        assert_eq!(accepted.ended, None);
+        let id = session.session_id().unwrap();
+        session.note_video_sent(id + 1, now + Duration::from_millis(10));
+        session.note_video_sent(id, now + Duration::from_millis(40));
+        session.note_video_sent(id, now + Duration::from_millis(90));
+        // Frames count once a report shows some; a later empty one keeps them.
+        for frames_complete in [0, 3, 0] {
+            let report = ControlMessage::ReceiverReport(ReceiverReport {
+                frames_complete,
+                ..Default::default()
+            });
+            session.handle_control_authed(peer, report, &TestConfig, now);
+        }
+        let bye = session.handle_control_authed(
+            peer,
+            ControlMessage::Bye(ByeReason::UserDisconnect),
+            &TestConfig,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            ended(&bye),
+            SessionEnd {
+                session_id: Some(id),
+                client_nonce: 0xA1,
+                link: LinkId::Udp,
+                reason: EndReason::Goodbye(ByeReason::UserDisconnect),
+                first_video: Some(Duration::from_millis(40)),
+                frames_received: true,
+                duration: Duration::from_secs(2),
+            }
+        );
+    }
+
+    #[test]
+    fn liveness_expiry_and_a_new_nonce_end_sessions() {
+        let mut session = Session::new(500);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control(peer, 0, hello(1, 50000), &TestConfig, now);
+        let first = session.session_id().unwrap();
+        let again = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        let old = ended(&again);
+        assert_eq!(
+            (old.session_id, old.client_nonce, old.reason),
+            (Some(first), 1, EndReason::Superseded)
+        );
+        let second = session.session_id().unwrap();
+        let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
+        let lapsed = ended(&expired);
+        assert_eq!(
+            (
+                lapsed.session_id,
+                lapsed.client_nonce,
+                lapsed.reason,
+                lapsed.first_video
+            ),
+            (Some(second), 2, EndReason::Liveness, None)
+        );
+        assert_eq!(lapsed.duration, LIVENESS_TIMEOUT);
+        assert!(!lapsed.frames_received);
+        assert_eq!(
+            session
+                .tick(&TestConfig, false, now + LIVENESS_TIMEOUT)
+                .ended,
+            None
+        );
+    }
+
+    #[test]
+    fn a_wifi_goodbye_ends_at_the_cable_takeover_or_when_none_comes() {
+        let now = Instant::now();
+        let wifi = addr([10, 0, 0, 5], 50000);
+        let usb = PeerId::usb(17);
+        for takeover in [true, false] {
+            let mut session = Session::new(500);
+            session.handle_control(wifi, 0, identified_hello(1, 77), &TestConfig, now);
+            let bye = session.handle_control_authed(
+                wifi,
+                ControlMessage::Bye(ByeReason::Superseded),
+                &TestConfig,
+                now,
+            );
+            assert_eq!(bye.ended, None, "the display waits for the cable");
+            let end = if takeover {
+                ended(&session.handle_control(usb, 0, identified_hello(2, 77), &TestConfig, now))
+            } else {
+                ended(&session.tick(&TestConfig, false, now + USB_TAKEOVER_TIMEOUT))
+            };
+            let reason = if takeover {
+                EndReason::Superseded
+            } else {
+                EndReason::Goodbye(ByeReason::Superseded)
+            };
+            assert_eq!(
+                (end.client_nonce, end.link, end.reason),
+                (1, LinkId::Udp, reason)
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_cable_an_update_and_quitting_end_the_session() {
+        let now = Instant::now();
+        let usb = PeerId::usb(17);
+        let mut session = Session::new(500);
+        session.handle_control(usb, 0, identified_hello(3, 77), &TestConfig, now);
+        assert_eq!(session.link_lost(LinkId::Udp).ended, None);
+        let lost = ended(&session.link_lost(usb.link));
+        assert_eq!(
+            (lost.client_nonce, lost.link, lost.reason),
+            (3, usb.link, EndReason::LinkLost)
+        );
+
+        session.handle_control(usb, 0, identified_hello(4, 77), &TestConfig, now);
+        assert!(session.begin_update(true));
+        let stopped = session.tick(&TestConfig, false, now);
+        assert!(stopped.goodbye.is_some());
+        assert_eq!(
+            (ended(&stopped).client_nonce, ended(&stopped).reason),
+            (4, EndReason::Shutdown)
+        );
+        assert_eq!(session.shut_down(now), None, "reported once");
+
+        session.end_update();
+        session.handle_control(usb, 0, identified_hello(5, 77), &TestConfig, now);
+        let quit = session.shut_down(now + Duration::from_secs(3)).unwrap();
+        assert_eq!((quit.client_nonce, quit.reason), (5, EndReason::Shutdown));
+        assert_eq!(quit.duration, Duration::from_secs(3));
+        assert!(!session.is_active());
+    }
+
+    #[test]
+    fn a_refused_hello_is_one_attempt_without_a_session() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        let ControlMessage::Hello2(mut old) = hello(9, 50000) else {
+            unreachable!()
+        };
+        old.proto_min = 3;
+        old.proto_max = 3;
+        let refused = session.handle_control(
+            peer,
+            0,
+            ControlMessage::Hello2(old.clone()),
+            &TestConfig,
+            now,
+        );
+        assert_eq!(
+            ended(&refused),
+            SessionEnd {
+                session_id: None,
+                client_nonce: 9,
+                link: LinkId::Udp,
+                reason: EndReason::Refused(HelloStatus::VersionUnsupported),
+                first_video: None,
+                frames_received: false,
+                duration: Duration::ZERO,
+            }
+        );
+        let retransmit =
+            session.handle_control(peer, 0, ControlMessage::Hello2(old), &TestConfig, now);
+        assert_eq!(retransmit.replies.len(), 1);
+        assert_eq!(retransmit.ended, None);
+
+        session.handle_control(peer, 0, hello(10, 50000), &TestConfig, now);
+        let other = addr([10, 0, 0, 6], 50000);
+        let busy = session.handle_control(other, 0, hello(11, 50000), &TestConfig, now);
+        assert_eq!(ended(&busy).reason, EndReason::Refused(HelloStatus::Busy));
+        assert!(session.is_active(), "the streaming session goes on");
+
+        let config = pair_config(true);
+        let mut paired = Session::new(500);
+        let unpaired = pair_send(&mut paired, &config, peer, pair_hello(12), now);
+        assert_eq!(
+            ended(&unpaired).reason,
+            EndReason::Refused(HelloStatus::Unauthorized)
+        );
+        // Two attempts' retransmits interleaved are still two attempts.
+        let ends: Vec<u32> = [12, 13, 12, 13, 13]
+            .into_iter()
+            .filter_map(|nonce| pair_send(&mut paired, &config, peer, pair_hello(nonce), now).ended)
+            .map(|end| end.client_nonce)
+            .collect();
+        assert_eq!(ends, [13]);
+        // A minute later, a nonce counts again.
+        let later = now + REFUSED_FOR;
+        assert!(pair_send(&mut paired, &config, peer, pair_hello(13), later)
+            .ended
+            .is_some());
+        assert!(pair_send(&mut paired, &config, peer, pair_hello(13), later)
+            .ended
+            .is_none());
+    }
+
+    /// Seventeen nonces cycled a hundred times are seventeen attempts, and a
+    /// flood of new ones gets 20 summaries a minute and one line with the rest.
+    #[test]
+    fn refused_attempts_cannot_flood_the_summaries() {
+        let config = pair_config(true);
+        let peer = addr([10, 0, 0, 9], 50000);
+        let now = Instant::now();
+        let mut session = Session::new(500);
+        let cycled = (0..100)
+            .flat_map(|_| 0..17u32)
+            .filter(|&nonce| {
+                pair_send(&mut session, &config, peer, pair_hello(nonce), now)
+                    .ended
+                    .is_some()
+            })
+            .count();
+        assert_eq!(cycled, 17);
+
+        let mut session = Session::new(500);
+        let flood = (1000..1100u32)
+            .filter(|&nonce| {
+                pair_send(&mut session, &config, peer, pair_hello(nonce), now)
+                    .ended
+                    .is_some()
+            })
+            .count();
+        assert_eq!(flood, REFUSED_SUMMARIES as usize);
+        assert_eq!(session.refusal_minute.unwrap().left_out, 80);
+
+        #[derive(Default)]
+        struct LeftOut(std::sync::Arc<parking_lot::Mutex<Vec<u64>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LeftOut {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Count<'a>(&'a parking_lot::Mutex<Vec<u64>>);
+                impl tracing::field::Visit for Count<'_> {
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        if field.name() == "left_out" {
+                            self.0.lock().push(value);
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                event.record(&mut Count(&self.0));
+            }
+        }
+        use tracing_subscriber::prelude::*;
+        let counts = LeftOut::default();
+        let seen = counts.0.clone();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(counts), || {
+            session.tick(&config, false, now + Duration::from_secs(30));
+            session.tick(&config, false, now + REFUSAL_MINUTE);
+            session.tick(&config, false, now + REFUSAL_MINUTE * 2);
+        });
+        assert_eq!(*seen.lock(), [80], "one line for the minute");
+        assert!(
+            pair_send(
+                &mut session,
+                &config,
+                peer,
+                pair_hello(5000),
+                now + REFUSAL_MINUTE * 2
+            )
+            .ended
+            .is_some(),
+            "a new minute summarizes again"
+        );
+    }
+
+    #[test]
+    fn changed_pairing_credentials_end_the_session() {
+        let config = pair_config(true);
+        let mut session = Session::new(500);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let now = Instant::now();
+        let mut hello = pair_hello(20);
+        hello.pairing_code = config.0.lock().code();
+        assert!(pair_send(&mut session, &config, peer, hello, now)
+            .new_target
+            .is_some());
+        config.0.lock().regenerate_token().unwrap();
+        let revoked = ended(&session.tick(&config, false, now));
+        assert_eq!(
+            (revoked.client_nonce, revoked.reason),
+            (20, EndReason::Revoked)
         );
     }
 }

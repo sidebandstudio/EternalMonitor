@@ -20,7 +20,7 @@ use eternal_host::capture::synthetic::decode_frame_counter_from_luma;
 use eternal_host::control::{SharedControl, SupervisorCommand};
 use eternal_host::gpu::GpuInfo;
 use eternal_host::pipeline;
-use eternal_host::transport::session::SessionEnd;
+use eternal_host::transport::session::EndReason;
 use eternal_wire::h264::contains_nal_type;
 use eternal_wire::reassembly::{AddOutcome, Reassembler};
 use eternal_wire::v2::control::{
@@ -105,6 +105,7 @@ fn init_test_tracing() {
     use tracing_subscriber::EnvFilter;
     static LIVE_OUTPUT: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
         std::sync::OnceLock::new();
+    use tracing_subscriber::prelude::*;
     let subscriber = tracing_subscriber::fmt().with_env_filter(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     );
@@ -113,13 +114,56 @@ fn init_test_tracing() {
         || std::env::var("RUST_TEST_NOCAPTURE").is_ok_and(|value| value != "0");
     if nocapture {
         let (writer, guard) = eternal_host::logging::non_blocking_output(std::io::stdout());
-        if subscriber.with_writer(writer).try_init().is_ok() {
+        let subscriber = subscriber.with_writer(writer).finish().with(SummaryCapture);
+        if subscriber.try_init().is_ok() {
             let _ = LIVE_OUTPUT.set(guard);
         }
     } else {
-        let _ = subscriber.with_test_writer().try_init();
+        let _ = subscriber
+            .with_test_writer()
+            .finish()
+            .with(SummaryCapture)
+            .try_init();
     }
     eternal_host::diagnostics::install_ffmpeg_logging();
+}
+
+/// The host's `session_summary` lines, as logged.
+static SUMMARIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct SummaryCapture;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SummaryCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut message = Message(None);
+        event.record(&mut message);
+        if let Some(line) = message
+            .0
+            .filter(|line| line.starts_with("session_summary "))
+        {
+            SUMMARIES.lock().unwrap().push(line);
+        }
+    }
+}
+
+/// The summaries logged so far that name `nonce`.
+fn summaries_with_nonce(nonce: u32) -> Vec<String> {
+    let nonce = format!(" nonce={nonce:016x} ");
+    SUMMARIES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains(&nonce))
+        .cloned()
+        .collect()
 }
 
 const SYNTH_W: u32 = 640;
@@ -397,7 +441,7 @@ fn usb_framed_stream_end_to_end() {
         }
         assert!(!shared.client_connected(), "tunnel EOF must release the session");
         // The EOF ended it, not the 3 s liveness expiry within the backstop.
-        assert_eq!(shared.session.lock().last_end(), Some((session, SessionEnd::LinkLost)));
+        assert_eq!(shared.session.lock().last_end(), Some((session, EndReason::LinkLost)));
         assert!(shared.running.load(Ordering::SeqCst));
     })
     }));
@@ -590,6 +634,22 @@ impl FakeReceiver {
         feature_caps: u16,
         preferred_fps: u8,
     ) -> Self {
+        Self::connect_as(
+            host_port,
+            decoder_caps,
+            feature_caps,
+            preferred_fps,
+            0xE2E0_0001,
+        )
+    }
+
+    fn connect_as(
+        host_port: u16,
+        decoder_caps: u16,
+        feature_caps: u16,
+        preferred_fps: u8,
+        client_nonce: u32,
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -601,7 +661,7 @@ impl FakeReceiver {
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
             proto_max: 2,
-            client_nonce: 0xE2E0_0001,
+            client_nonce,
             listen_port,
             decoder_caps,
             feature_caps,
@@ -1215,6 +1275,103 @@ fn synthetic_stream_end_to_end_v2() {
     done_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("supervisor must shut down within 5s");
+}
+
+/// The host's summary of a session names the nonce the iPad sent, once, when
+/// the iPad says goodbye after the first video.
+#[test]
+fn a_session_ends_with_one_summary_naming_the_clients_nonce() {
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let (shared, supervisor_tx) = (shared.clone(), supervisor_tx.clone());
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                gpu_info,
+                supervisor_tx,
+                supervisor_rx,
+            );
+        })
+    };
+
+    const NONCE: u32 = 0x5E55_1011;
+    let mut receiver = FakeReceiver::connect_as(listen_port, CAP_DECODE_H264, 0, 0, NONCE);
+    let deadline = Instant::now() + DEADLINE;
+    let mut datagram = [0u8; 2048];
+    loop {
+        assert!(Instant::now() < deadline, "no video within {DEADLINE:?}");
+        receiver.maybe_report(0, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        if matches!(classify(&datagram[..len]), Classified::Media { .. }) {
+            break;
+        }
+    }
+    assert!(
+        summaries_with_nonce(NONCE).is_empty(),
+        "the session is still on"
+    );
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while summaries_with_nonce(NONCE).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "no summary within 3 s of the goodbye"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A late heartbeat tick or goodbye copy adds nothing.
+    std::thread::sleep(Duration::from_millis(600));
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+
+    let lines = summaries_with_nonce(NONCE);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    let start = format!(
+        "session_summary v=1 role=pc session_id={} nonce=000000005e551011 transport=wifi \
+         mode=mirror stage=video_sent outcome=streamed failure=none fallback=none end=goodbye ttff_ms=",
+        receiver.session_id
+    );
+    assert!(line.starts_with(&start), "{line}");
+    assert!(line.contains(" hw=pc "), "{line}");
+    if let Some(path) = std::env::var_os("ETERNAL_SUMMARY_DUMP") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        // One write: tests running at once must not interleave lines.
+        file.write_all(format!("{line}\n").as_bytes()).unwrap();
+    }
 }
 
 /// Repair is negotiated and exercised through the real encoder and transport.
@@ -2348,7 +2505,7 @@ fn pairing_flow_end_to_end() {
             shared.session.lock().last_end(),
             Some((
                 paired.session_id,
-                SessionEnd::Bye(ByeReason::UserDisconnect)
+                EndReason::Goodbye(ByeReason::UserDisconnect)
             )),
             "the BYE must end the session"
         );
@@ -2393,7 +2550,7 @@ fn pairing_flow_end_to_end() {
         keepalive.join().unwrap();
         assert_eq!(
             shared.session.lock().last_end(),
-            Some((reconnected.session_id, SessionEnd::Revoked)),
+            Some((reconnected.session_id, EndReason::Revoked)),
             "the token reset must end the session"
         );
     }));
@@ -2494,7 +2651,7 @@ fn preferred_fps_caps_the_host() {
             shared.session.lock().last_end(),
             Some((
                 receiver.session_id,
-                SessionEnd::Bye(ByeReason::UserDisconnect)
+                EndReason::Goodbye(ByeReason::UserDisconnect)
             )),
             "the BYE must release the cap"
         );
@@ -2637,7 +2794,7 @@ fn quiet_clients_keep_their_session_until_they_go_silent() {
     assert!(
         matches!(
             shared.session.lock().last_end(),
-            Some((_, SessionEnd::LivenessExpired))
+            Some((_, EndReason::Liveness))
         ),
         "{:?}",
         shared.session.lock().last_end()
