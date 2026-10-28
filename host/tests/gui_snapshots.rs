@@ -776,14 +776,18 @@ fn update_arrives_while_feedback_is_open(
     }
     window.run_steps(4);
     // Past the quiet period, so only the open panel keeps the popup away.
-    for _ in 0..(POPUP_QUIET_MS / FRAME_MS + 5) {
+    for frame in 0..(POPUP_QUIET_MS / FRAME_MS + 5) {
         advance_popup_clock(FRAME_MS);
         window.run_steps(1);
+        assert!(
+            window.query_by_label("Tell us how it's going").is_some(),
+            "Send feedback closed by itself after {frame} frames"
+        );
         assert!(
             window
                 .query_by_role_and_label(Role::Dialog, "Update ready")
                 .is_none(),
-            "the popup must not open over Send feedback"
+            "the popup must not open over Send feedback (frame {frame})"
         );
     }
     window.get_by_label("Close").click();
