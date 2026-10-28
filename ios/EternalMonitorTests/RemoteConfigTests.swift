@@ -159,6 +159,62 @@ final class RemoteConfigTests: XCTestCase {
         XCTAssertEqual(parsed.note, "Connects faster to PCs that start their second screen slowly.")
     }
 
+    /// Review round 2: a start 15 days out was a typo (shown today), then a
+    /// valid start the next day (hidden). Once shown, it stays for that
+    /// build, through a restart and a clock set back; the next build waits
+    /// for its own turn.
+    @MainActor
+    func testAPromptThatShowedKeepsShowingForThatBuild() throws {
+        let suite = "RemoteConfigTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let installed = InstalledApp(version: "0.3.3", build: 316)
+        let id = ids(1)[0]
+        let today = start.addingTimeInterval(-15 * day)
+        let checker = UpdateChecker(defaults: defaults, source: .injected(try example()), installed: installed,
+                                    now: today, installationID: { id })
+        checker.checkIfDue(now: today)
+        XCTAssertNotNil(checker.popup(now: today))
+        for later in [today.addingTimeInterval(day), today.addingTimeInterval(5 * day), today.addingTimeInterval(-day)] {
+            XCTAssertNotNil(checker.prompted(now: later), "\(later)")
+        }
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed,
+                                       now: today, installationID: { id })
+        XCTAssertNotNil(relaunched.prompted(now: today.addingTimeInterval(day)))
+
+        let next = Data(#"{"schema":1,"ipad":{"version":"0.3.5","build":330,"rollout":{"start":"2026-11-02T00:00:00Z","days":3}}}"#.utf8)
+        let newer = UpdateChecker(defaults: defaults, source: .injected(next), installed: installed,
+                                  now: today, installationID: { id })
+        newer.checkIfDue(now: start.addingTimeInterval(-day))
+        XCTAssertEqual(newer.available?.build, 330)
+        XCTAssertNil(newer.prompted(now: start.addingTimeInterval(-day)), "before its start")
+    }
+
+    /// A saved rollout is held to the manifest's limits: an out-of-range one
+    /// is no rollout, and the update still shows.
+    @MainActor
+    func testASavedRolloutOutOfRangeIsNoRollout() throws {
+        let installed = InstalledApp(version: "0.3.3", build: 316)
+        for days in [15, 365, -1, Int.max] {
+            let suite = "RemoteConfigTests-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set("0.3.4", forKey: "updateAvailableVersion")
+            defaults.set(320, forKey: "updateAvailableBuild")
+            defaults.set(start, forKey: "updateAvailableRolloutStart")
+            defaults.set(days, forKey: "updateAvailableRolloutDays")
+            let checker = UpdateChecker(defaults: defaults, source: .disabled, installed: installed,
+                                        now: start, installationID: { "x" })
+            XCTAssertEqual(checker.available?.build, 320, "\(days)")
+            XCTAssertNil(checker.available?.rollout, "\(days)")
+            XCTAssertNotNil(checker.prompted(now: start), "\(days)")
+        }
+        XCTAssertNil(RemoteConfig.Rollout(start: start, days: 15))
+        XCTAssertNil(RemoteConfig.Rollout(start: Date.distantFuture, days: Int.max))
+        let far = try XCTUnwrap(RemoteConfig.Rollout(start: Date.distantFuture, days: 14))
+        XCTAssertTrue(far.shows(id: "x", version: "0.3.4", now: start))
+    }
+
     /// The banner and popup wait for this iPad's turn; Settings shows the
     /// update at once, and a relaunch keeps the rollout.
     @MainActor

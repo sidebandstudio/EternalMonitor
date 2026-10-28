@@ -36,10 +36,14 @@ enum RemoteConfig {
         }
 
         /// Whether install `id` may see the prompt for `version` at `now`.
+        /// Once it shows, the caller keeps showing it for that build
+        /// (check-versions.sh refuses such starts, but a clock set back
+        /// could also move them).
         func shows(id: String, version: String, now: Date) -> Bool {
             let day: TimeInterval = 24 * 60 * 60
             // A start further ahead than any ramp lasts is a typo, not a plan.
             if start.timeIntervalSince(now) > Double(RemoteConfig.maxRolloutDays) * day { return true }
+            guard (0...RemoteConfig.maxRolloutDays).contains(days) else { return true }
             let ramp = UInt64(days) * 86_400
             let wait = RemoteConfig.bucket(id: id, version: version).multipliedFullWidth(by: ramp).high
             return now >= start.addingTimeInterval(TimeInterval(wait))

@@ -210,6 +210,8 @@ final class UpdateChecker: ObservableObject {
         static let popupAt = "updatePopupClosedAt"
         static let rolloutStart = "updateAvailableRolloutStart"
         static let rolloutDays = "updateAvailableRolloutDays"
+        /// The staged build whose prompt this iPad has reached.
+        static let rolloutReached = "updateRolloutReachedBuild"
         static let saved = [version, build, testflight, recommended, note, rolloutStart, rolloutDays]
     }
 
@@ -288,9 +290,14 @@ final class UpdateChecker: ObservableObject {
 
     /// The update the banner and popup may offer at `now`: nil while a
     /// staged rollout hasn't reached this iPad.
+    /// Once this iPad's turn comes for a build, its prompt keeps showing,
+    /// whatever the clock does later.
     func prompted(now: Date) -> UpdateManifest.IPad? {
         guard let available, let rollout = available.rollout else { return available }
-        return rollout.shows(id: installationID(), version: available.version, now: now) ? available : nil
+        if defaults.integer(forKey: Key.rolloutReached) == available.build { return available }
+        guard rollout.shows(id: installationID(), version: available.version, now: now) else { return nil }
+        defaults.set(available.build, forKey: Key.rolloutReached)
+        return available
     }
 
     var banner: UpdateBannerModel? {
