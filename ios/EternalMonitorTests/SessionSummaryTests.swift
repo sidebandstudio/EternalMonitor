@@ -64,6 +64,8 @@ final class SessionSummaryTests: XCTestCase {
         noFrame.datagramsReceived = 12
         var pairing = summary(.userDisconnect, session: nil, duration: 30)
         pairing.awaitingPairing = true
+        var retried = summary(.retriedWithCode, session: nil, duration: 4)
+        retried.awaitingPairing = true
         let cases: [(SessionSummary, [String])] = [
             (summary(.userDisconnect), ["accepted", "user_ended", "none", "user"]),
             (summary(.usbTurnedOff, usb: true, firstFrame: 1, duration: 5), ["first_frame", "streamed", "none", "user"]),
@@ -83,6 +85,7 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.closedBeforePicture, usb: true), ["accepted", "no_picture", "usb_lost", "error"]),
             (summary(.linkFailed, session: nil, nonce: 0, duration: 0.2), ["started", "error", "other", "error"]),
             (summary(.receiverFailed, session: nil, nonce: 0, duration: 0), ["started", "error", "other", "error"]),
+            (retried, ["hello_sent", "pairing", "none", "superseded"]),
         ]
         for (summary, expected) in cases {
             XCTAssertEqual(tokens(summary.line), expected, "\(summary.end)")
@@ -99,7 +102,8 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(AttemptEnd.appBackground.bye, .appBackground)
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
         for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
-                    .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed, .receiverFailed] {
+                    .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed, .receiverFailed,
+                    .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")
         }
         XCTAssertEqual(AttemptEnd.linkFailed.name, "linkFailed")
@@ -184,6 +188,43 @@ final class SessionSummaryTests: XCTestCase {
             + " transport=wifi mode=unknown stage=first_frame outcome=streamed failure=signal_lost fallback=none"
             + " end=liveness ttff_ms="), line)
         Self.assertContract(line)
+    }
+
+    /// A refused HELLO2, a wrong code, then the right one: three nonces, and
+    /// a line for each, as the PC writes.
+    func testEachPairingAttemptHasItsOwnSummary() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        var nonces: [UInt32] = []
+        for (round, status) in [HelloStatus.unauthorized, .unauthorized, .ok].enumerated() {
+            let nonce = await Task.detached { host.acceptSession(status: status) ? host.lastNonce : nil }.value
+            nonces.append(try XCTUnwrap(nonce, "HELLO2 \(round + 1) never came"))
+            guard status != .ok else { break }
+            try await until("prompt \(round + 1)") {
+                manager.diagnostics.filter { $0.message == "Pairing code required" }.count == round + 1
+            }
+            let prompt = try XCTUnwrap(manager.pairingPrompt)
+            prompt.code = "123456"
+            manager.submitPairing()
+        }
+        try await until("paired") { manager.hostInfo != nil }
+        manager.cancel()
+        let summaries = logged(manager, "summary")
+        XCTAssertEqual(summaries.count, 3, "\(summaries)")
+        guard summaries.count == 3 else { return }
+        XCTAssertEqual(Set(nonces).count, 3)
+        for (index, line) in summaries.enumerated() {
+            XCTAssertTrue(line.contains(" nonce=\(SessionSummary.hex16(nonces[index])) "), line)
+            Self.assertContract(line)
+        }
+        for line in summaries.prefix(2) {
+            XCTAssertTrue(line.contains(" session_id=- "), line)
+            XCTAssertEqual(tokens(line), ["hello_sent", "pairing", "none", "superseded"])
+        }
+        XCTAssertTrue(summaries[2].contains(" session_id=41 "), summaries[2])
+        XCTAssertEqual(tokens(summaries[2]), ["accepted", "user_ended", "none", "user"])
     }
 
     /// The user's Disconnect is the one `userDisconnect`, with one summary.

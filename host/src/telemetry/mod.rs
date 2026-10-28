@@ -416,7 +416,7 @@ fn level(line: &str) -> &'static str {
 }
 /// The message of a session summary line (`crate::diagnostics::session_summary`):
 /// the backend copies category `summary` events whose message is exactly that.
-fn session_summary(line: &str) -> Option<&str> {
+pub(crate) fn session_summary(line: &str) -> Option<&str> {
     let (_stamp, rest) = line.split_once(' ')?;
     rest.trim_start()
         .strip_prefix("INFO ")

@@ -161,6 +161,9 @@ final class ConnectionManager: ObservableObject {
     private var attemptStartedAt: TimeInterval = 0
     private var sessionAcceptedAt: TimeInterval?
     private var firstFrameAt: TimeInterval?
+    /// When the HELLO2 the next summary describes was started: the attempt's
+    /// start, or the latest pairing code's.
+    private var summaryStartedAt: TimeInterval = 0
 
     let frameSlot = FrameSlot()
     /// Lets hot-path closures reach the CURRENT control channel without
@@ -291,6 +294,10 @@ final class ConnectionManager: ObservableObject {
 
     func submitPairing() {
         guard awaitingPairing, let code = pairingPrompt?.submit() else { return }
+        // The code goes in a new HELLO2. The refused one ends here, as on the
+        // PC, which wrote a line for its nonce.
+        record(.info, "summary", summary(.retriedWithCode).line)
+        summaryStartedAt = ProcessInfo.processInfo.systemUptime
         controlChannel?.retryPairing(code: code)
     }
 
@@ -365,6 +372,7 @@ final class ConnectionManager: ObservableObject {
         attemptStartedAt = ProcessInfo.processInfo.systemUptime
         sessionAcceptedAt = nil
         firstFrameAt = nil
+        summaryStartedAt = attemptStartedAt
         videoSize = .zero
         let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
         sessionDrawingMode = drawing.enabled
@@ -1195,8 +1203,8 @@ final class ConnectionManager: ObservableObject {
         return SessionSummary(
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
             nonce: controlChannel?.helloNonce.withLock { $0 } ?? 0, awaitingPairing: awaitingPairing,
-            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - attemptStartedAt },
-            duration: now - attemptStartedAt)
+            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            duration: now - summaryStartedAt)
     }
 
     private func recordStreamSummary(reason: String) {

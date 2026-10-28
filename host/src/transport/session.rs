@@ -23,6 +23,10 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 pub const REPORT_INTERVAL_MS: u16 = 500;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
+/// Refused nonces remembered, and for how long: far past an iPad's 2 s of
+/// HELLO2 retransmits.
+const REFUSED_KEPT: usize = 16;
+const REFUSED_FOR: Duration = Duration::from_secs(60);
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -145,8 +149,8 @@ pub struct Session {
     goodbye: Option<(PeerId, Vec<u8>)>,
     /// That stream's end, reported by the next tick or [`Self::shut_down`].
     stopped: Option<SessionEnd>,
-    /// The last refused HELLO2's nonce: its retransmits are one attempt.
-    refused_nonce: Option<u32>,
+    /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
+    refused: std::collections::VecDeque<(u32, Instant)>,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -160,7 +164,7 @@ impl Session {
             updating: false,
             goodbye: None,
             stopped: None,
-            refused_nonce: None,
+            refused: std::collections::VecDeque::new(),
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -392,14 +396,14 @@ impl Session {
         // Version gate first.
         if hello.proto_min > 2 || hello.proto_max < 2 {
             crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
-            return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config);
+            return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
         }
 
         // An update is about to close the host: don't start a stream it would cut.
         // The iPad shows Busy ("already streaming"); a retry after the restart works.
         if self.updating {
             info!(peer = %source, "Client turned away while an update starts");
-            return self.refuse(source, HelloStatus::Busy, &hello, config);
+            return self.refuse(source, HelloStatus::Busy, &hello, config, now);
         }
 
         // Keep credentials locked through authorization, rotation and ACK creation:
@@ -423,7 +427,7 @@ impl Session {
         {
             Some(Ok(grant)) => grant,
             Some(Err(status)) => {
-                return self.refuse(source, status, &hello, config);
+                return self.refuse(source, status, &hello, config, now);
             }
             None => crate::pairing::Grant {
                 token: [0; 16],
@@ -450,14 +454,14 @@ impl Session {
         if let Some(session) = self.active.as_ref() {
             if session.same_device(source, hello.device_id) {
                 if matches!(session.peer.link, LinkId::Usb { .. }) && source.link == LinkId::Udp {
-                    return self.refuse(source, HelloStatus::Busy, &hello, config);
+                    return self.refuse(source, HelloStatus::Busy, &hello, config, now);
                 }
                 // Same device, new connect attempt: supersede in place.
                 info!(peer = %source, "Client reconnected — superseding session in place");
             } else {
                 // A different device while one is streaming: reject.
                 info!(peer = %source, "Second client rejected while a session is active");
-                return self.refuse(source, HelloStatus::Busy, &hello, config);
+                return self.refuse(source, HelloStatus::Busy, &hello, config, now);
             }
         }
 
@@ -468,7 +472,7 @@ impl Session {
                 .rotate_code()
             {
                 warn!(%error, "Pairing code rotation failed");
-                return self.refuse(source, HelloStatus::Error, &hello, config);
+                return self.refuse(source, HelloStatus::Error, &hello, config, now);
             }
         }
 
@@ -739,9 +743,21 @@ impl Session {
         status: HelloStatus,
         hello: &eternal_wire::v2::control::Hello2,
         config: &impl ConfigSource,
+        now: Instant,
     ) -> Actions {
         let ack = self.make_ack(status, hello.client_nonce, 0, config);
-        let first = self.refused_nonce.replace(hello.client_nonce) != Some(hello.client_nonce);
+        self.refused
+            .retain(|(_, at)| now.saturating_duration_since(*at) < REFUSED_FOR);
+        let first = !self
+            .refused
+            .iter()
+            .any(|(nonce, _)| *nonce == hello.client_nonce);
+        if first {
+            if self.refused.len() == REFUSED_KEPT {
+                self.refused.pop_front();
+            }
+            self.refused.push_back((hello.client_nonce, now));
+        }
         Actions {
             replies: vec![(source, ack)],
             ended: first.then_some(SessionEnd {
@@ -1928,6 +1944,35 @@ mod tests {
         assert_eq!(
             ended(&unpaired).reason,
             EndReason::Refused(HelloStatus::Unauthorized)
+        );
+        // Two attempts' retransmits interleaved are still two attempts.
+        let ends: Vec<u32> = [12, 13, 12, 13, 13]
+            .into_iter()
+            .filter_map(|nonce| pair_send(&mut paired, &config, peer, pair_hello(nonce), now).ended)
+            .map(|end| end.client_nonce)
+            .collect();
+        assert_eq!(ends, [13]);
+        // Sixteen newer refusals, or a minute, and a nonce counts again.
+        for nonce in 100..116 {
+            assert!(
+                pair_send(&mut paired, &config, peer, pair_hello(nonce), now)
+                    .ended
+                    .is_some()
+            );
+        }
+        assert!(pair_send(&mut paired, &config, peer, pair_hello(12), now)
+            .ended
+            .is_some());
+        let later = now + REFUSED_FOR;
+        assert!(
+            pair_send(&mut paired, &config, peer, pair_hello(115), later)
+                .ended
+                .is_some()
+        );
+        assert!(
+            pair_send(&mut paired, &config, peer, pair_hello(115), later)
+                .ended
+                .is_none()
         );
     }
 

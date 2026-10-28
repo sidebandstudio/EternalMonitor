@@ -25,6 +25,9 @@ enum AttemptEnd: Equatable {
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
     case receiverFailed
+    /// The PC asked for the pairing code, and a new HELLO2 sends it: the
+    /// refused one is over, the attempt goes on.
+    case retriedWithCode
 
     /// The support log's name for it.
     var name: String { "\(self)" }
@@ -107,7 +110,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .userDisconnect, .usbTurnedOff: return "user"
         case .appBackground: return "background"
-        case .superseded: return "superseded"
+        case .superseded, .retriedWithCode: return "superseded"
         case .pcGoodbye: return "goodbye"
         case .connectTimeout: return "timeout"
         case .pcStoppedResponding: return "liveness"

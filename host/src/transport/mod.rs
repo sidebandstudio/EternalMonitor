@@ -652,7 +652,9 @@ async fn execute_actions(
         if let Some(end) = ended.take() {
             crate::diagnostics::log_session_end(&end, shared);
         }
-        crate::diagnostics::note_session_start();
+        if let Some(session_id) = shared.session.lock().session_id() {
+            crate::diagnostics::note_session_start(session_id);
+        }
     }
     for (destination, datagram) in &actions.replies {
         if let Err(e) = links.send_to(datagram, *destination).await {
