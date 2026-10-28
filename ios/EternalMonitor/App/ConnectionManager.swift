@@ -194,6 +194,9 @@ final class ConnectionManager: ObservableObject {
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
     }
     var timing: Timing
+    /// The Wi-Fi link to a host's port. Tests replace it to fail a lookup
+    /// without asking DNS.
+    var makeUDPLink: (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }
 
     init(timing: Timing = Timing()) {
         self.timing = timing
@@ -328,7 +331,7 @@ final class ConnectionManager: ObservableObject {
             normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedHost.isEmpty, targetPort != 0 else { return }
             port = targetPort
-            receiver = UDPReceiver(port: port)
+            receiver = makeUDPLink(port)
             lastTarget = (normalizedHost, port)
         case .usb(let link):
             normalizedHost = "USB"

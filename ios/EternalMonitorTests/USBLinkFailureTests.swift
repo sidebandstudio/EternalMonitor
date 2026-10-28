@@ -154,11 +154,10 @@ final class USBLinkFailureTests: XCTestCase {
     private let fast = ConnectionManager.Timing(connectTimeoutSeconds: 0.4, reconnectGraceSeconds: 0.1,
         reconnectBackoffSeconds: { _ in 0.05 })
 
-    /// Waits for the reconnect cycle to start and then to run out, polling
-    /// every 10 ms for at most `polls` times.
-    private func waitForFallbackToGiveUp(_ manager: ConnectionManager, polls: Int = 1000) async throws {
+    /// Waits for the reconnect cycle to start and then to run out.
+    private func waitForFallbackToGiveUp(_ manager: ConnectionManager) async throws {
         var started = false
-        for _ in 0..<polls {
+        for _ in 0..<1000 {
             if manager.reconnectAttempt > 0 { started = true }
             if started && manager.reconnectAttempt == 0 { return }
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -202,18 +201,16 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         UserDefaults.standard.set("eternalmonitor-test.invalid", forKey: "lastHost")
         UserDefaults.standard.set(9876, forKey: "lastPort")
-        // An attempt ends at its timeout and reports the last error it saw,
-        // here the lookup's failure. With `fast`'s 0.4 s timeout a slow DNS
-        // answer on CI came too late, every attempt timed out without it,
-        // and the cable advice rightly stayed. 5 s leaves the answer room;
-        // the wait for the cycle to finish is only a backstop.
-        var dnsBound = fast
-        dnsBound.connectTimeoutSeconds = 5
-        let (manager, link) = try await connectOverCable(timing: dnsBound)
+        let (manager, link) = try await connectOverCable(timing: fast)
         defer { link.stop(); manager.cancel() }
+        // Every Wi-Fi attempt's lookup fails at once. A real lookup of an
+        // .invalid name raced each attempt's 0.4 s timeout: on CI its answer
+        // came too late, the attempts ended as plain timeouts, and the
+        // cable advice rightly stayed.
+        manager.makeUDPLink = { _ in UnresolvableLink() }
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
-        try await waitForFallbackToGiveUp(manager, polls: 30_000)
+        try await waitForFallbackToGiveUp(manager)
         XCTAssertEqual(manager.reconnectAttempt, 0)
         XCTAssertEqual(manager.problem, .badAddress("eternalmonitor-test.invalid"))
     }
@@ -663,4 +660,25 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
         try await finishConnecting(manager, to: wifi)
     }
+}
+
+/// A Wi-Fi link whose lookup fails at once, as a host name that doesn't
+/// resolve does, without asking DNS.
+private final class UnresolvableLink: MediaLink {
+    let datagrams = MediaDatagrams()
+    let controlQueue = DispatchQueue(label: "test.unresolvable")
+    var onConnectionEstablished: (() -> Void)?
+    var onError: ((LinkError) -> Void)?
+    var onListenerReady: ((UInt16) -> Void)?
+    var onClosed: (() -> Void)?
+
+    @discardableResult func start(host: String) -> Bool {
+        controlQueue.async { [weak self] in
+            self?.onError?(LinkError(.resolve, "Cannot resolve \(host)"))
+        }
+        return true
+    }
+
+    func send(_ data: Data) {}
+    func stop() {}
 }
