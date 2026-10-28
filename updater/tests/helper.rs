@@ -65,23 +65,48 @@ fn close(host: &mut Child) {
     let _ = host.wait();
 }
 
+/// How long the helper may take to say whether it is ready, and then to
+/// exit. Only a hung helper waits this long.
+const HELPER_WAIT: Duration = Duration::from_secs(60);
+
 /// Starts the helper, returns its first line and exit code. Once the helper
-/// says it is ready, the host closes.
+/// says it is ready, the host closes. Anything but ready or an error fails
+/// the test at once, and so does a helper still running after
+/// [`HELPER_WAIT`]. The helper is killed first and the case's drop closes
+/// the host, so neither waits out the host's ten minutes.
 fn run(case: &mut Case) -> (String, i32) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_eternal-updater"))
         .args(case.args.to_args())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    if line.trim() == READY {
+    let stdout = child.stdout.take().unwrap();
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = line_tx.send(line);
+    });
+    let Ok(line) = line_rx.recv_timeout(HELPER_WAIT) else {
+        close(&mut child);
+        panic!("the helper said nothing within {HELPER_WAIT:?}");
+    };
+    let line = line.trim().to_string();
+    if line == READY {
         close(&mut case.host);
+    } else if !line.starts_with("error:") {
+        close(&mut child);
+        panic!("the helper said neither ready nor an error: {line:?}");
     }
-    let code = child.wait().unwrap().code().unwrap();
-    (line.trim().to_string(), code)
+    let deadline = Instant::now() + HELPER_WAIT;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return (line, status.code().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    close(&mut child);
+    panic!("the helper did not exit within {HELPER_WAIT:?} of saying {line:?}");
 }
 
 /// Whether `path` appears within `wait`. The relaunched app writes it on its
