@@ -61,10 +61,14 @@ pub fn passing_code(code: i32) -> bool {
 /// secure screen, a display or mode change, a GPU reset, another capturing
 /// app, a disconnected session) rather than from the display itself. Such a
 /// second screen failure is not remembered for later app runs. A display
-/// Windows will not duplicate from this GPU is the PC's.
+/// Windows will not duplicate from this GPU is the PC's. A driver call that
+/// did not return in time passes too, like a hung device.
 pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     if let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() {
         return unavailable.block != CaptureBlock::UnsupportedOnThisGpu;
+    }
+    if error.downcast_ref::<crate::stall::Stall>().is_some() {
+        return true;
     }
     #[cfg(windows)]
     if let Some(error) = error.downcast_ref::<windows::core::Error>() {
@@ -304,6 +308,17 @@ mod tests {
         ));
         let other: Box<dyn std::error::Error + Send + Sync> = "DuplicateOutput failed".into();
         assert!(!passing_error(other.as_ref()));
+        let call = crate::stall::Call::DuplicateOutput;
+        for stall in [
+            crate::stall::Stall::TimedOut {
+                call,
+                after: Duration::from_secs(3),
+            },
+            crate::stall::Stall::Refused { call },
+        ] {
+            let error: Box<dyn std::error::Error + Send + Sync> = Box::new(stall);
+            assert!(passing_error(error.as_ref()), "{stall:?}");
+        }
         let code = |hresult: u32| hresult as i32;
         for passing in [
             0x8007_0005, // E_ACCESSDENIED
