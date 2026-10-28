@@ -1,6 +1,6 @@
 //! Low-frequency support evidence. Never collect credentials or user documents.
 use std::ffi::CStr;
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
 use crate::control::{CaptureTarget, SharedControl};
@@ -206,30 +206,45 @@ fn hybrid(cards: &[(u32, u32)]) -> Option<bool> {
     (!cards.is_empty()).then_some(distinct.len() > 1)
 }
 
-/// The live session, and the first `second_screen_fallback` reason logged
-/// while it was live. Between sessions, reasons are dropped.
+/// The live session with its mode, and the first `second_screen_fallback`
+/// reason logged while it was live in Second screen mode. Reasons logged
+/// between sessions, or while the session mirrors, are dropped.
 struct SessionFallback {
     session_id: Option<u32>,
+    mode: Option<Arc<parking_lot::Mutex<CaptureTarget>>>,
     reason: Option<&'static str>,
 }
 
 static SESSION_FALLBACK: parking_lot::Mutex<SessionFallback> =
     parking_lot::Mutex::new(SessionFallback {
         session_id: None,
+        mode: None,
         reason: None,
     });
 
 /// `session_id` started: fallbacks logged from now on are its own.
-pub fn note_session_start(session_id: u32) {
+pub fn note_session_start(session_id: u32, shared: &SharedControl) {
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
+        mode: Some(Arc::clone(&shared.capture_target)),
         reason: None,
     };
 }
 
 fn note_fallback(reason: &str) {
+    let (session_id, mode) = {
+        let slot = SESSION_FALLBACK.lock();
+        match (slot.session_id, &slot.mode) {
+            (Some(id), Some(mode)) if slot.reason.is_none() => (id, Arc::clone(mode)),
+            _ => return,
+        }
+    };
+    // Bounded: a log line written while the mode is held can't wait on it.
+    let second_screen = mode
+        .try_lock_for(Duration::from_millis(50))
+        .is_some_and(|mode| *mode == CaptureTarget::VirtualExtended);
     let mut slot = SESSION_FALLBACK.lock();
-    if slot.session_id.is_some() {
+    if second_screen && slot.session_id == Some(session_id) {
         slot.reason.get_or_insert(fallback_token(reason));
     }
 }
@@ -242,6 +257,7 @@ fn take_fallback(session_id: u32) -> Option<&'static str> {
         return None;
     }
     slot.session_id = None;
+    slot.mode = None;
     slot.reason.take()
 }
 
@@ -293,12 +309,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FallbackWatch {
 /// upload sends it as category `summary` (`crate::telemetry`).
 pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
     let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
-    // A session that ends mirroring by choice has no fallback, whatever an
-    // earlier session's virtual display start reported during it.
-    let fallback = end
-        .session_id
-        .and_then(take_fallback)
-        .filter(|_| second_screen);
+    // `mode=` is the mode at the end; the fallback was counted in Second
+    // screen mode, perhaps before a switch to Mirror.
+    let fallback = end.session_id.and_then(take_fallback);
     info!(
         "{}",
         session_summary(end, second_screen, fallback, host_facts())
@@ -840,7 +853,6 @@ pub(crate) mod tests {
     #[test]
     fn a_session_keeps_the_first_second_screen_fallback_it_logs() {
         use tracing_subscriber::prelude::*;
-        let _slot = FALLBACK_SLOT.lock();
         for (reason, token) in [
             ("attach_timeout", "attach_timeout"),
             ("enable_failed", "enable_failed"),
@@ -852,10 +864,13 @@ pub(crate) mod tests {
         ] {
             assert_eq!(fallback_token(reason), token);
         }
+        let _slot = FALLBACK_SLOT.lock();
+        let shared = SharedControl::new(9876, 15_000_000);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         let subscriber = tracing_subscriber::registry().with(FallbackWatch);
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(second_screen_fallback = "remembered", "before the session");
-            note_session_start(1);
+            note_session_start(1, &shared);
             tracing::info!("no reason here");
             tracing::info!(
                 second_screen_fallback = "remembered",
@@ -867,15 +882,18 @@ pub(crate) mod tests {
             assert_eq!(take_fallback(1), Some("remembered"));
             tracing::warn!(second_screen_fallback = "enable_failed", "after it ended");
             assert_eq!(take_fallback(1), None);
-            note_session_start(3);
+            note_session_start(3, &shared);
             tracing::warn!(second_screen_fallback = %"something new", "unknown");
             assert_eq!(take_fallback(3), Some("other"));
         });
     }
 
-    /// Session 1 starts the virtual display and leaves; its start fails
-    /// late. Neither the gap before session 2 nor a session 2 that mirrors
-    /// by choice gets that fallback.
+    /// A fallback counts for the live session in the mode it has when the
+    /// fallback is logged. Session 1 starts the virtual display and leaves,
+    /// and its start fails late: neither the gap before session 2 nor a
+    /// session 3 that mirrors gets that. Session 5 falls back, then the user
+    /// picks Mirror; session 6 mirrors through a failure, then picks Second
+    /// screen.
     #[test]
     fn a_late_fallback_of_an_ended_session_is_not_the_next_ones() {
         use tracing_subscriber::prelude::*;
@@ -891,12 +909,12 @@ pub(crate) mod tests {
         };
         tracing::subscriber::with_default(subscriber, || {
             *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
-            note_session_start(1);
+            note_session_start(1, &shared);
             log_session_end(&ended(1), &shared);
             tracing::warn!(second_screen_fallback = "enable_failed", "in the gap");
-            note_session_start(2);
+            note_session_start(2, &shared);
             log_session_end(&ended(2), &shared);
-            note_session_start(3);
+            note_session_start(3, &shared);
             *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
             tracing::warn!(
                 second_screen_fallback = "enable_failed",
@@ -906,25 +924,47 @@ pub(crate) mod tests {
             // The same reason for a session in Second screen mode is its own:
             // it mirrors because the start it waited on failed.
             *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
-            note_session_start(4);
+            note_session_start(4, &shared);
             tracing::warn!(
                 second_screen_fallback = "enable_failed",
                 "the start it waited on"
             );
             log_session_end(&ended(4), &shared);
+            note_session_start(5, &shared);
+            tracing::warn!(second_screen_fallback = "attach_timeout", "fell back");
+            *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+            tracing::warn!(second_screen_fallback = "no_frames", "while mirroring");
+            log_session_end(&ended(5), &shared);
+            note_session_start(6, &shared);
+            tracing::info!(second_screen_fallback = "remembered", "while mirroring");
+            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+            log_session_end(&ended(6), &shared);
         });
-        let fallbacks: Vec<_> = summaries
+        let modes: Vec<_> = summaries
             .lock()
             .iter()
             .map(|line| {
                 assert_contract(line);
-                line.split(' ')
-                    .find_map(|word| word.strip_prefix("fallback="))
-                    .unwrap()
-                    .to_string()
+                ["mode=", "fallback="]
+                    .map(|key| {
+                        line.split(' ')
+                            .find_map(|word| word.strip_prefix(key))
+                            .unwrap()
+                    })
+                    .join(" ")
             })
             .collect();
-        assert_eq!(fallbacks, ["none", "none", "none", "enable_failed"]);
+        assert_eq!(
+            modes,
+            [
+                "second_screen none",
+                "second_screen none",
+                "mirror none",
+                "second_screen enable_failed",
+                "mirror attach_timeout",
+                "second_screen none",
+            ]
+        );
     }
 
     #[test]

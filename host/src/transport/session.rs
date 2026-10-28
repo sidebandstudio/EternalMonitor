@@ -25,8 +25,20 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// Refused nonces remembered, and for how long: far past an iPad's 2 s of
 /// HELLO2 retransmits.
-const REFUSED_KEPT: usize = 16;
+const REFUSED_KEPT: usize = 64;
 const REFUSED_FOR: Duration = Duration::from_secs(60);
+/// Refused attempts summarized per minute. Unauthenticated traffic can't
+/// fill the support log: the rest are counted in one line a minute.
+const REFUSED_SUMMARIES: u32 = 20;
+const REFUSAL_MINUTE: Duration = Duration::from_secs(60);
+
+/// The refused attempts of the current minute.
+#[derive(Debug, Clone, Copy)]
+struct RefusalMinute {
+    since: Instant,
+    summarized: u32,
+    left_out: u32,
+}
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -151,6 +163,7 @@ pub struct Session {
     stopped: Option<SessionEnd>,
     /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
     refused: std::collections::VecDeque<(u32, Instant)>,
+    refusal_minute: Option<RefusalMinute>,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -165,6 +178,7 @@ impl Session {
             goodbye: None,
             stopped: None,
             refused: std::collections::VecDeque::new(),
+            refusal_minute: None,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -654,6 +668,7 @@ impl Session {
         now: Instant,
     ) -> Actions {
         let mut actions = Actions::default();
+        self.close_refusal_minute(now);
         if let Some(goodbye) = self.take_goodbye() {
             actions.goodbye = Some(goodbye);
             actions.client_lost = self.active.is_none();
@@ -758,9 +773,10 @@ impl Session {
             }
             self.refused.push_back((hello.client_nonce, now));
         }
+        let summarized = first && self.summarize_refusal(now);
         Actions {
             replies: vec![(source, ack)],
-            ended: first.then_some(SessionEnd {
+            ended: summarized.then_some(SessionEnd {
                 session_id: None,
                 client_nonce: hello.client_nonce,
                 link: source.link,
@@ -770,6 +786,37 @@ impl Session {
                 duration: Duration::ZERO,
             }),
             ..Actions::default()
+        }
+    }
+
+    /// Whether a new refused attempt gets a summary in this minute's budget.
+    fn summarize_refusal(&mut self, now: Instant) -> bool {
+        self.close_refusal_minute(now);
+        let minute = self.refusal_minute.get_or_insert(RefusalMinute {
+            since: now,
+            summarized: 0,
+            left_out: 0,
+        });
+        if minute.summarized < REFUSED_SUMMARIES {
+            minute.summarized += 1;
+            true
+        } else {
+            minute.left_out += 1;
+            false
+        }
+    }
+
+    /// Ends a minute of refusals that is over, saying how many it left out.
+    fn close_refusal_minute(&mut self, now: Instant) {
+        let over = self
+            .refusal_minute
+            .take_if(|minute| now.saturating_duration_since(minute.since) >= REFUSAL_MINUTE);
+        if let Some(minute) = over.filter(|minute| minute.left_out > 0) {
+            warn!(
+                left_out = minute.left_out,
+                summarized = minute.summarized,
+                "Turned down more connection attempts in a minute than the session summaries keep"
+            );
         }
     }
 
@@ -1952,27 +1999,86 @@ mod tests {
             .map(|end| end.client_nonce)
             .collect();
         assert_eq!(ends, [13]);
-        // Sixteen newer refusals, or a minute, and a nonce counts again.
-        for nonce in 100..116 {
-            assert!(
-                pair_send(&mut paired, &config, peer, pair_hello(nonce), now)
-                    .ended
-                    .is_some()
-            );
-        }
-        assert!(pair_send(&mut paired, &config, peer, pair_hello(12), now)
+        // A minute later, a nonce counts again.
+        let later = now + REFUSED_FOR;
+        assert!(pair_send(&mut paired, &config, peer, pair_hello(13), later)
             .ended
             .is_some());
-        let later = now + REFUSED_FOR;
+        assert!(pair_send(&mut paired, &config, peer, pair_hello(13), later)
+            .ended
+            .is_none());
+    }
+
+    /// Seventeen nonces cycled a hundred times are seventeen attempts, and a
+    /// flood of new ones gets 20 summaries a minute and one line with the rest.
+    #[test]
+    fn refused_attempts_cannot_flood_the_summaries() {
+        let config = pair_config(true);
+        let peer = addr([10, 0, 0, 9], 50000);
+        let now = Instant::now();
+        let mut session = Session::new(500);
+        let cycled = (0..100)
+            .flat_map(|_| 0..17u32)
+            .filter(|&nonce| {
+                pair_send(&mut session, &config, peer, pair_hello(nonce), now)
+                    .ended
+                    .is_some()
+            })
+            .count();
+        assert_eq!(cycled, 17);
+
+        let mut session = Session::new(500);
+        let flood = (1000..1100u32)
+            .filter(|&nonce| {
+                pair_send(&mut session, &config, peer, pair_hello(nonce), now)
+                    .ended
+                    .is_some()
+            })
+            .count();
+        assert_eq!(flood, REFUSED_SUMMARIES as usize);
+        assert_eq!(session.refusal_minute.unwrap().left_out, 80);
+
+        #[derive(Default)]
+        struct LeftOut(std::sync::Arc<parking_lot::Mutex<Vec<u64>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LeftOut {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Count<'a>(&'a parking_lot::Mutex<Vec<u64>>);
+                impl tracing::field::Visit for Count<'_> {
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        if field.name() == "left_out" {
+                            self.0.lock().push(value);
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                event.record(&mut Count(&self.0));
+            }
+        }
+        use tracing_subscriber::prelude::*;
+        let counts = LeftOut::default();
+        let seen = counts.0.clone();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(counts), || {
+            session.tick(&config, false, now + Duration::from_secs(30));
+            session.tick(&config, false, now + REFUSAL_MINUTE);
+            session.tick(&config, false, now + REFUSAL_MINUTE * 2);
+        });
+        assert_eq!(*seen.lock(), [80], "one line for the minute");
         assert!(
-            pair_send(&mut paired, &config, peer, pair_hello(115), later)
-                .ended
-                .is_some()
-        );
-        assert!(
-            pair_send(&mut paired, &config, peer, pair_hello(115), later)
-                .ended
-                .is_none()
+            pair_send(
+                &mut session,
+                &config,
+                peer,
+                pair_hello(5000),
+                now + REFUSAL_MINUTE * 2
+            )
+            .ended
+            .is_some(),
+            "a new minute summarizes again"
         );
     }
 

@@ -42,6 +42,8 @@ final class ControlChannel {
     private var hostCaps: UInt16 = 0
     private var msgSeq: UInt32 = 0
     private var clientNonce: UInt32 = 0
+    /// The latest HELLO2's nonce, kept after its answer.
+    private var lastHelloNonce: UInt32 = 0
     private var helloBytes = Data()
     private var helloTemplate: Hello2?
     private var helloAttempts = 0
@@ -54,9 +56,6 @@ final class ControlChannel {
     /// Client clock (µs) of the last host heartbeat; 0 = none yet. Read by the
     /// ConnectionManager's watchdog.
     let lastHeartbeatAtUs = OSAllocatedUnfairLock<UInt64>(initialState: 0)
-    /// The latest HELLO2's nonce, kept after its answer for the attempt's
-    /// summary; 0 before one is sent.
-    let helloNonce = OSAllocatedUnfairLock<UInt32>(initialState: 0)
     /// Latest clock-sync results for latency math and the HUD.
     let clockSnapshot = OSAllocatedUnfairLock<ClockSnapshot>(initialState: ClockSnapshot())
 
@@ -93,6 +92,12 @@ final class ControlChannel {
         queue.sync { sessionId }
     }
 
+    /// The latest HELLO2's nonce, for the attempt's summary, after whatever
+    /// is already queued (a pairing retry mints a new one); 0 before one.
+    var helloNonce: UInt32 {
+        queue.sync { lastHelloNonce }
+    }
+
     // MARK: - Handshake
 
     struct ClientIdentity {
@@ -118,9 +123,8 @@ final class ControlChannel {
             hostCaps = 0
             msgSeq = 0
             helloAttempts = 0
-            let nonce = UInt32.random(in: 1...UInt32.max)
-            clientNonce = nonce
-            helloNonce.withLock { $0 = nonce }
+            clientNonce = UInt32.random(in: 1...UInt32.max)
+            lastHelloNonce = clientNonce
             let hello = Hello2(
                 clientNonce: clientNonce,
                 listenPort: listenPort,
@@ -149,9 +153,8 @@ final class ControlChannel {
     func retryPairing(code: UInt32) {
         queue.async { [self] in
             guard sessionId == 0, var hello = helloTemplate else { return }
-            let nonce = UInt32.random(in: 1...UInt32.max)
-            clientNonce = nonce
-            helloNonce.withLock { $0 = nonce }
+            clientNonce = UInt32.random(in: 1...UInt32.max)
+            lastHelloNonce = clientNonce
             hello.clientNonce = clientNonce
             hello.authToken = Data(repeating: 0, count: 16)
             hello.pairingCode = code

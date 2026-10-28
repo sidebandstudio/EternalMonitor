@@ -653,7 +653,7 @@ async fn execute_actions(
             crate::diagnostics::log_session_end(&end, shared);
         }
         if let Some(session_id) = shared.session.lock().session_id() {
-            crate::diagnostics::note_session_start(session_id);
+            crate::diagnostics::note_session_start(session_id, shared);
         }
     }
     for (destination, datagram) in &actions.replies {

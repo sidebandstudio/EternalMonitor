@@ -227,6 +227,38 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(tokens(summaries[2]), ["accepted", "user_ended", "none", "user"])
     }
 
+    /// Cancel right after a code goes out, while the control queue hasn't
+    /// sent the new HELLO2 yet: the refused nonce and the new one get one
+    /// summary each.
+    func testCancellingWhileACodeGoesOutSummarizesEachNonceOnce() async throws {
+        let host = FakeUDPHost()
+        var receiver: UDPReceiver?
+        let manager = ConnectionManager(udpReceiver: { port in
+            let link = UDPReceiver(port: port)
+            receiver = link
+            return link
+        })
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let nonce = await Task.detached { host.acceptSession(status: .unauthorized) ? host.lastNonce : nil }.value
+        let refused = try XCTUnwrap(nonce, "the iPad never sent HELLO2")
+        try await until("prompt") { manager.pairingPrompt != nil }
+        let queue = try XCTUnwrap(receiver).controlQueue
+        let held = DispatchSemaphore(value: 0)
+        queue.async { held.wait() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { held.signal() }
+        manager.pairingPrompt?.code = "123456"
+        manager.submitPairing()
+        manager.cancel()
+        let summaries = logged(manager, "summary")
+        XCTAssertEqual(summaries.count, 2, "\(summaries)")
+        XCTAssertTrue(summaries.first?.contains(" nonce=\(SessionSummary.hex16(refused)) ") == true, "\(summaries)")
+        let nonces = summaries.compactMap { $0.split(separator: " ").first { $0.hasPrefix("nonce=") } }
+        XCTAssertEqual(Set(nonces).count, 2, "\(summaries)")
+        XCTAssertEqual(tokens(summaries.last ?? ""), ["hello_sent", "pairing", "none", "user"])
+        summaries.forEach { Self.assertContract($0) }
+    }
+
     /// The user's Disconnect is the one `userDisconnect`, with one summary.
     func testTheUsersDisconnectEndsWithOneSummary() async throws {
         let host = FakeUDPHost()

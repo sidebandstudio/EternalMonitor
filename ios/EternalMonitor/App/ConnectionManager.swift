@@ -164,6 +164,8 @@ final class ConnectionManager: ObservableObject {
     /// When the HELLO2 the next summary describes was started: the attempt's
     /// start, or the latest pairing code's.
     private var summaryStartedAt: TimeInterval = 0
+    /// The latest nonces that have their summary.
+    private var summarizedNonces: [UInt32] = []
 
     let frameSlot = FrameSlot()
     /// Lets hot-path closures reach the CURRENT control channel without
@@ -296,7 +298,7 @@ final class ConnectionManager: ObservableObject {
         guard awaitingPairing, let code = pairingPrompt?.submit() else { return }
         // The code goes in a new HELLO2. The refused one ends here, as on the
         // PC, which wrote a line for its nonce.
-        record(.info, "summary", summary(.retriedWithCode).line)
+        recordSummary(.retriedWithCode)
         summaryStartedAt = ProcessInfo.processInfo.systemUptime
         controlChannel?.retryPairing(code: code)
     }
@@ -1150,7 +1152,7 @@ final class ConnectionManager: ObservableObject {
         if state != .disconnected {
             recordStreamSummary(reason: "disconnect=\(end.name)")
             record(.info, "connection", "Disconnect state=\(state) reason=\(end.name)")
-            record(.info, "summary", summary(end).line)
+            recordSummary(end)
         }
         awaitingPairing = false
         pairingPrompt = nil
@@ -1197,12 +1199,24 @@ final class ConnectionManager: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
+    /// Records the summary of the HELLO2 that ends with `end`: one per nonce,
+    /// whichever paths reach it.
+    private func recordSummary(_ end: AttemptEnd) {
+        let summary = summary(end)
+        if summary.nonce != 0 {
+            guard !summarizedNonces.contains(summary.nonce) else { return }
+            summarizedNonces.append(summary.nonce)
+            if summarizedNonces.count > 32 { summarizedNonces.removeFirst() }
+        }
+        record(.info, "summary", summary.line)
+    }
+
     /// The attempt's summary as it ends with `end`.
     private func summary(_ end: AttemptEnd) -> SessionSummary {
         let now = ProcessInfo.processInfo.systemUptime
         return SessionSummary(
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
-            nonce: controlChannel?.helloNonce.withLock { $0 } ?? 0, awaitingPairing: awaitingPairing,
+            nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
             datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
             duration: now - summaryStartedAt)
     }
