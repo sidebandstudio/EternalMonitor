@@ -249,6 +249,7 @@ impl State {
                 "The second screen failed while Windows withheld the desktop or the display may \
                  have been asleep — not remembering it beyond this app run"
             );
+            self.memory.excuse();
             return;
         }
         if let Some(hold) = self.memory.note_failure(reason, now) {
