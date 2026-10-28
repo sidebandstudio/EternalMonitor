@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(env_filter)
         .with(stdout_layer)
         .with(memory_layer)
+        .with(eternal_host::diagnostics::FallbackWatch)
         .init();
 
     let _uploads = eternal_host::telemetry::UploadGuard::start();
@@ -299,6 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stop_streaming = || {
+        eternal_host::diagnostics::log_session_end_at_quit(&gui_control.shared);
         gui_control.shared.stop();
         gui_control.request_shutdown();
 

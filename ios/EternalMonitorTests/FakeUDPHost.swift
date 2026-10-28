@@ -12,6 +12,8 @@ final class FakeUDPHost: @unchecked Sendable {
     /// HELLO2 nonces already answered, so a late copy of one isn't taken
     /// for the iPad's next attempt.
     private var answered = Set<UInt32>()
+    /// The nonce of the HELLO2 answered last.
+    private(set) var lastNonce: UInt32 = 0
 
     init() {
         var address = sockaddr_in()
@@ -53,6 +55,7 @@ final class FakeUDPHost: @unchecked Sendable {
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
             client = (from, length)
+            lastNonce = hello.clientNonce
             send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion))
             return true
         }

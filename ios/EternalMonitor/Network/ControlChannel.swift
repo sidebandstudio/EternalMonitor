@@ -54,6 +54,9 @@ final class ControlChannel {
     /// Client clock (µs) of the last host heartbeat; 0 = none yet. Read by the
     /// ConnectionManager's watchdog.
     let lastHeartbeatAtUs = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+    /// The latest HELLO2's nonce, kept after its answer for the attempt's
+    /// summary; 0 before one is sent.
+    let helloNonce = OSAllocatedUnfairLock<UInt32>(initialState: 0)
     /// Latest clock-sync results for latency math and the HUD.
     let clockSnapshot = OSAllocatedUnfairLock<ClockSnapshot>(initialState: ClockSnapshot())
 
@@ -115,7 +118,9 @@ final class ControlChannel {
             hostCaps = 0
             msgSeq = 0
             helloAttempts = 0
-            clientNonce = UInt32.random(in: 1...UInt32.max)
+            let nonce = UInt32.random(in: 1...UInt32.max)
+            clientNonce = nonce
+            helloNonce.withLock { $0 = nonce }
             let hello = Hello2(
                 clientNonce: clientNonce,
                 listenPort: listenPort,
@@ -144,7 +149,9 @@ final class ControlChannel {
     func retryPairing(code: UInt32) {
         queue.async { [self] in
             guard sessionId == 0, var hello = helloTemplate else { return }
-            clientNonce = UInt32.random(in: 1...UInt32.max)
+            let nonce = UInt32.random(in: 1...UInt32.max)
+            clientNonce = nonce
+            helloNonce.withLock { $0 = nonce }
             hello.clientNonce = clientNonce
             hello.authToken = Data(repeating: 0, count: 16)
             hello.pairingCode = code

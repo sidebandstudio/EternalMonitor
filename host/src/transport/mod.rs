@@ -373,7 +373,10 @@ pub async fn start_sender(
                 if awaiting_keyframe {
                     let started = shared.session.lock().client_info().map(|info| info.connected_at);
                     match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
-                        FirstFrame::Send => awaiting_keyframe = false,
+                        FirstFrame::Send => {
+                            awaiting_keyframe = false;
+                            shared.session.lock().note_video_sent(session_id, Instant::now());
+                        }
                         FirstFrame::Skip => continue, // the forced IDR is coming
                         FirstFrame::SkipAndRequestKeyframe => {
                             shared.force_next_idr.store(true, Ordering::SeqCst);
@@ -641,6 +644,13 @@ async fn execute_actions(
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
+    // The ended session's summary first: a new one starts its own.
+    if let Some(end) = &actions.ended {
+        crate::diagnostics::log_session_end(end, shared);
+    }
+    if actions.new_target.is_some() {
+        crate::diagnostics::note_session_start();
+    }
     for (destination, datagram) in &actions.replies {
         if let Err(e) = links.send_to(datagram, *destination).await {
             warn!(peer = %destination, error = %e, "Failed to send control reply");
