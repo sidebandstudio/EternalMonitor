@@ -212,11 +212,12 @@ fn usb_framed_stream_end_to_end() {
         let mut highest_seq = 0;
         // The last whole frame read, the last one before the stall, the
         // frames read after it until the recovery keyframe, and the capture
-        // count when the stall began.
+        // and USB drop counts when the stall began.
         let mut last_complete = 0;
         let mut stall_seq = 0;
         let mut stale = 0;
         let mut captured_before = 0;
+        let mut dropped_before = 0;
         let mut caught_up = false;
         let mut behind = 0;
         let mut epoch = ack.stream_config.stream_epoch;
@@ -232,6 +233,7 @@ fn usb_framed_stream_end_to_end() {
                 let stall_from = encoded();
                 stall_seq = last_complete;
                 captured_before = captured();
+                dropped_before = PIPELINE_STATS.lock().usb_frames_dropped;
                 while encoded() < stall_from + STALL_FRAMES {
                     assert!(started.elapsed() < DEADLINE, "the host stopped encoding during the stall");
                     if last_report.elapsed() >= Duration::from_millis(300) {
@@ -318,7 +320,9 @@ fn usb_framed_stream_end_to_end() {
                 _ => panic!("unexpected USB packet"),
             }
         }
-        let dropped = PIPELINE_STATS.lock().usb_frames_dropped;
+        // A drop before the stall is not the stall's. A stream restart zeroes
+        // the counter, which leaves none to the stall.
+        let dropped = PIPELINE_STATS.lock().usb_frames_dropped.saturating_sub(dropped_before);
         assert!(dropped > 0, "a read stall of {STALL_FRAMES} frames must overflow the video queue");
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
         eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} stale={stale} behind={behind} recovery_ms={recovery_ms}");
