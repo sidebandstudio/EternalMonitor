@@ -178,9 +178,12 @@ fn missing_garbage_or_newer_config_is_the_defaults() {
 #[test]
 fn the_attach_wait_is_clamped_to_a_safe_range() {
     for (value, applied) in [
-        (json!(20), Some(20)),
         (json!(30), Some(30)),
+        (json!(45), Some(45)),
         (json!(60), Some(60)),
+        // Shorter than today's 30 s would fail PCs that attach late.
+        (json!(20), None),
+        (json!(29), None),
         (json!(19), None),
         (json!(61), None),
         (json!(0), None),
@@ -210,7 +213,7 @@ fn a_rule_matches_only_its_hardware() {
     let rule = rule(json!({
         "gpus": ["nvidia", "intel"],
         "gpu_driver": { "gpu": "nvidia", "min": "32.0.15.6000", "max": "32.0.15.6099" },
-        "display_driver": { "min": "25.7", "max": "25.7.99" },
+        "display_driver": { "min": "25.7.0", "max": "25.7.99" },
         "windows": { "min": "26100.0", "max": "26100.2999" }
     }))
     .unwrap();
@@ -236,43 +239,102 @@ fn a_rule_matches_only_its_hardware() {
     assert!(!rule.matches(&[], "25.7.23", "26100.2894"));
 }
 
+/// A rule that passes, to break one way at a time.
+fn narrow_rule() -> Value {
+    json!({
+        "gpus": ["intel", "nvidia"],
+        "gpu_driver": { "gpu": "nvidia", "min": "32.0.15.6000", "max": "32.0.15.6099" },
+        "display_driver": { "min": "25.7.0", "max": "25.7.99" },
+        "windows": { "min": "26100.0", "max": "26100.2999" }
+    })
+}
+
 #[test]
 fn broad_or_unknown_rules_are_ignored() {
-    let range = json!({ "min": "25.7.0", "max": "25.7.99" });
-    for bad in [
+    assert!(rule(narrow_rule()).is_some());
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut value = narrow_rule();
+        change(&mut value);
+        value
+    };
+    let without = |keys: &'static [&'static str]| {
+        with(&move |v| {
+            for key in keys {
+                v.as_object_mut().unwrap().remove(*key);
+            }
+        })
+    };
+    // Exact releases pass: one driver, one VDD version, one Windows update.
+    let exact = with(&|v| {
+        v["gpu_driver"] = json!({ "gpu": "nvidia", "min": "32.0.15.6094", "max": "32.0.15.6094" });
+        v["display_driver"] = json!({ "min": "25.7.23", "max": "25.7.23" });
+        v["windows"] = json!({ "min": "26100.2894", "max": "26100.2894" });
+    });
+    assert!(rule(exact).is_some());
+    assert!(rule(without(&["windows"])).is_some());
+    assert!(rule(without(&["display_driver"])).is_some());
+    let bad = [
+        // The review's soft kill switch: every NVIDIA-only PC.
+        json!({
+            "gpus": ["nvidia"],
+            "gpu_driver": { "gpu": "nvidia", "min": "32.0", "max": "32.4294967295" },
+            "windows": { "min": "26100.0", "max": "26100.99999" }
+        }),
+        // Every PC on Windows 11 24H2 with these cards: no driver release.
+        without(&["gpu_driver"]),
+        json!({ "gpus": ["intel", "nvidia"], "windows": { "min": "26100.0", "max": "26100.99999" } }),
+        // A driver release and nothing else.
+        without(&["display_driver", "windows"]),
         // The vendor set alone, or nothing at all.
         json!({ "gpus": ["intel", "nvidia"] }),
-        json!({ "display_driver": range }),
-        json!({ "gpus": [], "display_driver": range }),
-        json!({ "gpus": ["intel", "intel"], "display_driver": range }),
-        json!({ "gpus": ["Intel"], "display_driver": range }),
-        json!({ "gpus": ["other"], "display_driver": range }),
-        json!({ "gpus": "intel", "display_driver": range }),
-        // Ranges across major versions, reversed, open or malformed.
-        json!({ "gpus": ["intel"], "display_driver": { "min": "0", "max": "4294967295" } }),
-        json!({ "gpus": ["intel"], "windows": { "min": "22000.0", "max": "26100.9999" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "25.7.99", "max": "25.7.0" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "25.7.0" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "25.x", "max": "25.9" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "25.1.2.3.4", "max": "25.9" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "", "max": "25.9" } }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": 25, "max": 26 } }),
-        // A driver range for a vendor the rule doesn't name.
-        json!({ "gpus": ["intel"], "gpu_driver": { "gpu": "nvidia", "min": "32.0", "max": "32.1" } }),
+        without(&["gpus"]),
+        with(&|v| v["gpus"] = json!([])),
+        with(&|v| v["gpus"] = json!(["intel", "nvidia", "nvidia"])),
+        with(&|v| v["gpus"] = json!(["Intel", "nvidia"])),
+        with(&|v| v["gpus"] = json!(["other", "nvidia"])),
+        with(&|v| v["gpus"] = json!("nvidia")),
+        // Graphics driver ranges wider than one release.
+        with(&|v| v["gpu_driver"]["max"] = json!("32.0.15.6100")),
+        with(&|v| v["gpu_driver"]["min"] = json!("32.0.15.0")),
+        with(&|v| v["gpu_driver"]["max"] = json!("32.0.15.9999")),
+        with(&|v| v["gpu_driver"]["max"] = json!("32.0.16.6000")),
+        with(&|v| {
+            v["gpu_driver"]["min"] = json!("32.0.15");
+            v["gpu_driver"]["max"] = json!("32.0.15");
+        }),
+        with(&|v| v["gpu_driver"]["min"] = json!("32.0.15.6100")),
+        with(&|v| v["gpu_driver"]["gpu"] = json!("amd")),
+        with(&|v| v["gpu_driver"] = json!({ "gpu": "nvidia", "min": "32.0.15.6000" })),
+        // A VDD range across minor versions, or a bare major.
+        with(&|v| v["display_driver"] = json!({ "min": "25.7.0", "max": "25.8.0" })),
+        with(&|v| v["display_driver"] = json!({ "min": "25", "max": "25" })),
+        with(&|v| v["display_driver"] = json!({ "min": "25.7", "max": "25.7.99" })),
+        with(&|v| v["display_driver"] = json!({ "min": "0", "max": "4294967295" })),
+        // Windows: another build, or a build without its update number.
+        with(&|v| v["windows"] = json!({ "min": "22631.0", "max": "26100.9999" })),
+        with(&|v| v["windows"] = json!({ "min": "26100", "max": "26100" })),
+        with(&|v| v["windows"] = json!({ "min": "26100.0.0", "max": "26100.0.9" })),
+        // Reversed or malformed.
+        with(&|v| v["display_driver"] = json!({ "min": "25.7.99", "max": "25.7.0" })),
+        with(&|v| v["display_driver"] = json!({ "min": "25.7.x", "max": "25.7.9" })),
+        with(&|v| v["display_driver"] = json!({ "min": "25.1.2.3.4", "max": "25.1.2.3.5" })),
+        with(&|v| v["display_driver"] = json!({ "min": "", "max": "25.7.9" })),
+        with(&|v| v["display_driver"] = json!({ "min": 25, "max": 26 })),
         // A constraint this app doesn't know would be dropped, widening the
         // rule: the whole rule goes instead.
-        json!({ "gpus": ["intel"], "display_driver": range, "cpu": "arm64" }),
-        json!({ "gpus": ["intel"], "display_driver": { "min": "25.7", "max": "25.8", "beta": true } }),
+        with(&|v| v["cpu"] = json!("arm64")),
+        with(&|v| v["display_driver"]["beta"] = json!(true)),
         json!(null),
         json!([]),
-    ] {
+    ];
+    for bad in bad {
         assert_eq!(rule(bad.clone()), None, "{bad}");
     }
 }
 
 #[test]
 fn too_many_rules_apply_none() {
-    let one = json!({ "gpus": ["intel", "nvidia"], "display_driver": { "min": "25.7.0", "max": "25.7.99" } });
+    let one = narrow_rule();
     let config = |count: usize| {
         parse_config(Some(&json!({
             "schema": 1,

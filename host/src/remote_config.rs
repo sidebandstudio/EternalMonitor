@@ -24,10 +24,15 @@ use serde_json::Value;
 pub const SCHEMA: u64 = 1;
 /// A staged prompt reaches every install within this many days of its start.
 pub const MAX_ROLLOUT_DAYS: u64 = 14;
-/// The virtual display attach wait the manifest may set, around today's 30 s.
-pub const ATTACH_TIMEOUT_S: RangeInclusive<u64> = 20..=60;
+/// The virtual display attach wait the manifest may set: only ever longer
+/// than today's 30 s, since a shorter one would fail PCs that attach late.
+pub const ATTACH_TIMEOUT_S: RangeInclusive<u64> = 30..=60;
 /// More rules than this is a mistake: none of them apply.
-pub const MAX_RULES: usize = 16;
+pub const MAX_RULES: usize = 8;
+/// How far the last number of a rule's graphics driver range may span. An
+/// NVIDIA version's last number is its release (6094 is 560.94), so this is
+/// one release branch; for Intel and AMD it is a handful of builds.
+pub const GPU_DRIVER_SPAN: u32 = 99;
 /// The vendors a rule may name. A PC with any other graphics card matches no rule.
 pub const VENDORS: [&str; 4] = ["amd", "intel", "nvidia", "qualcomm"];
 
@@ -197,15 +202,17 @@ pub fn parse_config(value: Option<&Value>) -> Result<Config, &'static str> {
 /// A set of PCs where the second screen is known not to start: Second
 /// screen sessions there start in the mirror, as after a failure the PC
 /// remembers, and Try again overrides it for good. A rule must name the
-/// exact set of graphics vendors and at least one version range, each within
-/// one major version; anything broader, or a key this app doesn't know, and
-/// the rule is ignored, so a rule can only ever be narrower than intended.
+/// exact set of graphics vendors, one graphics driver release
+/// ([`GPU_DRIVER_SPAN`]), and an exact virtual display driver version or
+/// patch range, an exact Windows build (any update of it), or both. So no
+/// rule matches every PC of a vendor or every PC on a Windows release.
+/// Anything broader, or a key this app doesn't know, and the rule is
+/// ignored: a rule can only ever be narrower than intended.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     gpus: Vec<String>,
-    #[serde(default)]
-    gpu_driver: Option<GpuDriver>,
+    gpu_driver: GpuDriver,
     #[serde(default)]
     display_driver: Option<Range>,
     #[serde(default)]
@@ -236,16 +243,20 @@ impl Rule {
         let vendors_ok = !gpus.is_empty()
             && gpus.len() == rule.gpus.len()
             && gpus.iter().all(|gpu| VENDORS.contains(&gpu.as_str()));
-        let driver_ok = rule.gpu_driver.as_ref().is_none_or(|driver| {
-            rule.gpus.contains(&driver.gpu) && narrow(&driver.min, &driver.max)
-        });
-        let ranges_ok = [&rule.display_driver, &rule.windows]
-            .into_iter()
-            .flatten()
-            .all(|range| narrow(&range.min, &range.max));
-        let constrained =
-            rule.gpu_driver.is_some() || rule.display_driver.is_some() || rule.windows.is_some();
-        (vendors_ok && driver_ok && ranges_ok && constrained).then_some(Rule { gpus, ..rule })
+        let driver = &rule.gpu_driver;
+        let driver_ok = rule.gpus.contains(&driver.gpu)
+            && narrow(&driver.min, &driver.max, 4..=4, GPU_DRIVER_SPAN);
+        let display_ok = rule
+            .display_driver
+            .as_ref()
+            .is_none_or(|r| narrow(&r.min, &r.max, 2..=4, u32::MAX));
+        let windows_ok = rule
+            .windows
+            .as_ref()
+            .is_none_or(|r| narrow(&r.min, &r.max, 2..=2, u32::MAX));
+        let constrained = rule.display_driver.is_some() || rule.windows.is_some();
+        (vendors_ok && driver_ok && display_ok && windows_ok && constrained)
+            .then_some(Rule { gpus, ..rule })
     }
 
     /// `graphics` holds each card's name and driver version, as the second
@@ -258,12 +269,11 @@ impl Rule {
         if vendors != self.gpus {
             return false;
         }
-        let driver_ok = self.gpu_driver.as_ref().is_none_or(|range| {
-            cards
-                .iter()
-                .filter(|(vendor, _)| *vendor == range.gpu)
-                .all(|(_, version)| within(version, &range.min, &range.max))
-        });
+        let range = &self.gpu_driver;
+        let driver_ok = cards
+            .iter()
+            .filter(|(vendor, _)| *vendor == range.gpu)
+            .all(|(_, version)| within(version, &range.min, &range.max));
         driver_ok
             && self
                 .display_driver
@@ -301,22 +311,40 @@ fn card(graphics: &str) -> Option<(&'static str, &str)> {
     Some((vendor, driver))
 }
 
-/// A dotted version of one to four numbers.
-fn version(text: &str) -> Option<[u32; 4]> {
-    let mut parts = [0u32; 4];
-    for (index, piece) in text.split('.').enumerate() {
-        if index == 4 || piece.is_empty() || !piece.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        parts[index] = piece.parse().ok()?;
-    }
-    Some(parts)
+/// The numbers of a dotted version of one to four numbers.
+fn numbers(text: &str) -> Option<Vec<u32>> {
+    let parts = text
+        .split('.')
+        .map(|piece| {
+            (!piece.is_empty() && piece.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| piece.parse().ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<u32>>>()?;
+    (parts.len() <= 4).then_some(parts)
 }
 
-/// A range a rule may use: both ends valid, in order, and in one major
-/// version, so no range spans every driver or Windows build.
-fn narrow(min: &str, max: &str) -> bool {
-    matches!((version(min), version(max)), (Some(lo), Some(hi)) if lo <= hi && lo[0] == hi[0])
+/// For comparing, padded with zeros.
+fn version(text: &str) -> Option<[u32; 4]> {
+    let mut padded = [0u32; 4];
+    for (slot, number) in padded.iter_mut().zip(numbers(text)?) {
+        *slot = number;
+    }
+    Some(padded)
+}
+
+/// A range a rule may use: both ends `parts` numbers long and equal but for
+/// the last number, which rises by at most `span`.
+fn narrow(min: &str, max: &str, parts: RangeInclusive<usize>, span: u32) -> bool {
+    let (Some(lo), Some(hi)) = (numbers(min), numbers(max)) else {
+        return false;
+    };
+    let last = lo.len() - 1;
+    lo.len() == hi.len()
+        && parts.contains(&lo.len())
+        && lo[..last] == hi[..last]
+        && lo[last] <= hi[last]
+        && hi[last] - lo[last] <= span
 }
 
 fn within(value: &str, min: &str, max: &str) -> bool {

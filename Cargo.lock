@@ -1197,6 +1197,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-general-category",
  "ureq",
  "windows 0.58.0",
  "winresource",

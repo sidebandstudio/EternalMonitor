@@ -155,13 +155,26 @@ struct ManifestWindows {
 
 const MAX_NOTE_CHARS: usize = 200;
 
+/// Control, format (U+200B and the like) and line or paragraph separator
+/// characters: invisible, or a break the popup's one line can't show.
+/// check-versions.sh and the iPad refuse the same categories.
+fn hidden(c: char) -> bool {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+    matches!(
+        get_general_category(c),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+    )
+}
+
 /// A note the popup can show: one trimmed line, not empty and not too long.
 /// Anything else is dropped rather than failing the check.
 fn short_note(note: Option<&str>) -> Option<String> {
     let note = note?.trim();
-    let fits = !note.is_empty()
-        && note.chars().count() <= MAX_NOTE_CHARS
-        && !note.chars().any(char::is_control);
+    let fits =
+        !note.is_empty() && note.chars().count() <= MAX_NOTE_CHARS && !note.chars().any(hidden);
     fits.then(|| note.to_string())
 }
 

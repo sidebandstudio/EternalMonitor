@@ -259,7 +259,7 @@ pub(crate) fn resolve_target(
 }
 
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
-/// via `ETERNAL_VDD_TIMEOUT_SECS`, or within 20–60 s by the update manifest. The iPad mirrors
+/// via `ETERNAL_VDD_TIMEOUT_SECS`, or within 30–60 s by the update manifest. The iPad mirrors
 /// meanwhile, so a longer wait costs the user nothing; it was 10 s while the iPad gave up 10 s
 /// after connecting, and on some PCs the display attaches only after that.
 #[cfg(any(windows, test))]

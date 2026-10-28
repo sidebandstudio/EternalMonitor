@@ -131,6 +131,15 @@ fn manifest_reads_the_optional_recommended_flag_and_note() {
         serde_json::json!({ "note": "" }),
         serde_json::json!({ "note": "   " }),
         serde_json::json!({ "note": "Two\nlines" }),
+        // Separators and invisible format characters, as the iPad and
+        // check-versions.sh refuse them.
+        serde_json::json!({ "note": "Two\u{2028}lines" }),
+        serde_json::json!({ "note": "Two\u{2029}paragraphs" }),
+        serde_json::json!({ "note": "Zero\u{200B}width" }),
+        serde_json::json!({ "note": "Reversed \u{202E}text" }),
+        serde_json::json!({ "note": "Soft\u{00AD}hyphen" }),
+        serde_json::json!({ "note": "\u{FEFF}Fixes audio." }),
+        serde_json::json!({ "note": "Bell\u{7}" }),
         serde_json::json!({ "note": "x".repeat(201) }),
         serde_json::json!({ "note": 7, "recommended": "yes" }),
         serde_json::json!({ "note": null, "recommended": null }),
