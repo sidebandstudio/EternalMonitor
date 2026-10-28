@@ -532,14 +532,15 @@ fn rising_within_epochs(frames: &[(u32, u64)]) -> bool {
 fn seq_ranges(ranges: &str) -> Vec<u32> {
     ranges
         .split(',')
-        .flat_map(|range| {
+        .filter_map(|range| {
             let mut ends = range.splitn(2, '-').map(|end| end.parse::<u32>());
             match (ends.next(), ends.next()) {
-                (Some(Ok(start)), None) => start..=start,
-                (Some(Ok(start)), Some(Ok(end))) => start..=end,
-                _ => 1..=0,
+                (Some(Ok(start)), None) => Some(start..=start),
+                (Some(Ok(start)), Some(Ok(end))) => Some(start..=end),
+                _ => None,
             }
         })
+        .flatten()
         .collect()
 }
 
