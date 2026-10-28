@@ -151,6 +151,7 @@ struct Store {
 struct Io {
     remove: fn(&Path) -> std::io::Result<()>,
     replace: fn(&Path, &[u8]) -> std::io::Result<()>,
+    overwrite: fn(&Path, &[u8]) -> std::io::Result<()>,
 }
 
 #[cfg(any(windows, test))]
@@ -158,18 +159,26 @@ impl Io {
     const FILES: Io = Io {
         remove: remove_file,
         replace: replace_file,
+        overwrite: overwrite_file,
     };
 }
+
+/// How often a forgotten failure that could not be cleared from the file is
+/// tried again, besides at each success and Try again.
+const CLEAR_RETRY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 pub(crate) struct Memory {
     store: Option<Store>,
     failed: Option<Failed>,
-    /// A forgotten failure is still in the file: neither removing nor
-    /// replacing it worked. This app run treats it as cleared and tries again
-    /// at the next success; the next app run may hold until the wait ends or
-    /// the user clicks Try again.
-    uncleared: bool,
+    /// A forgotten failure is still in the file, and when clearing it was
+    /// last tried: removing, replacing and overwriting it all failed. This app
+    /// run treats it as cleared and tries again at the next success or Try
+    /// again, or a minute later; the next app run may hold until the wait
+    /// ends or the user clicks Try again.
+    uncleared: Option<Instant>,
+    /// Clearing failed and was logged once in this app run.
+    clear_failure_logged: bool,
 }
 
 impl Memory {
@@ -210,7 +219,8 @@ impl Memory {
                 io: Io::FILES,
             }),
             failed,
-            uncleared: false,
+            uncleared: None,
+            clear_failure_logged: false,
         };
         if let Some(failed) = memory.failed {
             tracing::info!(
@@ -260,13 +270,14 @@ impl Memory {
         let failed_at = self.wall(now)?;
         let store = self.store.as_ref()?;
         let failures = self.failed.map_or(0, |f| f.failures).saturating_add(1);
-        if store.write(Some(Record {
+        match store.write(Some(Record {
             fingerprint: store.fingerprint.clone(),
             reason: reason.to_string(),
             failures,
             failed_at,
         })) {
-            self.uncleared = false;
+            Ok(()) => self.uncleared = None,
+            Err(error) => warn!(%error, "Could not save the second screen record"),
         }
         self.failed = Some(Failed {
             reason,
@@ -278,22 +289,33 @@ impl Memory {
 
     /// Forget the saved failure. Whether there was one. A file that can't
     /// be removed (another program holds it) is replaced by one that says
-    /// there is no failure, so the next app run doesn't hold either. When
-    /// neither works, see [`Memory::uncleared`].
-    pub(crate) fn forget(&mut self) -> bool {
+    /// there is no failure, or overwritten in place with that, so the next
+    /// app run doesn't hold either. When none works, see
+    /// [`Memory::uncleared`]. `now` paces those retries; `success` (a picture
+    /// or Try again) retries at once.
+    pub(crate) fn forget(&mut self, now: Instant, success: bool) -> bool {
         let forgot = self.failed.take().is_some();
         let Some(store) = &self.store else {
             return forgot;
         };
-        if forgot || self.uncleared {
-            let cleared = store.remove() || store.write(None);
-            if !cleared && !self.uncleared {
-                warn!(
-                    "Could not clear the second screen record — this app run treats it as \
-                     cleared; the next may wait until it tries again or Try again is clicked"
-                );
+        let retry = self
+            .uncleared
+            .is_some_and(|tried| success || now.saturating_duration_since(tried) >= CLEAR_RETRY);
+        if forgot || retry {
+            match store.clear() {
+                Ok(()) => self.uncleared = None,
+                Err(error) => {
+                    if !std::mem::replace(&mut self.clear_failure_logged, true) {
+                        warn!(
+                            %error,
+                            "Could not clear the second screen record — this app run treats it \
+                             as cleared; the next may wait until it tries again or Try again is \
+                             clicked"
+                        );
+                    }
+                    self.uncleared = Some(now);
+                }
             }
-            self.uncleared = !cleared;
         }
         forgot
     }
@@ -301,34 +323,32 @@ impl Memory {
 
 impl Store {
     /// Replace the file at once, as the settings file is: a crash leaves the
-    /// old record or the new one. Whether it worked.
-    fn write(&self, failure: Option<Record>) -> bool {
-        let file = File {
-            format: FORMAT,
-            failure,
-        };
-        let saved = self
-            .path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| serde_json::to_vec_pretty(&file).map_err(std::io::Error::other))
-            .and_then(|data| (self.io.replace)(&self.path, &data));
-        if let Err(error) = &saved {
-            warn!(%error, "Could not save the second screen record");
-        }
-        saved.is_ok()
+    /// old record or the new one.
+    fn write(&self, failure: Option<Record>) -> std::io::Result<()> {
+        self.path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+        (self.io.replace)(&self.path, &encode(failure)?)
     }
 
-    /// Whether the file is gone.
-    fn remove(&self) -> bool {
+    /// Leave no failure in the file: remove it; else replace it with one that
+    /// says there is none; else, when a handle another program holds allows
+    /// writing but not deleting, overwrite it in place. Torn by a crash, that
+    /// reads as unusable, which also means no failure. The last error.
+    fn clear(&self) -> std::io::Result<()> {
         match (self.io.remove)(&self.path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                warn!(%error, "Could not remove the second screen record");
-                false
-            }
-            _ => true,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
+            _ => return Ok(()),
         }
+        let empty = encode(None)?;
+        (self.io.replace)(&self.path, &empty).or_else(|_| (self.io.overwrite)(&self.path, &empty))
     }
+}
+
+fn encode(failure: Option<Record>) -> std::io::Result<Vec<u8>> {
+    let file = File {
+        format: FORMAT,
+        failure,
+    };
+    serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -373,6 +393,18 @@ fn remove_file(path: &Path) -> std::io::Result<()> {
 fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path))
+}
+
+/// The existing file, truncated and written where it is.
+#[cfg(any(windows, test))]
+fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(data)?;
+    file.flush()
 }
 
 #[cfg(test)]
@@ -844,6 +876,8 @@ mod tests {
 
     /// Review round 2: a display that keeps dropping out on the normal
     /// desktop is the PC's failure, whether or not capture got it back last.
+    /// Round 3: every recovery still gives it the full window first, and a
+    /// fourth loss ends the proof at once.
     #[test]
     fn a_desktop_lost_again_and_again_is_remembered() {
         use super::super::{note_interruption, note_recovery};
@@ -856,8 +890,8 @@ mod tests {
                     note_recovery(&shared, 1, start + secs(second));
                 }
             }
-            // The third recovery no longer restarts the window.
-            let deadline = start + secs(2) + PROVE_TIMEOUT;
+            let last_recovery = start + secs(if recovers_last { 3 } else { 2 });
+            let deadline = last_recovery + PROVE_TIMEOUT;
             assert_eq!(next_step(&shared, deadline - secs(1)), Step::Nothing);
             assert_eq!(
                 next_step(&shared, deadline),
@@ -866,6 +900,42 @@ mod tests {
             assert_eq!(saved(&path)["failure"]["failures"], 1, "{recovers_last}");
             std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
+        let path = temp_file("fourth-loss");
+        let (shared, start) = proving_second_screen(&path);
+        for second in 1..=4 {
+            note_interruption(&shared, 1);
+            note_recovery(&shared, 1, start + secs(second));
+        }
+        assert_eq!(
+            next_step(&shared, start + secs(4)),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Review round 3: a loss behind the lock screen counted toward the
+    /// three, so two more after unlocking saved a working display.
+    #[test]
+    fn losses_behind_a_secure_screen_do_not_count() {
+        use super::super::{note_interruption, note_interruption_while, note_recovery};
+        let path = temp_file("secure-loss");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption_while(&shared, 1, true);
+        note_recovery(&shared, 1, start + secs(30));
+        for second in [31, 32] {
+            note_interruption(&shared, 1);
+            note_recovery(&shared, 1, start + secs(second));
+        }
+        let unlocked = start + secs(32);
+        assert_eq!(
+            next_step(&shared, unlocked + PROVE_TIMEOUT - secs(1)),
+            Step::Nothing
+        );
+        note_image(&shared, 1);
+        assert!(!super::super::proving(&shared));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert!(!path.exists(), "nothing saved");
     }
 
     /// Review round 2: idle time said "the display may be off", but an iPad
@@ -892,29 +962,49 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    fn locked(_: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("sharing violation"))
+    }
+
+    fn locked_write(_: &Path, _: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("sharing violation"))
+    }
+
     /// Review round 2: a file another program holds without FILE_SHARE_DELETE
     /// can be neither removed nor replaced. This app run then acts as if it
-    /// were cleared, and clears it at the next success.
+    /// were cleared, and clears it at the next success. Round 3: nor
+    /// overwritten, here; Mirror mode retried that every transport tick and
+    /// warned each time.
     #[test]
-    fn a_record_that_cant_be_cleared_is_cleared_at_the_next_success() {
-        fn locked(_: &Path) -> std::io::Result<()> {
-            Err(std::io::Error::other("sharing violation"))
-        }
-        fn locked_replace(_: &Path, _: &[u8]) -> std::io::Result<()> {
+    fn a_record_that_cant_be_cleared_is_retried_now_and_then() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static REMOVES: AtomicU32 = AtomicU32::new(0);
+        fn counted(_: &Path) -> std::io::Result<()> {
+            REMOVES.fetch_add(1, Ordering::Relaxed);
             Err(std::io::Error::other("sharing violation"))
         }
         let path = temp_file("locked");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("attach_timeout", start).unwrap();
         memory.store.as_mut().unwrap().io = Io {
-            remove: locked,
-            replace: locked_replace,
+            remove: counted,
+            replace: locked_write,
+            overwrite: locked_write,
         };
-        assert!(memory.forget());
-        assert!(!memory.saved() && memory.uncleared);
+        assert!(memory.forget(start, false));
+        assert!(!memory.saved() && memory.uncleared.is_some());
+        assert!(memory.clear_failure_logged);
         assert_eq!(memory.hold(start), None, "this app run acts as cleared");
-        assert!(!memory.forget(), "still locked: nothing new to forget");
-        assert!(memory.uncleared);
+        // Mirror mode's ticks for the next minute don't touch the file.
+        for tick in 1..1200 {
+            assert!(!memory.forget(start + Duration::from_millis(50 * tick), false));
+        }
+        assert_eq!(REMOVES.load(Ordering::Relaxed), 1);
+        assert!(!memory.forget(start + CLEAR_RETRY, false));
+        assert_eq!(REMOVES.load(Ordering::Relaxed), 2, "once a minute");
+        assert!(!memory.forget(start + CLEAR_RETRY, true));
+        assert_eq!(REMOVES.load(Ordering::Relaxed), 3, "and at each success");
+        assert!(memory.uncleared.is_some());
         // The residual: an app run starting now would still hold.
         let (next, at) = app_run(&path, secs(60));
         assert!(next.hold(at).is_some());
@@ -922,11 +1012,36 @@ mod tests {
         memory.store.as_mut().unwrap().io = Io {
             remove: locked,
             replace: Io::FILES.replace,
+            overwrite: locked_write,
         };
-        assert!(!memory.forget());
-        assert!(!memory.uncleared);
+        assert!(!memory.forget(start + CLEAR_RETRY, true));
+        assert!(memory.uncleared.is_none());
         assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
         let (next, at) = app_run(&path, secs(60));
+        assert!(!next.saved() && next.hold(at).is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Review round 3: a handle that allows writing but not deleting defeats
+    /// both the removal and the rename; the file is then written in place.
+    #[test]
+    fn a_record_that_cant_be_removed_or_renamed_is_overwritten_in_place() {
+        let path = temp_file("in-place");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("no_frames", start).unwrap();
+        memory.store.as_mut().unwrap().io = Io {
+            remove: locked,
+            replace: locked_write,
+            overwrite: Io::FILES.overwrite,
+        };
+        assert!(memory.forget(start, true));
+        assert!(memory.uncleared.is_none() && !memory.clear_failure_logged);
+        assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
+        let (next, at) = app_run(&path, secs(60));
+        assert!(!next.saved() && next.hold(at).is_none());
+        // Torn halfway, it reads as unusable: no failure either.
+        std::fs::write(&path, &std::fs::read(&path).unwrap()[..10]).unwrap();
+        let (next, at) = app_run(&path, secs(120));
         assert!(!next.saved() && next.hold(at).is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -938,7 +1053,7 @@ mod tests {
         let path = temp_file("cleared");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("no_frames", start).unwrap();
-        assert!(memory.store.as_ref().unwrap().write(None));
+        assert!(memory.store.as_ref().unwrap().write(None).is_ok());
         let (memory, start) = app_run(&path, Duration::from_secs(60));
         assert_eq!(memory.hold(start), None);
         assert!(!memory.saved());
@@ -983,6 +1098,6 @@ mod tests {
         let now = Instant::now();
         assert_eq!(memory.note_failure("attach_timeout", now), None);
         assert_eq!(memory.hold(now), None);
-        assert!(!memory.saved() && !memory.forget());
+        assert!(!memory.saved() && !memory.forget(now, true));
     }
 }

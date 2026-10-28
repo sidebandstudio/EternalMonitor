@@ -115,16 +115,18 @@ struct Proving {
     /// change, a GPU reset), and capture hasn't got it back: a failure now is
     /// not the PC's.
     interrupted: bool,
-    /// How often Windows lost the desktop during this proof.
+    /// How often Windows lost the desktop during this proof while it was
+    /// the user's, with the displays on.
     losses: u32,
     /// Since the last loss, getting the display back failed with an error
     /// that does not pass, such as DXGI_ERROR_UNSUPPORTED.
     persistent: bool,
 }
 
-/// A second screen that loses its desktop this often in one proof fails as
-/// the PC's, unless a secure screen is up: a display that keeps dropping out
-/// on its own is the hybrid-laptop failure, not a passing state.
+/// A second screen that loses the user's desktop this often in one proof
+/// fails as the PC's, and once more ends the proof at once: a display that
+/// keeps dropping out on its own is the hybrid-laptop failure, not a passing
+/// state. Losses behind a secure screen or with the displays off don't count.
 const REPEATED_LOSSES: u32 = 3;
 
 #[derive(Debug, Default)]
@@ -155,7 +157,7 @@ impl State {
         now: Instant,
     ) -> Step {
         if !selected {
-            if self.memory.forget() {
+            if self.memory.forget(now, false) {
                 tracing::info!(
                     "Another mode was chosen — the second screen is tried afresh when it is \
                      chosen again"
@@ -398,7 +400,7 @@ pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str>
 pub(crate) fn retry(shared: &SharedControl) {
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
-    if state.memory.forget() {
+    if state.memory.forget(Instant::now(), true) {
         tracing::info!("Try again — the second screen is tried afresh at the next connection");
     }
     let stale = *status == VddStatus::Attaching && !state.attaching;
@@ -461,7 +463,7 @@ pub fn note_image(shared: &SharedControl, generation: u64) {
             after_ms = proving.since.elapsed().as_millis() as u64,
             "Second screen captured its first image — streaming it"
         );
-        if state.memory.forget() {
+        if state.memory.forget(Instant::now(), true) {
             tracing::info!("The second screen works on this PC again — forgetting its failure");
         }
     }
@@ -484,25 +486,31 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
 /// [`super::recovery::passing_error`]). A second screen that fails its proof
 /// before capture gets it back is not remembered beyond this app run.
 pub fn note_interruption(shared: &SharedControl, generation: u64) {
+    note_interruption_while(shared, generation, desktop_away());
+}
+
+/// [`note_interruption`], `away` from the user's desktop or not.
+fn note_interruption_while(shared: &SharedControl, generation: u64, away: bool) {
     if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
         if proving.generation == generation {
             proving.interrupted = true;
-            proving.losses += 1;
+            if !away {
+                proving.losses += 1;
+                proving.capture_failed |= proving.losses > REPEATED_LOSSES;
+            }
         }
     }
 }
 
 /// Capture `generation` got the desktop back after an interruption: the
-/// proof starts over from `now`, unless it was lost [`REPEATED_LOSSES`]
-/// times.
+/// proof starts over from `now`, so nothing is decided before the second
+/// screen has had its full time to show a picture.
 pub fn note_recovery(shared: &SharedControl, generation: u64, now: Instant) {
     if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
         if proving.generation == generation && proving.interrupted {
             proving.interrupted = false;
             proving.persistent = false;
-            if proving.losses < REPEATED_LOSSES {
-                proving.since = now;
-            }
+            proving.since = now;
         }
     }
 }
