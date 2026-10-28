@@ -154,10 +154,11 @@ final class USBLinkFailureTests: XCTestCase {
     private let fast = ConnectionManager.Timing(connectTimeoutSeconds: 0.4, reconnectGraceSeconds: 0.1,
         reconnectBackoffSeconds: { _ in 0.05 })
 
-    /// Waits for the reconnect cycle to start and then to run out.
-    private func waitForFallbackToGiveUp(_ manager: ConnectionManager) async throws {
+    /// Waits for the reconnect cycle to start and then to run out, polling
+    /// every 10 ms for at most `polls` times.
+    private func waitForFallbackToGiveUp(_ manager: ConnectionManager, polls: Int = 1000) async throws {
         var started = false
-        for _ in 0..<1000 {
+        for _ in 0..<polls {
             if manager.reconnectAttempt > 0 { started = true }
             if started && manager.reconnectAttempt == 0 { return }
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -201,11 +202,18 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         UserDefaults.standard.set("eternalmonitor-test.invalid", forKey: "lastHost")
         UserDefaults.standard.set(9876, forKey: "lastPort")
-        let (manager, link) = try await connectOverCable(timing: fast)
+        // An attempt ends at its timeout and reports the last error it saw,
+        // here the lookup's failure. With `fast`'s 0.4 s timeout a slow DNS
+        // answer on CI came too late, every attempt timed out without it,
+        // and the cable advice rightly stayed. 5 s leaves the answer room;
+        // the wait for the cycle to finish is only a backstop.
+        var dnsBound = fast
+        dnsBound.connectTimeoutSeconds = 5
+        let (manager, link) = try await connectOverCable(timing: dnsBound)
         defer { link.stop(); manager.cancel() }
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
-        try await waitForFallbackToGiveUp(manager)
+        try await waitForFallbackToGiveUp(manager, polls: 30_000)
         XCTAssertEqual(manager.reconnectAttempt, 0)
         XCTAssertEqual(manager.problem, .badAddress("eternalmonitor-test.invalid"))
     }
