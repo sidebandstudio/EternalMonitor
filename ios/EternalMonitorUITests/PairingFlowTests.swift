@@ -27,7 +27,10 @@ final class PairingFlowTests: XCTestCase {
         input.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 6) + code)
         app.buttons["pairing.submit"].tap()
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
-        XCTAssertFalse(input.exists)
+        // The stream can start while the code sheet is still closing; wait
+        // for the sheet to go. The timeout is only a backstop.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: input)
+        waitForExpectations(timeout: 30)
         capture("pairing-connected", app: app)
         disconnect(app)
         XCTAssertTrue(app.images["recent.paired"].firstMatch.exists)
