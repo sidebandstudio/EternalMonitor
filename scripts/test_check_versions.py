@@ -17,6 +17,7 @@ FILES = [
     "docs/download.html",
     "docs/latest.json",
     "docs/script.js",
+    "scripts/manifest_fields.py",
 ]
 OLD_SCRIPT_FETCH = (
     "  fetch('https://api.github.com/repos/sidebandstudio/EternalMonitor/releases/tags/v0.3.1', {\n"

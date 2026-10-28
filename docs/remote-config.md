@@ -22,7 +22,10 @@ logged.
 Apps from before these fields ignore them: both parsers skip unknown keys
 (tested against a copy of the 0.3.3 parsers and
 `proto/testdata/latest_remote_config.json`). `scripts/check-versions.sh`
-refuses a manifest with a bad value, so one can't be published. The
+and `scripts/latest_json.py` (`--rollout-start`/`--rollout-days`,
+`--windows-config`, `--ipad-config`) check every field with the same code,
+`scripts/manifest_fields.py`, so a manifest with a bad value can't be
+published. The
 top-level `schema` stays 1; a newer one would stop old apps' update checks.
 
 ## Fields
