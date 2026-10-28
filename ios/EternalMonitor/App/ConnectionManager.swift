@@ -209,7 +209,7 @@ final class ConnectionManager: ObservableObject {
             return
         }
         guard usbListener == nil else { return }
-        let listener = USBListener()
+        let listener = USBListener(port: E2E.usbListenPort)
         usbListener = listener
         listener.onState = { [weak self, weak listener] state in
             Task { @MainActor in

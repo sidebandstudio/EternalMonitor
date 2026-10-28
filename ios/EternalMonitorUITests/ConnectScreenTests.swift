@@ -26,6 +26,10 @@ final class ConnectScreenTests: XCTestCase {
     func testSettingsOpenAndDismiss() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
+        // Any free port for the USB listener: on a Mac running another
+        // simulator's app, 9877 can be taken, and the card then says the
+        // cable can't be used instead of asking for one.
+        app.launchEnvironment["EM_USB_PORT"] = "0"
         app.launch()
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
