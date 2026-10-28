@@ -672,11 +672,22 @@ fn audio_stream_end_to_end() {
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buffer = [0; 2048];
-        let assert_video_without_audio = |receiver: &mut FakeReceiver, duration: Duration| {
-            let end = Instant::now() + duration;
+        // No audio for `duration` of a stream that visibly runs, and until
+        // `done`. A loaded machine can take longer than `duration` to send
+        // 30 video packets, so the window lasts until it has.
+        let assert_video_without_audio = |receiver: &mut FakeReceiver,
+                                          duration: Duration,
+                                          done: &dyn Fn() -> bool| {
+            let started = Instant::now();
             let mut buffer = [0; 2048];
             let mut video = 0;
-            while Instant::now() < end {
+            while started.elapsed() < duration || video < 30 || !done() {
+                // Only a backstop for a stalled host.
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "video stopped while audio was off: {video} packets, done={}",
+                    done()
+                );
                 receiver.maybe_report(0, 0);
                 if let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) {
                     match classify(&buffer[..len]) {
@@ -688,12 +699,12 @@ fn audio_stream_end_to_end() {
                     }
                 }
             }
-            assert!(video >= 30, "video stopped while audio was off");
         };
+        let always = || true;
 
         let mut legacy = FakeReceiver::connect(listen_port);
         assert_ne!(legacy.host_caps & HOSTCAP_AUDIO, 0);
-        assert_video_without_audio(&mut legacy, Duration::from_millis(600));
+        assert_video_without_audio(&mut legacy, Duration::from_millis(600), &always);
         legacy.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
         drop(legacy);
         std::thread::sleep(Duration::from_millis(100));
@@ -701,7 +712,7 @@ fn audio_stream_end_to_end() {
         shared.audio_enabled.store(false, Ordering::SeqCst);
         let mut receiver =
             FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_WANTS_AUDIO);
-        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600), &always);
         shared.audio_enabled.store(true, Ordering::SeqCst);
         let codec = ffmpeg_next::decoder::find_by_name("opus").unwrap();
         let mut context = ffmpeg_next::codec::Context::new_with_codec(codec);
@@ -713,12 +724,16 @@ fn audio_stream_end_to_end() {
         let mut previous: Option<AudioHeader> = None;
         let mut audio_packets = 0;
         let mut quiet_packets = 0;
+        let mut missing = 0;
         let mut pcm = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while audio_packets < 130 {
+        // A backstop for a stalled host. 130 packets take 2.6 s, and hold
+        // one 100 ms silence; when the host dropped some of it, the next
+        // comes two seconds later.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while audio_packets < 130 || quiet_packets < 5 {
             assert!(
                 Instant::now() < deadline,
-                "only {audio_packets} audio packets arrived"
+                "only {audio_packets} audio packets arrived, {quiet_packets} of them quiet"
             );
             receiver.maybe_report(0, 0);
             let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
@@ -731,7 +746,30 @@ fn audio_stream_end_to_end() {
             let (header, payload) = AudioHeader::decode(&buffer[..len]).unwrap();
             assert_eq!(header.session_id, receiver.session_id);
             if let Some(previous) = previous {
-                assert_eq!(header.audio_seq, previous.audio_seq.wrapping_add(1));
+                // A loaded host drops packets that miss their send deadline
+                // or find the queue full. It counts each drop before a later
+                // packet goes out, and marks that packet as a discontinuity.
+                // Any other missing packet is lost numbering.
+                let skipped = header
+                    .audio_seq
+                    .wrapping_sub(previous.audio_seq)
+                    .wrapping_sub(1);
+                if skipped > 0 {
+                    missing += u64::from(skipped);
+                    let dropped = eternal_host::stats::PIPELINE_STATS.lock().audio.dropped;
+                    assert!(
+                        missing <= dropped,
+                        "audio skipped to {} after {}: {missing} packets missing, {dropped} dropped",
+                        header.audio_seq,
+                        previous.audio_seq
+                    );
+                    assert!(
+                        header.discontinuity,
+                        "audio skipped to {} after {} without a DISCONTINUITY",
+                        header.audio_seq,
+                        previous.audio_seq
+                    );
+                }
                 assert!(header.capture_ts_us > previous.capture_ts_us);
                 assert_eq!(header.stream_epoch, previous.stream_epoch);
             } else {
@@ -769,27 +807,51 @@ fn audio_stream_end_to_end() {
             "100 ms silence did not produce small Opus packets"
         );
         eprintln!(
-            "Audio E2E decoded={audio_packets}, tone={tone_db:.2} dBFS, quiet={quiet_packets}"
+            "Audio E2E decoded={audio_packets}, tone={tone_db:.2} dBFS, quiet={quiet_packets}, missing={missing}"
         );
 
         shared.audio_enabled.store(false, Ordering::SeqCst);
-        let drain_until = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < drain_until {
-            let _ = receiver.socket.recv_from(&mut buffer);
+        // Audio the host sent before it saw the switch may still be queued
+        // here. The host checks the switch as it sends, from the loop that
+        // also sends video, so everything after a frame captured since then
+        // was sent with audio off. A fixed drain time was not enough on a
+        // loaded machine.
+        let off_us = eternal_host::clock::host_now_us();
+        let drain_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < drain_deadline,
+                "no video captured after audio was turned off"
+            );
+            receiver.maybe_report(0, 0);
+            let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if !matches!(classify(&buffer[..len]), Classified::Media { .. }) {
+                continue;
+            }
+            let (header, _) = MediaHeader::decode(&buffer[..len]).unwrap();
+            if header.capture_ts_us > off_us {
+                break;
+            }
         }
-        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600), &always);
 
         // Force an actual source-open error. It must disable audio for this
         // session, without opening a Windows endpoint or restarting video.
         let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
         std::env::set_var("ETERNAL_AUDIO", "invalid-test-source");
         shared.audio_enabled.store(true, Ordering::SeqCst);
-        assert_video_without_audio(&mut receiver, Duration::from_millis(600));
-        assert!(eternal_host::stats::PIPELINE_STATS
-            .lock()
-            .audio
-            .error
-            .is_some());
+        // Until the audio stage has tried the source, however long a loaded
+        // machine takes to get there.
+        let failed = || {
+            eternal_host::stats::PIPELINE_STATS
+                .lock()
+                .audio
+                .error
+                .is_some()
+        };
+        assert_video_without_audio(&mut receiver, Duration::from_millis(600), &failed);
         assert_eq!(
             eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst),
             generation
@@ -2104,8 +2166,10 @@ fn pairing_flow_end_to_end() {
             auth_token: [0; 16],
             pairing_code: 0,
         };
+        // The deadline is only a backstop: the first exchange also waits for
+        // the host to start, which a loaded machine can make slow.
         let exchange = |hello: &Hello2| -> HelloAck {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut last_send = Instant::now() - Duration::from_secs(1);
             let mut buffer = [0; 2048];
             loop {
@@ -2162,7 +2226,7 @@ fn pairing_flow_end_to_end() {
         let mut decoder = H264TestDecoder::new();
         let mut frames = Vec::new();
         let mut buffer = [0; 2048];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while frames.len() < 20 {
             assert!(Instant::now() < deadline, "paired stream did not decode");
             receiver.maybe_report(0, frames.len() as u32);
@@ -2186,9 +2250,13 @@ fn pairing_flow_end_to_end() {
         }
         assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Reports keep the session alive, so only the BYE can end it: without
+        // them it would expire after 3 s of silence anyway, and the deadline
+        // is only a backstop.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_connected() {
             assert!(Instant::now() < deadline, "BYE did not end pairing session");
+            receiver.maybe_report(0, frames.len() as u32);
             std::thread::sleep(Duration::from_millis(5));
         }
         hello.client_nonce += 1;
@@ -2197,17 +2265,29 @@ fn pairing_flow_end_to_end() {
         let reconnected = exchange(&hello);
         assert_eq!(reconnected.status, HelloStatus::Ok);
         assert_ne!(reconnected.session_id, paired.session_id);
+        let mut receiver = FakeReceiver {
+            session_id: reconnected.session_id,
+            msg_seq: 1,
+            last_report: Instant::now() - Duration::from_secs(1),
+            host_caps: reconnected.host_caps,
+            advertised_fps: reconnected.stream_config.fps,
+            ..receiver
+        };
+        receiver.maybe_report(0, 0);
         shared.pairing.lock().regenerate_token().unwrap();
         hello.client_nonce += 1;
         let revoked = exchange(&hello);
         assert_eq!(revoked.status, HelloStatus::Unauthorized);
         assert_eq!(revoked.auth_token, [0; 16]);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // As after the BYE: reports keep the session alive, so only the
+        // token reset can end it.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_connected() {
             assert!(
                 Instant::now() < deadline,
                 "token reset did not revoke session"
             );
+            receiver.maybe_report(0, 0);
             std::thread::sleep(Duration::from_millis(5));
         }
     }));
