@@ -1625,6 +1625,47 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// #108 round 5 with a rule: the rule's failure, tried after its wait,
+    /// fails for a reason that passes. This app run mirrors until Try again,
+    /// as after any such failure, the rule isn't saved again, and Try again
+    /// exempts the PC.
+    #[test]
+    fn a_rule_failure_excused_after_its_wait_mirrors_until_try_again() {
+        use super::super::{note_capture_error, note_interruption};
+        let path = temp_file("rule-excused");
+        let (mut memory, start) = ruled_run(&path, Duration::ZERO, true);
+        assert!(memory.hold_for_rule(start).is_some());
+        let (memory, start) = ruled_run(&path, hours(2), true);
+        assert!(memory.saved() && memory.hold(start).is_none());
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 1, start);
+        note_interruption(&shared, 1);
+        note_capture_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + secs(1)),
+            Step::Fallback("duplication_failed")
+        );
+        for minute in 1..=90 {
+            let now = start + Duration::from_secs(60 * minute);
+            reconnect(&shared, now);
+            assert_eq!(next_step(&shared, now), Step::Nothing, "minute {minute}");
+        }
+        assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule");
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, start + hours(2)), Step::Attach);
+        assert!(!path.exists() && rule_file(&path).exists());
+        let (memory, start) = ruled_run(&path, hours(3), true);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     fn locked_state(path: &Path, data: &[u8]) -> std::io::Result<()> {
         if path.file_name() == Some(std::ffi::OsStr::new(FILE_NAME)) {
             Err(std::io::Error::other("sharing violation"))
