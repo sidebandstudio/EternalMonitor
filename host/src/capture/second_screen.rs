@@ -123,11 +123,12 @@ struct Proving {
     persistent: bool,
 }
 
-/// A second screen that loses the user's desktop this often in one proof
-/// fails as the PC's, and once more ends the proof at once: a display that
-/// keeps dropping out on its own is the hybrid-laptop failure, not a passing
-/// state. Losses behind a secure screen or with the displays off don't count.
-const REPEATED_LOSSES: u32 = 3;
+/// A second screen that loses the user's desktop more often than this in one
+/// proof goes back to the mirror at once, for this app run only, so a display
+/// that keeps dropping out can't hold the iPad on the last mirror frame:
+/// losses that pass, however many, are never the PC's failure. Losses behind
+/// a secure screen or with the displays off don't count.
+const LOSS_LIMIT: u32 = 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -156,6 +157,7 @@ impl State {
         connected: bool,
         now: Instant,
     ) -> Step {
+        self.memory.retry_clear(now);
         if !selected {
             if self.memory.forget(now, false) {
                 tracing::info!(
@@ -213,11 +215,10 @@ impl State {
     /// no image within [`PROVE_TIMEOUT`] of the switch. Returns why.
     fn fail_unproven(&mut self, status: &mut VddStatus, now: Instant) -> Option<&'static str> {
         let proving = self.proving?;
-        let repeated = proving.losses >= REPEATED_LOSSES;
         let reason = if proving.capture_failed {
             "duplication_failed"
         } else if now.duration_since(proving.since) >= PROVE_TIMEOUT {
-            if repeated || proving.persistent {
+            if proving.persistent {
                 "duplication_failed"
             } else {
                 "no_frames"
@@ -233,7 +234,8 @@ impl State {
             ..State::default()
         };
         *status = VddStatus::Failed;
-        self.remember(reason, now, proving.interrupted && !repeated);
+        let passing = proving.interrupted || proving.losses > LOSS_LIMIT;
+        self.remember(reason, now, passing);
         Some(reason)
     }
 
@@ -496,7 +498,7 @@ fn note_interruption_while(shared: &SharedControl, generation: u64, away: bool) 
             proving.interrupted = true;
             if !away {
                 proving.losses += 1;
-                proving.capture_failed |= proving.losses > REPEATED_LOSSES;
+                proving.capture_failed |= proving.losses > LOSS_LIMIT;
             }
         }
     }

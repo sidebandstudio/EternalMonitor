@@ -295,29 +295,44 @@ impl Memory {
     /// or Try again) retries at once.
     pub(crate) fn forget(&mut self, now: Instant, success: bool) -> bool {
         let forgot = self.failed.take().is_some();
-        let Some(store) = &self.store else {
-            return forgot;
-        };
-        let retry = self
-            .uncleared
-            .is_some_and(|tried| success || now.saturating_duration_since(tried) >= CLEAR_RETRY);
-        if forgot || retry {
-            match store.clear() {
-                Ok(()) => self.uncleared = None,
-                Err(error) => {
-                    if !std::mem::replace(&mut self.clear_failure_logged, true) {
-                        warn!(
-                            %error,
-                            "Could not clear the second screen record — this app run treats it \
-                             as cleared; the next may wait until it tries again or Try again is \
-                             clicked"
-                        );
-                    }
-                    self.uncleared = Some(now);
-                }
-            }
+        if forgot || (success && self.uncleared.is_some()) {
+            self.clear(now);
+        } else {
+            self.retry_clear(now);
         }
         forgot
+    }
+
+    /// Try again to clear a forgotten failure the file still holds, a
+    /// minute after the last try. The transport calls this at every tick,
+    /// whatever the mode and however the second screen is doing.
+    pub(crate) fn retry_clear(&mut self, now: Instant) {
+        if self
+            .uncleared
+            .is_some_and(|tried| now.saturating_duration_since(tried) >= CLEAR_RETRY)
+        {
+            self.clear(now);
+        }
+    }
+
+    fn clear(&mut self, now: Instant) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        match store.clear() {
+            Ok(()) => self.uncleared = None,
+            Err(error) => {
+                if !std::mem::replace(&mut self.clear_failure_logged, true) {
+                    warn!(
+                        %error,
+                        "Could not clear the second screen record — this app run treats it \
+                         as cleared; the next may wait until it tries again or Try again is \
+                         clicked"
+                    );
+                }
+                self.uncleared = Some(now);
+            }
+        }
     }
 }
 
@@ -874,43 +889,72 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// Review round 2: a display that keeps dropping out on the normal
-    /// desktop is the PC's failure, whether or not capture got it back last.
-    /// Round 3: every recovery still gives it the full window first, and a
-    /// fourth loss ends the proof at once.
+    /// Round 4: losses that pass never save a failure, however many. The
+    /// picture that follows proves the second screen; without one the stream
+    /// goes back to the mirror for this app run only.
     #[test]
-    fn a_desktop_lost_again_and_again_is_remembered() {
-        use super::super::{note_interruption, note_recovery};
-        for recovers_last in [true, false] {
-            let path = temp_file("repeated-loss");
-            let (shared, start) = proving_second_screen(&path);
-            for second in 1..=3 {
-                note_interruption(&shared, 1);
-                if second < 3 || recovers_last {
-                    note_recovery(&shared, 1, start + secs(second));
-                }
-            }
-            let last_recovery = start + secs(if recovers_last { 3 } else { 2 });
-            let deadline = last_recovery + PROVE_TIMEOUT;
-            assert_eq!(next_step(&shared, deadline - secs(1)), Step::Nothing);
-            assert_eq!(
-                next_step(&shared, deadline),
-                Step::Fallback("duplication_failed")
-            );
-            assert_eq!(saved(&path)["failure"]["failures"], 1, "{recovers_last}");
-            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        }
-        let path = temp_file("fourth-loss");
+    fn passing_losses_never_save_a_failure() {
+        use super::super::{note_interruption, note_recovery, LOSS_LIMIT};
+        // Four losses, then a picture.
+        let path = temp_file("four-then-frames");
         let (shared, start) = proving_second_screen(&path);
         for second in 1..=4 {
             note_interruption(&shared, 1);
             note_recovery(&shared, 1, start + secs(second));
         }
         assert_eq!(
-            next_step(&shared, start + secs(4)),
+            next_step(&shared, start + secs(4) + PROVE_TIMEOUT - secs(1)),
+            Step::Nothing
+        );
+        note_image(&shared, 1);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert!(!path.exists());
+
+        // Four losses, and the desktop never comes back.
+        let path = temp_file("four-then-nothing");
+        let (shared, start) = proving_second_screen(&path);
+        for second in 1..=4 {
+            note_interruption(&shared, 1);
+            if second < 4 {
+                note_recovery(&shared, 1, start + secs(second));
+            }
+        }
+        assert_eq!(
+            next_step(&shared, start + secs(3) + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert!(!path.exists(), "this app run only");
+        assert!(!retries_later(&shared));
+
+        // A display that keeps dropping out ends the proof early, still for
+        // this app run only.
+        let path = temp_file("loss-limit");
+        let (shared, start) = proving_second_screen(&path);
+        for second in 1..=u64::from(LOSS_LIMIT) + 1 {
+            note_interruption(&shared, 1);
+            note_recovery(&shared, 1, start + secs(second));
+        }
+        assert_eq!(
+            next_step(&shared, start + secs(9)),
             Step::Fallback("duplication_failed")
         );
-        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        assert!(!path.exists());
+    }
+
+    /// Round 4: a full window after the desktop came back, with no picture,
+    /// is the PC's failure.
+    #[test]
+    fn a_full_window_without_a_picture_after_a_recovery_is_remembered() {
+        use super::super::{note_interruption, note_recovery};
+        let path = temp_file("loss-recovery-nothing");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_recovery(&shared, 1, start + secs(2));
+        let deadline = start + secs(2) + PROVE_TIMEOUT;
+        assert_eq!(next_step(&shared, deadline - secs(1)), Step::Nothing);
+        assert_eq!(next_step(&shared, deadline), Step::Fallback("no_frames"));
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -1020,6 +1064,51 @@ mod tests {
         let (next, at) = app_run(&path, secs(60));
         assert!(!next.saved() && next.hold(at).is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Round 4: the paced retry ran only while Second screen was not
+    /// chosen, so a record that couldn't be cleared survived a working
+    /// session and held again at the next app run.
+    #[test]
+    fn a_record_that_couldnt_be_cleared_is_cleared_during_a_working_session() {
+        let path = temp_file("uncleared-session");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start).unwrap();
+        memory.store.as_mut().unwrap().io = Io {
+            remove: locked,
+            replace: locked_write,
+            overwrite: locked_write,
+        };
+        let later = start + hours(2);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        // Past the wait: the second screen is tried and shows a picture, but
+        // the file is still held.
+        assert_eq!(next_step(&shared, later), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, later), Step::Switch);
+        start_proving(&shared, 1, later);
+        note_image(&shared, 1);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert!(shared.second_screen.lock().memory.uncleared.is_some());
+        // The other program lets go; the transport's ticks clear it while
+        // the second screen streams.
+        shared
+            .second_screen
+            .lock()
+            .memory
+            .store
+            .as_mut()
+            .unwrap()
+            .io = Io::FILES;
+        let tried = shared.second_screen.lock().memory.uncleared.unwrap();
+        assert_eq!(next_step(&shared, tried + secs(30)), Step::Nothing);
+        assert!(path.exists(), "paced: not yet");
+        assert_eq!(next_step(&shared, tried + CLEAR_RETRY), Step::Nothing);
+        assert!(!path.exists());
+        assert!(shared.second_screen.lock().memory.uncleared.is_none());
+        let (next, at) = app_run(&path, hours(3));
+        assert!(!next.saved() && next.hold(at).is_none());
     }
 
     /// Review round 3: a handle that allows writing but not deleting defeats
