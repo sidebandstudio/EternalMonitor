@@ -20,6 +20,7 @@ use eternal_host::capture::synthetic::decode_frame_counter_from_luma;
 use eternal_host::control::{SharedControl, SupervisorCommand};
 use eternal_host::gpu::GpuInfo;
 use eternal_host::pipeline;
+use eternal_host::transport::session::SessionEnd;
 use eternal_wire::h264::contains_nal_type;
 use eternal_wire::reassembly::{AddOutcome, Reassembler};
 use eternal_wire::v2::control::{
@@ -199,6 +200,10 @@ fn usb_framed_stream_end_to_end() {
         assert!(!shared.session.lock().client_supports_nack());
 
         let mut reassembler = Reassembler::new();
+        // The read stall below would expire a frame it cut in two on the
+        // wall clock; see stream_time.
+        let origin = Instant::now();
+        let mut recent = Vec::new();
         let mut decoder = H264TestDecoder::new();
         let started = Instant::now();
         let mut last_report = Instant::now();
@@ -272,7 +277,7 @@ fn usb_framed_stream_end_to_end() {
                     highest_seq = header.frame_seq;
                     epoch = header.stream_epoch;
                     if let AddOutcome::Completed(frame) = reassembler.add_fragment(header.frame_seq,
-                        header.frag_index, header.frag_count, header.stream_epoch, payload, Instant::now()) {
+                        header.frag_index, header.frag_count, header.stream_epoch, payload, stream_time(origin, &header)) {
                         // How old a frame is depends on how fast this machine
                         // encodes, and how much of the stall the socket
                         // buffers took depends on the OS, so recovery is
@@ -308,8 +313,13 @@ fn usb_framed_stream_end_to_end() {
                         }
                         last_complete = header.frame_seq;
                         let frames = decoder.decode(&frame);
+                        recent.push((header.frame_seq, header.is_keyframe, frames.clone()));
+                        if recent.len() > 8 {
+                            recent.remove(0);
+                        }
                         for counter in &frames {
-                            assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
+                            assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF),
+                                "frame, keyframe and decoded counters, newest last: {recent:?}");
                         }
                         decoded += frames.len() as u32;
                         if recovered && !frames.is_empty() {
@@ -334,6 +344,8 @@ fn usb_framed_stream_end_to_end() {
         // gives up 10 s after the handshake, and over USB it was dialed again
         // into the same restart. Here the start fails at once (no driver
         // with synthetic capture), and the reconnect after it mirrors too.
+        // The epoch and generation checks prove there was no restart first;
+        // the 30 s deadlines are only backstops.
         use eternal_host::capture::second_screen;
         use eternal_host::control::{CaptureTarget, VddStatus};
         use eternal_host::supervisor::CURRENT_GENERATION;
@@ -347,7 +359,7 @@ fn usb_framed_stream_end_to_end() {
             let sent = Instant::now();
             write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
             let (frame_epoch, decoded) =
-                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(5)).await;
+                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(30)).await;
             assert_eq!(frame_epoch, epoch, "the mirror comes from the running pipeline");
             assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation,
                 "attempt {attempt}: connecting must not restart the pipeline");
@@ -361,7 +373,7 @@ fn usb_framed_stream_end_to_end() {
         second_screen::note_attached(&shared, "virtual".into());
         let switched = Instant::now();
         let (second_epoch, decoded) = first_decoded_frame(
-            &mut stream, &mut session, &mut msg_seq, Some(epoch), switched + Duration::from_secs(5)).await;
+            &mut stream, &mut session, &mut msg_seq, Some(epoch), switched + Duration::from_secs(30)).await;
         assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation + 1, "one restart onto it");
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
         eprintln!("USB_SECOND_SCREEN_SWITCH first_decoded_ms={}", decoded.duration_since(switched).as_millis());
@@ -372,7 +384,7 @@ fn usb_framed_stream_end_to_end() {
         second_screen::note_capture_error(&shared, generation + 1);
         let failed = Instant::now();
         let (_, decoded) = first_decoded_frame(
-            &mut stream, &mut session, &mut msg_seq, Some(second_epoch), failed + Duration::from_secs(5)).await;
+            &mut stream, &mut session, &mut msg_seq, Some(second_epoch), failed + Duration::from_secs(30)).await;
         assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation + 2, "one restart back");
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
         eprintln!("USB_SECOND_SCREEN_FALLBACK first_decoded_ms={}", decoded.duration_since(failed).as_millis());
@@ -384,6 +396,8 @@ fn usb_framed_stream_end_to_end() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!shared.client_connected(), "tunnel EOF must release the session");
+        // The EOF ended it, not the 3 s liveness expiry within the backstop.
+        assert_eq!(shared.session.lock().last_end(), Some((session, SessionEnd::LinkLost)));
         assert!(shared.running.load(Ordering::SeqCst));
     })
     }));
@@ -416,6 +430,7 @@ async fn first_decoded_frame(
 ) -> (u32, Instant) {
     use eternal_host::transport::link::{read_datagram, write_datagram};
     let mut reassembler = Reassembler::new();
+    let origin = Instant::now();
     let mut decoder = H264TestDecoder::new();
     let mut last_report = Instant::now();
     let mut highest_seq = 0;
@@ -458,7 +473,7 @@ async fn first_decoded_frame(
             header.frag_count,
             header.stream_epoch,
             payload,
-            Instant::now(),
+            stream_time(origin, &header),
         ) {
             if !decoder.decode(&frame).is_empty() {
                 return (header.stream_epoch, Instant::now());
@@ -2321,44 +2336,45 @@ fn pairing_flow_end_to_end() {
             "decoded counters out of order: {decoded:?}"
         );
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
-        // Reports keep the session alive, so only the BYE can end it: without
-        // them it would expire after 3 s of silence anyway, and the deadline
-        // is only a backstop.
+        // Reports keep the session from expiring meanwhile; the deadline is
+        // only a backstop.
         let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_connected() {
             assert!(Instant::now() < deadline, "BYE did not end pairing session");
             receiver.maybe_report(0, frames.len() as u32);
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(
+            shared.session.lock().last_end(),
+            Some((
+                paired.session_id,
+                SessionEnd::Bye(ByeReason::UserDisconnect)
+            )),
+            "the BYE must end the session"
+        );
         hello.client_nonce += 1;
         hello.pairing_code = 0;
         hello.auth_token = paired.auth_token;
-        // From before the session can exist, so every gap is counted.
-        let reconnecting = Instant::now();
         let reconnected = exchange(&hello);
         assert_eq!(reconnected.status, HelloStatus::Ok);
         assert_ne!(reconnected.session_id, paired.session_id);
-        // As after the BYE, reports keep the session alive, here from their
-        // own thread, so they go on through the revoked handshake. It
-        // returns the longest time the session went without one.
+        // Reports keep the session from expiring meanwhile, here from their
+        // own thread, so they go on through the revoked handshake.
         let keepalive = {
             let socket = socket.try_clone().unwrap();
             let host = host.clone();
             let shared = shared.clone();
             let session_id = reconnected.session_id;
             std::thread::spawn(move || {
-                let (mut last, mut longest, mut msg_seq) = (reconnecting, Duration::ZERO, 1);
+                let mut msg_seq = 1;
                 while shared.client_connected() {
                     msg_seq += 1;
                     let report = ControlMessage::ReceiverReport(ReceiverReport::default());
                     socket
                         .send_to(&encode_control(session_id, msg_seq, &report), &host)
                         .unwrap();
-                    longest = longest.max(last.elapsed());
-                    last = Instant::now();
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                longest.max(last.elapsed())
             })
         };
         shared.pairing.lock().regenerate_token().unwrap();
@@ -2374,12 +2390,11 @@ fn pairing_flow_end_to_end() {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // The session never went the liveness timeout without a report, so
-        // it could not have expired: the token reset ended it.
-        let longest = keepalive.join().unwrap();
-        assert!(
-            longest < Duration::from_millis(u64::from(reconnected.liveness_timeout_ms)),
-            "the session went {longest:?} without a report, so it may have expired instead of being revoked"
+        keepalive.join().unwrap();
+        assert_eq!(
+            shared.session.lock().last_end(),
+            Some((reconnected.session_id, SessionEnd::Revoked)),
+            "the token reset must end the session"
         );
     }));
     shared.stop();
@@ -2464,8 +2479,8 @@ fn preferred_fps_caps_the_host() {
         assert_eq!(shared.effective_fps(), 30);
         assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
-        // Reports keep the session alive, so only the BYE can release the
-        // cap; the deadline is only a backstop.
+        // Reports keep the session from expiring meanwhile; the deadline is
+        // only a backstop.
         let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_preferred_fps.load(Ordering::SeqCst) != 0 {
             assert!(
@@ -2475,6 +2490,14 @@ fn preferred_fps_caps_the_host() {
             receiver.maybe_report(0, frames.len() as u32);
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(
+            shared.session.lock().last_end(),
+            Some((
+                receiver.session_id,
+                SessionEnd::Bye(ByeReason::UserDisconnect)
+            )),
+            "the BYE must release the cap"
+        );
         assert_eq!(shared.effective_fps(), 120);
         shared.target_fps.store(30, Ordering::SeqCst);
         let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 120);
@@ -2611,6 +2634,14 @@ fn quiet_clients_keep_their_session_until_they_go_silent() {
     }
     let expired_after = last_message.elapsed();
     assert!(!shared.client_connected(), "a silent client must expire");
+    assert!(
+        matches!(
+            shared.session.lock().last_end(),
+            Some((_, SessionEnd::LivenessExpired))
+        ),
+        "{:?}",
+        shared.session.lock().last_end()
+    );
     assert!(
         expired_after >= LIVENESS_TIMEOUT - Duration::from_millis(300),
         "expired early: {expired_after:?}"

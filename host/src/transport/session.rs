@@ -92,8 +92,25 @@ pub trait ConfigSource {
     }
 }
 
+/// Why a session ended, as the host saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The client said goodbye.
+    Bye(ByeReason),
+    /// The pairing token changed under it.
+    Revoked,
+    /// The client went silent for the liveness timeout.
+    LivenessExpired,
+    /// Its link closed (a USB tunnel's EOF).
+    LinkLost,
+    /// Stop and update stopped its stream.
+    StoppedForUpdate,
+}
+
 pub struct Session {
     active: Option<ActiveSession>,
+    /// The last session that ended, and why.
+    last_end: Option<(u32, SessionEnd)>,
     /// An update is taking over: new clients are turned away (`Busy`) until it
     /// either closes the host or gives up. Changed only under the session lock,
     /// together with the check that nobody is streaming.
@@ -110,6 +127,7 @@ impl Session {
     pub fn new(session_id_seed: u32) -> Self {
         Self {
             active: None,
+            last_end: None,
             updating: false,
             goodbye: None,
             next_session_id: session_id_seed.max(1),
@@ -119,6 +137,18 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// The id of the last session that ended, and why it ended.
+    pub fn last_end(&self) -> Option<(u32, SessionEnd)> {
+        self.last_end
+    }
+
+    /// Ends the active session for `why`.
+    fn end(&mut self, why: SessionEnd) {
+        if let Some(session) = self.active.take() {
+            self.last_end = Some((session.session_id, why));
+        }
     }
 
     /// Starts an update handoff. Atomic with admission: call with the session
@@ -139,7 +169,7 @@ impl Session {
                 peer,
                 eternal_wire::v2::control::encode_control(session_id, msg_seq, &bye),
             ));
-            self.active = None;
+            self.end(SessionEnd::StoppedForUpdate);
         }
         self.updating = true;
         true
@@ -165,7 +195,7 @@ impl Session {
             .as_ref()
             .is_some_and(|session| session.peer.link == link);
         if lost {
-            self.active = None;
+            self.end(SessionEnd::LinkLost);
         }
         Actions {
             client_lost: lost,
@@ -494,7 +524,7 @@ impl Session {
             info!(peer = %source, "Awaiting USB takeover after WiFi goodbye");
             return actions;
         }
-        self.active = None;
+        self.end(SessionEnd::Bye(reason));
         actions.client_lost = true;
         actions
     }
@@ -603,7 +633,7 @@ impl Session {
         });
         if revoked {
             info!(peer = %session.peer, "Pairing credentials changed — reconnect required");
-            self.active = None;
+            self.end(SessionEnd::Revoked);
             actions.client_lost = true;
             return actions;
         }
@@ -614,7 +644,7 @@ impl Session {
                 device = %session.info.device_name,
                 "Client liveness expired — tearing session down"
             );
-            self.active = None;
+            self.end(SessionEnd::LivenessExpired);
             actions.client_lost = true;
             return actions;
         }
@@ -823,7 +853,9 @@ mod tests {
             HelloStatus::Busy
         );
         assert!(!session.link_lost(LinkId::Udp).client_lost);
+        let usb_id = session.session_id().unwrap();
         assert!(session.link_lost(usb.link).client_lost);
+        assert_eq!(session.last_end(), Some((usb_id, SessionEnd::LinkLost)));
         let fallback = session.handle_control(wifi, 0, identified_hello(3, 77), &TestConfig, now);
         assert_eq!(fallback.new_target, Some(wifi));
     }
@@ -1176,6 +1208,7 @@ mod tests {
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
         session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let first = session.session_id().unwrap();
 
         let bye = session.handle_control_authed(
             peer,
@@ -1185,12 +1218,21 @@ mod tests {
         );
         assert!(bye.client_lost);
         assert!(!session.is_active());
+        assert_eq!(
+            session.last_end(),
+            Some((first, SessionEnd::Bye(ByeReason::UserDisconnect)))
+        );
 
         // Re-establish, then let liveness lapse.
         session.handle_control_authed(peer, hello(2, 50000), &TestConfig, now);
+        let second = session.session_id().unwrap();
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
+        assert_eq!(
+            session.last_end(),
+            Some((second, SessionEnd::LivenessExpired))
+        );
     }
 
     #[test]
@@ -1548,6 +1590,10 @@ mod tests {
         assert_eq!(pair_ack(&stale).auth_token, [0; 16]);
         assert!(session.tick(&config, false, now).client_lost);
         assert!(!session.is_active());
+        assert_eq!(
+            session.last_end(),
+            Some((pair_ack(&reconnected).session_id, SessionEnd::Revoked))
+        );
     }
 
     #[test]
