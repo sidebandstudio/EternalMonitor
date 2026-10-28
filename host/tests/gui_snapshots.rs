@@ -58,7 +58,8 @@ fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
 /// that ends within the quiet period after `seen`, the earliest the app can
 /// have last seen an iPad (or launched). Later frames may open it: a slow
 /// machine has simply waited out the quiet period. With `ipad` connected,
-/// each frame moves `seen` on. Returns it.
+/// the popup stays closed however long a frame takes, so every frame is
+/// checked, and each one moves `seen` on. Returns it.
 fn no_popup_for(
     harness: &mut Harness<'_, AnalyzerApp>,
     mut seen: Instant,
@@ -76,7 +77,7 @@ fn no_popup_for(
         }
         harness.run_steps(1);
         // The frame read the time before this, so it was inside the period.
-        if Instant::now() < seen + quiet {
+        if ipad || Instant::now() < seen + quiet {
             assert!(!popup_shown(harness), "{why}");
             checked += 1;
         }
