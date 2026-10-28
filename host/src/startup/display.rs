@@ -576,6 +576,9 @@ mod tests {
     struct PausedClock {
         start: std::time::Instant,
         elapsed: std::cell::Cell<std::time::Duration>,
+        /// Reads since the last sleep. A wait that stopped sleeping on this
+        /// clock would never reach its deadline, so too many fail the test.
+        reads: std::cell::Cell<u32>,
     }
 
     impl PausedClock {
@@ -583,6 +586,7 @@ mod tests {
             Self {
                 start: std::time::Instant::now(),
                 elapsed: std::cell::Cell::new(std::time::Duration::ZERO),
+                reads: std::cell::Cell::new(0),
             }
         }
 
@@ -593,11 +597,29 @@ mod tests {
 
     impl Clock for PausedClock {
         fn now(&self) -> std::time::Instant {
+            self.reads.set(self.reads.get() + 1);
+            assert!(
+                self.reads.get() <= 100,
+                "read the paused clock 100 times without sleeping on it"
+            );
             self.start + self.elapsed.get()
         }
 
         fn sleep(&self, duration: std::time::Duration) {
+            self.reads.set(0);
             self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "without sleeping on it")]
+    fn a_wait_that_never_sleeps_on_the_paused_clock_fails() {
+        let clock = PausedClock::new();
+        let deadline = clock.now() + std::time::Duration::from_millis(50);
+        for _ in 0..1000 {
+            if clock.now() >= deadline {
+                return;
+            }
         }
     }
 
