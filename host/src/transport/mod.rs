@@ -639,16 +639,19 @@ async fn repair_while_pacing(
 }
 
 async fn execute_actions(
-    actions: Actions,
+    mut actions: Actions,
     links: &TransportLinks,
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
-    // The ended session's summary first: a new one starts its own.
-    if let Some(end) = &actions.ended {
-        crate::diagnostics::log_session_end(end, shared);
-    }
+    // An ended session's summary waits for this pass's second screen step,
+    // which can give the second screen up for it, unless a new session
+    // starts now: second screen news from here on is the new one's.
+    let mut ended = actions.ended.take();
     if actions.new_target.is_some() {
+        if let Some(end) = ended.take() {
+            crate::diagnostics::log_session_end(&end, shared);
+        }
         crate::diagnostics::note_session_start();
     }
     for (destination, datagram) in &actions.replies {
@@ -749,6 +752,9 @@ async fn execute_actions(
             true
         }
     };
+    if let Some(end) = ended {
+        crate::diagnostics::log_session_end(&end, shared);
+    }
     if restart {
         shared.stop();
         if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
@@ -783,6 +789,88 @@ mod tests {
         encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,
         FEATURE_SUPPORTS_NACK,
     };
+
+    /// The second screen gives up for a session in the same pass that ends
+    /// it: the session's summary names that fallback.
+    #[test]
+    fn a_session_ended_with_a_fallback_in_one_pass_names_it() {
+        use tracing_subscriber::prelude::*;
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
+        let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(crate::diagnostics::FallbackWatch)
+                .with(crate::diagnostics::tests::SummaryCapture(summaries.clone())),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+            shared.pairing.lock().required = false;
+            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+            // Streaming the virtual display already, so the session's pass has
+            // nothing to start.
+            *shared.vdd_status.lock() = VddStatus::Active;
+            let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let config = SharedConfigSource {
+                shared: &shared,
+                stream_epoch: 1,
+                pen_available: false,
+            };
+            let peer = PeerId::udp("127.0.0.1:19893".parse().unwrap());
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 0xFA11,
+                listen_port: 19893,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps: 0,
+                screen_px_w: 1920,
+                screen_px_h: 1080,
+                screen_pt_w: 960,
+                screen_pt_h: 540,
+                refresh_hz: 60,
+                device_name: "fallback test".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            let now = Instant::now();
+            let accepted = shared
+                .session
+                .lock()
+                .handle_control(peer, 0, hello, &config, now);
+            execute_actions(accepted, &links, &shared, &supervisor_tx).await;
+            // The virtual display attached and has shown no picture for too long.
+            second_screen::note_attached(&shared, "virtual".into());
+            second_screen::start_proving(&shared, 1, now - second_screen::PROVE_TIMEOUT);
+            let session_id = shared.session.lock().session_id().unwrap();
+            let bye = shared.session.lock().handle_control(
+                peer,
+                session_id,
+                ControlMessage::Bye(eternal_wire::v2::control::ByeReason::UserDisconnect),
+                &config,
+                Instant::now(),
+            );
+            assert!(bye.ended.is_some());
+            execute_actions(bye, &links, &shared, &supervisor_tx).await;
+        });
+        let summaries = summaries.lock();
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert!(
+            summaries[0].contains(" nonce=000000000000fa11 ")
+                && summaries[0].contains(" mode=second_screen ")
+                && summaries[0].contains(" fallback=no_frames "),
+            "{}",
+            summaries[0]
+        );
+        crate::diagnostics::tests::assert_contract(&summaries[0]);
+    }
 
     #[tokio::test]
     async fn repairs_current_and_previous_frames_before_the_pacing_wait_ends() {

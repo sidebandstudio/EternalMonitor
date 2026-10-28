@@ -109,7 +109,8 @@ fn log_stream_summary(shared: &SharedControl) {
         "Support stream summary");
 }
 
-/// Video for this long makes a session `steady` in its summary.
+/// Video for this long, with frames the client reports, makes a session
+/// `steady` in its summary.
 pub const STEADY_AFTER: Duration = Duration::from_secs(10);
 
 /// What a session summary says about this PC.
@@ -292,13 +293,17 @@ pub fn session_summary(
 ) -> String {
     use eternal_wire::v2::control::{ByeReason, HelloStatus};
     let streamed = end.first_video.is_some();
-    let steady = end
-        .first_video
-        .is_some_and(|video| end.duration.saturating_sub(video) >= STEADY_AFTER);
+    // Only the client's reports say a picture arrived: video sent alone is
+    // `video_sent`, however long it went on.
+    let steady = end.frames_received
+        && end
+            .first_video
+            .is_some_and(|video| end.duration.saturating_sub(video) >= STEADY_AFTER);
     let stage = match (end.reason, end.first_video) {
         (EndReason::Refused(_), _) => "hello_sent",
         (_, None) => "accepted",
         _ if steady => "steady",
+        _ if end.frames_received => "first_frame",
         _ => "video_sent",
     };
     let pairing = |status| matches!(status, HelloStatus::Unauthorized | HelloStatus::RateLimited);
@@ -549,6 +554,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// Held by tests that use the session's fallback slot.
+    pub(crate) static FALLBACK_SLOT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Collects the `session_summary` lines logged.
+    pub(crate) struct SummaryCapture(pub std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SummaryCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut message = Message(None);
+            event.record(&mut message);
+            if let Some(line) = message
+                .0
+                .filter(|line| line.starts_with("session_summary "))
+            {
+                self.0.lock().push(line);
+            }
+        }
+    }
+
     fn pc() -> HostFacts {
         HostFacts {
             os: "win:26200.9457".into(),
@@ -564,6 +604,7 @@ pub(crate) mod tests {
             link: LinkId::Udp,
             reason,
             first_video: first_video_ms.map(Duration::from_millis),
+            frames_received: first_video_ms.is_some(),
             duration: Duration::from_millis(duration_ms),
         }
     }
@@ -613,6 +654,14 @@ pub(crate) mod tests {
             ),
             (
                 end(Goodbye(ByeReason::AppBackground), Some(300), 4_000),
+                ["first_frame", "streamed", "none", "goodbye"],
+            ),
+            // Video went out, but no report counted a frame.
+            (
+                SessionEnd {
+                    frames_received: false,
+                    ..end(Goodbye(ByeReason::UserDisconnect), Some(300), 60_000)
+                },
                 ["video_sent", "streamed", "none", "goodbye"],
             ),
             (
@@ -638,7 +687,7 @@ pub(crate) mod tests {
             ),
             (
                 end(Superseded, Some(250), 9_000),
-                ["video_sent", "streamed", "none", "superseded"],
+                ["first_frame", "streamed", "none", "superseded"],
             ),
             (
                 end(Superseded, None, 100),
@@ -652,7 +701,7 @@ pub(crate) mod tests {
                 end(Shutdown, None, 20),
                 ["accepted", "app_ended", "none", "shutdown"],
             ),
-            (usb, ["video_sent", "streamed", "usb_lost", "error"]),
+            (usb, ["first_frame", "streamed", "usb_lost", "error"]),
             (
                 end(LinkLost, None, 100),
                 ["accepted", "error", "other", "error"],
@@ -761,6 +810,7 @@ pub(crate) mod tests {
     #[test]
     fn a_session_keeps_the_first_second_screen_fallback_it_logs() {
         use tracing_subscriber::prelude::*;
+        let _slot = FALLBACK_SLOT.lock();
         for (reason, token) in [
             ("attach_timeout", "attach_timeout"),
             ("enable_failed", "enable_failed"),

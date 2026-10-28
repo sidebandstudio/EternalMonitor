@@ -67,6 +67,8 @@ pub struct SessionEnd {
     pub reason: EndReason,
     /// From the session's start to the first video sent to it.
     pub first_video: Option<Duration>,
+    /// The client's receiver reports counted complete frames.
+    pub frames_received: bool,
     pub duration: Duration,
 }
 
@@ -114,6 +116,8 @@ struct ActiveSession {
     msg_seq_out: u32,
     /// When the first video went to this session.
     first_video_at: Option<Instant>,
+    /// A receiver report counted complete frames.
+    frames_received: bool,
     /// A Wi-Fi goodbye while the cable takes over.
     bye: Option<ByeReason>,
 }
@@ -507,6 +511,7 @@ impl Session {
             last_report: None,
             msg_seq_out: 0,
             first_video_at: None,
+            frames_received: false,
             bye: None,
         });
 
@@ -588,6 +593,7 @@ impl Session {
             if session_peer_matches(session, source) {
                 session.liveness_deadline = now + LIVENESS_TIMEOUT;
                 session.last_report = Some(report);
+                session.frames_received |= report.frames_complete > 0;
                 actions.report = Some(report);
             }
         }
@@ -744,6 +750,7 @@ impl Session {
                 link: source.link,
                 reason: EndReason::Refused(status),
                 first_video: None,
+                frames_received: false,
                 duration: Duration::ZERO,
             }),
             ..Actions::default()
@@ -807,6 +814,7 @@ impl ActiveSession {
             first_video: self
                 .first_video_at
                 .map(|at| at.saturating_duration_since(start)),
+            frames_received: self.frames_received,
             duration: now.saturating_duration_since(start),
         }
     }
@@ -1748,6 +1756,14 @@ mod tests {
         session.note_video_sent(id + 1, now + Duration::from_millis(10));
         session.note_video_sent(id, now + Duration::from_millis(40));
         session.note_video_sent(id, now + Duration::from_millis(90));
+        // Frames count once a report shows some; a later empty one keeps them.
+        for frames_complete in [0, 3, 0] {
+            let report = ControlMessage::ReceiverReport(ReceiverReport {
+                frames_complete,
+                ..Default::default()
+            });
+            session.handle_control_authed(peer, report, &TestConfig, now);
+        }
         let bye = session.handle_control_authed(
             peer,
             ControlMessage::Bye(ByeReason::UserDisconnect),
@@ -1762,6 +1778,7 @@ mod tests {
                 link: LinkId::Udp,
                 reason: EndReason::Goodbye(ByeReason::UserDisconnect),
                 first_video: Some(Duration::from_millis(40)),
+                frames_received: true,
                 duration: Duration::from_secs(2),
             }
         );
@@ -1793,6 +1810,7 @@ mod tests {
             (Some(second), 2, EndReason::Liveness, None)
         );
         assert_eq!(lapsed.duration, LIVENESS_TIMEOUT);
+        assert!(!lapsed.frames_received);
         assert_eq!(
             session
                 .tick(&TestConfig, false, now + LIVENESS_TIMEOUT)
@@ -1889,6 +1907,7 @@ mod tests {
                 link: LinkId::Udp,
                 reason: EndReason::Refused(HelloStatus::VersionUnsupported),
                 first_video: None,
+                frames_received: false,
                 duration: Duration::ZERO,
             }
         );
