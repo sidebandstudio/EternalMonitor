@@ -2,7 +2,10 @@
 """Point docs/latest.json and docs/download.html at a published release.
 
   latest_json.py publish [--windows VERSION] [--ipad VERSION --build N] [--note TEXT] [--not-recommended]
+                         [--rollout-start YYYY-MM-DDTHH:MM:SSZ --rollout-days N]
+                         [--windows-config FILE|none] [--ipad-config FILE|none]
   latest_json.py rollback [--windows VERSION] [--ipad VERSION] [--note TEXT] [--not-recommended]
+                          [--windows-config FILE|none] [--ipad-config FILE|none]
 
 Windows takes the installer's SHA-256 from GitHub release vVERSION: the
 release must be published and stable, and its asset digest (or the installer,
@@ -18,8 +21,14 @@ and checks App Store Connect too when those variables are set.
 
 Both apps only offer a strictly newer version than the one installed, so a
 rollback never prompts anyone already on the bad release; it stops new
-prompts for it. --note and --not-recommended apply to each platform given;
-without them the old note goes. scripts/check-versions.sh must pass, or both
+prompts for it. --note, --not-recommended and the --rollout pair (publish
+only: stage the automatic prompt over 0 to 14 days from a start at most 14
+days ahead) apply to each platform given; without them the old note and
+rollout go. A platform's config (docs/remote-config.md) is kept unless
+--windows-config or --ipad-config names a JSON file to use instead, or
+"none" to remove it; either may be given without a release to change only
+the config. Every optional field is checked by scripts/manifest_fields.py,
+as check-versions.sh checks it. scripts/check-versions.sh must pass, or both
 files are restored. Then the git commands for the pull request are printed.
 """
 import argparse
@@ -35,6 +44,7 @@ import tempfile
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import manifest_fields  # noqa: E402
 import testflight_review  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -142,11 +152,34 @@ def check_testflight(asc, version, build):
 
 
 def short_note(note):
-    """The rule both apps apply: one trimmed line of at most 200 characters."""
+    """The rule both apps apply: one trimmed line of at most 200 characters,
+    without control, format or line and paragraph separator characters."""
     note = note.strip()
-    if not note or len(note) > 200 or any(ord(c) < 32 or 127 <= ord(c) < 160 for c in note):
-        raise ManifestError("--note must be one line of 1 to 200 characters")
+    try:
+        manifest_fields.check_note("--note", note)
+    except ValueError:
+        raise ManifestError("--note must be one line of 1 to 200 characters") from None
     return note
+
+
+def read_config(value):
+    """--windows-config/--ipad-config: a JSON object from a file, or None for "none"."""
+    if value == "none":
+        return None
+    try:
+        config = json.loads(pathlib.Path(value).read_text())
+    except (OSError, ValueError) as error:
+        raise ManifestError(f"config {value}: {error}") from None
+    if not isinstance(config, dict):
+        raise ManifestError(f"config {value} must hold a JSON object")
+    return config
+
+
+def with_config(entry, current, change):
+    """`entry` with the platform's config: `change` when given, else `current`'s."""
+    config = current.get("config") if change is ... else change
+    entry = {key: value for key, value in entry.items() if key != "config"}
+    return entry if config is None else {**entry, "config": config}
 
 
 def safe_manifest(latest):
@@ -154,7 +187,7 @@ def safe_manifest(latest):
     if set(latest) != {"schema", "windows", "ipad"} or latest["schema"] != 1:
         raise ManifestError("latest.json must hold schema 1, windows and ipad only")
     windows, ipad = latest["windows"], latest["ipad"]
-    optional = {"recommended", "note"}
+    optional = {"recommended", "note", "rollout", "config"}
     if not {"version", "installer", "sha256"} <= set(windows) <= {"version", "installer", "sha256"} | optional:
         raise ManifestError("unexpected Windows fields")
     if not {"version", "build", "testflight"} <= set(ipad) <= {"version", "build", "testflight"} | optional:
@@ -172,6 +205,10 @@ def safe_manifest(latest):
         raise ManifestError("iPad build must be a positive integer")
     if not TESTFLIGHT.fullmatch(ipad["testflight"]):
         raise ManifestError("iPad TestFlight link is invalid")
+    try:
+        manifest_fields.check(windows, ipad)
+    except ValueError as error:
+        raise ManifestError(str(error)) from None
 
 
 def replace_once(html, pattern, value, what):
@@ -211,6 +248,10 @@ def build_manifest(args, current, release, download, connect, root):
         flags["note"] = short_note(args.note)
     if args.not_recommended:
         flags["recommended"] = False
+    if args.rollout_start is not None:
+        flags["rollout"] = {"start": args.rollout_start, "days": args.rollout_days}
+    configs = {platform: ... if value is None else read_config(value)
+               for platform, value in (("windows", args.windows_config), ("ipad", args.ipad_config))}
     if args.windows:
         old = current["windows"]["version"]
         if args.command == "rollback" and version_key(args.windows) >= version_key(old):
@@ -218,9 +259,12 @@ def build_manifest(args, current, release, download, connect, root):
         if args.command == "publish" and version_key(args.windows) < version_key(old):
             raise ManifestError(f"Windows {args.windows} is older than the published {old}; use rollback")
         sha256, size = windows_release(args.windows, release, download)
-        latest["windows"] = {"version": args.windows, "installer": installer_url(args.windows), "sha256": sha256,
-                             **flags}
+        latest["windows"] = with_config({"version": args.windows, "installer": installer_url(args.windows),
+                                         "sha256": sha256, **flags}, current["windows"], configs["windows"])
         changes.append(f"Windows {args.windows}")
+    elif configs["windows"] is not ...:
+        latest["windows"] = with_config(latest["windows"], current["windows"], configs["windows"])
+        changes.append("Windows config")
     if args.ipad:
         asc = connect()
         old = current["ipad"]["build"]
@@ -245,8 +289,13 @@ def build_manifest(args, current, release, download, connect, root):
             check_testflight(asc, args.ipad, build)
         else:
             print("App Store Connect was not checked (no ASC_KEY_ID): confirm the build has not expired in TestFlight")
-        latest["ipad"] = {"version": args.ipad, "build": build, "testflight": current["ipad"]["testflight"], **flags}
+        latest["ipad"] = with_config({"version": args.ipad, "build": build,
+                                      "testflight": current["ipad"]["testflight"], **flags},
+                                     current["ipad"], configs["ipad"])
         changes.append(f"iPad {args.ipad} build {build}")
+    elif configs["ipad"] is not ...:
+        latest["ipad"] = with_config(latest["ipad"], current["ipad"], configs["ipad"])
+        changes.append("iPad config")
     safe_manifest(latest)
     return latest, size, changes
 
@@ -276,9 +325,17 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
     parser.add_argument("--build", type=int, help="TestFlight build number (publish --ipad)")
     parser.add_argument("--note", help="one line for the update popup, at most 200 characters")
     parser.add_argument("--not-recommended", action="store_true", help="soften the popup's wording")
+    parser.add_argument("--rollout-start", metavar="TIME", help="stage the automatic prompt from this UTC time")
+    parser.add_argument("--rollout-days", type=int, metavar="N", help="over this many days, 0 to 14")
+    parser.add_argument("--windows-config", metavar="FILE", help="windows.config as a JSON file, or none")
+    parser.add_argument("--ipad-config", metavar="FILE", help="ipad.config as a JSON file, or none")
     args = parser.parse_args(argv)
-    if not args.windows and not args.ipad:
-        parser.error("name --windows, --ipad or both")
+    if not (args.windows or args.ipad or args.windows_config or args.ipad_config):
+        parser.error("name --windows, --ipad, a config, or several")
+    if (args.rollout_start is None) != (args.rollout_days is None):
+        parser.error("--rollout-start and --rollout-days go together")
+    if args.rollout_start is not None and (args.command != "publish" or not (args.windows or args.ipad)):
+        parser.error("a rollout stages the prompt for a release: publish --windows or --ipad")
     for value in (args.windows, args.ipad):
         if value and not VERSION.fullmatch(value):
             parser.error(f"invalid version {value!r}")

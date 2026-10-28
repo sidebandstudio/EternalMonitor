@@ -191,11 +191,13 @@ final class ConnectionManager: ObservableObject {
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
-    /// Connect and reconnect timing. The app uses the defaults; tests pass
+    /// Connect and reconnect timing. The app uses the defaults, with the
+    /// first-picture wait the update manifest may set (10–20 s); tests pass
     /// shorter ones when they create the manager, and may shorten them once
     /// a session streams, so a slow machine's first connect isn't cut off.
     struct Timing {
-        var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
+        var connectTimeoutSeconds = Double(RemoteConfig.launch.firstFrameTimeoutSeconds
+            ?? Int(ConnectionManager.connectionTimeoutSeconds))
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
     }

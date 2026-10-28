@@ -9,6 +9,8 @@ struct EternalMonitorApp: App {
     init() {
         FontRegistry.shared.registerBundledFonts()
         SupportDiagnostics.shared.recordDeviceSnapshot()
+        SupportDiagnostics.shared.record("info", "update",
+            RemoteConfig.summary(RemoteConfig.launch, rollout: UpdateChecker.shared.available?.rollout))
     }
 
     var body: some Scene {

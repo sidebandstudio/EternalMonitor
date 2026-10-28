@@ -259,9 +259,9 @@ pub(crate) fn resolve_target(
 }
 
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
-/// via `ETERNAL_VDD_TIMEOUT_SECS`. The iPad mirrors meanwhile, so a longer wait costs the user
-/// nothing; it was 10 s while the iPad gave up 10 s after connecting, and on some PCs the
-/// display attaches only after that.
+/// via `ETERNAL_VDD_TIMEOUT_SECS`, or within 30–60 s by the update manifest. The iPad mirrors
+/// meanwhile, so a longer wait costs the user nothing; it was 10 s while the iPad gave up 10 s
+/// after connecting, and on some PCs the display attaches only after that.
 #[cfg(any(windows, test))]
 const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 30;
 #[cfg(any(windows, test))]
@@ -583,6 +583,7 @@ fn vdd_attach_timeout() -> Duration {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(Duration::from_secs)
+        .or_else(|| crate::remote_config::current().attach_timeout())
         .unwrap_or(Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS))
 }
 

@@ -16,8 +16,10 @@ import latest_json  # noqa: E402
 import testflight_review  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FILES = ["scripts/check-versions.sh", "host/Cargo.toml", "proto/Cargo.toml", "ios/project.yml",
-         "docs/download.html", "docs/latest.json", "docs/script.js"]
+FILES = ["scripts/check-versions.sh", "scripts/manifest_fields.py", "host/Cargo.toml", "proto/Cargo.toml",
+         "ios/project.yml", "docs/download.html", "docs/latest.json", "docs/script.js"]
+# The optional fields the Rust and Swift tests read too.
+EXAMPLE = json.loads((ROOT / "proto/testdata/latest_remote_config.json").read_text())
 SHA = {"0.3.2": "2" * 64, "0.3.3": "3" * 64, "0.3.4": "4" * 64}
 
 
@@ -230,6 +232,104 @@ class LatestJsonTest(unittest.TestCase):
         bad["ipad"]["required"] = True
         with self.assertRaises(latest_json.ManifestError):
             latest_json.safe_manifest(bad)
+
+
+    # ── Optional fields (docs/remote-config.md), checked as check-versions.sh does ──
+
+    def soon(self, days=1):
+        import datetime
+        when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+        return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def config_file(self, name, config):
+        path = self.tmp / name
+        path.write_text(json.dumps(config))
+        return str(path)
+
+    def with_configs(self):
+        latest = self.latest()
+        latest["windows"]["config"] = EXAMPLE["windows"]["config"]
+        latest["ipad"]["config"] = EXAMPLE["ipad"]["config"]
+        self.publish_state(latest)
+
+    def test_publish_stages_the_prompt_and_keeps_each_config(self):
+        self.with_configs()
+        self.bump_tree("0.3.4")
+        self.asc = FakeTestFlight()
+        start = self.soon()
+        self.run_tool("publish", "--windows", "0.3.4", "--ipad", "0.3.4", "--build", "401",
+                      "--rollout-start", start, "--rollout-days", "7")
+        latest = self.latest()
+        for platform in ("windows", "ipad"):
+            self.assertEqual(latest[platform]["rollout"], {"start": start, "days": 7})
+            self.assertEqual(latest[platform]["config"], EXAMPLE[platform]["config"], platform)
+        # The next publish without a rollout drops it, as it drops the note.
+        self.bump_tree("0.3.5")
+        self.releases["v0.3.5"] = release("0.3.5", sha="5" * 64)
+        self.run_tool("publish", "--windows", "0.3.5")
+        self.assertNotIn("rollout", self.latest()["windows"])
+        self.assertEqual(self.latest()["windows"]["config"], EXAMPLE["windows"]["config"])
+
+    def test_a_config_can_change_without_a_release(self):
+        config = {"schema": 1, "attach_timeout_s": 45}
+        self.run_tool("publish", "--windows-config", self.config_file("w.json", config))
+        latest = self.latest()
+        self.assertEqual(latest["windows"]["config"], config)
+        self.assertEqual(latest["windows"]["version"], "0.3.3")
+        self.assertEqual(latest["windows"]["note"], "Fixes Second screen.", "nothing else changes")
+        out = self.run_tool("publish", "--windows-config", "none",
+                            "--ipad-config", self.config_file("i.json", EXAMPLE["ipad"]["config"]))
+        self.assertNotIn("config", self.latest()["windows"])
+        self.assertEqual(self.latest()["ipad"]["config"], EXAMPLE["ipad"]["config"])
+        self.assertIn("Windows config and iPad config", out)
+
+    def test_bad_rollouts_configs_and_notes_are_refused(self):
+        self.bump_tree("0.3.4")
+        bad_rollouts = [(self.soon(), "15"), (self.soon(15), "7"), ("2026-11-02", "7"),
+                        ("2026-11-02T00:00:00+01:00", "7"), (self.soon(), "-1")]
+        for start, days in bad_rollouts:
+            with self.subTest(start=start, days=days):
+                self.assertIn("rollout", self.fails("publish", "--windows", "0.3.4",
+                                                    "--rollout-start", start, "--rollout-days", days))
+        narrow = EXAMPLE["windows"]["config"]["second_screen_rules"][0]
+        broad = {"gpus": ["nvidia"], "gpu_driver": {"gpu": "nvidia", "min": "32.0", "max": "32.4294967295"},
+                 "windows": {"min": "26100.0", "max": "26100.99999"}}
+        bad_configs = [
+            ("--windows-config", {"schema": 1, "attach_timeout_s": 20}),
+            ("--windows-config", {"schema": 2}),
+            ("--windows-config", {"schema": 1, "second_screen_rules": [broad]}),
+            ("--windows-config", {"schema": 1, "second_screen_rules": [narrow] * 9}),
+            ("--windows-config", {"schema": 1, "second_screen_rules": [{**narrow, "cpu": "arm64"}]}),
+            ("--windows-config", {"schema": 1, "kill_switch": True}),
+            ("--ipad-config", {"schema": 1, "first_frame_timeout_s": 8}),
+            ("--ipad-config", {"schema": 1, "first_frame_timeout_s": 21}),
+            ("--ipad-config", ["schema", 1]),
+        ]
+        for index, (flag, config) in enumerate(bad_configs):
+            with self.subTest(index=index):
+                self.fails("publish", flag, self.config_file(f"bad{index}.json", config))
+        self.fails("publish", "--windows-config", str(self.tmp / "missing.json"))
+        for note in ("two\u2028lines", "zero\u200bwidth", "reversed \u202etext", "\ufeffhidden"):
+            with self.subTest(note=note):
+                self.assertIn("--note", self.fails("publish", "--windows", "0.3.4", "--note", note))
+
+    def test_rollout_arguments_go_together_on_a_release(self):
+        for argv in (["publish", "--windows", "0.3.3", "--rollout-start", self.soon()],
+                     ["publish", "--windows", "0.3.3", "--rollout-days", "3"],
+                     ["rollback", "--windows", "0.3.2", "--rollout-start", self.soon(), "--rollout-days", "3"],
+                     ["publish", "--windows-config", "none", "--rollout-start", self.soon(), "--rollout-days", "3"]):
+            with self.subTest(argv):
+                self.fails(*argv)
+
+    def test_the_example_fields_are_fields_the_apps_accept(self):
+        latest = manifest("0.3.3", "0.3.3", 364)
+        for platform in ("windows", "ipad"):
+            latest[platform].update({key: EXAMPLE[platform][key] for key in ("note", "config")})
+            latest[platform]["rollout"] = {"start": self.soon(), "days": 3}
+        latest_json.safe_manifest(latest)
+        latest["ipad"]["config"]["attach_timeout_s"] = 45
+        with self.assertRaises(latest_json.ManifestError):
+            latest_json.safe_manifest(latest)
 
 
 if __name__ == "__main__":
