@@ -54,17 +54,41 @@ fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
     harness.run_steps(4);
 }
 
-/// Draws frames for `millis` and checks the popup stays closed in each.
-fn no_popup_for(harness: &mut Harness<'_, AnalyzerApp>, millis: u64, why: &str) {
+/// Draws frames for `millis` and checks the popup stays closed in each one
+/// that ends within the quiet period after `seen`, the earliest the app can
+/// have last seen an iPad (or launched). Later frames may open it: a slow
+/// machine has simply waited out the quiet period. With `ipad` connected,
+/// each frame moves `seen` on. Returns it.
+fn no_popup_for(
+    harness: &mut Harness<'_, AnalyzerApp>,
+    mut seen: Instant,
+    ipad: bool,
+    millis: u64,
+    why: &str,
+) -> Instant {
+    let quiet = std::time::Duration::from_millis(POPUP_QUIET_MS);
     let end = Instant::now() + std::time::Duration::from_millis(millis);
+    let mut checked = 0;
     loop {
+        let started = Instant::now();
+        if ipad {
+            seen = started;
+        }
         harness.run_steps(1);
-        assert!(!popup_shown(harness), "{why}");
+        // The frame read the time before this, so it was inside the period.
+        if Instant::now() < seen + quiet {
+            assert!(!popup_shown(harness), "{why}");
+            checked += 1;
+        }
         if Instant::now() >= end {
-            return;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    if checked == 0 {
+        eprintln!("not checked, every frame ended after the quiet period: {why}");
+    }
+    seen
 }
 
 fn snapshot(harness: &mut Harness<'_, AnalyzerApp>, shared: &SharedControl, name: &str) {
@@ -580,30 +604,39 @@ fn popup_waits_while_the_ipad_has_a_session(
     }
     .save();
     connect_ipad(shared);
+    let launched = Instant::now();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, 200, "the iPad is streaming");
+    let mut seen = no_popup_for(&mut window, launched, true, 200, "the iPad is streaming");
 
     // The pipeline restarts; the session stays. Longer than the quiet period.
     PIPELINE_STATS.lock().pipeline_running = false;
-    no_popup_for(
+    seen = no_popup_for(
         &mut window,
+        seen,
+        true,
         POPUP_QUIET_MS + 1000,
         "the iPad is still connected while the stream restarts",
     );
     PIPELINE_STATS.lock().pipeline_running = true;
-    no_popup_for(&mut window, 200, "the stream is back");
+    seen = no_popup_for(&mut window, seen, true, 200, "the stream is back");
 
     // Three USB drops, each followed by the iPad reconnecting.
     for _ in 0..3 {
         shared.session.lock().link_lost(PeerId::usb(7).link);
-        no_popup_for(&mut window, 300, "the iPad is reconnecting");
+        no_popup_for(&mut window, seen, false, 300, "the iPad is reconnecting");
         connect_ipad(shared);
-        no_popup_for(&mut window, 100, "the iPad reconnected");
+        seen = no_popup_for(&mut window, seen, true, 100, "the iPad reconnected");
     }
     // It stays away this time: the popup opens after the quiet period.
     shared.session.lock().link_lost(PeerId::usb(7).link);
-    no_popup_for(&mut window, 500, "too soon after the iPad left");
+    no_popup_for(
+        &mut window,
+        seen,
+        false,
+        500,
+        "too soon after the iPad left",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
@@ -627,9 +660,16 @@ fn popup_waits_after_launch(
     cached["popup"] = serde_json::Value::Null;
     cached["later"] = serde_json::Value::Null;
     std::fs::write(&state, cached.to_string()).unwrap();
+    let launched = Instant::now();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, POPUP_QUIET_MS - 1000, "too soon after launch");
+    no_popup_for(
+        &mut window,
+        launched,
+        false,
+        POPUP_QUIET_MS - 1000,
+        "too soon after launch",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")

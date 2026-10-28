@@ -1004,6 +1004,13 @@ mod tests {
             GAVE_UP.with(|gave_up| gave_up.get()),
             "quit did not stop waiting for the worker"
         );
+        // So the quit waited only on its two bounded waits: SHUTDOWN_WAIT
+        // for the worker, then FINAL_WRITE_WAIT for the fallback's write.
+        // Pin them, so lengthening either fails here.
+        assert_eq!(
+            (SHUTDOWN_WAIT, FINAL_WRITE_WAIT),
+            (Duration::from_secs(2), Duration::from_millis(250))
+        );
         stall.release();
         *STALLED_WRITE.lock().unwrap() = None;
         let messages = outbox_messages_once(&directory, |messages| {
