@@ -675,31 +675,30 @@ fn audio_stream_end_to_end() {
         // No audio for `duration` of a stream that visibly runs, and until
         // `done`. A loaded machine can take longer than `duration` to send
         // 30 video packets, so the window lasts until it has.
-        let assert_video_without_audio = |receiver: &mut FakeReceiver,
-                                          duration: Duration,
-                                          done: &dyn Fn() -> bool| {
-            let started = Instant::now();
-            let mut buffer = [0; 2048];
-            let mut video = 0;
-            while started.elapsed() < duration || video < 30 || !done() {
-                // Only a backstop for a stalled host.
-                assert!(
-                    started.elapsed() < Duration::from_secs(60),
-                    "video stopped while audio was off: {video} packets, done={}",
-                    done()
-                );
-                receiver.maybe_report(0, 0);
-                if let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) {
-                    match classify(&buffer[..len]) {
-                        Classified::Audio { .. } => {
-                            panic!("audio was sent without both peers opting in")
+        let assert_video_without_audio =
+            |receiver: &mut FakeReceiver, duration: Duration, done: &dyn Fn() -> bool| {
+                let started = Instant::now();
+                let mut buffer = [0; 2048];
+                let mut video = 0;
+                while started.elapsed() < duration || video < 30 || !done() {
+                    // Only a backstop for a stalled host.
+                    assert!(
+                        started.elapsed() < Duration::from_secs(60),
+                        "video stopped while audio was off: {video} packets, done={}",
+                        done()
+                    );
+                    receiver.maybe_report(0, 0);
+                    if let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) {
+                        match classify(&buffer[..len]) {
+                            Classified::Audio { .. } => {
+                                panic!("audio was sent without both peers opting in")
+                            }
+                            Classified::Media { .. } => video += 1,
+                            _ => {}
                         }
-                        Classified::Media { .. } => video += 1,
-                        _ => {}
                     }
                 }
-            }
-        };
+            };
         let always = || true;
 
         let mut legacy = FakeReceiver::connect(listen_port);
@@ -766,8 +765,7 @@ fn audio_stream_end_to_end() {
                     assert!(
                         header.discontinuity,
                         "audio skipped to {} after {} without a DISCONTINUITY",
-                        header.audio_seq,
-                        previous.audio_seq
+                        header.audio_seq, previous.audio_seq
                     );
                 }
                 assert!(header.capture_ts_us > previous.capture_ts_us);
@@ -2147,6 +2145,11 @@ fn pairing_flow_end_to_end() {
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
+        // As FakeReceiver's. Windows' default is 64 KiB, less than a
+        // keyframe here: one that arrives while this thread decodes can
+        // lose fragments, and later frames then decode without their
+        // reference, with wrong counters.
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024);
         let host = format!("127.0.0.1:{port}");
         let mut hello = Hello2 {
             proto_min: 2,
@@ -2225,6 +2228,8 @@ fn pairing_flow_end_to_end() {
         let mut assembler = Reassembler::new();
         let mut decoder = H264TestDecoder::new();
         let mut frames = Vec::new();
+        // Each whole frame's number and the counters decoded from it.
+        let mut decoded = Vec::new();
         let mut buffer = [0; 2048];
         let deadline = Instant::now() + Duration::from_secs(60);
         while frames.len() < 20 {
@@ -2245,10 +2250,15 @@ fn pairing_flow_end_to_end() {
                 payload,
                 Instant::now(),
             ) {
-                frames.extend(decoder.decode(&bytes));
+                let counters = decoder.decode(&bytes);
+                frames.extend(counters.iter().copied());
+                decoded.push((header.frame_seq, counters));
             }
         }
-        assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(
+            frames.windows(2).all(|pair| pair[1] > pair[0]),
+            "decoded counters out of order: {decoded:?}"
+        );
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
         // Reports keep the session alive, so only the BYE can end it: without
         // them it would expire after 3 s of silence anyway, and the deadline
