@@ -10,10 +10,22 @@ class UITestCase: XCTestCase {
 
 extension XCTestCase {
     /// What XCTest reports when its runner misses the exit of an app it
-    /// terminated. On CI's simulator the app exited 70 ms after SIGTERM,
-    /// but testmanagerd never passed that on, and the launch that had asked
-    /// for it failed after 60 s.
-    private static let missedExit = "Failed to terminate com.eternal.monitor"
+    /// terminated, whole: "Failed to terminate com.eternal.monitor:20016:
+    /// Failed to terminate com.eternal.monitor:0" on CI, where the app exited
+    /// 70 ms after SIGTERM but testmanagerd never passed that on, and the
+    /// launch that had asked for it failed after 60 s.
+    private static let missedExit = try! NSRegularExpression(
+        pattern: #"^Failed to terminate com\.eternal\.monitor:\d+(: Failed to terminate com\.eternal\.monitor:\d+)?$"#)
+
+    /// Whether `issue` is that fault. XCTest records its runner's launch
+    /// faults as assertion failures with no source location; every XCTAssert
+    /// and XCTFail in test code has one, so none of them can pass for it.
+    static func isMissedExit(_ issue: XCTIssue) -> Bool {
+        let text = issue.compactDescription
+        return issue.type == .assertionFailure
+            && issue.sourceCodeContext.location == nil
+            && missedExit.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
 
     /// Launches `app` with nothing left for XCTest to terminate first. If
     /// XCTest still misses an exit, that one failure is expected and the app
@@ -49,7 +61,7 @@ extension XCTestCase {
         let options = XCTExpectedFailure.Options()
         options.isStrict = false
         options.issueMatcher = { issue in
-            let matches = issue.compactDescription.contains(Self.missedExit)
+            let matches = Self.isMissedExit(issue)
             missed = missed || matches
             return matches
         }
@@ -63,15 +75,45 @@ extension XCTestCase {
 }
 
 final class UITestLaunchingTests: XCTestCase {
-    /// The runner's missed exit is expected, nothing else is: a crash of the
-    /// app during a launch still fails the test.
-    func testOnlyTheMissedExitIsExpected() {
-        XCTAssertTrue(expectingMissedExit {
-            XCTFail("Failed to terminate com.eternal.monitor:20016: Failed to terminate com.eternal.monitor:0")
-        })
+    private static let fault = "Failed to terminate com.eternal.monitor:20016: Failed to terminate com.eternal.monitor:0"
+
+    /// An issue as XCTest's runner raises it: an assertion failure with no
+    /// source location. (Recording one from here would give it this file's
+    /// location, so the matcher is checked on the issue itself.)
+    private func issue(_ text: String, type: XCTIssue.IssueType = .assertionFailure,
+                       line: Int? = nil) -> XCTIssue {
+        let context = line.map {
+            XCTSourceCodeContext(location: XCTSourceCodeLocation(filePath: #filePath, lineNumber: $0))
+        } ?? XCTSourceCodeContext()
+        return XCTIssue(type: type, compactDescription: text, sourceCodeContext: context)
+    }
+
+    /// Only the runner's missed exit, whole, is that fault: not the same text
+    /// from an assertion in test code, another launch fault, the text inside
+    /// another message, another issue type, or a crash of the app.
+    func testOnlyTheRunnersMissedExitMatches() {
+        XCTAssertTrue(Self.isMissedExit(issue(Self.fault)))
+        XCTAssertTrue(Self.isMissedExit(issue("Failed to terminate com.eternal.monitor:20016")))
+        XCTAssertFalse(Self.isMissedExit(issue(Self.fault, line: 7)))
+        XCTAssertFalse(Self.isMissedExit(issue("Failed to launch com.eternal.monitor: The request to open failed.")))
+        XCTAssertFalse(Self.isMissedExit(issue("Setup failed: \(Self.fault)")))
+        XCTAssertFalse(Self.isMissedExit(issue("\(Self.fault) (then the app crashed)")))
+        XCTAssertFalse(Self.isMissedExit(issue(Self.fault, type: .system)))
+        XCTAssertFalse(Self.isMissedExit(issue("com.eternal.monitor crashed in ConnectionManager")))
+    }
+
+    /// Through the helper, failures in test code are still failures, even
+    /// with the fault's text, and no failure means no relaunch.
+    func testFailuresInTestCodeStillFail() {
         XCTAssertFalse(expectingMissedExit {})
-        XCTExpectFailure("a crash is not the runner missing an exit") {
-            XCTAssertFalse(expectingMissedExit { XCTFail("com.eternal.monitor crashed in ConnectionManager") })
+        for text in [Self.fault, "com.eternal.monitor crashed in ConnectionManager"] {
+            // Strict, and only for this failure: if the helper swallowed it,
+            // this expectation goes unmet and the test fails.
+            let options = XCTExpectedFailure.Options()
+            options.issueMatcher = { $0.compactDescription.hasSuffix(text) }
+            XCTExpectFailure("\(text) is not the runner's missed exit", options: options) {
+                XCTAssertFalse(expectingMissedExit { XCTFail(text) }, "the helper expected a failure in test code")
+            }
         }
     }
 }
