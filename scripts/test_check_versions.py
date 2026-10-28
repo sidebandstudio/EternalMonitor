@@ -1,4 +1,6 @@
 """check-versions.sh must reject a publish that the download page would not show."""
+import copy
+import json
 import pathlib
 import re
 import shutil
@@ -103,6 +105,94 @@ class CheckVersionsTest(unittest.TestCase):
         script.write_text(script.read_text().replace("fetch('latest.json'", "fetch('other.json'"))
         result = self.run_check()
         self.assertNotEqual(result.returncode, 0, result.stdout)
+
+
+    # The optional fields both apps read (docs/remote-config.md), taken from
+    # the example manifest the Rust and Swift tests also read.
+    EXAMPLE = json.loads((ROOT / "proto/testdata/latest_remote_config.json").read_text())
+
+    def with_fields(self, platform, change):
+        latest = self.tmp / "docs/latest.json"
+        manifest = json.loads(latest.read_text())
+        change(manifest[platform])
+        latest.write_text(json.dumps(manifest, indent=2))
+        return self.run_check()
+
+    def example_fields(self, platform):
+        def change(entry):
+            for key in ("rollout", "config", "note"):
+                entry[key] = copy.deepcopy(self.EXAMPLE[platform][key])
+        return change
+
+    def test_the_example_fields_pass(self):
+        for platform in ("windows", "ipad"):
+            result = self.with_fields(platform, self.example_fields(platform))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def assert_rejected(self, platform, change, message):
+        def both(entry):
+            self.example_fields(platform)(entry)
+            change(entry)
+        result = self.with_fields(platform, both)
+        self.assertNotEqual(result.returncode, 0, f"{message}: {result.stdout}")
+        self.assertIn("FAIL", result.stdout + result.stderr, message)
+        self.tearDown()
+        self.setUp()
+
+    def test_bad_rollouts_are_refused(self):
+        bad = [
+            "2026-11-02",
+            {"start": "2026-11-02T00:00:00Z"},
+            {"start": "2026-11-02T00:00:00+01:00", "days": 7},
+            {"start": "2026-02-30T00:00:00Z", "days": 7},
+            {"start": "2026-11-02T00:00:00Z", "days": 15},
+            {"start": "2026-11-02T00:00:00Z", "days": -1},
+            {"start": "2026-11-02T00:00:00Z", "days": 2.5},
+            {"start": "2026-11-02T00:00:00Z", "days": True},
+            {"start": "2026-11-02T00:00:00Z", "days": 7, "percent": 10},
+        ]
+        for platform in ("windows", "ipad"):
+            for rollout in bad:
+                self.assert_rejected(platform, lambda e, r=rollout: e.update(rollout=r), f"{platform} {rollout}")
+
+    def test_bad_config_values_are_refused(self):
+        cases = [
+            ("windows", lambda c: c.update(schema=2)),
+            ("windows", lambda c: c.update(attach_timeout_s=19)),
+            ("windows", lambda c: c.update(attach_timeout_s=61)),
+            ("windows", lambda c: c.update(attach_timeout_s="45")),
+            ("windows", lambda c: c.update(attach_seconds=45)),
+            ("windows", lambda c: c.update(second_screen_rules=[c["second_screen_rules"][0]] * 17)),
+            ("windows", lambda c: c["second_screen_rules"].append({"gpus": ["intel", "nvidia"]})),
+            ("windows", lambda c: c["second_screen_rules"].append(
+                {"gpus": ["intel"], "windows": {"min": "22000.0", "max": "26100.0"}})),
+            ("windows", lambda c: c["second_screen_rules"].append(
+                {"gpus": ["intel"], "windows": {"min": "26100.9", "max": "26100.1"}})),
+            ("windows", lambda c: c["second_screen_rules"].append(
+                {"gpus": ["Intel"], "windows": {"min": "26100.0", "max": "26100.9"}})),
+            ("windows", lambda c: c["second_screen_rules"].append(
+                {"gpus": ["intel"], "gpu_driver": {"gpu": "nvidia", "min": "32.0", "max": "32.1"}})),
+            ("windows", lambda c: c["second_screen_rules"].append(
+                {"gpus": ["intel"], "windows": {"min": "26100.0", "max": "26100.9"}, "cpu": "arm"})),
+            ("ipad", lambda c: c.update(first_frame_timeout_s=7)),
+            ("ipad", lambda c: c.update(first_frame_timeout_s=21)),
+            ("ipad", lambda c: c.update(attach_timeout_s=45)),
+            ("ipad", lambda c: c.update(schema="1")),
+        ]
+        for index, (platform, change) in enumerate(cases):
+            self.assert_rejected(platform, lambda e, f=change: f(e["config"]), f"case {index}")
+
+    def test_bad_notes_and_unknown_keys_are_refused(self):
+        for platform in ("windows", "ipad"):
+            for change in [
+                lambda e: e.update(note="x" * 201),
+                lambda e: e.update(note="Two\nlines"),
+                lambda e: e.update(note=""),
+                lambda e: e.update(note=7),
+                lambda e: e.update(recommended="yes"),
+                lambda e: e.update(rolout={"start": "2026-11-02T00:00:00Z", "days": 7}),
+            ]:
+                self.assert_rejected(platform, change, platform)
 
 
 if __name__ == "__main__":
