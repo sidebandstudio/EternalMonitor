@@ -511,16 +511,36 @@ impl H264TestDecoder {
     }
 }
 
-/// Whether `seq` is in host stats ranges written like `3-5,9,+`.
-fn in_seq_ranges(ranges: &str, seq: u32) -> bool {
-    ranges.split(',').any(|range| {
-        let mut ends = range.splitn(2, '-').map(|end| end.parse::<u32>());
-        match (ends.next(), ends.next()) {
-            (Some(Ok(start)), None) => seq == start,
-            (Some(Ok(start)), Some(Ok(end))) => (start..=end).contains(&seq),
-            _ => false,
-        }
-    })
+/// The reassembler's 100 ms expiry on the stream's own clock, the time the
+/// host captured each frame: a frame expires only once frames captured
+/// 100 ms after it arrive, never because the test thread was descheduled
+/// between two of its fragments.
+fn stream_time(origin: Instant, header: &MediaHeader) -> Instant {
+    origin + Duration::from_micros(header.capture_ts_us)
+}
+
+/// Whether a stream's decoded frame counters rise within each stream epoch.
+/// A pipeline restart (the host's own watchdog, on a starved machine) starts
+/// a new epoch, which numbers its frames from 1 again.
+fn rising_within_epochs(frames: &[(u32, u64)]) -> bool {
+    frames
+        .windows(2)
+        .all(|pair| pair[0].0 != pair[1].0 || pair[1].1 > pair[0].1)
+}
+
+/// The sequence numbers in host stats ranges written like `3-5,9`.
+fn seq_ranges(ranges: &str) -> Vec<u32> {
+    ranges
+        .split(',')
+        .flat_map(|range| {
+            let mut ends = range.splitn(2, '-').map(|end| end.parse::<u32>());
+            match (ends.next(), ends.next()) {
+                (Some(Ok(start)), None) => start..=start,
+                (Some(Ok(start)), Some(Ok(end))) => start..=end,
+                _ => 1..=0,
+            }
+        })
+        .collect()
 }
 
 /// The fake iPad: one socket, HELLO2 handshake, media reassembly, reports.
@@ -736,6 +756,8 @@ fn audio_stream_end_to_end() {
         let mut audio_packets = 0;
         let mut quiet_packets = 0;
         let mut missing = 0;
+        // Every sequence number the host recorded dropping.
+        let mut recorded = std::collections::HashSet::new();
         let mut pcm = Vec::new();
         // A backstop for a stalled host. 130 packets take 2.6 s, and hold
         // one 100 ms silence; when the host dropped some of it, the next
@@ -756,36 +778,36 @@ fn audio_stream_end_to_end() {
             assert!(len <= 576);
             let (header, payload) = AudioHeader::decode(&buffer[..len]).unwrap();
             assert_eq!(header.session_id, receiver.session_id);
+            // The host records each drop by number before a later packet
+            // goes out. Its lists hold 32 ranges, which a loaded run fills,
+            // so empty them into `recorded` at every packet.
+            {
+                let mut stats = eternal_host::stats::PIPELINE_STATS.lock();
+                let audio = &mut stats.audio;
+                for list in [&mut audio.late_seqs, &mut audio.failed_seqs] {
+                    let taken = std::mem::take(list).to_string();
+                    assert!(
+                        !taken.ends_with('+'),
+                        "the host's list of dropped audio filled between two packets: {taken}"
+                    );
+                    recorded.extend(seq_ranges(&taken));
+                }
+            }
             if let Some(previous) = previous {
                 // A loaded host drops packets that miss their send deadline
-                // or find the queue full. It counts each drop before a later
-                // packet goes out, and marks that packet as a discontinuity.
-                // Any other missing packet is lost numbering.
+                // or find the queue full. It records each drop, and marks the
+                // next packet it sends as a discontinuity. Any other missing
+                // packet is lost numbering.
                 let skipped = header
                     .audio_seq
                     .wrapping_sub(previous.audio_seq)
                     .wrapping_sub(1);
                 if skipped > 0 {
                     missing += u64::from(skipped);
-                    // Each missing packet must be one the host recorded by
-                    // number. Its lists keep 32 ranges; past that, fall back
-                    // to the count of drops.
-                    let (late, failed, dropped) = {
-                        let stats = eternal_host::stats::PIPELINE_STATS.lock();
-                        let audio = &stats.audio;
-                        (
-                            audio.late_seqs.to_string(),
-                            audio.failed_seqs.to_string(),
-                            audio.dropped,
-                        )
-                    };
-                    let truncated = late.ends_with('+') || failed.ends_with('+');
                     for seq in (1..=skipped).map(|n| previous.audio_seq.wrapping_add(n)) {
                         assert!(
-                            in_seq_ranges(&late, seq)
-                                || in_seq_ranges(&failed, seq)
-                                || (truncated && missing <= dropped),
-                            "audio {seq} is missing but the host did not record it: late {late}, failed {failed}"
+                            recorded.contains(&seq),
+                            "audio {seq} is missing but the host did not record dropping it"
                         );
                     }
                     assert!(
@@ -2259,9 +2281,10 @@ fn pairing_flow_end_to_end() {
             advertised_fps: paired.stream_config.fps,
         };
         let mut assembler = Reassembler::new();
+        let origin = Instant::now();
         let mut decoder = H264TestDecoder::new();
         let mut frames = Vec::new();
-        // Each whole frame's number and the counters decoded from it.
+        // Each whole frame's epoch and number and the counters decoded from it.
         let mut decoded = Vec::new();
         let mut buffer = [0; 2048];
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -2281,15 +2304,19 @@ fn pairing_flow_end_to_end() {
                 header.frag_count,
                 header.stream_epoch,
                 payload,
-                Instant::now(),
+                stream_time(origin, &header),
             ) {
                 let counters = decoder.decode(&bytes);
-                frames.extend(counters.iter().copied());
-                decoded.push((header.frame_seq, counters));
+                frames.extend(
+                    counters
+                        .iter()
+                        .map(|&counter| (header.stream_epoch, counter)),
+                );
+                decoded.push((header.stream_epoch, header.frame_seq, counters));
             }
         }
         assert!(
-            frames.windows(2).all(|pair| pair[1] > pair[0]),
+            rising_within_epochs(&frames),
             "decoded counters out of order: {decoded:?}"
         );
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
@@ -2305,34 +2332,54 @@ fn pairing_flow_end_to_end() {
         hello.client_nonce += 1;
         hello.pairing_code = 0;
         hello.auth_token = paired.auth_token;
+        // From before the session can exist, so every gap is counted.
+        let reconnecting = Instant::now();
         let reconnected = exchange(&hello);
         assert_eq!(reconnected.status, HelloStatus::Ok);
         assert_ne!(reconnected.session_id, paired.session_id);
-        let mut receiver = FakeReceiver {
-            session_id: reconnected.session_id,
-            msg_seq: 1,
-            last_report: Instant::now() - Duration::from_secs(1),
-            host_caps: reconnected.host_caps,
-            advertised_fps: reconnected.stream_config.fps,
-            ..receiver
+        // As after the BYE, reports keep the session alive, here from their
+        // own thread, so they go on through the revoked handshake. It
+        // returns the longest time the session went without one.
+        let keepalive = {
+            let socket = socket.try_clone().unwrap();
+            let host = host.clone();
+            let shared = shared.clone();
+            let session_id = reconnected.session_id;
+            std::thread::spawn(move || {
+                let (mut last, mut longest, mut msg_seq) = (reconnecting, Duration::ZERO, 1);
+                while shared.client_connected() {
+                    msg_seq += 1;
+                    let report = ControlMessage::ReceiverReport(ReceiverReport::default());
+                    socket
+                        .send_to(&encode_control(session_id, msg_seq, &report), &host)
+                        .unwrap();
+                    longest = longest.max(last.elapsed());
+                    last = Instant::now();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                longest.max(last.elapsed())
+            })
         };
-        receiver.maybe_report(0, 0);
         shared.pairing.lock().regenerate_token().unwrap();
         hello.client_nonce += 1;
         let revoked = exchange(&hello);
         assert_eq!(revoked.status, HelloStatus::Unauthorized);
         assert_eq!(revoked.auth_token, [0; 16]);
-        // As after the BYE: reports keep the session alive, so only the
-        // token reset can end it.
         let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_connected() {
             assert!(
                 Instant::now() < deadline,
                 "token reset did not revoke session"
             );
-            receiver.maybe_report(0, 0);
             std::thread::sleep(Duration::from_millis(5));
         }
+        // The session never went the liveness timeout without a report, so
+        // it could not have expired: the token reset ended it.
+        let longest = keepalive.join().unwrap();
+        assert!(
+            longest < Duration::from_millis(u64::from(reconnected.liveness_timeout_ms)),
+            "the session went {longest:?} without a report, so it may have expired instead of being revoked"
+        );
     }));
     shared.stop();
     tx.send(SupervisorCommand::Shutdown).unwrap();
@@ -2373,11 +2420,13 @@ fn preferred_fps_caps_the_host() {
         let mut receiver = FakeReceiver::connect_preferred(port, CAP_DECODE_H264, 0, 30);
         assert_eq!(receiver.advertised_fps, 30);
         let mut assembler = Reassembler::new();
+        let origin = Instant::now();
         let mut decoder = H264TestDecoder::new();
         let mut frames = Vec::new();
         let mut buffer = [0; 2048];
         let mut heartbeat_seen = false;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // A backstop: at load ~700, libx264 made only 4 frames a second.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while frames.len() < 45 || !heartbeat_seen {
             assert!(Instant::now() < deadline, "capped stream must still decode");
             receiver.maybe_report(0, frames.len() as u32);
@@ -2397,21 +2446,32 @@ fn preferred_fps_caps_the_host() {
                 header.frag_count,
                 header.stream_epoch,
                 payload,
-                Instant::now(),
+                stream_time(origin, &header),
             ) {
-                frames.extend(decoder.decode(&bytes));
+                let counters = decoder.decode(&bytes);
+                frames.extend(
+                    counters
+                        .iter()
+                        .map(|&counter| (header.stream_epoch, counter)),
+                );
             }
         }
-        assert!(frames.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(
+            rising_within_epochs(&frames),
+            "decoded counters out of order: {frames:?}"
+        );
         assert_eq!(shared.effective_fps(), 30);
         assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Reports keep the session alive, so only the BYE can release the
+        // cap; the deadline is only a backstop.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while shared.client_preferred_fps.load(Ordering::SeqCst) != 0 {
             assert!(
                 Instant::now() < deadline,
                 "disconnect must release the client cap"
             );
+            receiver.maybe_report(0, frames.len() as u32);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(shared.effective_fps(), 120);
@@ -2428,7 +2488,7 @@ fn preferred_fps_caps_the_host() {
         let _ = done_tx.send(());
     });
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .expect("bounded shutdown");
     if let Err(error) = outcome {
         std::panic::resume_unwind(error);
