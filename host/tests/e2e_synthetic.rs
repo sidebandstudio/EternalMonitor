@@ -511,6 +511,18 @@ impl H264TestDecoder {
     }
 }
 
+/// Whether `seq` is in host stats ranges written like `3-5,9,+`.
+fn in_seq_ranges(ranges: &str, seq: u32) -> bool {
+    ranges.split(',').any(|range| {
+        let mut ends = range.splitn(2, '-').map(|end| end.parse::<u32>());
+        match (ends.next(), ends.next()) {
+            (Some(Ok(start)), None) => seq == start,
+            (Some(Ok(start)), Some(Ok(end))) => (start..=end).contains(&seq),
+            _ => false,
+        }
+    })
+}
+
 /// The fake iPad: one socket, HELLO2 handshake, media reassembly, reports.
 struct FakeReceiver {
     socket: UdpSocket,
@@ -755,13 +767,27 @@ fn audio_stream_end_to_end() {
                     .wrapping_sub(1);
                 if skipped > 0 {
                     missing += u64::from(skipped);
-                    let dropped = eternal_host::stats::PIPELINE_STATS.lock().audio.dropped;
-                    assert!(
-                        missing <= dropped,
-                        "audio skipped to {} after {}: {missing} packets missing, {dropped} dropped",
-                        header.audio_seq,
-                        previous.audio_seq
-                    );
+                    // Each missing packet must be one the host recorded by
+                    // number. Its lists keep 32 ranges; past that, fall back
+                    // to the count of drops.
+                    let (late, failed, dropped) = {
+                        let stats = eternal_host::stats::PIPELINE_STATS.lock();
+                        let audio = &stats.audio;
+                        (
+                            audio.late_seqs.to_string(),
+                            audio.failed_seqs.to_string(),
+                            audio.dropped,
+                        )
+                    };
+                    let truncated = late.ends_with('+') || failed.ends_with('+');
+                    for seq in (1..=skipped).map(|n| previous.audio_seq.wrapping_add(n)) {
+                        assert!(
+                            in_seq_ranges(&late, seq)
+                                || in_seq_ranges(&failed, seq)
+                                || (truncated && missing <= dropped),
+                            "audio {seq} is missing but the host did not record it: late {late}, failed {failed}"
+                        );
+                    }
                     assert!(
                         header.discontinuity,
                         "audio skipped to {} after {} without a DISCONTINUITY",
@@ -803,6 +829,13 @@ fn audio_stream_end_to_end() {
         assert!(
             quiet_packets >= 5,
             "100 ms silence did not produce small Opus packets"
+        );
+        // Dropping is how a loaded host keeps audio current, but not most of
+        // it. On devbox1 it dropped up to 6 per 190 sent at load ~350, and
+        // up to 76 per 130 at load ~860 with 750 busy loops beside it.
+        assert!(
+            missing <= audio_packets,
+            "the host dropped {missing} audio packets and sent {audio_packets}"
         );
         eprintln!(
             "Audio E2E decoded={audio_packets}, tone={tone_db:.2} dBFS, quiet={quiet_packets}, missing={missing}"
