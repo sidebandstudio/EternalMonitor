@@ -1,14 +1,14 @@
 import XCTest
 
 /// scripts/test_ios.sh starts the real synthetic host on this dedicated port.
-final class StreamDiagnosticsTests: XCTestCase {
+final class StreamDiagnosticsTests: UITestCase {
     func testQualityPopoverShowsRepairsAndJitter() {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = "127.0.0.1:19875"
         app.launchEnvironment["EM_UDP_BACKEND"] = "bsd"
-        app.launch()
+        launchCleanly(app)
         let hud = app.buttons["display.hud"]
         if !hud.waitForExistence(timeout: 2) {
             // The normal HUD fades after five seconds. Reveal it with the

@@ -1,13 +1,13 @@
 import XCTest
 
-final class AudioStreamTests: XCTestCase {
+final class AudioStreamTests: UITestCase {
     func testAudioStatusAndLiveMuteKeepVideoConnected() {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         let hud = app.buttons["display.hud"]
         XCTAssertTrue(hud.waitForExistence(timeout: 10))
         waitForHUD(app, containing: "PC audio playing")

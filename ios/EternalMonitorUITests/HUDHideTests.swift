@@ -3,7 +3,7 @@ import XCTest
 /// The HUD slides away five seconds after it appears. Once it starts leaving,
 /// a tap anywhere along its way out must reach the stream, so the
 /// three-finger reveal works there instead of pressing a HUD button.
-final class HUDHideTests: XCTestCase {
+final class HUDHideTests: UITestCase {
     func testLeavingHUDPassesTapsToTheStream() {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
@@ -13,7 +13,7 @@ final class HUDHideTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
                                "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
-        app.launch()
+        launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
@@ -56,7 +56,7 @@ final class HUDHideTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
                                "-playPCaudio", "NO", "-assumeVoiceOver", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
-        app.launch()
+        launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
