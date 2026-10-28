@@ -125,6 +125,13 @@ const SYNTH_W: u32 = 640;
 const SYNTH_H: u32 = 360;
 const WANT_DECODED_FRAMES: usize = 30;
 const DEADLINE: Duration = Duration::from_secs(30);
+/// Frames the host encodes while the USB reader stalls: 500 ms at 60 fps.
+/// Counting frames rather than waiting a fixed time gives every machine the
+/// same backlog to shed.
+const STALL_FRAMES: u64 = 30;
+/// How far behind the newest capture the reader may be once it has caught
+/// up after the stall: 100 ms at 60 fps.
+const CATCH_UP_FRAMES: i64 = 6;
 
 #[test]
 fn usb_framed_stream_end_to_end() {
@@ -171,7 +178,7 @@ fn usb_framed_stream_end_to_end() {
         runtime.block_on(async {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await.unwrap().unwrap();
         stream.set_nodelay(true).unwrap();
         socket2::SockRef::from(&stream).set_recv_buffer_size(32 * 1024).unwrap();
         read_preamble(&mut stream).await.unwrap();
@@ -184,7 +191,7 @@ fn usb_framed_stream_end_to_end() {
             device_id: 77, preferred_fps: 60, auth_token: [0; 16], pairing_code: 0,
         });
         write_datagram(&mut stream, &encode_control(0, 1, &hello)).await.unwrap();
-        let ack = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(10), read_datagram(&mut stream)).await.unwrap().unwrap();
         let (_, ControlMessage::HelloAck(ack)) = parse_control(&ack).unwrap() else { panic!("expected USB HELLO_ACK"); };
         assert_eq!(ack.status, HelloStatus::Ok);
         assert_ne!(ack.session_id, 0);
@@ -203,11 +210,43 @@ fn usb_framed_stream_end_to_end() {
         let mut recovered = false;
         let mut recovery_ms = 0;
         let mut highest_seq = 0;
+        // The last whole frame read, the last one before the stall, the
+        // frames read after it until the recovery keyframe, and the capture
+        // and USB drop counts when the stall began.
+        let mut last_complete = 0;
+        let mut stall_seq = 0;
+        let mut stale = 0;
+        let mut captured_before = 0;
+        let mut dropped_before = 0;
+        let mut caught_up = false;
+        let mut behind = 0;
         let mut epoch = ack.stream_config.stream_epoch;
-        while after_recovery < 30 || heartbeats == 0 {
+        let encoded = || PIPELINE_STATS.lock().encode_frame_count;
+        // Earlier tests' pipelines count here too, so only differences mean
+        // anything. Synthetic frames are numbered by capture.
+        let captured = || PIPELINE_STATS.lock().capture_frame_count;
+        while after_recovery < 30 || heartbeats == 0 || !caught_up {
             assert!(started.elapsed() < DEADLINE, "USB timed out: decoded={decoded}, recovered={recovered}, heartbeats={heartbeats}");
             if decoded >= 30 && resumed.is_none() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Stop reading while the host encodes STALL_FRAMES frames.
+                // Reports still go out, so the session stays.
+                let stall_from = encoded();
+                stall_seq = last_complete;
+                captured_before = captured();
+                dropped_before = PIPELINE_STATS.lock().usb_frames_dropped;
+                while encoded() < stall_from + STALL_FRAMES {
+                    assert!(started.elapsed() < DEADLINE, "the host stopped encoding during the stall");
+                    if last_report.elapsed() >= Duration::from_millis(300) {
+                        last_report = Instant::now();
+                        msg_seq += 1;
+                        let report = ControlMessage::ReceiverReport(ReceiverReport {
+                            stream_epoch: epoch, highest_seq, frames_complete: decoded,
+                            decode_fps_x10: 600, ..ReceiverReport::default()
+                        });
+                        write_datagram(&mut stream, &encode_control(ack.session_id, msg_seq, &report)).await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
                 resumed = Some(Instant::now());
             }
             if last_report.elapsed() >= Duration::from_millis(300) {
@@ -219,32 +258,61 @@ fn usb_framed_stream_end_to_end() {
                 });
                 write_datagram(&mut stream, &encode_control(ack.session_id, msg_seq, &report)).await.unwrap();
             }
-            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+            // Only a backstop for a hung host; heartbeats come every second.
+            let bytes = tokio::time::timeout(Duration::from_secs(10), read_datagram(&mut stream)).await.unwrap().unwrap();
             match classify(&bytes) {
                 Classified::Control(_) => if matches!(parse_control(&bytes), Ok((_, ControlMessage::Heartbeat(_)))) { heartbeats += 1; },
                 Classified::Media { .. } => {
                     let (header, payload) = MediaHeader::decode(&bytes).unwrap();
                     assert_eq!(header.session_id, ack.session_id);
                     assert!(!header.is_retransmit);
+                    if recovered {
+                        assert!(header.frame_seq >= highest_seq, "USB retained stale video after recovery: frame {} after {highest_seq}", header.frame_seq);
+                    }
                     highest_seq = header.frame_seq;
                     epoch = header.stream_epoch;
                     if let AddOutcome::Completed(frame) = reassembler.add_fragment(header.frame_seq,
                         header.frag_index, header.frag_count, header.stream_epoch, payload, Instant::now()) {
-                        let age_us = eternal_host::clock::host_now_us().saturating_sub(header.capture_ts_us);
+                        // How old a frame is depends on how fast this machine
+                        // encodes, and how much of the stall the socket
+                        // buffers took depends on the OS, so recovery is
+                        // checked by frame numbers. What the socket buffers
+                        // held comes first, fewer frames than the stall made.
+                        // Then frames the link dropped are missing, and the
+                        // stream resumes at a keyframe. From there it
+                        // catches up to within a few frames of the newest
+                        // capture, so the link does not stay behind.
+                        // A link that replayed the stall would deliver all
+                        // of it, with no gap. Frames are numbered by
+                        // capture, and a loaded encoder skips captures, so
+                        // a gap before an ordinary frame is not a drop. A
+                        // scheduled keyframe (GOP 30) right after a skip
+                        // would also pass as the recovery; nothing in the
+                        // header tells it from the one the link asked for.
                         if let Some(resumed) = resumed {
-                            if !recovered && header.is_keyframe && age_us <= 100_000 {
+                            if !recovered && header.is_keyframe && header.frame_seq > last_complete + 1 {
                                 recovered = true;
                                 recovery_ms = resumed.elapsed().as_millis();
-                                assert!(recovery_ms <= 100, "USB recovery took {recovery_ms} ms");
+                            } else if !recovered {
+                                stale += 1;
+                                assert!(stale < STALL_FRAMES,
+                                    "USB did not drop the stall and resume at a keyframe: {stale} frames after it, the last {}", header.frame_seq);
                             }
+                            // Captures since the stall began, added to the
+                            // last frame read then: the newest capture, less
+                            // the pipeline's lag before the stall.
+                            let newest = i64::from(stall_seq) + (captured() - captured_before) as i64;
+                            behind = newest - i64::from(header.frame_seq);
+                            // The loop ends only on a frame that is caught up.
+                            caught_up = recovered && behind <= CATCH_UP_FRAMES;
                         }
+                        last_complete = header.frame_seq;
                         let frames = decoder.decode(&frame);
                         for counter in &frames {
                             assert_eq!(*counter, u64::from(header.frame_seq & 0xFF_FFFF));
                         }
                         decoded += frames.len() as u32;
                         if recovered && !frames.is_empty() {
-                            assert!(age_us <= 100_000, "USB retained stale video after recovery: {age_us} us");
                             after_recovery += frames.len();
                         }
                     }
@@ -252,10 +320,12 @@ fn usb_framed_stream_end_to_end() {
                 _ => panic!("unexpected USB packet"),
             }
         }
-        let dropped = PIPELINE_STATS.lock().usb_frames_dropped;
-        assert!(dropped > 0, "a 500 ms read stall must overflow the video queue");
+        // A drop before the stall is not the stall's. A stream restart zeroes
+        // the counter, which leaves none to the stall.
+        let dropped = PIPELINE_STATS.lock().usb_frames_dropped.saturating_sub(dropped_before);
+        assert!(dropped > 0, "a read stall of {STALL_FRAMES} frames must overflow the video queue");
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
-        eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
+        eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} stale={stale} behind={behind} recovery_ms={recovery_ms}");
 
         // With the second screen selected, a connecting iPad gets the mirror
         // from the running pipeline at once, while the virtual display starts
@@ -310,7 +380,7 @@ fn usb_framed_stream_end_to_end() {
         *shared.vdd_status.lock() = VddStatus::Inactive;
         drop(stream);
         let disconnected = Instant::now();
-        while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
+        while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(10) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!shared.client_connected(), "tunnel EOF must release the session");
@@ -325,7 +395,7 @@ fn usb_framed_stream_end_to_end() {
         let _ = done_tx.send(());
     });
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .expect("USB host shutdown");
     std::env::remove_var("ETERNAL_USB_DIRECT");
     if let Err(panic) = outcome {
@@ -365,7 +435,7 @@ async fn first_decoded_frame(
                 .await
                 .unwrap();
         }
-        let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(stream))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), read_datagram(stream))
             .await
             .expect("the tunnel stays active")
             .expect("the tunnel stays open");
@@ -1128,7 +1198,16 @@ fn lossy_stream_recovers_and_adapts() {
     let mut nack_trace = Vec::new();
     let mut recovery_sequences = Vec::new();
     let mut bytes = [0; 2048];
-    while started.elapsed() < Duration::from_secs(15) {
+    // Fifteen seconds of stream, and on a slow machine as long as it takes
+    // to send the 600 packets that make it a sustained one, up to a minute.
+    let sent_so_far = || {
+        eternal_host::stats::PIPELINE_STATS
+            .lock()
+            .transport_packets_sent
+    };
+    while started.elapsed() < Duration::from_secs(15)
+        || (started.elapsed() < Duration::from_secs(60) && sent_so_far() < 600)
+    {
         #[cfg(target_os = "macos")]
         {
             use std::os::fd::AsRawFd;

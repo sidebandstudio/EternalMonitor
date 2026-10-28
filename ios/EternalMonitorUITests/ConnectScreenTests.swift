@@ -1,6 +1,6 @@
 import XCTest
 
-final class ConnectScreenTests: XCTestCase {
+final class ConnectScreenTests: UITestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
@@ -8,7 +8,7 @@ final class ConnectScreenTests: XCTestCase {
     func testConnectControls() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.textFields["connect.port"].exists)
@@ -26,7 +26,7 @@ final class ConnectScreenTests: XCTestCase {
     func testSettingsOpenAndDismiss() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         settings.tap()
@@ -67,7 +67,7 @@ final class ConnectScreenTests: XCTestCase {
     func testScrollingFromThePictureRowKeepsTheChoice() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-pictureFit", "fit"]
-        app.launch()
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         let picture = app.buttons["settings.pictureFit"]
@@ -111,7 +111,7 @@ final class ConnectScreenTests: XCTestCase {
     func testPairingCodeAsAddressIsExplainedAtOnce() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "390756", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -128,7 +128,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "searchFailed"
-        app.launch()
+        launchCleanly(app)
         let title = app.staticTexts["connect.scanProblemTitle"]
         XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
         XCTAssertEqual(title.label, "Couldn't search for PCs")
@@ -146,7 +146,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         // 192.0.2.1 is a documentation address: nothing ever answers.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "192.0.2.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -166,7 +166,7 @@ final class ConnectScreenTests: XCTestCase {
     func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let diagnostics = app.buttons["settings.diagnostics"]
@@ -182,26 +182,37 @@ final class ConnectScreenTests: XCTestCase {
         let share = app.navigationBars["UIActivityContentView"]
         // On a cold simulator, Apple's remote share-sheet container can appear
         // before its contents finish loading. Still require the document and
-        // export actions once the remote interface is ready.
-        XCTAssertTrue(share.waitForExistence(timeout: 30), app.debugDescription)
-        XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
-        let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
-        XCTAssertTrue(documentType.waitForExistence(timeout: 5))
+        // export actions once the remote interface is ready. The waits are
+        // long because a loaded simulator is slow, not because speed is
+        // tested here: on a busy Mac the remote sheet took 78 s to draw.
+        XCTAssertTrue(share.waitForExistence(timeout: 120), app.debugDescription)
+        // The header names our file. Once the file's preview has loaded it
+        // shows the title over "Text Document"; while it hasn't, and on a
+        // loaded simulator it can stay that way, it shows the file name,
+        // whose extension names the type.
+        let title = "EternalMonitor-iPad-diagnostics"
+        let header = share.otherElements.matching(NSPredicate(
+            format: "label == %@ OR label == %@", title, "\(title).txt")).firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 30), app.debugDescription)
+        if header.label == title {
+            let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
+            XCTAssertTrue(documentType.waitForExistence(timeout: 30), app.debugDescription)
+        }
         let save = app.cells["Save to Files"]
-        XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(save.waitForExistence(timeout: 30), app.debugDescription)
         XCTAssertTrue(save.isEnabled)
         // Verify our exported attachment and share actions. The Files provider
         // can remain uninitialized on a fresh simulator after its picker opens.
         app.buttons["header.closeButton"].tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
-        waitForExpectations(timeout: 5)
+        waitForExpectations(timeout: 30)
         XCTAssertTrue(app.buttons["diagnostics.export"].isEnabled)
     }
 
     func testFrameRatePreference() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let rate = app.buttons["settings.targetFPS"]
@@ -215,7 +226,7 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "settings-fps120"; shot.lifetime = .keepAlways; add(shot)
         app.terminate()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         XCTAssertTrue(rate.waitForExistence(timeout: 5))

@@ -564,16 +564,17 @@ mod tests {
                 fs::write(ready, reporter.to_string()).unwrap();
             })
         };
-        assert!(wait_until_ready(&ready, reporter, Duration::from_secs(5)));
+        // The wait is long enough for any machine; it ends when the file
+        // appears.
+        assert!(wait_until_ready(&ready, reporter, Duration::from_secs(60)));
         writer.join().unwrap();
-        // A reporter that exited reads nothing, ready or not.
+        // A reporter that exited reads nothing, ready or not, and is not
+        // waited for. Its process is made before the clock starts, and the
+        // wait is long enough that returning early cannot be the machine.
+        let exited = exited_process();
         let started = Instant::now();
-        assert!(!wait_until_ready(
-            &ready,
-            exited_process(),
-            Duration::from_secs(5)
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!wait_until_ready(&ready, exited, Duration::from_secs(60)));
+        assert!(started.elapsed() < Duration::from_secs(30));
         fs::remove_dir_all(directory).unwrap();
     }
 

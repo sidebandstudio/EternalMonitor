@@ -214,7 +214,7 @@ impl AnalyzerApp {
         let connected = ipad_nearby(
             client.info.is_some(),
             &mut self.ipad_last_seen,
-            Instant::now(),
+            super::popup_now(),
             self.popup_quiet,
         );
         let Some(popup) = self.updates.popup() else {
