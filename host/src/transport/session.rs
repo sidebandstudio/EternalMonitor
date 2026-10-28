@@ -1378,10 +1378,7 @@ mod tests {
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
-        assert_eq!(
-            session.last_end(),
-            Some((second, EndReason::Liveness))
-        );
+        assert_eq!(session.last_end(), Some((second, EndReason::Liveness)));
     }
 
     #[test]
