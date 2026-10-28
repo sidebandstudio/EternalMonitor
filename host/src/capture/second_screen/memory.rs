@@ -235,6 +235,11 @@ const CLEAR_RETRY: Duration = Duration::from_secs(60);
 pub(crate) struct Memory {
     store: Option<Store>,
     failed: Option<Failed>,
+    /// The try after the saved failure's wait failed for a reason that
+    /// passes. This app run then mirrors until Try again, as after any such
+    /// failure, instead of trying again at each connection. The saved
+    /// failure and its count stay for the next app run.
+    excused: bool,
     /// A forgotten failure is still in the file, and when clearing it was
     /// last tried: removing, replacing and overwriting it all failed. This app
     /// run treats it as cleared and tries again at the next success or Try
@@ -284,6 +289,7 @@ impl Memory {
                 io: Io::FILES,
             }),
             failed,
+            excused: false,
             uncleared: None,
             clear_failure_logged: false,
             rule: None,
@@ -405,9 +411,16 @@ impl Memory {
         })
     }
 
-    /// Whether a failure is saved, held or due.
+    /// Whether a failure is saved, held or due, and not
+    /// [`Memory::excused`].
     pub(crate) fn saved(&self) -> bool {
-        self.failed.is_some()
+        self.failed.is_some() && !self.excused
+    }
+
+    /// The try after the wait failed for a reason that passes; see
+    /// [`Memory::excused`].
+    pub(crate) fn excuse(&mut self) {
+        self.excused = true;
     }
 
     /// An attempt failed for `reason`. Saves it when it is one to remember,
@@ -426,6 +439,7 @@ impl Memory {
             Ok(()) => self.uncleared = None,
             Err(error) => warn!(%error, "Could not save the second screen record"),
         }
+        self.excused = false;
         self.failed = Some(Failed {
             reason,
             failures,
@@ -445,6 +459,7 @@ impl Memory {
             self.note_worked();
         }
         let forgot = self.failed.take().is_some();
+        self.excused = false;
         if forgot || (success && self.uncleared.is_some()) {
             self.clear(now);
         } else {
@@ -986,6 +1001,48 @@ mod tests {
         }
     }
 
+    /// Round 5: a try after the wait that failed for a reason that passes
+    /// kept the expired record, so every later connection in that app run
+    /// turned the driver on again.
+    #[test]
+    fn a_passing_failure_after_the_wait_mirrors_for_the_rest_of_the_app_run() {
+        use super::super::{note_capture_error, note_interruption};
+        let path = temp_file("expired-then-passing");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("no_frames", start).unwrap();
+        // The next app run is past the hour, so it tries, and the lock
+        // screen ends the try.
+        let (memory, start) = app_run(&path, hours(2));
+        assert!(memory.saved() && memory.hold(start).is_none());
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 1, start);
+        note_interruption(&shared, 1);
+        note_capture_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + secs(1)),
+            Step::Fallback("duplication_failed")
+        );
+        assert!(!retries_later(&shared));
+        // This app run mirrors until Try again, without trying by itself.
+        for minute in 1..=180 {
+            let now = start + Duration::from_secs(60 * minute);
+            reconnect(&shared, now);
+            assert_eq!(next_step(&shared, now), Step::Nothing, "minute {minute}");
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        }
+        // The saved count stays for the next app run's wait, and Try again
+        // still forgets it.
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+        shared.retry_second_screen();
+        assert!(!path.exists());
+        assert_eq!(next_step(&shared, start + hours(3)), Step::Attach);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// The second screen shown up to the switch, then proving itself.
     fn proving_second_screen(path: &Path) -> (SharedControl, Instant) {
         let (memory, start) = app_run(path, Duration::ZERO);
@@ -1037,6 +1094,45 @@ mod tests {
         );
         assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Round 5: a retry that failed with an error that doesn't pass kept the
+    /// recovery after it from restarting the window, and a retry that then
+    /// failed with one that passes still saved the failure. The last retry
+    /// decides.
+    #[test]
+    fn the_last_retry_after_a_lost_desktop_decides() {
+        use super::super::{
+            note_interruption, note_passing_retry_error, note_persistent_error, note_recovery,
+        };
+        // Lost at 1 s, UNSUPPORTED at 2 s, back at 4 s: the window runs to 9 s.
+        let path = temp_file("unsupported-then-back");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        note_recovery(&shared, 1, start + secs(4));
+        assert_eq!(next_step(&shared, start + PROVE_TIMEOUT), Step::Nothing);
+        assert_eq!(next_step(&shared, start + secs(8)), Step::Nothing);
+        assert_eq!(
+            next_step(&shared, start + secs(9)),
+            Step::Fallback("no_frames")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // Lost, UNSUPPORTED, then another capturing app until the window
+        // ends: this app run only.
+        let path = temp_file("unsupported-then-passing");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        note_passing_retry_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(!path.exists());
+        assert!(!retries_later(&shared));
     }
 
     /// Round 4: losses that pass never save a failure, however many. The

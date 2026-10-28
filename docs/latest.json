@@ -8,8 +8,8 @@
     "note": "Fixes Second screen not starting on some PCs, especially laptops with Intel and NVIDIA graphics. Your iPad now shows your screen right away while the second screen starts."
   },
   "ipad": {
-    "version": "0.3.2",
-    "build": 316,
+    "version": "0.3.3",
+    "build": 364,
     "testflight": "https://testflight.apple.com/join/ppc9QfXc"
   }
 }

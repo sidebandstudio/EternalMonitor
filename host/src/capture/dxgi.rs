@@ -637,7 +637,9 @@ pub fn run_capture_loop(
                         Err(retry_error) => {
                             debug!(error = %retry_error, "DuplicateOutput retry failed");
                             last_code = retry_error.code();
-                            if !super::recovery::passing_code(last_code.0) {
+                            if super::recovery::passing_code(last_code.0) {
+                                super::second_screen::note_passing_retry_error(&shared, generation);
+                            } else {
                                 super::second_screen::note_persistent_error(&shared, generation);
                             }
                             // Tell the GUI why while the retries continue.
