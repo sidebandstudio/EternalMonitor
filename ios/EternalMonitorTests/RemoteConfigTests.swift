@@ -234,14 +234,16 @@ final class RemoteConfigTests: XCTestCase {
         XCTAssertEqual(checker.available?.build, 320, "Settings shows it")
         XCTAssertNil(checker.prompted(now: turn.addingTimeInterval(-day)))
         XCTAssertNil(checker.popup(now: turn.addingTimeInterval(-day)))
-        XCTAssertNotNil(checker.prompted(now: turn.addingTimeInterval(60)))
-        XCTAssertNotNil(checker.popup(now: turn.addingTimeInterval(60)))
 
+        // A relaunch keeps the rollout, and the turn.
         let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed,
                                        now: turn.addingTimeInterval(-day), installationID: { id })
         XCTAssertEqual(relaunched.available?.rollout, RemoteConfig.Rollout(start: start, days: 3))
         XCTAssertNil(relaunched.popup(now: turn.addingTimeInterval(-day)))
-        XCTAssertNotNil(relaunched.popup(now: start.addingTimeInterval(3 * day)))
+        XCTAssertNotNil(relaunched.prompted(now: turn.addingTimeInterval(60)))
+        XCTAssertNotNil(relaunched.popup(now: turn.addingTimeInterval(60)))
+        // Once shown, it stays for this build.
+        XCTAssertNotNil(checker.popup(now: turn.addingTimeInterval(-day)))
         XCTAssertEqual(RemoteConfig.read(from: defaults, now: turn), RemoteConfig.Settings(firstFrameTimeoutSeconds: 12, reason: nil))
     }
 }
