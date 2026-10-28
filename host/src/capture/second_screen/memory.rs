@@ -1078,6 +1078,43 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// PR #110 on 945873d's rule: the last duplication retry decides. A
+    /// retry that stalls after one that failed for good passes, like a hung
+    /// device; one that fails for good after a stall is the PC's.
+    #[test]
+    fn a_stalled_duplication_retry_counts_as_the_last_try() {
+        use super::super::{
+            driver_call, note_interruption, note_passing_retry_error, note_persistent_error,
+        };
+        let path = temp_file("unsupported-then-stall");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        // What the access-lost ladder does with a retry that timed out.
+        let retry = driver_call(&shared, 1);
+        assert_eq!(next_step(&shared, start + secs(3)), Step::Nothing);
+        drop(retry);
+        note_passing_retry_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(!path.exists(), "a failure whose last try stalled was saved");
+
+        let path = temp_file("stall-then-unsupported");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        drop(driver_call(&shared, 1));
+        note_passing_retry_error(&shared, 1);
+        note_persistent_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// PR #110, review 5: a restart during a time-limited call. The new
     /// generation's own real failure is saved, the old call's guard cannot
     /// cover it or clear the new generation's own call.

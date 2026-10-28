@@ -575,10 +575,17 @@ pub fn run_capture_loop(
                 // Windows refuses a second duplication of the same output.
                 duplication = None;
                 let mut last_code = e.code();
+                // Set while the last try was a driver call that did not
+                // return in time. The last try decides, as for errors.
+                let mut last_stall: Option<Stall> = None;
                 while duplication.is_none() {
                     let delay = match recovery.lost(Instant::now()) {
                         LossStep::Retry(delay) => delay,
                         LossStep::GiveUp => {
+                            // The stage waits for the driver; it passes.
+                            if let Some(stall) = last_stall {
+                                return Err(Box::new(stall));
+                            }
                             return Err(Box::new(CaptureUnavailable {
                                 block: CaptureBlock::from_hresult(last_code.0)
                                     .unwrap_or(CaptureBlock::DisplayChanging),
@@ -640,9 +647,17 @@ pub fn run_capture_loop(
                     let retried = duplicate_output(&output1, &device, poll);
                     drop(call);
                     let retried = match retried {
-                        Ok(retried) => retried,
+                        Ok(retried) => {
+                            last_stall = None;
+                            retried
+                        }
                         // Logged; the ladder keeps trying until it gives up.
-                        Err(_stall) => continue,
+                        // A stuck driver passes, like a hung device.
+                        Err(stall) => {
+                            super::second_screen::note_passing_retry_error(&shared, generation);
+                            last_stall = Some(stall);
+                            continue;
+                        }
                     };
                     match retried {
                         Ok(d) => {
