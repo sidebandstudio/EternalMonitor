@@ -763,13 +763,15 @@ fn update_arrives_while_feedback_is_open(
     window.run_steps(4);
     window.get_by_label("Tell us how it's going");
     answer.send(()).unwrap();
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    // Only a backstop: the check is a loopback request, but on a starved
+    // machine it took longer than 10 s.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while window
         .query_by_label("EternalMonitor 99.1.0 is available")
         .is_none()
     {
         assert!(Instant::now() < deadline, "the check never finished");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         window.run_steps(1);
     }
     window.run_steps(4);
