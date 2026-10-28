@@ -26,10 +26,11 @@ use tracing::{info, warn};
 pub enum Call {
     D3d11CreateDevice,
     DuplicateOutput,
-    /// Opening an NVENC, AMF or QSV encoder. They share one lane: FFmpeg opens
-    /// all of them under one process-wide lock (FF_CODEC_CAP_NOT_INIT_THREADSAFE),
-    /// so after one hangs the others would only wait behind it. libx264 does
-    /// not take that lock and opens without a limit.
+    /// Opening an NVENC, AMF or QSV encoder, or libx265. They share one lane:
+    /// FFmpeg opens all of them under one process-wide lock
+    /// (FF_CODEC_CAP_NOT_INIT_THREADSAFE), so after one hangs the others would
+    /// only wait behind it. libx264 does not take that lock and opens without
+    /// a limit.
     EncoderOpen,
     /// The Enable and Disable driver tasks: a PowerShell process, killed at
     /// the limit (see `vdd::run_task`).
@@ -147,6 +148,11 @@ impl Lanes {
 
 static LANES: Lanes = Lanes::new();
 
+/// The process's lanes, for callers that pass them on to [`run_on`].
+pub(crate) fn lanes() -> &'static Lanes {
+    &LANES
+}
+
 /// Abandoned calls of this kind still running, process-wide. For the native
 /// Windows tests.
 #[cfg(all(test, windows))]
@@ -168,33 +174,70 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_on(&LANES, call, f, progress)
+}
+
+/// [`run`] counting abandoned calls in `lanes`.
+pub(crate) fn run_on<T, F>(
+    lanes: &'static Lanes,
+    call: Call,
+    f: F,
+    progress: impl FnMut(),
+) -> Result<T, Stall>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let wait = Wait {
         limits: call.limits(),
         slice: WAIT_SLICE,
         now: Instant::now,
     };
     let delay = simulated_delay(call);
-    run_in(&LANES, call, wait, f, progress, move || {
-        if let Some(delay) = delay {
-            std::thread::sleep(delay);
-        }
-    })
+    let hooks = Hooks {
+        before: move || {
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+        },
+        handoff: || {},
+    };
+    run_in(lanes, call, wait, f, progress, hooks)
 }
 
-/// [`run`] with its lanes and clock given, and `before` run on the call's
-/// thread ahead of the call (a simulated stall).
+/// Points on the call's thread: `before` the call (a simulated stall), and
+/// `handoff` after it returned, holding the hand-over lock, just before the
+/// result is handed over or released.
+pub(crate) struct Hooks<B, H> {
+    pub before: B,
+    pub handoff: H,
+}
+
+#[cfg(test)]
+pub(crate) fn no_hooks() -> Hooks<fn(), fn()> {
+    Hooks {
+        before: || {},
+        handoff: || {},
+    }
+}
+
+/// What the call's thread hands over: its result, or its panic.
+type Outcome<T> = std::thread::Result<T>;
+
+/// [`run`] with its lanes, clock and hooks given.
 pub(crate) fn run_in<T, F>(
     lanes: &'static Lanes,
     call: Call,
     wait: Wait<impl Fn() -> Instant>,
     f: F,
     mut progress: impl FnMut(),
-    before: impl FnOnce() + Send + 'static,
+    hooks: Hooks<impl FnOnce() + Send + 'static, impl FnOnce() + Send + 'static>,
 ) -> Result<T, Stall>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
     let lane = &lanes.0[call as usize];
     let abandoned = lane.load(SeqCst);
     if abandoned >= MAX_ABANDONED {
@@ -205,28 +248,41 @@ where
         );
         return Err(Stall::Refused { call });
     }
-    // Set by the caller when it gives up. The call's thread reads it under
-    // the same lock before handing over its result, so exactly one of them
-    // owns the result. Never held across the call itself.
+    // Set by the caller when it gives up. The call's thread holds the same
+    // lock from reading it until its result is in the channel, and the
+    // caller looks in the channel under it before giving up, so exactly one
+    // of them owns the result, and the lane is freed whenever it was taken.
+    // Never held across the call itself.
     let gave_up = Arc::new(Mutex::new(false));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<Outcome<T>>();
     let thread_gave_up = Arc::clone(&gave_up);
     let real_start = Instant::now();
+    let Hooks { before, handoff } = hooks;
     let spawned = std::thread::Builder::new()
         .name(format!("call-{}", call.name()))
         .spawn(move || {
-            before();
-            let value = f();
-            if !*thread_gave_up.lock() {
-                let _ = tx.send(value);
+            // A panic is handed over like a result: the caller re-raises it,
+            // or, given up on, it is dropped here and the lane still frees.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                before();
+                f()
+            }));
+            let given_up = thread_gave_up.lock();
+            handoff();
+            if !*given_up {
+                let _ = tx.send(outcome);
                 return;
             }
-            // Released here, before the lane lets a new call start.
-            drop(value);
+            drop(given_up);
+            let panicked = outcome.is_err();
+            // Released here, before the lane lets a new call start. A drop
+            // that panics must not keep the lane taken either.
+            let _ = catch_unwind(AssertUnwindSafe(move || drop(outcome)));
             lanes.0[call as usize].fetch_sub(1, SeqCst);
             info!(
                 stall_ended = %call.name(),
                 after_ms = real_start.elapsed().as_millis() as u64,
+                panicked,
                 "A Windows or driver call that was given up on returned; its result was released"
             );
         });
@@ -235,25 +291,30 @@ where
         return Err(Stall::Refused { call });
     }
     let started = (wait.now)();
+    let finish = |outcome: Outcome<T>, took: Duration| match outcome {
+        Ok(value) => {
+            note_finished(call, took);
+            Ok(value)
+        }
+        Err(panic) => resume_unwind(panic),
+    };
     loop {
         match rx.recv_timeout(wait.slice) {
-            Ok(value) => {
-                note_finished(call, (wait.now)().saturating_duration_since(started));
-                return Ok(value);
+            Ok(outcome) => {
+                return finish(outcome, (wait.now)().saturating_duration_since(started));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("{} panicked on its own thread", call.name())
+                panic!("{} ended without a result", call.name())
             }
         }
         let after = (wait.now)().saturating_duration_since(started);
         if after >= wait.limits.limit {
             let mut gave_up = gave_up.lock();
             // It may have returned since the last look.
-            if let Ok(value) = rx.try_recv() {
+            if let Ok(outcome) = rx.try_recv() {
                 drop(gave_up);
-                note_finished(call, after);
-                return Ok(value);
+                return finish(outcome, after);
             }
             *gave_up = true;
             lane.fetch_add(1, SeqCst);
@@ -372,7 +433,7 @@ mod tests {
             wait(Call::D3d11CreateDevice),
             call,
             || progress += 1,
-            || {},
+            no_hooks(),
         );
         let Err(Stall::TimedOut { call, after }) = result else {
             panic!("{result:?}")
@@ -397,7 +458,7 @@ mod tests {
             wait(Call::EncoderOpen),
             call,
             || {},
-            || {},
+            no_hooks(),
         );
         assert!(matches!(result, Err(Stall::TimedOut { .. })));
         assert!(dropped_on.lock().is_none());
@@ -420,7 +481,7 @@ mod tests {
             wait(Call::DuplicateOutput),
             call,
             || {},
-            || {},
+            no_hooks(),
         );
         assert!(matches!(stuck, Err(Stall::TimedOut { .. })));
         // Refused without starting: the call never runs, and nothing waits.
@@ -434,7 +495,7 @@ mod tests {
                 wait(Call::DuplicateOutput),
                 move || counted.fetch_add(1, SeqCst),
                 || panic!("a refused call waited"),
-                || {},
+                no_hooks(),
             );
             assert_eq!(
                 result,
@@ -453,7 +514,7 @@ mod tests {
             wait(Call::D3d11CreateDevice),
             || 7,
             || {},
-            || {},
+            no_hooks(),
         );
         assert_eq!(other, Ok(7));
         // Once the stuck call returns, its kind runs again.
@@ -467,7 +528,7 @@ mod tests {
             wait(Call::DuplicateOutput),
             || "duplication",
             || {},
-            || {},
+            no_hooks(),
         );
         assert_eq!(again, Ok("duplication"));
     }
@@ -481,7 +542,7 @@ mod tests {
             wait(Call::EncoderOpen),
             || Err::<(), _>("h264_nvenc open failed: FFmpeg code=-40"),
             || {},
-            || {},
+            no_hooks(),
         );
         assert_eq!(result, Ok(Err("h264_nvenc open failed: FFmpeg code=-40")));
         assert_eq!(lanes.abandoned(Call::EncoderOpen), 0);
@@ -506,7 +567,7 @@ mod tests {
                 "device"
             },
             || panic!("no heartbeat is due within the slice"),
-            || {},
+            no_hooks(),
         );
         assert_eq!(result, Ok("device"));
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -530,7 +591,7 @@ mod tests {
                     },
                     || 1,
                     || {},
-                    || {},
+                    no_hooks(),
                 );
                 assert_eq!(result, Ok(1));
                 started.elapsed()
@@ -544,6 +605,93 @@ mod tests {
         );
         // Generous for a loaded shared machine; typically 20-100 µs.
         assert!(median < Duration::from_millis(5), "{median:?}");
+    }
+
+    #[test]
+    fn a_result_handed_over_as_the_caller_gives_up_is_returned_and_frees_the_lane() {
+        // The call returns just as the caller reads its deadline as passed:
+        // the call's thread is inside the hand-over when the caller goes to
+        // give up. Before, the caller found the channel empty and took the
+        // lane, the thread then sent its result anyway, and the lane stayed
+        // taken for the life of the process.
+        for _ in 0..20 {
+            let lanes = lanes();
+            let (inside_tx, inside_rx) = mpsc::channel::<()>();
+            let start = Instant::now();
+            let reads = AtomicU64::new(0);
+            let dropped_on = Arc::new(Mutex::new(None));
+            let device = Device(Arc::clone(&dropped_on));
+            let result = run_in(
+                lanes,
+                Call::D3d11CreateDevice,
+                Wait {
+                    limits: Call::D3d11CreateDevice.limits(),
+                    slice: Duration::from_millis(1),
+                    now: move || {
+                        if reads.fetch_add(1, SeqCst) == 0 {
+                            return start;
+                        }
+                        // The deadline passes once the thread is handing over.
+                        let _ = inside_rx.recv_timeout(Duration::from_secs(60));
+                        start + Duration::from_secs(60)
+                    },
+                },
+                move || device,
+                || {},
+                Hooks {
+                    before: || {},
+                    handoff: move || {
+                        let _ = inside_tx.send(());
+                        // Give the caller time to reach the lock.
+                        std::thread::sleep(Duration::from_millis(20));
+                    },
+                },
+            );
+            assert!(result.is_ok(), "{:?}", result.err());
+            assert_eq!(lanes.abandoned(Call::D3d11CreateDevice), 0);
+            assert!(
+                dropped_on.lock().is_none(),
+                "the returned result was released"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_that_panics_after_it_was_given_up_on_frees_its_lane() {
+        let lanes = lanes();
+        let (release, released) = mpsc::channel::<()>();
+        let result = run_in(
+            lanes,
+            Call::EncoderOpen,
+            wait(Call::EncoderOpen),
+            move || {
+                let _ = released.recv();
+                panic!("the driver crashed late");
+            },
+            || {},
+            no_hooks(),
+        );
+        assert!(matches!(result, Err(Stall::TimedOut { .. })));
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 1);
+        release.send(()).unwrap();
+        wait_until("a late panic kept the lane taken", || {
+            lanes.abandoned(Call::EncoderOpen) == 0
+        });
+        // A panic while the caller still waits reaches the caller, as when
+        // the call ran on its thread.
+        let panicked = std::panic::catch_unwind(|| {
+            run_in(
+                lanes,
+                Call::EncoderOpen,
+                wait(Call::EncoderOpen),
+                || -> u32 { panic!("the driver crashed") },
+                || {},
+                no_hooks(),
+            )
+        });
+        let message = panicked.unwrap_err();
+        assert_eq!(message.downcast_ref::<&str>(), Some(&"the driver crashed"));
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 0);
     }
 
     #[test]

@@ -812,34 +812,50 @@ impl InFlightFrames {
     }
 }
 
-/// Open `encoder` with its options. A hardware encoder opens under its time
-/// limit (see [`crate::stall`]); one that returns after it is closed on the
-/// call's thread. libx264 has no driver to wait for.
+type OpenResult = Result<
+    Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>,
+    crate::stall::Stall,
+>;
+
+/// Open `encoder` with its options. An encoder that opens under FFmpeg's
+/// process-wide lock opens under its time limit (see [`crate::stall`]); one
+/// that returns after it is closed on the call's thread.
 fn open_encoder(
     encoder: ffmpeg_next::codec::encoder::video::Video,
     encoder_name: &str,
     progress: &mut dyn FnMut(),
-) -> Result<
-    Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>,
-    crate::stall::Stall,
-> {
-    if !is_hardware_encoder(encoder_name) {
+) -> OpenResult {
+    open_encoder_on(crate::stall::lanes(), encoder, encoder_name, progress)
+}
+
+fn open_encoder_on(
+    lanes: &'static crate::stall::Lanes,
+    encoder: ffmpeg_next::codec::encoder::video::Video,
+    encoder_name: &str,
+    progress: &mut dyn FnMut(),
+) -> OpenResult {
+    if !takes_codec_lock(encoder_name) {
         return Ok(encoder.open_with(encoder_options(encoder_name)));
     }
     let name = encoder_name.to_string();
-    crate::stall::run(
+    crate::stall::run_on(
+        lanes,
         crate::stall::Call::EncoderOpen,
         move || encoder.open_with(encoder_options(&name)),
         progress,
     )
 }
 
-/// The Windows hardware encoders, which FFmpeg opens under one process-wide
-/// lock and which wait on a graphics driver.
-fn is_hardware_encoder(encoder_name: &str) -> bool {
-    ["_nvenc", "_amf", "_qsv"]
-        .iter()
-        .any(|suffix| encoder_name.ends_with(suffix))
+/// Encoders FFmpeg 7.1 opens under its one process-wide lock
+/// (FF_CODEC_CAP_NOT_INIT_THREADSAFE): the NVENC, AMF and QSV hardware
+/// encoders, which wait on a graphics driver, and libx265. While one of them
+/// is stuck holding the lock, any other would block behind it, so they share
+/// one time-limited lane. libx264 and VideoToolbox do not take the lock.
+fn takes_codec_lock(encoder_name: &str) -> bool {
+    encoder_name == "libx265"
+        || ["_nvenc", "_amf", "_qsv"]
+            .iter()
+            .any(|suffix| encoder_name.ends_with(suffix))
 }
 
 fn open_remaining_encoders<T>(
@@ -1758,7 +1774,7 @@ mod tests {
             let _ = released.recv();
         });
         let mut open = |name: &str| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            if !is_hardware_encoder(name) {
+            if !takes_codec_lock(name) {
                 return Ok(());
             }
             let wait = Wait {
@@ -1778,7 +1794,7 @@ mod tests {
                     }
                 },
                 || {},
-                || {},
+                crate::stall::no_hooks(),
             )
             .map_err(|stall: Stall| stall.to_string().into())
         };
@@ -1800,6 +1816,77 @@ mod tests {
         assert_eq!(attempts, ["h264_amf", "h264_qsv", "libx264"]);
         assert_eq!(selected, "libx264");
         assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn hevc_software_does_not_block_behind_a_stuck_hardware_open() {
+        use crate::stall::{no_hooks, run_in, Call, Lanes, Stall, Wait};
+        use std::time::Duration;
+        for name in ["h264_nvenc", "hevc_amf", "h264_qsv", "libx265"] {
+            assert!(takes_codec_lock(name), "{name}");
+        }
+        for name in ["libx264", "h264_videotoolbox", "hevc_videotoolbox"] {
+            assert!(!takes_codec_lock(name), "{name}");
+        }
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        // An NVENC open is stuck holding FFmpeg's lock.
+        let start = Instant::now();
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stuck = run_in(
+            lanes,
+            Call::EncoderOpen,
+            Wait {
+                limits: Call::EncoderOpen.limits(),
+                slice: Duration::from_millis(1),
+                now: move || {
+                    start + Duration::from_millis(100 * reads.fetch_add(1, Ordering::SeqCst))
+                },
+            },
+            move || {
+                let _ = released.recv();
+            },
+            || {},
+            no_hooks(),
+        );
+        assert!(matches!(stuck, Err(Stall::TimedOut { .. })));
+        let context = |name: &str| {
+            let codec = ffmpeg_next::encoder::find_by_name(name)?;
+            let mut video = ffmpeg_next::codec::Context::new_with_codec(codec)
+                .encoder()
+                .video()
+                .ok()?;
+            video.set_width(64);
+            video.set_height(64);
+            video.set_format(ffmpeg_next::format::Pixel::YUV420P);
+            video.set_time_base(ffmpeg_next::Rational(1, 60));
+            Some(video)
+        };
+        // A reconnect asks for HEVC again: libx265 is refused at once
+        // instead of waiting on the lock with no limit, and the encode loop
+        // stays on H.264.
+        if let Some(video) = context("libx265") {
+            let started = Instant::now();
+            let opened = open_encoder_on(lanes, video, "libx265", &mut || {});
+            assert!(
+                matches!(
+                    opened,
+                    Err(Stall::Refused {
+                        call: Call::EncoderOpen
+                    })
+                ),
+                "{:?}",
+                opened.map(|r| r.map(|_| ()))
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        // libx264 opens meanwhile.
+        let video = context("libx264").expect("libx264 is in every build");
+        assert!(matches!(
+            open_encoder_on(lanes, video, "libx264", &mut || {}),
+            Ok(Ok(_))
+        ));
         let _ = release.send(());
     }
 
