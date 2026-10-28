@@ -118,8 +118,8 @@ struct Proving {
     /// How often Windows lost the desktop during this proof while it was
     /// the user's, with the displays on.
     losses: u32,
-    /// Since the last loss, getting the display back failed with an error
-    /// that does not pass, such as DXGI_ERROR_UNSUPPORTED.
+    /// The last try to get the display back failed with an error that does
+    /// not pass, such as DXGI_ERROR_UNSUPPORTED.
     persistent: bool,
 }
 
@@ -505,12 +505,13 @@ fn note_interruption_while(shared: &SharedControl, generation: u64, away: bool) 
     }
 }
 
-/// Capture `generation` got the desktop back after an interruption: the
-/// proof starts over from `now`, so nothing is decided before the second
-/// screen has had its full time to show a picture.
+/// Capture `generation` got the desktop back after an interruption, whatever
+/// the retries before returned: the proof starts over from `now`, so nothing
+/// is decided before the second screen has had its full time to show a
+/// picture.
 pub fn note_recovery(shared: &SharedControl, generation: u64, now: Instant) {
     if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
-        if proving.generation == generation && proving.interrupted {
+        if proving.generation == generation {
             proving.interrupted = false;
             proving.persistent = false;
             proving.since = now;
@@ -525,6 +526,19 @@ pub fn note_persistent_error(shared: &SharedControl, generation: u64) {
         if proving.generation == generation {
             proving.interrupted = false;
             proving.persistent = true;
+        }
+    }
+}
+
+/// Capture `generation` is still getting the desktop back after a loss, and
+/// its last try failed with an error that passes, such as another capturing
+/// app: whatever failed before, a failure now is not the PC's. It is not
+/// another loss.
+pub fn note_passing_retry_error(shared: &SharedControl, generation: u64) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = true;
+            proving.persistent = false;
         }
     }
 }

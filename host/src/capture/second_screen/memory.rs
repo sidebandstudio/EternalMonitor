@@ -946,6 +946,45 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// Round 5: a retry that failed with an error that doesn't pass kept the
+    /// recovery after it from restarting the window, and a retry that then
+    /// failed with one that passes still saved the failure. The last retry
+    /// decides.
+    #[test]
+    fn the_last_retry_after_a_lost_desktop_decides() {
+        use super::super::{
+            note_interruption, note_passing_retry_error, note_persistent_error, note_recovery,
+        };
+        // Lost at 1 s, UNSUPPORTED at 2 s, back at 4 s: the window runs to 9 s.
+        let path = temp_file("unsupported-then-back");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        note_recovery(&shared, 1, start + secs(4));
+        assert_eq!(next_step(&shared, start + PROVE_TIMEOUT), Step::Nothing);
+        assert_eq!(next_step(&shared, start + secs(8)), Step::Nothing);
+        assert_eq!(
+            next_step(&shared, start + secs(9)),
+            Step::Fallback("no_frames")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // Lost, UNSUPPORTED, then another capturing app until the window
+        // ends: this app run only.
+        let path = temp_file("unsupported-then-passing");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        note_passing_retry_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(!path.exists());
+        assert!(!retries_later(&shared));
+    }
+
     /// Round 4: losses that pass never save a failure, however many. The
     /// picture that follows proves the second screen; without one the stream
     /// goes back to the mirror for this app run only.
