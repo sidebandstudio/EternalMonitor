@@ -428,7 +428,7 @@ impl AnalyzerApp {
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
-            ipad_last_seen: Some(Instant::now()),
+            ipad_last_seen: Some(popup_now()),
             popup_quiet: popup_quiet(),
             ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
@@ -777,6 +777,29 @@ impl eframe::App for AnalyzerApp {
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
     }
+}
+
+/// The time the update popup's quiet period reads. Debug builds let the GUI
+/// tests hold it and move it themselves, so whether the popup waited does
+/// not depend on how fast a machine draws frames. Release builds always
+/// read the real time.
+#[cfg(debug_assertions)]
+static POPUP_CLOCK: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+/// Debug builds only: runs the popup's quiet period on `now` instead of the
+/// real time, until called with `None`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_popup_clock(now: Option<Instant>) {
+    *POPUP_CLOCK.lock() = now;
+}
+
+fn popup_now() -> Instant {
+    #[cfg(debug_assertions)]
+    if let Some(now) = *POPUP_CLOCK.lock() {
+        return now;
+    }
+    Instant::now()
 }
 
 /// [`update_banner::POPUP_QUIET`]. Debug builds only:
