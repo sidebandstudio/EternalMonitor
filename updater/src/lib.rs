@@ -690,6 +690,8 @@ mod tests {
                 "#!/bin/sh
 if [ \"$1\" = linger ]; then
   touch '{d}/lingering'
+  # Until killed, a second at a time, so no sleep outlives it for long.
+  [ \"$2\" = forever ] && while :; do sleep 1; done
   sleep \"$2\"
   rm '{d}/lingering'
   exit 0
@@ -740,8 +742,13 @@ touch '{d}/setup-ran'
     #[cfg(unix)]
     fn linger(app: &Path, seconds: &str, dir: &Path) -> std::process::Child {
         let child = Command::new(app).args(["linger", seconds]).spawn().unwrap();
+        // A backstop: the copy must be running before the helper looks.
         let start = std::time::Instant::now();
-        while !dir.join("lingering").exists() && start.elapsed() < Duration::from_secs(5) {
+        while !dir.join("lingering").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the copy never started"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         child
@@ -769,7 +776,9 @@ touch '{d}/setup-ran'
     #[test]
     fn a_copy_of_the_app_that_does_not_close_skips_setup_and_relaunches() {
         let (dir, mut args) = lingering_case("stuck-copy");
-        let mut copy = linger(&args.app, "30", &dir);
+        // It lingers until killed: on a loaded Mac, ps took 132 s to list
+        // the processes, and a copy that left meanwhile was not in the list.
+        let mut copy = linger(&args.app, "forever", &dir);
         args.host_pid = closing_host();
         let mut out = Vec::new();
         let code = run_with(args.clone(), &mut out, Duration::from_millis(2000));
