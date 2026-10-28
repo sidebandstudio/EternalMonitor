@@ -124,7 +124,7 @@ pub struct Release {
     pub note: Option<String>,
     /// Spreads the automatic prompt for this release over a few days.
     /// Missing means everyone at once.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "Rollout::saved")]
     pub rollout: Option<Rollout>,
 }
 
@@ -729,6 +729,10 @@ struct Saved {
     /// leaves the PC.
     #[serde(default)]
     rollout_id: Option<String>,
+    /// The staged version whose prompt this install has reached. It keeps
+    /// showing for that version, whatever the clock does later.
+    #[serde(default)]
+    rollout_reached: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -865,9 +869,24 @@ impl State {
             return false;
         };
         !self.manual_check
+            && self.saved.rollout_reached.as_ref() != Some(&release.version)
             && release
                 .rollout
                 .is_some_and(|rollout| !rollout.shows(id, &release.version, now))
+    }
+
+    /// Remember that this install's turn came for the available staged
+    /// release, so its prompt doesn't go away again.
+    fn reach_rollout(&mut self, now: u64) {
+        let (Some(release), Some(id)) = (self.available(), &self.saved.rollout_id) else {
+            return;
+        };
+        let reached = release
+            .rollout
+            .is_some_and(|rollout| rollout.shows(id, &release.version, now));
+        if reached && self.saved.rollout_reached.as_ref() != Some(&release.version) {
+            self.saved.rollout_reached = Some(release.version.clone());
+        }
     }
 
     fn due(&self, now: u64, interval: u64) -> bool {
@@ -915,6 +934,7 @@ impl State {
             }
             return None;
         }
+        self.reach_rollout(now);
         let version = self.available()?.version.clone();
         if !self.auto
             || self.snoozed(now)
@@ -964,6 +984,7 @@ impl State {
     /// Once per version while the banner offers it, then at most every
     /// three days after it is closed. Never when automatic checks are off.
     fn popup(&mut self, now: u64) -> Option<Popup> {
+        self.reach_rollout(now);
         // Closed "in the future" means the clock was set back: count it as
         // closed now, so the next reminder is three days from this clock,
         // neither at once nor never.
@@ -1381,7 +1402,11 @@ impl Updater {
     }
 
     pub fn notice(&self) -> Option<Notice> {
-        self.state.lock().notice(now_secs())
+        self.with(|state| {
+            let now = now_secs();
+            state.reach_rollout(now);
+            state.notice(now)
+        })
     }
 
     pub fn popup(&self) -> Option<Popup> {

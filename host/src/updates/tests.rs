@@ -825,6 +825,80 @@ fn a_staged_release_waits_only_for_the_automatic_prompt() {
     );
 }
 
+/// Review round 2: a start 15 days out counted as a typo (shown today) and
+/// became a valid start the next day (hidden). Once an install's prompt
+/// shows for a release it stays, through later days and a clock set back.
+#[test]
+fn a_prompt_that_showed_keeps_showing_for_that_release() {
+    let today = ROLLOUT_START - 15 * DAY;
+    let mut s = state(install_at(0.5));
+    s.finish_check(today, false, Ok(staged("0.3.2")));
+    assert_eq!(s.notice(today), Some(Notice::Available("0.3.2".into())));
+    assert!(s.popup(today).is_some());
+    assert_eq!(s.saved.rollout_reached.as_deref(), Some("0.3.2"));
+    for later in [today + DAY, today + 5 * DAY, ROLLOUT_START, today - DAY] {
+        assert_eq!(
+            s.notice(later),
+            Some(Notice::Available("0.3.2".into())),
+            "{later}"
+        );
+    }
+    // A restart keeps it.
+    let restarted = state(s.saved.clone());
+    assert!(restarted.notice(today + DAY).is_some());
+    // The next staged release waits for its own turn.
+    let mut next = state(s.saved.clone());
+    let before = ROLLOUT_START - DAY;
+    assert_eq!(next.finish_check(before, false, Ok(staged("0.3.3"))), None);
+    assert_eq!(next.notice(before), None);
+    assert_eq!(next.popup(before), None);
+    assert_eq!(next.saved.rollout_reached.as_deref(), Some("0.3.2"));
+}
+
+/// Review round 2: a cached rollout skipped the manifest's limits, so
+/// `days: 365` hid the prompt for a year, and extreme values overflowed.
+#[test]
+fn a_saved_rollout_out_of_range_is_no_rollout() {
+    let saved = |rollout: serde_json::Value| {
+        let mut latest = serde_json::to_value(release("0.3.2")).unwrap();
+        latest["rollout"] = rollout;
+        serde_json::from_value::<Saved>(serde_json::json!({
+            "checked_at": 10,
+            "latest": latest,
+            "notified": "0.3.2",
+        }))
+        .unwrap()
+    };
+    for bad in [
+        serde_json::json!({ "start": ROLLOUT_START, "days": 15 }),
+        serde_json::json!({ "start": ROLLOUT_START, "days": 365 }),
+        serde_json::json!({ "start": ROLLOUT_START, "days": u64::MAX }),
+        serde_json::json!({ "start": "2026-11-02T00:00:00Z", "days": 7 }),
+        serde_json::json!({ "start": -1, "days": 7 }),
+        serde_json::json!("garbage"),
+        serde_json::json!(null),
+    ] {
+        let loaded = saved(bad.clone());
+        assert_eq!(loaded.latest.as_ref().unwrap().rollout, None, "{bad}");
+        assert_eq!(loaded.notified.as_deref(), Some("0.3.2"), "the rest loads");
+        let mut s = state(Saved {
+            rollout_id: Some("0".repeat(32)),
+            ..loaded
+        });
+        s.saved.notified = None;
+        assert!(s.notice(ROLLOUT_START).is_some(), "{bad}");
+    }
+    // In range, and extreme starts, load and never overflow.
+    let ok = saved(serde_json::json!({ "start": ROLLOUT_START, "days": 14 }));
+    assert_eq!(ok.latest.unwrap().rollout.map(|r| r.days), Some(14));
+    let far = saved(serde_json::json!({ "start": u64::MAX, "days": 14 }));
+    let s = state(Saved {
+        rollout_id: Some("0".repeat(32)),
+        ..far
+    });
+    assert!(s.notice(u64::MAX).is_some() && s.notice(0).is_some());
+}
+
 /// Each install gets its id once, keeps it, and an older state file without
 /// one gets a new one.
 #[test]

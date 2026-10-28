@@ -139,6 +139,19 @@ class CheckVersionsTest(unittest.TestCase):
         self.tearDown()
         self.setUp()
 
+    @staticmethod
+    def days_from_now(days):
+        import datetime
+        when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+        return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_rollouts_up_to_two_weeks_ahead_pass(self):
+        for start in [self.days_from_now(13), self.days_from_now(-400), "2026-11-02T00:00:00Z"]:
+            result = self.with_fields("ipad", lambda e: e.update(rollout={"start": start, "days": 14}))
+            self.assertEqual(result.returncode, 0, start + result.stdout + result.stderr)
+            self.tearDown()
+            self.setUp()
+
     def test_bad_rollouts_are_refused(self):
         bad = [
             "2026-11-02",
@@ -150,6 +163,8 @@ class CheckVersionsTest(unittest.TestCase):
             {"start": "2026-11-02T00:00:00Z", "days": 2.5},
             {"start": "2026-11-02T00:00:00Z", "days": True},
             {"start": "2026-11-02T00:00:00Z", "days": 7, "percent": 10},
+            {"start": self.days_from_now(15), "days": 7},
+            {"start": "2099-01-01T00:00:00Z", "days": 7},
         ]
         for platform in ("windows", "ipad"):
             for rollout in bad:

@@ -46,7 +46,11 @@ uploads carry; the rollout only hashes it on the iPad and sends neither the
 id nor the hash. An install
 whose place is a share *p* of the ramp sees the prompt at
 `start + p × days`; before `start` nobody does, and from `start + days`
-everybody. A `start` more than 14 days ahead counts as a typo: no staging.
+everybody. `check-versions.sh` refuses a `start` more than 14 days ahead;
+an app that still sees one (a clock set back) shows the prompt at once.
+Once an install's prompt has shown for a release, it keeps showing for that
+release, whatever the clock does later. A rollout saved with an earlier
+check is held to the same limits when it is read back.
 
 Only the automatic prompt waits: the PC's banner, popup and notification,
 and the iPad's banner and popup. Check now, Update now, the PC's
@@ -100,12 +104,16 @@ On a matching PC in Second screen mode, the first connection of an app run
 saves a `hardware_rule` failure without turning the driver on, so it is
 handled like a failure the PC remembers: the iPad gets the mirror, the
 Stream page shows the notice with Try again, and the host tries by itself
-after the usual waits (1 h, then 6 h, …). Try again, or a picture from the
-second screen, overrides the rule on that PC for good
+after the usual waits (1 h, then 6 h, …).
+
+A PC where the second screen has shown a picture, with or without a rule
+then, or where Try again was clicked, is exempt from every rule for good
 (`second-screen-rule.json`, keyed by its graphics cards, so a driver or
-Windows update keeps it). Mirror mode is never affected, and Second screen
-is never hidden. When the manifest drops the rule, the saved failure is
-forgotten at the next launch.
+Windows update keeps it): a rule never moves a PC that works into the
+mirror. Mirror mode is never affected, and Second screen is never hidden.
+When the manifest drops the rule, or the PC is exempt, a saved
+`hardware_rule` failure is forgotten at the next launch, in that app run
+even if the state file can't be cleared yet.
 
 The PC saves the manifest's values in `remote-config.json` after each check
 and applies them at the next launch for up to 14 days; with automatic

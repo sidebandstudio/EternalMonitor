@@ -119,6 +119,26 @@ fn a_rollout_ramps_from_few_to_everyone() {
     assert!(ids(100).all(|id| typo.shows(&id, "0.3.4", START)));
 }
 
+/// Review round 2: values that could only come from a tampered cache
+/// overflowed. Any start or ramp shows rather than panicking or hiding.
+#[test]
+fn extreme_rollouts_never_overflow_or_hide_for_long() {
+    for (start, days) in [
+        (u64::MAX, 7),
+        (u64::MAX, u64::MAX),
+        (0, u64::MAX),
+        (START, 365),
+    ] {
+        let rollout = Rollout { start, days };
+        for now in [0, START, u64::MAX] {
+            let shows = rollout.shows("00000000000000000000000000000000", "0.3.4", now);
+            if days > MAX_ROLLOUT_DAYS || start > now.saturating_add(MAX_ROLLOUT_DAYS * DAY) {
+                assert!(shows, "{start} {days} {now}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_bad_rollout_is_no_rollout() {
     for bad in [

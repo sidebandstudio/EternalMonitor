@@ -63,18 +63,36 @@ impl Rollout {
     pub fn parse(value: &Value) -> Option<Self> {
         let start = parse_utc(value.get("start")?.as_str()?)?;
         let days = value.get("days")?.as_u64()?;
-        (days <= MAX_ROLLOUT_DAYS).then_some(Self { start, days })
+        Self { start, days }.valid()
+    }
+
+    fn valid(self) -> Option<Self> {
+        (self.days <= MAX_ROLLOUT_DAYS).then_some(self)
+    }
+
+    /// A rollout saved in `update-state.json`, held to the same limits as a
+    /// fresh one: anything else is no rollout, and the rest of the file
+    /// still loads.
+    pub fn saved<'de, D: serde::Deserializer<'de>>(data: D) -> Result<Option<Self>, D::Error> {
+        let value = Option::<Value>::deserialize(data)?;
+        Ok(value
+            .and_then(|value| serde_json::from_value::<Self>(value).ok())
+            .and_then(Self::valid))
     }
 
     /// Whether install `id` may see the prompt for `version` at `now`. Each
     /// install waits a share of the ramp fixed by a hash of its id and the
     /// version, so a different set of installs goes first each release.
+    /// Once it shows, the caller keeps showing it for that version
+    /// (`check-versions.sh` refuses such starts, but a clock set
+    /// back could also move them).
     pub fn shows(&self, id: &str, version: &str, now: u64) -> bool {
-        // A start further ahead than any ramp lasts is a typo, not a plan.
-        if self.start > now.saturating_add(MAX_ROLLOUT_DAYS * DAY) {
+        // A start further ahead than any ramp lasts is a typo, not a plan,
+        // and a ramp longer than allowed is no ramp.
+        if self.days > MAX_ROLLOUT_DAYS || self.start > now.saturating_add(MAX_ROLLOUT_DAYS * DAY) {
             return true;
         }
-        let ramp = u128::from(self.days * DAY);
+        let ramp = u128::from(self.days.saturating_mul(DAY));
         let wait = ((u128::from(bucket(id, version)) * ramp) >> 64) as u64;
         now >= self.start.saturating_add(wait)
     }

@@ -15,8 +15,9 @@
 //! known not to start ([`crate::remote_config`]). On such a PC the first
 //! Second screen connection of an app run saves a `hardware_rule` failure
 //! without trying, so it is handled like any other: the mirror, the notice
-//! with Try again, and the same waits. Try again, or a picture the second
-//! screen shows, overrides the rule on this PC for good.
+//! with Try again, and the same waits. A PC where the second screen showed a
+//! picture, or where Try again was clicked, is exempt from every rule for
+//! good: a rule never moves a PC that works into the mirror.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,7 +28,8 @@ use tracing::warn;
 #[cfg(any(windows, test))]
 pub(super) const FILE_NAME: &str = "second-screen-state.json";
 
-/// Where Try again, or a picture, overrides a manifest rule for this PC.
+/// The graphics cards of a PC where the second screen showed a picture, or
+/// Try again was clicked: no manifest rule applies there.
 #[cfg(any(windows, test))]
 pub(super) const RULE_FILE_NAME: &str = "second-screen-rule.json";
 
@@ -140,20 +142,26 @@ impl Fingerprint {
     }
 }
 
-/// `second-screen-rule.json`: the cards of a PC where Try again or a picture
-/// overrode a manifest rule.
+/// `second-screen-rule.json`: the cards of a PC where the second screen
+/// showed a picture or Try again was clicked.
 #[derive(Debug, Serialize, Deserialize)]
 struct Override {
     format: u32,
     cards: Vec<String>,
 }
 
-/// A manifest rule names this PC and nothing here overrode it.
+/// Manifest rules on this PC.
 #[derive(Debug)]
 struct Rule {
+    /// Where [`Override`] is saved.
     path: PathBuf,
-    /// This app run saved its failure once already; after another mode or
-    /// the wait, it is tried like any failure.
+    /// A manifest rule names this PC.
+    matched: bool,
+    /// The second screen worked on these cards, or Try again was clicked,
+    /// in this app run or an earlier one: no rule applies.
+    exempt: bool,
+    /// This app run saved the rule's failure once already; after another
+    /// mode or the wait, it is tried like any failure.
     applied: bool,
 }
 
@@ -291,39 +299,39 @@ impl Memory {
         memory
     }
 
-    /// Whether a manifest rule names this PC. Without one, a failure saved
-    /// for an earlier rule is forgotten: the second screen is tried at the
-    /// next connection. `path` holds an override of the rule.
+    /// Whether a manifest rule names this PC. `path` holds the record of a
+    /// PC where the second screen worked or Try again was clicked, which
+    /// exempts it. Without a rule, or on an exempt PC, a failure saved for a
+    /// rule is forgotten, as any forgotten failure is: the second screen is
+    /// tried at the next connection, even if the file can't be cleared now.
     #[cfg(any(windows, test))]
     pub(crate) fn set_rule(&mut self, matched: bool, path: PathBuf) {
         let Some(store) = &self.store else {
             return;
         };
         let (since, cards) = (store.since, store.fingerprint.cards());
-        if !matched {
-            if self.failed.is_some_and(|f| f.reason == HARDWARE_RULE) {
-                tracing::info!(
-                    "The update manifest no longer names this PC's hardware — trying the \
-                     second screen at the next connection"
-                );
-                self.failed = None;
-                self.clear(since);
-            }
-            return;
-        }
-        let overridden = std::fs::read(&path)
+        let exempt = std::fs::read(&path)
             .ok()
             .and_then(|data| serde_json::from_slice::<Override>(&data).ok())
             .is_some_and(|saved| saved.format == FORMAT && saved.cards == cards);
-        if overridden {
+        if matched && exempt {
             tracing::info!(
-                "The update manifest names this PC's hardware, but the second screen was \
-                 tried here — not applying the rule"
+                "The update manifest names this PC's hardware, but the second screen worked \
+                 or was tried here — not applying the rule"
             );
-            return;
+        }
+        if (!matched || exempt) && self.failed.is_some_and(|f| f.reason == HARDWARE_RULE) {
+            tracing::info!(
+                "The update manifest's rule no longer applies to this PC — trying the second \
+                 screen at the next connection"
+            );
+            self.failed = None;
+            self.clear(since);
         }
         self.rule = Some(Rule {
             path,
+            matched,
+            exempt,
             applied: false,
         });
     }
@@ -333,35 +341,41 @@ impl Memory {
     /// failure.
     pub(crate) fn hold_for_rule(&mut self, now: Instant) -> Option<Hold> {
         let rule = self.rule.as_mut()?;
-        if rule.applied || self.failed.is_some() {
+        if !rule.matched || rule.exempt || rule.applied || self.failed.is_some() {
             return None;
         }
         rule.applied = true;
         self.note_failure(HARDWARE_RULE, now)
     }
 
-    /// Try again, or a picture: the rule no longer applies on this PC, in
-    /// this app run or later ones.
-    fn override_rule(&mut self) {
-        let (Some(rule), Some(store)) = (self.rule.take(), &self.store) else {
+    /// A picture, or Try again: exempt this PC's cards from every manifest
+    /// rule, in this app run and later ones. Saved once.
+    fn note_worked(&mut self) {
+        let (Some(rule), Some(store)) = (self.rule.as_mut(), &self.store) else {
             return;
         };
+        if std::mem::replace(&mut rule.exempt, true) {
+            return;
+        }
         let saved = Override {
             format: FORMAT,
             cards: store.fingerprint.cards(),
         };
         let written = serde_json::to_vec_pretty(&saved)
             .map_err(std::io::Error::other)
-            .and_then(|data| (store.io.replace)(&rule.path, &data));
+            .and_then(|data| {
+                rule.path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+                (store.io.replace)(&rule.path, &data)
+            });
         match written {
             Ok(()) => tracing::info!(
-                "The second screen was tried on this PC — the update manifest's rule for its \
-                 hardware no longer applies here"
+                "The second screen worked or was tried on this PC — no update manifest rule \
+                 applies here"
             ),
             Err(error) => warn!(
                 %error,
-                "Could not save that the second screen was tried — the update manifest's rule \
-                 for this PC applies again at the next app run"
+                "Could not save that the second screen worked on this PC — an update manifest \
+                 rule may apply again at the next app run"
             ),
         }
     }
@@ -428,7 +442,7 @@ impl Memory {
     /// or Try again) retries at once.
     pub(crate) fn forget(&mut self, now: Instant, success: bool) -> bool {
         if success {
-            self.override_rule();
+            self.note_worked();
         }
         let forgot = self.failed.take().is_some();
         if forgot || (success && self.uncleared.is_some()) {
@@ -1481,6 +1495,94 @@ mod tests {
         memory.note_failure("no_frames", start).unwrap();
         let (memory, start) = ruled_run(&path, Duration::from_secs(60), false);
         assert_eq!(memory.hold(start).map(|h| h.reason), Some("no_frames"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Review round 2: a PC streaming Second screen fine was moved to the
+    /// mirror by a rule fetched later. A picture now exempts its cards from
+    /// every rule, whether or not one matched then.
+    #[test]
+    fn a_pc_where_the_second_screen_worked_is_exempt_from_later_rules() {
+        let path = temp_file("rule-worked");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, false);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 1, start);
+        note_image(&shared, 1);
+        assert!(rule_file(&path).exists(), "recorded without a rule");
+        // A rule naming this PC arrives with the next check.
+        let (memory, start) = ruled_run(&path, hours(24), true);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        assert_eq!(remembered_failure(&shared), None);
+        assert!(!path.exists());
+        // Without manifest rules at all (unit tests, off Windows) nothing is
+        // recorded.
+        let other = temp_file("rule-none");
+        let (mut memory, start) = app_run(&other, Duration::ZERO);
+        memory.forget(start, true);
+        assert!(!rule_file(&other).exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn locked_state(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if path.file_name() == Some(std::ffi::OsStr::new(FILE_NAME)) {
+            Err(std::io::Error::other("sharing violation"))
+        } else {
+            replace_file(path, data)
+        }
+    }
+
+    /// Review round 2: Try again saved the exemption, but a locked state
+    /// file kept the rule's failure, so a restart within the hour mirrored
+    /// again. The exemption wins over it at load, and the failure is
+    /// cleared as any forgotten one is, in this app run even if the file
+    /// can't be.
+    #[test]
+    fn an_exemption_wins_over_a_rule_failure_the_file_kept() {
+        let path = temp_file("rule-locked");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        shared
+            .second_screen
+            .lock()
+            .memory
+            .store
+            .as_mut()
+            .unwrap()
+            .io = Io {
+            remove: locked,
+            replace: locked_state,
+            overwrite: locked_write,
+        };
+        shared.retry_second_screen();
+        assert!(rule_file(&path).exists());
+        assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule", "kept");
+
+        // Restarted ten minutes later, with the file still locked.
+        let (mut memory, start) = app_run(&path, Duration::from_secs(600));
+        assert_eq!(memory.hold(start).map(|h| h.reason), Some("hardware_rule"));
+        memory.store.as_mut().unwrap().io = Io {
+            remove: locked,
+            replace: locked_state,
+            overwrite: locked_write,
+        };
+        memory.set_rule(true, rule_file(&path));
+        assert_eq!(memory.hold(start), None);
+        assert!(!memory.saved() && memory.uncleared.is_some());
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        // Unlocked, the next app run clears it from the file.
+        let (memory, start) = ruled_run(&path, Duration::from_secs(700), true);
+        assert_eq!(memory.hold(start), None);
+        assert!(!memory.saved() && !path.exists());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

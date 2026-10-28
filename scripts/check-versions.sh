@@ -111,9 +111,13 @@ def check_rollout(where, rollout):
     try:
         if not isinstance(start, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", start):
             raise ValueError
-        datetime.datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ")
+        when = datetime.datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
     except ValueError:
         fail(f"{where}.rollout.start must be a UTC time like 2026-11-02T00:00:00Z")
+    # The apps show the prompt at once for a start this far ahead, as a typo.
+    if when > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=14):
+        fail(f"{where}.rollout.start must be at most 14 days from now")
     if not integer(rollout["days"]) or not 0 <= rollout["days"] <= 14:
         fail(f"{where}.rollout.days must be a whole number from 0 to 14")
 
