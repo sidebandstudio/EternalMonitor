@@ -45,9 +45,18 @@ impl CaptureBlock {
     }
 }
 
-/// Errors a GPU reset or a display change raises while it lasts:
-/// DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET and _ACCESS_LOST.
-const PASSING_ERRORS: [u32; 4] = [0x887A_0005, 0x887A_0006, 0x887A_0007, 0x887A_0026];
+/// Errors a GPU reset, a display change or a shortage of memory raises while
+/// it lasts: DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET,
+/// _ACCESS_LOST and E_OUTOFMEMORY. Freeing the memory changes nothing in a
+/// saved record's fingerprint, so saving it would keep a working PC on the
+/// mirror.
+const PASSING_ERRORS: [u32; 5] = [
+    0x887A_0005,
+    0x887A_0006,
+    0x887A_0007,
+    0x887A_0026,
+    0x8007_000E,
+];
 
 /// [`passing_error`] for a DXGI/Win32 HRESULT.
 pub fn passing_code(code: i32) -> bool {
@@ -313,6 +322,7 @@ mod tests {
             0x887A_0006, // DXGI_ERROR_DEVICE_HUNG
             0x887A_0007, // DXGI_ERROR_DEVICE_RESET
             0x887A_0026, // DXGI_ERROR_ACCESS_LOST
+            0x8007_000E, // E_OUTOFMEMORY, until another app frees memory
         ] {
             assert!(passing_code(code(passing)), "{passing:#x}");
         }
