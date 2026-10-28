@@ -37,7 +37,7 @@ Accelerate conversion with a swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
 restart-storm brake. Driver calls that can block for good (D3D11 device creation,
-DuplicateOutput, NVENC/AMF/QSV and libx265 opens, the VDD tasks) run under limits in
+DuplicateOutput, NVENC/AMF/QSV, libx265 and libopus opens, the VDD tasks) run under limits in
 `stall.rs`: a call past its limit takes that call's error path, is logged once as
 `stall=<call>`, and its thread is abandoned; its late result is released there.
 The client session outlives an encoder/capture restart. A new

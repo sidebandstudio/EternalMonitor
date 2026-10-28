@@ -26,11 +26,11 @@ use tracing::{info, warn};
 pub enum Call {
     D3d11CreateDevice,
     DuplicateOutput,
-    /// Opening an NVENC, AMF or QSV encoder, or libx265. They share one lane:
-    /// FFmpeg opens all of them under one process-wide lock
-    /// (FF_CODEC_CAP_NOT_INIT_THREADSAFE), so after one hangs the others would
-    /// only wait behind it. libx264 does not take that lock and opens without
-    /// a limit.
+    /// Opening an NVENC, AMF or QSV encoder, libx265, or libopus for PC audio.
+    /// They share one lane: FFmpeg opens all of them under one process-wide
+    /// lock (FF_CODEC_CAP_NOT_INIT_THREADSAFE), so after one hangs the others
+    /// would only wait behind it. libx264 does not take that lock and opens
+    /// without a limit.
     EncoderOpen,
     /// The Enable and Disable driver tasks: a PowerShell process, killed at
     /// the limit (see `vdd::run_task`).
