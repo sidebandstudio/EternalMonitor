@@ -101,8 +101,12 @@ while the second screen starts, and the PC's screen no longer blinks in a loop.
 Update the iPad to TestFlight v0.3.3, build 364, to go with Windows 0.3.3.
 
 Windows and iPad diagnostics include device details, app errors and stream
-statistics. Reports include PC names and network addresses, but exclude screen
-content, audio and pairing credentials. Disable automatic sharing in Settings.
+statistics. Reports include PC and iPad names, audio device names and network
+addresses, but exclude screen content, audio and pairing credentials. Disable
+automatic sharing in Settings. Diagnostics are kept up to 30 days and may be
+removed sooner. Deleted or expired diagnostics can remain in daily backups for
+up to 7 more days. See
+[Automatic diagnostics](SETUP.md#automatic-diagnostics).
 On iPad, open Settings > Support > Diagnostics to copy or export a report.
 
 The release checks passed on Windows, macOS and iPad simulators. Problems we

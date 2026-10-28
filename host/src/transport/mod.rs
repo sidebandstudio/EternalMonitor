@@ -678,13 +678,7 @@ async fn execute_actions(
             stats.reset_connection_stats();
         }
         if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
-            if let Some(reason) = second_screen::remembered_failure(shared) {
-                info!(
-                    second_screen_fallback = reason,
-                    "Client connected, but the second screen failed to start earlier — \
-                     mirroring the primary display until the user clicks Try again"
-                );
-            }
+            second_screen::note_connected(shared, Instant::now());
         }
     }
 
