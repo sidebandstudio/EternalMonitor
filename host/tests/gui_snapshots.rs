@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
@@ -36,6 +36,32 @@ impl ConfigSource for Fixture {
 }
 
 const POPUP_QUIET_MS: u64 = 3000;
+/// How far the popup's clock moves between frames.
+const FRAME_MS: u64 = 100;
+
+/// The popup's quiet period runs on a clock only these tests move, so how
+/// long a frame takes never decides whether the popup waited.
+static POPUP_CLOCK: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn start_popup_clock() {
+    let now = Instant::now();
+    *POPUP_CLOCK.lock().unwrap() = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
+
+fn popup_clock() -> Instant {
+    POPUP_CLOCK
+        .lock()
+        .unwrap()
+        .expect("the fixture starts the popup clock")
+}
+
+fn advance_popup_clock(millis: u64) {
+    let mut clock = POPUP_CLOCK.lock().unwrap();
+    let now = clock.expect("the fixture starts the popup clock") + Duration::from_millis(millis);
+    *clock = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
 
 fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
     harness
@@ -45,21 +71,20 @@ fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
 
 /// The popup opens once no iPad has been connected for the quiet period.
 fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
-    let deadline = Instant::now() + std::time::Duration::from_millis(POPUP_QUIET_MS + 7000);
+    let deadline = popup_clock() + Duration::from_millis(POPUP_QUIET_MS + 7000);
     while !popup_shown(harness) {
-        assert!(Instant::now() < deadline, "the popup never opened");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(popup_clock() < deadline, "the popup never opened");
+        advance_popup_clock(FRAME_MS);
         harness.run_steps(1);
     }
     harness.run_steps(4);
 }
 
-/// Draws frames for `millis` and checks the popup stays closed in each one
-/// that ends within the quiet period after `seen`, the earliest the app can
-/// have last seen an iPad (or launched). Later frames may open it: a slow
-/// machine has simply waited out the quiet period. With `ipad` connected,
-/// the popup stays closed however long a frame takes, so every frame is
-/// checked, and each one moves `seen` on. Returns it.
+/// Draws a frame every [`FRAME_MS`] of the popup's clock for `millis` and
+/// checks the popup stays closed in each one within the quiet period after
+/// `seen`, when the app last saw an iPad (or launched). With `ipad`
+/// connected, every frame is checked, and each one moves `seen` on.
+/// Returns it.
 fn no_popup_for(
     harness: &mut Harness<'_, AnalyzerApp>,
     mut seen: Instant,
@@ -67,28 +92,24 @@ fn no_popup_for(
     millis: u64,
     why: &str,
 ) -> Instant {
-    let quiet = std::time::Duration::from_millis(POPUP_QUIET_MS);
-    let end = Instant::now() + std::time::Duration::from_millis(millis);
+    let quiet = Duration::from_millis(POPUP_QUIET_MS);
+    let end = popup_clock() + Duration::from_millis(millis);
     let mut checked = 0;
     loop {
-        let started = Instant::now();
         if ipad {
-            seen = started;
+            seen = popup_clock();
         }
         harness.run_steps(1);
-        // The frame read the time before this, so it was inside the period.
-        if ipad || Instant::now() < seen + quiet {
+        if ipad || popup_clock() < seen + quiet {
             assert!(!popup_shown(harness), "{why}");
             checked += 1;
         }
-        if Instant::now() >= end {
+        if popup_clock() >= end {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        advance_popup_clock(FRAME_MS);
     }
-    if checked == 0 {
-        eprintln!("not checked, every frame ended after the quiet period: {why}");
-    }
+    assert!(checked > 0, "no frame fell within the quiet period: {why}");
     seen
 }
 
@@ -121,6 +142,7 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
     std::env::set_var("APPDATA", &dir);
     // The popup's quiet period after an iPad leaves, shortened from 20 s.
     std::env::set_var("ETERNAL_UPDATE_POPUP_QUIET_MS", POPUP_QUIET_MS.to_string());
+    start_popup_clock();
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
@@ -605,7 +627,7 @@ fn popup_waits_while_the_ipad_has_a_session(
     }
     .save();
     connect_ipad(shared);
-    let launched = Instant::now();
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
     let mut seen = no_popup_for(&mut window, launched, true, 200, "the iPad is streaming");
@@ -661,7 +683,7 @@ fn popup_waits_after_launch(
     cached["popup"] = serde_json::Value::Null;
     cached["later"] = serde_json::Value::Null;
     std::fs::write(&state, cached.to_string()).unwrap();
-    let launched = Instant::now();
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
     no_popup_for(
