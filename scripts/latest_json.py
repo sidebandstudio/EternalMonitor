@@ -294,13 +294,18 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
         html = update_page(before[page], latest, size)
     except (ManifestError, testflight_review.AscError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(f"latest_json.py: {error}")
-    manifest.write_text(json.dumps(latest, indent=2, ensure_ascii=False) + "\n")
-    page.write_text(html)
-    check = subprocess.run(["bash", str(root / "scripts/check-versions.sh")], capture_output=True, text=True)
-    if check.returncode != 0:
+    try:
+        manifest.write_text(json.dumps(latest, indent=2, ensure_ascii=False) + "\n")
+        page.write_text(html)
+        check = subprocess.run(["bash", str(root / "scripts/check-versions.sh")], capture_output=True, text=True)
+        problem = None if check.returncode == 0 else \
+            f"failed, so both files were restored:\n{check.stdout}{check.stderr}"
+    except OSError as error:
+        problem = f"could not run ({error}), so both files were restored"
+    if problem is not None:
         for path, text in before.items():
             path.write_text(text)
-        sys.exit(f"scripts/check-versions.sh failed, so both files were restored:\n{check.stdout}{check.stderr}")
+        sys.exit(f"scripts/check-versions.sh {problem}")
     print(check.stdout, end="")
     print(f"docs/latest.json and docs/download.html now name {' and '.join(changes)}. Open the pull request:\n")
     print("\n".join(pull_request_commands(args.command, changes, latest)))

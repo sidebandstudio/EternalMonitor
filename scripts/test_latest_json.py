@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import latest_json  # noqa: E402
@@ -202,6 +203,11 @@ class LatestJsonTest(unittest.TestCase):
         self.bump_tree("0.3.4")
         self.asc = FakeTestFlight()
         self.assertIn("use rollback", self.fails("publish", "--ipad", "0.3.2", "--build", "401"))
+
+    def test_a_version_check_that_cannot_start_restores_both_files(self):
+        self.bump_tree("0.3.4")
+        with mock.patch.object(latest_json.subprocess, "run", side_effect=FileNotFoundError("bash")):
+            self.assertIn("both files were restored", self.fails("publish", "--windows", "0.3.4"))
 
     def test_publish_newer_than_the_tree_is_refused(self):
         self.assertIn("newer than this tree", self.fails("publish", "--windows", "0.3.4"))
