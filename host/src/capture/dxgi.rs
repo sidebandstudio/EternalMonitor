@@ -203,7 +203,10 @@ pub fn run_capture_loop(
     }
 
     // --- Create D3D11 device on the selected adapter ---
-    let device = create_device(adapter, super::hold_watchdog(&shared, generation))??;
+    let device = {
+        let _call = super::second_screen::driver_call(&shared, generation);
+        create_device(adapter, super::hold_watchdog(&shared, generation))??
+    };
     info!("D3D11 device created");
 
     // --- Get immediate device context ---
@@ -213,10 +216,11 @@ pub fn run_capture_loop(
     let output1: IDXGIOutput1 = output.cast()?;
     // `None` only between releasing a lost duplication and creating its
     // replacement inside the ACCESS_LOST handler.
-    let mut duplication: Option<IDXGIOutputDuplication> = Some(
+    let mut duplication: Option<IDXGIOutputDuplication> = Some({
+        let _call = super::second_screen::driver_call(&shared, generation);
         duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
-            .map_err(blocked_or_error)?,
-    );
+            .map_err(blocked_or_error)?
+    });
     info!("Desktop duplication active");
 
     // --- Query desktop dimensions from duplication ---
@@ -632,7 +636,10 @@ pub fn run_capture_loop(
                             );
                         }
                     };
-                    let retried = match duplicate_output(&output1, &device, poll) {
+                    let call = super::second_screen::driver_call(&shared, generation);
+                    let retried = duplicate_output(&output1, &device, poll);
+                    drop(call);
+                    let retried = match retried {
                         Ok(retried) => retried,
                         // Logged; the ladder keeps trying until it gives up.
                         Err(_stall) => continue,

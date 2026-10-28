@@ -121,6 +121,9 @@ struct Proving {
     /// Since the last loss, getting the display back failed with an error
     /// that does not pass, such as DXGI_ERROR_UNSUPPORTED.
     persistent: bool,
+    /// A time-limited driver call of this generation is outstanding (see
+    /// [`driver_call`]): a failure now may be the driver's, not the PC's.
+    call_pending: bool,
 }
 
 /// A second screen that loses the user's desktop more often than this in one
@@ -234,7 +237,7 @@ impl State {
             ..State::default()
         };
         *status = VddStatus::Failed;
-        let passing = proving.interrupted || proving.losses > LOSS_LIMIT;
+        let passing = proving.interrupted || proving.call_pending || proving.losses > LOSS_LIMIT;
         self.remember(reason, now, passing);
         Some(reason)
     }
@@ -451,7 +454,37 @@ pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
                 interrupted: false,
                 losses: 0,
                 persistent: false,
+                call_pending: false,
             })
+        }
+    }
+}
+
+/// While the returned guard lives, capture `generation` waits on a
+/// time-limited driver call (see `crate::stall`). The proof's deadline may
+/// pass meanwhile and end the attempt, but that failure is not remembered:
+/// the call's own limit decides about the driver, and its timeout lands
+/// after the proof is gone.
+pub fn driver_call(shared: &SharedControl, generation: u64) -> DriverCall<'_> {
+    set_call_pending(shared, generation, true);
+    DriverCall { shared, generation }
+}
+
+pub struct DriverCall<'a> {
+    shared: &'a SharedControl,
+    generation: u64,
+}
+
+impl Drop for DriverCall<'_> {
+    fn drop(&mut self) {
+        set_call_pending(self.shared, self.generation, false);
+    }
+}
+
+fn set_call_pending(shared: &SharedControl, generation: u64, pending: bool) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.call_pending = pending;
         }
     }
 }

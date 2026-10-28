@@ -182,12 +182,35 @@ pub fn run_until_unblocked(
     mut wait: impl FnMut(Duration) -> bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry = BlockedRetry::default();
+    let mut stalled = 0;
     let mut frame_number = 0;
     loop {
         let error = match capture(&mut frame_number) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
+        // A driver call that did not return in time, or was refused while an
+        // earlier one is stuck. Restarting the pipeline cannot free the
+        // driver, and refusals would spend the restart budget until the
+        // supervisor gave up for good, with nothing to start capture again
+        // once the call returns. Retry here at the blocked pace instead.
+        if error.downcast_ref::<crate::stall::Stall>().is_some() {
+            let delay = Duration::from_millis(
+                BLOCKED_RETRY_MS[(stalled as usize).min(BLOCKED_RETRY_MS.len() - 1)],
+            );
+            if stalled == 0 {
+                warn!(
+                    error = %error,
+                    "A graphics driver call is stuck — retrying capture until it returns"
+                );
+            }
+            stalled += 1;
+            if !wait(delay) {
+                return Ok(());
+            }
+            continue;
+        }
+        stalled = 0;
         let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() else {
             return Err(error);
         };
@@ -217,6 +240,90 @@ pub fn note_capture_resumed(shared: &SharedControl) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_stuck_driver_call_is_waited_out_in_the_stage_not_restarted() {
+        use crate::stall::{no_hooks, run_in, Call, Lanes, Stall, Wait};
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        let stepping = || {
+            let start = Instant::now();
+            let reads = AtomicU64::new(0);
+            move || start + Duration::from_millis(100 * reads.fetch_add(1, SeqCst))
+        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut stuck = Some(move || {
+            let _ = released.recv();
+        });
+        let mut release = Some(release);
+        let mut outcomes = Vec::new();
+        let mut waited = Duration::ZERO;
+        // Each attempt makes the device call through the real runner: the
+        // first hangs and times out, later ones are refused until it returns.
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                let call = stuck.take();
+                let result = run_in(
+                    lanes,
+                    Call::D3d11CreateDevice,
+                    Wait {
+                        limits: Call::D3d11CreateDevice.limits(),
+                        slice: Duration::from_millis(1),
+                        now: stepping(),
+                    },
+                    move || {
+                        if let Some(call) = call {
+                            call();
+                        }
+                    },
+                    || {},
+                    no_hooks(),
+                );
+                outcomes.push(result);
+                result.map_err(|stall: Stall| stall.into())
+            },
+            |delay| {
+                waited += delay;
+                // Over a minute in, the driver returns the stuck call.
+                if waited >= Duration::from_secs(65) {
+                    if let Some(release) = release.take() {
+                        release.send(()).unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(60);
+                        while lanes.abandoned(Call::D3d11CreateDevice) != 0 {
+                            assert!(Instant::now() < deadline, "the lane did not free");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+                true
+            },
+        );
+        // Capture resumed by itself, and nothing reached the supervisor.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(outcomes[0], Err(Stall::TimedOut { .. })));
+        let refused = outcomes[1..outcomes.len() - 1]
+            .iter()
+            .all(|outcome| matches!(outcome, Err(Stall::Refused { .. })));
+        assert!(refused, "{outcomes:?}");
+        assert_eq!(outcomes.last(), Some(&Ok(())));
+        // At the blocked pace, not a spin: 5 s apart once settled.
+        assert!(outcomes.len() < 25, "{} attempts", outcomes.len());
+        assert!(shared.capture_block.lock().is_none());
+        // A real failure still goes straight to the supervisor's budget.
+        let mut attempts = 0;
+        let failed = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                Err("DuplicateOutput failed".into())
+            },
+            |_| panic!("a real failure was retried"),
+        );
+        assert!(failed.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn repeated_losses_back_off_instead_of_spinning() {
