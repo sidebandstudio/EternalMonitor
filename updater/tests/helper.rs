@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use eternal_updater::{sha256_hex, HelperArgs, READY};
+use eternal_updater::{reason, sha256_hex, HelperArgs, UpdateResult, READY, RESULT_FILE};
 
 struct Case {
     dir: PathBuf,
@@ -133,6 +133,13 @@ fn verified_setup_runs_silently_then_the_app_starts() {
     assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
     let log = std::fs::read_to_string(&c.args.log).unwrap();
     assert!(log.contains("Setup exit code 0"), "{log}");
+    assert_eq!(
+        UpdateResult::read(&c.dir.join(RESULT_FILE)),
+        Some(UpdateResult::Setup {
+            exit: 0,
+            files_in_use: false
+        })
+    );
 }
 
 #[test]
@@ -146,6 +153,10 @@ fn a_changed_installer_is_refused_before_ready() {
     );
     assert_eq!(code, 3);
     assert!(!c.dir.join("ran").exists());
+    assert_eq!(
+        UpdateResult::read(&c.dir.join(RESULT_FILE)),
+        Some(UpdateResult::Skipped(reason::REFUSED.into()))
+    );
     // The host is still open, so the helper must not start a second copy.
     assert!(!appears(&c.dir.join("relaunched"), Duration::from_secs(5)));
 }
@@ -159,6 +170,10 @@ fn a_setup_that_cannot_start_still_brings_the_app_back() {
     assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
     let log = std::fs::read_to_string(&c.args.log).unwrap();
     assert!(log.contains("Setup did not run"), "{log}");
+    assert_eq!(
+        UpdateResult::read(&c.dir.join(RESULT_FILE)),
+        Some(UpdateResult::Skipped(reason::SETUP_NOT_STARTED.into()))
+    );
 }
 
 #[test]
@@ -179,4 +194,30 @@ fn a_failing_setup_still_brings_the_app_back() {
     assert!(std::fs::read_to_string(&c.args.log)
         .unwrap()
         .contains("Setup exit code 7"));
+    assert_eq!(
+        UpdateResult::read(&c.dir.join(RESULT_FILE)),
+        Some(UpdateResult::Setup {
+            exit: 7,
+            files_in_use: false
+        })
+    );
+}
+
+/// With its messages suppressed, Setup aborts on a file it cannot replace
+/// with the exit code a click on Cancel gives; its log tells them apart.
+#[test]
+fn a_setup_stopped_by_a_file_in_use_says_so() {
+    let mut c = case(
+        "in-use",
+        "echo 'DeleteFile: The existing file appears to be in use (5). Retrying.' > \"$(dirname \"$0\")/setup.log\"\nexit 5",
+    );
+    assert_eq!(run(&mut c), (READY.to_string(), 0));
+    assert!(appears(&c.dir.join("relaunched"), Duration::from_secs(60)));
+    assert_eq!(
+        UpdateResult::read(&c.dir.join(RESULT_FILE)),
+        Some(UpdateResult::Setup {
+            exit: 5,
+            files_in_use: true
+        })
+    );
 }

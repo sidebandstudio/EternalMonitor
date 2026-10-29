@@ -11,8 +11,9 @@
 //! Each launch's files in the crash folder are named by the host's process:
 //! `.rec` the crash record, `.box` a message to show, `.ready` the reporter's
 //! own id once it watches the host, `.shown` once the window works,
-//! `.done` once the host quit normally or reported its failure itself, and
-//! `.display` when it quit without turning the virtual display off.
+//! `.done` once the host quit normally or reported its failure itself,
+//! `.failed` once it saved a failure it will report, and `.display` when it
+//! quit without turning the virtual display off.
 
 use super::process::ProcessId;
 #[cfg(windows)]
@@ -30,6 +31,7 @@ pub(super) const REQUEST: &str = "box";
 const READY: &str = "ready";
 pub(super) const SHOWN: &str = "shown";
 pub(super) const DONE: &str = "done";
+pub(super) const FAILED: &str = "failed";
 pub(super) const DISPLAY: &str = "display";
 /// How long a host that fails at once waits for its reporter to start.
 const READY_WAIT: Duration = Duration::from_secs(3);
@@ -83,6 +85,11 @@ pub(super) fn start(directory: &Path, owner: ProcessId, launch_id: &str) {
         }
         Err(error) => tracing::warn!(%error, "Could not start the failure reporter"),
     }
+}
+
+/// Whether a reporter was started for this process.
+pub(super) fn started() -> bool {
+    REPORTER.get().is_some()
 }
 
 /// Tell the reporter how this launch is going (see the module notes).
@@ -198,7 +205,7 @@ fn save(outcome: &super::Outcome, launch_id: &str) -> std::io::Result<()> {
 /// this reporter waits for its messages, so it is not taken for a host.
 #[cfg(any(windows, test))]
 fn remove_files(directory: &Path, owner: ProcessId, saved: bool) {
-    for kind in [REQUEST, "tmp", DONE, SHOWN, DISPLAY] {
+    for kind in [REQUEST, "tmp", DONE, FAILED, SHOWN, DISPLAY] {
         let _ = fs::remove_file(owner_file(directory, owner, kind));
     }
     if saved {
@@ -241,6 +248,7 @@ fn run(args: &[String]) -> i32 {
     let file = |kind| owner_file(&directory, owner, kind);
     let process = open_host(owner);
     let _ = fs::write(file(READY), ProcessId::current().to_string());
+    super::offer::reporting_for(launch_id);
 
     // Each message on its own thread: an open message never holds the
     // watching, the report or the cleanup. Without a thread, a message waits
@@ -264,10 +272,15 @@ fn run(args: &[String]) -> i32 {
     if let Some(process) = process {
         loop {
             let exited = unsafe { WaitForSingleObject(process, 100) } == WAIT_OBJECT_0;
+            // A failure is coming: look for a newer version meanwhile.
+            if file(FAILED).exists() {
+                super::offer::begin();
+            }
             if let Some((title, body)) = take_request(&file(REQUEST)) {
                 show_soon(title, body);
             }
             if let Some((record, false)) = read_record(&file(RECORD)) {
+                super::offer::begin();
                 let module = module_at(process, record.address);
                 let outcome = super::Outcome::new(
                     record,
@@ -355,6 +368,10 @@ fn run(args: &[String]) -> i32 {
                 fs::write(file(RECORD), bytes)
             };
             let outcome = super::Outcome::new(record, None, false);
+            if outcome.crash {
+                // Beside the cleanup the message waits for below.
+                super::offer::begin();
+            }
             let saved = save(&outcome, launch_id).and(kept);
             report = Some((outcome, saved));
         }
@@ -485,18 +502,8 @@ fn module_at(process: windows::Win32::Foundation::HANDLE, address: u64) -> Optio
 
 #[cfg(windows)]
 fn show(title: &str, body: &str) {
-    use windows::core::HSTRING;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    };
-    unsafe {
-        MessageBoxW(
-            None,
-            &HSTRING::from(body),
-            &HSTRING::from(title),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-    }
+    use windows::Win32::UI::WindowsAndMessaging::{MB_SETFOREGROUND, MB_TOPMOST};
+    super::offer::show_box(title, body, MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 #[cfg(test)]
