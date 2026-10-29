@@ -19,23 +19,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host it watches and must never be turned away as a second instance,
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
-    eternal_host::console::join_parent_console();
-
-    // Before any DXGI query or window: monitor rects and injected input must
-    // be physical pixels from the start, not only once the GUI's event loop
-    // opts in. Unaware, a 125% monitor reports 2048x1152 instead of 2560x1440.
+    // Before any DXGI query or window (a restart copy's message too):
+    // monitor rects and injected input must be physical pixels from the
+    // start, not only once the GUI's event loop opts in. Unaware, a 125%
+    // monitor reports 2048x1152 instead of 2560x1440.
     #[cfg(windows)]
     eternal_host::input::windows_inject::become_per_monitor_dpi_aware();
+
+    // A copy started by "Restart EternalMonitor" tells the old window it runs
+    // before anything else, then waits for the old host to exit and takes
+    // over its single-instance mutex (or explains and exits).
+    let restart_started = std::time::Instant::now();
+    let restarted = eternal_host::relaunch::take_over_if_requested();
+    let restart_wait = restarted.is_some().then(|| restart_started.elapsed());
+    eternal_host::console::join_parent_console();
 
     // One host per installation; a second launch shows the first one and
     // exits. Checked after helper-mode dispatch and before anything a host
     // owns: opening the session log rotates it and the uploader drains the
     // shared outbox, so a launch that loses here must not reach either, and
     // must not reset the virtual display the first host is streaming.
-    let Some(instance) = eternal_host::single_instance::acquire() else {
-        eprintln!("EternalMonitor is already running; showing its window");
-        eternal_host::single_instance::show_existing();
-        return Ok(());
+    let instance = match restarted {
+        Some(Some(instance)) => instance,
+        Some(None) => return Ok(()),
+        None => {
+            let Some(instance) = eternal_host::single_instance::acquire() else {
+                eprintln!("EternalMonitor is already running; showing its window");
+                eternal_host::single_instance::show_existing();
+                return Ok(());
+            };
+            instance
+        }
     };
 
     // Anchor the process-wide media clock before anything else runs.
@@ -70,6 +84,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(problem) = &instance.problem {
         tracing::warn!(%problem, "Could not check for another EternalMonitor");
+    }
+    if let Some(waited) = restart_wait {
+        info!(
+            waited_ms = waited.as_millis() as u64,
+            "Started by Restart EternalMonitor once the previous copy had exited"
+        );
     }
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
@@ -147,29 +167,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pairing.configure(persisted.require_pairing, auth_token);
         pairing.log_code();
     }
-    let max_dgram = std::env::var("ETERNAL_MAX_DGRAM")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(persisted.max_dgram)
-        .clamp(576, 1400);
+    // Each Troubleshooting knob: an environment variable (developers, CI)
+    // wins, then the saved setting, then Automatic.
+    let overrides = eternal_host::troubleshooting::Overrides::from_process(&persisted)
+        .map_err(eternal_host::startup::fatal)?;
+    let gpu_value = eternal_host::gpu_preference::read_value().ok().flatten();
+    overrides.log(eternal_host::gpu_preference::preference_in(
+        gpu_value.as_deref(),
+    ));
+    if let Some(record) = persisted.gpu_switch.as_mut().filter(|r| r.checking) {
+        let saved =
+            eternal_host::gpu_preference::started_after_switch(record, gpu_value.as_deref());
+        info!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            saved,
+            "Graphics card switch: started again after the switch"
+        );
+        if !saved {
+            let _ = persisted.save();
+        }
+    }
+    let max_dgram = overrides.max_dgram.value;
     shared
         .max_dgram
         .store(u32::from(max_dgram), std::sync::atomic::Ordering::SeqCst);
     info!(max_dgram, "Media packet size configured");
-    if [30, 60, 90, 120].contains(&persisted.target_fps) {
-        shared
-            .target_fps
-            .store(persisted.target_fps, std::sync::atomic::Ordering::SeqCst);
-    }
-    if let Some(name) = persisted.encoder_override.clone() {
-        *shared.encoder_override.lock() = Some(name);
-    }
-    *shared.encoder_input.lock() = match std::env::var("ETERNAL_INPUT") {
-        Ok(value) => eternal_host::encoder::input::EncoderInput::from_env(&value)
-            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))
-            .map_err(eternal_host::startup::fatal)?,
-        Err(_) => persisted.encoder_input,
-    };
+    shared.target_fps.store(
+        overrides.target_fps.value,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *shared.encoder_override.lock() = overrides.encoder.value.clone();
+    *shared.encoder_input.lock() = overrides.encoder_input.value;
+    *shared.gpu_switch.lock() = persisted.gpu_switch.clone();
     *shared.capture_target.lock() =
         eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
     eternal_host::remote_config::load();
@@ -178,7 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eternal_host::remote_config::log_launch();
     shared
         .hevc_enabled
-        .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+        .store(overrides.hevc.value, std::sync::atomic::Ordering::SeqCst);
     shared
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
@@ -190,39 +220,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.set_target_addr(shared.target_addr.lock().to_string());
         stats.set_gpu_name(gpu_info.name.clone());
         stats.set_codec_name(gpu_info.codec_display_name.clone());
-    }
-
-    // Optional encoder override from the environment, applied BEFORE the first pipeline run
-    // so it takes effect without a manual stream restart. Useful for testing a specific
-    // encoder, e.g. `set ETERNAL_ENCODER=h264_amf` to force the AMD path.
-    if let Ok(name) = std::env::var("ETERNAL_ENCODER") {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            info!(encoder = %name, "Encoder forced from ETERNAL_ENCODER (no restart needed)");
-            *shared.encoder_override.lock() = Some(name);
-        }
-    }
-    // Optional HEVC preference override for automation (the E2E harness runs headless without
-    // the GUI toggle). When present it is authoritative in BOTH directions, so
-    // ETERNAL_HEVC=0 pins H.264 regardless of the persisted setting.
-    if let Ok(value) = std::env::var("ETERNAL_HEVC") {
-        let enabled = value.trim() == "1";
-        info!(enabled, "HEVC preference forced from ETERNAL_HEVC");
-        shared
-            .hevc_enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
-    }
-    // Optional target FPS override (e.g. ETERNAL_FPS=30) to lighten encode load — useful when
-    // testing a hardware encoder on a weak/integrated GPU.
-    if let Ok(fps) = std::env::var("ETERNAL_FPS") {
-        if let Ok(fps) = fps.trim().parse::<u32>() {
-            if fps > 0 {
-                info!(fps, "Target FPS forced from ETERNAL_FPS");
-                shared
-                    .target_fps
-                    .store(fps, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
     }
 
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
@@ -350,6 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
 
+    eternal_host::startup::simulate_slow_exit();
     info!("EternalMonitor shutting down");
     // process::exit skips destructors. Flush the log writers and the upload
     // outbox first, so a normal quit is told apart from a crash.

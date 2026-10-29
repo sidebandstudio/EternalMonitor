@@ -10,6 +10,7 @@ use super::icons::{self, Icon};
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, StreamState};
+use crate::handoff::Handoff;
 use crate::updates::{CheckStatus, Notice, OlderSide, IPAD_OUT_OF_DATE, WEBSITE_DOWNLOAD};
 
 /// The popup's last line: what Update now does from here.
@@ -195,6 +196,14 @@ impl AnalyzerApp {
                 },
             ),
         }
+        // An update refused, or a ready one waiting, while a restart hands
+        // over.
+        if self.update_refused
+            || matches!(notice, Notice::Installing(_))
+                && self.control.shared.handoff.holder() == Some(Handoff::Restart)
+        {
+            self.handoff_line(ui, Handoff::Restart);
+        }
         ui.add_space(GAP - 10.0);
         if let Some(action) = action {
             self.update_action(ui.ctx(), action);
@@ -338,6 +347,16 @@ impl AnalyzerApp {
 
     fn update_action(&mut self, ctx: &egui::Context, action: Action) {
         update_toast::hide();
+        let installs = match action {
+            Action::UpdateNow => self.updates.installs_in_place(),
+            Action::Force => true,
+            Action::Cancel | Action::Later => false,
+        };
+        if installs && self.control.shared.handoff.holder() == Some(Handoff::Restart) {
+            tracing::info!("Update refused: EternalMonitor is restarting");
+            self.update_refused = true;
+            return;
+        }
         match action {
             Action::UpdateNow if !self.updates.installs_in_place() => {
                 tracing::info!(

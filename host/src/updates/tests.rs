@@ -1496,6 +1496,54 @@ fn a_failed_helper_keeps_the_app_open_with_a_message() {
     assert!(s.close);
 }
 
+/// The update and "Restart EternalMonitor" share one handoff gate: a ready
+/// update waits while a restart hands over, and holds the gate until it goes
+/// back to waiting or fails.
+#[test]
+fn an_update_and_a_restart_never_hand_over_together() {
+    use crate::handoff::{Gate, Handoff};
+    let gate = Gate::default();
+    let ready = || {
+        let mut s = state(Saved::default());
+        s.gate = gate.clone();
+        s.finish_check(1000, false, Ok(release("0.3.2")));
+        s.update_now(false);
+        s.download_finished(Ok(PathBuf::from("setup.exe")));
+        s
+    };
+
+    // A restart first: the update stays ready, saying it installs.
+    gate.claim(Handoff::Restart).unwrap();
+    let mut s = ready();
+    assert_eq!(s.take_ready(false), None);
+    assert_eq!(s.phase, Phase::Ready(PathBuf::from("setup.exe")));
+    assert_eq!(s.saved.pending, None);
+    assert_eq!(s.notice(1000), Some(Notice::Installing("0.3.2".into())));
+    // The restart failed and this copy stays: the update goes ahead.
+    gate.release(Handoff::Restart);
+    assert!(s.take_ready(false).is_some());
+
+    // The update first: a restart is refused until it fails.
+    assert_eq!(gate.claim(Handoff::Restart), Err(Handoff::Update));
+    s.install_failed(&UpdateError::Launch("the update helper stopped".into()));
+    assert_eq!(gate.holder(), None);
+
+    // An iPad connected just before the handoff: back to waiting, and a
+    // restart may go meanwhile.
+    let mut s = ready();
+    let (path, _) = s.take_ready(false).unwrap();
+    assert_eq!(gate.holder(), Some(Handoff::Update));
+    s.requeue(path);
+    assert_eq!(gate.holder(), None);
+
+    // A helper that took over keeps it while this copy closes.
+    let mut s = ready();
+    s.take_ready(false).unwrap();
+    s.install_started();
+    assert!(s.close);
+    assert_eq!(gate.claim(Handoff::Restart), Err(Handoff::Update));
+}
+
 #[test]
 fn the_helper_is_copied_out_and_held_unchanged() {
     let dir = std::env::temp_dir().join(format!("eternal-stage-{}", std::process::id()));

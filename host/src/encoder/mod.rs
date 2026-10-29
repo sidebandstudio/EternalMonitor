@@ -1348,6 +1348,11 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("look_ahead", "0");
             // Like NVENC, QSV makes a requested keyframe a plain I-frame.
             opts.set("forced_idr", "1");
+            // Quick Sync queues 4 frames by default. On a still desktop the
+            // keepalive sends a frame every 750 ms, so the last change would
+            // reach the iPad 3 s late. Laptops moved onto their Intel iGPU
+            // encode here when NVENC can't open.
+            opts.set("async_depth", "1");
         }
         "libx264" => {
             opts.set("preset", "ultrafast");
@@ -1376,6 +1381,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         "hevc_qsv" => {
             opts.set("preset", "veryfast");
             opts.set("forced_idr", "1");
+            opts.set("async_depth", "1");
         }
         "hevc_videotoolbox" => {
             opts.set("realtime", "1");
@@ -2074,7 +2080,7 @@ mod tests {
             // The requested frame itself opens the session, as soon as the
             // encoder's configured delay lets it out: at once on NVENC with
             // delay=0 and libx264 with zerolatency, and once QSV has its
-            // async_depth frames queued (FFmpeg's default 4).
+            // async_depth frames queued (set to 1).
             let (submitted, sequence) =
                 first.unwrap_or_else(|| panic!("{name}: no frame could open the session"));
             assert_eq!(sequence, 40, "{name}: the session opened on a later frame");

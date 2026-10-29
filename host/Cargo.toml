@@ -54,6 +54,10 @@ winresource = "0.1"
 cc = "1"
 pkg-config = "0.3"
 
+[dev-dependencies]
+# Paused-clock simulations of the USB link.
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
 
@@ -79,6 +83,7 @@ features = [
     "Win32_Storage_FileSystem",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Graphics_DXCore",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",

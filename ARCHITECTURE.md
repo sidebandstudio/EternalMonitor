@@ -25,8 +25,10 @@ Capture, encode and audio have dedicated threads. Capture publishes the latest
 raw frame; a slow encoder skips obsolete raw frames. The encoder copies into its
 own input buffer and releases capture's reference for reuse. Encoded access
 units use a bounded channel: silently dropping an arbitrary encoded P-frame
-would corrupt the GOP. The USB sender instead drops whole queued access units
-when necessary and requests an IDR, keeping its queue bounded.
+would corrupt the GOP. The USB sender instead drops whole access units, the
+newest first, and requests an IDR with backoff, keeping its queue bounded. It
+finishes the frame it is writing, and a keyframe replaces queued frames only
+when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on

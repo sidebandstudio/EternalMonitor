@@ -15,6 +15,7 @@ use eternal_updater::{quote_arg, UpdateResult};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::handoff::{Gate, Handoff};
 use crate::remote_config::Rollout;
 
 /// Where people can always get the installer by hand.
@@ -737,7 +738,7 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         sha256: release.sha256.clone(),
         app,
         // The listen port, if one was given, survives the restart.
-        app_args: std::env::args_os().skip(1).collect(),
+        app_args: crate::relaunch::own_args(std::env::args_os().skip(1)),
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };
@@ -919,6 +920,9 @@ pub struct State {
     recheck: bool,
     /// The popup's version already logged as shown in this run.
     popup_logged: Option<String>,
+    /// Held from handing the installer over until it goes back to waiting
+    /// or fails; never while a restart hands over (see `handoff`).
+    gate: Gate,
 }
 
 /// How an update a previous run handed to Setup ended.
@@ -1033,6 +1037,7 @@ impl State {
             close: false,
             recheck: false,
             popup_logged: None,
+            gate: Gate::default(),
         };
         if state.saved.rollout_id.is_none() {
             let mut random = [0u8; 16];
@@ -1347,7 +1352,9 @@ impl State {
         };
     }
 
-    /// Hands the installer to the GUI unless a stream would be cut.
+    /// Hands the installer to the GUI unless a stream would be cut. While a
+    /// restart hands over it stays ready: if the restart works this copy
+    /// closes, and if not the update goes ahead.
     fn take_ready(&mut self, streaming: bool) -> Option<(PathBuf, Release)> {
         let Phase::Ready(path) = &self.phase else {
             return None;
@@ -1359,6 +1366,7 @@ impl State {
         }
         let path = path.clone();
         let release = self.chosen.clone()?;
+        self.gate.claim(Handoff::Update).ok()?;
         self.phase = Phase::Installing;
         self.saved.pending = Some((self.current.clone(), release.version.clone()));
         self.saved.pending_result = path
@@ -1375,6 +1383,7 @@ impl State {
             self.idle_since = None;
             self.saved.pending = None;
             self.saved.pending_result = None;
+            self.gate.release(Handoff::Update);
         }
     }
 
@@ -1391,6 +1400,7 @@ impl State {
         self.saved.pending = None;
         self.saved.pending_result = None;
         self.phase = Phase::Failed(error.message().into());
+        self.gate.release(Handoff::Update);
     }
 }
 
@@ -1609,15 +1619,19 @@ fn wait_while_checks_held() {
 }
 
 impl Updater {
-    pub fn start(auto: bool, session: SharedSession, wake: Wake) -> Self {
+    /// `gate` is the process's handoff gate, shared with the window's
+    /// restart.
+    pub fn start(auto: bool, session: SharedSession, gate: Gate, wake: Wake) -> Self {
         let path = state_path();
         let saved = load(path.as_deref());
-        let state = Arc::new(Mutex::new(State::resume(
+        let mut state = State::resume(
             env!("CARGO_PKG_VERSION"),
             auto,
             saved,
             PREVIOUS.lock().take(),
-        )));
+        );
+        state.gate = gate;
+        let state = Arc::new(Mutex::new(state));
         save(path.as_deref(), &state.lock().saved);
         let (tx, rx) = mpsc::channel();
         if state.lock().launch_check(now_secs()) {

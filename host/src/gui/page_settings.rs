@@ -5,8 +5,7 @@ use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense, Ui};
 use super::page_performance::page_header;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
-use super::{AnalyzerApp, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL, ENCODER_CHOICES};
-use crate::encoder::input::EncoderInput;
+use super::{AnalyzerApp, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL};
 
 impl AnalyzerApp {
     pub(super) fn settings_page(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
@@ -47,17 +46,43 @@ impl AnalyzerApp {
                 self.set_vdd_match(vdd_match);
             }
             widgets::divider(ui);
-            let mut fps = self.settings_fps_target;
+            let fps_env = self.overrides.target_fps.env();
+            let mut fps = match fps_env {
+                Some(_) => self.overrides.target_fps.value,
+                None => self.settings_fps_target,
+            };
             widgets::setting_row(
                 ui,
                 "Frame rate",
-                "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less.",
+                &env_or(fps_env, "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less."),
                 230.0,
                 |ui| {
-                    widgets::segmented(ui, &mut fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120")]);
+                    ui.add_enabled_ui(fps_env.is_none(), |ui| {
+                        widgets::segmented(ui, &mut fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120")]);
+                    });
                 },
             );
-            self.set_fps(fps);
+            if self.overrides.target_fps.env().is_none() {
+                self.set_fps(fps);
+            }
+            widgets::divider(ui);
+            let mut bitrate = self.settings_bitrate_mbps;
+            widgets::setting_row(
+                ui,
+                "Video quality limit",
+                "Higher is sharper but needs a stronger network. The stream lowers it by itself when the network is busy.",
+                290.0,
+                |ui| {
+                    ui.add_sized(
+                        vec2(64.0, 24.0),
+                        egui::Label::new(mono(format!("{bitrate:.0} Mbps"), 13.0)),
+                    );
+                    widgets::slider(ui, &mut bitrate, 4.0..=50.0, 1.0, 210.0, "Maximum bitrate");
+                },
+            );
+            if bitrate != self.settings_bitrate_mbps {
+                self.set_bitrate_mbps(bitrate);
+            }
         });
         ui.add_space(GAP - 6.0);
 
@@ -158,115 +183,7 @@ impl AnalyzerApp {
         });
         ui.add_space(GAP - 6.0);
 
-        // ── Advanced ────────────────────────────────────────────────────────
-        // Troubleshooting options. The defaults suit almost every PC.
-        widgets::section_label(ui, "Advanced");
-        ui.label(muted("Most people never need these. Change them only if the picture looks wrong or a support guide asks you to."));
-        ui.add_space(4.0);
-        widgets::list_card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let mut bitrate = self.settings_bitrate_mbps;
-            widgets::setting_row(
-                ui,
-                "Video quality limit",
-                "Higher is sharper but needs a stronger network. The stream lowers it by itself when the network is busy.",
-                290.0,
-                |ui| {
-                    ui.add_sized(
-                        vec2(64.0, 24.0),
-                        egui::Label::new(mono(format!("{bitrate:.0} Mbps"), 13.0)),
-                    );
-                    widgets::slider(ui, &mut bitrate, 4.0..=50.0, 1.0, 210.0, "Maximum bitrate");
-                },
-            );
-            if bitrate != self.settings_bitrate_mbps {
-                self.set_bitrate_mbps(bitrate);
-            }
-            widgets::divider(ui);
-
-            let mut hevc = self.settings_hevc_enabled;
-            widgets::setting_row(
-                ui,
-                "Sharper video format (HEVC)",
-                "Experimental. Sharper at the same quality limit on iPads and graphics cards that support it; others keep the standard format.",
-                64.0,
-                |ui| {
-                    widgets::toggle(ui, &mut hevc, "Prefer HEVC (H.265) when the iPad supports it");
-                },
-            );
-            if hevc != self.settings_hevc_enabled {
-                self.set_hevc(hevc);
-            }
-            widgets::divider(ui);
-            let mut packet = self.settings_packet_size;
-            widgets::setting_row(
-                ui,
-                "Packet size",
-                "Leave at 1400 on a home network. Use 1200 only when connecting through a VPN such as Tailscale.",
-                150.0,
-                |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut packet)
-                            .range(576..=1400)
-                            .speed(4.0)
-                            .suffix(" bytes"),
-                    );
-                },
-            );
-            if packet != self.settings_packet_size {
-                self.set_packet_size(packet);
-            }
-            widgets::divider(ui);
-            let detected = super::friendly_codec(&snap.codec_name);
-            let mut choice = self.settings_encoder_choice.clone();
-            widgets::setting_row(
-                ui,
-                "Video encoder",
-                &format!("Automatic uses your graphics card when it can. Change this only if the picture is missing or broken. In use now: {detected}."),
-                200.0,
-                |ui| {
-                    widgets::combo("encoder-override", &choice_label(&choice), 190.0).show_ui(
-                        ui,
-                        |ui| {
-                            for (label, _) in ENCODER_CHOICES {
-                                if ui
-                                    .selectable_label(choice == *label, choice_label(label))
-                                    .clicked()
-                                {
-                                    choice = (*label).to_string();
-                                }
-                            }
-                        },
-                    );
-                },
-            );
-            if choice != self.settings_encoder_choice {
-                self.set_encoder_choice(&choice);
-            }
-            widgets::divider(ui);
-
-            let mut input = self.settings_encoder_input;
-            widgets::setting_row(
-                ui,
-                "Encoder input",
-                "YUV420, the default, suits most PCs. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
-                230.0,
-                |ui| {
-                    widgets::segmented(
-                        ui,
-                        &mut input,
-                        &[
-                            (EncoderInput::Auto, "Auto"),
-                            (EncoderInput::Bgra, "BGRA"),
-                            (EncoderInput::Yuv420, "YUV420"),
-                        ],
-                    );
-                },
-            );
-            if input != self.settings_encoder_input {
-                self.set_encoder_input(input);
-            }
-        });
+        self.troubleshooting_section(ui, snap);
         ui.add_space(GAP - 6.0);
 
         // ── About ───────────────────────────────────────────────────────────
@@ -314,14 +231,24 @@ impl AnalyzerApp {
     }
 }
 
-fn choice_label(label: &str) -> String {
+/// The Video encoder choices in words a user knows: the maker of the
+/// graphics card, or the processor.
+pub(super) fn choice_label(label: &str) -> String {
     match label {
         "Auto" => "Automatic".into(),
-        "NVENC" => "NVIDIA NVENC".into(),
-        "AMF" => "AMD AMF".into(),
-        "QSV" => "Intel Quick Sync".into(),
-        "x264" => "x264 (CPU)".into(),
+        "NVENC" => "NVIDIA".into(),
+        "AMF" => "AMD".into(),
+        "QSV" => "Intel".into(),
+        "x264" => "Software (processor)".into(),
         other => other.into(),
+    }
+}
+
+/// A row's description, or which environment variable fixes its value.
+pub(super) fn env_or(env: Option<&str>, description: &str) -> String {
+    match env {
+        Some(name) => format!("Set by {name} on this PC, which wins over this setting."),
+        None => description.to_string(),
     }
 }
 

@@ -146,6 +146,18 @@ begin
     Result := 20;
 end;
 
+const
+  GpuPreferencesKey = 'Software\Microsoft\DirectX\UserGpuPreferences';
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // The app's own graphics card choice, which it writes only when its user
+  // asks (Windows Settings > Display > Graphics writes the same value). The
+  // key and every other app's value stay. HKCU is the user who uninstalls.
+  if CurUninstallStep = usUninstall then
+    RegDeleteValue(HKEY_CURRENT_USER, GpuPreferencesKey, ExpandConstant('{app}\EternalMonitor-host.exe'));
+end;
+
 #ifdef IncludeDriver
 const
   VddRegistryKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VirtualDisplayDriver_is1';
