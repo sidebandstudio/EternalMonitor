@@ -89,6 +89,34 @@ pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) ->
     false
 }
 
+/// After a graphics card switch made from the Stream page notice, the first
+/// capture attempt of the relaunched app says whether it helped: one log
+/// line, and the record the GUI saves.
+pub fn note_gpu_outcome(shared: &SharedControl, outcome: crate::gpu_preference::Outcome) {
+    let mut record = shared.gpu_switch.lock();
+    let Some(record) = record.as_mut() else {
+        return;
+    };
+    if !crate::gpu_preference::settle(record, outcome) {
+        return;
+    }
+    let app_gpu = crate::stats::PIPELINE_STATS.lock().gpu_name.clone();
+    match outcome {
+        crate::gpu_preference::Outcome::Worked => info!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            app_gpu,
+            "Graphics card switch outcome: capture works"
+        ),
+        crate::gpu_preference::Outcome::StillUnsupported => warn!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            app_gpu,
+            "Graphics card switch outcome: Windows still won't share the screen; another app probably chooses the card"
+        ),
+    }
+}
+
 /// The capture loop could not get at the desktop for a reason outside the
 /// app's control. The stage retries instead of failing the pipeline.
 #[derive(Debug)]

@@ -19,6 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host it watches and must never be turned away as a second instance,
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
+    // A copy started to switch the graphics card waits for the app to exit,
+    // saves the choice and opens the app again; it is never a host itself.
+    eternal_host::gpu_preference::run_helper_if_requested();
     eternal_host::console::join_parent_console();
 
     // Before any DXGI query or window: monitor rects and injected input must
@@ -144,29 +147,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pairing.configure(persisted.require_pairing, auth_token);
         pairing.log_code();
     }
-    let max_dgram = std::env::var("ETERNAL_MAX_DGRAM")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(persisted.max_dgram)
-        .clamp(576, 1400);
+    // Each Troubleshooting knob: an environment variable (developers, CI)
+    // wins, then the saved setting, then Automatic.
+    let overrides = eternal_host::troubleshooting::Overrides::from_process(&persisted)
+        .map_err(eternal_host::startup::fatal)?;
+    overrides.log(eternal_host::gpu_preference::preference_in(
+        eternal_host::gpu_preference::read_value()
+            .ok()
+            .flatten()
+            .as_deref(),
+    ));
+    let max_dgram = overrides.max_dgram.value;
     shared
         .max_dgram
         .store(u32::from(max_dgram), std::sync::atomic::Ordering::SeqCst);
     info!(max_dgram, "Media packet size configured");
-    if [30, 60, 90, 120].contains(&persisted.target_fps) {
-        shared
-            .target_fps
-            .store(persisted.target_fps, std::sync::atomic::Ordering::SeqCst);
-    }
-    if let Some(name) = persisted.encoder_override.clone() {
-        *shared.encoder_override.lock() = Some(name);
-    }
-    *shared.encoder_input.lock() = match std::env::var("ETERNAL_INPUT") {
-        Ok(value) => eternal_host::encoder::input::EncoderInput::from_env(&value)
-            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))
-            .map_err(eternal_host::startup::fatal)?,
-        Err(_) => persisted.encoder_input,
-    };
+    shared.target_fps.store(
+        overrides.target_fps.value,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *shared.encoder_override.lock() = overrides.encoder.value.clone();
+    *shared.encoder_input.lock() = overrides.encoder_input.value;
+    *shared.gpu_switch.lock() = persisted.gpu_switch.clone();
     *shared.capture_target.lock() =
         eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
     eternal_host::remote_config::load();
@@ -175,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eternal_host::remote_config::log_launch();
     shared
         .hevc_enabled
-        .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+        .store(overrides.hevc.value, std::sync::atomic::Ordering::SeqCst);
     shared
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
@@ -187,39 +189,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.set_target_addr(shared.target_addr.lock().to_string());
         stats.set_gpu_name(gpu_info.name.clone());
         stats.set_codec_name(gpu_info.codec_display_name.clone());
-    }
-
-    // Optional encoder override from the environment, applied BEFORE the first pipeline run
-    // so it takes effect without a manual stream restart. Useful for testing a specific
-    // encoder, e.g. `set ETERNAL_ENCODER=h264_amf` to force the AMD path.
-    if let Ok(name) = std::env::var("ETERNAL_ENCODER") {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            info!(encoder = %name, "Encoder forced from ETERNAL_ENCODER (no restart needed)");
-            *shared.encoder_override.lock() = Some(name);
-        }
-    }
-    // Optional HEVC preference override for automation (the E2E harness runs headless without
-    // the GUI toggle). When present it is authoritative in BOTH directions, so
-    // ETERNAL_HEVC=0 pins H.264 regardless of the persisted setting.
-    if let Ok(value) = std::env::var("ETERNAL_HEVC") {
-        let enabled = value.trim() == "1";
-        info!(enabled, "HEVC preference forced from ETERNAL_HEVC");
-        shared
-            .hevc_enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
-    }
-    // Optional target FPS override (e.g. ETERNAL_FPS=30) to lighten encode load — useful when
-    // testing a hardware encoder on a weak/integrated GPU.
-    if let Ok(fps) = std::env::var("ETERNAL_FPS") {
-        if let Ok(fps) = fps.trim().parse::<u32>() {
-            if fps > 0 {
-                info!(fps, "Target FPS forced from ETERNAL_FPS");
-                shared
-                    .target_fps
-                    .store(fps, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
     }
 
     let (supervisor_tx, supervisor_rx) = mpsc::channel();

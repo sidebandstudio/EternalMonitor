@@ -12,7 +12,8 @@ use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
 use super::recovery::{
-    note_capture_resumed, CaptureBlock, CaptureUnavailable, LossRecovery, LossStep, LOSS_GIVE_UP,
+    note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
+    LossStep, LOSS_GIVE_UP,
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
@@ -21,6 +22,7 @@ use super::{
     FPS_WINDOW,
 };
 use crate::control::{CaptureTarget, SharedControl};
+use crate::gpu_preference::Outcome;
 use crate::stall::{Call, Stall};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
@@ -33,8 +35,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -219,9 +221,15 @@ pub fn run_capture_loop(
     let mut duplication: Option<IDXGIOutputDuplication> = Some({
         let _call = super::second_screen::driver_call(&shared, generation);
         duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
+            .inspect_err(|error| {
+                if error.code() == DXGI_ERROR_UNSUPPORTED {
+                    check_gpu(&output1, &shared);
+                }
+            })
             .map_err(blocked_or_error)?
     });
     info!("Desktop duplication active");
+    note_gpu_outcome(&shared, Outcome::Worked);
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
@@ -805,6 +813,31 @@ fn resend_last_frame(
         height,
     });
     *last_send = now;
+}
+
+/// Windows won't duplicate `output` from the card this process runs on (a
+/// hybrid PC running EternalMonitor on its other card). Works out which card
+/// the screen is wired to, once per screen, for the Stream page notice.
+fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl) {
+    static CHECKED: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    note_gpu_outcome(shared, Outcome::StillUnsupported);
+    let Ok(desc) = (unsafe { output.GetDesc() }) else {
+        return;
+    };
+    let screen = utf16_to_string(&desc.DeviceName);
+    if CHECKED.lock().replace(screen.clone()).as_ref() == Some(&screen) {
+        return;
+    }
+    let facts = crate::gpu_preference::facts().unwrap_or_default();
+    let diagnosis = crate::gpu_preference::diagnose(&facts, &screen);
+    info!(
+        screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
+        app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str()),
+        switch = ?diagnosis.as_ref().and_then(|d| d.preference),
+        cards = facts.adapters.len(),
+        "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
+    );
+    *shared.gpu_diagnosis.lock() = diagnosis;
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which

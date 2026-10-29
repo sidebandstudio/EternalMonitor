@@ -119,7 +119,11 @@ impl AnalyzerApp {
         if let Some((icon, title, body)) =
             capture_block_notice(capture_block, snap.pipeline_running)
         {
-            widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            if capture_block == Some(CaptureBlock::UnsupportedOnThisGpu) {
+                self.graphics_card_notice(ui, icon, title, body);
+            } else {
+                widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            }
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
@@ -165,6 +169,88 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
         }
         self.restart_notice(ui);
+    }
+
+    /// Windows won't share the screen from the card EternalMonitor runs on:
+    /// name the card the screen is connected to and offer to move the app
+    /// onto it, or, when that did not help, say what overrides it.
+    fn graphics_card_notice(&mut self, ui: &mut Ui, icon: Icon, title: &str, body: &str) {
+        let diagnosis = self.control.shared.gpu_diagnosis.lock().clone();
+        let record = self.control.shared.gpu_switch.lock().clone();
+        let ctx = ui.ctx().clone();
+        match gpu_notice(diagnosis.as_ref(), record.as_ref()) {
+            GpuNotice::Plain => widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {}),
+            GpuNotice::Choose { gpu } => widgets::banner(
+                ui,
+                WARNING,
+                icon,
+                title,
+                &gpu_choice_body(&gpu),
+                0.0,
+                |_| {},
+            ),
+            GpuNotice::Switch {
+                gpu,
+                app_gpu,
+                preference,
+            } => {
+                let label = gpu_switch_button(&gpu);
+                let mut clicked = false;
+                widgets::banner(
+                    ui,
+                    WARNING,
+                    icon,
+                    title,
+                    &gpu_switch_body(&gpu, &app_gpu),
+                    button_width(&label),
+                    |ui| {
+                        clicked = widgets::button(ui, Tone::Primary, None, &label).clicked();
+                    },
+                );
+                if clicked {
+                    self.switch_graphics_card(&ctx, preference, &gpu);
+                }
+            }
+            GpuNotice::Overridden { gpu, app_gpu } => {
+                let (mut restart, mut undo) = (false, false);
+                widgets::banner(
+                    ui,
+                    WARNING,
+                    Icon::Warning,
+                    GPU_OVERRIDDEN_TITLE,
+                    &gpu_overridden_body(&gpu, app_gpu.as_deref()),
+                    330.0,
+                    |ui| {
+                        undo =
+                            widgets::button(ui, Tone::Secondary, None, "Undo the change").clicked();
+                        restart = widgets::button(
+                            ui,
+                            Tone::Primary,
+                            Some(Icon::Refresh),
+                            "Restart EternalMonitor",
+                        )
+                        .clicked();
+                    },
+                );
+                if undo {
+                    self.undo_graphics_switch(&ctx);
+                } else if restart {
+                    self.restart_app(&ctx);
+                }
+            }
+        }
+        if let Some(error) = &self.relaunch_error {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "EternalMonitor couldn't restart itself ({error}). Quit it and open it again."
+                    ))
+                    .size(SMALL)
+                    .color(DANGER),
+                )
+                .wrap(),
+            );
+        }
     }
 
     pub(super) fn restart_notice(&mut self, ui: &mut Ui) {
@@ -754,6 +840,104 @@ pub(super) fn add_later_retry(notice: &mut SecondScreenNotice, retries_later: bo
         notice
             .body
             .push_str(" EternalMonitor also tries again by itself later.");
+    }
+}
+
+/// What the notice says when Windows won't share the screen from the card
+/// EternalMonitor runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GpuNotice {
+    /// The card could not be found: the general Windows Settings steps.
+    Plain,
+    /// One click moves EternalMonitor onto the screen's card.
+    Switch {
+        gpu: String,
+        app_gpu: String,
+        preference: crate::gpu_preference::Preference,
+    },
+    /// No preference certainly selects the card: how to pick it by hand.
+    Choose { gpu: String },
+    /// EternalMonitor switched and Windows still refuses: another app picks
+    /// the card. Offered instead of the switch, so the app never reopens
+    /// in a loop.
+    Overridden {
+        gpu: String,
+        app_gpu: Option<String>,
+    },
+}
+
+pub(super) fn gpu_notice(
+    diagnosis: Option<&crate::gpu_preference::Diagnosis>,
+    record: Option<&crate::gpu_preference::SwitchRecord>,
+) -> GpuNotice {
+    if let Some(record) = record.filter(|record| record.failed) {
+        return GpuNotice::Overridden {
+            gpu: record.gpu.clone(),
+            app_gpu: diagnosis.map(|d| d.app_gpu.clone()),
+        };
+    }
+    match diagnosis {
+        Some(d) => match d.preference {
+            Some(preference) => GpuNotice::Switch {
+                gpu: d.screen_gpu.clone(),
+                app_gpu: d.app_gpu.clone(),
+                preference,
+            },
+            // Already on that card: switching can't help.
+            None if d.screen_gpu == d.app_gpu => GpuNotice::Plain,
+            None => GpuNotice::Choose {
+                gpu: d.screen_gpu.clone(),
+            },
+        },
+        None => GpuNotice::Plain,
+    }
+}
+
+pub(super) fn gpu_switch_button(gpu: &str) -> String {
+    format!(
+        "Use the {}",
+        super::page_troubleshooting::short_gpu_name(gpu)
+    )
+}
+
+/// Room for a button with `label` in a banner.
+fn button_width(label: &str) -> f32 {
+    (label.chars().count() as f32 * 7.5 + 40.0).clamp(140.0, 320.0)
+}
+
+pub(super) fn gpu_switch_body(gpu: &str, app_gpu: &str) -> String {
+    format!(
+        "Your screen is connected to the {gpu}, but EternalMonitor is running on the {app_gpu}. Click the button and EternalMonitor restarts on the right card. You can change this later in Settings > Troubleshooting."
+    )
+}
+
+pub(super) fn gpu_choice_body(gpu: &str) -> String {
+    format!(
+        "Your screen is connected to the {gpu}. Open Windows Settings > System > Display > Graphics, choose EternalMonitor, and pick the {gpu}. Then quit EternalMonitor and open it again."
+    )
+}
+
+pub(super) const GPU_OVERRIDDEN_TITLE: &str =
+    "Another app is choosing EternalMonitor's graphics card";
+
+/// After a switch that did not help. `app_gpu` is the card EternalMonitor
+/// still runs on, which says whose control app is in the way.
+pub(super) fn gpu_overridden_body(gpu: &str, app_gpu: Option<&str>) -> String {
+    let nvidia = |name: &str| name.to_ascii_uppercase().contains("NVIDIA");
+    let setting = if nvidia(gpu) {
+        "\"High-performance NVIDIA processor\""
+    } else {
+        "\"Let Windows decide\" (or \"Auto-select\") or \"Integrated graphics\""
+    };
+    let other_is_nvidia = nvidia(gpu) || app_gpu.is_none_or(nvidia);
+    if other_is_nvidia {
+        format!(
+            "Your screen is connected to the {gpu}, but the NVIDIA app or NVIDIA Control Panel probably keeps EternalMonitor on another card. Open it, find EternalMonitor in the program settings, and set its graphics processor to {setting}. Then click Restart EternalMonitor."
+        )
+    } else {
+        format!(
+            "Your screen is connected to the {gpu}, but your graphics card's own app (such as AMD Software) probably keeps EternalMonitor on another card. Set EternalMonitor there to use the {gpu}, then click Restart EternalMonitor."
+        )
     }
 }
 

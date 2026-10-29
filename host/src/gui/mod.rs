@@ -7,7 +7,8 @@
 //! - on Stream, the "Pairing", "USB connection" and "PC audio" rows, and a
 //!   "Connected iPad" card that lists "Decode rate" and "Repaired fragments"
 //!   (or "Waiting for an iPad" when nobody is connected);
-//! - on Settings, the "Encoder input" row;
+//! - on Settings, the "Encoder input" row, under "Troubleshooting", which
+//!   opens when clicked;
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
 //! - in the sidebar, "Send feedback" and the GitHub star card (see
 //!   `feedback_panel.rs`).
@@ -17,6 +18,7 @@ mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
+mod page_troubleshooting;
 mod renderer;
 mod theme;
 mod update_banner;
@@ -35,10 +37,12 @@ use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_regist
 use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
+use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
 use crate::transport::link::{LinkId, PeerId};
 use crate::transport::session::ClientInfo;
+use crate::troubleshooting::{Overrides, WindowDrawing};
 use eternal_wire::v2::control::ReceiverReport;
 
 use icons::Icon;
@@ -315,6 +319,20 @@ pub struct AnalyzerApp {
     feedback: Option<feedback_panel::Draft>,
     feedback_ask: crate::feedback::Ask,
     star_clicked: bool,
+    /// Settings > Troubleshooting is open.
+    troubleshooting_open: bool,
+    /// Which Troubleshooting values an environment variable fixes.
+    overrides: Overrides,
+    settings_window_drawing: WindowDrawing,
+    /// EternalMonitor's own Windows graphics preference value, read when
+    /// Troubleshooting opens.
+    gpu_value: Option<String>,
+    /// A graphics card choice waiting for "Restart EternalMonitor".
+    gpu_choice: Option<Change>,
+    /// The graphics card switch record as last saved; capture changes it.
+    saved_gpu_switch: Option<SwitchRecord>,
+    /// Why EternalMonitor could not restart itself, when it couldn't.
+    relaunch_error: Option<String>,
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
@@ -343,18 +361,24 @@ impl AnalyzerApp {
             runtime_bitrate_mbps
         };
 
+        // An environment variable wins over each saved value (developers,
+        // CI); the settings below keep the saved values, which are what the
+        // file stores.
+        let overrides = Overrides::from_process(&persisted).unwrap_or_else(|_| {
+            Overrides::resolve(&persisted, |_| None).expect("no environment, no error")
+        });
         let fps_target = if [30, 60, 90, 120].contains(&persisted.target_fps) {
             persisted.target_fps
         } else {
-            control.shared.target_fps.load(Ordering::SeqCst)
+            crate::control::DEFAULT_TARGET_FPS
         };
         control
             .shared
             .target_fps
-            .store(fps_target, Ordering::SeqCst);
+            .store(overrides.target_fps.value, Ordering::SeqCst);
+        *control.shared.encoder_override.lock() = overrides.encoder.value.clone();
 
         let encoder_choice = if let Some(name) = persisted.encoder_override.as_deref() {
-            *control.shared.encoder_override.lock() = Some(name.to_string());
             ENCODER_CHOICES
                 .iter()
                 .find(|(_, ffmpeg)| *ffmpeg == name)
@@ -388,7 +412,7 @@ impl AnalyzerApp {
         control
             .shared
             .hevc_enabled
-            .store(persisted.hevc_enabled, Ordering::SeqCst);
+            .store(overrides.hevc.value, Ordering::SeqCst);
         control
             .shared
             .audio_enabled
@@ -422,16 +446,17 @@ impl AnalyzerApp {
                 }),
             )
         };
-        let encoder_input = *control.shared.encoder_input.lock();
+        *control.shared.encoder_input.lock() = overrides.encoder_input.value;
+        let saved_gpu_switch = control.shared.gpu_switch.lock().clone();
         Self {
-            settings_encoder_input: encoder_input,
+            settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
             ipad_last_seen: Some(popup_now()),
             popup_quiet: popup_quiet(),
             ipad_notice_dismissed: false,
-            settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
+            settings_packet_size: u32::from(persisted.max_dgram.clamp(576, 1400)),
             control,
             page: Page::Stream,
             settings_bitrate_mbps: bitrate_mbps,
@@ -454,6 +479,13 @@ impl AnalyzerApp {
                 persisted.feedback_ask_done,
             ),
             star_clicked: persisted.star_clicked,
+            troubleshooting_open: false,
+            overrides,
+            settings_window_drawing: persisted.window_drawing,
+            gpu_value: None,
+            gpu_choice: None,
+            saved_gpu_switch,
+            relaunch_error: None,
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
@@ -496,6 +528,8 @@ impl AnalyzerApp {
             feedback_sessions: self.feedback_ask.long_sessions,
             feedback_ask_done: self.feedback_ask.done,
             star_clicked: self.star_clicked,
+            window_drawing: self.settings_window_drawing,
+            gpu_switch: self.control.shared.gpu_switch.lock().clone(),
         };
         file.save();
     }
@@ -531,7 +565,8 @@ impl AnalyzerApp {
     fn set_packet_size(&mut self, bytes: u32) {
         self.settings_packet_size = bytes;
         self.control.shared.max_dgram.store(bytes, Ordering::SeqCst);
-        self.settings_dirty_at = Some(Instant::now());
+        info!(max_dgram = bytes, "Media packet size changed");
+        self.persist_settings();
     }
 
     fn set_encoder_input(&mut self, input: crate::encoder::input::EncoderInput) {
@@ -689,6 +724,144 @@ impl AnalyzerApp {
         self.control.request_restart();
     }
 
+    /// The Stream page notice: move EternalMonitor onto the card the screen
+    /// is wired to. Windows applies that only when the app starts, so the
+    /// app closes and a helper opens it again once the value is saved.
+    fn switch_graphics_card(&mut self, ctx: &egui::Context, preference: Preference, gpu: &str) {
+        let current = match crate::gpu_preference::read_value() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "Could not read EternalMonitor's graphics card setting");
+                self.relaunch_error = Some(error);
+                return;
+            }
+        };
+        let previous = self.control.shared.gpu_switch.lock().clone();
+        let record = SwitchRecord::new(previous.as_ref(), current, preference, gpu);
+        info!(
+            ?preference,
+            gpu,
+            "Graphics card switch: restarting EternalMonitor on the card the screen is wired to"
+        );
+        self.relaunch(ctx, Some(Change::Set(preference)), record.into());
+    }
+
+    /// Puts EternalMonitor's graphics card setting back as it was before the
+    /// switch, and restarts.
+    fn undo_graphics_switch(&mut self, ctx: &egui::Context) {
+        let Some(record) = self.control.shared.gpu_switch.lock().clone() else {
+            return;
+        };
+        info!(
+            preference = ?crate::gpu_preference::preference_in(record.before.as_deref()),
+            "Graphics card switch undone: restarting EternalMonitor"
+        );
+        self.relaunch(ctx, Some(Change::Restore(record.before)), None);
+    }
+
+    /// Saves `record`, then closes the window while a helper copy makes
+    /// `change` and opens EternalMonitor again. If the helper can't start,
+    /// everything stays as it was and the reason shows.
+    fn relaunch(
+        &mut self,
+        ctx: &egui::Context,
+        change: Option<Change>,
+        record: Option<SwitchRecord>,
+    ) {
+        let previous = std::mem::replace(&mut *self.control.shared.gpu_switch.lock(), record);
+        self.persist_settings();
+        match crate::gpu_preference::relaunch(change.as_ref()) {
+            Ok(()) => {
+                self.gpu_choice = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                warn!(%error, "Could not restart EternalMonitor");
+                *self.control.shared.gpu_switch.lock() = previous;
+                self.persist_settings();
+                self.relaunch_error = Some(error);
+            }
+        }
+    }
+
+    /// Reads the graphics cards and EternalMonitor's own preference when
+    /// Troubleshooting opens. Outside Windows the fixture's facts stay.
+    fn refresh_gpu_facts(&mut self) {
+        if let Some(facts) = crate::gpu_preference::facts() {
+            *self.control.shared.gpu_facts.lock() = Some(facts);
+        }
+        self.gpu_value = crate::gpu_preference::read_value().ok().flatten();
+    }
+
+    /// Troubleshooting's graphics card choice, applied at the restart.
+    fn choose_graphics_card(&mut self, preference: Preference) {
+        let current = crate::gpu_preference::preference_in(self.gpu_value.as_deref()).unwrap_or(0);
+        self.gpu_choice = (preference.value() != current).then_some(Change::Set(preference));
+    }
+
+    fn apply_graphics_card(&mut self, ctx: &egui::Context) {
+        let change = self.gpu_choice.clone();
+        info!(
+            preference = ?change.as_ref().map(|change| match change {
+                Change::Set(preference) => preference.value(),
+                Change::Restore(value) => crate::gpu_preference::preference_in(value.as_deref()).unwrap_or(0),
+            }),
+            "Graphics card choice changed in Troubleshooting: restarting EternalMonitor"
+        );
+        // The user's own choice replaces any switch the notice made.
+        let record = match change {
+            Some(Change::Set(_)) => None,
+            _ => self.control.shared.gpu_switch.lock().clone(),
+        };
+        self.relaunch(ctx, change, record);
+    }
+
+    /// Restarts EternalMonitor without changing the graphics card, for the
+    /// Window drawing choice.
+    fn restart_app(&mut self, ctx: &egui::Context) {
+        info!("Restarting EternalMonitor for a Troubleshooting change");
+        let record = self.control.shared.gpu_switch.lock().clone();
+        self.relaunch(ctx, None, record);
+    }
+
+    fn set_window_drawing(&mut self, drawing: WindowDrawing) {
+        if self.settings_window_drawing == drawing {
+            return;
+        }
+        self.settings_window_drawing = drawing;
+        info!(
+            ?drawing,
+            "Window drawing changed — applies at the next start"
+        );
+        self.persist_settings();
+    }
+
+    /// Every Troubleshooting option back to Automatic. The graphics card
+    /// waits for "Restart EternalMonitor", like any change to it.
+    fn reset_troubleshooting(&mut self) {
+        info!("Troubleshooting settings reset to Automatic");
+        self.set_encoder_choice(ENCODER_AUTO_LABEL);
+        self.set_encoder_input(crate::encoder::input::EncoderInput::default());
+        if self.settings_hevc_enabled {
+            self.set_hevc(false);
+        }
+        if self.settings_packet_size != u32::from(crate::troubleshooting::FULL_PACKET) {
+            self.set_packet_size(u32::from(crate::troubleshooting::FULL_PACKET));
+        }
+        self.set_window_drawing(WindowDrawing::Automatic);
+        // A switch the notice made is undone, back to what the user had;
+        // otherwise a preference is cleared.
+        let record = self.control.shared.gpu_switch.lock().clone();
+        self.gpu_choice = match record {
+            Some(record) => {
+                (record.before != self.gpu_value).then_some(Change::Restore(record.before))
+            }
+            None => crate::gpu_preference::preference_in(self.gpu_value.as_deref())
+                .filter(|&value| value != 0)
+                .map(|_| Change::Set(Preference::Automatic)),
+        };
+    }
+
     fn copy(&mut self, ctx: &egui::Context, what: Copied, text: String) {
         ctx.copy_text(text);
         self.copied = Some((what, Instant::now()));
@@ -732,6 +905,12 @@ impl eframe::App for AnalyzerApp {
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
         self.observe_session(&client);
+        // Capture recorded how a graphics card switch went: save that.
+        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
+        if gpu_switch != self.saved_gpu_switch {
+            self.saved_gpu_switch = gpu_switch;
+            self.persist_settings();
+        }
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;

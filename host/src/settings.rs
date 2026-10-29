@@ -51,6 +51,13 @@ pub struct SettingsFile {
     /// The sidebar's GitHub star card was clicked; it says thank you since.
     #[serde(default)]
     pub star_clicked: bool,
+    /// Troubleshooting: how the window is drawn, from the next start.
+    #[serde(default)]
+    pub window_drawing: crate::troubleshooting::WindowDrawing,
+    /// A graphics card switch made from the Stream page, for its outcome
+    /// after the relaunch and for Undo.
+    #[serde(default)]
+    pub gpu_switch: Option<crate::gpu_preference::SwitchRecord>,
 }
 
 fn default_true() -> bool {
@@ -81,6 +88,8 @@ impl Default for SettingsFile {
             feedback_sessions: 0,
             feedback_ask_done: false,
             star_clicked: false,
+            window_drawing: Default::default(),
+            gpu_switch: None,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
+use egui_kittest::{kittest, kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
 use eternal_host::gui::AnalyzerApp;
@@ -403,12 +403,17 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     snapshot(&mut harness, &shared, "performance");
 
     nav(&mut harness, "Settings");
-    harness.get_by_label("Encoder input");
-    harness.get_by_label("ADVANCED");
+    harness.get_by_label("TROUBLESHOOTING");
     harness.get_by_label("120").click();
     harness.run_steps(4);
     assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
-    // Encoder input sits under Advanced, below the fold.
+    // Encoder input sits under Troubleshooting, closed until clicked.
+    assert!(harness.query_by_label("Encoder input").is_none());
+    harness.get_by_label("Show options").scroll_to_me();
+    harness.run_steps(4);
+    harness.get_by_label("Show options").click();
+    harness.run_steps(4);
+    harness.get_by_label("Encoder input");
     harness.get_by_label("BGRA").scroll_to_me();
     harness.run_steps(4);
     harness.get_by_label("BGRA").click();
@@ -588,8 +593,159 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     disconnect_ipad(&shared);
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
+    troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// A hybrid laptop: the panel on the Radeon iGPU, EternalMonitor on the
+/// NVIDIA card (the 0.3.3 field case).
+fn hybrid_laptop() -> eternal_host::gpu_preference::GpuFacts {
+    use eternal_host::gpu_preference::{Adapter, GpuFacts};
+    GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: (0, 0x2222),
+                name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            },
+            Adapter {
+                id: (0, 0x1111),
+                name: "AMD Radeon(TM) 780M Graphics".into(),
+            },
+        ],
+        power_saving: Some((0, 0x1111)),
+        high_performance: Some((0, 0x2222)),
+        screens: vec![
+            (r"\\.\DISPLAY1".into(), (0, 0x1111)),
+            (r"\\.\DISPLAY2".into(), (0, 0x2222)),
+        ],
+    }
+}
+
+/// Settings > Troubleshooting on a hybrid laptop, and the Stream page
+/// notice that moves EternalMonitor onto the card its screen is wired to.
+/// Nothing here writes Windows settings: off Windows, the restart reports
+/// that it can't run, which the test checks.
+fn troubleshooting_and_hybrid_notice(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    for label in [
+        "Graphics card for EternalMonitor",
+        "Window drawing",
+        "Video encoder",
+        "Sharper video format (HEVC)",
+        "Smaller network packets",
+        "Reset troubleshooting settings",
+        "EternalMonitor runs on the NVIDIA GeForce RTX 5060 Laptop GPU now.",
+        "DISPLAY1 is connected to the AMD Radeon(TM) 780M Graphics.",
+    ] {
+        window.get_by_label(label);
+    }
+    // Every choice starts at Automatic.
+    let graphics_card = || {
+        kittest::by()
+            .role(Role::ComboBox)
+            .value("Automatic (Windows decides)")
+    };
+    window.get(graphics_card());
+    window
+        .get_by_label("Graphics card for EternalMonitor")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-troubleshooting");
+
+    // Picking a card waits for a restart, which Windows needs.
+    window.get(graphics_card()).click();
+    window.run_steps(4);
+    window
+        .get_by_label("Power saving (AMD Radeon 780M)")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Windows applies this when EternalMonitor starts again.");
+    window.get_by_label("Restart EternalMonitor").click();
+    window.run_steps(4);
+    window.get_by_label_contains("EternalMonitor couldn't restart itself");
+    // Smaller packets is the VPN size; Reset puts it back.
+    window
+        .get_by_label("Use smaller network packets")
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Use smaller network packets").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1200);
+    assert_eq!(settings_file(dir).max_dgram, 1200);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1400);
+    assert_eq!(settings_file(dir).max_dgram, 1400);
+    assert_eq!(
+        settings_file(dir).window_drawing,
+        eternal_host::troubleshooting::WindowDrawing::Automatic
+    );
+    results.extend_harness(&mut window);
+
+    // Windows won't share the panel from the NVIDIA card.
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_diagnosis.lock() = Some(Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    });
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window
+        .get_by_label("Windows won't share this screen from the graphics card EternalMonitor uses");
+    window.get_by_label_contains("Your screen is connected to the AMD Radeon(TM) 780M Graphics");
+    snapshot(&mut window, shared, "stream-hybrid-switch");
+    window
+        .get_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .click();
+    window.run_steps(4);
+    // Off Windows nothing restarts, and no switch is recorded.
+    window.get_by_label_contains("EternalMonitor couldn't restart itself");
+    assert!(shared.gpu_switch.lock().is_none());
+    assert!(settings_file(dir).gpu_switch.is_none());
+    results.extend_harness(&mut window);
+
+    // After the restart Windows still refused: another app picks the card.
+    let mut record = SwitchRecord::new(
+        None,
+        None,
+        Preference::PowerSaving,
+        "AMD Radeon(TM) 780M Graphics",
+    );
+    record.checking = false;
+    record.failed = true;
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    // Capture records the outcome while the window is open.
+    *shared.gpu_switch.lock() = Some(record);
+    window.run_steps(4);
+    window.get_by_label("Another app is choosing EternalMonitor's graphics card");
+    window.get_by_role_and_label(Role::Button, "Undo the change");
+    window.get_by_role_and_label(Role::Button, "Restart EternalMonitor");
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .is_none());
+    snapshot(&mut window, shared, "stream-hybrid-overridden");
+    // The window saved the record capture changed.
+    assert!(settings_file(dir)
+        .gpu_switch
+        .is_some_and(|record| record.failed));
+    results.extend_harness(&mut window);
+
+    *shared.gpu_switch.lock() = None;
+    *shared.gpu_diagnosis.lock() = None;
+    *shared.capture_block.lock() = None;
+    *shared.gpu_facts.lock() = None;
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture
@@ -1153,6 +1309,15 @@ fn review_screens() {
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
         save(&mut h, &format!("problem-{name}"));
     }
+    *shared.gpu_diagnosis.lock() = Some(eternal_host::gpu_preference::Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(eternal_host::gpu_preference::Preference::PowerSaving),
+    });
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_diagnosis.lock() = None;
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);
@@ -1168,6 +1333,12 @@ fn review_screens() {
     let mut tall = harness(&shared, egui::vec2(1040.0, 1720.0), 2.0);
     nav(&mut tall, "Settings");
     save(&mut tall, "settings-full");
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut tall = harness(&shared, egui::vec2(1040.0, 2300.0), 2.0);
+    nav(&mut tall, "Settings");
+    tall.get_by_label("Show options").click();
+    save(&mut tall, "settings-troubleshooting-full");
+    *shared.gpu_facts.lock() = None;
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
 
