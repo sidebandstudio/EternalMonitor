@@ -36,9 +36,11 @@ jobs:
     name: Windows installer
     runs-on: windows-2022
     timeout-minutes: 60
-    # Holds the Artifact Signing settings and is the identity Azure trusts
-    # for this job's OIDC login (docs/windows-signing.md).
-    environment: release
+    # The release environment holds the Artifact Signing settings and is the
+    # identity Azure trusts for the OIDC login (docs/windows-signing.md). Only
+    # main and version tags use it; dry runs from other branches get no
+    # environment and build unsigned.
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'release' || '' }}
     env:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
       ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}

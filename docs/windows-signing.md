@@ -49,17 +49,45 @@ Identity validation can't be done from the CLI.
 6. Under Certificate profiles, create a Public Trust profile that uses the
    completed identity validation.
 7. In Microsoft Entra ID, register an app for the workflow, for example
-   `eternalmonitor-release-signing`. Under Certificates & secrets, Federated
-   credentials, add a GitHub Actions credential for organization
-   `sidebandstudio`, repository `EternalMonitor`, entity type Environment,
-   environment `release`. The app needs no client secret.
-8. On the Artifact Signing account's Access control (IAM), assign the Artifact
+   `eternalmonitor-release-signing`. The app needs no client secret.
+8. Under the app's Certificates & secrets, Federated credentials, add a
+   credential with the scenario Other issuer:
+
+   | Field | Value |
+   | --- | --- |
+   | Issuer | `https://token.actions.githubusercontent.com` |
+   | Subject identifier | `repo:sidebandstudio@322977961/EternalMonitor@1199998561:environment:release` |
+   | Audience | `api://AzureADTokenExchange` |
+
+   This repository's OIDC tokens use GitHub's
+   [immutable subject](https://learn.microsoft.com/en-us/entra/workload-id/workload-identities-github-immutable-subjects),
+   which carries the owner and repository IDs. The GitHub Actions scenario
+   builds a subject from names alone, and Azure rejects the login when the two
+   don't match. `gh api repos/sidebandstudio/EternalMonitor/actions/oidc/customization/sub`
+   prints the prefix GitHub uses.
+9. On the Artifact Signing account's Access control (IAM), assign the Artifact
    Signing Certificate Profile Signer role to that app.
 
 ## GitHub settings
 
-The first Release run that includes this workflow creates the `release`
-environment. Create it under Settings, Environments if it isn't there yet, then add:
+Azure trusts any job that runs in the `release` environment, so lock the
+environment down before adding the variable that turns signing on.
+
+1. Under Settings, Environments, `release` (create it if it isn't there), set
+   Deployment branches and tags to Selected branches and tags. Add the branch
+   `main` and the tag pattern `v*`.
+2. Under Settings, Rules, Rulesets, add a tag ruleset that targets `v*` and
+   restricts creations, updates and deletions to maintainers. A version tag
+   on any commit otherwise reaches the signing step.
+3. Optionally add a required reviewer to the environment, so each signing run
+   waits for an approval.
+
+The Release job only asks for the environment on `main` and `v*` tags. Dry
+runs from other branches still work. They run without the environment, can't
+log in, and build unsigned. Keep `release` out of every other workflow, because
+the Azure trust covers whatever job uses it.
+
+Then add these to the `release` environment:
 
 | Secret | Value |
 | --- | --- |
@@ -73,11 +101,8 @@ environment. Create it under Settings, Environments if it isn't there yet, then 
 | `ARTIFACT_SIGNING_ACCOUNT` | The Artifact Signing account name |
 | `ARTIFACT_SIGNING_PROFILE` | The certificate profile name |
 
-Setting `ARTIFACT_SIGNING_ACCOUNT` turns signing on for every Release run.
-
-Any branch that can run the Release workflow can sign with this identity. To
-limit that, set the environment's deployment branches and tags to the `v*` tag
-pattern and `main`. Dry runs from other branches then fail before they start.
+Setting `ARTIFACT_SIGNING_ACCOUNT` turns signing on for Release runs from
+`main` and `v*` tags.
 
 ## Checking a signed build
 
