@@ -19,7 +19,7 @@ mod page_performance;
 mod page_settings;
 mod page_stream;
 mod page_troubleshooting;
-mod renderer;
+pub(crate) mod renderer;
 mod theme;
 mod update_banner;
 mod update_toast;

@@ -193,7 +193,7 @@ impl AnalyzerApp {
         if status.avoiding && env.is_none() {
             ui.horizontal(|ui| {
                 ui.label(muted(
-                    "After a problem when EternalMonitor started, it set a drawing method aside until the graphics driver updates.",
+                    "After a problem when EternalMonitor started, it set a drawing method aside.",
                 ));
                 retry = widgets::link_button(ui, "Try all again", super::icons::Icon::Refresh)
                     .clicked();

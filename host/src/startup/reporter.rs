@@ -282,6 +282,13 @@ fn run(args: &[String]) -> i32 {
             if let Some((record, false)) = read_record(&file(RECORD)) {
                 super::offer::begin();
                 let module = module_at(process, record.address);
+                // Before the release below, so the next launch finds it.
+                crate::gui::renderer::note_fault(
+                    owner,
+                    module
+                        .as_ref()
+                        .map_or(crate::gui::renderer::UNKNOWN, |(name, _)| name.as_str()),
+                );
                 let outcome = super::Outcome::new(
                     record,
                     module.as_ref().map(|(n, o)| (n.as_str(), *o)),
@@ -368,6 +375,14 @@ fn run(args: &[String]) -> i32 {
                 fs::write(file(RECORD), bytes)
             };
             let outcome = super::Outcome::new(record, None, false);
+            crate::gui::renderer::note_fault(
+                owner,
+                if outcome.crash {
+                    crate::gui::renderer::UNKNOWN
+                } else {
+                    crate::gui::renderer::TERMINATED
+                },
+            );
             if outcome.crash {
                 // Beside the cleanup the message waits for below.
                 super::offer::begin();
