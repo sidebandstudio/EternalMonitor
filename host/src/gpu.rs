@@ -1,6 +1,8 @@
 use tracing::{info, warn};
 use windows::core::Interface;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
+};
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
@@ -76,24 +78,47 @@ impl GpuInfo {
 
 /// Vendors of the hardware adapters present now. Read at each encoder
 /// fallback rather than at launch, so a card connected since (an eGPU, a
-/// dock) or a driver installed since is tried. Empty if DXGI can't be asked.
-pub fn vendors_present() -> Vec<GpuVendor> {
-    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return Vec::new();
+/// dock) or a driver installed since comes first. None unless DXGI listed
+/// and described every adapter.
+pub fn vendors_present() -> Option<Vec<GpuVendor>> {
+    let factory = match unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+        Ok(factory) => factory,
+        Err(error) => {
+            info!(%error, "Could not list the graphics cards");
+            return None;
+        }
     };
+    vendors_listed(|index| {
+        let adapter = unsafe { factory.EnumAdapters1(index) }?;
+        let desc = unsafe { adapter.GetDesc1() }?;
+        Ok((desc.VendorId, desc.Flags))
+    })
+}
+
+/// The vendors of the adapters `adapter` describes (vendor ID and flags) by
+/// index until DXGI_ERROR_NOT_FOUND, without software adapters or repeats.
+/// None on any other error: a list missing a card that is there would put
+/// that card's encoder behind ones the PC may not have.
+fn vendors_listed(
+    mut adapter: impl FnMut(u32) -> windows::core::Result<(u32, u32)>,
+) -> Option<Vec<GpuVendor>> {
     let mut vendors = Vec::new();
-    let mut index = 0u32;
-    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
-        index += 1;
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
-            continue;
-        };
-        let vendor = GpuVendor::from_vendor_id(desc.VendorId);
-        if desc.Flags & FLAG_SOFTWARE == 0 && !vendors.contains(&vendor) {
-            vendors.push(vendor);
+    for index in 0u32.. {
+        match adapter(index) {
+            Ok((vendor_id, flags)) => {
+                let vendor = GpuVendor::from_vendor_id(vendor_id);
+                if flags & FLAG_SOFTWARE == 0 && !vendors.contains(&vendor) {
+                    vendors.push(vendor);
+                }
+            }
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => {
+                info!(adapter_index = index, %error, "Could not list every graphics card");
+                return None;
+            }
         }
     }
-    vendors
+    Some(vendors)
 }
 
 /// Windows driver versions of the NVIDIA adapters, packed as DXGI reports
@@ -280,4 +305,49 @@ fn resolve_encoder(vendor: GpuVendor) -> (String, String) {
 
     warn!("No hardware or software encoder found in FFmpeg — defaulting to libx264");
     ("libx264".to_string(), "H.264 (x264)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+
+    /// `vendors_listed` over these adapters (vendor ID and flags, or the
+    /// error describing it gave), then DXGI_ERROR_NOT_FOUND.
+    fn listed(adapters: &[windows::core::Result<(u32, u32)>]) -> Option<Vec<GpuVendor>> {
+        vendors_listed(|index| match adapters.get(index as usize) {
+            Some(adapter) => adapter.clone(),
+            None => Err(DXGI_ERROR_NOT_FOUND.into()),
+        })
+    }
+
+    #[test]
+    fn every_adapter_is_listed_or_there_is_no_list() {
+        use GpuVendor::{Amd, Intel, Nvidia, Unknown};
+        // RTX + Radeon iGPU, the basic render driver skipped, repeats once.
+        assert_eq!(
+            listed(&[
+                Ok((VENDOR_NVIDIA, 0)),
+                Ok((VENDOR_AMD, 0)),
+                Ok((VENDOR_NVIDIA, 0)),
+                Ok((0x1414, FLAG_SOFTWARE)),
+            ]),
+            Some(vec![Nvidia, Amd])
+        );
+        assert_eq!(listed(&[]), Some(vec![]));
+        // NVIDIA described, then Intel's description failed: no list, not
+        // [NVIDIA].
+        assert_eq!(listed(&[Ok((VENDOR_NVIDIA, 0)), Err(E_FAIL.into())]), None);
+        // The adapter list itself failed after one adapter.
+        assert_eq!(
+            listed(&[Ok((VENDOR_INTEL, 0)), Err(DXGI_ERROR_DEVICE_REMOVED.into())]),
+            None
+        );
+        // A vendor ID with no encoder here is listed as unknown.
+        assert_eq!(
+            listed(&[Ok((0x1414, 0)), Ok((VENDOR_INTEL, 0))]),
+            Some(vec![Unknown, Intel])
+        );
+    }
 }
