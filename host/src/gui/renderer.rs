@@ -9,6 +9,13 @@
 //! the window is confirmed working. A marker whose process has exited means
 //! that launch never got there, so that backend is avoided on that GPU and
 //! driver, and tried again after some clean launches or a driver change.
+//!
+//! On Windows the instance is created without OpenGL. Listing GL adapters
+//! makes a context on the display GPU, and AMD's OpenGL driver can crash the
+//! process there before any adapter is chosen. Vulkan, DX12 and WARP cover
+//! every Windows 10 PC. A launch that dies while wgpu lists adapters leaves a
+//! marker for that stage too, and the next launch narrows the instance to
+//! DX12, then to WARP.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
-use eframe::wgpu::{self, Backend, DeviceType};
+use eframe::wgpu::{self, Backend, Backends, DeviceType};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -40,6 +47,35 @@ static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
 static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+
+/// The backends the instance is created with, from widest to safest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Plan {
+    Full,
+    Dx12,
+    Warp,
+}
+
+impl Plan {
+    const ALL: [Plan; 3] = [Plan::Full, Plan::Dx12, Plan::Warp];
+
+    /// The marker backend of a launch still listing adapters with this plan.
+    fn stage(self) -> &'static str {
+        match self {
+            Plan::Full => "enumerate",
+            Plan::Dx12 => "enumerate dx12",
+            Plan::Warp => "enumerate warp",
+        }
+    }
+
+    /// Windows only; elsewhere the instance keeps egui's backends.
+    fn backends(self) -> Backends {
+        match self {
+            Plan::Full => Backends::DX12 | Backends::VULKAN,
+            Plan::Dx12 | Plan::Warp => Backends::DX12,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
@@ -65,7 +101,8 @@ struct Failure {
     clean_launches: u32,
 }
 
-/// Install the adapter selector, after recording failed earlier starts.
+/// Choose the instance backends and install the adapter selector, after
+/// recording failed earlier starts.
 pub(super) fn configure(config: &mut WgpuConfiguration) {
     let history = match crate::settings::app_data_dir() {
         Some(base) => {
@@ -78,8 +115,9 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         None => Vec::new(),
     };
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        let plan = choose_backends(&mut setup.instance_descriptor, &history);
         setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
-            select(adapters, surface, &history)
+            select(adapters, surface, &history, plan)
         }));
     }
     let default = config.on_surface_status.clone();
@@ -87,6 +125,56 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
         default(status)
     });
+}
+
+/// `WGPU_BACKEND` decides when set, as in wgpu, and nothing is narrowed or
+/// recorded then.
+fn choose_backends(descriptor: &mut wgpu::InstanceDescriptor, history: &[Failure]) -> Plan {
+    let forced = Backends::from_env();
+    let mut plan = Plan::Full;
+    if cfg!(windows) {
+        if forced.is_none() {
+            let gpus = system_gpus();
+            plan = instance_plan(history, &gpus);
+            start(Marker {
+                gpu: gpus,
+                backend: plan.stage().to_string(),
+            });
+        }
+        descriptor.backends = instance_backends(forced, plan);
+    }
+    info!(
+        backends = ?descriptor.backends,
+        from_env = forced.is_some(),
+        narrowed = plan != Plan::Full,
+        "Window renderer instance"
+    );
+    plan
+}
+
+fn instance_backends(forced: Option<Backends>, plan: Plan) -> Backends {
+    forced.unwrap_or(plan.backends())
+}
+
+/// The widest plan that has not died while listing adapters on these GPUs and
+/// drivers.
+fn instance_plan(history: &[Failure], gpus: &str) -> Plan {
+    Plan::ALL
+        .into_iter()
+        .find(|plan| !avoided(history, gpus, plan.stage()))
+        .unwrap_or(Plan::Warp)
+}
+
+/// Leave this launch's marker until the window is confirmed working.
+fn start(marker: Marker) {
+    if let Some(directory) = STATE_DIR.get() {
+        if let Ok(json) = serde_json::to_vec(&marker) {
+            let _ = fs::write(marker_path(directory, ProcessId::current()), json);
+        }
+    }
+    if let Ok(mut started) = STARTED.lock() {
+        *started = Some(marker);
+    }
 }
 
 /// Called at the start of each UI pass; clears this launch's marker once the
@@ -201,10 +289,12 @@ fn select(
     adapters: &[wgpu::Adapter],
     surface: Option<&wgpu::Surface<'_>>,
     history: &[Failure],
+    plan: Plan,
 ) -> Result<wgpu::Adapter, String> {
     let usable: Vec<&wgpu::Adapter> = adapters
         .iter()
         .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
+        .filter(|adapter| plan != Plan::Warp || adapter.get_info().device_type == DeviceType::Cpu)
         .collect();
     let gpus: Vec<String> = usable.iter().map(|a| gpu_key(&a.get_info())).collect();
     let candidates: Vec<Candidate> = usable
@@ -236,14 +326,7 @@ fn select(
         avoided = ?history.iter().filter(|f| avoided(history, &f.gpu, &f.backend)).map(|f| (&f.gpu, &f.backend)).collect::<Vec<_>>(),
         "Window renderer selected"
     );
-    if let Some(directory) = STATE_DIR.get() {
-        if let Ok(json) = serde_json::to_vec(&marker) {
-            let _ = fs::write(marker_path(directory, ProcessId::current()), json);
-        }
-    }
-    if let Ok(mut started) = STARTED.lock() {
-        *started = Some(marker);
-    }
+    start(marker);
     crate::startup::simulate_renderer_failure()?;
     Ok(adapter)
 }
@@ -290,32 +373,50 @@ fn gpu_key(info: &wgpu::AdapterInfo) -> String {
 }
 
 /// The driver version DXGI reports for the adapter wgpu describes.
-#[cfg(windows)]
 fn driver_version(vendor: u32, device: u32) -> Option<String> {
+    dxgi_adapters()
+        .into_iter()
+        .find(|(v, d, _)| *v == vendor && *d == device)
+        .map(|(_, _, driver)| driver)
+}
+
+/// Every GPU and driver DXGI lists, as wgpu lists them before choosing one.
+fn system_gpus() -> String {
+    dxgi_adapters()
+        .iter()
+        .map(|(vendor, device, driver)| format!("{vendor:04x}:{device:04x} {driver}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Vendor, device and driver version of each DXGI adapter. Creates no device.
+#[cfg(windows)]
+fn dxgi_adapters() -> Vec<(u32, u32, String)> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
     (0..)
         .map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok())
-        .find_map(|adapter| {
+        .filter_map(|adapter| {
             let desc = unsafe { adapter.GetDesc1() }.ok()?;
-            if desc.VendorId != vendor || desc.DeviceId != device {
-                return None;
-            }
             let version = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }.ok()? as u64;
-            Some(format!(
+            let driver = format!(
                 "{}.{}.{}.{}",
                 version >> 48,
                 (version >> 32) & 0xffff,
                 (version >> 16) & 0xffff,
                 version & 0xffff
-            ))
+            );
+            Some((desc.VendorId, desc.DeviceId, driver))
         })
+        .collect()
 }
 
 #[cfg(not(windows))]
-fn driver_version(_vendor: u32, _device: u32) -> Option<String> {
-    None
+fn dxgi_adapters() -> Vec<(u32, u32, String)> {
+    Vec::new()
 }
 
 fn avoided(history: &[Failure], gpu: &str, backend: &str) -> bool {
@@ -443,13 +544,13 @@ mod tests {
         }
     }
 
-    /// The adapters wgpu listed on the UHD 620 host from issue #59.
+    /// The adapters wgpu listed on the UHD 620 host from issue #59, less the
+    /// OpenGL one the instance no longer lists.
     fn uhd_620() -> Vec<Candidate> {
         vec![
             candidate(Backend::Vulkan, DeviceType::IntegratedGpu, false),
             candidate(Backend::Dx12, DeviceType::IntegratedGpu, true),
             candidate(Backend::Dx12, DeviceType::Cpu, true),
-            candidate(Backend::Gl, DeviceType::IntegratedGpu, false),
         ]
     }
 
@@ -523,12 +624,13 @@ mod tests {
     #[test]
     fn a_backend_that_failed_before_is_tried_last() {
         assert_eq!(pick(&avoiding(uhd_620(), &[Backend::Dx12])), Some(0));
-        assert_eq!(
-            pick(&avoiding(uhd_620(), &[Backend::Vulkan, Backend::Dx12])),
-            Some(3)
-        );
+        // Both backends of the GPU failed: WARP draws.
+        let mut candidates = uhd_620();
+        candidates[0].avoided = true;
+        candidates[1].avoided = true;
+        assert_eq!(pick(&candidates), Some(2));
         // With everything avoided, the usual order applies again.
-        let all = [Backend::Dx12, Backend::Gl, Backend::Vulkan];
+        let all = [Backend::Dx12, Backend::Vulkan];
         assert_eq!(pick(&avoiding(uhd_620(), &all)), Some(1));
         assert_eq!(pick(&[]), None);
     }
@@ -588,6 +690,59 @@ mod tests {
         assert_eq!(sweep(&directory, elsewhere), history);
         assert_eq!(read_history(&directory), history);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_windows_instance_leaves_out_opengl_unless_wgpu_backend_asks() {
+        let full = instance_backends(None, Plan::Full);
+        assert_eq!(full, Backends::DX12 | Backends::VULKAN);
+        assert!(!full.contains(Backends::GL));
+        // WGPU_BACKEND is read as wgpu reads it and wins over any narrowing.
+        let dx12 = Backends::from_comma_list("dx12");
+        assert_eq!(instance_backends(Some(dx12), Plan::Full), Backends::DX12);
+        let gl = Backends::from_comma_list("gl");
+        assert_eq!(instance_backends(Some(gl), Plan::Warp), Backends::GL);
+    }
+
+    #[test]
+    fn a_launch_that_died_listing_adapters_narrows_the_next_one() {
+        let directory = temp_dir("renderer-enumerate");
+        let gpus = "1002:150e 32.0.21025.1024, 10de:2d59 32.0.15.9186";
+        assert_eq!(instance_plan(&[], gpus), Plan::Full);
+        let crash = |plan: Plan| {
+            let dead = exited_process();
+            let json = serde_json::to_vec(&marker(gpus, plan.stage())).unwrap();
+            fs::write(marker_path(&directory, dead), json).unwrap();
+            sweep(&directory, ProcessId::current())
+        };
+        let history = crash(Plan::Full);
+        assert_eq!(instance_plan(&history, gpus), Plan::Dx12);
+        assert_eq!(instance_backends(None, Plan::Dx12), Backends::DX12);
+        let history = crash(Plan::Dx12);
+        assert_eq!(instance_plan(&history, gpus), Plan::Warp);
+        // Other GPUs or a driver update start with every backend.
+        assert_eq!(
+            instance_plan(&history, "1002:150e 32.0.21030.2001"),
+            Plan::Full
+        );
+        // Everything failed: stay on the safest set.
+        let history = crash(Plan::Warp);
+        assert_eq!(instance_plan(&history, gpus), Plan::Warp);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn clean_launches_bring_the_full_instance_back() {
+        let gpus = "1002:150e 32.0.21025.1024";
+        let drew = marker("1002:150e 32.0.21025.1024", "dx12");
+        let mut history = Vec::new();
+        record_failure(&mut history, &marker(gpus, Plan::Full.stage()));
+        for _ in 0..RETRY_AFTER - 1 {
+            record_success(&mut history, &drew);
+        }
+        assert_eq!(instance_plan(&history, gpus), Plan::Dx12);
+        record_success(&mut history, &drew);
+        assert_eq!(instance_plan(&history, gpus), Plan::Full);
     }
 
     #[test]
