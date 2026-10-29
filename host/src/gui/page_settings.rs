@@ -154,7 +154,7 @@ impl AnalyzerApp {
             let mut upload = crate::telemetry::enabled();
             widgets::setting_row(ui, "Automatically share diagnostics", "Sends device details, errors and stream statistics to EternalMonitor support. Includes PC names and network addresses. Screen content, audio and pairing credentials are excluded.", 64.0, |ui| { widgets::toggle(ui, &mut upload, "Automatically share diagnostics"); });
             if upload != crate::telemetry::enabled() { crate::telemetry::set_enabled(upload); }
-            ui.label(muted(crate::telemetry::status()));
+            ui.label(muted(crate::telemetry::summary()));
         });
         ui.add_space(GAP - 6.0);
 

@@ -33,6 +33,12 @@ static SENDER: OnceLock<mpsc::SyncSender<Queued>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
+/// What Settings tells the user, in plain words; [`STATUS`] is for support.
+static SHARING_STATE: Mutex<Sharing> = Mutex::new(Sharing::Unavailable);
+/// When the backend last acknowledged a batch.
+static LAST_SENT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// The sharing preference could not be saved.
+static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
 /// The uploader's summary window, for fatal reports.
@@ -126,6 +132,68 @@ fn set_status(text: impl Into<String>) {
         *value = text.into();
     }
 }
+
+#[derive(Clone, Copy)]
+enum Sharing {
+    /// This build has no upload endpoint.
+    Unavailable,
+    /// The outbox could not be written.
+    Stopped,
+    Ready,
+    /// The last upload failed; it is retried.
+    Retrying,
+}
+fn set_sharing(sharing: Sharing) {
+    *lock(&SHARING_STATE) = sharing;
+}
+/// What Settings shows about uploads, without field names or ids.
+pub fn summary() -> String {
+    let last_sent = lock(&LAST_SENT).map(|at| at.elapsed());
+    plain_summary(
+        *lock(&SHARING_STATE),
+        enabled(),
+        last_sent,
+        DROPPED.load(Ordering::Relaxed),
+        SAVE_FAILED.load(Ordering::Relaxed),
+    )
+}
+fn plain_summary(
+    sharing: Sharing,
+    enabled: bool,
+    last_sent: Option<Duration>,
+    dropped: u64,
+    save_failed: bool,
+) -> String {
+    let mut text = match sharing {
+        Sharing::Unavailable => "Sharing diagnostics isn't available in this build.".to_string(),
+        Sharing::Stopped => {
+            "Sharing diagnostics stopped: they could not be saved on this PC.".to_string()
+        }
+        _ if !enabled => "Sharing diagnostics: off.".to_string(),
+        Sharing::Retrying => "Sharing diagnostics: on. Waiting for a connection.".to_string(),
+        Sharing::Ready => match last_sent {
+            Some(ago) => format!("Sharing diagnostics: on. Last sent {}.", ago_text(ago)),
+            None => "Sharing diagnostics: on. Nothing sent yet.".to_string(),
+        },
+    };
+    if enabled && dropped > 0 && !matches!(sharing, Sharing::Unavailable) {
+        text.push_str(" Some diagnostics were dropped while offline.");
+    }
+    if save_failed {
+        text.push_str(" This setting could not be saved.");
+    }
+    text
+}
+fn ago_text(ago: Duration) -> String {
+    let minutes = ago.as_secs() / 60;
+    let (count, unit) = match minutes {
+        0 => return "just now".to_string(),
+        1..60 => (minutes, "minute"),
+        60..1440 => (minutes / 60, "hour"),
+        _ => (minutes / 1440, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
 pub fn status() -> String {
     format!(
         "{}{}; queue_dropped={}",
@@ -160,10 +228,12 @@ pub fn set_enabled(value: bool) {
             fs::write(path, b"disabled")
         };
         if result.is_err() {
+            SAVE_FAILED.store(true, Ordering::Relaxed);
             set_status("Could not save automatic upload preference");
             return;
         }
     }
+    SAVE_FAILED.store(false, Ordering::Relaxed);
     ENABLED.store(value, Ordering::Relaxed);
     set_status(if value {
         "Automatic upload enabled"
@@ -240,6 +310,7 @@ impl Uploader {
             );
             std::thread::spawn(move || {
                 if run(config, directory, receiver, periodic, stop).is_err() {
+                    set_sharing(Sharing::Stopped);
                     set_status("Automatic upload stopped: local outbox unavailable");
                 }
                 let _ = done_tx.send(());
@@ -342,6 +413,7 @@ impl UploadGuard {
         let identity = match identity(&directory) {
             Ok(identity) => identity,
             Err(_) => {
+                set_sharing(Sharing::Stopped);
                 set_status("Automatic upload stopped: local outbox unavailable");
                 return Self { _uploader: None };
             }
@@ -598,6 +670,7 @@ fn upload(
         return Err("Upload acknowledgement mismatch".into());
     }
     fs::remove_file(path)?;
+    *lock(&LAST_SENT) = Some(std::time::Instant::now());
     Ok(())
 }
 fn run(
@@ -616,6 +689,7 @@ fn run(
     let mut next = std::time::Instant::now();
     let mut backoff = 5;
     let mut last_persist = std::time::Instant::now();
+    set_sharing(Sharing::Ready);
     set_status("Automatic upload enabled; waiting for events");
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -673,12 +747,14 @@ fn run(
                 }
             }
             if failed {
+                set_sharing(Sharing::Retrying);
                 set_status(format!(
                     "Automatic upload waiting to retry; pending_batches={}",
                     files(&directory)?.len()
                 ));
                 backoff = (backoff * 2).min(300);
             } else {
+                set_sharing(Sharing::Ready);
                 set_status(format!(
                     "Automatic upload connected; pending_batches={}",
                     files(&directory)?.len()
@@ -1474,6 +1550,64 @@ mod tests {
             assert!(uploaded.len() <= MAX_LINE_BYTES, "{}", uploaded.len());
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+    /// Settings says what happens in words: no field names, ids or counts.
+    #[test]
+    fn settings_shows_sharing_in_plain_words() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        let cases = [
+            (
+                plain_summary(Sharing::Ready, true, minutes(2), 0, false),
+                "Sharing diagnostics: on. Last sent 2 minutes ago.",
+            ),
+            (
+                plain_summary(
+                    Sharing::Ready,
+                    true,
+                    Some(Duration::from_secs(20)),
+                    0,
+                    false,
+                ),
+                "Sharing diagnostics: on. Last sent just now.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(61), 0, false),
+                "Sharing diagnostics: on. Last sent 1 hour ago.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(3 * 1440), 0, false),
+                "Sharing diagnostics: on. Last sent 3 days ago.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, None, 0, false),
+                "Sharing diagnostics: on. Nothing sent yet.",
+            ),
+            (
+                plain_summary(Sharing::Retrying, true, minutes(1), 3, false),
+                "Sharing diagnostics: on. Waiting for a connection. \
+                 Some diagnostics were dropped while offline.",
+            ),
+            (
+                plain_summary(Sharing::Ready, false, minutes(1), 3, false),
+                "Sharing diagnostics: off.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(1), 0, true),
+                "Sharing diagnostics: on. Last sent 1 minute ago. This setting could not be saved.",
+            ),
+            (
+                plain_summary(Sharing::Unavailable, true, None, 0, false),
+                "Sharing diagnostics isn't available in this build.",
+            ),
+            (
+                plain_summary(Sharing::Stopped, true, None, 0, false),
+                "Sharing diagnostics stopped: they could not be saved on this PC.",
+            ),
+        ];
+        for (shown, expected) in cases {
+            assert_eq!(shown, expected);
+            assert!(!shown.contains(['=', '_']), "{shown}");
+        }
     }
     #[test]
     fn drained_events_keep_their_level() {
