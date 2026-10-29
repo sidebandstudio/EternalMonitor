@@ -177,7 +177,6 @@ impl AnalyzerApp {
     fn graphics_card_notice(&mut self, ui: &mut Ui, icon: Icon, title: &str, body: &str) {
         let diagnosis = self.control.shared.gpu_diagnosis.lock().clone();
         let record = self.control.shared.gpu_switch.lock().clone();
-        let ctx = ui.ctx().clone();
         match gpu_notice(diagnosis.as_ref(), record.as_ref()) {
             GpuNotice::Plain => widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {}),
             GpuNotice::Choose { gpu } => widgets::banner(
@@ -208,7 +207,7 @@ impl AnalyzerApp {
                     },
                 );
                 if clicked {
-                    self.switch_graphics_card(&ctx, preference, &gpu);
+                    self.switch_graphics_card(preference, &gpu);
                 }
             }
             GpuNotice::Overridden { gpu, app_gpu } => {
@@ -233,23 +232,62 @@ impl AnalyzerApp {
                     },
                 );
                 if undo {
-                    self.undo_graphics_switch(&ctx);
+                    self.undo_graphics_switch();
                 } else if restart {
-                    self.restart_app(&ctx);
+                    // The user changed the card in another app.
+                    self.restart_now(crate::relaunch::Reason::Plain);
                 }
             }
         }
-        if let Some(error) = &self.relaunch_error {
+        self.gpu_error_line(ui);
+    }
+
+    /// Why the graphics card setting wasn't saved, when it wasn't.
+    pub(super) fn gpu_error_line(&self, ui: &mut Ui) {
+        if let Some(error) = &self.gpu_error {
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!(
-                        "EternalMonitor couldn't restart itself ({error}). Quit it and open it again."
-                    ))
-                    .size(SMALL)
-                    .color(DANGER),
+                    RichText::new(gpu_error_text(error))
+                        .size(SMALL)
+                        .color(DANGER),
                 )
                 .wrap(),
             );
+        }
+    }
+
+    /// "Restart EternalMonitor" on every page: while the new copy starts,
+    /// and, when it never said it runs, why this window stays, with Quit.
+    pub(super) fn restart_banner(&mut self, ui: &mut Ui) {
+        if self.restart.busy() {
+            widgets::banner(
+                ui,
+                ACCENT,
+                Icon::Refresh,
+                "Restarting EternalMonitor",
+                "EternalMonitor opens again in a moment.",
+                0.0,
+                |_| {},
+            );
+            return;
+        }
+        let Some(reason) = self.restart.failed() else {
+            return;
+        };
+        let mut quit = false;
+        widgets::banner(
+            ui,
+            DANGER,
+            Icon::Warning,
+            crate::relaunch::RESTART_FAILED_TITLE,
+            &crate::relaunch::restart_failed_body(reason),
+            button_width("Quit EternalMonitor"),
+            |ui| {
+                quit = widgets::button(ui, Tone::Primary, None, "Quit EternalMonitor").clicked();
+            },
+        );
+        if quit {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -909,6 +947,11 @@ pub(super) fn gpu_switch_body(gpu: &str, app_gpu: &str) -> String {
     format!(
         "Your screen is connected to the {gpu}, but EternalMonitor is running on the {app_gpu}. Click the button and EternalMonitor restarts on the right card. You can change this later in Settings > Troubleshooting."
     )
+}
+
+/// A graphics card setting that couldn't be saved: nothing else changed.
+pub(super) fn gpu_error_text(error: &str) -> String {
+    format!("Couldn't save the graphics card setting ({error}). Nothing was changed.")
 }
 
 pub(super) fn gpu_choice_body(gpu: &str) -> String {

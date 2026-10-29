@@ -11,10 +11,10 @@
 //! Windows picks the adapter from the per-app value under
 //! `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`, the same one
 //! Settings > System > Display > Graphics writes, and reads it only when a
-//! process starts. A change is written by a helper copy after this process
-//! has exited (writing it while EternalMonitor still held a duplication hung
-//! that process's next DuplicateOutput on the reference PC), and the helper
-//! then opens EternalMonitor again. Nothing is written unless the user asks.
+//! process starts. The running app writes its own value when the user asks,
+//! which changes nothing for itself, then restarts (`relaunch`): the new copy,
+//! and any launch after the write, starts on the chosen card. Nothing is
+//! written unless the user asks.
 
 use serde::{Deserialize, Serialize};
 
@@ -332,8 +332,8 @@ pub fn settle(record: &mut SwitchRecord, outcome: Outcome) -> bool {
     }
 }
 
-/// Whether the stored value holds the switch `record` asked for. False after
-/// a helper copy could not save it (HKCU writes refused).
+/// Whether the stored value holds the switch `record` asked for. False when
+/// something else changed it before this start (Windows Settings, a tool).
 pub fn switch_saved(record: &SwitchRecord, value: Option<&str>) -> bool {
     preference_in(value).unwrap_or(0) == record.preference.value()
 }
@@ -371,7 +371,7 @@ pub fn with_preference(existing: Option<&str>, preference: Preference) -> Option
     (!value.is_empty()).then_some(value)
 }
 
-/// What the helper copy writes once the app has exited.
+/// A change to EternalMonitor's own value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Set `GpuPreference`, keeping the value's other settings.
@@ -381,25 +381,6 @@ pub enum Change {
 }
 
 impl Change {
-    fn to_arg(&self) -> String {
-        match self {
-            Self::Set(preference) => preference.value().to_string(),
-            Self::Restore(value) => format!("restore:{}", value.as_deref().unwrap_or_default()),
-        }
-    }
-
-    fn from_arg(arg: &str) -> Option<Self> {
-        if let Some(value) = arg.strip_prefix("restore:") {
-            return Some(Self::Restore(
-                (!value.is_empty()).then(|| value.to_string()),
-            ));
-        }
-        arg.parse()
-            .ok()
-            .and_then(Preference::from_value)
-            .map(Self::Set)
-    }
-
     /// The value to store, given the one stored now.
     pub fn apply(&self, existing: Option<&str>) -> Option<String> {
         match self {
@@ -430,171 +411,71 @@ pub fn apply(
     Ok((before, after))
 }
 
-/// The helper copy's arguments: wait for this process to exit, then make
-/// this change before opening the app again.
-pub const AFTER_EXIT_ARG: &str = "--after-exit-of";
-pub const CHANGE_ARG: &str = "--set-gpu-preference";
-
-/// The user's own arguments (a custom port is the first one), without the
-/// ones a reopen adds.
-pub fn own_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut kept = Vec::new();
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == AFTER_EXIT_ARG || arg == CHANGE_ARG {
-            args.next();
-        } else {
-            kept.push(arg);
+/// Writes `change` to EternalMonitor's own value while the app runs: Windows
+/// reads it only when a process starts, so this process keeps its card.
+/// `record` becomes `next` only when the write succeeds, and `persist` saves
+/// each record it holds (settings.json). A `next` that keeps an Undo value is
+/// saved before the write, so a crash between the two never loses what Undo
+/// restores. A failed write puts the earlier record back and changes nothing
+/// else.
+pub fn save_change(
+    store: &mut impl PreferenceStore,
+    record: &mut Option<SwitchRecord>,
+    change: &Change,
+    next: Option<SwitchRecord>,
+    mut persist: impl FnMut(&Option<SwitchRecord>),
+) -> Result<(), String> {
+    let previous = record.clone();
+    if next.is_some() && next != previous {
+        *record = next.clone();
+        persist(record);
+    }
+    if let Err(error) = apply(store, change) {
+        if *record != previous {
+            *record = previous;
+            persist(record);
         }
+        return Err(error);
     }
-    kept
-}
-
-/// The arguments for a helper copy that waits for `pid`, makes `change` and
-/// opens the app again with the user's own arguments.
-pub fn helper_args(
-    args: impl IntoIterator<Item = String>,
-    pid: u32,
-    change: Option<&Change>,
-) -> Vec<String> {
-    let mut kept = own_args(args);
-    kept.extend([AFTER_EXIT_ARG.to_string(), pid.to_string()]);
-    if let Some(change) = change {
-        kept.extend([CHANGE_ARG.to_string(), change.to_arg()]);
+    if *record != next {
+        *record = next;
+        persist(record);
     }
-    kept
+    Ok(())
 }
 
-fn arg_after<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    let index = args.iter().position(|arg| arg == name)?;
-    args.get(index + 1).map(String::as_str)
+/// The Stream page's switch to `preference`, the card `gpu`. A switch made
+/// earlier keeps the user's original value for Undo.
+pub fn switch(
+    store: &mut impl PreferenceStore,
+    record: &mut Option<SwitchRecord>,
+    preference: Preference,
+    gpu: &str,
+    persist: impl FnMut(&Option<SwitchRecord>),
+) -> Result<(), String> {
+    let current = store.read()?;
+    let next = SwitchRecord::new(record.as_ref(), current, preference, gpu);
+    save_change(store, record, &Change::Set(preference), Some(next), persist)
 }
 
-/// What a helper copy was asked to do, from its arguments: the process to
-/// wait for and the change to make. `None` for an ordinary launch.
-pub fn helper_request(args: &[String]) -> Option<(u32, Option<Change>)> {
-    let pid = arg_after(args, AFTER_EXIT_ARG)?.parse().ok()?;
-    Some((pid, arg_after(args, CHANGE_ARG).and_then(Change::from_arg)))
-}
-
-/// How long a helper copy waits for the app to exit. Closing can take 40 s
-/// (the virtual display's Disable task may run 35 s, then its worker 5 s),
-/// and the copy must not start EternalMonitor before then: the new copy
-/// would find the old one's single-instance lock and quit, leaving no app.
-pub const WAIT_FOR_EXIT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// What a helper copy needs from Windows. Tests fake it.
-pub trait HelperHost {
-    /// Waits for the app to exit; false when it still runs after `timeout`.
-    fn wait_for_exit(&mut self, timeout: std::time::Duration) -> bool;
-    /// Opens EternalMonitor again with the user's own arguments.
-    fn launch(&mut self) -> Result<(), String>;
-    /// Shows a message box and waits for OK.
-    fn tell(&mut self, title: &str, body: &str);
-    /// Leaves a line for the next start to log (and so upload). The helper
-    /// has no log of its own.
-    fn note(&mut self, line: &str);
-}
-
-/// How a helper copy ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelperEnd {
-    Reopened,
-    /// The app exited but could not be started again; the user was told.
-    NotReopened,
-    /// The app was still running at the deadline: nothing was changed or
-    /// started, and the user was told.
-    StillRunning,
-}
-
-pub const SLOW_EXIT_TITLE: &str = "EternalMonitor is taking a long time to close";
-pub const REOPEN_FAILED_TITLE: &str = "EternalMonitor couldn't reopen";
-
-/// A helper copy's work: wait for the app to exit, then make `change` with
-/// `save` and open the app again. Nothing is written or started while the
-/// app may still run, and every way this can end without a window tells
-/// the user.
-pub fn run_helper(
-    host: &mut impl HelperHost,
-    change: Option<&Change>,
-    save: impl FnOnce(&Change) -> Result<(), String>,
-) -> HelperEnd {
-    if !host.wait_for_exit(WAIT_FOR_EXIT) {
-        host.note(&format!(
-            "Graphics card helper: EternalMonitor was still running after {} s; nothing was changed or reopened",
-            WAIT_FOR_EXIT.as_secs()
-        ));
-        let body = if change.is_some() {
-            "The graphics card wasn't changed. Wait until EternalMonitor has closed, then open it from the Start menu and choose the card again."
-        } else {
-            "Wait until EternalMonitor has closed, then open it from the Start menu."
-        };
-        host.tell(SLOW_EXIT_TITLE, body);
-        return HelperEnd::StillRunning;
-    }
-    // If saving fails, the app opens as before and offers the switch again.
-    let saved = change.map(save);
-    if let Some(Err(error)) = &saved {
-        host.note(&format!(
-            "Graphics card helper: the graphics setting was not saved ({error})"
-        ));
-    }
-    let Err(error) = host.launch() else {
-        return HelperEnd::Reopened;
+/// Undo: EternalMonitor's value back to what it was before the first switch,
+/// or removed if there was none. The record (and with it Undo) goes only
+/// once that is written.
+pub fn undo(
+    store: &mut impl PreferenceStore,
+    record: &mut Option<SwitchRecord>,
+    persist: impl FnMut(&Option<SwitchRecord>),
+) -> Result<(), String> {
+    let Some(before) = record.as_ref().map(|record| record.before.clone()) else {
+        return Ok(());
     };
-    let (saved_word, setting) = match saved {
-        None => ("no change", ""),
-        Some(Ok(())) => ("yes", " The graphics card setting was saved."),
-        Some(Err(_)) => ("no", " The graphics card setting couldn't be saved."),
-    };
-    host.note(&format!(
-        "Graphics card helper: EternalMonitor could not be reopened ({error}); setting saved: {saved_word}"
-    ));
-    host.tell(
-        REOPEN_FAILED_TITLE,
-        &format!("Open EternalMonitor from the Start menu.{setting}"),
-    );
-    HelperEnd::NotReopened
+    save_change(store, record, &Change::Restore(before), None, persist)
 }
 
-/// The file a helper copy leaves its lines in, beside settings.json.
-const HELPER_NOTES: &str = "graphics-helper-notes.txt";
-
-/// Adds `line` to the helper notes in `dir`.
-pub fn leave_note_in(dir: &std::path::Path, line: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(HELPER_NOTES))?;
-    writeln!(file, "{}", line.replace(['\r', '\n'], " "))
-}
-
-/// The lines helper copies left in `dir`, removed once read.
-pub fn take_notes_in(dir: &std::path::Path) -> Vec<String> {
-    let path = dir.join(HELPER_NOTES);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let _ = std::fs::remove_file(&path);
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// The lines helper copies left for this start to log.
-pub fn take_helper_notes() -> Vec<String> {
-    crate::settings::app_data_dir()
-        .map(|dir| take_notes_in(&dir))
-        .unwrap_or_default()
-}
-
-/// Whether the switch `record` waits on reached Windows, as the relaunched
-/// app first sees it. A switch the helper couldn't save is no longer
-/// awaited, so a refused capture offers it again instead of blaming
-/// another app for choosing the card.
+/// Whether the switch `record` waits on reached Windows, as the restarted
+/// app first sees it. A switch no longer in the value (something else
+/// changed it) is no longer awaited, so a refused capture offers it again
+/// instead of blaming another app for choosing the card.
 pub fn started_after_switch(record: &mut SwitchRecord, value: Option<&str>) -> bool {
     let saved = switch_saved(record, value);
     if !saved {
@@ -604,7 +485,7 @@ pub fn started_after_switch(record: &mut SwitchRecord, value: Option<&str>) -> b
 }
 
 #[cfg(windows)]
-pub use windows_impl::{facts, read_value, relaunch, run_helper_if_requested};
+pub use windows_impl::{facts, OwnValue};
 
 /// No graphics preference outside Windows.
 #[cfg(not(windows))]
@@ -612,23 +493,36 @@ pub fn facts() -> Option<GpuFacts> {
     None
 }
 
+/// Outside Windows there is no value: reads find none and writes fail.
 #[cfg(not(windows))]
+pub struct OwnValue;
+
+#[cfg(not(windows))]
+impl OwnValue {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
+#[cfg(not(windows))]
+impl PreferenceStore for OwnValue {
+    fn read(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    fn write(&mut self, _value: Option<&str>) -> Result<(), String> {
+        Err("switching graphics cards needs Windows".into())
+    }
+}
+
+/// EternalMonitor's own value now.
 pub fn read_value() -> Result<Option<String>, String> {
-    Ok(None)
+    OwnValue::new()?.read()
 }
-
-#[cfg(not(windows))]
-pub fn relaunch(_change: Option<&Change>) -> Result<(), String> {
-    Err("switching graphics cards needs Windows".into())
-}
-
-#[cfg(not(windows))]
-pub fn run_helper_if_requested() {}
 
 #[cfg(windows)]
 mod windows_impl {
     use std::os::windows::ffi::OsStrExt;
-    use std::time::Duration;
 
     use std::ffi::c_void;
 
@@ -655,7 +549,7 @@ mod windows_impl {
         REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
-    use super::{AdapterId, AdapterKind, Change, GpuFacts, PreferenceStore};
+    use super::{AdapterId, AdapterKind, GpuFacts, PreferenceStore};
 
     const PREFERENCES_KEY: PCWSTR = w!("Software\\Microsoft\\DirectX\\UserGpuPreferences");
     /// DXGI_ADAPTER_FLAG_SOFTWARE.
@@ -811,12 +705,12 @@ mod windows_impl {
     }
 
     /// This executable's value under HKCU.
-    struct OwnValue {
+    pub struct OwnValue {
         name: Vec<u16>,
     }
 
     impl OwnValue {
-        fn new() -> Result<Self, String> {
+        pub fn new() -> Result<Self, String> {
             let exe = std::env::current_exe().map_err(|error| error.to_string())?;
             Ok(Self {
                 name: exe.as_os_str().encode_wide().chain([0]).collect(),
@@ -932,100 +826,6 @@ mod windows_impl {
                 Err(format!("could not save the graphics setting: {status:?}"))
             }
         }
-    }
-
-    /// EternalMonitor's own value now.
-    pub fn read_value() -> Result<Option<String>, String> {
-        OwnValue::new()?.read()
-    }
-
-    /// Starts `exe` with `args`, inheriting no handles (the host holds
-    /// inheritable sockets and driver handles) and outside this process's
-    /// job object where the job allows it, so it outlives this process.
-    fn start(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        let mut line = eternal_updater::quote_arg(&exe.display().to_string());
-        for arg in args {
-            line.push(' ');
-            line.push_str(&eternal_updater::quote_arg(arg));
-        }
-        let flags = CREATE_NEW_PROCESS_GROUP;
-        eternal_updater::win::start_suspended(exe, &line, flags | CREATE_BREAKAWAY_FROM_JOB, None)
-            .or_else(|_| eternal_updater::win::start_suspended(exe, &line, flags, None))
-            .and_then(|started| started.resume())
-            .map(drop)
-            .map_err(|error| format!("could not open EternalMonitor again: {error}"))
-    }
-
-    /// Starts a helper copy that waits for this process to exit, makes
-    /// `change` and opens the app again. The caller then closes the window.
-    /// This process never writes the value itself.
-    pub fn relaunch(change: Option<&Change>) -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        start(
-            &exe,
-            &super::helper_args(std::env::args().skip(1), std::process::id(), change),
-        )
-    }
-
-    /// A helper copy's view of Windows: the app's process, this executable
-    /// and the user's own arguments.
-    struct Helper {
-        pid: u32,
-        args: Vec<String>,
-    }
-
-    impl super::HelperHost for Helper {
-        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
-            // A process that can't be opened has already exited.
-            eternal_updater::win::open_process(self.pid).map_or(true, |process| {
-                eternal_updater::win::wait(&process, Some(timeout)).is_some()
-            })
-        }
-
-        fn launch(&mut self) -> Result<(), String> {
-            let exe = std::env::current_exe()
-                .map_err(|error| format!("could not open EternalMonitor again: {error}"))?;
-            start(&exe, &super::own_args(self.args.clone()))
-        }
-
-        fn tell(&mut self, title: &str, body: &str) {
-            use windows::core::HSTRING;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-            };
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(body),
-                    &HSTRING::from(title),
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
-                );
-            }
-        }
-
-        fn note(&mut self, line: &str) {
-            if let Some(dir) = crate::settings::app_data_dir() {
-                let _ = super::leave_note_in(&dir, line);
-            }
-        }
-    }
-
-    /// In a helper copy: wait for the app to exit, make the change, open the
-    /// app again and exit. Runs before logging and the single-instance check,
-    /// so it touches neither the session log nor the running app.
-    pub fn run_helper_if_requested() {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let Some((pid, change)) = super::helper_request(&args) else {
-            return;
-        };
-        super::run_helper(&mut Helper { pid, args }, change.as_ref(), |change| {
-            OwnValue::new()
-                .and_then(|mut value| super::apply(&mut value, change))
-                .map(drop)
-        });
-        std::process::exit(0);
     }
 }
 
@@ -1372,251 +1172,135 @@ mod tests {
     }
 
     #[test]
-    fn the_relaunched_app_can_tell_a_switch_that_was_never_saved() {
+    fn the_restarted_app_can_tell_a_switch_that_is_no_longer_saved() {
         let record = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
         assert!(switch_saved(
             &record,
             Some("AutoHDREnable=1;GpuPreference=1;")
         ));
-        // The helper's HKCU write was refused, or another tool changed it.
+        // Another tool changed it.
         assert!(!switch_saved(&record, None));
         assert!(!switch_saved(&record, Some("GpuPreference=2;")));
     }
 
-    #[test]
-    fn a_helper_copy_finds_its_request_and_reopens_with_the_users_arguments() {
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(helper_request(&args(&["19876"])), None);
-        assert_eq!(helper_request(&args(&[AFTER_EXIT_ARG, "x"])), None);
-        let helper = helper_args(
-            args(&["19876", AFTER_EXIT_ARG, "7", CHANGE_ARG, "1"]),
-            4242,
-            Some(&Change::Set(Preference::HighPerformance)),
-        );
-        assert_eq!(
-            helper,
-            args(&["19876", AFTER_EXIT_ARG, "4242", CHANGE_ARG, "2"])
-        );
-        assert_eq!(
-            helper_request(&helper),
-            Some((4242, Some(Change::Set(Preference::HighPerformance))))
-        );
-        assert_eq!(own_args(helper), args(&["19876"]));
-        // A plain restart and an undo to a value or to none.
-        assert_eq!(
-            helper_request(&helper_args(args(&[]), 9, None)),
-            Some((9, None))
-        );
-        let undo = Change::Restore(Some("AutoHDREnable=1;GpuPreference=2;".into()));
-        assert_eq!(
-            helper_request(&helper_args(args(&[]), 9, Some(&undo))),
-            Some((9, Some(undo)))
-        );
-        let remove = Change::Restore(None);
-        assert_eq!(
-            helper_request(&helper_args(args(&[]), 9, Some(&remove))),
-            Some((9, Some(remove)))
-        );
-        // A value outside 0-2 is never written.
-        assert_eq!(
-            helper_request(&args(&[AFTER_EXIT_ARG, "9", CHANGE_ARG, "3"])),
-            Some((9, None))
-        );
+    /// The switch record as settings.json last saved it, and every save.
+    #[derive(Default)]
+    struct Saved {
+        file: Option<SwitchRecord>,
+        saves: usize,
     }
 
-    /// The old app and the single-instance lock it holds until it exits, as
-    /// a helper copy sees them. The app exits `exits_after` into the wait
-    /// (never when `None`). Events go to a log the test's save shares.
-    struct FakeApp {
-        exits_after: Option<std::time::Duration>,
-        clock: std::time::Duration,
-        events: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-        launch_error: Option<String>,
-    }
-
-    impl FakeApp {
-        fn new(exits_after: Option<u64>) -> Self {
-            Self {
-                exits_after: exits_after.map(std::time::Duration::from_secs),
-                clock: std::time::Duration::ZERO,
-                events: Default::default(),
-                launch_error: None,
+    impl Saved {
+        fn persist(&mut self) -> impl FnMut(&Option<SwitchRecord>) + '_ {
+            |record| {
+                self.file = record.clone();
+                self.saves += 1;
             }
         }
-
-        fn running(&self) -> bool {
-            self.exits_after.is_none_or(|at| self.clock < at)
-        }
-
-        fn events(&self) -> Vec<String> {
-            self.events.borrow().clone()
-        }
-    }
-
-    impl HelperHost for FakeApp {
-        fn wait_for_exit(&mut self, timeout: std::time::Duration) -> bool {
-            self.clock = match self.exits_after {
-                Some(at) if at <= self.clock + timeout => at.max(self.clock),
-                _ => self.clock + timeout,
-            };
-            if !self.running() {
-                self.events
-                    .borrow_mut()
-                    .push(format!("exited after {} s", self.clock.as_secs()));
-            }
-            !self.running()
-        }
-        fn launch(&mut self) -> Result<(), String> {
-            // A new copy started while the old one holds the lock shows the
-            // old (closed) window and quits: no app at all.
-            assert!(!self.running(), "started while the old app holds the lock");
-            match self.launch_error.clone() {
-                Some(error) => Err(error),
-                None => {
-                    self.events.borrow_mut().push("launch".into());
-                    Ok(())
-                }
-            }
-        }
-        fn tell(&mut self, title: &str, body: &str) {
-            self.events
-                .borrow_mut()
-                .push(format!("tell: {title}: {body}"));
-        }
-        fn note(&mut self, line: &str) {
-            self.events.borrow_mut().push(format!("note: {line}"));
-        }
     }
 
     #[test]
-    fn a_helper_waits_out_a_slow_shutdown_before_saving_and_reopening() {
-        // Closing with a virtual display Disable that runs its full 35 s,
-        // then the worker's 5 s: past the old 30 s wait.
-        let mut app = FakeApp::new(Some(41));
-        let events = app.events.clone();
-        let mut store = key(None);
-        let change = Change::Set(Preference::HighPerformance);
-        let end = run_helper(&mut app, Some(&change), |change| {
-            events.borrow_mut().push("save".into());
-            apply(&mut store, change).map(drop)
-        });
-        assert_eq!(end, HelperEnd::Reopened);
-        assert_eq!(app.events(), ["exited after 41 s", "save", "launch"]);
-        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=2;"));
+    fn a_switch_is_saved_while_the_app_runs_with_its_undo_value_first() {
+        let mut store = key(Some("AutoHDREnable=1;"));
+        let mut record = None;
+        let mut saved = Saved::default();
+        switch(
+            &mut store,
+            &mut record,
+            Preference::HighPerformance,
+            "NVIDIA GeForce RTX 5080",
+            saved.persist(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.read().unwrap().as_deref(),
+            Some("AutoHDREnable=1;GpuPreference=2;")
+        );
+        let record = record.unwrap();
+        assert_eq!(record.before.as_deref(), Some("AutoHDREnable=1;"));
+        assert!(record.checking);
+        assert_eq!(saved.file, Some(record));
+        // Saved once, before the write: a crash after it still has Undo.
+        assert_eq!(saved.saves, 1);
     }
 
     #[test]
-    fn a_helper_changes_and_starts_nothing_while_the_app_still_runs() {
-        let mut app = FakeApp::new(None);
-        let mut saved = false;
-        let end = run_helper(
-            &mut app,
-            Some(&Change::Set(Preference::PowerSaving)),
-            |_| {
-                saved = true;
-                Ok(())
-            },
-        );
-        assert_eq!(end, HelperEnd::StillRunning);
-        assert!(!saved, "wrote the preference while the app still ran");
-        assert_eq!(app.clock, WAIT_FOR_EXIT);
-        // No launch; one line for the next start and one message.
-        assert_eq!(app.events().len(), 2, "{:?}", app.events());
-        assert!(app.events()[0].starts_with(
-            "note: Graphics card helper: EternalMonitor was still running after 120 s"
-        ));
-        assert!(app.events()[1].starts_with(&format!(
-            "tell: {SLOW_EXIT_TITLE}: The graphics card wasn't changed."
-        )));
-        assert!(app.events()[1].contains("open it from the Start menu"));
-        // A plain restart (Window drawing) says only how to reopen.
-        let mut app = FakeApp::new(Some(500));
-        assert_eq!(
-            run_helper(&mut app, None, |_| Ok(())),
-            HelperEnd::StillRunning
-        );
-        assert_eq!(
-            app.events()[1],
-            format!("tell: {SLOW_EXIT_TITLE}: Wait until EternalMonitor has closed, then open it from the Start menu.")
-        );
-    }
-
-    #[test]
-    fn a_failed_reopen_tells_the_user_and_the_next_start() {
-        let mut app = FakeApp::new(Some(0));
-        app.launch_error =
-            Some("could not open EternalMonitor again: Access is denied. (0x80070005)".into());
-        let mut store = key(None);
-        let end = run_helper(
-            &mut app,
-            Some(&Change::Set(Preference::PowerSaving)),
-            |change| apply(&mut store, change).map(drop),
-        );
-        assert_eq!(end, HelperEnd::NotReopened);
-        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
-        assert_eq!(
-            app.events(),
-            [
-                "exited after 0 s".to_string(),
-                "note: Graphics card helper: EternalMonitor could not be reopened (could not open EternalMonitor again: Access is denied. (0x80070005)); setting saved: yes".to_string(),
-                format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu. The graphics card setting was saved."),
-            ]
-        );
-        // A refused write and a failed start: both noted, and the message
-        // doesn't claim the setting was saved.
-        let mut app = FakeApp::new(Some(0));
-        app.launch_error = Some("no".into());
-        let mut store = key(None);
+    fn a_refused_switch_changes_nothing_and_keeps_the_earlier_record() {
+        // An earlier switch to Power saving, then a switch back that HKCU
+        // refuses: the value and the record stay as they were.
+        let mut store = key(Some("GpuPreference=1;"));
+        let earlier = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
+        let mut record = Some(earlier.clone());
         store.denied = true;
-        run_helper(
-            &mut app,
-            Some(&Change::Set(Preference::PowerSaving)),
-            |change| apply(&mut store, change).map(drop),
-        );
-        assert_eq!(
-            app.events()[1],
-            "note: Graphics card helper: the graphics setting was not saved (access denied)"
-        );
-        assert!(app.events()[2].ends_with("setting saved: no"));
-        assert_eq!(
-            app.events()[3],
-            format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu. The graphics card setting couldn't be saved.")
-        );
-        // A plain restart that can't start again.
-        let mut app = FakeApp::new(Some(0));
-        app.launch_error = Some("no".into());
-        run_helper(&mut app, None, |_| unreachable!());
-        assert_eq!(
-            app.events()[2],
-            format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu.")
-        );
+        let mut saved = Saved {
+            file: record.clone(),
+            saves: 0,
+        };
+        let error = switch(
+            &mut store,
+            &mut record,
+            Preference::HighPerformance,
+            "NVIDIA",
+            saved.persist(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "access denied");
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
+        assert_eq!(record, Some(earlier.clone()));
+        assert_eq!(saved.file, Some(earlier));
     }
 
     #[test]
-    fn the_next_start_reads_each_helper_note_once() {
-        let dir = std::env::temp_dir().join(format!(
-            "eternal-helper-notes-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+    fn undo_clears_its_record_only_once_the_value_is_back() {
+        // The user had High performance; the switch set Power saving.
+        let mut store = key(Some("GpuPreference=1;"));
+        let switched = SwitchRecord::new(
+            None,
+            Some("GpuPreference=2;".into()),
+            Preference::PowerSaving,
+            "AMD",
+        );
+        // HKCU refuses the restore: Undo and the original value are kept.
+        store.denied = true;
+        let mut record = Some(switched.clone());
+        let mut saved = Saved {
+            file: record.clone(),
+            saves: 0,
+        };
+        assert!(undo(&mut store, &mut record, saved.persist()).is_err());
+        assert_eq!(record, Some(switched.clone()));
+        assert_eq!(saved.file, Some(switched.clone()));
+        assert_eq!(saved.saves, 0);
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
+        // The next try works: the value is back, then the record goes.
+        store.denied = false;
+        undo(&mut store, &mut record, saved.persist()).unwrap();
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=2;"));
+        assert_eq!(record, None);
+        assert_eq!(saved.file, None);
+        // Undo of a switch over no value removes only EternalMonitor's.
+        let mut store = key(Some("GpuPreference=1;"));
+        let mut record = Some(SwitchRecord::new(
+            None,
+            None,
+            Preference::PowerSaving,
+            "AMD",
         ));
-        assert!(take_notes_in(&dir).is_empty());
-        leave_note_in(&dir, "first").unwrap();
-        leave_note_in(&dir, "second\r\nline").unwrap();
-        assert_eq!(take_notes_in(&dir), ["first", "second  line"]);
-        assert!(take_notes_in(&dir).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        undo(&mut store, &mut record, |_| {}).unwrap();
+        assert_eq!(store.values.len(), 1);
+        assert_eq!(store.values[r"C:\Games\game.exe"], "GpuPreference=2;");
+        // Nothing to undo writes nothing.
+        let mut none = None;
+        assert!(undo(&mut store, &mut none, |_| unreachable!()).is_ok());
     }
 
     #[test]
-    fn a_switch_the_helper_never_saved_is_offered_again() {
+    fn a_switch_no_longer_in_the_value_is_offered_again() {
         let mut record = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
         assert!(started_after_switch(&mut record, Some("GpuPreference=1;")));
         assert!(record.checking);
-        // Not saved (the app took too long to close, or HKCU refused it):
-        // a refused capture must not read as another app choosing the card.
+        // Something else changed the value before this start: a refused
+        // capture must not read as another app choosing the card.
         assert!(!started_after_switch(&mut record, None));
         assert!(!record.checking);
         assert!(!settle(&mut record, Outcome::StillUnsupported));

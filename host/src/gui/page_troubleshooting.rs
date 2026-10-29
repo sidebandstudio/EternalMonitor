@@ -145,11 +145,10 @@ impl AnalyzerApp {
                 .clicked();
             });
             if restart {
-                let ctx = ui.ctx().clone();
-                self.apply_graphics_card(&ctx);
+                self.apply_graphics_card();
             }
         }
-        self.relaunch_error_line(ui);
+        self.gpu_error_line(ui);
         ui.add_space(8.0);
     }
 
@@ -217,8 +216,7 @@ impl AnalyzerApp {
             renderer::reset_avoidance();
         }
         if restart {
-            let ctx = ui.ctx().clone();
-            self.restart_app(&ctx);
+            self.restart_now(crate::relaunch::Reason::Settings);
         }
         ui.add_space(8.0);
     }
@@ -343,21 +341,6 @@ impl AnalyzerApp {
         );
         if packet_env.is_none() && small != small_now {
             self.set_packet_size(u32::from(if small { SMALL_PACKET } else { FULL_PACKET }));
-        }
-    }
-
-    fn relaunch_error_line(&self, ui: &mut Ui) {
-        if let Some(error) = &self.relaunch_error {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "EternalMonitor couldn't restart itself ({error}). Quit it and open it again."
-                    ))
-                    .size(SMALL)
-                    .color(DANGER),
-                )
-                .wrap(),
-            );
         }
     }
 }

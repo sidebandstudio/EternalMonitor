@@ -19,26 +19,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host it watches and must never be turned away as a second instance,
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
-    // A copy started to switch the graphics card waits for the app to exit,
-    // saves the choice and opens the app again; it is never a host itself.
-    eternal_host::gpu_preference::run_helper_if_requested();
-    eternal_host::console::join_parent_console();
-
-    // Before any DXGI query or window: monitor rects and injected input must
-    // be physical pixels from the start, not only once the GUI's event loop
-    // opts in. Unaware, a 125% monitor reports 2048x1152 instead of 2560x1440.
+    // Before any DXGI query or window (a restart copy's message too):
+    // monitor rects and injected input must be physical pixels from the
+    // start, not only once the GUI's event loop opts in. Unaware, a 125%
+    // monitor reports 2048x1152 instead of 2560x1440.
     #[cfg(windows)]
     eternal_host::input::windows_inject::become_per_monitor_dpi_aware();
+
+    // A copy started by "Restart EternalMonitor" tells the old window it runs
+    // before anything else, then waits for the old host to exit and takes
+    // over its single-instance mutex (or explains and exits).
+    let restart_started = std::time::Instant::now();
+    let restarted = eternal_host::relaunch::take_over_if_requested();
+    let restart_wait = restarted.is_some().then(|| restart_started.elapsed());
+    eternal_host::console::join_parent_console();
 
     // One host per installation; a second launch shows the first one and
     // exits. Checked after helper-mode dispatch and before anything a host
     // owns: opening the session log rotates it and the uploader drains the
     // shared outbox, so a launch that loses here must not reach either, and
     // must not reset the virtual display the first host is streaming.
-    let Some(instance) = eternal_host::single_instance::acquire() else {
-        eprintln!("EternalMonitor is already running; showing its window");
-        eternal_host::single_instance::show_existing();
-        return Ok(());
+    let instance = match restarted {
+        Some(Some(instance)) => instance,
+        Some(None) => return Ok(()),
+        None => {
+            let Some(instance) = eternal_host::single_instance::acquire() else {
+                eprintln!("EternalMonitor is already running; showing its window");
+                eternal_host::single_instance::show_existing();
+                return Ok(());
+            };
+            instance
+        }
     };
 
     // Anchor the process-wide media clock before anything else runs.
@@ -73,6 +84,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(problem) = &instance.problem {
         tracing::warn!(%problem, "Could not check for another EternalMonitor");
+    }
+    if let Some(waited) = restart_wait {
+        info!(
+            waited_ms = waited.as_millis() as u64,
+            "Started by Restart EternalMonitor once the previous window had closed"
+        );
     }
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
@@ -155,11 +172,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overrides.log(eternal_host::gpu_preference::preference_in(
         gpu_value.as_deref(),
     ));
-    // The helper copy that saved a switch has no log of its own: it leaves
-    // lines here when it could not finish.
-    for note in eternal_host::gpu_preference::take_helper_notes() {
-        tracing::warn!("{note}");
-    }
     if let Some(record) = persisted.gpu_switch.as_mut().filter(|r| r.checking) {
         let saved =
             eternal_host::gpu_preference::started_after_switch(record, gpu_value.as_deref());

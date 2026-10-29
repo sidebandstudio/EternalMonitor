@@ -641,7 +641,7 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         sha256: release.sha256.clone(),
         app,
         // The listen port, if one was given, survives the restart.
-        app_args: std::env::args_os().skip(1).collect(),
+        app_args: crate::relaunch::own_args(std::env::args_os().skip(1)),
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };

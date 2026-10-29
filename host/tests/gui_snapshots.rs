@@ -625,8 +625,8 @@ fn hybrid_laptop() -> eternal_host::gpu_preference::GpuFacts {
 
 /// Settings > Troubleshooting on a hybrid laptop, and the Stream page
 /// notice that moves EternalMonitor onto the card its screen is wired to.
-/// Nothing here writes Windows settings: off Windows, the restart reports
-/// that it can't run, which the test checks.
+/// Nothing here writes Windows settings: off Windows the graphics card
+/// setting can't be saved and a restart can't start, which the test checks.
 fn troubleshooting_and_hybrid_notice(
     shared: &SharedControl,
     dir: &std::path::Path,
@@ -675,7 +675,11 @@ fn troubleshooting_and_hybrid_notice(
     window.get_by_label("Windows applies this when EternalMonitor starts again.");
     window.get_by_label("Restart EternalMonitor").click();
     window.run_steps(4);
-    window.get_by_label_contains("EternalMonitor couldn't restart itself");
+    // Saved before any restart; refused here, so nothing restarts.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
     // Smaller packets is the VPN size; Reset puts it back.
     window
         .get_by_label("Use smaller network packets")
@@ -711,8 +715,12 @@ fn troubleshooting_and_hybrid_notice(
         .get_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
         .click();
     window.run_steps(4);
-    // Off Windows nothing restarts, and no switch is recorded.
-    window.get_by_label_contains("EternalMonitor couldn't restart itself");
+    // Off Windows the setting can't be saved: nothing restarts, and no
+    // switch is recorded.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
     assert!(shared.gpu_switch.lock().is_none());
     assert!(settings_file(dir).gpu_switch.is_none());
     results.extend_harness(&mut window);
@@ -741,6 +749,25 @@ fn troubleshooting_and_hybrid_notice(
     assert!(settings_file(dir)
         .gpu_switch
         .is_some_and(|record| record.failed));
+    // The user changed the card in the NVIDIA app and restarts. Off Windows
+    // no copy starts: the window stays and says how to restart by hand.
+    window
+        .get_by_role_and_label(Role::Button, "Restart EternalMonitor")
+        .click();
+    for _ in 0..200 {
+        window.run_steps(1);
+        if window
+            .query_by_label("EternalMonitor couldn't restart by itself")
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    window.get_by_label("EternalMonitor couldn't restart by itself");
+    window.get_by_label("Quit EternalMonitor and open it again.");
+    window.get_by_role_and_label(Role::Button, "Quit EternalMonitor");
+    snapshot(&mut window, shared, "stream-restart-failed");
     results.extend_harness(&mut window);
 
     *shared.gpu_switch.lock() = None;
