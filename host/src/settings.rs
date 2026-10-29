@@ -136,6 +136,7 @@ impl SettingsFile {
     /// callers that can go on without the file ignore the error.
     pub fn save(&self) -> Result<(), String> {
         let Some(path) = settings_path() else {
+            warn!("Failed to save settings: no folder for settings (APPDATA and HOME unset)");
             return Err("no folder for settings".into());
         };
         if let Some(parent) = path.parent() {
