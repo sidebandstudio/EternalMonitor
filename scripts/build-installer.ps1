@@ -13,7 +13,13 @@ param(
     # Today's upstream setup wrapper is unsigned (CI pins its SHA-256 in
     # release.yml instead), so leave this off unless you are bundling a
     # signed driver build and want the signature enforced.
-    [switch]$StrictSignature
+    [switch]$StrictSignature,
+
+    # Authenticode-sign Setup, its uninstaller and our two exes. Inno Setup runs
+    # this command once per file, replacing $f with the quoted file path and $q
+    # with a quote. release.yml passes the Artifact Signing command; see
+    # docs/windows-signing.md. Empty builds an unsigned installer.
+    [string]$SignCommand
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,6 +116,7 @@ $issArgs = @(
     "/DAppVersion=$version"
 )
 if ($includeDriver) { $issArgs += "/DIncludeDriver" }
+if ($SignCommand) { $issArgs += "/DSign", "/Seternal=$SignCommand" }
 $issArgs += (Join-Path $repo "installer\EternalMonitor.iss")
 
 & $iscc @issArgs
