@@ -797,6 +797,10 @@ impl AnalyzerApp {
         self.saved_gpu_switch = self.control.shared.gpu_switch.lock().clone();
         match result {
             Ok(()) => {
+                self.control
+                    .shared
+                    .gpu_changed_here
+                    .store(true, Ordering::SeqCst);
                 self.gpu_error = None;
                 self.gpu_value = crate::gpu_preference::read_value().ok().flatten();
                 true

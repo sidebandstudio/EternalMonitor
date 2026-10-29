@@ -48,6 +48,11 @@ pub struct SharedControl {
     /// A switch made from that notice, as saved in settings. Capture
     /// records its outcome here; the GUI saves it.
     pub gpu_switch: Arc<Mutex<Option<crate::gpu_preference::SwitchRecord>>>,
+    /// This process saved a graphics card change. Windows applies it only
+    /// when EternalMonitor starts, so this process's own captures say
+    /// nothing about whether it helped (a restart that didn't happen, or
+    /// the moments before this process leaves).
+    pub gpu_changed_here: Arc<std::sync::atomic::AtomicBool>,
     /// The graphics cards and screens, for Settings > Troubleshooting. The
     /// GUI reads them on Windows when the section opens.
     pub gpu_facts: Arc<Mutex<Option<crate::gpu_preference::GpuFacts>>>,
@@ -167,6 +172,7 @@ impl SharedControl {
             capture_block: Arc::new(Mutex::new(None)),
             gpu_diagnosis: Arc::new(Mutex::new(None)),
             gpu_switch: Arc::new(Mutex::new(None)),
+            gpu_changed_here: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gpu_facts: Arc::new(Mutex::new(None)),
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),

@@ -4,6 +4,7 @@
 //! ACCESS_LOST loop re-created the duplication every millisecond for hours)
 //! nor count toward the supervisor's restart budget.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -91,8 +92,12 @@ pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) ->
 
 /// After a graphics card switch made from the Stream page notice, the first
 /// capture attempt of the relaunched app says whether it helped: one log
-/// line, and the record the GUI saves.
+/// line, and the record the GUI saves. The process that saved the change
+/// still runs on the old card and says nothing.
 pub fn note_gpu_outcome(shared: &SharedControl, outcome: crate::gpu_preference::Outcome) {
+    if shared.gpu_changed_here.load(Ordering::SeqCst) {
+        return;
+    }
     let mut record = shared.gpu_switch.lock();
     let Some(record) = record.as_mut() else {
         return;
@@ -282,6 +287,24 @@ pub fn note_capture_resumed(shared: &SharedControl) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn the_process_that_saved_a_switch_never_judges_it() {
+        use crate::gpu_preference::{Outcome, Preference, SwitchRecord};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let waiting = SwitchRecord::new(None, None, Preference::HighPerformance, "NVIDIA");
+        *shared.gpu_switch.lock() = Some(waiting.clone());
+        // The old window saved it and still runs on the old card (its
+        // restart failed, or it is about to leave): no "another app" verdict.
+        shared.gpu_changed_here.store(true, Ordering::SeqCst);
+        note_gpu_outcome(&shared, Outcome::StillUnsupported);
+        assert_eq!(*shared.gpu_switch.lock(), Some(waiting.clone()));
+        // The restarted copy judges it.
+        let restarted = SharedControl::new(9876, 15_000_000);
+        *restarted.gpu_switch.lock() = Some(waiting);
+        note_gpu_outcome(&restarted, Outcome::StillUnsupported);
+        assert!(restarted.gpu_switch.lock().as_ref().unwrap().failed);
+    }
 
     #[test]
     fn a_stuck_driver_call_is_waited_out_in_the_stage_not_restarted() {
