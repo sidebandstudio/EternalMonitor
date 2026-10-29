@@ -34,20 +34,40 @@ pub(super) fn port_notice_text(held: &Held) -> Option<(String, String)> {
             "Another copy of EternalMonitor is running".into(),
             "Only one copy can stream at a time, so iPads can't connect to this one. Quit the other copy (look for EternalMonitor in Task Manager if you can't see it), and this one starts streaming by itself.".into(),
         ),
-        HeldBy::Program(program) => (
-            format!("{program} is using EternalMonitor's network port"),
-            format!("iPads can't connect while {program} uses port {port}. Quit {program}. {then}"),
-        ),
+        HeldBy::Program(_) | HeldBy::Windows | HeldBy::WindowsService => {
+            let program = name(&held.by)?;
+            (
+                format!("{program} is using EternalMonitor's network port"),
+                format!("iPads can't connect while {program} uses port {port}. Quit {program}. {then}"),
+            )
+        }
         HeldBy::Unknown => (
             "Another program is using EternalMonitor's network port".into(),
             format!("iPads can't connect while another program uses port {port}. Quit that program or restart the PC. {then}"),
         ),
-        HeldBy::Blocked { .. } => (
-            format!("Windows is blocking EternalMonitor from using port {port}"),
-            "A firewall, security tool or reserved port range can do this.".into(),
-        ),
+        HeldBy::Blocked { ipv6, .. } => {
+            let mut body = "A firewall, security tool or reserved port range can do this.".to_string();
+            if let Some(program) = ipv6.as_deref().and_then(name) {
+                body += &format!(" {program} also uses this port over IPv6.");
+            }
+            (
+                format!("Windows is blocking EternalMonitor from using port {port}"),
+                body,
+            )
+        }
         // Checked again before anything is said.
         HeldBy::ThisCopy | HeldBy::Refused => return None,
+    })
+}
+
+/// What the notice calls a program on the port, when Windows says.
+fn name(by: &HeldBy) -> Option<&str> {
+    Some(match by {
+        HeldBy::Program(program) => program,
+        HeldBy::Windows => "Windows",
+        HeldBy::WindowsService => "A Windows service",
+        HeldBy::OtherCopy => "Another copy of EternalMonitor",
+        _ => return None,
     })
 }
 
@@ -114,7 +134,14 @@ mod tests {
     /// advice.
     #[test]
     fn a_blocked_port_says_windows_blocks_it() {
-        let (title, body) = port_notice_text(&held(HeldBy::Blocked { code: Some(10013) })).unwrap();
+        let blocked = |ipv6: Option<HeldBy>| {
+            port_notice_text(&held(HeldBy::Blocked {
+                code: Some(10013),
+                ipv6: ipv6.map(Box::new),
+            }))
+            .unwrap()
+        };
+        let (title, body) = blocked(None);
         assert_eq!(
             title,
             "Windows is blocking EternalMonitor from using port 9876"
@@ -122,6 +149,30 @@ mod tests {
         assert_eq!(
             body,
             "A firewall, security tool or reserved port range can do this."
+        );
+        assert_eq!(blocked(Some(HeldBy::Unknown)).1, body, "nobody to name");
+
+        // A program on the port over IPv6 only is named as a hint.
+        let (title, body) = blocked(Some(HeldBy::Program("Steam".into())));
+        assert_eq!(
+            title,
+            "Windows is blocking EternalMonitor from using port 9876"
+        );
+        assert_eq!(
+            body,
+            "A firewall, security tool or reserved port range can do this. Steam also uses this port over IPv6."
+        );
+    }
+
+    /// Windows' own processes keep their plain names.
+    #[test]
+    fn windows_and_its_services_are_named_plainly() {
+        let (title, _) = port_notice_text(&held(HeldBy::Windows)).unwrap();
+        assert_eq!(title, "Windows is using EternalMonitor's network port");
+        let (title, _) = port_notice_text(&held(HeldBy::WindowsService)).unwrap();
+        assert_eq!(
+            title,
+            "A Windows service is using EternalMonitor's network port"
         );
     }
 

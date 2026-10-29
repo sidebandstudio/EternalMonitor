@@ -10,16 +10,26 @@
 //! firewall, security tool or reserved port range. After [`REFUSALS`] checks
 //! in a row that find no holder, the page says Windows is blocking the port
 //! instead, and the error code is logged once. The checks go on.
+//!
+//! Logs and uploads say only what kind of program holds the port (see
+//! [`category`]); the program's own name is shown on the Stream page alone.
 
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use tracing::{info, warn};
 
 /// How often the supervisor checks a held port again.
 pub const RECHECK: Duration = Duration::from_secs(2);
+
+/// How long a check waits to learn which program holds the port. Reading an
+/// executable on a slow network share can take much longer; its holder is
+/// then [`HeldBy::Unknown`].
+const LOOKUP: Duration = Duration::from_millis(500);
 
 /// Refused binds in a row, with no program on the port, before the Stream
 /// page says Windows is blocking it (about 6 s).
@@ -37,7 +47,12 @@ pub struct Held {
 pub enum HeldBy {
     /// Another copy of EternalMonitor, from another folder or user.
     OtherCopy,
-    /// What Task Manager calls the program.
+    /// Windows itself (the System process).
+    Windows,
+    /// A service in a Windows service host.
+    WindowsService,
+    /// What Task Manager calls the program. Shown on the Stream page only,
+    /// never logged.
     Program(String),
     /// Windows doesn't say which program.
     Unknown,
@@ -48,8 +63,12 @@ pub enum HeldBy {
     Refused,
     /// Windows refused the bind [`REFUSALS`] times in a row and no program
     /// has the port: a firewall, security tool or reserved port range.
-    /// `code` is the bind's error code.
-    Blocked { code: Option<i32> },
+    /// `code` is the bind's error code; `ipv6` is a program on the port over
+    /// IPv6 only, which doesn't stop the stream's IPv4 bind by itself.
+    Blocked {
+        code: Option<i32>,
+        ipv6: Option<Box<HeldBy>>,
+    },
 }
 
 /// What the stream waits for, and how many refused binds in a row found no
@@ -88,7 +107,12 @@ pub fn check(port: u16) -> bool {
 /// As [`check`], for the host whose process is `own`.
 fn check_as(port: u16, own: u32) -> bool {
     let bound = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-    check_with(port, Bind::of(bound.map(drop)), || holder(port, own))
+    check_with(
+        port,
+        Bind::of(bound.map(drop)),
+        || holder(port, own, Family::V4),
+        || holder(port, own, Family::V6),
+    )
 }
 
 /// How the check's bind went.
@@ -113,34 +137,41 @@ impl Bind {
     }
 }
 
-/// [`check`] once the bind is done; `holder` looks up the program on the
-/// port, None when Windows lists none.
-fn check_with(port: u16, bind: Bind, holder: impl FnOnce() -> Option<HeldBy>) -> bool {
-    let mut waiting = HELD.lock().unwrap_or_else(|e| e.into_inner());
-    let by = match bind {
+/// [`check`] once the bind is done. `v4` and `v6` look up the program on
+/// the port in Windows' IPv4 and IPv6 tables, None when it lists none. Only
+/// `v4` decides the holder, since the stream binds IPv4 and an IPv6 socket is
+/// IPv6-only unless it says otherwise; `v6` is asked only for the blocked
+/// notice. They run without [`HELD`], which the Stream page reads every frame.
+fn check_with(
+    port: u16,
+    bind: Bind,
+    v4: impl FnOnce() -> Option<HeldBy>,
+    v6: impl FnOnce() -> Option<HeldBy>,
+) -> bool {
+    let refusals = || HELD.lock().unwrap_or_else(|e| e.into_inner()).refusals;
+    let (by, refusals) = match bind {
         Bind::Free => {
+            let mut waiting = HELD.lock().unwrap_or_else(|e| e.into_inner());
             if waiting.held.is_some() {
                 info!(port, "The stream port is free; starting the stream");
             }
             note(&mut waiting, None);
             return true;
         }
-        Bind::InUse => holder().unwrap_or(HeldBy::Unknown),
-        Bind::Refused(code) => match holder() {
-            Some(by) => by,
-            None => {
-                waiting.refusals += 1;
-                if waiting.refusals >= REFUSALS {
-                    HeldBy::Blocked { code }
-                } else {
-                    HeldBy::Refused
+        Bind::InUse => (v4().unwrap_or(HeldBy::Unknown), 0),
+        Bind::Refused(code) => match v4() {
+            Some(by) => (by, 0),
+            None => match refusals() + 1 {
+                refusals if refusals >= REFUSALS => {
+                    let ipv6 = v6().map(Box::new);
+                    (HeldBy::Blocked { code, ipv6 }, refusals)
                 }
-            }
+                refusals => (HeldBy::Refused, refusals),
+            },
         },
     };
-    if !matches!(by, HeldBy::Refused | HeldBy::Blocked { .. }) {
-        waiting.refusals = 0;
-    }
+    let mut waiting = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    waiting.refusals = refusals;
     note(&mut waiting, Some(Held { port, by }));
     false
 }
@@ -154,46 +185,109 @@ fn note(waiting: &mut Waiting, held: Option<Held>) {
     if held.is_none() {
         waiting.refusals = 0;
     }
-    if waiting.held == held {
-        return;
-    }
-    if let Some(held) = &held {
+    let said = |held: &Option<Held>| held.as_ref().map(|held| (held.port, category(&held.by)));
+    if let Some(held) = held.as_ref().filter(|_| said(&waiting.held) != said(&held)) {
         let port = held.port;
         match &held.by {
             // Checked again before anything is said.
             HeldBy::Refused => {}
-            HeldBy::Blocked { code } => warn!(
+            HeldBy::Blocked { code, .. } => warn!(
                 port,
                 code, "Windows is blocking the stream port; checking again every 2 s"
             ),
-            HeldBy::OtherCopy => warn_held(port, "another copy of EternalMonitor"),
-            HeldBy::Program(program) => warn_held(port, program),
-            HeldBy::Unknown => warn_held(port, "unknown"),
-            HeldBy::ThisCopy => warn_held(port, "this copy's previous stream"),
+            by => warn!(
+                port,
+                holder = category(by),
+                "Another program is using the stream port; the stream starts once it is free"
+            ),
         }
     }
     waiting.held = held;
 }
 
-fn warn_held(port: u16, holder: &str) {
-    warn!(
-        port,
-        holder, "Another program is using the stream port; the stream starts once it is free"
-    );
+/// What logs and uploads say holds the port. Never a program's own name: a
+/// file description or name can carry this user's or another account's.
+fn category(by: &HeldBy) -> &'static str {
+    match by {
+        HeldBy::OtherCopy => "another copy of EternalMonitor",
+        HeldBy::Windows => "Windows",
+        HeldBy::WindowsService => "a Windows service",
+        HeldBy::Program(_) => "another program",
+        HeldBy::Unknown => "unknown",
+        HeldBy::ThisCopy => "this copy's previous stream",
+        HeldBy::Refused => "refused",
+        HeldBy::Blocked { .. } => "blocked",
+    }
 }
 
-/// Who holds `port`, as process `own` sees it; None when Windows lists no
-/// program on it.
-fn holder(port: u16, own: u32) -> Option<HeldBy> {
-    let pid = owner(port)?;
+/// Which of Windows' UDP tables to look in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+}
+
+/// Who holds `port` in `family`'s table, as process `own` sees it; None
+/// when Windows lists no program on it.
+fn holder(port: u16, own: u32, family: Family) -> Option<HeldBy> {
+    let pid = owner(port, family)?;
+    Some(identify(pid, own, |pid| {
+        named(pid, image_path(pid).as_deref())
+    }))
+}
+
+/// Who process `pid` is, as `name` finds out within [`LOOKUP`].
+fn identify(pid: u32, own: u32, name: impl FnOnce(u32) -> HeldBy + Send + 'static) -> HeldBy {
+    static LOOKING: AtomicBool = AtomicBool::new(false);
     if pid == own {
-        return Some(HeldBy::ThisCopy);
+        return HeldBy::ThisCopy;
     }
-    let image = image_path(pid);
-    if image.as_deref().is_some_and(is_eternal_monitor) {
-        return Some(HeldBy::OtherCopy);
+    within(&LOOKING, LOOKUP, move || name(pid)).unwrap_or(HeldBy::Unknown)
+}
+
+/// Runs `lookup` on its own thread and waits up to `limit` for it; None if
+/// it takes longer. While one is still running (`busy`), none is started.
+fn within<T: Send + 'static>(
+    busy: &'static AtomicBool,
+    limit: Duration,
+    lookup: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    if busy.swap(true, Ordering::AcqRel) {
+        return None;
     }
-    Some(program_name(pid, image.as_deref()).map_or(HeldBy::Unknown, HeldBy::Program))
+    let (found_tx, found_rx) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("port-holder".into())
+        .spawn(move || {
+            let found = lookup();
+            busy.store(false, Ordering::Release);
+            let _ = found_tx.send(found);
+        });
+    if spawned.is_err() {
+        busy.store(false, Ordering::Release);
+        return None;
+    }
+    found_rx.recv_timeout(limit).ok()
+}
+
+/// Who process `pid`, running `image`, is. Windows' own processes get a
+/// plain name rather than "System" or a service host.
+fn named(pid: u32, image: Option<&str>) -> HeldBy {
+    if pid == 4 {
+        return HeldBy::Windows;
+    }
+    let Some(image) = image else {
+        return HeldBy::Unknown;
+    };
+    if is_eternal_monitor(image) {
+        return HeldBy::OtherCopy;
+    }
+    let file = image.rsplit(['\\', '/']).next().unwrap_or(image);
+    if file.eq_ignore_ascii_case("svchost.exe") {
+        return HeldBy::WindowsService;
+    }
+    // What Task Manager shows: the file's description, else its file name.
+    HeldBy::Program(description(image).unwrap_or_else(|| file.to_string()))
 }
 
 fn is_eternal_monitor(image: &str) -> bool {
@@ -202,9 +296,10 @@ fn is_eternal_monitor(image: &str) -> bool {
     file.starts_with("eternalmonitor") || file.starts_with("eternal-host")
 }
 
-/// The process listening on UDP `port`, IPv4 or dual-stack IPv6.
+/// The process listening on UDP `port` in `family`'s table. A dual-stack
+/// IPv6 socket is listed in the IPv6 table only.
 #[cfg(windows)]
-fn owner(port: u16) -> Option<u32> {
+fn owner(port: u16, family: Family) -> Option<u32> {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetExtendedUdpTable, MIB_UDP6TABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
     };
@@ -234,14 +329,16 @@ fn owner(port: u16) -> Option<u32> {
     }
 
     let wanted = u32::from(port.to_be());
-    if let Some(buffer) = table(AF_INET.0) {
+    if family == Family::V4 {
+        let buffer = table(AF_INET.0)?;
         let table = buffer.as_ptr().cast::<MIB_UDPTABLE_OWNER_PID>();
         let rows = unsafe {
             std::slice::from_raw_parts((*table).table.as_ptr(), (*table).dwNumEntries as usize)
         };
-        if let Some(row) = rows.iter().find(|row| row.dwLocalPort & 0xffff == wanted) {
-            return Some(row.dwOwningPid);
-        }
+        return rows
+            .iter()
+            .find(|row| row.dwLocalPort & 0xffff == wanted)
+            .map(|row| row.dwOwningPid);
     }
     let buffer = table(AF_INET6.0)?;
     let table = buffer.as_ptr().cast::<MIB_UDP6TABLE_OWNER_PID>();
@@ -254,7 +351,7 @@ fn owner(port: u16) -> Option<u32> {
 }
 
 #[cfg(not(windows))]
-fn owner(_port: u16) -> Option<u32> {
+fn owner(_port: u16, _family: Family) -> Option<u32> {
     None
 }
 
@@ -285,21 +382,6 @@ fn image_path(pid: u32) -> Option<String> {
 #[cfg(not(windows))]
 fn image_path(_pid: u32) -> Option<String> {
     None
-}
-
-/// The name Task Manager shows: the file's description, else its file name.
-/// Windows' own processes get a plain name rather than "System" or a
-/// service host.
-fn program_name(pid: u32, image: Option<&str>) -> Option<String> {
-    if pid == 4 {
-        return Some("Windows".into());
-    }
-    let image = image?;
-    let file = image.rsplit(['\\', '/']).next().unwrap_or(image);
-    if file.eq_ignore_ascii_case("svchost.exe") {
-        return Some("A Windows service".into());
-    }
-    description(image).or_else(|| Some(file.to_string()))
 }
 
 #[cfg(windows)]
@@ -398,7 +480,7 @@ mod tests {
     /// The stream binds IPv4 only. Whether a dual-stack IPv6 socket on the
     /// port blocks it is Windows' choice (a plain one doesn't); the check
     /// agrees with the stream's own bind either way, and names the holder
-    /// from the IPv6 table when blocked.
+    /// from the IPv6 table beside the blocked notice.
     #[cfg(windows)]
     #[test]
     fn a_dual_stack_holder_blocks_the_check_exactly_when_it_blocks_the_stream() {
@@ -433,8 +515,17 @@ mod tests {
                 .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into());
             assert_eq!(free, stream.is_ok(), "exclusive: {exclusive}");
             if !free {
+                // Not in the IPv4 table, so Windows blocks the port as far as
+                // the check can tell, and the IPv6 holder is named beside it.
+                assert_eq!(super::held().unwrap().by, HeldBy::Refused);
+                for _ in 1..REFUSALS {
+                    assert!(!check_as(port, 0));
+                }
                 assert!(
-                    matches!(super::held().unwrap().by, HeldBy::Program(_)),
+                    matches!(
+                        &super::held().unwrap().by,
+                        HeldBy::Blocked { ipv6: Some(by), .. } if matches!(**by, HeldBy::Program(_))
+                    ),
                     "{:?}",
                     super::held()
                 );
@@ -472,21 +563,23 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// Windows refused the bind (10013) and a program is on the port: it is
-    /// named, as for 10048, however long it stays.
+    /// Windows refused the bind (10013) and a program is on the port: the
+    /// Stream page names it, as for 10048, however long it stays. The log
+    /// says only "another program".
     #[test]
     fn a_refused_bind_with_a_holder_names_it() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let vlc = || Some(HeldBy::Program("VLC media player".into()));
         let log = logged(|| {
             for _ in 0..REFUSALS * 3 {
-                assert!(!check_with(9876, Bind::Refused(Some(10013)), vlc));
+                assert!(!check_with(9876, Bind::Refused(Some(10013)), vlc, || None));
                 assert_eq!(super::held().unwrap().by, vlc().unwrap());
             }
         });
-        assert_eq!(log.matches("VLC media player").count(), 1, "{log}");
+        assert_eq!(log.matches("another program").count(), 1, "{log}");
+        assert!(!log.contains("VLC"), "{log}");
         assert!(!log.contains("blocking"), "{log}");
-        assert!(check_with(9876, Bind::Free, || None));
+        assert!(check_with(9876, Bind::Free, || None, || None));
         assert_eq!(super::held(), None);
     }
 
@@ -497,10 +590,16 @@ mod tests {
     fn a_refused_bind_without_a_holder_says_windows_blocks_it() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let refused = Bind::Refused(Some(10013));
-        let blocked = HeldBy::Blocked { code: Some(10013) };
+        let blocked = HeldBy::Blocked {
+            code: Some(10013),
+            ipv6: None,
+        };
         let log = logged(|| {
             for check in 1..=REFUSALS * 3 {
-                assert!(!check_with(9876, refused, || None), "still waiting");
+                assert!(
+                    !check_with(9876, refused, || None, || None),
+                    "still waiting"
+                );
                 let by = super::held().unwrap().by;
                 if check < REFUSALS {
                     assert_eq!(by, HeldBy::Refused, "check {check}");
@@ -514,17 +613,22 @@ mod tests {
         assert!(!log.contains("Another program"), "{log}");
 
         // A holder in between starts the count again.
-        assert!(!check_with(9876, refused, || Some(HeldBy::Unknown)));
-        assert!(!check_with(9876, refused, || None));
+        assert!(!check_with(
+            9876,
+            refused,
+            || Some(HeldBy::Unknown),
+            || None
+        ));
+        assert!(!check_with(9876, refused, || None, || None));
         assert_eq!(super::held().unwrap().by, HeldBy::Refused);
         // So does a free port.
         for _ in 0..REFUSALS {
-            check_with(9876, refused, || None);
+            check_with(9876, refused, || None, || None);
         }
         assert_eq!(super::held().unwrap().by, blocked);
-        assert!(check_with(9876, Bind::Free, || None));
+        assert!(check_with(9876, Bind::Free, || None, || None));
         assert_eq!(super::held(), None);
-        assert!(!check_with(9876, refused, || None));
+        assert!(!check_with(9876, refused, || None, || None));
         assert_eq!(super::held().unwrap().by, HeldBy::Refused);
         forget();
         assert_eq!(super::held(), None);
@@ -559,11 +663,174 @@ mod tests {
             r"D:\build\target\debug\eternal-host.exe"
         ));
         assert!(!is_eternal_monitor(r"C:\Program Files\VLC\vlc.exe"));
-        assert_eq!(program_name(4, None).as_deref(), Some("Windows"));
+        assert_eq!(named(4, None), HeldBy::Windows);
         assert_eq!(
-            program_name(1234, Some(r"C:\Windows\System32\svchost.exe")).as_deref(),
-            Some("A Windows service")
+            named(1234, Some(r"C:\Windows\System32\svchost.exe")),
+            HeldBy::WindowsService
         );
-        assert_eq!(program_name(1234, None), None, "unreadable: Unknown");
+        assert_eq!(
+            named(
+                1234,
+                Some(r"C:\Program Files\EternalMonitor\EternalMonitor.exe")
+            ),
+            HeldBy::OtherCopy
+        );
+        assert_eq!(named(1234, None), HeldBy::Unknown, "unreadable");
+    }
+
+    /// Windows' IPv6 sockets are IPv6-only unless they say otherwise, so a
+    /// program on the port over IPv6 doesn't explain a refused IPv4 bind: the
+    /// port is still blocked from the third check, with that program named
+    /// beside it. It is asked for only then, and never for 10048.
+    #[test]
+    fn an_ipv6_listener_does_not_hide_a_blocked_port() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let refused = Bind::Refused(Some(10013));
+        let asked = std::cell::Cell::new(0);
+        let steam = || {
+            asked.set(asked.get() + 1);
+            Some(HeldBy::Program("Steam".into()))
+        };
+        let log = logged(|| {
+            for check in 1..=REFUSALS * 3 {
+                assert!(!check_with(9876, refused, || None, steam));
+                let by = super::held().unwrap().by;
+                if check < REFUSALS {
+                    assert_eq!(by, HeldBy::Refused, "check {check}");
+                    assert_eq!(asked.get(), 0, "check {check}");
+                } else {
+                    assert_eq!(
+                        by,
+                        HeldBy::Blocked {
+                            code: Some(10013),
+                            ipv6: Some(Box::new(HeldBy::Program("Steam".into()))),
+                        },
+                        "check {check}"
+                    );
+                }
+            }
+        });
+        assert_eq!(log.matches("Windows is blocking").count(), 1, "{log}");
+        assert!(!log.contains("Steam"), "{log}");
+
+        let asked_before = asked.get();
+        assert!(!check_with(9876, Bind::InUse, || None, steam));
+        assert_eq!(super::held().unwrap().by, HeldBy::Unknown);
+        assert_eq!(asked.get(), asked_before, "IPv6 isn't asked for 10048");
+        forget();
+    }
+
+    /// Logs say what kind of program holds the port, never its name, on
+    /// every path: 10048, a refused bind with a holder, and the IPv6 program
+    /// beside a blocked port.
+    #[test]
+    fn no_program_name_reaches_a_log_line() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let alice = || Some(HeldBy::Program("AliceTool.exe".into()));
+        let bob = || Some(HeldBy::Program("Bob's Helper".into()));
+        let refused = Bind::Refused(Some(10013));
+        let log = logged(|| {
+            check_with(9876, Bind::InUse, alice, || None);
+            check_with(9876, Bind::InUse, bob, || None);
+            check_with(9876, Bind::Free, || None, || None);
+            check_with(9876, refused, bob, || None);
+            check_with(9876, Bind::Free, || None, || None);
+            for _ in 0..REFUSALS {
+                check_with(9876, refused, || None, alice);
+            }
+            for by in [
+                HeldBy::OtherCopy,
+                HeldBy::Windows,
+                HeldBy::WindowsService,
+                HeldBy::Unknown,
+            ] {
+                check_with(9876, Bind::InUse, || Some(by), || None);
+            }
+            forget();
+        });
+        assert!(!log.contains("Alice"), "{log}");
+        assert!(!log.contains("Bob"), "{log}");
+        for category in [
+            "another program",
+            "another copy of EternalMonitor",
+            "Windows",
+            "a Windows service",
+            "unknown",
+        ] {
+            let field = format!("holder=\"{category}\"");
+            assert!(log.contains(&field), "{field}: {log}");
+        }
+        assert!(log.contains("Windows is blocking"), "{log}");
+    }
+
+    /// A program whose file is slow to read (a network share) is Unknown
+    /// after [`LOOKUP`], and no second lookup starts while it runs.
+    #[test]
+    fn a_slow_lookup_is_unknown_after_half_a_second() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let by = identify(1234, 0, move |_| {
+            let _ = release_rx.recv();
+            HeldBy::Program("Slow".into())
+        });
+        let took = started.elapsed();
+        assert_eq!(by, HeldBy::Unknown);
+        assert!(took >= LOOKUP && took < LOOKUP * 4, "{took:?}");
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let by = identify(1234, 0, {
+            let ran = ran.clone();
+            move |_| {
+                ran.store(true, Ordering::SeqCst);
+                HeldBy::Program("Quick".into())
+            }
+        });
+        assert_eq!(by, HeldBy::Unknown, "the slow one still runs");
+        assert!(started.elapsed() < LOOKUP, "didn't wait");
+        assert!(!ran.load(Ordering::SeqCst), "no second lookup");
+
+        drop(release_tx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while identify(1234, 0, |_| HeldBy::Program("Quick".into())) == HeldBy::Unknown {
+            assert!(std::time::Instant::now() < deadline, "the slow one ends");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(identify(7, 7, |_| HeldBy::Unknown), HeldBy::ThisCopy);
+    }
+
+    /// The Stream page reads the holder every frame; a check whose lookup is
+    /// slow doesn't make it wait.
+    #[test]
+    fn the_stream_page_reads_the_holder_while_a_lookup_is_slow() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        check_with(9876, Bind::InUse, || Some(HeldBy::Unknown), || None);
+        let (looking_tx, looking_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let checker = thread::spawn(move || {
+            check_with(
+                9876,
+                Bind::InUse,
+                || {
+                    looking_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Some(HeldBy::OtherCopy)
+                },
+                || None,
+            )
+        });
+        looking_rx.recv().unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        thread::spawn(move || read_tx.send(super::held()).unwrap());
+        let read = read_rx.recv_timeout(Duration::from_secs(1));
+        drop(release_tx);
+        assert!(!checker.join().unwrap());
+        assert_eq!(
+            read.expect("read during the lookup").unwrap().by,
+            HeldBy::Unknown
+        );
+        assert_eq!(super::held().unwrap().by, HeldBy::OtherCopy);
+        forget();
     }
 }
