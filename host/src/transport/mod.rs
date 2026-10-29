@@ -78,12 +78,15 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn host_caps(&self) -> u16 {
+        // `start_sender` numbers sent frames contiguously per epoch.
+        let numbering = eternal_wire::v2::control::HOSTCAP_CONTIGUOUS_FRAME_SEQ;
         let usb = if PIPELINE_STATS.lock().usb_service_reachable {
             eternal_wire::v2::control::HOSTCAP_USB
         } else {
             0
         };
-        eternal_wire::v2::control::HOSTCAP_KEYBOARD
+        numbering
+            | eternal_wire::v2::control::HOSTCAP_KEYBOARD
             | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
@@ -205,6 +208,10 @@ pub async fn start_sender(
     // pre-IDR leftovers; a new session must begin with a keyframe.
     let mut last_session_id: Option<u32> = None;
     let mut awaiting_keyframe = true;
+    // The wire numbers access units contiguously per epoch, as proto says.
+    // Capture numbers skip the frames the encoder never took, and the iPad
+    // held the frame after each skip waiting for one that never existed.
+    let mut frame_seq: u32 = 0;
 
     let mut retransmit_ring = RetransmitRing::default();
     let mut audio_sender = audio::AudioSender::default();
@@ -310,8 +317,10 @@ pub async fn start_sender(
                                             // down changes the label and nothing
                                             // else for the life of the pipeline.
                                             let clamped = abr.set_ceiling(ceiling);
+                                            let tunnel_drops = (shared.target_addr.lock().link != LinkId::Udp)
+                                                .then(link::tunnel_congestion_drops);
                                             let reported =
-                                                abr.on_report(&report, Instant::now());
+                                                abr.on_report(&report, tunnel_drops, Instant::now());
                                             let decision = abr::AbrDecision {
                                                 target_bps: reported.target_bps,
                                                 changed: clamped.changed || reported.changed,
@@ -385,6 +394,7 @@ pub async fn start_sender(
                     }
                 }
 
+                frame_seq = frame_seq.wrapping_add(1);
                 let send_start = Instant::now();
                 let payload = &nal.data;
                 let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
@@ -407,7 +417,7 @@ pub async fn start_sender(
                     let header = MediaHeader {
                         session_id,
                         stream_epoch,
-                        frame_seq: nal.sequence as u32,
+                        frame_seq,
                         frag_index: index as u16,
                         frag_count,
                         is_keyframe: nal.is_keyframe,
@@ -425,7 +435,7 @@ pub async fn start_sender(
                 // are still paced. Make this frame repairable before sending
                 // its first batch, so a delayed pacing timer cannot hold NACKs.
                 if keep_for_repair {
-                    retransmit_ring.insert(stream_epoch, nal.sequence as u32, stored.clone());
+                    retransmit_ring.insert(stream_epoch, frame_seq, stored.clone());
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
@@ -438,14 +448,14 @@ pub async fn start_sender(
                         for due in fault.push(datagram, Instant::now()) {
                             if let Err(e) = links.send_to(&due, target_addr).await {
                                 if !send_failed {
-                                    warn!(seq = nal.sequence, error = %e, "UDP send failed");
+                                    warn!(seq = frame_seq, error = %e, "UDP send failed");
                                     send_failed = true;
                                 }
                             }
                         }
                     } else if let Err(e) = links.send_to(datagram, target_addr).await {
                         if !send_failed {
-                            warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
+                            warn!(seq = frame_seq, fragment = index, error = %e, "UDP send failed");
                             send_failed = true;
                         }
                     }
@@ -478,7 +488,8 @@ pub async fn start_sender(
                 );
 
                 debug!(
-                    seq = nal.sequence,
+                    seq = frame_seq,
+                    capture_seq = nal.sequence,
                     fragments = frag_count,
                     total_bytes,
                     keyframe = nal.is_keyframe,

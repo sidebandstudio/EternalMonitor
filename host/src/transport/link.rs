@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
+use tokio::time::Instant;
 
 use eternal_wire::v2::audio::{AudioHeader, AUDIO_FLAG_DISCONTINUITY};
 use eternal_wire::v2::media::MediaHeader;
@@ -21,8 +21,17 @@ use tokio::task::JoinHandle;
 
 pub const PREAMBLE: &[u8; 8] = b"EMLINK\x01\x00";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-const FRAME_LIMIT: usize = 2;
+/// Room for a keyframe burst to drain: about 100 ms at 60 fps. Two frames
+/// overflowed behind every keyframe on a slow PC's usbmuxd.
+const FRAME_LIMIT: usize = 6;
 const BYTE_LIMIT: usize = 1024 * 1024;
+const KEYFRAME_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const KEYFRAME_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// This long without a lost frame, and the next request is immediate again.
+const KEYFRAME_BACKOFF_RESET: Duration = Duration::from_secs(5);
+/// A write that waited this long means the tunnel stood still, not that it
+/// is slow: a datagram drains in milliseconds even through a slow usbmuxd.
+const STALL: Duration = Duration::from_millis(100);
 const CONTROL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -162,51 +171,67 @@ impl Frame {
 struct VideoQueue {
     frames: VecDeque<Frame>,
     bytes: usize,
-    revision: u64,
     awaiting_keyframe: bool,
     discarded: Option<(u32, u32)>,
+    keyframes: KeyframeBackoff,
+    /// The session and stream epoch of the latest frame.
+    stream: Option<(u32, u32)>,
+    /// The writer has taken a frame and not yet found the queue empty.
+    writer_busy: bool,
+    /// Frames replaced since the last count while the writer was idle: their
+    /// pictures are lost, but the tunnel was not behind.
+    unscheduled: u64,
 }
 
 impl VideoQueue {
-    fn clear_for_recovery(&mut self) -> u64 {
-        let dropped = self.frames.len() as u64;
-        self.frames.clear();
-        self.bytes = 0;
-        self.revision = self.revision.wrapping_add(1);
-        self.awaiting_keyframe = true;
-        dropped
-    }
-
-    /// Returns whole frames dropped. All dependent P frames are discarded
-    /// until a new keyframe starts. Old queued keyframes can also be superseded
-    /// so a stalled connection always makes room for the newest recovery frame.
-    fn push(&mut self, bytes: &[u8]) -> io::Result<u64> {
+    /// Returns frames lost. A full queue drops the newest frame, never the
+    /// queued ones: those still decode, and the frame already being written
+    /// is never cut short. Dropping the queue to admit newer frames sent the
+    /// iPad partial keyframes, each of which asked for another keyframe, the
+    /// biggest frame of all. Dependents of a lost frame are discarded until a
+    /// keyframe, and a keyframe always passes, replacing what is still queued.
+    /// Replaced frames count as lost, or periodic keyframes would hide a
+    /// tunnel that never catches up. They show congestion only while the
+    /// writer is busy: a frame can also wait because the sender ran twice
+    /// before the writer was scheduled, with the tunnel idle.
+    fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
         if self.discarded == Some(key) {
             return Ok(0);
         }
-        if self.awaiting_keyframe {
-            if header.is_keyframe && header.frag_index == 0 {
-                self.awaiting_keyframe = false;
-            } else {
-                self.discarded = Some(key);
-                return Ok(1);
-            }
-        }
-
         let mut dropped = 0;
         if header.frag_index == 0 {
             if self.frames.back().is_some_and(|frame| !frame.complete()) {
                 return Err(invalid("unfinished video access unit"));
             }
-            if self.frames.len() >= FRAME_LIMIT || self.bytes + bytes.len() > BYTE_LIMIT {
-                dropped += self.clear_for_recovery();
-                if !header.is_keyframe {
-                    self.discarded = Some(key);
-                    return Ok(dropped + 1);
+            let stream = (header.session_id, header.stream_epoch);
+            if self
+                .stream
+                .replace(stream)
+                .is_some_and(|last| last != stream)
+            {
+                // A new stream on a reused tunnel owes nothing to the old
+                // one's losses: its first request must not wait out their
+                // backoff.
+                self.keyframes = KeyframeBackoff::default();
+            }
+            if header.is_keyframe {
+                // Queued frames are older and the keyframe needs none of them.
+                dropped = self.frames.len() as u64;
+                if !self.writer_busy {
+                    self.unscheduled += dropped;
                 }
+                self.frames.clear();
+                self.bytes = 0;
                 self.awaiting_keyframe = false;
+                self.keyframes.arrived();
+            } else if self.awaiting_keyframe {
+                self.discarded = Some(key);
+                return Ok(1);
+            } else if self.frames.len() >= FRAME_LIMIT || self.bytes + bytes.len() > BYTE_LIMIT {
+                self.lose(key, now);
+                return Ok(1);
             }
             self.frames.push_back(Frame {
                 epoch: header.stream_epoch,
@@ -226,9 +251,11 @@ impl VideoQueue {
             return Err(invalid("video fragment order"));
         }
         if self.bytes + bytes.len() > BYTE_LIMIT {
-            dropped += self.clear_for_recovery();
-            self.discarded = Some(key);
-            return Ok(dropped);
+            // Only the newest frame can be partial; the others stay.
+            let frame = self.frames.pop_back().unwrap();
+            self.bytes -= frame.bytes;
+            self.lose(key, now);
+            return Ok(dropped + 1);
         }
         frame.bytes += bytes.len();
         frame.datagrams.push(bytes.to_vec());
@@ -236,13 +263,85 @@ impl VideoQueue {
         Ok(dropped)
     }
 
-    fn pop(&mut self) -> Option<(u64, Frame)> {
+    fn lose(&mut self, key: (u32, u32), now: Instant) {
+        self.discarded = Some(key);
+        self.awaiting_keyframe = true;
+        self.keyframes.lost(now);
+    }
+
+    /// The tunnel stood still, so everything queued is stale. Returns frames
+    /// dropped. A fresh keyframe is requested at once: a stall is not a slow
+    /// link, and a keyframe requested during it would be stale too.
+    fn stalled(&mut self, now: Instant) -> u64 {
+        let dropped = self.frames.len() as u64;
+        if let Some(frame) = self.frames.back().filter(|frame| !frame.complete()) {
+            self.discarded = Some((frame.epoch, frame.seq));
+        }
+        self.frames.clear();
+        self.bytes = 0;
+        self.awaiting_keyframe = true;
+        self.keyframes = KeyframeBackoff::default();
+        self.keyframes.lost(now);
+        dropped
+    }
+
+    fn pop(&mut self) -> Option<Frame> {
         if !self.frames.front().is_some_and(Frame::complete) {
+            self.writer_busy = false;
             return None;
         }
         let frame = self.frames.pop_front().unwrap();
         self.bytes -= frame.bytes;
-        Some((self.revision, frame))
+        self.writer_busy = true;
+        Some(frame)
+    }
+}
+
+/// When a lost frame may ask the encoder for a keyframe. Every request used
+/// to be immediate, and on a link too slow for keyframe bursts each new
+/// keyframe overflowed the queue again. The first request is immediate, then
+/// the wait doubles while the link keeps losing frames.
+#[derive(Default)]
+struct KeyframeBackoff {
+    pending: bool,
+    next_allowed: Option<Instant>,
+    interval: Duration,
+    last_loss: Option<Instant>,
+}
+
+impl KeyframeBackoff {
+    fn lost(&mut self, now: Instant) {
+        if self
+            .last_loss
+            .is_some_and(|at| now.saturating_duration_since(at) >= KEYFRAME_BACKOFF_RESET)
+        {
+            self.next_allowed = None;
+            self.interval = Duration::ZERO;
+        }
+        self.last_loss = Some(now);
+        self.pending = true;
+    }
+
+    /// A keyframe reached the queue; nothing more needs to be requested.
+    fn arrived(&mut self) {
+        self.pending = false;
+    }
+
+    /// Whether to request a keyframe now. Each request starts the next wait.
+    fn due(&mut self, now: Instant) -> bool {
+        if !self.pending || self.next_allowed.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.pending = false;
+        let interval = self.interval.max(KEYFRAME_BACKOFF_MIN);
+        self.next_allowed = Some(now + interval);
+        self.interval = (interval * 2).min(KEYFRAME_BACKOFF_MAX);
+        true
+    }
+
+    /// When a deferred request falls due, if one is waiting.
+    fn deadline(&self) -> Option<Instant> {
+        self.next_allowed.filter(|_| self.pending)
     }
 }
 
@@ -294,7 +393,18 @@ impl AudioQueue {
 #[derive(Default)]
 pub struct FramedStats {
     pub frames_dropped: AtomicU64,
+    /// Dropped frames that show the tunnel falling behind; ABR's signal.
+    pub congestion_drops: AtomicU64,
     pub audio_packets_dropped: AtomicU64,
+}
+
+/// Every tunnel's [`FramedStats::congestion_drops`], for ABR.
+static TUNNEL_CONGESTION: AtomicU64 = AtomicU64::new(0);
+
+/// Frames all USB tunnels have dropped because they fell behind, since the
+/// process started.
+pub fn tunnel_congestion_drops() -> u64 {
+    TUNNEL_CONGESTION.load(Ordering::Relaxed)
 }
 
 struct WriterState {
@@ -327,11 +437,29 @@ impl WriterState {
         }
     }
 
-    fn record_drops(&self, dropped: u64) {
-        if dropped > 0 {
-            self.stats
-                .frames_dropped
-                .fetch_add(dropped, Ordering::Relaxed);
+    /// After a write that started at `started`: whether the tunnel stood
+    /// still, in which case queued video and `in_flight` frames are dropped.
+    fn check_stall(&self, started: Instant, in_flight: u64) -> bool {
+        let now = Instant::now();
+        if now.saturating_duration_since(started) < STALL {
+            return false;
+        }
+        let mut queue = self.queue.lock();
+        let dropped = queue.video.stalled(now) + in_flight;
+        self.record_drops(&mut queue.video, dropped, now);
+        true
+    }
+
+    fn record_drops(&self, video: &mut VideoQueue, dropped: u64, now: Instant) {
+        self.stats
+            .frames_dropped
+            .fetch_add(dropped, Ordering::Relaxed);
+        let congested = dropped.saturating_sub(std::mem::take(&mut video.unscheduled));
+        self.stats
+            .congestion_drops
+            .fetch_add(congested, Ordering::Relaxed);
+        TUNNEL_CONGESTION.fetch_add(congested, Ordering::Relaxed);
+        if video.keyframes.due(now) {
             self.force_idr.store(true, Ordering::SeqCst);
         }
     }
@@ -508,17 +636,18 @@ impl Link for FramedLink {
             ));
         }
         check_length(datagram.len())?;
-        let dropped = {
+        {
             let mut queue = self.state.queue.lock();
             if matches!(classify(datagram), Classified::Media { .. }) {
-                queue.video.push(datagram)?
+                let now = Instant::now();
+                let dropped = queue.video.push(datagram, now)?;
+                self.state.record_drops(&mut queue.video, dropped, now);
             } else if matches!(classify(datagram), Classified::Audio { .. }) {
                 let dropped = queue.audio.push(datagram, Instant::now())?;
                 self.state
                     .stats
                     .audio_packets_dropped
                     .fetch_add(dropped, Ordering::Relaxed);
-                0
             } else {
                 if queue.controls.len() >= CONTROL_LIMIT {
                     return Err(io::Error::new(
@@ -528,10 +657,8 @@ impl Link for FramedLink {
                 }
                 queue.controls.push_back(datagram.to_vec());
                 queue.controls_queued += 1;
-                0
             }
-        };
-        self.state.record_drops(dropped);
+        }
         self.state.ready.notify_one();
         Ok(())
     }
@@ -557,42 +684,55 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             None => (None, state.queue.lock().video.pop()),
         };
         if let Some((packet, control)) = priority {
+            let started = Instant::now();
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
                 sent = write_datagram(&mut writer, &packet) => sent?,
             }
             state.wrote(control);
-        } else if let Some((revision, frame)) = frame {
+            state.check_stall(started, 0);
+        } else if let Some(frame) = frame {
+            // A frame that has started is finished: the iPad cannot use part
+            // of one, and over a lossless tunnel would count the rest as lost.
+            // Only after a stall is the rest stale and abandoned.
             let count = frame.datagrams.len();
             for (index, packet) in frame.datagrams.into_iter().enumerate() {
-                // Never cancel a partial packet and then reuse the byte stream.
-                // Finish its framing before abandoning the rest of a stale frame.
+                let started = Instant::now();
                 tokio::select! {
                     biased;
                     _ = closed.changed() => return Ok(()),
                     sent = write_datagram(&mut writer, &packet) => sent?,
                 }
-                if index + 1 < count && state.queue.lock().video.revision != revision {
-                    state.record_drops(1);
-                    break;
-                }
+                let mut stalled = state.check_stall(started, u64::from(index + 1 < count));
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
                 while let Some((priority, control)) = state.take_priority() {
+                    let started = Instant::now();
                     tokio::select! {
                         biased;
                         _ = closed.changed() => return Ok(()),
                         sent = write_datagram(&mut writer, &priority) => sent?,
                     }
                     state.wrote(control);
+                    stalled |= state.check_stall(started, u64::from(!stalled && index + 1 < count));
+                }
+                if stalled {
+                    break;
                 }
             }
         } else {
+            // A deferred keyframe request must not wait for the next frame:
+            // a still desktop may not send one.
+            let deferred = state.queue.lock().video.keyframes.deadline();
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
                 _ = state.ready.notified() => {},
+                _ = tokio::time::sleep_until(deferred.unwrap_or_else(Instant::now)), if deferred.is_some() => {
+                    let mut queue = state.queue.lock();
+                    state.record_drops(&mut queue.video, 0, Instant::now());
+                }
             }
         }
     }
@@ -661,40 +801,177 @@ mod tests {
 
     #[test]
     fn queue_holds_whole_frames_and_discards_dependencies_until_a_new_keyframe() {
+        let now = Instant::now();
         let mut queue = VideoQueue::default();
-        assert_eq!(queue.push(&packet(1, true, 0, 2, 64)).unwrap(), 0);
+        assert_eq!(queue.push(&packet(1, true, 0, 2, 64), now).unwrap(), 0);
         assert!(
             queue.pop().is_none(),
             "partial frames cannot reach the writer"
         );
-        queue.push(&packet(1, true, 1, 2, 64)).unwrap();
-        queue.push(&packet(2, false, 0, 1, 64)).unwrap();
-        assert_eq!(queue.frames.len(), 2);
-        assert_eq!(queue.push(&packet(3, false, 0, 2, 64)).unwrap(), 3);
-        assert!(queue.frames.is_empty());
-        assert_eq!(queue.bytes, 0);
-        assert_eq!(queue.push(&packet(3, false, 1, 2, 64)).unwrap(), 0);
-        assert_eq!(queue.push(&packet(4, false, 0, 1, 64)).unwrap(), 1);
-        assert_eq!(queue.push(&packet(5, true, 0, 1, 64)).unwrap(), 0);
-        assert_eq!(queue.pop().unwrap().1.seq, 5);
+        queue.push(&packet(1, true, 1, 2, 64), now).unwrap();
+        for seq in 2..=FRAME_LIMIT as u32 {
+            assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
+        }
+        assert_eq!(queue.frames.len(), FRAME_LIMIT);
+        // The newest frame is dropped, with its fragments and dependents.
+        let next = FRAME_LIMIT as u32 + 1;
+        assert_eq!(queue.push(&packet(next, false, 0, 2, 64), now).unwrap(), 1);
+        assert_eq!(queue.push(&packet(next, false, 1, 2, 64), now).unwrap(), 0);
+        assert_eq!(
+            queue.push(&packet(next + 1, false, 0, 1, 64), now).unwrap(),
+            1
+        );
+        assert_eq!(queue.frames.len(), FRAME_LIMIT, "queued frames stay");
+        assert_eq!(queue.pop().unwrap().seq, 1);
+        assert_eq!(queue.pop().unwrap().seq, 2);
+        // A keyframe replaces what is still queued, and those frames are lost.
+        assert_eq!(
+            queue.push(&packet(next + 2, true, 0, 1, 64), now).unwrap(),
+            FRAME_LIMIT as u64 - 2
+        );
+        assert_eq!(queue.pop().unwrap().seq, next + 2);
+        assert!(queue.pop().is_none());
         assert_eq!(queue.bytes, 0);
     }
 
     #[test]
     fn queue_limits_bytes_even_when_a_single_keyframe_is_too_large() {
+        let now = Instant::now();
         let mut queue = VideoQueue::default();
         let mut dropped = 0;
         for index in 0..1000 {
             dropped += queue
-                .push(&packet(1, true, index, 1000, MAX_DGRAM_SIZE))
+                .push(&packet(1, true, index, 1000, MAX_DGRAM_SIZE), now)
                 .unwrap();
             assert!(queue.bytes <= BYTE_LIMIT);
             assert!(queue.frames.len() <= FRAME_LIMIT);
         }
         assert_eq!(dropped, 1);
         assert_eq!(queue.bytes, 0);
-        queue.push(&packet(2, true, 0, 1, 64)).unwrap();
-        assert_eq!(queue.pop().unwrap().1.seq, 2);
+        queue.push(&packet(2, true, 0, 1, 64), now).unwrap();
+        assert_eq!(queue.pop().unwrap().seq, 2);
+    }
+
+    fn packet_in(stream: (u32, u32), seq: u32, keyframe: bool) -> Vec<u8> {
+        let mut bytes = packet(seq, keyframe, 0, 1, 64);
+        MediaHeader {
+            session_id: stream.0,
+            stream_epoch: stream.1,
+            ..MediaHeader::decode(&bytes).unwrap().0
+        }
+        .encode_into(&mut bytes);
+        bytes
+    }
+
+    /// Under a steady overload, periodic keyframes can clear the queue before
+    /// it ever overflows. The video they replace is lost, and must count, or
+    /// the bitrate never comes down.
+    #[test]
+    fn a_keyframe_counts_the_frames_it_replaces_as_dropped() {
+        let now = Instant::now();
+        let mut queue = VideoQueue::default();
+        queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
+        queue.pop().unwrap();
+        for seq in 2..=5 {
+            assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
+        }
+        assert_eq!(queue.push(&packet(6, true, 0, 1, 64), now).unwrap(), 4);
+        assert_eq!(queue.pop().unwrap().seq, 6);
+        // An empty queue loses nothing to a keyframe.
+        assert_eq!(queue.push(&packet(7, true, 0, 1, 64), now).unwrap(), 0);
+    }
+
+    /// A frame replaced while the writer is busy waited behind real writing:
+    /// the tunnel is behind. One replaced before the writer even ran shows
+    /// only scheduling, although its picture is lost all the same.
+    #[test]
+    fn replacements_show_congestion_only_while_the_writer_is_busy() {
+        let now = Instant::now();
+        let mut queue = VideoQueue::default();
+        queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
+        queue.pop().unwrap();
+        assert!(queue.pop().is_none(), "the writer finds the queue empty");
+        queue.push(&packet(2, false, 0, 1, 64), now).unwrap();
+        assert_eq!(queue.push(&packet(3, true, 0, 1, 64), now).unwrap(), 1);
+        assert_eq!(std::mem::take(&mut queue.unscheduled), 1, "writer idle");
+        queue.pop().unwrap();
+        queue.push(&packet(4, false, 0, 1, 64), now).unwrap();
+        assert_eq!(queue.push(&packet(5, true, 0, 1, 64), now).unwrap(), 1);
+        assert_eq!(queue.unscheduled, 0, "writer busy with frame 3");
+    }
+
+    /// A pipeline restart keeps the USB tunnel. Its new stream must not
+    /// inherit the old stream's backoff: at the longest wait, the new
+    /// stream's first request was deferred by almost two seconds.
+    #[test]
+    fn a_new_stream_on_the_same_tunnel_asks_for_a_keyframe_at_once() {
+        let start = Instant::now();
+        let mut queue = VideoQueue::default();
+        let overflow = |queue: &mut VideoQueue, stream, first: u32, now| {
+            queue.push(&packet_in(stream, first, true), now).unwrap();
+            for seq in first + 1..=first + FRAME_LIMIT as u32 + 1 {
+                queue.push(&packet_in(stream, seq, false), now).unwrap();
+            }
+            queue.keyframes.due(now)
+        };
+        // Overflow every 250 ms until the backoff reaches its longest wait.
+        let mut now = start;
+        let mut requests = Vec::new();
+        for round in 0..8 {
+            if overflow(&mut queue, (1, 1), round * 10 + 1, now) {
+                requests.push(now - start);
+            }
+            now += Duration::from_millis(250);
+        }
+        let ms = Duration::from_millis;
+        assert_eq!(requests, [ms(0), ms(250), ms(750), ms(1750)]);
+        assert!(!overflow(&mut queue, (1, 1), 100, now));
+        assert_eq!(
+            queue.keyframes.deadline(),
+            Some(start + ms(1750) + KEYFRAME_BACKOFF_MAX)
+        );
+        assert!(
+            overflow(&mut queue, (1, 2), 1, now),
+            "a new epoch asks at once"
+        );
+        now += Duration::from_millis(50);
+        assert!(
+            !overflow(&mut queue, (1, 2), 20, now),
+            "then backs off again"
+        );
+        assert!(
+            overflow(&mut queue, (2, 2), 1, now),
+            "and so does a new session"
+        );
+    }
+
+    #[test]
+    fn keyframe_requests_back_off_while_frames_keep_being_lost() {
+        let start = Instant::now();
+        let mut backoff = KeyframeBackoff::default();
+        let mut requests = Vec::new();
+        // A frame is lost every 50 ms; a keyframe arrives after each request.
+        for tick in 0..100u64 {
+            let now = start + Duration::from_millis(50 * tick);
+            backoff.lost(now);
+            if backoff.due(now) {
+                requests.push(50 * tick);
+                backoff.arrived();
+            }
+        }
+        assert_eq!(requests, [0, 250, 750, 1750, 3750]);
+        // A link that stays clean asks at once again.
+        let later = start + Duration::from_millis(4950 + 5000);
+        backoff.lost(later);
+        assert!(backoff.due(later));
+        // A deferred request names when it falls due, and a keyframe that
+        // arrives first cancels it.
+        backoff.lost(later + Duration::from_millis(10));
+        assert!(!backoff.due(later + Duration::from_millis(10)));
+        assert_eq!(backoff.deadline(), Some(later + KEYFRAME_BACKOFF_MIN));
+        backoff.arrived();
+        assert_eq!(backoff.deadline(), None);
+        assert!(!backoff.due(later + Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -761,8 +1038,12 @@ mod tests {
         );
     }
 
+    /// The frame being written is finished however many newer frames
+    /// overflow behind it. Cutting it short sent the iPad a partial keyframe
+    /// over a lossless cable: lost fragments in its report, and another
+    /// keyframe request.
     #[tokio::test]
-    async fn bounded_writer_recovers_after_stall_without_breaking_partial_packet_framing() {
+    async fn bounded_writer_finishes_the_frame_in_flight_and_recovers_with_a_keyframe() {
         let (host, mut client) = tokio::io::duplex(64);
         let force_idr = Arc::new(AtomicBool::new(false));
         let peer = PeerId::usb(7);
@@ -785,8 +1066,15 @@ mod tests {
         assert!(link.stats().frames_dropped.load(Ordering::Relaxed) > 0);
         assert!(force_idr.load(Ordering::SeqCst));
         link.send(peer, &packet(10, true, 0, 1, 100)).await.unwrap();
-        let first = read_datagram(&mut client).await.unwrap();
-        assert_eq!(MediaHeader::decode(&first).unwrap().0.frame_seq, 1);
+        for index in 0..4 {
+            let datagram =
+                tokio::time::timeout(Duration::from_millis(100), read_datagram(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let header = MediaHeader::decode(&datagram).unwrap().0;
+            assert_eq!((header.frame_seq, header.frag_index), (1, index));
+        }
         let recovery = tokio::time::timeout(Duration::from_millis(100), read_datagram(&mut client))
             .await
             .unwrap()
@@ -801,6 +1089,98 @@ mod tests {
         assert_eq!(inbound, ping);
         link.send(peer, &ping).await.unwrap();
         assert_eq!(read_datagram(&mut client).await.unwrap(), ping);
+    }
+
+    /// A link that overflows again right after a keyframe waits before it
+    /// asks for the next one, and still asks once the wait is over, even if
+    /// no other frame comes.
+    #[tokio::test]
+    async fn overflow_right_after_a_keyframe_defers_the_next_request() {
+        let (host, mut client) = tokio::io::duplex(64);
+        let force_idr = Arc::new(AtomicBool::new(false));
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::clone(&force_idr))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        let overflow = |first: u32| (first..first + 10).map(|seq| packet(seq, false, 0, 1, 1400));
+        link.send(peer, &packet(1, true, 0, 1, 1400)).await.unwrap();
+        for datagram in overflow(2) {
+            link.send(peer, &datagram).await.unwrap();
+        }
+        assert!(
+            force_idr.swap(false, Ordering::SeqCst),
+            "the first loss asks at once"
+        );
+        link.send(peer, &packet(20, true, 0, 1, 1400))
+            .await
+            .unwrap();
+        for datagram in overflow(21) {
+            link.send(peer, &datagram).await.unwrap();
+        }
+        assert!(
+            !force_idr.load(Ordering::SeqCst),
+            "a keyframe that overflowed again must not be requested at once"
+        );
+        // Let the writer drain, then wait out the backoff with no new frames.
+        let mut drained = 0;
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(50), read_datagram(&mut client)).await
+        {
+            drained += 1;
+        }
+        assert!(drained > 0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !force_idr.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            force_idr.load(Ordering::SeqCst),
+            "the deferred request is sent"
+        );
+    }
+
+    /// A tunnel that stands still leaves only stale video behind. When it
+    /// moves again, the rest of the frame in flight and everything queued is
+    /// dropped and a keyframe requested at once, although the backoff would
+    /// otherwise make the request wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tunnel_drops_stale_video_and_asks_for_a_keyframe_at_once() {
+        let (host, mut client) = tokio::io::duplex(64);
+        let force_idr = Arc::new(AtomicBool::new(false));
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::clone(&force_idr))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        for index in 0..4 {
+            link.send(peer, &packet(1, true, index, 4, 1400))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        for seq in 2..10 {
+            link.send(peer, &packet(seq, false, 0, 1, 1400))
+                .await
+                .unwrap();
+        }
+        assert!(force_idr.swap(false, Ordering::SeqCst));
+        let dropped = link.stats().frames_dropped.load(Ordering::Relaxed);
+        tokio::time::sleep(STALL * 3).await;
+        let first = read_datagram(&mut client).await.unwrap();
+        assert_eq!(MediaHeader::decode(&first).unwrap().0.frame_seq, 1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            force_idr.load(Ordering::SeqCst),
+            "asked at once after the stall"
+        );
+        assert!(link.stats().frames_dropped.load(Ordering::Relaxed) > dropped);
+        link.send(peer, &packet(10, true, 0, 1, 100)).await.unwrap();
+        let next = read_datagram(&mut client).await.unwrap();
+        let header = MediaHeader::decode(&next).unwrap().0;
+        assert_eq!((header.frame_seq, header.is_keyframe), (10, true));
     }
 
     /// A last message is written before the link goes, and a peer that

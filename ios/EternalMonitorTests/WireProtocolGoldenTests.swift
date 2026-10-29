@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 28,
+            Self.vectors.count, 29,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -199,6 +199,30 @@ final class WireProtocolGoldenTests: XCTestCase {
         guard case .helloAck(let legacy) = old else { return XCTFail("wrong type") }
         XCTAssertEqual(legacy.authToken, Data(repeating: 0, count: 16))
         XCTAssertEqual(legacy.hostCaps, 0)
+    }
+
+    /// A host that numbers frames contiguously says so. A new iPad reads the
+    /// bit; parsing is the same as 0.3.1's, which stores host caps and tests
+    /// only the bits it knows, so an older iPad behaves exactly as before.
+    func testHelloAckContiguousFrameSeqVector() throws {
+        let data = try vector("hello_ack_contiguous_seq")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(HelloAck.hostCapContiguousFrameSeq, 0x0020)
+        XCTAssertNotEqual(ack.hostCaps & HelloAck.hostCapContiguousFrameSeq, 0, "a new iPad reads it")
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        // Every bit an older iPad knows reads as it does without the flag.
+        let (_, oldMessage) = try XCTUnwrap(Wire.parseControl(try vector("hello_ack_paired")))
+        guard case .helloAck(let withoutFlag) = oldMessage else { return XCTFail("wrong type") }
+        for bit in [HelloAck.hostCapNack, HelloAck.hostCapAudio, HelloAck.hostCapUSB,
+                    HelloAck.hostCapKeyboard, HelloAck.hostCapPen] {
+            XCTAssertEqual(ack.hostCaps & bit, withoutFlag.hostCaps & bit)
+        }
+        XCTAssertEqual(ack.authToken, withoutFlag.authToken)
+        XCTAssertEqual(ack.sessionId, withoutFlag.sessionId)
+        XCTAssertEqual(ack.streamConfig, withoutFlag.streamConfig)
+        // A host without contiguous numbering leaves it clear.
+        XCTAssertEqual(withoutFlag.hostCaps & HelloAck.hostCapContiguousFrameSeq, 0)
     }
 
     func testReceiverReportV030VectorAndLegacyDefaults() throws {
