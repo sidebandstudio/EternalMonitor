@@ -74,6 +74,11 @@ impl GpuInfo {
     }
 }
 
+/// No hardware encoder fallback chain outside Windows.
+pub fn vendors_present() -> Vec<GpuVendor> {
+    Vec::new()
+}
+
 /// No graphics card names off Windows; a feedback email leaves the line out.
 pub fn adapter_names() -> Vec<String> {
     Vec::new()

@@ -74,6 +74,28 @@ impl GpuInfo {
     }
 }
 
+/// Vendors of the hardware adapters present now. Read at each encoder
+/// fallback rather than at launch, so a card connected since (an eGPU, a
+/// dock) or a driver installed since is tried. Empty if DXGI can't be asked.
+pub fn vendors_present() -> Vec<GpuVendor> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let mut vendors = Vec::new();
+    let mut index = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+        index += 1;
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        let vendor = GpuVendor::from_vendor_id(desc.VendorId);
+        if desc.Flags & FLAG_SOFTWARE == 0 && !vendors.contains(&vendor) {
+            vendors.push(vendor);
+        }
+    }
+    vendors
+}
+
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 

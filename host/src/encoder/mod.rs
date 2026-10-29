@@ -16,7 +16,7 @@ use eternal_wire::h264::{
 
 use crate::capture::FrameSlot;
 use crate::control::SharedControl;
-use crate::gpu::GpuInfo;
+use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
 
 pub mod input;
@@ -299,18 +299,22 @@ fn run_encode_loop(
                         "Preferred encoder failed to open; trying remaining encoders"
                     );
                     let stalled = is_open_stall(e.as_ref());
-                    let (name, state) = open_remaining_encoders(&desired_encoder, |name| {
-                        EncoderState::new(
-                            name,
-                            raw_frame.width,
-                            raw_frame.height,
-                            desired_bitrate,
-                            target_fps,
-                            input_mode,
-                            Opening::First,
-                            &mut opening,
-                        )
-                    })?;
+                    let (name, state) = open_remaining_encoders(
+                        &desired_encoder,
+                        crate::gpu::vendors_present,
+                        |name| {
+                            EncoderState::new(
+                                name,
+                                raw_frame.width,
+                                raw_frame.height,
+                                desired_bitrate,
+                                target_fps,
+                                input_mode,
+                                Opening::First,
+                                &mut opening,
+                            )
+                        },
+                    )?;
                     // After a stall the preferred encoder stays preferred,
                     // to be tried again; a real error leaves it for good.
                     if !stall_recovery.failed(stalled, &preferred, name, Instant::now()) {
@@ -973,17 +977,37 @@ fn takes_codec_lock(encoder_name: &str) -> bool {
             .any(|suffix| encoder_name.ends_with(suffix))
 }
 
+/// `vendors_present` lists the graphics cards' vendors when the fallback
+/// runs (see [`crate::gpu::vendors_present`]). An encoder whose vendor is
+/// absent is skipped: AMF on a PC without an AMD card only logs that its DLL
+/// failed to load. With no list, every encoder is tried. A hybrid laptop
+/// lists both of its cards.
 fn open_remaining_encoders<T>(
     failed: &str,
+    vendors_present: impl FnOnce() -> Vec<GpuVendor>,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
-    let hardware: &[&str] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
-        &["h264_nvenc", "h264_amf", "h264_qsv"]
+    let hardware: &[(&str, GpuVendor)] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv")
+    {
+        &[
+            ("h264_nvenc", GpuVendor::Nvidia),
+            ("h264_amf", GpuVendor::Amd),
+            ("h264_qsv", GpuVendor::Intel),
+        ]
     } else {
         &[]
     };
-    for &name in hardware {
+    let vendors = if hardware.is_empty() {
+        Vec::new()
+    } else {
+        vendors_present()
+    };
+    for &(name, vendor) in hardware {
         if name == failed {
+            continue;
+        }
+        if !vendors.is_empty() && !vendors.contains(&vendor) {
+            info!(encoder = name, %vendor, "No graphics card from this vendor; not trying it");
             continue;
         }
         match open(name) {
@@ -2170,7 +2194,7 @@ mod tests {
     #[test]
     fn startup_tries_other_hardware_before_software() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", Vec::new, |name| {
             attempts.push(name.to_string());
             match name {
                 "h264_qsv" => Ok(()),
@@ -2180,6 +2204,62 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, ["h264_amf", "h264_qsv"]);
         assert_eq!(selected, "h264_qsv");
+    }
+
+    #[test]
+    fn the_fallback_tries_only_encoders_for_the_graphics_cards_present() {
+        use GpuVendor::{Amd, Intel, Nvidia, Unknown};
+        let tried = |failed: &str, vendors: Vec<GpuVendor>| {
+            let mut attempts = Vec::new();
+            let (selected, ()) = open_remaining_encoders(
+                failed,
+                || vendors,
+                |name| {
+                    attempts.push(name.to_string());
+                    match name {
+                        "libx264" => Ok(()),
+                        _ => Err("device unavailable".into()),
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(selected, "libx264");
+            attempts
+        };
+        // An NVIDIA desktop goes straight to the CPU; AMF and Quick Sync
+        // only logged errors there.
+        assert_eq!(tried("h264_nvenc", vec![Nvidia]), ["libx264"]);
+        // A hybrid laptop tries its other card.
+        assert_eq!(
+            tried("h264_nvenc", vec![Intel, Nvidia]),
+            ["h264_qsv", "libx264"]
+        );
+        // RTX + Radeon iGPU: AMF, not Quick Sync. Unknown adapters (a virtual
+        // display, a remote desktop card) have no encoder to try.
+        assert_eq!(
+            tried("h264_nvenc", vec![Nvidia, Amd, Unknown]),
+            ["h264_amf", "libx264"]
+        );
+        assert_eq!(
+            tried("h264_qsv", vec![Intel, Amd, Nvidia]),
+            ["h264_nvenc", "h264_amf", "libx264"]
+        );
+        // No adapter list (DXGI could not be asked): everything, as before.
+        assert_eq!(
+            tried("h264_amf", Vec::new()),
+            ["h264_nvenc", "h264_qsv", "libx264"]
+        );
+        // The adapters are read when the fallback runs, not at launch: an
+        // AMD eGPU connected before the second pipeline start is tried.
+        assert_eq!(tried("h264_nvenc", vec![Nvidia]), ["libx264"]);
+        assert_eq!(
+            tried("h264_nvenc", vec![Nvidia, Amd]),
+            ["h264_amf", "libx264"]
+        );
+        // A non-Windows backend never asks.
+        let (selected, ()) =
+            open_remaining_encoders("h264_videotoolbox", || panic!("asked"), |_| Ok(())).unwrap();
+        assert_eq!(selected, "libx264");
     }
 
     #[test]
@@ -2232,7 +2312,7 @@ mod tests {
         // are refused at once, and x264 opens.
         let started = Instant::now();
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", Vec::new, |name| {
             attempts.push(name.to_string());
             open(name)
         })
@@ -2444,7 +2524,7 @@ mod tests {
         );
         // NVENC and AMF are refused at once behind it; x264 gives a picture.
         let mut attempts = Vec::new();
-        let (name, opened) = open_remaining_encoders(preferred, |name| {
+        let (name, opened) = open_remaining_encoders(preferred, Vec::new, |name| {
             attempts.push(name.to_string());
             open_in(lanes, name, Opening::First, || {})
         })
@@ -3079,7 +3159,7 @@ mod tests {
     fn startup_uses_software_only_after_all_other_hardware_fails() {
         for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
             let mut attempts = Vec::new();
-            let (selected, ()) = open_remaining_encoders(failed, |name| {
+            let (selected, ()) = open_remaining_encoders(failed, Vec::new, |name| {
                 attempts.push(name.to_string());
                 if name == "libx264" {
                     Ok(())
@@ -3093,7 +3173,7 @@ mod tests {
             assert!(!attempts.iter().any(|name| name == failed));
             assert_eq!(attempts.last().unwrap(), "libx264");
         }
-        assert!(open_remaining_encoders::<()>("h264_amf", |_| {
+        assert!(open_remaining_encoders::<()>("h264_amf", Vec::new, |_| {
             Err("no encoder can open".into())
         })
         .is_err());
@@ -3102,7 +3182,7 @@ mod tests {
     #[test]
     fn non_windows_backends_keep_their_software_fallback() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", |name| {
+        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", Vec::new, |name| {
             attempts.push(name.to_string());
             Ok(())
         })
