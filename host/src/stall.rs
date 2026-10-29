@@ -102,6 +102,13 @@ impl Call {
 /// left the slowest QSV open seen since only 1.4 times as long.
 const HARDWARE_OPEN: Limits = Limits::ms(5_000, 15_000);
 
+/// NVENC, AMF and QSV reopens of a live session (a bitrate, frame rate or
+/// codec change, an AMF keyframe, a try of the preferred encoder after a
+/// stall). The old session goes on if the reopen is given up on, but the
+/// picture freezes until then, so the limit is shorter: still twice the
+/// slowest open seen.
+const HARDWARE_REOPEN: Limits = Limits::ms(5_000, 9_000);
+
 /// Each encoder in the [`Call::EncoderOpen`] lane by name suffix, its
 /// limits, and the slowest open of it seen. A limit stays at least twice
 /// that, so a slow PC that works keeps its encoder; the warning comes after
@@ -140,6 +147,16 @@ pub fn encoder_open_limits(encoder: &str) -> Limits {
         .iter()
         .find(|(suffix, ..)| encoder.ends_with(suffix))
         .map_or(HARDWARE_OPEN, |&(_, limits, _)| limits)
+}
+
+/// The limits for reopening `encoder` while its live session goes on if
+/// the reopen is given up on: [`HARDWARE_REOPEN`] for the hardware
+/// encoders, the same as a first open for libx265 and libopus.
+pub fn encoder_reopen_limits(encoder: &str) -> Limits {
+    match encoder_open_limits(encoder) {
+        HARDWARE_OPEN => HARDWARE_REOPEN,
+        limits => limits,
+    }
 }
 
 /// Abandoned calls of one kind that may still run. One: calls that hang wait
@@ -398,7 +415,8 @@ pub(crate) fn log_timed_out(call: Call, limits: Limits, after: Duration) {
 
 /// Debug builds only, to see the recovery on a PC whose driver works:
 /// `ETERNAL_SIMULATE_STALL=d3d11_create_device,encoder_open` holds the first
-/// such call of this process for twice its limit before making it.
+/// such call of this process for twice its limit before making it, or for
+/// `ETERNAL_SIMULATE_STALL_MS` if set.
 #[cfg(debug_assertions)]
 fn simulated_delay(call: Call, limits: Limits) -> Option<Duration> {
     static USED: AtomicUsize = AtomicUsize::new(0);
@@ -411,7 +429,11 @@ fn simulated_delay(call: Call, limits: Limits) -> Option<Duration> {
         return None;
     }
     warn!(call = %call.name(), "Simulating a stuck Windows or driver call");
-    Some(limits.limit * 2)
+    let held = std::env::var("ETERNAL_SIMULATE_STALL_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse().ok())
+        .map(Duration::from_millis);
+    Some(held.unwrap_or(limits.limit * 2))
 }
 
 #[cfg(not(debug_assertions))]
@@ -820,6 +842,31 @@ mod tests {
             }
         }
         assert_eq!(Call::EncoderOpen.limits(), encoder_open_limits("h264_qsv"));
+        // A reopen of a live session freezes the picture until it returns,
+        // so the hardware encoders' is shorter, and holds to the same rules.
+        for (suffix, first, slowest) in ENCODER_OPENS {
+            let reopen = encoder_reopen_limits(&format!("h264{suffix}"));
+            assert!(reopen.limit >= slowest * 2, "{suffix}: {reopen:?}");
+            assert!(reopen.warn > slowest, "{suffix}: {reopen:?}");
+            assert!(reopen.warn < reopen.limit, "{suffix}: {reopen:?}");
+            assert!(reopen.limit <= first.limit, "{suffix}: {reopen:?}");
+        }
+        for (name, limit) in [
+            ("h264_nvenc", 9),
+            ("hevc_nvenc", 9),
+            ("h264_amf", 9),
+            ("hevc_amf", 9),
+            ("h264_qsv", 9),
+            ("hevc_qsv", 9),
+            ("libx265", 20),
+            ("libopus", 6),
+        ] {
+            assert_eq!(
+                encoder_reopen_limits(name).limit,
+                Duration::from_secs(limit),
+                "{name}"
+            );
+        }
     }
 
     #[test]
