@@ -16,10 +16,11 @@ def steps(job):
     return re.split(r"(?m)^(?=      - )", job)[1:]
 
 
-def env(text, indent):
-    """The env: block at this indent: workflow 0, job 4, step 8."""
-    block = re.search(r"(?m)^%senv:\n((?:(?: {%d}.*)?\n)*)" % (" " * indent, indent + 2), text + "\n")
-    return block[1] if block else ""
+def step_env(step):
+    """(name, value) pairs bound directly in the step's own env: block. Comments and
+    lines nested deeper, such as block scalar contents, are not bindings."""
+    block = re.search(r"(?m)^        env:\n((?:(?: {10}.*)?\n)*)", step + "\n")
+    return re.findall(r"(?m)^ {10}([\w-]+): *(.*?) *$", block[1] if block else "")
 
 
 def paths(step):
@@ -83,10 +84,11 @@ class WorkflowArtifactsTest(unittest.TestCase):
                 optional = set((command[2] or "").split(",")) - {""}
                 self.assertLessEqual(secrets, set(command[1].split(",")) | optional, name)
                 self.assertIn("GITHUB_TOKEN: ${{ github.token }}", scan, name)
-                visible = env(head, 0) + env(job, 4) + env(scan, 8)
+                bound = step_env(scan)
                 for secret in optional:
-                    self.assertTrue("%s: ${{ secrets.%s }}" % (secret, secret) in visible,
-                                    f"{name}: {secret} must reach the scan step's env")
+                    self.assertEqual([value for key, value in bound if key == secret],
+                                     ["${{ secrets.%s }}" % secret],
+                                     f"{name}: the scan step's env must bind {secret} to its secret")
                 scanned = command[3].split()
                 for path in paths(step):
                     self.assertIn(path, scanned, name)
@@ -99,13 +101,23 @@ class WorkflowArtifactsTest(unittest.TestCase):
                 uploads += self.assert_uploads_scanned(workflow.read_text())
         self.assertGreaterEqual(uploads, 5)
 
-    def test_optional_secrets_must_be_bound_where_the_scan_step_sees_them(self):
+    def test_optional_secrets_must_be_bound_in_the_scan_step(self):
         binding = "AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}"
-        for place in ("workflow", "job", "scan"):
-            with self.subTest(place):
-                self.assertEqual(self.assert_uploads_scanned(FIXTURE.replace(f"# {place}", binding)), 1)
-        with self.assertRaisesRegex(AssertionError, "AZURE_CLIENT_ID must reach the scan step's env"):
-            self.assert_uploads_scanned(FIXTURE.replace("# build", binding))
+        self.assertEqual(self.assert_uploads_scanned(FIXTURE.replace("# scan", binding)), 1)
+        rejected = {
+            "workflow only": FIXTURE.replace("# workflow", binding),
+            "job only": FIXTURE.replace("# job", binding),
+            "another step": FIXTURE.replace("# build", binding),
+            "commented out": FIXTURE.replace("# scan", "# " + binding),
+            "block scalar": FIXTURE.replace("# scan", "NOTE: |\n            " + binding),
+            "empty": FIXTURE.replace("# scan", 'AZURE_CLIENT_ID: ""'),
+            "literal": FIXTURE.replace("# scan", "AZURE_CLIENT_ID: abc123"),
+            "other secret": FIXTURE.replace("# scan", "AZURE_CLIENT_ID: ${{ secrets.GITHUB_TOKEN }}"),
+            "empty over job": FIXTURE.replace("# job", binding).replace("# scan", 'AZURE_CLIENT_ID: ""'),
+        }
+        for case, text in rejected.items():
+            with self.subTest(case), self.assertRaisesRegex(AssertionError, "must bind AZURE_CLIENT_ID"):
+                self.assert_uploads_scanned(text)
 
     def test_testflight_review_runs_only_for_tags_and_manual_runs(self):
         text = (WORKFLOWS / "testflight.yml").read_text()
