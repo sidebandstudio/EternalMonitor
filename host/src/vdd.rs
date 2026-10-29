@@ -343,7 +343,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
                 if let Err(error) = result {
                     warn!(task, %error, "VDD task runner failed");
                 } else {
-                    crate::stall::log_timed_out(call, started.elapsed());
+                    crate::stall::log_timed_out(call, call.limits(), started.elapsed());
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -351,7 +351,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
             }
         }
     }
-    crate::stall::note_finished(call, started.elapsed());
+    crate::stall::note_finished(call, call.limits(), started.elapsed());
 
     match child.wait_with_output() {
         Ok(out) if out.status.success() => {
