@@ -283,11 +283,13 @@ fn run(args: &[String]) -> i32 {
                 super::offer::begin();
                 let module = module_at(process, record.address);
                 // Before the release below, so the next launch finds it.
+                // Thread 0 is no thread.
                 crate::gui::renderer::note_fault(
                     owner,
                     module
                         .as_ref()
                         .map_or(crate::gui::renderer::UNKNOWN, |(name, _)| name.as_str()),
+                    (record.thread != 0).then_some(record.thread),
                 );
                 let outcome = super::Outcome::new(
                     record,
@@ -382,6 +384,7 @@ fn run(args: &[String]) -> i32 {
                 } else {
                     crate::gui::renderer::TERMINATED
                 },
+                None,
             );
             if outcome.crash {
                 // Beside the cleanup the message waits for below.

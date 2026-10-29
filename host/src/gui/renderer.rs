@@ -14,10 +14,13 @@
 //! the window is confirmed working. A marker whose process has exited means
 //! that launch never got there, so that backend is avoided on that GPU. The
 //! failure reporter notes beside the marker what ended the launch. A crash
-//! inside a graphics driver or its loader keeps the backend aside until the
-//! driver changes. Any other end, or one on a GPU whose driver version is
-//! unknown, is tried again after some clean launches: the cause may be
-//! elsewhere, and a working backend must not stay aside for it.
+//! inside a graphics driver or its loader, on the thread that started the
+//! window's renderer, keeps the backend aside until the driver changes.
+//! Capture and encoding run in the same drivers on other threads meanwhile,
+//! so a crash there says nothing about the window. Any other end, or one on a
+//! GPU whose driver version is unknown, is tried again after some clean
+//! launches: the cause may be elsewhere, and a working backend must not stay
+//! aside for it.
 //!
 //! On Windows the instance is created without OpenGL. Listing GL adapters
 //! makes a context on the display GPU, and AMD's OpenGL driver can crash the
@@ -59,7 +62,7 @@ pub(crate) const TERMINATED: &str = "terminated";
 /// Modules whose crash is the graphics driver's or its loader's, by the start
 /// of the lowercase file name. Kept narrow: a crash anywhere else is retried
 /// after clean launches.
-const DRIVER_MODULES: [&str; 16] = [
+const DRIVER_MODULES: [&str; 18] = [
     // Intel: the Vulkan driver (igvk64, the 0.3.3 crash), the Direct3D drivers
     // and their memory manager (igd10iumd64, igd12umd64, igdgmm64), the shader
     // compiler (igc64) and the Xe OpenGL driver (igxelpicd64).
@@ -68,12 +71,14 @@ const DRIVER_MODULES: [&str; 16] = [
     "igc",
     "igxelpicd",
     // AMD: the Vulkan driver (amdvlk64), the OpenGL driver (atio6axx), the
-    // Direct3D drivers (atidxx64, atiumd64) and the DX12 shader compiler
-    // (amdxc64).
+    // Direct3D drivers (atidxx64, atiumd64, and amdxx64 for D3D12 and amdxn64
+    // for D3D11 in newer drivers) and the DX12 shader compiler (amdxc64).
     "amdvlk",
     "atio6axx",
     "atidxx",
     "atiumd",
+    "amdxx",
+    "amdxn",
     "amdxc",
     // NVIDIA: the OpenGL and Vulkan driver (nvoglv64), the Direct3D drivers
     // (nvwgf2umx, nvd3dumx), their loader (nvldumdx) and the shader compiler
@@ -219,6 +224,10 @@ struct Candidate {
 struct Marker {
     gpu: String,
     backend: String,
+    /// The thread that lists adapters, creates the device and draws. 0.3.3
+    /// saved none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread: Option<u32>,
 }
 
 /// A backend that failed to draw on one GPU and driver.
@@ -229,7 +238,8 @@ struct Failure {
     failures: u32,
     clean_launches: u32,
     /// What ended the launch: the module it crashed in, [`UNKNOWN`] or
-    /// [`TERMINATED`]. 0.3.3 saved none.
+    /// [`TERMINATED`]. A driver crash off the window's thread names its
+    /// thread first (see [`attribute`]). 0.3.3 saved none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fault: Option<String>,
 }
@@ -297,6 +307,7 @@ fn choose_backends(
             start(Marker {
                 gpu: gpus.clone(),
                 backend: plan.stage().to_string(),
+                thread: current_thread(),
             });
         }
         descriptor.backends = instance_backends(forced, plan);
@@ -351,6 +362,19 @@ fn instance_plan(history: &[Failure], gpus: &str) -> Plan {
         .into_iter()
         .find(|plan| !avoided(history, gpus, plan.stage()))
         .unwrap_or(Plan::Warp)
+}
+
+/// The id of this thread, as a crash record names the thread that crashed.
+/// egui-wgpu lists adapters, creates the device and draws on the thread that
+/// runs the window. Only Windows has a reporter to compare it with.
+#[cfg(windows)]
+fn current_thread() -> Option<u32> {
+    Some(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() })
+}
+
+#[cfg(not(windows))]
+fn current_thread() -> Option<u32> {
+    None
 }
 
 /// Leave this launch's marker until the window is confirmed working.
@@ -507,6 +531,7 @@ fn select(
     let marker = Marker {
         gpu: gpus[index].clone(),
         backend: info.backend.to_str().to_string(),
+        thread: current_thread(),
     };
     info!(
         backend = %info.backend,
@@ -679,12 +704,20 @@ fn applies_now(failure: &Failure, gpus: &str) -> bool {
 }
 
 /// Whether every GPU in a key names its driver version, so a driver update
-/// shows as a new key.
+/// shows as a new key. A GPU DXGI does not list is keyed by wgpu's driver
+/// text, which can be a vendor name that stays the same across updates.
 fn knows_driver(gpu: &str) -> bool {
     gpu.split(", ").all(|gpu| {
         gpu.split_once(' ')
-            .is_some_and(|(_, driver)| !driver.trim().is_empty())
+            .is_some_and(|(_, driver)| is_version(driver.trim()))
     })
+}
+
+/// Digits separated by dots, as `31.0.101.2111`.
+fn is_version(text: &str) -> bool {
+    let mut parts = text.split('.');
+    parts.clone().count() >= 2
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Count a failure and what ended it. A driver crash stays noted when a later
@@ -732,19 +765,42 @@ fn fault_path(directory: &Path, owner: ProcessId) -> PathBuf {
 }
 
 /// Called by the failure reporter once it knows how `owner` ended: the module
-/// it crashed in, [`UNKNOWN`] or [`TERMINATED`]. Noted only while that
-/// launch's marker is there, for the next launch's sweep.
+/// it crashed in and the crash record's thread, or [`UNKNOWN`] or
+/// [`TERMINATED`] without a thread. Noted only while that launch's marker is
+/// there, for the next launch's sweep.
 #[cfg(windows)]
-pub(crate) fn note_fault(owner: ProcessId, fault: &str) {
+pub(crate) fn note_fault(owner: ProcessId, fault: &str, thread: Option<u32>) {
     if let Some(base) = crate::settings::app_data_dir() {
-        write_fault(&base.join("renderer"), owner, fault);
+        write_fault(&base.join("renderer"), owner, fault, thread);
     }
 }
 
 #[cfg(any(windows, test))]
-fn write_fault(directory: &Path, owner: ProcessId, fault: &str) {
-    if marker_path(directory, owner).exists() {
-        let _ = fs::write(fault_path(directory, owner), fault);
+fn write_fault(directory: &Path, owner: ProcessId, fault: &str, thread: Option<u32>) {
+    let Ok(bytes) = fs::read(marker_path(directory, owner)) else {
+        return;
+    };
+    let window = serde_json::from_slice::<Marker>(&bytes)
+        .ok()
+        .and_then(|marker| marker.thread);
+    let _ = fs::write(
+        fault_path(directory, owner),
+        attribute(fault, thread, window),
+    );
+}
+
+/// The fault to note for a crash in `module` on `thread`. A driver crash is
+/// the window's only on the `window` thread, which started its renderer.
+/// Elsewhere, as in capture or encoding, or on a thread the record or marker
+/// does not name, it is noted after its thread, which no driver name starts
+/// with, so it is retried after clean launches.
+#[cfg(any(windows, test))]
+fn attribute(module: &str, thread: Option<u32>, window: Option<u32>) -> String {
+    match thread {
+        _ if !driver_module(module) => module.to_string(),
+        Some(thread) if window == Some(thread) => module.to_string(),
+        Some(thread) => format!("thread {thread}: {module}"),
+        None => format!("unnamed thread: {module}"),
     }
 }
 
@@ -935,8 +991,12 @@ mod tests {
         Marker {
             gpu: gpu.into(),
             backend: backend.into(),
+            thread: None,
         }
     }
+
+    /// The thread a test launch draws its window on.
+    const WINDOW: u32 = 0x1a2b;
 
     #[test]
     fn an_incomplete_vulkan_driver_yields_to_dx12_on_the_same_gpu() {
@@ -1086,6 +1146,8 @@ mod tests {
             "amdvlk64.dll",
             "atio6axx.dll",
             "atidxx64.dll",
+            "amdxx64.dll",
+            "amdxn64.dll",
             "amdxc64.dll",
             "nvoglv64.dll",
             "nvwgf2umx.dll",
@@ -1106,10 +1168,39 @@ mod tests {
             "GameOverlayVulkanLayer64.dll",
             "graphics-hook64.dll",
             "nvspcap64.dll",
+            "amdihk64.dll",
+            "thread 9: igvk64.dll",
+            "unnamed thread: igvk64.dll",
             "",
         ] {
             assert!(!driver_module(fault), "{fault}");
         }
+    }
+
+    #[test]
+    fn only_a_driver_crash_on_the_window_thread_is_the_windows() {
+        assert_eq!(attribute(IGVK, Some(WINDOW), Some(WINDOW)), IGVK);
+        // Capture's D3D11 duplication or an encoder in the same driver.
+        let capture = attribute("igd10iumd64.dll", Some(7), Some(WINDOW));
+        assert_eq!(capture, "thread 7: igd10iumd64.dll");
+        // A record without a thread.
+        let unnamed = attribute(IGVK, None, Some(WINDOW));
+        assert_eq!(unnamed, "unnamed thread: igvk64.dll");
+        // A marker without one, as 0.3.3's.
+        assert_eq!(
+            attribute(IGVK, Some(WINDOW), None),
+            format!("thread {WINDOW}: igvk64.dll")
+        );
+        for fault in [capture, unnamed] {
+            assert!(!driver_module(&fault), "{fault}");
+        }
+        // Anything else is noted as it was.
+        assert_eq!(
+            attribute("EternalMonitor.exe", Some(7), Some(WINDOW)),
+            "EternalMonitor.exe"
+        );
+        assert_eq!(attribute(UNKNOWN, None, Some(WINDOW)), UNKNOWN);
+        assert_eq!(attribute(TERMINATED, None, Some(WINDOW)), TERMINATED);
     }
 
     #[test]
@@ -1170,23 +1261,30 @@ mod tests {
         assert!(knows_driver(
             "8086:5917 23.20.16.5038, 10de:1c8d 31.0.15.3623"
         ));
+        // wgpu's driver text, when it is no version.
+        assert!(!knows_driver("8086:5917 Intel Corporation Intel driver"));
+        assert!(!knows_driver("1002:150e AMD proprietary driver 24.10.1"));
+        assert!(!knows_driver("8086:5917 31"));
+        assert!(!knows_driver("8086:5917 31..101"));
         // Even a driver crash: a driver update could not be seen.
-        let old = marker(gpu, "vulkan");
-        let fallback = marker(gpu, "dx12");
-        let mut history = Vec::new();
-        record_failure(&mut history, &old, IGVK);
-        for _ in 0..RETRY_AFTER - 1 {
+        for gpu in [gpu, "8086:5917 Intel Corporation Intel driver"] {
+            let old = marker(gpu, "vulkan");
+            let fallback = marker(gpu, "dx12");
+            let mut history = Vec::new();
+            record_failure(&mut history, &old, IGVK);
+            for _ in 0..RETRY_AFTER - 1 {
+                record_success(&mut history, &fallback);
+            }
+            assert!(avoided(&history, gpu, "vulkan"), "{gpu}");
             record_success(&mut history, &fallback);
+            assert!(!avoided(&history, gpu, "vulkan"), "{gpu}");
+            // Failing again waits twice as long.
+            record_failure(&mut history, &old, IGVK);
+            for _ in 0..2 * RETRY_AFTER - 1 {
+                record_success(&mut history, &fallback);
+            }
+            assert!(avoided(&history, gpu, "vulkan"), "{gpu}");
         }
-        assert!(avoided(&history, gpu, "vulkan"));
-        record_success(&mut history, &fallback);
-        assert!(!avoided(&history, gpu, "vulkan"));
-        // Failing again waits twice as long.
-        record_failure(&mut history, &old, IGVK);
-        for _ in 0..2 * RETRY_AFTER - 1 {
-            record_success(&mut history, &fallback);
-        }
-        assert!(avoided(&history, gpu, "vulkan"));
     }
 
     #[test]
@@ -1262,13 +1360,13 @@ mod tests {
         let dead = exited_process();
         fs::write(marker_path(&directory, dead), json(&marker(gpu, "dx12"))).unwrap();
         // The reporter noted both; the running one's note stays with it.
-        write_fault(&directory, running, IGVK);
-        write_fault(&directory, dead, IGVK);
+        write_fault(&directory, running, "EternalMonitor.exe", Some(WINDOW));
+        write_fault(&directory, dead, "EternalMonitor.exe", Some(WINDOW));
 
         let history = sweep(&directory, elsewhere);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].backend, "dx12");
-        assert_eq!(history[0].fault.as_deref(), Some(IGVK));
+        assert_eq!(history[0].fault.as_deref(), Some("EternalMonitor.exe"));
         assert!(marker_path(&directory, running).exists());
         assert!(fault_path(&directory, running).exists());
         assert!(!marker_path(&directory, dead).exists());
@@ -1451,27 +1549,39 @@ mod tests {
     fn the_reporter_note_decides_how_a_crashed_launch_is_retried() {
         let directory = temp_dir("renderer-fault");
         let gpu = "8086:9bc4 31.0.101.2111";
-        let launch = |backend: &str, fault: Option<&str>| {
+        let launch = |backend: &str, fault: Option<(&str, Option<u32>)>| {
             let dead = exited_process();
-            let json = serde_json::to_vec(&marker(gpu, backend)).unwrap();
-            fs::write(marker_path(&directory, dead), json).unwrap();
-            if let Some(fault) = fault {
-                write_fault(&directory, dead, fault);
+            let drawing = Marker {
+                thread: Some(WINDOW),
+                ..marker(gpu, backend)
+            };
+            fs::write(
+                marker_path(&directory, dead),
+                serde_json::to_vec(&drawing).unwrap(),
+            )
+            .unwrap();
+            if let Some((fault, thread)) = fault {
+                write_fault(&directory, dead, fault, thread);
             }
         };
-        // Intel's Vulkan driver crashed; DX12 crashed in our own code; GL
-        // was ended by Task Manager; Metal's launch has no note at all.
-        launch("vulkan", Some(IGVK));
-        launch("dx12", Some("EternalMonitor.exe"));
-        launch("gl", Some(TERMINATED));
+        // Intel's Vulkan driver crashed on the window's thread; DX12 crashed
+        // in our own code; GL was ended by Task Manager; Metal's launch has
+        // no note at all.
+        launch("vulkan", Some((IGVK, Some(WINDOW))));
+        launch("dx12", Some(("EternalMonitor.exe", Some(WINDOW))));
+        launch("gl", Some((TERMINATED, None)));
         launch("metal", None);
+        // Capture crashed in Intel's D3D11 driver on its own thread, and a
+        // record named no thread.
+        launch("enumerate", Some(("igd10iumd64.dll", Some(WINDOW + 1))));
+        launch("enumerate dx12", Some((IGVK, None)));
         // A note without a marker: that window worked; it goes.
         let shown = exited_process();
         fs::write(fault_path(&directory, shown), IGVK).unwrap();
         // And the reporter notes nothing for a launch without a marker.
-        write_fault(&directory, exited_process(), IGVK);
+        write_fault(&directory, exited_process(), IGVK, Some(WINDOW));
         let mut history = sweep(&directory, ProcessId::current());
-        assert_eq!(history.len(), 4);
+        assert_eq!(history.len(), 6);
         assert!(!fault_path(&directory, shown).exists());
         let left = fs::read_dir(&directory)
             .unwrap()
@@ -1489,13 +1599,31 @@ mod tests {
                 .find(|f| f.backend == backend)
                 .and_then(|f| f.fault.clone())
         };
+        assert_eq!(fault("vulkan").as_deref(), Some(IGVK));
         assert_eq!(fault("metal").as_deref(), Some(UNKNOWN));
         assert_eq!(fault("gl").as_deref(), Some(TERMINATED));
-        for _ in 0..RETRY_AFTER {
+        assert_eq!(
+            fault("enumerate").as_deref(),
+            Some(format!("thread {}: igd10iumd64.dll", WINDOW + 1).as_str())
+        );
+        assert_eq!(
+            fault("enumerate dx12").as_deref(),
+            Some("unnamed thread: igvk64.dll")
+        );
+        for _ in 0..RETRY_AFTER - 1 {
+            record_success(&mut history, &marker("1414:008c 10.0.22621.1", "dx12"));
+        }
+        for backend in ["dx12", "gl", "metal", "enumerate", "enumerate dx12"] {
+            assert!(avoided(&history, gpu, backend), "{backend}");
+        }
+        record_success(&mut history, &marker("1414:008c 10.0.22621.1", "dx12"));
+        // Only the window's driver crash stays aside, until the driver changes.
+        for _ in 0..100 * RETRY_AFTER {
             record_success(&mut history, &marker("1414:008c 10.0.22621.1", "dx12"));
         }
         assert!(avoided(&history, gpu, "vulkan"));
-        for backend in ["dx12", "gl", "metal"] {
+        assert!(!avoided(&history, "8086:9bc4 32.0.101.6078", "vulkan"));
+        for backend in ["dx12", "gl", "metal", "enumerate", "enumerate dx12"] {
             assert!(!avoided(&history, gpu, backend), "{backend}");
         }
         fs::remove_dir_all(directory).unwrap();
