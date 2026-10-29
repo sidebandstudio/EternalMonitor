@@ -296,8 +296,7 @@ fn is_eternal_monitor(image: &str) -> bool {
     file.starts_with("eternalmonitor") || file.starts_with("eternal-host")
 }
 
-/// The process listening on UDP `port` in `family`'s table. A dual-stack
-/// IPv6 socket is listed in the IPv6 table only.
+/// The process listening on UDP `port` in `family`'s table.
 #[cfg(windows)]
 fn owner(port: u16, family: Family) -> Option<u32> {
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -480,7 +479,7 @@ mod tests {
     /// The stream binds IPv4 only. Whether a dual-stack IPv6 socket on the
     /// port blocks it is Windows' choice (a plain one doesn't); the check
     /// agrees with the stream's own bind either way, and names the holder
-    /// from the IPv6 table beside the blocked notice.
+    /// from the IPv4 table when blocked.
     #[cfg(windows)]
     #[test]
     fn a_dual_stack_holder_blocks_the_check_exactly_when_it_blocks_the_stream() {
@@ -515,17 +514,9 @@ mod tests {
                 .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into());
             assert_eq!(free, stream.is_ok(), "exclusive: {exclusive}");
             if !free {
-                // Not in the IPv4 table, so Windows blocks the port as far as
-                // the check can tell, and the IPv6 holder is named beside it.
-                assert_eq!(super::held().unwrap().by, HeldBy::Refused);
-                for _ in 1..REFUSALS {
-                    assert!(!check_as(port, 0));
-                }
+                // Windows lists the exclusive one in its IPv4 table too.
                 assert!(
-                    matches!(
-                        &super::held().unwrap().by,
-                        HeldBy::Blocked { ipv6: Some(by), .. } if matches!(**by, HeldBy::Program(_))
-                    ),
+                    matches!(super::held().unwrap().by, HeldBy::Program(_)),
                     "{:?}",
                     super::held()
                 );
