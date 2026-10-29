@@ -303,7 +303,8 @@ final class FrameAssembler {
                     if let partial = pending[older], !partial.isComplete {
                         beginGap(older, through: partial.fragmentCount - 1, now: now)
                         if partial.holdRetryUs > 0 {
-                            pending[older]?.deadline = min(pending[older]?.deadline ?? latest, latest)
+                            let deadline = min(pending[older]?.deadline ?? latest, latest)
+                            pending[older]?.deadline = deadline
                         }
                     }
                 }
