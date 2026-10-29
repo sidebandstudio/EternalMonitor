@@ -24,7 +24,8 @@ impl AnalyzerApp {
 
 /// What the notice says, naming the program when Windows does. None while
 /// this copy's own previous stream still holds the port: it lets go by
-/// itself, and the status card says the stream is waiting.
+/// itself, and the status card says the stream is waiting. None too while
+/// Windows has refused the port only a few times with no program on it.
 pub(super) fn port_notice_text(held: &Held) -> Option<(String, String)> {
     let port = held.port;
     let then = "EternalMonitor starts streaming as soon as the port is free.";
@@ -41,7 +42,12 @@ pub(super) fn port_notice_text(held: &Held) -> Option<(String, String)> {
             "Another program is using EternalMonitor's network port".into(),
             format!("iPads can't connect while another program uses port {port}. Quit that program or restart the PC. {then}"),
         ),
-        HeldBy::ThisCopy => return None,
+        HeldBy::Blocked { .. } => (
+            format!("Windows is blocking EternalMonitor from using port {port}"),
+            "A firewall, security tool or reserved port range can do this.".into(),
+        ),
+        // Checked again before anything is said.
+        HeldBy::ThisCopy | HeldBy::Refused => return None,
     })
 }
 
@@ -101,6 +107,22 @@ mod tests {
     #[test]
     fn this_copy_s_previous_stream_has_no_notice() {
         assert_eq!(port_notice_text(&held(HeldBy::ThisCopy)), None);
+        assert_eq!(port_notice_text(&held(HeldBy::Refused)), None);
+    }
+
+    /// Windows refuses the port and no program has it: no "another program"
+    /// advice.
+    #[test]
+    fn a_blocked_port_says_windows_blocks_it() {
+        let (title, body) = port_notice_text(&held(HeldBy::Blocked { code: Some(10013) })).unwrap();
+        assert_eq!(
+            title,
+            "Windows is blocking EternalMonitor from using port 9876"
+        );
+        assert_eq!(
+            body,
+            "A firewall, security tool or reserved port range can do this."
+        );
     }
 
     #[test]
