@@ -2060,6 +2060,12 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 /// heartbeats advertise codec=HEVC. The switch is a live reopen, so a stray
 /// H.264 access unit from before the handoff is tolerated (the iPad's decoder
 /// sniffs the codec per keyframe for exactly this reason).
+///
+/// On a starved machine libx265 can stay silent past the supervisor's 3 s
+/// encoder watchdog, which restarts the pipeline: a known limitation of
+/// that watchdog, not of HEVC. The restarted stream is a new epoch and must
+/// negotiate HEVC again, from an IRAP with parameter sets, so every check
+/// here holds within each epoch.
 #[test]
 fn hevc_stream_negotiates_and_decodes() {
     use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
@@ -2102,15 +2108,22 @@ fn hevc_stream_negotiates_and_decodes() {
     let mut receiver =
         FakeReceiver::connect_full(listen_port, CAP_DECODE_H264 | CAP_DECODE_HEVC, 0);
 
-    let deadline = Instant::now() + DEADLINE;
+    // Only a backstop: at load ~545 libx265 took 9 s for its first picture
+    // and made 18 in 30 s.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut reassembler = Reassembler::new();
     let mut decoder = H264TestDecoder::with_codec(ffmpeg_next::codec::Id::HEVC);
     let mut datagram = [0u8; 2048];
 
-    let mut decoded_hevc: Vec<u64> = Vec::new();
+    // Decoded counters with their stream epochs, the epochs that began
+    // with an HEVC IRAP, and the completed frames, newest last.
+    let mut decoded_hevc: Vec<(u32, u64)> = Vec::new();
+    let mut hevc_epochs: Vec<u32> = Vec::new();
+    let mut recent = Vec::new();
     let mut hevc_parameter_sets_seen = false;
     let mut hevc_codec_advertised = false;
     let mut highest_seq = 0u32;
+    let origin = Instant::now();
 
     while decoded_hevc.len() < WANT_DECODED_FRAMES
         || !hevc_parameter_sets_seen
@@ -2148,16 +2161,23 @@ fn hevc_stream_negotiates_and_decodes() {
                     header.frag_count,
                     header.stream_epoch,
                     payload,
-                    Instant::now(),
+                    stream_time(origin, &header),
                 ) else {
                     continue;
                 };
+                let parameter_sets = eternal_wire::hevc::contains_parameter_sets(&frame_bytes);
+                recent.push((header.stream_epoch, header.frame_seq, parameter_sets));
+                if recent.len() > 8 {
+                    recent.remove(0);
+                }
 
                 // Ignore anything before the HEVC handoff (a leftover H.264
-                // access unit from the pre-switch encoder session).
-                if !hevc_parameter_sets_seen {
-                    if eternal_wire::hevc::contains_parameter_sets(&frame_bytes) {
+                // access unit from the pre-switch encoder session). After
+                // it, a restarted pipeline's first frame is its HEVC IRAP.
+                if !hevc_epochs.contains(&header.stream_epoch) {
+                    if parameter_sets {
                         hevc_parameter_sets_seen = true;
+                        hevc_epochs.push(header.stream_epoch);
                         assert!(
                             eternal_wire::hevc::contains_keyframe(&frame_bytes),
                             "the first HEVC frame must be an IRAP keyframe"
@@ -2166,20 +2186,35 @@ fn hevc_stream_negotiates_and_decodes() {
                             header.is_keyframe,
                             "the wire keyframe flag must be set on the HEVC IRAP"
                         );
+                    } else if hevc_parameter_sets_seen {
+                        panic!(
+                            "a restarted stream must start with an HEVC IRAP; \
+                             epoch, frame and parameter sets, newest last: {recent:?}"
+                        );
                     } else {
                         continue;
                     }
                 }
 
-                decoded_hevc.extend(decoder.decode(&frame_bytes));
+                decoded_hevc.extend(
+                    decoder
+                        .decode(&frame_bytes)
+                        .into_iter()
+                        .map(|counter| (header.stream_epoch, counter)),
+                );
             }
             _ => {}
         }
     }
 
-    for pair in decoded_hevc.windows(2) {
-        assert!(pair[1] > pair[0], "HEVC counters must advance: {pair:?}");
-    }
+    eprintln!(
+        "HEVC_E2E epochs={hevc_epochs:?} decoded={}",
+        decoded_hevc.len()
+    );
+    assert!(
+        rising_within_epochs(&decoded_hevc),
+        "HEVC counters must advance within each epoch: {decoded_hevc:?}"
+    );
 
     shared.stop();
     supervisor_tx
