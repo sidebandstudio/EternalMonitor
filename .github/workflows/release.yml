@@ -272,9 +272,14 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Optional: empty until Artifact Signing is set up (docs/windows-signing.md).
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: >-
           python scripts/artifact_secrets.py scan
           --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,GITHUB_TOKEN
+          --optional AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID
           build/out/EternalMonitor-Setup.exe
 
       - name: Upload installer artifact (dry runs and debugging)
