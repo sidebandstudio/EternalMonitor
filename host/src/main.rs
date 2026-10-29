@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(waited) = restart_wait {
         info!(
             waited_ms = waited.as_millis() as u64,
-            "Started by Restart EternalMonitor once the previous window had closed"
+            "Started by Restart EternalMonitor once the previous copy had exited"
         );
     }
 

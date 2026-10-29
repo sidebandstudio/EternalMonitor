@@ -410,7 +410,7 @@ mod windows_impl {
             if crate::startup::simulate_relaunch_without_ready() {
                 return Err("simulated".into());
             }
-            let event = super::event(&self.nonce)?;
+            let event = event(&self.nonce)?;
             unsafe { SetEvent(raw(&event)) }.map_err(|error| error.to_string())
         }
 
