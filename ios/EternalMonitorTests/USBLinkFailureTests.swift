@@ -203,6 +203,11 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(9876, forKey: "lastPort")
         let (manager, link) = try await connectOverCable(timing: fast)
         defer { link.stop(); manager.cancel() }
+        // Every Wi-Fi attempt's lookup fails at once. A real lookup of an
+        // .invalid name raced each attempt's 0.4 s timeout: on CI its answer
+        // came too late, the attempts ended as plain timeouts, and the
+        // cable advice rightly stayed.
+        manager.makeUDPLink = { _ in UnresolvableLink() }
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
         try await waitForFallbackToGiveUp(manager)
@@ -655,4 +660,25 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
         try await finishConnecting(manager, to: wifi)
     }
+}
+
+/// A Wi-Fi link whose lookup fails at once, as a host name that doesn't
+/// resolve does, without asking DNS.
+private final class UnresolvableLink: MediaLink {
+    let datagrams = MediaDatagrams()
+    let controlQueue = DispatchQueue(label: "test.unresolvable")
+    var onConnectionEstablished: (() -> Void)?
+    var onError: ((LinkError) -> Void)?
+    var onListenerReady: ((UInt16) -> Void)?
+    var onClosed: (() -> Void)?
+
+    @discardableResult func start(host: String) -> Bool {
+        controlQueue.async { [weak self] in
+            self?.onError?(LinkError(.resolve, "Cannot resolve \(host)"))
+        }
+        return true
+    }
+
+    func send(_ data: Data) {}
+    func stop() {}
 }

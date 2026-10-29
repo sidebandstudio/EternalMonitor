@@ -145,6 +145,14 @@ fn run_encode_loop(
         .ok()
         .and_then(|v| v.trim().parse().ok());
 
+    // While an encoder opens under its time limit, the limit decides, not
+    // the watchdog.
+    let mut opening = || {
+        if crate::supervisor::generation_is_current(generation) {
+            crate::capture::heartbeat(&shared.hb_encode_frame_ms);
+        }
+    };
+
     while let Some(raw_frame) = frames.blocking_take() {
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
@@ -232,6 +240,7 @@ fn run_encode_loop(
                 desired_bitrate,
                 target_fps,
                 input_mode,
+                &mut opening,
             ) {
                 Ok(state) => {
                     encoder_state = Some(state);
@@ -260,6 +269,7 @@ fn run_encode_loop(
                             desired_bitrate,
                             target_fps,
                             input_mode,
+                            &mut opening,
                         )
                     })?;
                     encoder_name = name.to_string();
@@ -299,6 +309,7 @@ fn run_encode_loop(
                 desired_bitrate,
                 target_fps,
                 input_mode,
+                &mut opening,
             ) {
                 Ok(state) => {
                     info!(
@@ -598,6 +609,7 @@ impl EncoderState {
         bitrate_bps: u32,
         target_fps: u32,
         input_mode: EncoderInput,
+        progress: &mut dyn FnMut(),
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
@@ -645,12 +657,16 @@ impl EncoderState {
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
-        let opts = encoder_options(encoder_name);
-
-        let encoder = encoder.open_with(opts).map_err(|error| {
-            let code: i32 = error.into();
-            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
-        })?;
+        let encoder = match open_encoder(encoder, encoder_name, progress) {
+            Ok(Ok(encoder)) => encoder,
+            Ok(Err(error)) => {
+                let code: i32 = error.into();
+                return Err(format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
+            }
+            Err(stall) => {
+                return Err(format!("{encoder_name} open failed: {stall}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
+            }
+        };
         log_encoder_configuration(encoder_name, &encoder);
         info!(
             width,
@@ -794,6 +810,52 @@ impl InFlightFrames {
         }
         None
     }
+}
+
+type OpenResult = Result<
+    Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>,
+    crate::stall::Stall,
+>;
+
+/// Open `encoder` with its options. An encoder that opens under FFmpeg's
+/// process-wide lock opens under its time limit (see [`crate::stall`]); one
+/// that returns after it is closed on the call's thread.
+fn open_encoder(
+    encoder: ffmpeg_next::codec::encoder::video::Video,
+    encoder_name: &str,
+    progress: &mut dyn FnMut(),
+) -> OpenResult {
+    open_encoder_on(crate::stall::lanes(), encoder, encoder_name, progress)
+}
+
+fn open_encoder_on(
+    lanes: &'static crate::stall::Lanes,
+    encoder: ffmpeg_next::codec::encoder::video::Video,
+    encoder_name: &str,
+    progress: &mut dyn FnMut(),
+) -> OpenResult {
+    if !takes_codec_lock(encoder_name) {
+        return Ok(encoder.open_with(encoder_options(encoder_name)));
+    }
+    let name = encoder_name.to_string();
+    crate::stall::run_on(
+        lanes,
+        crate::stall::Call::EncoderOpen,
+        move || encoder.open_with(encoder_options(&name)),
+        progress,
+    )
+}
+
+/// Encoders FFmpeg 7.1 opens under its one process-wide lock
+/// (FF_CODEC_CAP_NOT_INIT_THREADSAFE): the NVENC, AMF and QSV hardware
+/// encoders, which wait on a graphics driver, and libx265. While one of them
+/// is stuck holding the lock, any other would block behind it, so they share
+/// one time-limited lane. libx264 and VideoToolbox do not take the lock.
+fn takes_codec_lock(encoder_name: &str) -> bool {
+    encoder_name == "libx265"
+        || ["_nvenc", "_amf", "_qsv"]
+            .iter()
+            .any(|suffix| encoder_name.ends_with(suffix))
 }
 
 fn open_remaining_encoders<T>(
@@ -1493,8 +1555,18 @@ mod tests {
         // A fixed cadence, like the synthetic source, so both sessions use
         // the same PTS values.
         let at = |n: u64| start + std::time::Duration::from_micros(n * 1_000_000 / 60);
-        let open =
-            || EncoderState::new("libx264", 640, 360, 8_000_000, 60, EncoderInput::Yuv420).unwrap();
+        let open = || {
+            EncoderState::new(
+                "libx264",
+                640,
+                360,
+                8_000_000,
+                60,
+                EncoderInput::Yuv420,
+                &mut || {},
+            )
+            .unwrap()
+        };
         // Sends frames through the encode loop's calls. With `hold_last`,
         // the last frame's packet is never collected, as when NVENC still
         // holds a viewer's last frame at a reopen.
@@ -1610,9 +1682,15 @@ mod tests {
         let start = Instant::now();
         let mut tested = Vec::new();
         for name in ["h264_nvenc", "h264_qsv", "libx264"] {
-            let Ok(mut state) =
-                EncoderState::new(name, 1280, 720, 8_000_000, 60, EncoderInput::Yuv420)
-            else {
+            let Ok(mut state) = EncoderState::new(
+                name,
+                1280,
+                720,
+                8_000_000,
+                60,
+                EncoderInput::Yuv420,
+                &mut || {},
+            ) else {
                 continue;
             };
             tested.push(name);
@@ -1681,6 +1759,138 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_hardware_open_falls_through_to_software_without_waiting_again() {
+        use crate::stall::{run_in, Call, Lanes, Stall, Wait};
+        use std::time::Duration;
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        // A clock 100 ms on per read: the 6 s limit passes in 60 reads.
+        let clock = || {
+            let start = Instant::now();
+            let reads = std::sync::atomic::AtomicU64::new(0);
+            move || start + Duration::from_millis(100 * reads.fetch_add(1, Ordering::SeqCst))
+        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut stuck = Some(move || {
+            let _ = released.recv();
+        });
+        let mut open = |name: &str| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if !takes_codec_lock(name) {
+                return Ok(());
+            }
+            let wait = Wait {
+                limits: Call::EncoderOpen.limits(),
+                slice: Duration::from_millis(1),
+                now: clock(),
+            };
+            // Only the first open hangs; any other would return at once.
+            let call = stuck.take();
+            run_in(
+                lanes,
+                Call::EncoderOpen,
+                wait,
+                move || {
+                    if let Some(call) = call {
+                        call();
+                    }
+                },
+                || {},
+                crate::stall::no_hooks(),
+            )
+            .map_err(|stall: Stall| stall.to_string().into())
+        };
+        // NVENC hangs and is given up on at its limit.
+        let error = open("h264_nvenc").unwrap_err().to_string();
+        assert!(
+            error.contains("encoder_open did not return within"),
+            "{error}"
+        );
+        // AMF and QSV open under FFmpeg's lock that NVENC still holds: they
+        // are refused at once, and x264 opens.
+        let started = Instant::now();
+        let mut attempts = Vec::new();
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+            attempts.push(name.to_string());
+            open(name)
+        })
+        .unwrap();
+        assert_eq!(attempts, ["h264_amf", "h264_qsv", "libx264"]);
+        assert_eq!(selected, "libx264");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn hevc_software_does_not_block_behind_a_stuck_hardware_open() {
+        use crate::stall::{no_hooks, run_in, Call, Lanes, Stall, Wait};
+        use std::time::Duration;
+        for name in ["h264_nvenc", "hevc_amf", "h264_qsv", "libx265"] {
+            assert!(takes_codec_lock(name), "{name}");
+        }
+        for name in ["libx264", "h264_videotoolbox", "hevc_videotoolbox"] {
+            assert!(!takes_codec_lock(name), "{name}");
+        }
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        // An NVENC open is stuck holding FFmpeg's lock.
+        let start = Instant::now();
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stuck = run_in(
+            lanes,
+            Call::EncoderOpen,
+            Wait {
+                limits: Call::EncoderOpen.limits(),
+                slice: Duration::from_millis(1),
+                now: move || {
+                    start + Duration::from_millis(100 * reads.fetch_add(1, Ordering::SeqCst))
+                },
+            },
+            move || {
+                let _ = released.recv();
+            },
+            || {},
+            no_hooks(),
+        );
+        assert!(matches!(stuck, Err(Stall::TimedOut { .. })));
+        let context = |name: &str| {
+            let codec = ffmpeg_next::encoder::find_by_name(name)?;
+            let mut video = ffmpeg_next::codec::Context::new_with_codec(codec)
+                .encoder()
+                .video()
+                .ok()?;
+            video.set_width(64);
+            video.set_height(64);
+            video.set_format(ffmpeg_next::format::Pixel::YUV420P);
+            video.set_time_base(ffmpeg_next::Rational(1, 60));
+            Some(video)
+        };
+        // A reconnect asks for HEVC again: libx265 is refused at once
+        // instead of waiting on the lock with no limit, and the encode loop
+        // stays on H.264.
+        if let Some(video) = context("libx265") {
+            let started = Instant::now();
+            let opened = open_encoder_on(lanes, video, "libx265", &mut || {});
+            assert!(
+                matches!(
+                    opened,
+                    Err(Stall::Refused {
+                        call: Call::EncoderOpen
+                    })
+                ),
+                "{:?}",
+                opened.map(|r| r.map(|_| ()))
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        // libx264 opens meanwhile.
+        let video = context("libx264").expect("libx264 is in every build");
+        assert!(matches!(
+            open_encoder_on(lanes, video, "libx264", &mut || {}),
+            Ok(Ok(_))
+        ));
+        let _ = release.send(());
+    }
+
+    #[test]
     fn startup_uses_software_only_after_all_other_hardware_fails() {
         for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
             let mut attempts = Vec::new();
@@ -1719,8 +1929,16 @@ mod tests {
     #[test]
     fn software_bitrate_changes_preserve_decoding_and_reduce_packet_size() {
         ffmpeg_next::init().unwrap();
-        let mut state =
-            EncoderState::new("libx264", 640, 360, 8_000_000, 60, EncoderInput::Yuv420).unwrap();
+        let mut state = EncoderState::new(
+            "libx264",
+            640,
+            360,
+            8_000_000,
+            60,
+            EncoderInput::Yuv420,
+            &mut || {},
+        )
+        .unwrap();
         let context = unsafe { state.encoder.as_ptr() };
         let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
         let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
@@ -1884,5 +2102,61 @@ mod tests {
             let hevc = hevc_variant_of(h264).unwrap();
             assert!(is_hevc_encoder(hevc), "{hevc} must register as HEVC");
         }
+    }
+
+    /// Native, on a PC with NVENC: a real NVENC open held past its limit.
+    /// The encoder falls through to software at once, the late NVENC session
+    /// is closed on its own thread, and NVENC opens again afterwards.
+    /// `cargo test -p eternal-host --lib a_real_nvenc_open -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native: needs an NVIDIA GPU"]
+    fn a_real_nvenc_open_that_stalls_recovers_through_software() {
+        use std::time::Duration;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        std::env::set_var("ETERNAL_SIMULATE_STALL", "d3d11_create_device,encoder_open");
+        let open = |name: &str| {
+            EncoderState::new(
+                name,
+                1280,
+                720,
+                8_000_000,
+                60,
+                EncoderInput::Yuv420,
+                &mut || {},
+            )
+        };
+        let started = Instant::now();
+        let error = open("h264_nvenc")
+            .err()
+            .expect("the held open returned")
+            .to_string();
+        let waited = started.elapsed();
+        assert!(
+            error.contains("encoder_open did not return within"),
+            "{error}"
+        );
+        assert!(
+            waited >= Duration::from_secs(6) && waited < Duration::from_secs(8),
+            "{waited:?}"
+        );
+        let started = Instant::now();
+        let (selected, _state) = open_remaining_encoders("h264_nvenc", open).unwrap();
+        assert_eq!(selected, "libx264");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // The held NVENC open finishes 12 s after it began and is closed.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while crate::stall::abandoned(crate::stall::Call::EncoderOpen) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the late NVENC session was not released"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(open("h264_nvenc").is_ok(), "NVENC did not open again");
     }
 }

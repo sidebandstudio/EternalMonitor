@@ -624,6 +624,7 @@ fn simulate_problem(
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "graphics-driver-stuck" => *block = Some(CaptureBlock::DriverNotResponding),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -784,6 +785,11 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::DriverNotResponding => (
+            Icon::Warning,
+            "The graphics driver isn't responding",
+            "The iPad keeps the last picture, and EternalMonitor waits for the driver. The picture comes back by itself when it responds. If it doesn't, restart the PC.",
         ),
     })
 }

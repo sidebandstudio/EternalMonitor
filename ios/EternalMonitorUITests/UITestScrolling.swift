@@ -17,7 +17,7 @@ extension XCUIApplication {
             if element.exists && Self.settled(element, timeout: 3) { return true }
             let list = collectionViews.allElementsBoundByIndex.last(where: { $0.isHittable }) ?? self
             let frame = list.frame
-            let back = element.exists && element.frame.midY < frame.minY
+            let back = Self.frame(of: element).map { $0.midY < frame.minY } ?? false
             let start = list.coordinate(withNormalizedOffset: .zero)
                 .withOffset(CGVector(dx: 6, dy: frame.height * (back ? 0.35 : 0.65)))
             start.press(forDuration: 0.05,
@@ -27,14 +27,26 @@ extension XCUIApplication {
         return element.exists && Self.settled(element)
     }
 
+    /// Where `element` is, or `nil` while it is gone. A row can leave the
+    /// list between two reads (in a review run the diagnostics row did, a
+    /// second after the list stopped), and reading `frame` of an element
+    /// that is gone fails the test; a snapshot reports it instead.
+    private static func frame(of element: XCUIElement) -> CGRect? {
+        (try? element.snapshot())?.frame
+    }
+
     /// Whether `element` keeps the same frame across two polls and can be
-    /// tapped, within `timeout`.
+    /// tapped, within `timeout`. A row that briefly leaves the list is waited
+    /// for, not swiped past.
     private static func settled(_ element: XCUIElement, timeout: TimeInterval = 5) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var last: CGRect?
         while Date() < deadline {
-            guard element.exists else { return false }
-            let frame = element.frame
+            guard let frame = frame(of: element) else {
+                last = nil
+                Thread.sleep(forTimeInterval: 0.15)
+                continue
+            }
             if frame == last && element.isHittable { return true }
             last = frame
             Thread.sleep(forTimeInterval: 0.15)
