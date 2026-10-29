@@ -6,8 +6,8 @@
 //! `BaseLink` is the video path of `transport/link.rs` on
 //! release/0.3.4-candidate before #118, copied as it was. The schedules carry
 //! only video, so its control and audio paths, which never ran, are left out.
-//! Both links run on the paused tokio clock through the same tunnel model as
-//! `usb_link_sim.rs`.
+//! Both links run on the paused tokio clock through the tunnel model of
+//! `usb_link_sim.rs`, which here also stands still at times, as usbmuxd does.
 
 use std::collections::VecDeque;
 use std::io;
@@ -185,6 +185,10 @@ mod base {
         pub fn frames_dropped(&self) -> u64 {
             self.state.frames_dropped.load(Ordering::Relaxed)
         }
+
+        pub fn take_keyframe_request(&self) -> bool {
+            self.state.force_idr.swap(false, Ordering::SeqCst)
+        }
     }
 
     impl Drop for BaseLink {
@@ -242,7 +246,13 @@ struct Schedule {
     bytes_per_sec: f64,
     /// The tunnel's socket buffering, between the link's writer and the iPad.
     buffer: usize,
+    /// When the tunnel stands still and for how long, in µs: sorted and
+    /// apart.
+    pauses: Vec<(u64, u64)>,
     frames: Vec<Arrival>,
+    /// The size of a keyframe the link asks for. The encoder makes the next
+    /// frame one, as the pipeline does.
+    requested_keyframe: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -251,6 +261,8 @@ struct Run {
     delivered: Vec<u32>,
     dropped: u64,
     congestion_drops: u64,
+    /// Frames that became keyframes because the link asked for one.
+    requested: u64,
 }
 
 fn datagrams(seq: u32, arrival: Arrival) -> Vec<Vec<u8>> {
@@ -285,8 +297,9 @@ enum Sender {
 async fn run(schedule: &Schedule, head: bool) -> Run {
     let (host, mut ipad) = tokio::io::duplex(schedule.buffer);
     let peer = PeerId::usb(9);
+    let force_idr = Arc::new(AtomicBool::new(false));
     let sender = if head {
-        let link = FramedLink::connect(host, peer, Arc::new(AtomicBool::new(false)))
+        let link = FramedLink::connect(host, peer, Arc::clone(&force_idr))
             .await
             .unwrap();
         read_preamble(&mut ipad).await.unwrap();
@@ -297,8 +310,15 @@ async fn run(schedule: &Schedule, head: bool) -> Run {
     let start = Instant::now();
 
     // The tunnel model of `usb_link_sim.rs`: a fixed drain rate whose clock
-    // restarts only after the tunnel sat idle.
+    // restarts only after the tunnel sat idle. While it stands still it
+    // drains nothing, and the link's writes block once its buffer is full.
     let bytes_per_sec = schedule.bytes_per_sec;
+    let at = move |us: u64| start + Duration::from_micros(us);
+    let mut pauses = schedule
+        .pauses
+        .iter()
+        .map(|&(from, len)| (at(from), at(from + len)))
+        .collect::<VecDeque<_>>();
     let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let tunnel = tokio::spawn(async move {
         let mut drained_until = start;
@@ -310,7 +330,26 @@ async fn run(schedule: &Schedule, head: bool) -> Run {
             if Instant::now() > waiting_since {
                 drained_until = drained_until.max(Instant::now());
             }
+            // A datagram starts to drain after a stand-still it meets, and
+            // one that begins while it drains holds it up for its length.
+            while let Some(&(from, until)) = pauses.front() {
+                if until <= drained_until {
+                    pauses.pop_front();
+                } else if from <= drained_until {
+                    drained_until = until;
+                    pauses.pop_front();
+                } else {
+                    break;
+                }
+            }
             drained_until += Duration::from_secs_f64((bytes.len() + 2) as f64 / bytes_per_sec);
+            while let Some(&(from, until)) = pauses.front() {
+                if from >= drained_until {
+                    break;
+                }
+                drained_until += until - from;
+                pauses.pop_front();
+            }
             tokio::time::sleep_until(drained_until).await;
             if arrived.send(bytes).is_err() {
                 return;
@@ -318,9 +357,23 @@ async fn run(schedule: &Schedule, head: bool) -> Run {
         }
     });
 
-    let mut total = 0;
+    let (mut total, mut requested) = (0, 0);
     for (index, &arrival) in schedule.frames.iter().enumerate() {
         tokio::time::sleep_until(start + Duration::from_micros(arrival.at_us)).await;
+        let asked = match &sender {
+            Sender::Head(_) => force_idr.swap(false, Ordering::SeqCst),
+            Sender::Base(link) => link.take_keyframe_request(),
+        };
+        let arrival = if asked && !arrival.keyframe {
+            requested += 1;
+            Arrival {
+                bytes: schedule.requested_keyframe,
+                keyframe: true,
+                ..arrival
+            }
+        } else {
+            arrival
+        };
         for datagram in datagrams(index as u32 + 1, arrival) {
             total += datagram.len() + 2;
             match &sender {
@@ -330,6 +383,9 @@ async fn run(schedule: &Schedule, head: bool) -> Run {
         }
     }
     // Everything still queued drains, with time to spare.
+    if let Some(&(from, len)) = schedule.pauses.last() {
+        tokio::time::sleep_until(at(from + len)).await;
+    }
     tokio::time::sleep(Duration::from_secs_f64(total as f64 / bytes_per_sec) * 2).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let (dropped, congestion_drops) = match &sender {
@@ -365,6 +421,7 @@ async fn run(schedule: &Schedule, head: bool) -> Run {
         delivered,
         dropped,
         congestion_drops,
+        requested,
     }
 }
 
@@ -414,7 +471,7 @@ fn schedule(rng: &mut Rng) -> Schedule {
     let large_delta = rng.unit() * 0.3;
     let count = 3 + rng.below(28) as usize;
     let mut at_us = 0;
-    let frames = (0..count)
+    let frames: Vec<Arrival> = (0..count)
         .map(|index| {
             if index > 0 {
                 let gap = rng.unit();
@@ -444,49 +501,179 @@ fn schedule(rng: &mut Rng) -> Schedule {
     Schedule {
         bytes_per_sec,
         buffer,
+        pauses: stand_stills(rng, &frames),
         frames,
+        requested_keyframe: keyframe_bytes as usize,
     }
 }
 
-/// Wherever the base queue loses nothing, the new one loses nothing, counts
-/// no congestion, and delivers the same frames in the same order.
-/// `EM_LINK_SCHEDULES` runs more schedules from the same seed.
-#[tokio::test(start_paused = true)]
-async fn the_queue_never_loses_a_frame_the_base_queue_delivered() {
-    let schedules = std::env::var("EM_LINK_SCHEDULES")
-        .ok()
-        .and_then(|count| count.parse().ok())
-        .unwrap_or(4_000u64);
-    let mut rng = Rng(0x0E7E_5A1D_0118_0034);
-    let (mut clean, mut base_lost, mut head_lost_more) = (0u64, 0u64, 0u64);
-    for case in 0..schedules {
-        let schedule = schedule(&mut rng);
+/// Stand-stills of 50–500 ms in half the schedules. Half of them begin just
+/// as a frame arrives, often one that a still desktop leaves alone for a
+/// while; the rest anywhere in the schedule.
+fn stand_stills(rng: &mut Rng, frames: &[Arrival]) -> Vec<(u64, u64)> {
+    if rng.unit() < 0.5 {
+        return Vec::new();
+    }
+    let sparse: Vec<&Arrival> = frames
+        .iter()
+        .zip(frames.iter().skip(1).map(Some).chain([None]))
+        .filter(|(frame, next)| next.is_none_or(|next| next.at_us - frame.at_us >= 50_000))
+        .map(|(frame, _)| frame)
+        .collect();
+    let end = frames.last().map_or(0, |last| last.at_us) + 200_000;
+    let mut pauses: Vec<(u64, u64)> = (0..1 + rng.below(3))
+        .map(|_| {
+            let from = if rng.unit() < 0.5 {
+                rng.below(end)
+            } else {
+                let frame = if rng.unit() < 0.5 {
+                    sparse[rng.below(sparse.len() as u64) as usize]
+                } else {
+                    &frames[rng.below(frames.len() as u64) as usize]
+                };
+                frame.at_us + rng.below(20_000)
+            };
+            (from, rng.log_uniform(50_000.0, 500_000.0) as u64)
+        })
+        .collect();
+    pauses.sort_unstable();
+    let mut apart: Vec<(u64, u64)> = Vec::new();
+    for (from, len) in pauses {
+        match apart.last_mut() {
+            Some((last, last_len)) if from <= *last + *last_len => {
+                *last_len = (*last_len).max(from + len - *last);
+            }
+            _ => apart.push((from, len)),
+        }
+    }
+    apart
+}
+
+/// Encoder output as the field sees it: 30, 60 or 120 fps within ±15%,
+/// 10–20 Mbps of deltas, 100–300 KB keyframes every 0.5–2 s, and others in
+/// between that the iPad or the link asked for, into a 1–3 MB/s tunnel that
+/// also stands still.
+fn realistic(rng: &mut Rng) -> Schedule {
+    let fps = [30.0, 60.0, 120.0][rng.below(3) as usize];
+    let interval = 1_000_000.0 / fps;
+    let delta_bytes = rng.log_uniform(10_000_000.0, 20_000_000.0) / 8.0 / fps;
+    let keyframe_every = rng.log_uniform(500_000.0, 2_000_000.0) as u64;
+    let keyframe_bytes = rng.log_uniform(100_000.0, MAX_FRAME as f64);
+    let requested = rng.unit() * 0.03;
+    let count = 60 + rng.below(181) as usize;
+    let (mut at_us, mut next_keyframe) = (0, 0);
+    let frames: Vec<Arrival> = (0..count)
+        .map(|index| {
+            if index > 0 {
+                at_us += (interval * (0.85 + 0.3 * rng.unit())) as u64;
+            }
+            let keyframe = at_us >= next_keyframe || rng.unit() < requested;
+            if keyframe {
+                next_keyframe = at_us + keyframe_every;
+            }
+            let bytes = if keyframe {
+                (keyframe_bytes * (0.85 + 0.3 * rng.unit())).clamp(100_000.0, MAX_FRAME as f64)
+            } else {
+                delta_bytes * (0.5 + rng.unit())
+            };
+            Arrival {
+                at_us,
+                bytes: (bytes as usize).clamp(MIN_FRAME, MAX_FRAME),
+                keyframe,
+            }
+        })
+        .collect();
+    Schedule {
+        bytes_per_sec: rng.log_uniform(1_000_000.0, 3_000_000.0),
+        buffer: [4096, 16 * 1024, 64 * 1024][rng.below(3) as usize],
+        pauses: stand_stills(rng, &frames),
+        frames,
+        requested_keyframe: keyframe_bytes as usize,
+    }
+}
+
+/// Runs `count` schedules from `generator` through both links. Wherever the
+/// base queue loses nothing, the new one loses nothing, counts no congestion,
+/// and delivers the same frames in the same order. Returns how many
+/// schedules the base queue ran clean.
+async fn differential(
+    label: &str,
+    seed: u64,
+    count: u64,
+    generator: fn(&mut Rng) -> Schedule,
+) -> u64 {
+    let mut rng = Rng(seed);
+    let (mut clean, mut base_lost, mut head_lost_more, mut head_delivered_less) = (0, 0, 0, 0);
+    let (mut paused, mut base_frames, mut head_frames) = (0, 0, 0);
+    for case in 0..count {
+        let schedule = generator(&mut rng);
+        paused += u64::from(!schedule.pauses.is_empty());
         let base = run(&schedule, false).await;
         let head = run(&schedule, true).await;
+        base_frames += base.delivered.len();
+        head_frames += head.delivered.len();
         if base.dropped > 0 {
             base_lost += 1;
             head_lost_more += u64::from(head.dropped > base.dropped);
+            head_delivered_less += u64::from(head.delivered.len() < base.delivered.len());
             continue;
         }
         clean += 1;
         let every_frame: Vec<u32> = (1..=schedule.frames.len() as u32).collect();
-        assert_eq!(base.delivered, every_frame, "case {case}: {schedule:?}");
+        assert_eq!(
+            base.delivered, every_frame,
+            "{label} case {case}: {schedule:?}"
+        );
         assert_eq!(
             head,
             Run {
                 delivered: every_frame,
                 dropped: 0,
                 congestion_drops: 0,
+                requested: 0,
             },
-            "case {case}: {schedule:?}"
+            "{label} case {case}: {schedule:?}"
         );
     }
     eprintln!(
-        "LINK_DIFF schedules={schedules} base_clean={clean} base_lost={base_lost} \
-         head_lost_more_than_base={head_lost_more}"
+        "LINK_DIFF {label} schedules={count} with_stand_stills={paused} base_clean={clean} \
+         base_lost={base_lost} head_lost_more_than_base={head_lost_more} \
+         head_delivered_fewer_than_base={head_delivered_less} \
+         frames_delivered base={base_frames} head={head_frames}"
     );
+    clean
+}
+
+fn schedules(variable: &str, default: u64) -> u64 {
+    std::env::var(variable)
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Schedules that stress the queue's rules: bursts, still-desktop gaps,
+/// keyframes and large deltas, in proportions that vary by schedule.
+/// `EM_LINK_SCHEDULES` runs more from the same seed.
+#[tokio::test(start_paused = true)]
+async fn the_queue_never_loses_a_frame_the_base_queue_delivered() {
+    let count = schedules("EM_LINK_SCHEDULES", 4_000);
+    let clean = differential("stress", 0x0E7E_5A1D_0118_0034, count, schedule).await;
     assert!(
-        clean * 4 >= schedules,
+        clean * 4 >= count,
+        "too few schedules test anything: {clean}"
+    );
+}
+
+/// Streams as the field sends them, through tunnels that carry them or
+/// almost do. The base queue overflows behind most keyframes this size, so
+/// only about one schedule in seventeen tests anything.
+/// `EM_LINK_REALISTIC_SCHEDULES` runs more from the same seed.
+#[tokio::test(start_paused = true)]
+async fn realistic_streams_never_lose_a_frame_the_base_queue_delivered() {
+    let count = schedules("EM_LINK_REALISTIC_SCHEDULES", 400);
+    let clean = differential("realistic", 0x0E7E_5A1D_0118_0035, count, realistic).await;
+    assert!(
+        clean * 25 >= count,
         "too few schedules test anything: {clean}"
     );
 }
@@ -506,6 +693,8 @@ async fn bursty_arrivals_on_a_healthy_link_keep_every_frame() {
     let schedule = Schedule {
         bytes_per_sec: 1_000_000.0,
         buffer: 4096,
+        pauses: Vec::new(),
+        requested_keyframe: 60_000,
         frames: vec![
             frame(0, 6_000, true),
             frame(65, 120_000, false),
@@ -517,7 +706,57 @@ async fn bursty_arrivals_on_a_healthy_link_keep_every_frame() {
         delivered: vec![1, 2, 3, 4],
         dropped: 0,
         congestion_drops: 0,
+        requested: 0,
     };
     assert_eq!(run(&schedule, false).await, expected, "base");
     assert_eq!(run(&schedule, true).await, expected);
+}
+
+/// Round 3's reproduction. Keyframe 1, 11 KB, is being written through a
+/// 4 KB buffer when the tunnel stands still at 1 ms; keyframe 2, 3 KB,
+/// arrives during or before the stand-still. Both still go out. Dropping
+/// everything after a write that had stood still for 100 ms threw away
+/// keyframe 2, which needed nothing, with the rest of keyframe 1, and a
+/// still desktop had nothing newer to send.
+async fn stand_still(pause_ms: u64, keyframe_at_ms: u64) {
+    let frame = |at_ms: u64, bytes| Arrival {
+        at_us: at_ms * 1000,
+        bytes,
+        keyframe: true,
+    };
+    let schedule = Schedule {
+        bytes_per_sec: 1_000_000.0,
+        buffer: 4096,
+        pauses: vec![(1_000, pause_ms * 1000)],
+        requested_keyframe: 11_000,
+        frames: vec![frame(0, 11_000), frame(keyframe_at_ms, 3_000)],
+    };
+    let expected = Run {
+        delivered: vec![1, 2],
+        dropped: 0,
+        congestion_drops: 0,
+        requested: 0,
+    };
+    assert_eq!(run(&schedule, false).await, expected, "base");
+    assert_eq!(run(&schedule, true).await, expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_150_ms_stand_still_keeps_the_keyframe_that_arrived_at_120_ms() {
+    stand_still(150, 120).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_300_ms_stand_still_keeps_the_keyframe_that_arrived_at_250_ms() {
+    stand_still(300, 250).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_300_ms_stand_still_keeps_the_keyframe_that_arrived_at_50_ms() {
+    stand_still(300, 50).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_90_ms_stand_still_keeps_the_keyframe_that_arrived_at_50_ms() {
+    stand_still(90, 50).await;
 }

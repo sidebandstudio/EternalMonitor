@@ -29,9 +29,6 @@ const KEYFRAME_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const KEYFRAME_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// This long without a lost frame, and the next request is immediate again.
 const KEYFRAME_BACKOFF_RESET: Duration = Duration::from_secs(5);
-/// A write that waited this long means the tunnel stood still, not that it
-/// is slow: a datagram drains in milliseconds even through a slow usbmuxd.
-const STALL: Duration = Duration::from_millis(100);
 const CONTROL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -176,8 +173,6 @@ struct VideoQueue {
     keyframes: KeyframeBackoff,
     /// The session and stream epoch of the latest frame.
     stream: Option<(u32, u32)>,
-    /// When the writer started the write it is waiting in, if any.
-    writing_since: Option<Instant>,
 }
 
 impl VideoQueue {
@@ -187,11 +182,12 @@ impl VideoQueue {
     /// iPad partial keyframes, each of which asked for another keyframe, the
     /// biggest frame of all. Dependents of a lost frame are discarded until a
     /// keyframe, and a keyframe always passes. It replaces what is still
-    /// queued only when the keyframe might not fit behind it or the tunnel
-    /// stands still, and those frames count as lost. Neither how long a frame
-    /// waited nor how often frames arrive says the tunnel is behind: one
-    /// large frame can take a second to write through a slow cable that still
-    /// moves, and the frames queued behind it still decode.
+    /// queued only when it cannot fit behind it, and those frames count as
+    /// lost. Neither how long a frame waited, how often frames arrive, nor
+    /// how long a write has stood still says the tunnel is behind: one large
+    /// frame can take a second to write through a slow cable that still
+    /// moves, a still desktop can leave a paused tunnel nothing newer to
+    /// send, and the frames queued behind either still decode.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
@@ -217,14 +213,9 @@ impl VideoQueue {
             if header.is_keyframe {
                 // Queued frames are older and the keyframe needs none of them,
                 // but they still decode. They are replaced only when the
-                // keyframe might not fit behind them or the write in progress
-                // has stood still.
-                let fits = self.frames.len() < FRAME_LIMIT
-                    && self.bytes + usize::from(header.frag_count) * MAX_DGRAM_SIZE <= BYTE_LIMIT;
-                let stalled = self
-                    .writing_since
-                    .is_some_and(|at| now.saturating_duration_since(at) >= STALL);
-                if !fits || stalled {
+                // keyframe cannot fit behind them: here when no frame fits,
+                // and below when its bytes do not.
+                if self.frames.len() >= FRAME_LIMIT {
                     dropped = self.frames.len() as u64;
                     self.frames.clear();
                     self.bytes = 0;
@@ -246,7 +237,7 @@ impl VideoQueue {
                 bytes: 0,
             });
         }
-        let Some(frame) = self.frames.back_mut() else {
+        let Some(frame) = self.frames.back() else {
             return Err(invalid("missing first fragment"));
         };
         if (frame.epoch, frame.seq) != key
@@ -255,6 +246,15 @@ impl VideoQueue {
         {
             return Err(invalid("video fragment order"));
         }
+        if header.is_keyframe && self.bytes + bytes.len() > BYTE_LIMIT {
+            // Only the newest frame can be partial, so all before it are
+            // older and complete.
+            let keyframe = self.frames.pop_back().unwrap();
+            dropped += self.frames.len() as u64;
+            self.frames.clear();
+            self.bytes = keyframe.bytes;
+            self.frames.push_back(keyframe);
+        }
         if self.bytes + bytes.len() > BYTE_LIMIT {
             // Only the newest frame can be partial; the others stay.
             let frame = self.frames.pop_back().unwrap();
@@ -262,6 +262,7 @@ impl VideoQueue {
             self.lose(key, now);
             return Ok(dropped + 1);
         }
+        let frame = self.frames.back_mut().unwrap();
         frame.bytes += bytes.len();
         frame.datagrams.push(bytes.to_vec());
         self.bytes += bytes.len();
@@ -272,22 +273,6 @@ impl VideoQueue {
         self.discarded = Some(key);
         self.awaiting_keyframe = true;
         self.keyframes.lost(now);
-    }
-
-    /// The tunnel stood still, so everything queued is stale. Returns frames
-    /// dropped. A fresh keyframe is requested at once: a stall is not a slow
-    /// link, and a keyframe requested during it would be stale too.
-    fn stalled(&mut self, now: Instant) -> u64 {
-        let dropped = self.frames.len() as u64;
-        if let Some(frame) = self.frames.back().filter(|frame| !frame.complete()) {
-            self.discarded = Some((frame.epoch, frame.seq));
-        }
-        self.frames.clear();
-        self.bytes = 0;
-        self.awaiting_keyframe = true;
-        self.keyframes = KeyframeBackoff::default();
-        self.keyframes.lost(now);
-        dropped
     }
 
     fn pop(&mut self) -> Option<Frame> {
@@ -438,28 +423,6 @@ impl WriterState {
         if control {
             self.controls_written.send_modify(|written| *written += 1);
         }
-    }
-
-    /// Starts a write, so that a keyframe arriving meanwhile can see a
-    /// tunnel that stands still.
-    fn start_write(&self) -> Instant {
-        let now = Instant::now();
-        self.queue.lock().video.writing_since = Some(now);
-        now
-    }
-
-    /// After a write that started at `started`: whether the tunnel stood
-    /// still, in which case queued video and `in_flight` frames are dropped.
-    fn check_stall(&self, started: Instant, in_flight: u64) -> bool {
-        let now = Instant::now();
-        let mut queue = self.queue.lock();
-        queue.video.writing_since = None;
-        if now.saturating_duration_since(started) < STALL {
-            return false;
-        }
-        let dropped = queue.video.stalled(now) + in_flight;
-        self.record_drops(&mut queue.video, dropped, now);
-        true
     }
 
     fn record_drops(&self, video: &mut VideoQueue, dropped: u64, now: Instant) {
@@ -695,41 +658,30 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             None => (None, state.queue.lock().video.pop()),
         };
         if let Some((packet, control)) = priority {
-            let started = state.start_write();
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
                 sent = write_datagram(&mut writer, &packet) => sent?,
             }
             state.wrote(control);
-            state.check_stall(started, 0);
         } else if let Some(frame) = frame {
             // A frame that has started is finished: the iPad cannot use part
             // of one, and over a lossless tunnel would count the rest as lost.
-            // Only after a stall is the rest stale and abandoned.
-            let count = frame.datagrams.len();
-            for (index, packet) in frame.datagrams.into_iter().enumerate() {
-                let started = state.start_write();
+            for packet in frame.datagrams {
                 tokio::select! {
                     biased;
                     _ = closed.changed() => return Ok(()),
                     sent = write_datagram(&mut writer, &packet) => sent?,
                 }
-                let mut stalled = state.check_stall(started, u64::from(index + 1 < count));
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
                 while let Some((priority, control)) = state.take_priority() {
-                    let started = state.start_write();
                     tokio::select! {
                         biased;
                         _ = closed.changed() => return Ok(()),
                         sent = write_datagram(&mut writer, &priority) => sent?,
                     }
                     state.wrote(control);
-                    stalled |= state.check_stall(started, u64::from(!stalled && index + 1 < count));
-                }
-                if stalled {
-                    break;
                 }
             }
         } else {
@@ -838,7 +790,10 @@ mod tests {
         // A keyframe goes out after the frames still queued.
         assert_eq!(
             queue
-                .push(&packet(next + 2, true, 0, 1, 64), now + STALL)
+                .push(
+                    &packet(next + 2, true, 0, 1, 64),
+                    now + Duration::from_secs(1)
+                )
                 .unwrap(),
             0
         );
@@ -879,10 +834,11 @@ mod tests {
         bytes
     }
 
-    /// A keyframe that might be cut short by the queue's bounds replaces
-    /// what is queued, however briefly it waited.
+    /// A keyframe that would be cut short by the queue's bounds replaces
+    /// what is queued, however briefly it waited. Its own bytes decide, not
+    /// its fragment count.
     #[test]
-    fn a_keyframe_replaces_queued_frames_it_might_not_fit_behind() {
+    fn a_keyframe_replaces_queued_frames_it_does_not_fit_behind() {
         let now = Instant::now();
         let mut queue = VideoQueue::default();
         queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
@@ -897,16 +853,40 @@ mod tests {
             "no room for another frame"
         );
         assert_eq!(queue.pop().unwrap().seq, next);
+        // Full datagrams, but for a short last one, that just fit beside a
+        // small frame, although their count times a full datagram does not.
+        let full = BYTE_LIMIT / MAX_DGRAM_SIZE;
+        let keyframe = |queue: &mut VideoQueue, seq, last| {
+            let count = full as u16 + 1;
+            let mut dropped = 0;
+            for index in 0..count {
+                let size = if index + 1 == count {
+                    last
+                } else {
+                    MAX_DGRAM_SIZE
+                };
+                dropped += queue
+                    .push(&packet(seq, true, index, count, size), now)
+                    .unwrap();
+            }
+            dropped
+        };
         queue.push(&packet(next + 1, false, 0, 1, 64), now).unwrap();
-        let count = (BYTE_LIMIT / MAX_DGRAM_SIZE) as u16 + 1;
+        let room = BYTE_LIMIT - full * MAX_DGRAM_SIZE - 64;
+        assert_eq!(keyframe(&mut queue, next + 2, room), 0, "it fits");
+        assert_eq!(queue.frames.len(), 2);
+        assert_eq!(queue.bytes, BYTE_LIMIT);
+        assert_eq!(queue.pop().unwrap().seq, next + 1);
+        assert_eq!(queue.pop().unwrap().seq, next + 2);
+        queue.push(&packet(next + 3, false, 0, 1, 64), now).unwrap();
         assert_eq!(
-            queue
-                .push(&packet(next + 2, true, 0, count, 64), now)
-                .unwrap(),
+            keyframe(&mut queue, next + 4, room + 1),
             1,
-            "the keyframe might not fit in the bytes left"
+            "the keyframe does not fit in the bytes left"
         );
         assert_eq!(queue.frames.len(), 1);
+        assert_eq!(queue.pop().unwrap().seq, next + 4);
+        assert_eq!(queue.bytes, 0);
     }
 
     /// How long a frame waited, and how closely frames arrived, say nothing
@@ -1183,9 +1163,7 @@ mod tests {
                 .unwrap();
         }
         tokio::task::yield_now().await;
-        let queue = link.state.queue.lock();
-        assert!(queue.video.frames.is_empty() && queue.video.writing_since.is_some());
-        drop(queue);
+        assert!(link.state.queue.lock().video.frames.is_empty());
         (link, client, peer)
     }
 
@@ -1213,66 +1191,36 @@ mod tests {
         assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 0);
     }
 
-    /// A keyframe that arrives while a write has stood still for `STALL`
-    /// replaces what is queued, even a frame that has only just arrived.
+    /// A tunnel that stands still says nothing about what is queued: on a
+    /// still desktop nothing newer may come. A frame and a keyframe that
+    /// arrive while a write has stood still for 250 ms go out after it, and
+    /// nothing counts as lost or asks for a keyframe. Dropping them when the
+    /// write finished left the iPad with no picture at all.
     #[tokio::test(start_paused = true)]
-    async fn a_keyframe_replaces_queued_frames_while_a_write_stands_still() {
-        let (link, _client, peer) = link_writing_frame_one().await;
-        tokio::time::advance(STALL).await;
+    async fn a_tunnel_that_stands_still_loses_nothing_it_queued() {
+        let (link, mut client, peer) = link_writing_frame_one().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         link.send(peer, &packet(2, false, 0, 1, 1400))
             .await
             .unwrap();
-        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 0);
+        tokio::time::sleep(Duration::from_millis(130)).await;
         link.send(peer, &packet(3, true, 0, 1, 1400)).await.unwrap();
-        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 1);
-        let queue = link.state.queue.lock();
-        assert_eq!(
-            queue.video.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
-            [3]
-        );
-    }
-
-    /// A tunnel that stands still leaves only stale video behind. When it
-    /// moves again, the rest of the frame in flight and everything queued is
-    /// dropped and a keyframe requested at once, although the backoff would
-    /// otherwise make the request wait.
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_tunnel_drops_stale_video_and_asks_for_a_keyframe_at_once() {
-        let (host, mut client) = tokio::io::duplex(64);
-        let force_idr = Arc::new(AtomicBool::new(false));
-        let peer = PeerId::usb(7);
-        let link = FramedLink::connect(host, peer, Arc::clone(&force_idr))
-            .await
-            .unwrap();
-        read_preamble(&mut client).await.unwrap();
-        for index in 0..4 {
-            link.send(peer, &packet(1, true, index, 4, 1400))
-                .await
-                .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut delivered = Vec::new();
+        for _ in 0..6 {
+            let datagram = read_datagram(&mut client).await.unwrap();
+            let header = MediaHeader::decode(&datagram).unwrap().0;
+            if header.frag_index == 0 {
+                delivered.push(header.frame_seq);
+            }
         }
-        tokio::task::yield_now().await;
-        for seq in 2..10 {
-            link.send(peer, &packet(seq, false, 0, 1, 1400))
-                .await
-                .unwrap();
-        }
-        assert!(force_idr.swap(false, Ordering::SeqCst));
-        let dropped = link.stats().frames_dropped.load(Ordering::Relaxed);
-        tokio::time::sleep(STALL * 3).await;
-        let first = read_datagram(&mut client).await.unwrap();
-        assert_eq!(MediaHeader::decode(&first).unwrap().0.frame_seq, 1);
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            force_idr.load(Ordering::SeqCst),
-            "asked at once after the stall"
-        );
-        assert!(link.stats().frames_dropped.load(Ordering::Relaxed) > dropped);
-        link.send(peer, &packet(10, true, 0, 1, 100)).await.unwrap();
-        let next = read_datagram(&mut client).await.unwrap();
-        let header = MediaHeader::decode(&next).unwrap().0;
-        assert_eq!((header.frame_seq, header.is_keyframe), (10, true));
+        assert_eq!(delivered, [1, 2, 3]);
+        assert_eq!(link.stats().frames_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 0);
+        assert!(!link.state.force_idr.load(Ordering::SeqCst));
     }
 
     /// A last message is written before the link goes, and a peer that
