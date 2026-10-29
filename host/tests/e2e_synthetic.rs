@@ -2554,9 +2554,12 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
     let mut epochs_seen: Vec<u32> = Vec::new();
     let mut decoded_first_epoch = 0usize;
     let mut decoded_second_epoch = 0usize;
-    let mut gap_started: Option<Instant> = None;
+    // The picture freezes from the first epoch's last datagram to the
+    // second epoch's first.
+    let mut last_first_epoch: Option<Instant> = None;
     let mut recovery_gap = Duration::ZERO;
     let mut highest_seq = 0u32;
+    let origin = Instant::now();
 
     while decoded_second_epoch < 30 {
         assert!(
@@ -2570,9 +2573,6 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
         );
 
         let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
-            if gap_started.is_none() && decoded_first_epoch >= 30 {
-                gap_started = Some(Instant::now());
-            }
             continue;
         };
         let bytes = &datagram[..len];
@@ -2590,10 +2590,13 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
         if !epochs_seen.contains(&header.stream_epoch) {
             epochs_seen.push(header.stream_epoch);
             if epochs_seen.len() == 2 {
-                if let Some(started) = gap_started {
-                    recovery_gap = started.elapsed();
+                if let Some(last) = last_first_epoch {
+                    recovery_gap = last.elapsed();
                 }
             }
+        }
+        if header.stream_epoch == epochs_seen[0] {
+            last_first_epoch = Some(Instant::now());
         }
 
         if let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
@@ -2602,7 +2605,7 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
             header.frag_count,
             header.stream_epoch,
             payload,
-            Instant::now(),
+            stream_time(origin, &header),
         ) {
             let frames = decoder.decode(&frame_bytes).len();
             if header.stream_epoch == epochs_seen[0] {
