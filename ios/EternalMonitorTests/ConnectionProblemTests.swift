@@ -269,4 +269,18 @@ final class ConnectionProblemTests: XCTestCase {
             XCTAssertFalse(USBStatusText.describe(status).hasPrefix("USB:"), status)
         }
     }
+
+    /// A HELLO no one answered is a warning (a PC off, asleep or elsewhere)
+    /// unless that PC answered at this address earlier in this launch.
+    func testAnUnansweredHelloIsAnErrorOnlyWhereAPCAnsweredBefore() {
+        let unanswered = ConnectionDebugState(host: "192.168.1.20", port: 9876, listenerReadyPort: 9877, helloAttempts: 4)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .warning)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: true), .error)
+        // Every other timeout stays an error.
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: true, answeredHereBefore: false), .error)
+        XCTAssertEqual(ConnectionDebugState(listenerReadyPort: nil).timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
+        var answered = unanswered
+        answered.datagramsReceived = 3
+        XCTAssertEqual(answered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
+    }
 }

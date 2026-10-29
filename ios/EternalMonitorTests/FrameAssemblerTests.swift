@@ -512,4 +512,22 @@ final class FrameAssemblerTests: XCTestCase {
         add(seq: 1, index: 0, count: 1, epoch: 2, byte: 0xB)
         XCTAssertEqual(completed, [Data([0xB])], "any epoch must be accepted after reset")
     }
+
+    /// An older PC sends these for every frame it fragments differently:
+    /// the first is logged, the rest are counted for the stream summary,
+    /// across a stream restart too.
+    func testMismatchedCountsAreLoggedOnceAndCounted() {
+        for seq in UInt32(1)...5 {
+            add(seq: seq, index: 0, count: 3, byte: 0xA)
+            add(seq: seq, index: 1, count: 2, byte: 0xB)
+        }
+        assembler.reset()
+        add(seq: 9, index: 0, count: 3, byte: 0xA)
+        add(seq: 9, index: 1, count: 2, byte: 0xB)
+        let logged = diagnostics.filter { $0.contains("mismatched count") }
+        XCTAssertEqual(logged, ["Ignored fragment for seq=1 with mismatched count 2 (frame has 3);"
+            + " later ones this session are counted in the stream summary"])
+        XCTAssertEqual(assembler.mismatchedCountFragments.withLock { $0 }, 6)
+        XCTAssertEqual(FrameAssembler().mismatchedCountFragments.withLock { $0 }, 0, "a new session starts at zero")
+    }
 }

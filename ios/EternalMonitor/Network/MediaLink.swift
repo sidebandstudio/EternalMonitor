@@ -78,12 +78,20 @@ final class MediaDatagrams {
     var onAudioPacket: ((AudioHeader, Data) -> Void)?
     private let acceptedSessionId = OSAllocatedUnfairLock<UInt32>(initialState: 0)
     private let unknownDatagramCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    /// Media for another session was reported for this one. A PC streaming
+    /// before its acceptance arrives, or still streaming an old session,
+    /// sends it at the frame rate.
+    private let reportedForeignSession = OSAllocatedUnfairLock<Bool>(initialState: false)
 
-    func setAcceptedSessionId(_ id: UInt32) { acceptedSessionId.withLock { $0 = id } }
+    func setAcceptedSessionId(_ id: UInt32) {
+        acceptedSessionId.withLock { $0 = id }
+        reportedForeignSession.withLock { $0 = false }
+    }
     var legacyLookingDatagrams: Int { unknownDatagramCount.withLock { $0 } }
     func reset() {
         acceptedSessionId.withLock { $0 = 0 }
         unknownDatagramCount.withLock { $0 = 0 }
+        reportedForeignSession.withLock { $0 = false }
     }
 
     func handle(_ data: Data) {
@@ -96,7 +104,11 @@ final class MediaDatagrams {
             }
             let expected = acceptedSessionId.withLock { $0 }
             guard header.sessionId == expected, expected != 0 else {
-                onDatagramIgnored?("Dropped media for foreign session \(header.sessionId)")
+                let reported = reportedForeignSession.withLock { reported in
+                    defer { reported = true }
+                    return reported
+                }
+                if !reported { onDatagramIgnored?("Dropped media for foreign session \(header.sessionId)") }
                 return
             }
             assembler?.addFragment(

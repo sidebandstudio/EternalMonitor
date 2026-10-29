@@ -129,7 +129,6 @@ final class FramedLink: MediaLink {
                 }
             }
             if let error {
-                SupportDiagnostics.shared.record("error", "usb", "NWConnection receive: \(error)")
                 self.fail(LinkError(.receive, "USB receive failed: \(error.localizedDescription)", underlying: error))
             }
             else if complete { self.finish() }
@@ -165,8 +164,9 @@ final class FramedLink: MediaLink {
 
     private func fail(_ error: LinkError) {
         guard connection != nil else { return }
-        SupportDiagnostics.shared.record("error", "usb", error.message)
-        onError?(error)
+        // The connection that took this link logs the failure with its state;
+        // a link still waiting for its preamble logs it here.
+        if let onError { onError(error) } else { SupportDiagnostics.shared.record("error", "usb", error.message) }
         finish()
     }
 
