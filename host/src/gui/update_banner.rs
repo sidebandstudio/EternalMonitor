@@ -233,7 +233,12 @@ impl AnalyzerApp {
             self.page == Page::Stream,
             busy,
         ) {
-            PopupGate::Show => self.update_popup_open = true,
+            PopupGate::Show => {
+                if !self.update_popup_open {
+                    self.updates.popup_shown(&popup.version);
+                }
+                self.update_popup_open = true;
+            }
             PopupGate::Wait => return,
             PopupGate::Hide => {
                 self.update_popup_open = false;
@@ -335,6 +340,10 @@ impl AnalyzerApp {
         update_toast::hide();
         match action {
             Action::UpdateNow if !self.updates.installs_in_place() => {
+                tracing::info!(
+                    version = ?self.updates.available_version(),
+                    "Update now clicked; opening the download page for a copy Setup does not replace"
+                );
                 ctx.open_url(egui::OpenUrl::new_tab(WEBSITE_DOWNLOAD));
             }
             Action::UpdateNow => self.updates.update_now(),

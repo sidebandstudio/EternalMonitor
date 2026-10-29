@@ -45,6 +45,98 @@ pub const SETUP_FLAGS: &[&str] = &[
 /// How long the helper waits for the host, and any other process running the
 /// installed app, to close before running Setup.
 const HOST_EXIT_WAIT: Duration = Duration::from_secs(60);
+/// Next to the installer, the helper says how the update ended, for the app
+/// it starts again: Setup's exit code, or why Setup did not run.
+pub const RESULT_FILE: &str = "update-result.txt";
+
+/// Why the helper did not run Setup, as written in [`RESULT_FILE`].
+pub mod reason {
+    /// The installer or the host could not be checked, so no `ready`.
+    pub const REFUSED: &str = "refused";
+    /// The host closed its pipe before the update started.
+    pub const HOST_GONE: &str = "host-gone";
+    /// The host did not close within the wait.
+    pub const HOST_OPEN: &str = "host-still-open";
+    /// Another process running the app did not close within the wait.
+    pub const OTHER_COPY: &str = "another-copy-open";
+    /// Setup could not be started or waited for.
+    pub const SETUP_NOT_STARTED: &str = "setup-not-started";
+    /// The helper itself failed.
+    pub const HELPER_FAILED: &str = "helper-failed";
+}
+
+/// How the helper's work ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateResult {
+    /// Setup ran and exited with this code. `files_in_use`: its log says a
+    /// file it had to replace was in use.
+    Setup { exit: i32, files_in_use: bool },
+    /// Setup did not run, for one of the [`reason`]s.
+    Skipped(String),
+}
+
+impl UpdateResult {
+    /// One `key=value` per line.
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Setup { exit, files_in_use } => {
+                let mut text = format!("setup_exit={exit}\n");
+                if *files_in_use {
+                    text.push_str("files_in_use=1\n");
+                }
+                text
+            }
+            Self::Skipped(reason) => format!("reason={reason}\n"),
+        }
+    }
+
+    /// `None` for anything that is not a result: an older helper writes no
+    /// file, and a broken one means nothing is known.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut exit = None;
+        let mut files_in_use = false;
+        let mut skipped = None;
+        for line in text.lines() {
+            match line.trim().split_once('=') {
+                Some(("setup_exit", value)) => exit = Some(value.trim().parse().ok()?),
+                Some(("files_in_use", value)) => files_in_use = value.trim() == "1",
+                Some(("reason", value)) => {
+                    let value = value.trim();
+                    let plain = !value.is_empty()
+                        && value.len() <= 40
+                        && value.bytes().all(|b| b.is_ascii_lowercase() || b == b'-');
+                    skipped = Some(plain.then(|| value.to_string())?);
+                }
+                _ => {}
+            }
+        }
+        match (exit, skipped) {
+            (Some(exit), None) => Some(Self::Setup { exit, files_in_use }),
+            (None, Some(reason)) => Some(Self::Skipped(reason)),
+            _ => None,
+        }
+    }
+
+    /// Written whole or not at all, so the app never reads half a result.
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, self.to_text())?;
+        std::fs::rename(temp, path)
+    }
+
+    pub fn read(path: &Path) -> Option<Self> {
+        Self::parse(&std::fs::read_to_string(path).ok()?)
+    }
+}
+
+/// Whether Setup's log says a file it had to replace was in use. Inno Setup
+/// logs this in English whatever the language, then, with its messages
+/// suppressed, aborts with exit code 5, the code a click on Cancel gives too.
+fn files_in_use(setup_log: &Path) -> bool {
+    std::fs::read(setup_log).is_ok_and(|log| {
+        String::from_utf8_lossy(&log).contains("The existing file appears to be in use")
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelperArgs {
@@ -164,12 +256,17 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
 /// [`run`], with how long Setup waits for the host to close.
 fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> i32 {
     let mut log = Log::open(&args.log);
+    let result_path = args.log.with_file_name(RESULT_FILE);
+    let skipped = |reason: &str| {
+        let _ = UpdateResult::Skipped(reason.into()).write(&result_path);
+    };
     let prepared = prepare(&args);
     let (installer, host) = match prepared {
         Ok(ready) => ready,
         Err(error) => {
             // The host is still open and shows the failure; nothing to relaunch.
             log.note(&format!("refused: {error}"));
+            skipped(reason::REFUSED);
             let _ = writeln!(out, "error: {error}");
             return 3;
         }
@@ -177,6 +274,7 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
     log.note("installer locked and verified");
     if writeln!(out, "{READY}").and_then(|()| out.flush()).is_err() {
         log.note("host is gone before the update started; not installing");
+        skipped(reason::HOST_GONE);
         return 4;
     }
     let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -187,7 +285,10 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
                 // Setup would close it mid-use or fail on its files. Leave
                 // the running app alone; the start after it closes reports
                 // the update did not finish.
-                return Err("EternalMonitor did not close; not installing".to_string());
+                return Err((
+                    reason::HOST_OPEN,
+                    "EternalMonitor did not close; not installing".to_string(),
+                ));
             }
         }
         // The host's failure reporter is a copy of the app without a window
@@ -201,17 +302,34 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
                 "cannot list other EternalMonitor processes: {error}"
             )),
             Err(OthersRunning::Running) => {
-                return Err(
+                return Err((
+                    reason::OTHER_COPY,
                     "another EternalMonitor process did not close; not installing".to_string(),
-                )
+                ))
             }
         }
-        run_setup(&args, &installer.file)
+        run_setup(&args, &installer.file).map_err(|error| (reason::SETUP_NOT_STARTED, error))
     }));
-    match installed {
-        Ok(Ok(code)) => log.note(&format!("Setup exit code {code}")),
-        Ok(Err(error)) => log.note(&format!("Setup did not run: {error}")),
-        Err(_) => log.note("the helper failed while installing"),
+    let result = match installed {
+        Ok(Ok(code)) => {
+            log.note(&format!("Setup exit code {code}"));
+            UpdateResult::Setup {
+                exit: code,
+                files_in_use: code != 0 && files_in_use(&args.log.with_file_name("setup.log")),
+            }
+        }
+        Ok(Err((reason, error))) => {
+            log.note(&format!("Setup did not run: {error}"));
+            UpdateResult::Skipped(reason.into())
+        }
+        Err(_) => {
+            log.note("the helper failed while installing");
+            UpdateResult::Skipped(reason::HELPER_FAILED.into())
+        }
+    };
+    // Before the app starts again, which reads it.
+    if let Err(error) = result.write(&result_path) {
+        log.note(&format!("could not write {RESULT_FILE}: {error}"));
     }
     drop(installer);
     // Whatever happened, the user gets EternalMonitor back, but only once the
@@ -828,12 +946,90 @@ touch '{d}/setup-ran'
             log.contains("another EternalMonitor process did not close"),
             "{log}"
         );
+        assert_eq!(
+            UpdateResult::read(&dir.join(RESULT_FILE)),
+            Some(UpdateResult::Skipped(reason::OTHER_COPY.into()))
+        );
         // The user still gets the app back; the wait is only a backstop.
         let start = std::time::Instant::now();
         while !dir.join("relaunched").exists() && start.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(dir.join("relaunched").exists(), "{log}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_result_file_round_trips_and_rejects_anything_else() {
+        for result in [
+            UpdateResult::Setup {
+                exit: 0,
+                files_in_use: false,
+            },
+            UpdateResult::Setup {
+                exit: 2,
+                files_in_use: false,
+            },
+            UpdateResult::Setup {
+                exit: 5,
+                files_in_use: true,
+            },
+            UpdateResult::Setup {
+                exit: -1,
+                files_in_use: false,
+            },
+            UpdateResult::Skipped(reason::OTHER_COPY.into()),
+        ] {
+            assert_eq!(UpdateResult::parse(&result.to_text()), Some(result));
+        }
+        assert_eq!(
+            UpdateResult::parse("setup_exit=5\r\nfiles_in_use=1\r\n"),
+            Some(UpdateResult::Setup {
+                exit: 5,
+                files_in_use: true
+            })
+        );
+        for broken in [
+            "",
+            "setup_exit=",
+            "setup_exit=five",
+            "reason=",
+            "reason=Not A Reason",
+            "setup_exit=0\nreason=host-gone",
+        ] {
+            assert_eq!(UpdateResult::parse(broken), None, "{broken:?}");
+        }
+        let dir = temp("result");
+        let path = dir.join(RESULT_FILE);
+        assert_eq!(
+            UpdateResult::read(&path),
+            None,
+            "an older helper wrote none"
+        );
+        UpdateResult::Skipped(reason::HOST_OPEN.into())
+            .write(&path)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "reason=host-still-open\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn setup_log_lines_about_a_file_in_use_are_found() {
+        let dir = temp("in-use");
+        let log = dir.join("setup.log");
+        assert!(!files_in_use(&log), "no log");
+        std::fs::write(&log, "2026-10-29 10:00:00.000   Installing the file.\r\n").unwrap();
+        assert!(!files_in_use(&log));
+        std::fs::write(
+            &log,
+            "2026-10-29 10:00:01.000   DeleteFile: The existing file appears to be in use (5). Retrying.\r\n\
+             2026-10-29 10:00:11.000   Defaulting to Abort for suppressed message box (Abort/Retry/Ignore):\r\n",
+        )
+        .unwrap();
+        assert!(files_in_use(&log));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -136,11 +136,14 @@ begin
   Result := not VddInstallFailed;
 end;
 
+{ Inno Setup's own exit codes are 1 to 8 (1: Setup failed to initialize).
+  The update helper reports Setup's code to the relaunched app, so this one
+  stays clear of them. }
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if VddInstallFailed then
-    Result := 1;
+    Result := 20;
 end;
 
 #ifdef IncludeDriver
