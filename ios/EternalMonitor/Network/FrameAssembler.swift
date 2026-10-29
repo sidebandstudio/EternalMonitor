@@ -13,6 +13,8 @@ final class FrameAssembler {
     /// fragment carried (protocol v2 repeats it per datagram).
     var onFrameAssembled: ((Data, _ seq: UInt32, _ captureTimestampUs: UInt64, _ isKeyframe: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
+    /// Expected events, such as the reset after a PC pipeline restart.
+    var onInfo: ((String) -> Void)?
     var onNack: ((Nack) -> Void)?
     var onNeedsKeyframe: ((_ epoch: UInt32, _ lastCompleteSeq: UInt32) -> Void)?
     var repairEnabled = false
@@ -161,7 +163,7 @@ final class FrameAssembler {
         // constant 0 here, so this stays a no-op for them and the seq-gap fallback takes over.
         if let current = currentEpoch {
             if epoch > current {
-                onDiagnostic?("Stream epoch changed (\(current) -> \(epoch)) — resetting reassembly")
+                onInfo?("Stream epoch changed (\(current) -> \(epoch)) — resetting reassembly")
                 reset()
                 currentEpoch = epoch
             } else if epoch < current {

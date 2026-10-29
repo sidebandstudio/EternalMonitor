@@ -1462,6 +1462,54 @@ mod tests {
         assert!(granted_again.force_idr);
     }
 
+    #[test]
+    fn a_resume_is_an_ordinary_rate_limited_keyframe_request() {
+        // A 0.3.4 iPad holding a picture asks for a keyframe every 600 ms and
+        // sends Resume after 2 s. Resume asks for one IDR under the same
+        // 500 ms limit as any other reason, and for nothing else: the
+        // encoder reopens only on AMF, through its keyframe reopen.
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let request = |reason| {
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 7,
+                last_complete_seq: 10,
+                reason,
+            })
+        };
+
+        let mut granted = Vec::new();
+        for (millis, reason) in [
+            (1_800, KeyframeReason::GapLoss),
+            (2_000, KeyframeReason::Resume),
+            (2_400, KeyframeReason::GapLoss),
+            (2_600, KeyframeReason::Resume),
+        ] {
+            let actions = session.handle_control_authed(
+                peer,
+                request(reason),
+                &TestConfig,
+                now + Duration::from_millis(millis),
+            );
+            assert!(actions.replies.is_empty(), "{millis} ms");
+            assert!(actions.new_target.is_none() && !actions.client_lost);
+            if actions.force_idr {
+                granted.push(millis);
+            }
+        }
+        assert_eq!(granted, [1_800, 2_400]);
+
+        let resume = session.handle_control_authed(
+            peer,
+            request(KeyframeReason::Resume),
+            &TestConfig,
+            now + Duration::from_millis(3_000),
+        );
+        assert!(resume.force_idr, "granted once the window has passed");
+    }
+
     fn input_event(event_id: u32) -> ControlMessage {
         ControlMessage::InputEvent(InputEvent {
             input_ver: 1,

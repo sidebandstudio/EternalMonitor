@@ -219,7 +219,7 @@ final class ConnectionProblemTests: XCTestCase {
             }
         }
         XCTAssertEqual(ConnectionProblem.noReply(usb: false).actions, [.retry])
-        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings])
+        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings, .retry])
         XCTAssertEqual(ConnectionProblem.lost(.cableUnplugged).actions, [])
         XCTAssertTrue(ConnectionProblem.noReply(usb: false).detail.contains("Firewall"))
         XCTAssertTrue(ConnectionProblem.noReply(usb: true).detail.contains("Apple Devices"))
