@@ -177,12 +177,24 @@ pub enum LossStep {
     GiveUp,
 }
 
+/// A duplication that came back keeps its place on the delay ladder until it
+/// has worked this long. A UAC prompt, the lock screen or a full-screen game
+/// can take the desktop again right after it returns; starting the ladder
+/// over at each return re-created the duplication at full speed in a loop.
+pub const LOSS_LADDER_RESET: Duration = Duration::from_secs(5);
+
 /// One loss episode lasts from the first ACCESS_LOST until a frame or an idle
 /// timeout proves the new duplication works.
 #[derive(Default)]
 pub struct LossRecovery {
     since: Option<Instant>,
+    /// Losses this episode.
     losses: u32,
+    /// Steps up the delay ladder, kept across an episode's end until the
+    /// duplication has worked for [`LOSS_LADDER_RESET`].
+    step: usize,
+    /// When the last episode ended, while `step` is kept.
+    back_at: Option<Instant>,
 }
 
 impl LossRecovery {
@@ -191,18 +203,37 @@ impl LossRecovery {
     }
 
     pub fn lost(&mut self, now: Instant) -> LossStep {
+        if let Some(back_at) = self.back_at.take() {
+            if now.duration_since(back_at) >= LOSS_LADDER_RESET {
+                self.step = 0;
+            }
+        }
         let since = *self.since.get_or_insert(now);
         self.losses += 1;
         if now.duration_since(since) >= LOSS_GIVE_UP {
             return LossStep::GiveUp;
         }
-        let index = (self.losses as usize - 1).min(LOSS_DELAYS_MS.len() - 1);
+        let index = self.step.min(LOSS_DELAYS_MS.len() - 1);
+        self.step += 1;
         LossStep::Retry(Duration::from_millis(LOSS_DELAYS_MS[index]))
     }
 
-    /// Ends the episode; returns how many losses it had and how long it took.
+    /// Called for each frame or idle timeout. Ends the episode, returning how
+    /// many losses it had and how long it took; once the duplication has
+    /// worked for [`LOSS_LADDER_RESET`], the next loss is retried at once
+    /// again.
     pub fn healthy(&mut self, now: Instant) -> Option<(u32, Duration)> {
-        let since = self.since.take()?;
+        let Some(since) = self.since.take() else {
+            if self
+                .back_at
+                .is_some_and(|back_at| now.duration_since(back_at) >= LOSS_LADDER_RESET)
+            {
+                self.back_at = None;
+                self.step = 0;
+            }
+            return None;
+        };
+        self.back_at = Some(now);
         let losses = std::mem::take(&mut self.losses);
         Some((losses, now.duration_since(since)))
     }
@@ -544,17 +575,70 @@ mod tests {
     }
 
     #[test]
-    fn a_working_frame_ends_the_episode_and_resets_the_ladder() {
+    fn a_working_frame_ends_the_episode_and_five_healthy_seconds_reset_the_ladder() {
+        let ms = Duration::from_millis;
         let mut recovery = LossRecovery::default();
         let start = Instant::now();
         recovery.lost(start);
         recovery.lost(start);
         assert!(recovery.in_episode());
-        let ended = recovery.healthy(start + Duration::from_millis(300));
-        assert_eq!(ended, Some((2, Duration::from_millis(300))));
+        let ended = recovery.healthy(start + ms(300));
+        assert_eq!(ended, Some((2, ms(300))));
         assert!(!recovery.in_episode());
-        assert_eq!(recovery.healthy(start), None);
-        assert_eq!(recovery.lost(start), LossStep::Retry(Duration::ZERO));
+        // Frames keep coming for 5 s: the next loss is retried at once.
+        let mut now = start + ms(300);
+        while now < start + ms(300) + LOSS_LADDER_RESET {
+            now += ms(16);
+            assert_eq!(recovery.healthy(now), None);
+        }
+        assert_eq!(recovery.lost(now), LossStep::Retry(Duration::ZERO));
+        // Also when no frame was looked at in between (nobody watching).
+        let back = now + ms(10);
+        assert!(recovery.healthy(back).is_some());
+        let later = back + LOSS_LADDER_RESET;
+        assert_eq!(recovery.lost(later), LossStep::Retry(Duration::ZERO));
+    }
+
+    /// A UAC prompt or a full-screen game takes the desktop again right after
+    /// each return. The first retry is as quick as before; the returns that
+    /// follow within 5 s keep climbing the ladder instead of starting over
+    /// at 0 ms each time.
+    #[test]
+    fn a_duplication_lost_again_soon_after_it_returned_keeps_its_backoff() {
+        let ms = Duration::from_millis;
+        let mut recovery = LossRecovery::default();
+        let start = Instant::now();
+        let mut now = start;
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            let LossStep::Retry(delay) = recovery.lost(now) else {
+                panic!("gave up")
+            };
+            delays.push(delay.as_millis() as u64);
+            // The new duplication works for a second, then is lost again.
+            now += delay + ms(1);
+            assert!(
+                recovery.healthy(now).is_some(),
+                "each loss is its own episode"
+            );
+            now += ms(1_000);
+            assert_eq!(recovery.healthy(now), None);
+        }
+        assert_eq!(delays, [0, 100, 250, 500, 1000, 2000, 2000]);
+        // The last return was a second ago. Four healthy seconds are not
+        // enough; five are.
+        let back = now - ms(1_000);
+        assert_eq!(recovery.healthy(back + ms(4_000)), None);
+        assert_eq!(recovery.lost(back + ms(4_000)), LossStep::Retry(ms(2000)));
+        recovery.healthy(back + ms(6_000));
+        assert_eq!(recovery.healthy(back + ms(11_000)), None);
+        assert_eq!(
+            recovery.lost(back + ms(11_000)),
+            LossStep::Retry(Duration::ZERO)
+        );
+        // Each return still ends its episode: the give-up window measures
+        // one outage, not the whole loop.
+        assert!(now.duration_since(start) > LOSS_GIVE_UP);
     }
 
     /// Lid closed for two minutes: every attempt finds no display output
