@@ -18,6 +18,10 @@ ENV = {
     "IOS_DIST_P12_PASSWORD": "p12 pass'word",
     "IOS_PROVISION_PROFILE_BASE64": "cHJvZmlsZS1iYXNlNjQ=",
 }
+OPTIONAL = {
+    "AZURE_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
+    "AZURE_TENANT_URL": "https://tenant-test.example.org/t",
+}
 
 
 class ArtifactSecretsTest(unittest.TestCase):
@@ -27,10 +31,12 @@ class ArtifactSecretsTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_scan(self, *paths, event="push", names=",".join(ENV), **overrides):
-        env = {k: v for k, v in os.environ.items() if k not in ENV and k != "GITHUB_EVENT_NAME"}
+    def run_scan(self, *paths, event="push", names=",".join(ENV), optional=None, **overrides):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ENV and k not in OPTIONAL and k != "GITHUB_EVENT_NAME"}
         env |= ENV | overrides | {"GITHUB_EVENT_NAME": event}
-        return subprocess.run([sys.executable, str(SCRIPT), "scan", "--secrets", names, *map(str, paths)],
+        flags = ["--optional", optional] if optional else []
+        return subprocess.run([sys.executable, str(SCRIPT), "scan", "--secrets", names, *flags, *map(str, paths)],
                               capture_output=True, text=True, env=env)
 
     def evidence(self, text):
@@ -97,6 +103,41 @@ class ArtifactSecretsTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ETERNAL_DIAGNOSTICS_ENDPOINT host", result.stderr)
 
+    def test_empty_optional_secrets_are_not_required(self):
+        clean = self.evidence("{}\n")
+        for values in ({}, {name: "" for name in OPTIONAL}, {name: "  \n" for name in OPTIONAL}):
+            with self.subTest(values):
+                result = self.run_scan(clean, optional=",".join(OPTIONAL), **values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_scan(clean, optional=",".join(OPTIONAL), ASC_ISSUER_ID="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ASC_ISSUER_ID", result.stderr)
+        self.assertNotIn("AZURE", result.stderr)
+
+    def test_set_optional_secrets_are_checked(self):
+        leaks = {
+            "AZURE_CLIENT_ID": "client 11111111-2222-3333-4444-555555555555",
+            "AZURE_CLIENT_ID prefix": "client 11111111-222...",
+            "AZURE_TENANT_URL host": "signed via tenant-test.example.org",
+        }
+        for name, text in leaks.items():
+            with self.subTest(name):
+                result = self.run_scan(self.evidence(text), optional=",".join(OPTIONAL), **OPTIONAL)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assertNotIn("11111111", result.stdout + result.stderr)
+        clean = self.run_scan(self.evidence("{}\n"), optional=",".join(OPTIONAL), **OPTIONAL)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+
+    def test_a_name_cannot_be_both_required_and_optional(self):
+        clean = self.evidence("{}\n")
+        for value in ("", ENV["ETERNAL_DIAGNOSTICS_INGEST_KEY"]):
+            with self.subTest(value=value):
+                result = self.run_scan(clean, optional="ETERNAL_DIAGNOSTICS_INGEST_KEY",
+                                       ETERNAL_DIAGNOSTICS_INGEST_KEY=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("A name cannot be in both lists", result.stderr)
+
     def test_directories_are_scanned(self):
         (self.tmp / "logs").mkdir()
         (self.tmp / "logs" / "a.log").write_text("token cDEyLWJhc2U2NC10ZXN0")
@@ -107,7 +148,10 @@ class ArtifactSecretsTest(unittest.TestCase):
     def test_secret_names_are_required(self):
         clean = self.evidence("{}\n")
         for argv in (["scan", str(clean)], ["scan", "--secrets", "", str(clean)],
-                     ["scan", "--secrets", "lower", str(clean)]):
+                     ["scan", "--secrets", "lower", str(clean)],
+                     ["scan", "--secrets", "ASC_KEY_ID", "--optional", str(clean)],
+                     ["scan", "--secrets", "ASC_KEY_ID", "--optional", "", str(clean)],
+                     ["scan", "--secrets", "ASC_KEY_ID", "--optional", "lower", str(clean)]):
             with self.subTest(argv):
                 result = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
