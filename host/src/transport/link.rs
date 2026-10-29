@@ -1207,15 +1207,13 @@ mod tests {
         link.send(peer, &packet(3, true, 0, 1, 1400)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut delivered = Vec::new();
-        for _ in 0..6 {
-            let datagram = read_datagram(&mut client).await.unwrap();
-            let header = MediaHeader::decode(&datagram).unwrap().0;
-            if header.frag_index == 0 {
+        while let Ok(datagram) =
+            tokio::time::timeout(Duration::from_secs(1), read_datagram(&mut client)).await
+        {
+            let header = MediaHeader::decode(&datagram.unwrap()).unwrap().0;
+            if header.frag_index + 1 == header.frag_count {
                 delivered.push(header.frame_seq);
             }
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
         }
         assert_eq!(delivered, [1, 2, 3]);
         assert_eq!(link.stats().frames_dropped.load(Ordering::Relaxed), 0);
