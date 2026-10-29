@@ -41,9 +41,13 @@ impl CaptureBlock {
         match code as u32 {
             0x8007_0005 => Some(Self::SecureDesktop), // E_ACCESSDENIED
             0x887A_0026 => Some(Self::DisplayChanging), // DXGI_ERROR_ACCESS_LOST
+            // DXGI_ERROR_NOT_FOUND: no display output, while a laptop's lid
+            // is closed or its screen is off. It ended capture like a crash,
+            // so the restart brake stopped it until the user clicked Start.
+            0x887A_0002 => Some(Self::DisplayChanging),
             0x887A_0004 => Some(Self::UnsupportedOnThisGpu), // DXGI_ERROR_UNSUPPORTED
-            0x887A_0022 => Some(Self::TooManyCaptureApps), // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
-            0x887A_0028 => Some(Self::SessionDisconnected), // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0022 => Some(Self::TooManyCaptureApps),   // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+            0x887A_0028 => Some(Self::SessionDisconnected),  // DXGI_ERROR_SESSION_DISCONNECTED
             _ => None,
         }
     }
@@ -551,6 +555,102 @@ mod tests {
         assert!(!recovery.in_episode());
         assert_eq!(recovery.healthy(start), None);
         assert_eq!(recovery.lost(start), LossStep::Retry(Duration::ZERO));
+    }
+
+    /// Lid closed for two minutes: every attempt finds no display output
+    /// (DXGI_ERROR_NOT_FOUND), then the lid opens.
+    #[test]
+    fn no_display_output_is_waited_out_without_the_restart_brake() {
+        use crate::supervisor::{Effect, Machine, Stage, StageOutcome, SupervisorState};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+
+        struct Warnings(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() <= tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let not_found = 0x887A_0002_u32 as i32;
+        assert_eq!(
+            CaptureBlock::from_hresult(not_found),
+            Some(CaptureBlock::DisplayChanging)
+        );
+        // Not remembered against the second screen either.
+        assert!(passing_code(not_found));
+        let lid_closed_for = Duration::from_secs(120);
+
+        let shared = SharedControl::new(0, 1);
+        let waited = RefCell::new(Duration::ZERO);
+        let waits = RefCell::new(Vec::new());
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Warnings(warnings.clone()));
+        let result = tracing::subscriber::with_default(subscriber, || {
+            run_until_unblocked(
+                &shared,
+                |_| {
+                    if *waited.borrow() < lid_closed_for {
+                        let block = CaptureBlock::from_hresult(not_found).unwrap();
+                        return Err(Box::new(CaptureUnavailable {
+                            block,
+                            detail: "EnumOutputs: 0x887a0002".into(),
+                        }));
+                    }
+                    note_capture_resumed(&shared);
+                    Ok(())
+                },
+                |delay| {
+                    assert_eq!(
+                        *shared.capture_block.lock(),
+                        Some(CaptureBlock::DisplayChanging)
+                    );
+                    waits.borrow_mut().push(delay);
+                    *waited.borrow_mut() += delay;
+                    true
+                },
+            )
+        });
+        // Capture resumed by itself; nothing reached the supervisor.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(shared.capture_block.lock().is_none());
+        // A bounded pace, never a tight loop.
+        let waits = waits.into_inner();
+        assert!(waits
+            .iter()
+            .all(|&d| d >= Duration::from_millis(500) && d <= Duration::from_secs(5)));
+        assert!(waits.len() < 30, "{} attempts", waits.len());
+        // One warning for the whole wait.
+        assert_eq!(warnings.load(Ordering::SeqCst), 1);
+
+        // Before, each attempt ended the stage: the brake stopped capture
+        // half a minute into the two, until the user clicked Start.
+        let mut machine = Machine::new(1);
+        let start = Instant::now();
+        let mut now = start;
+        let mut generation = 1;
+        let failure = StageOutcome::Failed("EnumOutputs: 0x887a0002".into());
+        while !matches!(machine.state, SupervisorState::Failed { .. }) {
+            assert!(now.duration_since(start) < lid_closed_for);
+            assert_eq!(
+                machine.on_stage_exit(generation, Stage::Capture, &failure, now),
+                Effect::StopPipeline
+            );
+            if let SupervisorState::BackingOff { until, .. } = machine.state {
+                now = until;
+                assert_eq!(machine.on_tick(now), Effect::Start);
+                generation += 1;
+                machine.note_started(generation);
+            }
+        }
+        assert!(now.duration_since(start) < Duration::from_secs(60));
     }
 
     #[test]
