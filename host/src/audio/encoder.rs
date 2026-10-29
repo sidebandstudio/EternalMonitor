@@ -22,7 +22,13 @@ pub struct OpusEncoder {
 /// time-limited lane: while a stuck video open holds that lock, an Opus
 /// open is refused at once (or given up on) instead of blocking audio.
 fn open_encoder(lanes: &'static Lanes) -> AudioResult<codec::encoder::Audio> {
-    match crate::stall::run_on(lanes, Call::EncoderOpen, open_libopus, || {}) {
+    match crate::stall::run_on(
+        lanes,
+        Call::EncoderOpen,
+        crate::stall::encoder_open_limits("libopus"),
+        open_libopus,
+        || {},
+    ) {
         Ok(opened) => opened,
         Err(stall) => Err(Box::new(stall)),
     }
