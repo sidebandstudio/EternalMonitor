@@ -309,8 +309,8 @@ expect 0 0 3 0 0 6 3 - 0 247:0|247:0|248:0|247:0|248:0|249:1
 add 256000 1 249 1 2 0 4 1
 expect 1 2 4 2 0 6 0 249 0 247:0|247:0|248:0|247:0|248:0|249:1
 
-# With a complete delta frame behind them, the older frames are dropped at
-# their deadlines, and a partial keyframe does not stop the requests.
+# With a complete delta frame behind them, the older frames are dropped, and
+# a partial keyframe does not stop their keyframe requests.
 reset 16667 10000
 add 0 1 247 1 2 0 1
 tick 125000
