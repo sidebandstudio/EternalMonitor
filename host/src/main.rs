@@ -151,12 +151,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // wins, then the saved setting, then Automatic.
     let overrides = eternal_host::troubleshooting::Overrides::from_process(&persisted)
         .map_err(eternal_host::startup::fatal)?;
+    let gpu_value = eternal_host::gpu_preference::read_value().ok().flatten();
     overrides.log(eternal_host::gpu_preference::preference_in(
-        eternal_host::gpu_preference::read_value()
-            .ok()
-            .flatten()
-            .as_deref(),
+        gpu_value.as_deref(),
     ));
+    // The helper copy that saved a switch has no log of its own.
+    if let Some(record) = persisted.gpu_switch.as_ref().filter(|r| r.checking) {
+        let saved = eternal_host::gpu_preference::switch_saved(record, gpu_value.as_deref());
+        info!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            saved,
+            "Graphics card switch: started again after the switch"
+        );
+    }
     let max_dgram = overrides.max_dgram.value;
     shared
         .max_dgram

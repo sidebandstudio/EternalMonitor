@@ -200,7 +200,8 @@ impl AnalyzerApp {
                     .clicked();
             });
         }
-        if env.is_none() && self.settings_window_drawing != status.choice {
+        if env.is_none() && (self.settings_window_drawing != status.choice || status.reset_pending)
+        {
             ui.horizontal(|ui| {
                 ui.label(muted("Applies when EternalMonitor starts again."));
                 restart = widgets::button(

@@ -223,6 +223,12 @@ pub fn settle(record: &mut SwitchRecord, outcome: Outcome) -> bool {
     }
 }
 
+/// Whether the stored value holds the switch `record` asked for. False after
+/// a helper copy could not save it (HKCU writes refused).
+pub fn switch_saved(record: &SwitchRecord, value: Option<&str>) -> bool {
+    preference_in(value).unwrap_or(0) == record.preference.value()
+}
+
 /// `GpuPreference` in a `UserGpuPreferences` value (`GpuPreference=2;`).
 pub fn preference_in(value: Option<&str>) -> Option<u32> {
     value?
@@ -402,9 +408,9 @@ mod windows_impl {
         DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
     };
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPEN_CREATE_OPTIONS,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
+        REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     use super::{AdapterId, Change, GpuFacts, PreferenceStore};
@@ -518,7 +524,28 @@ mod windows_impl {
             })
         }
 
-        fn key(&self) -> Result<Key, String> {
+        /// The key, read-only. `None` when it doesn't exist: reading must
+        /// never create it, since every start reads the value.
+        fn open(&self) -> Result<Option<Key>, String> {
+            let mut key = HKEY::default();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    PREFERENCES_KEY,
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut key,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => Ok(Some(Key(key))),
+                ERROR_FILE_NOT_FOUND => Ok(None),
+                status => Err(format!("could not open the graphics settings: {status:?}")),
+            }
+        }
+
+        /// The key for a write, created if Windows has none yet.
+        fn create(&self) -> Result<Key, String> {
             let mut key = HKEY::default();
             let status = unsafe {
                 RegCreateKeyExW(
@@ -527,7 +554,7 @@ mod windows_impl {
                     0,
                     PCWSTR::null(),
                     REG_OPEN_CREATE_OPTIONS(REG_OPTION_NON_VOLATILE.0),
-                    KEY_QUERY_VALUE | KEY_SET_VALUE,
+                    KEY_SET_VALUE,
                     None,
                     &mut key,
                     None,
@@ -553,7 +580,9 @@ mod windows_impl {
 
     impl PreferenceStore for OwnValue {
         fn read(&self) -> Result<Option<String>, String> {
-            let key = self.key()?;
+            let Some(key) = self.open()? else {
+                return Ok(None);
+            };
             let name = PCWSTR(self.name.as_ptr());
             let mut size = 0u32;
             let status =
@@ -582,7 +611,7 @@ mod windows_impl {
         }
 
         fn write(&mut self, value: Option<&str>) -> Result<(), String> {
-            let key = self.key()?;
+            let key = self.create()?;
             let name = PCWSTR(self.name.as_ptr());
             let status = match value {
                 Some(value) => {
@@ -966,6 +995,18 @@ mod tests {
         let mut record = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
         assert!(settle(&mut record, Outcome::Worked));
         assert!(!record.failed);
+    }
+
+    #[test]
+    fn the_relaunched_app_can_tell_a_switch_that_was_never_saved() {
+        let record = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
+        assert!(switch_saved(
+            &record,
+            Some("AutoHDREnable=1;GpuPreference=1;")
+        ));
+        // The helper's HKCU write was refused, or another tool changed it.
+        assert!(!switch_saved(&record, None));
+        assert!(!switch_saved(&record, Some("GpuPreference=2;")));
     }
 
     #[test]

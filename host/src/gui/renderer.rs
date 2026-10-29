@@ -71,6 +71,8 @@ pub struct Status {
     pub avoiding: bool,
     /// What draws the window now, in words.
     pub backend: Option<String>,
+    /// The user reset crash avoidance; it applies at the next start.
+    pub reset_pending: bool,
 }
 
 /// How this launch draws its window. `None` before the window starts.
@@ -93,6 +95,7 @@ pub fn reset_avoidance() {
     update_status(|status| {
         status.avoiding = false;
         status.chosen_failed = false;
+        status.reset_pending = true;
     });
     info!("Window renderer crash avoidance reset; applies at the next start");
 }
