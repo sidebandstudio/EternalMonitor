@@ -8,6 +8,7 @@
 ;   StagingDir  : absolute path to the staged payload (app exe, DLLs, docs, driver\)
 ;   AppVersion  : version string, e.g. 0.1.1
 ;   IncludeDriver (optional, defined only when a driver setup .exe was staged)
+;   Sign        (optional, defined with the "eternal" sign tool, /Seternal=<command>)
 
 #ifndef StagingDir
   #error "StagingDir is not defined — run scripts\build-installer.ps1 instead of compiling the .iss directly."
@@ -49,6 +50,11 @@ WizardImageStretch=yes
 UninstallDisplayName=EternalMonitor
 UninstallDisplayIcon={app}\EternalMonitor-host.exe
 SetupLogging=yes
+#ifdef Sign
+; Authenticode-signs Setup, the uninstaller it writes and the [Files] entries
+; flagged "sign" (see docs/windows-signing.md).
+SignTool=eternal
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -64,9 +70,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; which writes HKCU\Run for the signed-in user) — no installer task needed.
 
 [Files]
-Source: "{#StagingDir}\EternalMonitor-host.exe"; DestDir: "{app}"; Flags: ignoreversion
+; "sign" covers our own two exes. Inno ignores it when SignTool isn't set.
+; Third-party files ship exactly as their publishers built them.
+Source: "{#StagingDir}\EternalMonitor-host.exe"; DestDir: "{app}"; Flags: ignoreversion sign
 ; In-app updates run a copy of this helper from the user's update folder.
-Source: "{#StagingDir}\EternalMonitor-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StagingDir}\EternalMonitor-updater.exe"; DestDir: "{app}"; Flags: ignoreversion sign
 Source: "{#StagingDir}\*.dll";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
