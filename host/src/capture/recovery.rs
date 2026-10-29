@@ -4,6 +4,7 @@
 //! ACCESS_LOST loop re-created the duplication every millisecond for hours)
 //! nor count toward the supervisor's restart budget.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -87,6 +88,58 @@ pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) ->
         return passing_code(error.code().0);
     }
     false
+}
+
+/// After a graphics card switch made from the Stream page notice, the first
+/// capture attempt of the relaunched app says whether it helped: one log
+/// line, and the record the GUI saves. The process that saved the change
+/// still runs on the old card and says nothing.
+pub fn note_gpu_outcome(shared: &SharedControl, outcome: crate::gpu_preference::Outcome) {
+    let mut record = shared.gpu_switch.lock();
+    // Read under the record's lock: `save_gpu_switch` sets it there before
+    // a record saved here is shared.
+    if shared.gpu_changed_here.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(record) = record.as_mut() else {
+        return;
+    };
+    if !crate::gpu_preference::settle(record, outcome) {
+        return;
+    }
+    let app_gpu = crate::stats::PIPELINE_STATS.lock().gpu_name.clone();
+    match outcome {
+        crate::gpu_preference::Outcome::Worked => info!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            app_gpu,
+            "Graphics card switch outcome: capture works"
+        ),
+        crate::gpu_preference::Outcome::StillUnsupported => warn!(
+            gpu = %record.gpu,
+            preference = ?record.preference,
+            app_gpu,
+            "Graphics card switch outcome: Windows still won't share the screen; another app probably chooses the card"
+        ),
+    }
+}
+
+/// A graphics card change saved by this process: `save` works on a copy of
+/// the switch record (writing settings.json and Windows' value). Only when
+/// it worked is the record it keeps shared, under the record's lock and
+/// after marking this process as the one that changed the card, so capture
+/// here never sees it unmarked and never judges it. A failed save shares
+/// nothing.
+pub fn save_gpu_switch(
+    shared: &SharedControl,
+    save: impl FnOnce(&mut Option<crate::gpu_preference::SwitchRecord>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut record = shared.gpu_switch.lock().clone();
+    save(&mut record)?;
+    let mut shared_record = shared.gpu_switch.lock();
+    shared.gpu_changed_here.store(true, Ordering::SeqCst);
+    *shared_record = record;
+    Ok(())
 }
 
 /// The capture loop could not get at the desktop for a reason outside the
@@ -254,6 +307,114 @@ pub fn note_capture_resumed(shared: &SharedControl) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn the_process_that_saved_a_switch_never_judges_it() {
+        use crate::gpu_preference::{Outcome, Preference, SwitchRecord};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let waiting = SwitchRecord::new(None, None, Preference::HighPerformance, "NVIDIA");
+        *shared.gpu_switch.lock() = Some(waiting.clone());
+        // The old window saved it and still runs on the old card (its
+        // restart failed, or it is about to leave): no "another app" verdict.
+        shared.gpu_changed_here.store(true, Ordering::SeqCst);
+        note_gpu_outcome(&shared, Outcome::StillUnsupported);
+        assert_eq!(*shared.gpu_switch.lock(), Some(waiting.clone()));
+        // The restarted copy judges it.
+        let restarted = SharedControl::new(9876, 15_000_000);
+        *restarted.gpu_switch.lock() = Some(waiting);
+        note_gpu_outcome(&restarted, Outcome::StillUnsupported);
+        assert!(restarted.gpu_switch.lock().as_ref().unwrap().failed);
+    }
+
+    /// EternalMonitor's value, with capture on the old card retrying while
+    /// it is written.
+    struct RetriedDuringWrite<'a> {
+        value: Option<String>,
+        shared: &'a SharedControl,
+        refused: bool,
+    }
+
+    impl crate::gpu_preference::PreferenceStore for RetriedDuringWrite<'_> {
+        fn read(&self) -> Result<Option<String>, String> {
+            Ok(self.value.clone())
+        }
+        fn write(&mut self, value: Option<&str>) -> Result<(), String> {
+            note_gpu_outcome(
+                self.shared,
+                crate::gpu_preference::Outcome::StillUnsupported,
+            );
+            if self.refused {
+                return Err("access denied".into());
+            }
+            self.value = value.map(Into::into);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capture_retrying_during_a_switch_saved_here_never_judges_it() {
+        use crate::gpu_preference::{switch, Outcome, Preference, SwitchRecord};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let file = RefCell::new(None);
+        let mut store = RetriedDuringWrite {
+            value: None,
+            shared: &shared,
+            refused: false,
+        };
+        // A retry at every step: after settings.json has the record, during
+        // the write (the store above), and once the record is shared.
+        save_gpu_switch(&shared, |record| {
+            switch(
+                &mut store,
+                record,
+                Preference::HighPerformance,
+                "NVIDIA",
+                |saved| {
+                    *file.borrow_mut() = saved.clone();
+                    note_gpu_outcome(&shared, Outcome::StillUnsupported);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+        note_gpu_outcome(&shared, Outcome::StillUnsupported);
+        let record: SwitchRecord = shared.gpu_switch.lock().clone().unwrap();
+        assert!(record.checking && !record.failed, "{record:?}");
+        assert_eq!(*file.borrow(), Some(record));
+        assert!(shared.gpu_changed_here.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_refused_switch_shares_nothing_and_capture_still_judges_an_earlier_one() {
+        use crate::gpu_preference::{switch, Outcome, Preference, SwitchRecord};
+        // A restarted copy still waiting to judge an earlier switch.
+        let shared = SharedControl::new(9876, 15_000_000);
+        let earlier = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
+        *shared.gpu_switch.lock() = Some(earlier.clone());
+        let mut store = RetriedDuringWrite {
+            value: Some("GpuPreference=1;".into()),
+            shared: &shared,
+            refused: true,
+        };
+        let result = save_gpu_switch(&shared, |record| {
+            switch(
+                &mut store,
+                record,
+                Preference::HighPerformance,
+                "NVIDIA",
+                |_| Ok(()),
+            )
+        });
+        assert_eq!(result, Err("access denied".into()));
+        assert!(!shared.gpu_changed_here.load(Ordering::SeqCst));
+        // This process still runs on the card the value names: the retry
+        // during the write judged the earlier switch, and that verdict stays.
+        let record = shared.gpu_switch.lock().clone().unwrap();
+        assert!(record.failed && !record.checking, "{record:?}");
+        assert_eq!(record.gpu, earlier.gpu);
+        note_gpu_outcome(&shared, Outcome::StillUnsupported);
+        assert!(shared.gpu_switch.lock().as_ref().unwrap().failed);
+    }
 
     #[test]
     fn a_stuck_driver_call_is_waited_out_in_the_stage_not_restarted() {
