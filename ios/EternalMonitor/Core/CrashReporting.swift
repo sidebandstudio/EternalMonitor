@@ -180,13 +180,15 @@ struct MetricKitDiagnostic: Equatable {
     /// The last pass over a whole line: UUIDs, long hex runs and long
     /// base64-like runs become `<id>`, wherever they are. A binary name can
     /// carry one. A frame's address, which the line formats from a number,
-    /// is kept.
+    /// and the termination code, which `termination` reduced to hex or
+    /// decimal digits, are kept.
     static func scrub(_ line: String) -> String {
         [#"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#,
          // 16 hex digits or more with a letter among them (offsets stay far
          // shorter, and decimal counts and codes have no letter), except a
-         // frame's address after its `+0x<offset>@`.
-         #"(?<![0-9A-Za-z])(?<!\+0x[0-9a-f]{1,16}@)(0x)?(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Za-z])"#,
+         // frame's address after its `+0x<offset>@` and the termination's
+         // code, such as a 64-bit EXC_GUARD code.
+         #"(?<![0-9A-Za-z])(?<!\+0x[0-9a-f]{1,16}@)(?<!termination=namespace:[A-Z0-9_]{1,32} code:)(0x)?(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Za-z])"#,
          // 20 letters, digits, `_` or `-` or more, with letters and digits
          // both present. `=`, `+` and `.` split it, as they split the fields.
          #"(?<![0-9A-Za-z_-])(?=[0-9A-Za-z_-]*[0-9])(?=[0-9A-Za-z_-]*[A-Za-z])[0-9A-Za-z_-]{20,}(?![0-9A-Za-z_-])"#]

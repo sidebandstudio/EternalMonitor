@@ -143,6 +143,18 @@ final class CrashReportingTests: XCTestCase {
                        "exception_code=-9223372036854775808 frames=dyld+0x1a2b00", "decimal numbers and offsets stay")
     }
 
+    /// A 64-bit code says why the app was killed, so the scrub keeps it in
+    /// the termination field, and only there.
+    func testALongTerminationCodeIsKept() {
+        let code = "0xc00000000000ab12"
+        let line = crash(perThreadTree(frames: 2, binary: code), reason: "Namespace GUARD, Code \(code) GUARD_TYPE_MACH_PORT").line
+        XCTAssertTrue(line.hasSuffix(" termination=namespace:GUARD code:\(code)"), line)
+        XCTAssertTrue(line.contains(",<id>+0x1a2b10@0x100007fc1 "), "the same hex in a binary name: \(line)")
+        XCTAssertEqual(line.components(separatedBy: "c00000000000ab12").count, 2, line)
+        XCTAssertEqual(MetricKitDiagnostic.scrub("code:\(code) x code:\(code)"), "code:<id> x code:<id>", "outside the termination field")
+        XCTAssertTrue(crash(reason: "Namespace JETSAM, Code 0x8badf00dc00010ff").line.hasSuffix(" termination=namespace:JETSAM code:0x8badf00dc00010ff"))
+    }
+
     /// An early payload's offset can be the binary's load address, so each
     /// frame shows its address too. The scrub keeps an address of 16 hex
     /// digits, and still takes the same digits out of a binary name.
