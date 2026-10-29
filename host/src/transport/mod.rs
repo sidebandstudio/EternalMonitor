@@ -301,6 +301,11 @@ pub async fn start_sender(
                                                 decode_fps_x10 = report.decode_fps_x10,
                                                 decode_depth = report.decode_depth,
                                                 retransmits,
+                                                frags_received = report.frags_received,
+                                                frags_lost = report.frags_lost,
+                                                rtt_ms_x10 = report.rtt_ms_x10,
+                                                latency_ms_x10 = report.e2e_latency_ms_x10,
+                                                audio_lost = report.audio_packets_lost,
                                                 "Receiver report");
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
