@@ -1,10 +1,12 @@
 //! Behaviour the update manifest may change without a release.
 //!
 //! The rule: remote config never blocks or degrades a PC that works. It holds
-//! only the staging of the soft update prompt, a bounded attach wait, and
+//! only the staging of the soft update prompt, a bounded attach wait,
 //! narrow hardware rules that start Second screen sessions in the mirror on
 //! PCs where the second screen is known not to start, which Try again always
-//! overrides. There is no kill switch, minimum version or forced update.
+//! overrides, and rules that pick how the window draws on named graphics
+//! drivers from the next launch, below the user's choice and the PC's own
+//! crash memory. There is no kill switch, minimum version or forced update.
 //! Anything missing, unreadable, too old, from a newer schema or out of range
 //! means the built-in defaults, with one log line per app run.
 //!
@@ -35,6 +37,8 @@ pub const MAX_RULES: usize = 8;
 pub const GPU_DRIVER_SPAN: u32 = 99;
 /// The vendors a rule may name. A PC with any other graphics card matches no rule.
 pub const VENDORS: [&str; 4] = ["amd", "intel", "nvidia", "qualcomm"];
+/// The vendors a renderer rule may name, with their PCI vendor ids.
+const RENDERER_VENDORS: [(&str, u32); 3] = [("amd", 0x1002), ("intel", 0x8086), ("nvidia", 0x10de)];
 
 const DAY: u64 = 24 * 60 * 60;
 /// A saved config is applied this long after the check that fetched it. A PC
@@ -187,6 +191,7 @@ pub fn parse_utc(text: &str) -> Option<u64> {
 pub struct Config {
     pub attach_timeout_s: Option<u64>,
     pub rules: Vec<Rule>,
+    pub renderer_rules: Vec<RendererRule>,
 }
 
 /// `Err(reason)` when the whole object is unusable; the reason is a log token.
@@ -211,9 +216,16 @@ pub fn parse_config(value: Option<&Value>) -> Result<Config, &'static str> {
         }
         _ => Vec::new(),
     };
+    let renderer_rules = match object.get("renderer_rules") {
+        Some(Value::Array(rules)) if rules.len() <= MAX_RULES => {
+            rules.iter().filter_map(RendererRule::parse).collect()
+        }
+        _ => Vec::new(),
+    };
     Ok(Config {
         attach_timeout_s,
         rules,
+        renderer_rules,
     })
 }
 
@@ -372,6 +384,119 @@ fn within(value: &str, min: &str, max: &str) -> bool {
     }
 }
 
+// ── Window renderer ─────────────────────────────────────────────────────────
+
+/// `{ "vendor": "intel", "driver": { "min": "31.0.101.0", "max":
+/// "31.0.101.65535" }, "backend": "dx12" }`: the window draws with `backend`
+/// from the next launch when the graphics card it would draw on is of
+/// `vendor`, with a driver in the inclusive range (either end may be left
+/// out, not both; no `driver` is every driver). The user's Window drawing
+/// choice, `WGPU_BACKEND` and the renderer's crash memory all win over it
+/// (`gui/renderer.rs`). A key or value this app doesn't know, and the rule
+/// is ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererRule {
+    vendor: &'static str,
+    /// PCI vendor id.
+    vendor_id: u32,
+    min: Option<[u32; 4]>,
+    max: Option<[u32; 4]>,
+    pub backend: RendererBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererBackend {
+    Dx12,
+    Vulkan,
+    /// Microsoft's software renderer, on DX12.
+    Warp,
+}
+
+impl RendererBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dx12 => "dx12",
+            Self::Vulkan => "vulkan",
+            Self::Warp => "warp",
+        }
+    }
+}
+
+impl RendererRule {
+    pub fn parse(value: &Value) -> Option<Self> {
+        let rule = value.as_object()?;
+        if !rule
+            .keys()
+            .all(|key| ["vendor", "driver", "backend"].contains(&key.as_str()))
+        {
+            return None;
+        }
+        let vendor = rule.get("vendor")?.as_str()?;
+        let (vendor, vendor_id) = RENDERER_VENDORS
+            .into_iter()
+            .find(|(name, _)| *name == vendor)?;
+        let backend = rule.get("backend")?.as_str()?;
+        let backend = [
+            RendererBackend::Dx12,
+            RendererBackend::Vulkan,
+            RendererBackend::Warp,
+        ]
+        .into_iter()
+        .find(|b| b.name() == backend)?;
+        let (min, max) = match rule.get("driver") {
+            None => (None, None),
+            Some(driver) => {
+                let driver = driver.as_object()?;
+                if driver.is_empty() || !driver.keys().all(|key| key == "min" || key == "max") {
+                    return None;
+                }
+                // An end that is there must be a driver version, not null.
+                let end = |key: &str| match driver.get(key) {
+                    None => Some(None),
+                    Some(end) => Some(Some(driver_version(end.as_str()?)?)),
+                };
+                let (min, max) = (end("min")?, end("max")?);
+                if min.zip(max).is_some_and(|(min, max)| min > max) {
+                    return None;
+                }
+                (min, max)
+            }
+        };
+        Some(Self {
+            vendor,
+            vendor_id,
+            min,
+            max,
+            backend,
+        })
+    }
+
+    /// Whether the rule names a graphics card of PCI `vendor` with `driver`,
+    /// as the renderer's crash memory keys it. A driver that is no version
+    /// matches only a rule without a range.
+    pub fn matches(&self, vendor: u32, driver: &str) -> bool {
+        if vendor != self.vendor_id {
+            return false;
+        }
+        if self.min.is_none() && self.max.is_none() {
+            return true;
+        }
+        driver_version(driver).is_some_and(|driver| {
+            self.min.is_none_or(|min| min <= driver) && self.max.is_none_or(|max| driver <= max)
+        })
+    }
+
+    /// For the log: `intel`.
+    pub fn vendor(&self) -> &'static str {
+        self.vendor
+    }
+}
+
+/// A Windows driver version: four numbers, as `31.0.101.2111`.
+fn driver_version(text: &str) -> Option<[u32; 4]> {
+    numbers(text)?.try_into().ok()
+}
+
 // ── Saved between app runs ──────────────────────────────────────────────────
 
 /// `remote-config.json` beside the settings: the manifest's raw values, so
@@ -405,6 +530,13 @@ impl Applied {
     pub fn attach_timeout(&self) -> Option<Duration> {
         let seconds = self.config.as_ref().ok()?.attach_timeout_s?;
         Some(Duration::from_secs(seconds))
+    }
+
+    /// The renderer rules, for the next window to start.
+    pub fn renderer_rules(&self) -> &[RendererRule] {
+        self.config
+            .as_ref()
+            .map_or(&[], |config| &config.renderer_rules)
     }
 
     /// Whether a rule names this PC.
