@@ -30,6 +30,11 @@ use eternal_wire::v2::control::{
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
 
+/// The fake virtual display exists in debug builds only.
+#[cfg(debug_assertions)]
+#[path = "e2e_synthetic/second_screen.rs"]
+mod second_screen;
+
 /// Tests share process-global env (ETERNAL_*); run them one at a time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -114,7 +119,11 @@ fn init_test_tracing() {
         || std::env::var("RUST_TEST_NOCAPTURE").is_ok_and(|value| value != "0");
     if nocapture {
         let (writer, guard) = eternal_host::logging::non_blocking_output(std::io::stdout());
-        let subscriber = subscriber.with_writer(writer).finish().with(SummaryCapture);
+        let subscriber = subscriber
+            .with_writer(writer)
+            .finish()
+            .with(SummaryCapture)
+            .with(eternal_host::diagnostics::FallbackWatch);
         if subscriber.try_init().is_ok() {
             let _ = LIVE_OUTPUT.set(guard);
         }
@@ -123,6 +132,7 @@ fn init_test_tracing() {
             .with_test_writer()
             .finish()
             .with(SummaryCapture)
+            .with(eternal_host::diagnostics::FallbackWatch)
             .try_init();
     }
     eternal_host::diagnostics::install_ffmpeg_logging();
