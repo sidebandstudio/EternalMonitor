@@ -777,15 +777,32 @@ fn wait_while_blocked(shared: &SharedControl, generation: u64, delay: Duration) 
         {
             return false;
         }
-        let now_ms = crate::clock::host_now_us() / 1000;
-        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
-        shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
-        shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+        hold_heartbeats(shared);
         let now = Instant::now();
         if now >= deadline {
             return true;
         }
         std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
+}
+
+fn hold_heartbeats(shared: &SharedControl) {
+    use std::sync::atomic::Ordering;
+    let now_ms = crate::clock::host_now_us() / 1000;
+    shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+    shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+    shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+}
+
+/// `progress` for a time-limited call capture makes before its loop runs:
+/// the call's own limit, not the watchdog, decides when it took too long.
+/// A generation that was replaced meanwhile stamps nothing.
+#[cfg_attr(not(windows), allow(dead_code))] // Only DXGI capture waits on one.
+pub(crate) fn hold_watchdog(shared: &SharedControl, generation: u64) -> impl FnMut() + '_ {
+    move || {
+        if crate::supervisor::generation_is_current(generation) {
+            hold_heartbeats(shared);
+        }
     }
 }
 
