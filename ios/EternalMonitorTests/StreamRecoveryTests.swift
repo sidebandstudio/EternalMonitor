@@ -70,4 +70,102 @@ final class StreamRecoveryTests: XCTestCase {
         let quiet = await Task.detached { captured.keyframeRequests(within: 1) }.value
         XCTAssertEqual(quiet, [], "a 0.3.1 PC's numbers skip on their own")
     }
+
+    // MARK: - A lost frame through the reassembler
+
+    /// Sends `frame` as frames `seqs`, 100 ms apart, off the main actor.
+    private func stream(_ host: FakeUDPHost, _ frame: Data, seqs: ClosedRange<UInt32>) -> Task<Void, Never> {
+        Task.detached {
+            for seq in seqs {
+                host.sendFrame(frame, seq: seq, isKeyframe: false)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    private func until(_ description: String, seconds: Double = 5, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(condition(), description)
+    }
+
+    /// Requests about 600 ms apart: past the PC's 500 ms limit, well inside a second.
+    private func assertRetrySpacing(_ requests: [(reason: KeyframeReason, at: Date)], file: StaticString = #filePath,
+                                    line: UInt = #line) {
+        XCTAssertGreaterThanOrEqual(requests.count, 2, "\(requests.map(\.reason))", file: file, line: line)
+        for (earlier, later) in zip(requests, requests.dropFirst()) {
+            let gap = later.at.timeIntervalSince(earlier.at)
+            XCTAssertTrue((0.45...1.1).contains(gap), "retry \(gap) s after the last", file: file, line: line)
+        }
+    }
+
+    /// One P-frame loses a fragment and the reassembler drops it (without
+    /// repair, 100 ms after its latest fragment). The frames after it would
+    /// decode against a missing reference (-12909, smeared blocks): none is
+    /// shown, the last picture stays, keyframe requests repeat until the next
+    /// IDR, and that IDR ends the hold. A 0.3.4 PC's contiguous numbering
+    /// and a 0.3.3 PC's H.264 frame_num both reveal the loss.
+    func testALostPFrameHoldsThePictureAndAsksUntilTheNextIDR() async throws {
+        for hostCaps in [HelloAck.hostCapContiguousFrameSeq, 0] {
+            let units = try twoGOPs()
+            let host = FakeUDPHost()
+            let manager = try await streaming(host, hostCaps: hostCaps)
+            host.sendFrame(units[1], seq: 2, isKeyframe: false)
+            try await until("the P-frame before the loss is shown") { manager.debugState.decodedFrames == 2 }
+
+            host.sendFirstFragment(units[2], seq: 3)
+            let following = stream(host, units[3], seqs: 4...20)
+            let held = await Task.detached { host.timedKeyframeRequests(within: 1.9) }.value
+            XCTAssertEqual(manager.debugState.decodedFrames, 2, "caps \(hostCaps): no frame after the loss is shown")
+            XCTAssertNotNil(manager.videoDecoder?.keyframeWaitUs, "caps \(hostCaps): the last picture is held")
+            XCTAssertTrue(manager.pictureRestoring, "caps \(hostCaps): Restoring the picture after 1 s")
+            // The reassembler asks once as it drops the frame; the held decoder asks after.
+            XCTAssertEqual(held.first?.reason, .gapLoss, "caps \(hostCaps): \(held.map(\.reason))")
+            XCTAssertTrue(held.dropFirst().allSatisfy { $0.reason == .decodeError }, "caps \(hostCaps): \(held.map(\.reason))")
+            XCTAssertGreaterThanOrEqual(held.count, 3, "caps \(hostCaps): asked at once, then again")
+            assertRetrySpacing(held)
+            await following.value
+
+            host.sendFrame(units[4], seq: 21, isKeyframe: true)
+            let resumed = stream(host, units[5], seqs: 22...22)
+            await resumed.value
+            try await until("caps \(hostCaps): the IDR and the frame after it are shown") {
+                manager.debugState.decodedFrames == 4
+            }
+            let after = await Task.detached { host.keyframeRequests(within: 1.2) }.value
+            XCTAssertEqual(after, [], "caps \(hostCaps): the IDR ends the requests")
+            XCTAssertNil(manager.videoDecoder?.keyframeWaitUs)
+            try await until("caps \(hostCaps): the note goes") { !manager.pictureRestoring }
+            XCTAssertFalse(manager.diagnostics.contains { $0.category == "decode" && $0.message.contains("-12909") },
+                           "caps \(hostCaps): nothing was decoded against the missing frame")
+            manager.cancel()
+        }
+    }
+
+    /// The session's first IDR is lost: the P-frames that arrive instead
+    /// are not decoded, and each 600 ms one of them asks again until an IDR
+    /// comes and the picture starts.
+    func testALostFirstIDRIsAskedForUntilOneArrives() async throws {
+        let units = try twoGOPs()
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession(hostCaps: HelloAck.hostCapContiguousFrameSeq) }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+
+        let dependents = stream(host, units[1], seqs: 2...16)
+        let asked = await Task.detached { host.timedKeyframeRequests(within: 1.6) }.value
+        XCTAssertEqual(manager.debugState.decodedFrames, 0)
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertTrue(asked.allSatisfy { $0.reason == .decodeError }, "\(asked.map(\.reason))")
+        assertRetrySpacing(asked)
+        await dependents.value
+
+        host.sendFrame(units[4], seq: 17, isKeyframe: true)
+        try await until("the IDR starts the picture") { manager.state == .connected }
+        XCTAssertEqual(manager.debugState.decodedFrames, 1)
+        let after = await Task.detached { host.keyframeRequests(within: 1) }.value
+        XCTAssertEqual(after, [])
+    }
 }

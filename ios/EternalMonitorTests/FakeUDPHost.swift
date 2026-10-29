@@ -113,15 +113,27 @@ final class FakeUDPHost: @unchecked Sendable {
         }
     }
 
+    /// Frame `seq` as the first of two fragments, whose second never comes:
+    /// a frame the reassembler gives up on.
+    func sendFirstFragment(_ frame: Data, seq: UInt32) {
+        send(MediaHeader(sessionId: 41, streamEpoch: 1, frameSeq: seq, fragIndex: 0, fragCount: 2, isKeyframe: false,
+            captureTimestampUs: UInt64(seq) * 16_667, payloadLen: UInt16(frame.count)).encode(payload: frame))
+    }
+
     /// The reasons of the keyframe requests received within `seconds`.
     func keyframeRequests(within seconds: Double) -> [KeyframeReason] {
-        var reasons: [KeyframeReason] = []
+        timedKeyframeRequests(within: seconds).map(\.reason)
+    }
+
+    /// The keyframe requests received within `seconds`, with when each came.
+    func timedKeyframeRequests(within seconds: Double) -> [(reason: KeyframeReason, at: Date)] {
+        var requests: [(reason: KeyframeReason, at: Date)] = []
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             guard let (data, _, _) = receive() else { continue }
-            if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { reasons.append(request.reason) }
+            if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { requests.append((request.reason, Date())) }
         }
-        return reasons
+        return requests
     }
 
     /// The BYE reasons received until the iPad has been quiet for 300 ms.

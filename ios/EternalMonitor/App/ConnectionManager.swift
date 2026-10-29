@@ -143,7 +143,7 @@ final class ConnectionManager: ObservableObject {
     private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
-    private var videoDecoder: VideoDecoder?
+    private(set) var videoDecoder: VideoDecoder?
     private var audioPlayer: AudioPlayer?
     private var audioPreference: Bool?
     private var timeoutTask: Task<Void, Never>?
@@ -152,7 +152,7 @@ final class ConnectionManager: ObservableObject {
     /// old per-datagram MainActor Task (~2 per datagram, ~2,800 hops/s at
     /// 1080p60) throttled the whole receive path.
     private let streamCounters = StreamCounters()
-    private var debugState = ConnectionDebugState()
+    private(set) var debugState = ConnectionDebugState()
     // Whether we've already granted the one-time timeout extension that fires when datagrams
     // start arriving (so a slow/jittery network gets a fresh window to finish reassembly+decode).
     private var didExtendTimeout = false
