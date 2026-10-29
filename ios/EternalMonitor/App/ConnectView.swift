@@ -3,6 +3,7 @@ import SwiftUI
 struct ConnectView: View {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var settings: AppSettings
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var recentStore = RecentConnectionStore.shared
     @StateObject private var scanner = NetworkScanner()
     @ObservedObject private var pairings = PairingStore.shared
@@ -187,6 +188,11 @@ struct ConnectView: View {
                 if connectionManager.state == .disconnected && !scanner.isScanning && scanner.hosts.isEmpty {
                     scanner.startScan()
                 }
+            }
+            // Back from Settings, where Local Network may now be on: search
+            // again rather than keep showing the old denial.
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active && scanner.searchProblem == .localNetworkOff { scanner.startScan() }
             }
             .animation(.easeInOut(duration: 0.2), value: isConnecting)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
@@ -604,10 +610,11 @@ struct ConnectView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("connect.scanEmpty")
                 }
-                if scanner.searchProblem == .localNetworkOff {
-                    Button("Open Settings") { openAppSettings() }
-                        .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
-                } else {
+                HStack(spacing: 10) {
+                    if scanner.searchProblem == .localNetworkOff {
+                        Button("Open Settings") { openAppSettings() }
+                            .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                    }
                     Button("Search again") { scanner.startScan() }
                         .buttonStyle(PillButtonStyle())
                 }
@@ -623,7 +630,8 @@ struct ConnectView: View {
     static func scanEmptyAdvice(_ problem: NetworkScanner.SearchProblem?) -> (title: String?, detail: String) {
         switch problem {
         case .localNetworkOff:
-            return ("EternalMonitor can't look for PCs", "Turn on Local Network for EternalMonitor in Settings.")
+            return ("EternalMonitor can't look for PCs",
+                "Local Network is turned off for EternalMonitor. " + ConnectionProblem.localNetworkSteps(then: "Search again"))
         case .couldNotSearch:
             // NetServiceBrowser can report Local Network being off this way
             // too, so the Settings advice stays as the last resort.

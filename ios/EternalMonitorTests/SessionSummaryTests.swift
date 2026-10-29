@@ -162,6 +162,35 @@ final class SessionSummaryTests: XCTestCase {
         Self.assertContract(line)
     }
 
+    /// Try again opens a new connection, which asks iPadOS again: once
+    /// Local Network is on, the old denial isn't shown or remembered.
+    func testTryAgainAfterLocalNetworkDeniedAsksIPadOSAgain() async throws {
+        let links = Links()
+        let manager = ConnectionManager(udpReceiver: { _ in links.make() })
+        manager.connect(host: "192.168.1.20", port: 9876)
+        links.all.last?.onError?(LinkError(.localNetworkDenied, "UDP path not ready: Local network prohibited"))
+        try await until("blocked") { manager.problem == .localNetworkBlocked }
+        XCTAssertEqual(manager.problem?.actions, [.openSettings, .retry])
+
+        manager.retry()
+        XCTAssertEqual(links.all.count, 2, "a new connection, not the failed one")
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        // Still off: the new connection says so again.
+        links.all.last?.onError?(LinkError(.localNetworkDenied, "UDP path not ready: Local network prohibited"))
+        try await until("blocked again") { manager.problem == .localNetworkBlocked }
+
+        // Turned on: the third connection opens, and nothing says Local Network.
+        manager.retry()
+        XCTAssertEqual(links.all.count, 3)
+        links.all.last?.onListenerReady?(50000)
+        links.all.last?.onConnectionEstablished?()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        manager.disconnect()
+    }
+
     /// Heartbeats stop during a session: after the grace the app ends it as
     /// `pcStoppedResponding`, tells the PC `error`, and the summary says
     /// liveness with the session and the nonce the PC answered.
@@ -279,6 +308,15 @@ final class SessionSummaryTests: XCTestCase {
 }
 
 /// A Wi-Fi link that never gets ready, as when Local Network access is off.
+private final class Links {
+    private(set) var all: [DeniedLink] = []
+    func make() -> DeniedLink {
+        let link = DeniedLink()
+        all.append(link)
+        return link
+    }
+}
+
 private final class DeniedLink: MediaLink {
     let datagrams = MediaDatagrams()
     let controlQueue = DispatchQueue(label: "test.denied-link")

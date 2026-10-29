@@ -4,7 +4,7 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
+/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|error-local-network|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
 /// Launch with `-feedbackLongSessions 3` to show the one-time feedback card.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
@@ -54,6 +54,8 @@ enum UIPreview {
             manager.problem = .routerAddress
         case "error-updating":
             manager.problem = .pcUpdating(.reconnecting)
+        case "error-local-network":
+            manager.problem = .localNetworkBlocked
         case "mismatch":
             manager.versionMismatch = .iPadOlder
             manager.connectionError = VersionMismatch.iPadOlder.message
