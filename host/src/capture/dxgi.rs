@@ -830,11 +830,18 @@ fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl) {
     }
     let facts = crate::gpu_preference::facts().unwrap_or_default();
     let diagnosis = crate::gpu_preference::diagnose(&facts, &screen);
+    let card = |preference| {
+        facts
+            .card_for(preference)
+            .map_or("unknown", |a| a.name.as_str())
+    };
     info!(
         screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
         app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str()),
         switch = ?diagnosis.as_ref().and_then(|d| d.preference),
         cards = facts.adapters.len(),
+        power_saving_gpu = card(crate::gpu_preference::Preference::PowerSaving),
+        high_performance_gpu = card(crate::gpu_preference::Preference::HighPerformance),
         "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
     );
     *shared.gpu_diagnosis.lock() = diagnosis;

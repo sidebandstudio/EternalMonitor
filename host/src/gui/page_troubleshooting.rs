@@ -393,6 +393,7 @@ pub(super) fn gpu_option_label(facts: &GpuFacts, preference: Preference) -> Stri
 pub(super) fn graphics_card_description(facts: Option<&GpuFacts>) -> String {
     match facts {
         Some(facts) if facts.has_choice() => "Which card Windows runs EternalMonitor on. On a laptop, pick the card your screen is connected to.".to_string(),
+        Some(facts) if facts.adapters.len() > 1 => "Windows can't say for certain which card each choice picks on this PC. Choose one in Windows Settings > System > Display > Graphics.".to_string(),
         Some(facts) => match facts.running_on() {
             Some(card) => format!(
                 "This PC has one graphics card, the {}, so there is nothing to choose.",
@@ -407,7 +408,7 @@ pub(super) fn graphics_card_description(facts: Option<&GpuFacts>) -> String {
 /// Which card runs the app now and which card each screen is connected to.
 pub(super) fn wiring_lines(facts: &GpuFacts) -> Vec<String> {
     let mut lines = Vec::new();
-    if !facts.has_choice() {
+    if facts.adapters.len() < 2 {
         return lines;
     }
     if let Some(card) = facts.running_on() {

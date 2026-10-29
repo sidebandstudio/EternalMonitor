@@ -26,9 +26,9 @@ pub type AdapterId = (i32, u32);
 pub enum Preference {
     /// No preference: Windows decides (value 0 or none).
     Automatic,
-    /// 1: the adapter `EnumAdapterByGpuPreference(MINIMUM_POWER)` lists first.
+    /// 1: the integrated adapter.
     PowerSaving,
-    /// 2: the adapter `EnumAdapterByGpuPreference(HIGH_PERFORMANCE)` lists first.
+    /// 2: an external GPU if there is one, otherwise the internal card.
     HighPerformance,
 }
 
@@ -65,7 +65,8 @@ pub struct GpuFacts {
     /// Hardware adapters in DXGI order. Windows lists the adapter the
     /// process runs on first.
     pub adapters: Vec<Adapter>,
-    /// The first adapter for each preference, in Windows' own order.
+    /// The adapter each preference selects, from [`preference_cards`];
+    /// `None` when that is not certain.
     pub power_saving: Option<AdapterId>,
     pub high_performance: Option<AdapterId>,
     /// Active screens: GDI name (`\\.\DISPLAY1`) and the adapter wired to it.
@@ -112,12 +113,64 @@ impl GpuFacts {
     }
 }
 
-/// The preference certain to put EternalMonitor on `wired`: the one whose
-/// first adapter, in Windows' own order, is that card. `None` when the app
+/// How Windows ranks an adapter for the per-app graphics preference, from
+/// DXCore's hardware properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterKind {
+    /// Built into the processor: what Power saving selects.
+    Integrated,
+    /// An internal graphics card.
+    Discrete,
+    /// An external GPU. High performance ranks these ahead of internal cards.
+    Detachable,
+    /// Not integrated, but this Windows can't say whether it is detachable.
+    NotIntegrated,
+    /// Not a hardware adapter (the software renderer, a virtual display).
+    Ignored,
+    /// Windows could not classify it.
+    Unknown,
+}
+
+/// The adapter each preference selects, as (Power saving, High
+/// performance), following `EnumAdapterByGpuPreference`'s documented order:
+/// Power saving puts integrated adapters first; High performance puts
+/// detachable ones first, then the other cards. Video memory plays no part:
+/// a 16 GB internal card loses to an 8 GB eGPU. Each is `None` unless one
+/// adapter alone holds that rank and every adapter could be classified.
+///
+/// `EnumAdapterByGpuPreference` itself can't be asked: once a per-app value
+/// is set, it lists the forced card first for both preferences (reference
+/// PC, forced onto its iGPU: neither preference named the RTX card).
+pub fn preference_cards(
+    kinds: &[(AdapterId, AdapterKind)],
+) -> (Option<AdapterId>, Option<AdapterId>) {
+    use AdapterKind::*;
+    if kinds.iter().any(|(_, kind)| *kind == Unknown) {
+        return (None, None);
+    }
+    let only = |wanted: &[AdapterKind]| {
+        let mut matching = kinds.iter().filter(|(_, kind)| wanted.contains(kind));
+        match (matching.next(), matching.next()) {
+            (Some((id, _)), None) => Some(*id),
+            _ => None,
+        }
+    };
+    let detachable = kinds.iter().filter(|(_, kind)| *kind == Detachable).count();
+    let high_performance = match detachable {
+        0 => only(&[Discrete, NotIntegrated]),
+        // An undetermined card might be another eGPU.
+        1 if !kinds.iter().any(|(_, kind)| *kind == NotIntegrated) => only(&[Detachable]),
+        _ => None,
+    };
+    (only(&[Integrated]), high_performance)
+}
+
+/// The preference certain to put EternalMonitor on `wired`: the one that
+/// selects that card. `None` when the app
 /// already runs there (switching cannot help: a MUX laptop in dGPU-only
-/// mode, a single card), or when neither preference selects it (a third card
-/// that loses High performance to an eGPU or a larger card); the notice
-/// then explains Windows Settings instead.
+/// mode, a single card), or when neither preference certainly selects it (an
+/// internal card that loses High performance to an eGPU); the notice then
+/// explains Windows Settings instead.
 pub fn preference_for(wired: AdapterId, facts: &GpuFacts) -> Option<Preference> {
     if facts.running_on().map(|a| a.id) == Some(wired) {
         return None;
@@ -395,7 +448,9 @@ mod windows_impl {
     use std::os::windows::ffi::OsStrExt;
     use std::time::Duration;
 
-    use windows::core::{w, PCWSTR};
+    use std::ffi::c_void;
+
+    use windows::core::{s, w, Interface, GUID, HRESULT, PCWSTR};
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -403,17 +458,20 @@ mod windows_impl {
         QDC_ONLY_ACTIVE_PATHS,
     };
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LUID};
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIFactory6,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+    use windows::Win32::Graphics::DXCore::{
+        DXCoreAdapterProperty, IDXCoreAdapter, IDXCoreAdapterFactory, IDXCoreAdapterList,
+        InstanceLuid, IsDetachable, IsHardware, IsIntegrated,
+        DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS,
     };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
         RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
         REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
-    use super::{AdapterId, Change, GpuFacts, PreferenceStore};
+    use super::{AdapterId, AdapterKind, Change, GpuFacts, PreferenceStore};
 
     const PREFERENCES_KEY: PCWSTR = w!("Software\\Microsoft\\DirectX\\UserGpuPreferences");
     /// DXGI_ADAPTER_FLAG_SOFTWARE.
@@ -445,20 +503,68 @@ mod windows_impl {
                 })
             })
             .collect();
-        // IDXGIFactory6 is in every Windows 10 the installer accepts (1809+).
-        let first = |preference| {
-            let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1() }.ok()?;
-            let adapter: IDXGIAdapter1 =
-                unsafe { factory.EnumAdapterByGpuPreference(0, preference) }.ok()?;
-            let desc = unsafe { adapter.GetDesc1() }.ok()?;
-            (desc.Flags & FLAG_SOFTWARE == 0).then(|| id(desc.AdapterLuid))
-        };
+        let (power_saving, high_performance) =
+            super::preference_cards(&classify().unwrap_or_default());
         Some(GpuFacts {
             adapters,
-            power_saving: first(DXGI_GPU_PREFERENCE_MINIMUM_POWER),
-            high_performance: first(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+            power_saving,
+            high_performance,
             screens: screens(),
         })
+    }
+
+    /// Every adapter DXCore lists for Direct3D 11, by how the per-app
+    /// preference ranks it. `None` without DXCore (loaded at run time:
+    /// Windows 10 1809, which the installer accepts, may lack it).
+    fn classify() -> Option<Vec<(AdapterId, AdapterKind)>> {
+        type CreateFactory = unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> HRESULT;
+        let module = unsafe { LoadLibraryW(w!("dxcore.dll")) }.ok()?;
+        let create = unsafe { GetProcAddress(module, s!("DXCoreCreateAdapterFactory")) }?;
+        let create: CreateFactory = unsafe { std::mem::transmute(create) };
+        let mut raw = std::ptr::null_mut();
+        unsafe { create(&IDXCoreAdapterFactory::IID, &mut raw) }
+            .ok()
+            .ok()?;
+        let factory = unsafe { IDXCoreAdapterFactory::from_raw(raw) };
+        let list: IDXCoreAdapterList =
+            unsafe { factory.CreateAdapterList(&[DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS]) }
+                .ok()?;
+        let mut adapters = Vec::new();
+        for index in 0..unsafe { list.GetAdapterCount() } {
+            let Ok(adapter) = (unsafe { list.GetAdapter::<IDXCoreAdapter>(index) }) else {
+                continue;
+            };
+            let mut luid = LUID::default();
+            if unsafe {
+                adapter.GetProperty(
+                    InstanceLuid,
+                    std::mem::size_of::<LUID>(),
+                    (&mut luid as *mut LUID).cast(),
+                )
+            }
+            .is_err()
+            {
+                continue;
+            }
+            let flag = |property: DXCoreAdapterProperty| -> Option<bool> {
+                if !unsafe { adapter.IsPropertySupported(property) } {
+                    return None;
+                }
+                let mut value = 0u8;
+                unsafe { adapter.GetProperty(property, 1, (&mut value as *mut u8).cast()) }.ok()?;
+                Some(value != 0)
+            };
+            let kind = match (flag(IsHardware), flag(IsIntegrated), flag(IsDetachable)) {
+                (Some(false), _, _) => AdapterKind::Ignored,
+                (_, None, _) => AdapterKind::Unknown,
+                (_, Some(true), _) => AdapterKind::Integrated,
+                (_, Some(false), Some(true)) => AdapterKind::Detachable,
+                (_, Some(false), Some(false)) => AdapterKind::Discrete,
+                (_, Some(false), None) => AdapterKind::NotIntegrated,
+            };
+            adapters.push((id(luid), kind));
+        }
+        Some(adapters)
     }
 
     /// Each active screen's GDI name and the adapter the display
@@ -840,6 +946,51 @@ mod tests {
             "Intel(R) Iris(R) Xe Graphics"
         );
         assert_eq!(facts.card_for(Preference::Automatic), None);
+    }
+
+    #[test]
+    fn each_preference_selects_the_card_windows_ranks_first_for_it() {
+        use AdapterKind::*;
+        const BASIC: AdapterId = (0, 0x4444);
+        // The reference PC as DXCore classified it while forced onto its
+        // iGPU: the RTX card, the Radeon iGPU and Microsoft's renderer.
+        assert_eq!(
+            preference_cards(&[(DGPU, Discrete), (IGPU, Integrated), (BASIC, Ignored)]),
+            (Some(IGPU), Some(DGPU))
+        );
+        // An eGPU wins High performance over the internal card.
+        assert_eq!(
+            preference_cards(&[(IGPU, Integrated), (DGPU, Discrete), (EGPU, Detachable)]),
+            (Some(IGPU), Some(EGPU))
+        );
+        // A MUX laptop in dGPU-only mode hides its iGPU.
+        assert_eq!(preference_cards(&[(DGPU, Discrete)]), (None, Some(DGPU)));
+        // Two internal cards, or a card that might be another eGPU: High
+        // performance is not certain.
+        assert_eq!(
+            preference_cards(&[(IGPU, Integrated), (DGPU, Discrete), (EGPU, Discrete)]),
+            (Some(IGPU), None)
+        );
+        assert_eq!(
+            preference_cards(&[
+                (IGPU, Integrated),
+                (DGPU, NotIntegrated),
+                (EGPU, Detachable)
+            ]),
+            (Some(IGPU), None)
+        );
+        // An older Windows that can't say whether a card is detachable.
+        assert_eq!(
+            preference_cards(&[(IGPU, Integrated), (DGPU, NotIntegrated)]),
+            (Some(IGPU), Some(DGPU))
+        );
+        // One adapter Windows can't classify makes neither certain; nor
+        // does no DXCore at all.
+        assert_eq!(
+            preference_cards(&[(IGPU, Integrated), (DGPU, Unknown)]),
+            (None, None)
+        );
+        assert_eq!(preference_cards(&[]), (None, None));
     }
 
     #[test]

@@ -831,6 +831,15 @@ fn troubleshooting_names_each_cards_choice_in_plain_words() {
     };
     assert!(graphics_card_description(Some(&single)).contains("one graphics card"));
     assert!(wiring_lines(&single).is_empty());
+    // Two cards whose ranks Windows can't settle: no choice offered, but the
+    // wiring still shows and the text points at Windows Settings.
+    let uncertain = GpuFacts {
+        power_saving: None,
+        high_performance: None,
+        ..facts.clone()
+    };
+    assert!(graphics_card_description(Some(&uncertain)).contains("Windows Settings"));
+    assert_eq!(wiring_lines(&uncertain).len(), 3);
     for drawing in [
         WindowDrawing::Automatic,
         WindowDrawing::Dx12,
