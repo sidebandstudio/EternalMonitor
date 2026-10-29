@@ -10,6 +10,7 @@
 pub(crate) mod display;
 pub(crate) mod lock;
 mod offer;
+pub mod port;
 mod process;
 mod record;
 mod reporter;
