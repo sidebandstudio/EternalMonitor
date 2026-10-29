@@ -1279,6 +1279,32 @@ pub struct Updater {
     in_place: bool,
 }
 
+/// Debug builds: whether the GUI tests are holding update checks. A held
+/// check waits before its request, so the request's 10 s timeout starts
+/// only once a test is ready for the answer.
+#[cfg(debug_assertions)]
+static CHECKS_HELD: (parking_lot::Mutex<bool>, parking_lot::Condvar) =
+    (parking_lot::const_mutex(false), parking_lot::Condvar::new());
+
+/// Debug builds only: holds update checks before their request, or lets
+/// them go.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn hold_checks(hold: bool) {
+    *CHECKS_HELD.0.lock() = hold;
+    CHECKS_HELD.1.notify_all();
+}
+
+fn wait_while_checks_held() {
+    #[cfg(debug_assertions)]
+    {
+        let mut held = CHECKS_HELD.0.lock();
+        while *held {
+            CHECKS_HELD.1.wait(&mut held);
+        }
+    }
+}
+
 impl Updater {
     pub fn start(auto: bool, session: SharedSession, wake: Wake) -> Self {
         let path = state_path();
@@ -1434,6 +1460,7 @@ impl Worker {
                 Command::Check { manual } => {
                     self.state.lock().begin_check(manual);
                     (self.wake)(None);
+                    wait_while_checks_held();
                     let result = fetch_manifest(&self.endpoints);
                     let notify =
                         self.update(|state| state.finish_check(now_secs(), manual, result));

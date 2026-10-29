@@ -28,6 +28,9 @@ pub enum CaptureBlock {
     TooManyCaptureApps,
     /// The Windows session is disconnected or remote.
     SessionDisconnected,
+    /// A graphics driver call did not return in time (see `crate::stall`).
+    /// Capture waits for it and resumes by itself when it does.
+    DriverNotResponding,
 }
 
 impl CaptureBlock {
@@ -43,6 +46,47 @@ impl CaptureBlock {
             _ => None,
         }
     }
+}
+
+/// Errors a GPU reset, a display change or a shortage of memory raises while
+/// it lasts: DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET,
+/// _ACCESS_LOST and E_OUTOFMEMORY. Freeing the memory changes nothing in a
+/// saved record's fingerprint, so saving it would keep a working PC on the
+/// mirror.
+const PASSING_ERRORS: [u32; 5] = [
+    0x887A_0005,
+    0x887A_0006,
+    0x887A_0007,
+    0x887A_0026,
+    0x8007_000E,
+];
+
+/// [`passing_error`] for a DXGI/Win32 HRESULT.
+pub fn passing_code(code: i32) -> bool {
+    match CaptureBlock::from_hresult(code) {
+        Some(block) => block != CaptureBlock::UnsupportedOnThisGpu,
+        None => PASSING_ERRORS.contains(&(code as u32)),
+    }
+}
+
+/// Whether a capture error comes from a state of Windows that passes (a
+/// secure screen, a display or mode change, a GPU reset, another capturing
+/// app, a disconnected session) rather than from the display itself. Such a
+/// second screen failure is not remembered for later app runs. A display
+/// Windows will not duplicate from this GPU is the PC's. A driver call that
+/// did not return in time passes too, like a hung device.
+pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() {
+        return unavailable.block != CaptureBlock::UnsupportedOnThisGpu;
+    }
+    if error.downcast_ref::<crate::stall::Stall>().is_some() {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Some(error) = error.downcast_ref::<windows::core::Error>() {
+        return passing_code(error.code().0);
+    }
+    false
 }
 
 /// The capture loop could not get at the desktop for a reason outside the
@@ -150,12 +194,37 @@ pub fn run_until_unblocked(
     mut wait: impl FnMut(Duration) -> bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry = BlockedRetry::default();
+    let mut stalled = 0;
     let mut frame_number = 0;
     loop {
         let error = match capture(&mut frame_number) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
+        // A driver call that did not return in time, or was refused while an
+        // earlier one is stuck. Restarting the pipeline cannot free the
+        // driver, and refusals would spend the restart budget until the
+        // supervisor gave up for good, with nothing to start capture again
+        // once the call returns. Retry here at the blocked pace instead.
+        if error.downcast_ref::<crate::stall::Stall>().is_some() {
+            let delay = Duration::from_millis(
+                BLOCKED_RETRY_MS[(stalled as usize).min(BLOCKED_RETRY_MS.len() - 1)],
+            );
+            if stalled == 0 {
+                warn!(
+                    error = %error,
+                    "A graphics driver call is stuck — retrying capture until it returns"
+                );
+            }
+            // Tell the GUI why; the first working capture clears it.
+            *shared.capture_block.lock() = Some(CaptureBlock::DriverNotResponding);
+            stalled += 1;
+            if !wait(delay) {
+                return Ok(());
+            }
+            continue;
+        }
+        stalled = 0;
         let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() else {
             return Err(error);
         };
@@ -185,6 +254,100 @@ pub fn note_capture_resumed(shared: &SharedControl) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_stuck_driver_call_is_waited_out_in_the_stage_not_restarted() {
+        use crate::stall::{no_hooks, run_in, Call, Lanes, Stall, Wait};
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        let stepping = || {
+            let start = Instant::now();
+            let reads = AtomicU64::new(0);
+            move || start + Duration::from_millis(100 * reads.fetch_add(1, SeqCst))
+        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut stuck = Some(move || {
+            let _ = released.recv();
+        });
+        let mut release = Some(release);
+        let mut outcomes = Vec::new();
+        let mut waited = Duration::ZERO;
+        // Each attempt makes the device call through the real runner: the
+        // first hangs and times out, later ones are refused until it returns.
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                let call = stuck.take();
+                let result = run_in(
+                    lanes,
+                    Call::D3d11CreateDevice,
+                    Wait {
+                        limits: Call::D3d11CreateDevice.limits(),
+                        slice: Duration::from_millis(1),
+                        now: stepping(),
+                    },
+                    move || {
+                        if let Some(call) = call {
+                            call();
+                        }
+                    },
+                    || {},
+                    no_hooks(),
+                );
+                outcomes.push(result);
+                result.map_err(|stall: Stall| stall.into())
+            },
+            |delay| {
+                assert_eq!(
+                    *shared.capture_block.lock(),
+                    Some(CaptureBlock::DriverNotResponding)
+                );
+                waited += delay;
+                // Over a minute in, the driver returns the stuck call.
+                if waited >= Duration::from_secs(65) {
+                    if let Some(release) = release.take() {
+                        release.send(()).unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(60);
+                        while lanes.abandoned(Call::D3d11CreateDevice) != 0 {
+                            assert!(Instant::now() < deadline, "the lane did not free");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+                true
+            },
+        );
+        // Capture resumed by itself, and nothing reached the supervisor.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(outcomes[0], Err(Stall::TimedOut { .. })));
+        let refused = outcomes[1..outcomes.len() - 1]
+            .iter()
+            .all(|outcome| matches!(outcome, Err(Stall::Refused { .. })));
+        assert!(refused, "{outcomes:?}");
+        assert_eq!(outcomes.last(), Some(&Ok(())));
+        // At the blocked pace, not a spin: 5 s apart once settled.
+        assert!(outcomes.len() < 25, "{} attempts", outcomes.len());
+        // The GUI said why throughout; frames flowing again clear it.
+        assert_eq!(
+            *shared.capture_block.lock(),
+            Some(CaptureBlock::DriverNotResponding)
+        );
+        note_capture_resumed(&shared);
+        assert!(shared.capture_block.lock().is_none());
+        // A real failure still goes straight to the supervisor's budget.
+        let mut attempts = 0;
+        let failed = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                Err("DuplicateOutput failed".into())
+            },
+            |_| panic!("a real failure was retried"),
+        );
+        assert!(failed.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn repeated_losses_back_off_instead_of_spinning() {
@@ -253,6 +416,56 @@ mod tests {
             Some(CaptureBlock::DisplayChanging)
         );
         assert_eq!(CaptureBlock::from_hresult(code(0x8007_000E)), None);
+    }
+
+    #[test]
+    fn only_a_display_this_gpu_cannot_duplicate_is_the_pcs_failure() {
+        let unavailable = |block| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(CaptureUnavailable {
+                block,
+                detail: String::new(),
+            })
+        };
+        for block in [
+            CaptureBlock::SecureDesktop,
+            CaptureBlock::DisplayChanging,
+            CaptureBlock::TooManyCaptureApps,
+            CaptureBlock::SessionDisconnected,
+        ] {
+            assert!(passing_error(unavailable(block).as_ref()), "{block:?}");
+        }
+        assert!(!passing_error(
+            unavailable(CaptureBlock::UnsupportedOnThisGpu).as_ref()
+        ));
+        let other: Box<dyn std::error::Error + Send + Sync> = "DuplicateOutput failed".into();
+        assert!(!passing_error(other.as_ref()));
+        let call = crate::stall::Call::DuplicateOutput;
+        for stall in [
+            crate::stall::Stall::TimedOut {
+                call,
+                after: Duration::from_secs(3),
+            },
+            crate::stall::Stall::Refused { call },
+        ] {
+            let error: Box<dyn std::error::Error + Send + Sync> = Box::new(stall);
+            assert!(passing_error(error.as_ref()), "{stall:?}");
+        }
+        let code = |hresult: u32| hresult as i32;
+        for passing in [
+            0x8007_0005, // E_ACCESSDENIED
+            0x887A_0022, // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+            0x887A_0028, // DXGI_ERROR_SESSION_DISCONNECTED
+            0x887A_0005, // DXGI_ERROR_DEVICE_REMOVED
+            0x887A_0006, // DXGI_ERROR_DEVICE_HUNG
+            0x887A_0007, // DXGI_ERROR_DEVICE_RESET
+            0x887A_0026, // DXGI_ERROR_ACCESS_LOST
+            0x8007_000E, // E_OUTOFMEMORY, until another app frees memory
+        ] {
+            assert!(passing_code(code(passing)), "{passing:#x}");
+        }
+        for persistent in [0x887A_0004, 0x8007_0057, 0x8000_4005] {
+            assert!(!passing_code(code(persistent)), "{persistent:#x}");
+        }
     }
 
     fn blocked(block: CaptureBlock) -> Box<dyn std::error::Error + Send + Sync> {

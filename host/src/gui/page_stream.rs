@@ -125,8 +125,13 @@ impl AnalyzerApp {
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
         let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
-        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
+        if let Some(mut notice) =
+            second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
         {
+            add_later_retry(
+                &mut notice,
+                crate::capture::second_screen::retries_later(&self.control.shared),
+            );
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -619,6 +624,7 @@ fn simulate_problem(
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "graphics-driver-stuck" => *block = Some(CaptureBlock::DriverNotResponding),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -735,6 +741,16 @@ pub(super) fn second_screen_notice(
     }
 }
 
+/// Say that the host tries the second screen again by itself, after a
+/// failure it remembers for this PC.
+pub(super) fn add_later_retry(notice: &mut SecondScreenNotice, retries_later: bool) {
+    if retries_later && notice.retry {
+        notice
+            .body
+            .push_str(" EternalMonitor also tries again by itself later.");
+    }
+}
+
 /// The notice while Windows keeps the screen from EternalMonitor. It goes
 /// away when the picture comes back or the stream stops.
 pub(super) fn capture_block_notice(
@@ -769,6 +785,11 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::DriverNotResponding => (
+            Icon::Warning,
+            "The graphics driver isn't responding",
+            "The iPad keeps the last picture, and EternalMonitor waits for the driver. The picture comes back by itself when it responds. If it doesn't, restart the PC.",
         ),
     })
 }

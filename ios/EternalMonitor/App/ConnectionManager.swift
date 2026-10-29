@@ -186,13 +186,17 @@ final class ConnectionManager: ObservableObject {
     static let connectionTimeoutSeconds: UInt64 = 10
 
     /// Connect and reconnect timing. The app uses the defaults; tests pass
-    /// shorter ones when they create the manager.
+    /// shorter ones when they create the manager, and may shorten them once
+    /// a session streams, so a slow machine's first connect isn't cut off.
     struct Timing {
         var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
     }
-    private let timing: Timing
+    var timing: Timing
+    /// The Wi-Fi link to a host's port. Tests replace it to fail a lookup
+    /// without asking DNS.
+    var makeUDPLink: (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }
 
     init(timing: Timing = Timing()) {
         self.timing = timing
@@ -208,7 +212,7 @@ final class ConnectionManager: ObservableObject {
             return
         }
         guard usbListener == nil else { return }
-        let listener = USBListener()
+        let listener = USBListener(port: E2E.usbListenPort)
         usbListener = listener
         listener.onState = { [weak self, weak listener] state in
             Task { @MainActor in
@@ -327,7 +331,7 @@ final class ConnectionManager: ObservableObject {
             normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedHost.isEmpty, targetPort != 0 else { return }
             port = targetPort
-            receiver = UDPReceiver(port: port)
+            receiver = makeUDPLink(port)
             lastTarget = (normalizedHost, port)
         case .usb(let link):
             normalizedHost = "USB"

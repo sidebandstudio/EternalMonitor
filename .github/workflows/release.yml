@@ -126,12 +126,6 @@ jobs:
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "SHA256: $hash"
 
-      - name: Upload installer artifact (dry runs and debugging)
-        uses: actions/upload-artifact@v4
-        with:
-          name: EternalMonitor-Setup
-          path: build\out\EternalMonitor-Setup.exe
-
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -167,3 +161,23 @@ jobs:
               $releaseArgs += "--prerelease"
           }
           gh release create @releaseArgs
+
+      # Artifacts are public and not masked like the job log. The installer
+      # is the release asset, so this check never holds back a release.
+      - name: Check the installer artifact for secret values
+        id: artifact-scan
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/artifact_secrets.py scan
+          --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,GITHUB_TOKEN
+          build/out/EternalMonitor-Setup.exe
+
+      - name: Upload installer artifact (dry runs and debugging)
+        if: always() && steps.artifact-scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-Setup
+          path: build\out\EternalMonitor-Setup.exe

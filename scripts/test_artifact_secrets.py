@@ -1,4 +1,4 @@
-"""testflight_evidence.py must keep every secret value out of the public artifact."""
+"""artifact_secrets.py must keep every secret value out of the public artifacts."""
 import os
 import pathlib
 import shutil
@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT = pathlib.Path(__file__).resolve().parent / "testflight_evidence.py"
+SCRIPT = pathlib.Path(__file__).resolve().parent / "artifact_secrets.py"
 ENV = {
     "ETERNAL_DIAGNOSTICS_ENDPOINT": "https://diag-test.example.net/ingest",
     "ETERNAL_DIAGNOSTICS_INGEST_KEY": 'ing"est\\key-0123456789abcdef',
@@ -20,17 +20,17 @@ ENV = {
 }
 
 
-class TestFlightEvidenceTest(unittest.TestCase):
+class ArtifactSecretsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_scan(self, *paths, event="push", **overrides):
+    def run_scan(self, *paths, event="push", names=",".join(ENV), **overrides):
         env = {k: v for k, v in os.environ.items() if k not in ENV and k != "GITHUB_EVENT_NAME"}
         env |= ENV | overrides | {"GITHUB_EVENT_NAME": event}
-        return subprocess.run([sys.executable, str(SCRIPT), "scan", *map(str, paths)],
+        return subprocess.run([sys.executable, str(SCRIPT), "scan", "--secrets", names, *map(str, paths)],
                               capture_output=True, text=True, env=env)
 
     def evidence(self, text):
@@ -75,7 +75,8 @@ class TestFlightEvidenceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("ASC_ISSUER_ID", result.stderr)
         env_without = {k: v for k, v in ENV.items() if k != "ASC_KEY_P8"}
-        result = subprocess.run([sys.executable, str(SCRIPT), "scan", str(clean)], capture_output=True, text=True,
+        result = subprocess.run([sys.executable, str(SCRIPT), "scan", "--secrets", ",".join(ENV), str(clean)],
+                                capture_output=True, text=True,
                                 env={k: v for k, v in os.environ.items() if k not in ENV and k != "GITHUB_EVENT_NAME"}
                                 | env_without)
         self.assertNotEqual(result.returncode, 0)
@@ -87,6 +88,29 @@ class TestFlightEvidenceTest(unittest.TestCase):
         result = self.run_scan(self.evidence("issuer-0000-test"), event="pull_request", **empty)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ASC_ISSUER_ID", result.stderr)
+
+    def test_only_the_named_secrets_are_required_and_checked(self):
+        names = "ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY"
+        others = {name: "" for name in ENV if name not in names.split(",")}
+        self.assertEqual(self.run_scan(self.evidence("K1 issuer-0000-test"), names=names, **others).returncode, 0)
+        result = self.run_scan(self.evidence("diag-test.example.net"), names=names, **others)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ETERNAL_DIAGNOSTICS_ENDPOINT host", result.stderr)
+
+    def test_directories_are_scanned(self):
+        (self.tmp / "logs").mkdir()
+        (self.tmp / "logs" / "a.log").write_text("token cDEyLWJhc2U2NC10ZXN0")
+        result = self.run_scan(self.tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("IOS_DIST_P12_BASE64", result.stderr)
+
+    def test_secret_names_are_required(self):
+        clean = self.evidence("{}\n")
+        for argv in (["scan", str(clean)], ["scan", "--secrets", "", str(clean)],
+                     ["scan", "--secrets", "lower", str(clean)]):
+            with self.subTest(argv):
+                result = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

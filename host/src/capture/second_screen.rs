@@ -17,8 +17,11 @@
 //! onto it, and the second screen must deliver a real image within
 //! [`PROVE_TIMEOUT`] of that switch, across any restarts meanwhile;
 //! otherwise the stream goes back to the mirror. A start that failed is
-//! remembered: later connections stay on the mirror until the user clicks
-//! Try again, restarts the stream, or changes the mode.
+//! remembered, across app runs too ([`memory`]): later connections stay on
+//! the mirror until the wait after it ends, the user clicks Try again,
+//! restarts the stream, or changes the mode.
+
+mod memory;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,6 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
+use memory::{Hold, Memory};
 
 #[cfg(any(windows, test))]
 use super::{wait_for_virtual_output, AttachResult, OutputInfo};
@@ -107,7 +111,27 @@ struct Proving {
     generation: u64,
     since: Instant,
     capture_failed: bool,
+    /// Windows lost or blocked the desktop (a secure screen, a display
+    /// change, a GPU reset), and capture hasn't got it back: a failure now is
+    /// not the PC's.
+    interrupted: bool,
+    /// How often Windows lost the desktop during this proof while it was
+    /// the user's, with the displays on.
+    losses: u32,
+    /// The last try to get the display back failed with an error that does
+    /// not pass, such as DXGI_ERROR_UNSUPPORTED.
+    persistent: bool,
+    /// A time-limited driver call of this generation is outstanding (see
+    /// [`driver_call`]): a failure now may be the driver's, not the PC's.
+    call_pending: bool,
 }
+
+/// A second screen that loses the user's desktop more often than this in one
+/// proof goes back to the mirror at once, for this app run only, so a display
+/// that keeps dropping out can't hold the iPad on the last mirror frame:
+/// losses that pass, however many, are never the PC's failure. Losses behind
+/// a secure screen or with the displays off don't count.
+const LOSS_LIMIT: u32 = 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -124,6 +148,8 @@ pub(crate) struct State {
     proving: Option<Proving>,
     /// Why the second screen last failed, for the log and the backend.
     failure: Option<&'static str>,
+    /// The failure saved for later app runs.
+    memory: Memory,
 }
 
 impl State {
@@ -134,10 +160,18 @@ impl State {
         connected: bool,
         now: Instant,
     ) -> Step {
+        self.memory.retry_clear(now);
         if !selected {
+            if self.memory.forget(now, false) {
+                tracing::info!(
+                    "Another mode was chosen — the second screen is tried afresh when it is \
+                     chosen again"
+                );
+            }
             *self = State {
                 last_toggle: self.last_toggle,
                 attaching: self.attaching,
+                memory: std::mem::take(&mut self.memory),
                 ..State::default()
             };
             return Step::Nothing;
@@ -147,6 +181,12 @@ impl State {
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
+                if let Some(hold) = self.memory.hold(now) {
+                    *status = VddStatus::Failed;
+                    self.failure = Some(hold.reason);
+                    log_hold(hold);
+                    return Step::Nothing;
+                }
                 *status = VddStatus::Attaching;
                 self.attaching = true;
                 Step::Attach
@@ -181,7 +221,11 @@ impl State {
         let reason = if proving.capture_failed {
             "duplication_failed"
         } else if now.duration_since(proving.since) >= PROVE_TIMEOUT {
-            "no_frames"
+            if proving.persistent {
+                "duplication_failed"
+            } else {
+                "no_frames"
+            }
         } else {
             return None;
         };
@@ -189,10 +233,37 @@ impl State {
             last_toggle: self.last_toggle,
             attaching: self.attaching,
             failure: Some(reason),
+            memory: std::mem::take(&mut self.memory),
             ..State::default()
         };
         *status = VddStatus::Failed;
+        let passing = proving.interrupted || proving.call_pending || proving.losses > LOSS_LIMIT;
+        self.remember(reason, now, passing);
         Some(reason)
+    }
+
+    /// Save the failure for later connections and app runs, unless
+    /// something that passes may explain it: then only this app run keeps
+    /// mirroring, as before.
+    fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool) {
+        if interrupted || desktop_away() {
+            tracing::info!(
+                reason,
+                "The second screen failed while Windows withheld the desktop or the display may \
+                 have been asleep — not remembering it beyond this app run"
+            );
+            self.memory.excuse();
+            return;
+        }
+        if let Some(hold) = self.memory.note_failure(reason, now) {
+            tracing::info!(
+                reason,
+                failures = hold.failures,
+                retry_in_s = hold.retry_in.as_secs(),
+                "Remembering that the second screen failed on this PC — Second screen sessions \
+                 mirror until it is tried again"
+            );
+        }
     }
 
     /// Whether a capture generation with no viewer should leave an attached
@@ -245,6 +316,77 @@ pub(crate) fn proving(shared: &SharedControl) -> bool {
     shared.second_screen.lock().proving.is_some()
 }
 
+/// The one log line for a connection that mirrors because the second screen
+/// failed on this PC before. Diagnostics count `second_screen_fallback=remembered`.
+fn log_hold(hold: Hold) {
+    tracing::info!(
+        second_screen_fallback = "remembered",
+        reason = hold.reason,
+        failures = hold.failures,
+        retry_in_s = hold.retry_in.as_secs(),
+        "The second screen failed on this PC before — mirroring the primary display until it \
+         is tried again later, or the user clicks Try again"
+    );
+}
+
+/// Read the failure an earlier app run saved, for this PC as it is now.
+#[cfg(windows)]
+pub fn load_memory(shared: &SharedControl) {
+    let Some(dir) = crate::settings::app_data_dir() else {
+        return;
+    };
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let memory = Memory::load(
+        dir.join(memory::FILE_NAME),
+        memory::Fingerprint::current(),
+        wall,
+        Instant::now(),
+    );
+    shared.second_screen.lock().memory = memory;
+    #[cfg(not(test))]
+    display_power::watch();
+}
+
+/// A new iPad session in Second screen mode. After a failed start it says
+/// why the iPad gets the mirror, or tries again once the wait after a saved
+/// failure is over.
+pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
+    let mut status = shared.vdd_status.lock();
+    let mut state = shared.second_screen.lock();
+    if *status == VddStatus::Failed && state.memory.saved() {
+        match state.memory.hold(now) {
+            Some(hold) => log_hold(hold),
+            None => {
+                tracing::info!(
+                    reason = state.failure.unwrap_or("attach_timeout"),
+                    "Client connected, and the wait after the second screen failed is over — \
+                     trying it again"
+                );
+                *status = VddStatus::WaitingForClient;
+                state.failure = None;
+            }
+        }
+        return;
+    }
+    drop((state, status));
+    if let Some(reason) = remembered_failure(shared) {
+        tracing::info!(
+            second_screen_fallback = reason,
+            "Client connected, but the second screen failed to start earlier — \
+             mirroring the primary display until the user clicks Try again"
+        );
+    }
+}
+
+/// Whether the host tries the failed second screen again by itself later.
+pub(crate) fn retries_later(shared: &SharedControl) -> bool {
+    let status = *shared.vdd_status.lock();
+    status == VddStatus::Failed && shared.second_screen.lock().memory.saved()
+}
+
 /// Why connections mirror instead of extending, after a failed start. The
 /// value appears as `second_screen_fallback=` in the log, which the
 /// diagnostics upload sends as is.
@@ -259,10 +401,14 @@ pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str>
 }
 
 /// The user asked to try again: a failed start, or one whose thread is gone,
-/// is tried once more at the next connection.
+/// is tried once more at the next connection, and a saved failure is
+/// forgotten.
 pub(crate) fn retry(shared: &SharedControl) {
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
+    if state.memory.forget(Instant::now(), true) {
+        tracing::info!("Try again — the second screen is tried afresh at the next connection");
+    }
     let stale = *status == VddStatus::Attaching && !state.attaching;
     if stale || matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
         *status = VddStatus::WaitingForClient;
@@ -300,13 +446,53 @@ fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> boo
 pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
     let mut state = shared.second_screen.lock();
     match state.proving.as_mut() {
-        Some(proving) => proving.generation = generation,
+        // A call the earlier generation still waits on is not this one's,
+        // and its guard can no longer clear the flag.
+        Some(proving) => {
+            if proving.generation != generation {
+                proving.generation = generation;
+                proving.call_pending = false;
+            }
+        }
         None => {
             state.proving = Some(Proving {
                 generation,
                 since: now,
                 capture_failed: false,
+                interrupted: false,
+                losses: 0,
+                persistent: false,
+                call_pending: false,
             })
+        }
+    }
+}
+
+/// While the returned guard lives, capture `generation` waits on a
+/// time-limited driver call (see `crate::stall`). The proof's deadline may
+/// pass meanwhile and end the attempt, but that failure is not remembered:
+/// the call's own limit decides about the driver, and its timeout lands
+/// after the proof is gone.
+pub fn driver_call(shared: &SharedControl, generation: u64) -> DriverCall<'_> {
+    set_call_pending(shared, generation, true);
+    DriverCall { shared, generation }
+}
+
+pub struct DriverCall<'a> {
+    shared: &'a SharedControl,
+    generation: u64,
+}
+
+impl Drop for DriverCall<'_> {
+    fn drop(&mut self) {
+        set_call_pending(self.shared, self.generation, false);
+    }
+}
+
+fn set_call_pending(shared: &SharedControl, generation: u64, pending: bool) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.call_pending = pending;
         }
     }
 }
@@ -320,6 +506,9 @@ pub fn note_image(shared: &SharedControl, generation: u64) {
             after_ms = proving.since.elapsed().as_millis() as u64,
             "Second screen captured its first image — streaming it"
         );
+        if state.memory.forget(Instant::now(), true) {
+            tracing::info!("The second screen works on this PC again — forgetting its failure");
+        }
     }
 }
 
@@ -332,6 +521,192 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
     if let Some(proving) = state.proving.as_mut() {
         if proving.generation == generation {
             proving.capture_failed = true;
+        }
+    }
+}
+
+/// Capture `generation` lost the desktop for a passing reason (see
+/// [`super::recovery::passing_error`]). A second screen that fails its proof
+/// before capture gets it back is not remembered beyond this app run.
+pub fn note_interruption(shared: &SharedControl, generation: u64) {
+    note_interruption_while(shared, generation, desktop_away());
+}
+
+/// [`note_interruption`], `away` from the user's desktop or not.
+fn note_interruption_while(shared: &SharedControl, generation: u64, away: bool) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = true;
+            if !away {
+                proving.losses += 1;
+                proving.capture_failed |= proving.losses > LOSS_LIMIT;
+            }
+        }
+    }
+}
+
+/// Capture `generation` got the desktop back after an interruption, whatever
+/// the retries before returned: the proof starts over from `now`, so nothing
+/// is decided before the second screen has had its full time to show a
+/// picture.
+pub fn note_recovery(shared: &SharedControl, generation: u64, now: Instant) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = false;
+            proving.persistent = false;
+            proving.since = now;
+        }
+    }
+}
+
+/// Capture `generation` failed with an error that does not pass: whatever
+/// interrupted the proof before, a failure now is the PC's.
+pub fn note_persistent_error(shared: &SharedControl, generation: u64) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = false;
+            proving.persistent = true;
+        }
+    }
+}
+
+/// Capture `generation` is still getting the desktop back after a loss, and
+/// its last try failed with an error that passes, such as another capturing
+/// app: whatever failed before, a failure now is not the PC's. It is not
+/// another loss.
+pub fn note_passing_retry_error(shared: &SharedControl, generation: u64) {
+    if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
+        if proving.generation == generation {
+            proving.interrupted = true;
+            proving.persistent = false;
+        }
+    }
+}
+
+/// Whether the user can't be seeing the desktop now: a secure screen (the
+/// lock screen, a UAC prompt, Ctrl+Alt+Del) has the input, or Windows turned
+/// the displays off. How long the PC sat idle doesn't count: an iPad that
+/// connects sends Windows no input.
+#[cfg(all(windows, not(test)))]
+fn desktop_away() -> bool {
+    away(input_desktop().as_deref(), display_power::off())
+}
+
+/// Unit tests and other platforms: the desktop is always there.
+#[cfg(any(not(windows), test))]
+fn desktop_away() -> bool {
+    false
+}
+
+/// [`desktop_away`] from the input desktop's name (`None` when it can't be
+/// opened, as the secure desktop can't) and whether the displays are off
+/// (`None` before Windows has said).
+#[cfg(any(windows, test))]
+fn away(input_desktop: Option<&str>, displays_off: Option<bool>) -> bool {
+    input_desktop != Some("Default") || displays_off == Some(true)
+}
+
+/// The name of the desktop that has the input, `None` if it can't be opened.
+#[cfg(all(windows, not(test)))]
+fn input_desktop() -> Option<String> {
+    use windows::Win32::Foundation::{BOOL, HANDLE};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+        DESKTOP_READOBJECTS, UOI_NAME,
+    };
+    let desktop =
+        unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), BOOL(0), DESKTOP_READOBJECTS) }.ok()?;
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    let named = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            std::mem::size_of_val(&name) as u32,
+            Some(&mut needed),
+        )
+    };
+    let _ = unsafe { CloseDesktop(desktop) };
+    named.ok()?;
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    Some(String::from_utf16_lossy(&name[..length]))
+}
+
+/// Whether Windows has the console's displays off, from its
+/// GUID_CONSOLE_DISPLAY_STATE notifications. Windows sends the current state
+/// as soon as the callback is registered, at app start.
+#[cfg(all(windows, not(test)))]
+mod display_power {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Once;
+
+    use windows::core::GUID;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+    use windows::Win32::System::Power::{
+        PowerSettingRegisterNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+        POWERBROADCAST_SETTING,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_POWERSETTINGCHANGE};
+
+    const CONSOLE_DISPLAY_STATE: GUID = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    const UNKNOWN: u8 = u8::MAX;
+    /// 0 off, 1 on, 2 dimmed.
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    unsafe extern "system" fn changed(
+        _context: *const core::ffi::c_void,
+        kind: u32,
+        setting: *const core::ffi::c_void,
+    ) -> u32 {
+        if kind == PBT_POWERSETTINGCHANGE && !setting.is_null() {
+            let setting = setting.cast::<POWERBROADCAST_SETTING>();
+            let header = unsafe { std::ptr::read_unaligned(setting) };
+            if header.PowerSetting == CONSOLE_DISPLAY_STATE && header.DataLength >= 4 {
+                let data = unsafe { std::ptr::addr_of!((*setting).Data) }.cast::<u32>();
+                let value = unsafe { std::ptr::read_unaligned(data) };
+                STATE.store(value.min(2) as u8, Ordering::Relaxed);
+            }
+        }
+        0
+    }
+
+    /// Start listening. Later calls do nothing.
+    pub(super) fn watch() {
+        static WATCH: Once = Once::new();
+        WATCH.call_once(|| {
+            // Windows keeps both for as long as the app runs.
+            let parameters = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                Callback: Some(changed),
+                Context: std::ptr::null_mut(),
+            }));
+            let mut registration = std::ptr::null_mut();
+            let result = unsafe {
+                PowerSettingRegisterNotification(
+                    &CONSOLE_DISPLAY_STATE,
+                    DEVICE_NOTIFY_CALLBACK,
+                    HANDLE((parameters as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS).cast()),
+                    &mut registration,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                tracing::warn!(
+                    error = result.0,
+                    "Could not watch the display power state; a failed second screen is \
+                     remembered whatever it is"
+                );
+            }
+        });
+    }
+
+    pub(super) fn off() -> Option<bool> {
+        watch();
+        match STATE.load(Ordering::Relaxed) {
+            UNKNOWN => None,
+            state => Some(state == 0),
         }
     }
 }
@@ -718,7 +1093,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             disable(shared, driver);
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
-            shared.second_screen.lock().failure = Some("attach_timeout");
+            let mut state = shared.second_screen.lock();
+            state.failure = Some("attach_timeout");
+            state.remember("attach_timeout", driver.now(), false);
         }
     }
 }

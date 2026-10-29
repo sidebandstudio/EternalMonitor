@@ -21,6 +21,7 @@ use super::{
     FPS_WINDOW,
 };
 use crate::control::{CaptureTarget, SharedControl};
+use crate::stall::{Call, Stall};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -202,21 +203,10 @@ pub fn run_capture_loop(
     }
 
     // --- Create D3D11 device on the selected adapter ---
-    let mut device: Option<ID3D11Device> = None;
-    unsafe {
-        D3D11CreateDevice(
-            &adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            None,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
-        )?;
-    }
-    let device = device.expect("D3D11CreateDevice succeeded but returned no device");
+    let device = {
+        let _call = super::second_screen::driver_call(&shared, generation);
+        create_device(adapter, super::hold_watchdog(&shared, generation))??
+    };
     info!("D3D11 device created");
 
     // --- Get immediate device context ---
@@ -226,8 +216,11 @@ pub fn run_capture_loop(
     let output1: IDXGIOutput1 = output.cast()?;
     // `None` only between releasing a lost duplication and creating its
     // replacement inside the ACCESS_LOST handler.
-    let mut duplication: Option<IDXGIOutputDuplication> =
-        Some(unsafe { output1.DuplicateOutput(&device) }.map_err(blocked_or_error)?);
+    let mut duplication: Option<IDXGIOutputDuplication> = Some({
+        let _call = super::second_screen::driver_call(&shared, generation);
+        duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
+            .map_err(blocked_or_error)?
+    });
     info!("Desktop duplication active");
 
     // --- Query desktop dimensions from duplication ---
@@ -575,14 +568,24 @@ pub fn run_capture_loop(
                 if !recovery.in_episode() {
                     warn!("Desktop duplication access lost — reinitializing");
                 }
+                // A second screen that shows no picture before this is
+                // re-created failed for a passing reason.
+                super::second_screen::note_interruption(&shared, generation);
                 // Release the lost duplication before asking for a new one:
                 // Windows refuses a second duplication of the same output.
                 duplication = None;
                 let mut last_code = e.code();
+                // Set while the last try was a driver call that did not
+                // return in time. The last try decides, as for errors.
+                let mut last_stall: Option<Stall> = None;
                 while duplication.is_none() {
                     let delay = match recovery.lost(Instant::now()) {
                         LossStep::Retry(delay) => delay,
                         LossStep::GiveUp => {
+                            // The stage waits for the driver; it passes.
+                            if let Some(stall) = last_stall {
+                                return Err(Box::new(stall));
+                            }
                             return Err(Box::new(CaptureUnavailable {
                                 block: CaptureBlock::from_hresult(last_code.0)
                                     .unwrap_or(CaptureBlock::DisplayChanging),
@@ -621,14 +624,59 @@ pub fn run_capture_loop(
                         }
                         std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
                     }
-                    match unsafe { output1.DuplicateOutput(&device) } {
+                    // The picture stays alive while a slow driver answers.
+                    let poll = || {
+                        if !crate::supervisor::generation_is_current(generation) {
+                            return;
+                        }
+                        let now_ms = crate::clock::host_now_us() / 1000;
+                        if recovery_poll(&shared, now_ms, last_send.elapsed())
+                            && keepalive_allowed(seen_image, second_screen)
+                        {
+                            resend_last_frame(
+                                slot,
+                                &shared,
+                                frame_number,
+                                &mut last_send,
+                                &last_frame,
+                                (tex_width, tex_height),
+                            );
+                        }
+                    };
+                    let call = super::second_screen::driver_call(&shared, generation);
+                    let retried = duplicate_output(&output1, &device, poll);
+                    drop(call);
+                    let retried = match retried {
+                        Ok(retried) => {
+                            last_stall = None;
+                            retried
+                        }
+                        // Logged; the ladder keeps trying until it gives up.
+                        // A stuck driver passes, like a hung device.
+                        Err(stall) => {
+                            super::second_screen::note_passing_retry_error(&shared, generation);
+                            last_stall = Some(stall);
+                            continue;
+                        }
+                    };
+                    match retried {
                         Ok(d) => {
                             duplication = Some(d);
                             seen_image = false;
+                            super::second_screen::note_recovery(
+                                &shared,
+                                generation,
+                                Instant::now(),
+                            );
                         }
                         Err(retry_error) => {
                             debug!(error = %retry_error, "DuplicateOutput retry failed");
                             last_code = retry_error.code();
+                            if super::recovery::passing_code(last_code.0) {
+                                super::second_screen::note_passing_retry_error(&shared, generation);
+                            } else {
+                                super::second_screen::note_persistent_error(&shared, generation);
+                            }
                             // Tell the GUI why while the retries continue.
                             if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
                                 *shared.capture_block.lock() = Some(block);
@@ -689,6 +737,50 @@ pub fn run_capture_loop(
     }
 
     Ok(())
+}
+
+/// D3D11CreateDevice under its time limit; see [`crate::stall`].
+fn create_device(
+    adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    progress: impl FnMut(),
+) -> Result<windows::core::Result<ID3D11Device>, Stall> {
+    crate::stall::run(
+        Call::D3d11CreateDevice,
+        move || {
+            let mut device: Option<ID3D11Device> = None;
+            unsafe {
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    None,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )?;
+            }
+            Ok(device.expect("D3D11CreateDevice succeeded but returned no device"))
+        },
+        progress,
+    )
+}
+
+/// DuplicateOutput under its time limit. A duplication that comes back after
+/// the limit is released at once on the call's thread: Windows allows one
+/// duplication of an output, and the retries need it gone.
+fn duplicate_output(
+    output: &IDXGIOutput1,
+    device: &ID3D11Device,
+    progress: impl FnMut(),
+) -> Result<windows::core::Result<IDXGIOutputDuplication>, Stall> {
+    let (output, device) = (output.clone(), device.clone());
+    crate::stall::run(
+        Call::DuplicateOutput,
+        move || unsafe { output.DuplicateOutput(&device) },
+        progress,
+    )
 }
 
 /// Hand the last captured image downstream again, so the encoder emits a
@@ -978,5 +1070,50 @@ fn draw_monochrome_cursor(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Native: a real D3D11CreateDevice held past its limit. The caller gets
+    /// the timeout on time, a second attempt is refused at once, the late
+    /// device is released on its own thread, and then a device is created.
+    /// `cargo test -p eternal-host --lib a_real_device_creation -- --ignored --nocapture`
+    #[test]
+    #[ignore = "native: needs a Windows graphics adapter"]
+    fn a_real_device_creation_that_stalls_recovers() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        std::env::set_var("ETERNAL_SIMULATE_STALL", "d3d11_create_device,encoder_open");
+        let adapter = || {
+            let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+            unsafe { factory.EnumAdapters1(0) }.unwrap()
+        };
+        let mut beats = 0;
+        let started = Instant::now();
+        let held = create_device(adapter(), || beats += 1);
+        let waited = started.elapsed();
+        assert!(matches!(held, Err(Stall::TimedOut { .. })), "{held:?}");
+        assert!(
+            waited >= Duration::from_secs(4) && waited < Duration::from_secs(6),
+            "{waited:?}"
+        );
+        assert!(beats >= 60, "{beats} heartbeats in {waited:?}");
+        let started = Instant::now();
+        let refused = create_device(adapter(), || {});
+        assert!(matches!(refused, Err(Stall::Refused { .. })), "{refused:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // The held call creates its device 8 s after it began, and drops it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while crate::stall::abandoned(Call::D3d11CreateDevice) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the late device was not released"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let device = create_device(adapter(), || {}).unwrap().unwrap();
+        assert!(unsafe { device.GetImmediateContext() }.is_ok());
     }
 }
