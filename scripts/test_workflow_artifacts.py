@@ -38,11 +38,16 @@ class WorkflowArtifactsTest(unittest.TestCase):
                         gate = re.search(r"(?m)^        if: .*steps\.([\w-]+)\.outcome == 'success'", step)
                         self.assertTrue(gate, "upload must require a passing scan step")
                         scan = by_id.get(gate[1], "")
-                        command = re.search(r"artifact_secrets\.py scan --secrets (\S+)(.*)", " ".join(scan.split()))
+                        command = re.search(r"artifact_secrets\.py scan --secrets (\S+)(?: --optional (\S+))?(.*)",
+                                            " ".join(scan.split()))
                         self.assertTrue(command, f"step {gate[1]} must run artifact_secrets.py scan")
-                        self.assertLessEqual(secrets, set(command[1].split(",")))
+                        optional = set((command[2] or "").split(",")) - {""}
+                        self.assertLessEqual(secrets, set(command[1].split(",")) | optional)
                         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", scan)
-                        scanned = command[2].split()
+                        for secret in optional:
+                            self.assertTrue("%s: ${{ secrets.%s }}" % (secret, secret) in head + job,
+                                            f"{secret} must reach the scan step's env")
+                        scanned = command[3].split()
                         for path in paths(step):
                             self.assertIn(path, scanned)
         self.assertGreaterEqual(uploads, 5)

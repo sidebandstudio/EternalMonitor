@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Check workflow artifacts before they upload from this public repository.
 
-  artifact_secrets.py scan --secrets NAME[,NAME...] PATH...
+  artifact_secrets.py scan --secrets NAME[,NAME...] [--optional NAME[,NAME...]] PATH...
       Fail when any file under PATH holds the value of a named environment
       variable, its first 12 characters or its URL host, as written or
       escaped for JSON or a shell. Name every secret the job has. Outside
-      pull requests, also fail when any named secret is missing or empty.
+      pull requests, also fail when any --secrets name is missing or empty.
+      --optional names are checked the same way when set and are never
+      required, for secrets a job has only once a feature is configured.
       Paths that do not exist are skipped. Prints names, never values.
 
 Artifact files are not masked like the job log.
@@ -40,8 +42,9 @@ def needles(names):
     return missing, found
 
 
-def scan(names, paths):
-    missing, checked = needles(names)
+def scan(names, optional, paths):
+    missing, checked = needles(names + optional)
+    missing = [name for name in missing if name not in optional]
     if missing and os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
         sys.exit("Secrets are missing or empty, so the artifact cannot be checked; nothing was uploaded:\n"
                  + "\n".join(missing))
@@ -52,15 +55,20 @@ def scan(names, paths):
         found += sorted({f"{path}: {name}" for name, value in checked if value.encode() in data})
     if found:
         sys.exit("Artifact contains secret values; nothing was uploaded:\n" + "\n".join(found))
-    print(f"No secret values in {len(files)} artifact files ({len(checked)} forms of {len(names)} secrets checked)")
+    print(f"No secret values in {len(files)} artifact files "
+          f"({len(checked)} forms of {len(names + optional)} secrets checked)")
 
 
 def main():
     args = sys.argv[1:]
     if len(args) >= 4 and args[0] == "scan" and args[1] == "--secrets":
         names = [name for name in args[2].split(",") if name]
-        if names and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", name) for name in names):
-            scan(names, [pathlib.Path(p) for p in args[3:] if pathlib.Path(p).exists()])
+        optional, paths = [], args[3:]
+        if paths[0] == "--optional":
+            optional = [name for name in "".join(paths[1:2]).split(",") if name]
+            paths = paths[2:] if optional else []
+        if names and paths and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", name) for name in names + optional):
+            scan(names, optional, [pathlib.Path(p) for p in paths if pathlib.Path(p).exists()])
             return
     sys.exit(__doc__)
 
