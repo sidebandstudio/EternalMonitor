@@ -319,8 +319,12 @@ struct ConnectView: View {
                         ForEach(problem.actions, id: \.self) { action in
                             switch action {
                             case .retry:
+                                // Only one filled button a card: Open Settings
+                                // comes first where the card offers it.
                                 Button("Try again") { connectionManager.retry() }
-                                    .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                                    .buttonStyle(problem.actions.contains(.openSettings)
+                                        ? PillButtonStyle()
+                                        : PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                                     .accessibilityIdentifier("connect.retry")
                             case .openSettings:
                                 Button("Open Settings") { openAppSettings() }
@@ -631,7 +635,8 @@ struct ConnectView: View {
         switch problem {
         case .localNetworkOff:
             return ("EternalMonitor can't look for PCs",
-                "Local Network is turned off for EternalMonitor. " + ConnectionProblem.localNetworkSteps(then: "Search again"))
+                "Local Network is turned off for EternalMonitor. " + ConnectionProblem.localNetworkSteps(then: "Search again")
+                    + " A USB cable works without this setting.")
         case .couldNotSearch:
             // NetServiceBrowser can report Local Network being off this way
             // too, so the Settings advice stays as the last resort.

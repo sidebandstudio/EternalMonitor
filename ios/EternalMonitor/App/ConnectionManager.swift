@@ -490,11 +490,13 @@ final class ConnectionManager: ObservableObject {
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             controlChannelBox?.value?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .resume)
         }
-        // Held 5 s: reconnect, as for a PC that stopped responding.
-        decoder.onStalled = { [weak self] in
+        // Held 5 s, or longer while the PC reopens its encoder: reconnect, as
+        // for a PC that stopped responding.
+        decoder.onStalled = { [weak self, weak decoder] in
+            let heldMs = (decoder?.keyframeWaitUs ?? 0) / 1000
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connected else { return }
-                self.record(.warning, "decode", "Picture held 5 s without a keyframe — reconnecting")
+                self.record(.warning, "decode", "Picture held \(heldMs) ms without a keyframe — reconnecting")
                 self.beginReconnect(.pcStoppedResponding, end: .pictureStalled)
             }
         }
@@ -566,9 +568,11 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "ctrl", message)
             }
         }
-        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler, weak decoder] info in
+        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler, weak decoder, weak channel] info in
             assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
             decoder?.setFrameSeqContiguous(info.hostCaps & HelloAck.hostCapContiguousFrameSeq != 0)
+            decoder?.setHostLiveness(lastHeartbeatUs: { [weak channel] in channel?.lastHeartbeatAtUs.withLock { $0 } ?? 0 },
+                                     timeoutUs: UInt64(info.livenessTimeoutMs) * 1000)
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             let acceptedAt = ProcessInfo.processInfo.systemUptime

@@ -186,7 +186,7 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertEqual(blocked.title, "EternalMonitor can't look for PCs")
         XCTAssertEqual(blocked.detail, "Local Network is turned off for EternalMonitor. Tap Open Settings and turn on "
             + "Local Network, or go to Settings > Privacy & Security > Local Network and turn on EternalMonitor. "
-            + "Then tap Search again.")
+            + "Then tap Search again. A USB cable works without this setting.")
         XCTAssertNil(ConnectView.scanEmptyAdvice(nil).title)
         XCTAssertTrue(ConnectView.scanEmptyAdvice(nil).detail.hasPrefix("No PCs found."))
     }

@@ -18,8 +18,9 @@ enum AttemptEnd: Equatable {
     case connectTimeout
     /// Heartbeats stopped during a session.
     case pcStoppedResponding
-    /// The picture stayed held 5 s without a keyframe, though the PC still
-    /// answered: the app reconnects.
+    /// The picture stayed held without a keyframe, though the PC still
+    /// answered: 5 s, or longer while the PC reopened its encoder. The app
+    /// reconnects.
     case pictureStalled
     case cableUnplugged
     case usbLinkFailed

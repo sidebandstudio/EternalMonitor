@@ -142,7 +142,8 @@ final class ConnectScreenTests: UITestCase {
     }
 
     /// Local Network off: the card says where the switch is, that the
-    /// cable works without it, and offers Open Settings and Try again.
+    /// cable works without it, and offers Open Settings first and filled,
+    /// Try again second and not.
     func testLocalNetworkOffSaysWhereToTurnItOn() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
@@ -154,10 +155,36 @@ final class ConnectScreenTests: UITestCase {
         let detail = app.staticTexts["connect.problemDetail"].label
         XCTAssertTrue(detail.contains("Settings > Privacy & Security > Local Network"), detail)
         XCTAssertTrue(detail.contains("A USB cable works without this setting."), detail)
-        XCTAssertTrue(app.buttons["connect.openSettings"].isHittable)
-        XCTAssertTrue(app.buttons["connect.retry"].isHittable)
-        let shot = XCTAttachment(screenshot: app.screenshot())
+        let settings = app.buttons["connect.openSettings"], retry = app.buttons["connect.retry"]
+        XCTAssertTrue(settings.isHittable)
+        XCTAssertTrue(retry.isHittable)
+        XCTAssertLessThan(settings.frame.maxX, retry.frame.minX, "Open Settings comes first")
+        let screenshot = app.screenshot()
+        XCTAssertTrue(isFilled(settings, in: screenshot.image), "Open Settings is the primary action")
+        XCTAssertFalse(isFilled(retry, in: screenshot.image), "Try again is secondary")
+        let shot = XCTAttachment(screenshot: screenshot)
         shot.name = "local-network-off"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    /// Whether `button` is drawn filled with the accent: a point just inside
+    /// its left end, clear of the label, is the accent's yellow.
+    private func isFilled(_ button: XCUIElement, in image: UIImage) -> Bool {
+        guard let cgImage = image.cgImage else { return false }
+        let scale = CGFloat(cgImage.width) / image.size.width
+        let point = CGPoint(x: button.frame.minX + 6, y: button.frame.midY)
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let drawn = pixel.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8,
+                                          bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            // Shift the image so the sampled pixel lands on the context's
+            // only pixel (Core Graphics counts rows from the bottom).
+            context.draw(cgImage, in: CGRect(x: -(point.x * scale).rounded(.down),
+                                             y: -(CGFloat(cgImage.height) - 1 - (point.y * scale).rounded(.down)),
+                                             width: CGFloat(cgImage.width), height: CGFloat(cgImage.height)))
+            return true
+        }
+        return drawn && pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 150
     }
 
     /// Search blocked by Local Network: Open Settings, and Search again for
@@ -170,7 +197,9 @@ final class ConnectScreenTests: UITestCase {
         let title = app.staticTexts["connect.scanProblemTitle"]
         XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
         XCTAssertEqual(title.label, "EternalMonitor can't look for PCs")
-        XCTAssertTrue(app.staticTexts["connect.scanEmpty"].label.contains("Privacy & Security > Local Network"))
+        let detail = app.staticTexts["connect.scanEmpty"].label
+        XCTAssertTrue(detail.contains("Privacy & Security > Local Network"), detail)
+        XCTAssertTrue(detail.contains("A USB cable works without this setting."), detail)
         XCTAssertTrue(app.buttons["Open Settings"].exists)
         XCTAssertTrue(app.buttons["Search again"].exists)
         let shot = XCTAttachment(screenshot: app.screenshot())
