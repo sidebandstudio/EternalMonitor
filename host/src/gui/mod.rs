@@ -1591,25 +1591,19 @@ fn value_or_unknown(value: &str) -> &str {
 }
 
 pub fn detect_local_ip(listen_port: u16) -> String {
-    // Primary: ask the OS which local interface would route toward a public address. This is the
-    // happy path on any machine with a normal default route.
-    if let Ok(addr) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
-        s.connect("8.8.8.8:80")?;
-        s.local_addr()
-    }) {
-        let ip = addr.ip();
-        if !ip.is_unspecified() && !ip.is_loopback() {
-            return format!("{}:{}", ip, listen_port);
-        }
+    // The home network's Wi-Fi or Ethernet first: a VPN or a Hyper-V/WSL switch can own the
+    // default route, and an iPad on Wi-Fi can't reach those addresses. Otherwise the interface
+    // the OS would route toward a public address, then (no default route: isolated LAN, no
+    // internet) the first adapter's IPv4, so the displayed address and QR still work.
+    let adapters = crate::network::adapters();
+    match crate::network::pick(
+        adapters.as_deref(),
+        crate::network::default_route(),
+        first_lan_ipv4,
+    ) {
+        Some(ip) => format!("{ip}:{listen_port}"),
+        None => format!("unknown:{listen_port}"),
     }
-
-    // Fallback: no default route (isolated LAN / no internet / blocked) — enumerate local
-    // adapters and use the first real LAN IPv4 so the displayed address and QR still work.
-    if let Some(ip) = first_lan_ipv4() {
-        return format!("{}:{}", ip, listen_port);
-    }
-
-    format!("unknown:{listen_port}")
 }
 
 /// Launch the GUI window. Blocks the calling thread.

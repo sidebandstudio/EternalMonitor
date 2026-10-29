@@ -145,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Capture: {}", capture_summary);
     info!("  Listen:  0.0.0.0:{}", listen_port);
     info!("══════════════════════════════════");
+    eternal_host::network::log_addresses();
 
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.
