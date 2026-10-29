@@ -11,6 +11,7 @@ struct EternalMonitorApp: App {
         SupportDiagnostics.shared.recordDeviceSnapshot()
         SupportDiagnostics.shared.record("info", "update",
             RemoteConfig.summary(RemoteConfig.launch, rollout: UpdateChecker.shared.available?.rollout))
+        CrashReporting.shared.start()
     }
 
     var body: some Scene {
@@ -45,6 +46,12 @@ struct EternalMonitorApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
                     SupportDiagnostics.shared.record("warning", "device", "Thermal state changed to \(ProcessInfo.processInfo.thermalState.rawValue)")
                 }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in
+                    CrashReporting.shared.marker.clear()
+                }
+                .onChange(of: connectionManager.state) { _, state in
+                    CrashReporting.shared.marker.update(state)
+                }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
                     DiagnosticsUpload.shared.flushSoon()
                     connectionManager.prepareForBackground()
@@ -58,8 +65,10 @@ struct EternalMonitorApp: App {
             // down) instead of timing out on liveness. Coming back to the
             // foreground resumes the interrupted session (opt-out toggle).
             if phase == .background {
+                CrashReporting.shared.marker.clear()
                 connectionManager.handleAppBackgrounded()
             } else if phase == .active {
+                CrashReporting.shared.marker.activated(connectionManager.state)
                 connectionManager.handleAppForegrounded()
                 UpdateChecker.shared.checkIfDue()
             }

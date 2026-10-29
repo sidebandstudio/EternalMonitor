@@ -13,6 +13,7 @@ final class SupportDiagnostics: @unchecked Sendable {
     private var dropped = 0
     private let directory: URL
     private let limit: Int
+    private let upload: DiagnosticsUpload
     private let launchID = UUID().uuidString
     private var file: FileHandle?
     private var bytes = 0
@@ -21,10 +22,11 @@ final class SupportDiagnostics: @unchecked Sendable {
     private var startup: [String] = []
     private var recent: [String] = []
 
-    init(directory: URL? = nil, limit: Int = SupportDiagnostics.fileLimit) {
+    init(directory: URL? = nil, limit: Int = SupportDiagnostics.fileLimit, upload: DiagnosticsUpload = .shared) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Diagnostics", isDirectory: true)
         self.limit = limit
+        self.upload = upload
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         queue.sync {
             do {
@@ -65,7 +67,7 @@ final class SupportDiagnostics: @unchecked Sendable {
 
     func record(_ level: String = "info", _ category: String, _ message: String) {
         let timestamp = Date()
-        DiagnosticsUpload.shared.record(level: level, category: category, message: message, timestamp: timestamp)
+        upload.record(level: level, category: category, message: message, timestamp: timestamp)
         let uptime = ProcessInfo.processInfo.systemUptime
         guard pending.wait(timeout: .now()) == .success else {
             lossLock.lock(); dropped += 1; lossLock.unlock()
@@ -95,11 +97,11 @@ final class SupportDiagnostics: @unchecked Sendable {
 
     /// File names are fixed and bounded. Export never reads settings, Keychain or media.
     func report() async -> String {
-        let uploadStatus = await DiagnosticsUpload.shared.status()
+        let uploadStatus = await upload.status()
         return await withCheckedContinuation { continuation in
             queue.async {
                 self.lossLock.lock(); let dropped = self.dropped; self.lossLock.unlock()
-                var report = "EternalMonitor iPad support report, schema 1\nSupport ID: \(DiagnosticsUpload.shared.installationID)\nLaunch: \(self.launchID)\nAutomatic upload: \(uploadStatus)\nOutput queue dropped events: \(dropped)\nStorage error: \(self.storageError ?? "none")\nLogs may contain PC/device names and local network addresses.\n\n--- Startup evidence ---\n\(self.startup.joined())"
+                var report = "EternalMonitor iPad support report, schema 1\nSupport ID: \(self.upload.installationID)\nLaunch: \(self.launchID)\nAutomatic upload: \(uploadStatus)\nOutput queue dropped events: \(dropped)\nStorage error: \(self.storageError ?? "none")\nLogs may contain PC/device names and local network addresses.\n\n--- Startup evidence ---\n\(self.startup.joined())"
                 for suffix in [".2", ".1", ""] {
                     if let text = try? String(contentsOf: self.url(suffix), encoding: .utf8) {
                         report += "\n--- Log\(suffix) ---\n\(text)"
