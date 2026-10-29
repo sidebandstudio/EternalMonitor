@@ -29,8 +29,9 @@ const STARTUP_INTERVAL: u64 = 60 * 60;
 /// A saved release older than this is checked again at launch before it is
 /// offered, so a release taken back in latest.json stops being offered soon.
 const RECHECK_OFFER: u64 = 5 * 60;
-/// How long the failure message waits for the website's latest.json.
-const FAILURE_CHECK: Duration = Duration::from_secs(3);
+/// How long the failure message waits for its check, the website's
+/// latest.json included.
+pub const FAILURE_CHECK: Duration = Duration::from_secs(3);
 const LATER_INTERVAL: u64 = 24 * 60 * 60;
 /// A closed update popup stays away this long for the same version.
 const POPUP_INTERVAL: u64 = 3 * 24 * 60 * 60;
@@ -438,21 +439,53 @@ fn failure_offer(
     }
 }
 
-/// For the message that tells the user EternalMonitor failed: a newer stable
-/// version they can download. Reads the saved update state and, when update
-/// checks are on, the website's latest.json, validated as an update check
-/// does and given at most [`FAILURE_CHECK`]. Nothing is downloaded, installed
-/// or saved.
-pub fn failure_offer_now() -> FailureOffer {
-    let saved = load(state_path().as_deref()).latest;
-    let fetched = crate::settings::SettingsFile::load()
-        .check_for_updates
-        .then(|| fetch_within(Endpoints::from_env(), FAILURE_CHECK));
-    failure_offer(env!("CARGO_PKG_VERSION"), saved.as_ref(), fetched)
+/// What the message that tells the user EternalMonitor failed knows without
+/// the website: the saved release, and whether update checks are on.
+pub struct FailureLookup {
+    saved: Option<Release>,
+    checks: bool,
 }
 
-/// latest.json within `timeout`, validated as an update check does.
-fn fetch_within(endpoints: Endpoints, timeout: Duration) -> Result<Release, UpdateError> {
+/// Reads the saved update state and settings. Nothing is downloaded,
+/// installed or saved, here or in [`FailureLookup::finish`].
+pub fn failure_lookup() -> FailureLookup {
+    FailureLookup {
+        saved: load(state_path().as_deref()).latest,
+        checks: crate::settings::SettingsFile::load().check_for_updates,
+    }
+}
+
+impl FailureLookup {
+    /// The offer if the website does not answer in time.
+    pub fn saved_offer(&self) -> FailureOffer {
+        let late = || Err(UpdateError::Network("timed out".into()));
+        failure_offer(
+            env!("CARGO_PKG_VERSION"),
+            self.saved.as_ref(),
+            self.checks.then(late),
+        )
+    }
+
+    /// The offer with the website's latest.json, validated as an update
+    /// check does, when update checks are on and it answers by `deadline`.
+    pub fn finish(self, deadline: Instant) -> FailureOffer {
+        self.finish_from(Endpoints::from_env(), deadline)
+    }
+
+    fn finish_from(self, endpoints: Endpoints, deadline: Instant) -> FailureOffer {
+        let fetched = self.checks.then(|| fetch_by(endpoints, deadline));
+        failure_offer(env!("CARGO_PKG_VERSION"), self.saved.as_ref(), fetched)
+    }
+}
+
+/// latest.json by `deadline`, name lookup included, validated as an update
+/// check does.
+fn fetch_by(endpoints: Endpoints, deadline: Instant) -> Result<Release, UpdateError> {
+    let timed_out = || UpdateError::Network("timed out".into());
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timed_out());
+    }
     let (tx, rx) = mpsc::channel();
     // A request that outlasts its own timeout (a stuck name lookup) must not
     // hold the caller; its thread ends on its own.
@@ -460,13 +493,13 @@ fn fetch_within(endpoints: Endpoints, timeout: Duration) -> Result<Release, Upda
         .name("failure-offer".into())
         .spawn(move || {
             let _ = tx.send(
-                get_json_within(&endpoints.manifest, "application/json", timeout)
+                get_json_within(&endpoints.manifest, "application/json", left)
                     .and_then(|data| parse_manifest(&data, &endpoints)),
             );
         })
         .map_err(|error| UpdateError::Network(error.to_string()))?;
-    rx.recv_timeout(timeout + Duration::from_millis(250))
-        .unwrap_or_else(|_| Err(UpdateError::Network("timed out".into())))
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_else(|_| Err(timed_out()))
 }
 
 /// Downloads into a new, randomly named folder under `root`, verifies, and
@@ -868,6 +901,8 @@ pub enum Notice {
     Installing(String),
     Failed(String),
     Updated(String),
+    /// The new version runs, but part of the update failed: the message.
+    Incomplete(String),
 }
 
 /// The popup shown over the window when an automatic check finds an update.
@@ -903,13 +938,17 @@ pub struct State {
     auto: bool,
     manual_check: bool,
     saved: Saved,
-    /// The release being downloaded, waited for or installed. A check that
-    /// finds a newer one meanwhile leaves it alone: the helper checks the
-    /// file against this release's hash.
+    /// The release being downloaded, waited for or installed. The helper
+    /// checks the file against this release's hash. A check that replaces
+    /// the offered release meanwhile stops the update before its download
+    /// or handoff (see `still_offered`).
     chosen: Option<Release>,
     phase: Phase,
     check: CheckStatus,
     updated: Option<String>,
+    /// Shown once instead of `updated`: the new version runs, but part of
+    /// its Setup failed.
+    incomplete: Option<String>,
     idle_since: Option<Instant>,
     force: bool,
     /// As of the last GUI frame.
@@ -929,6 +968,9 @@ pub struct State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Previous {
     Updated,
+    /// The new version runs, but Setup failed after replacing it: the
+    /// banner's message.
+    Incomplete(String),
     /// The banner's message.
     Failed(String),
 }
@@ -947,11 +989,22 @@ fn take_pending(current: &str, saved: &mut Saved) -> Option<Previous> {
         _ => None,
     };
     if newer_stable(&to, current).is_none() {
-        match exit {
-            Some(setup_exit) => tracing::info!(%from, %to, setup_exit, "Update finished"),
-            None => tracing::info!(%from, %to, "Update finished"),
-        }
-        return Some(Previous::Updated);
+        // Setup replaces the app before its last steps, so the new version
+        // can run after Setup failed.
+        return Some(match exit {
+            Some(0) => {
+                tracing::info!(%from, %to, setup_exit = 0, "Update finished");
+                Previous::Updated
+            }
+            Some(setup_exit) => {
+                tracing::warn!(%from, %to, setup_exit, "Update finished with problems");
+                Previous::Incomplete(incomplete_message(setup_exit))
+            }
+            None => {
+                tracing::info!(%from, %to, "Update finished");
+                Previous::Updated
+            }
+        });
     }
     match &result {
         Some(UpdateResult::Setup { exit, files_in_use }) => {
@@ -997,6 +1050,20 @@ fn failure_message(current: &str, result: Option<&UpdateResult>) -> String {
     }
 }
 
+/// The installer's exit code when the virtual display driver could not be
+/// installed or repaired (installer/EternalMonitor.iss).
+const SETUP_VDD_FAILED: i32 = 20;
+
+/// The banner's message for an update that installed the new version, but
+/// whose Setup failed afterwards.
+fn incomplete_message(setup_exit: i32) -> String {
+    if setup_exit == SETUP_VDD_FAILED {
+        "EternalMonitor updated, but the virtual display driver couldn't be repaired. Second screen may not work. Reinstall from the website to fix it.".into()
+    } else {
+        "Some parts of the update didn't finish. Reinstall from the website.".into()
+    }
+}
+
 /// How the update a previous run started ended, taken at launch by
 /// [`report_previous_update`] for the banner.
 static PREVIOUS: Mutex<Option<Previous>> = parking_lot::const_mutex(None);
@@ -1031,6 +1098,7 @@ impl State {
             phase: Phase::Idle,
             check: CheckStatus::NotChecked,
             updated: None,
+            incomplete: None,
             idle_since: None,
             force: false,
             streaming: false,
@@ -1048,6 +1116,7 @@ impl State {
         // A previous run started Setup. The relaunched version tells us how it went.
         match previous.or_else(|| take_pending(current, &mut state.saved)) {
             Some(Previous::Updated) => state.updated = Some(state.current.clone()),
+            Some(Previous::Incomplete(message)) => state.incomplete = Some(message),
             Some(Previous::Failed(message)) => state.phase = Phase::Failed(message),
             None => {}
         }
@@ -1194,6 +1263,9 @@ impl State {
             Phase::Failed(message) => return Some(Notice::Failed(message.clone())),
             Phase::Idle => {}
         }
+        if let Some(message) = &self.incomplete {
+            return Some(Notice::Incomplete(message.clone()));
+        }
         if let Some(version) = &self.updated {
             return Some(Notice::Updated(version.clone()));
         }
@@ -1249,14 +1321,21 @@ impl State {
             self.saved.later = Some((version, now));
         }
         self.updated = None;
+        self.incomplete = None;
         if matches!(self.phase, Phase::Failed(_)) {
             self.phase = Phase::Idle;
         }
     }
 
+    /// The launch check of a saved release has not answered yet. Until it
+    /// does, nothing starts an update: the release may have been taken back.
+    fn rechecking(&self) -> bool {
+        self.recheck
+    }
+
     /// The user chose Update now (or Try again).
     fn update_now(&mut self, streaming: bool) -> Option<Command> {
-        if !matches!(self.phase, Phase::Idle | Phase::Failed(_)) {
+        if !matches!(self.phase, Phase::Idle | Phase::Failed(_)) || self.recheck {
             return None;
         }
         let release = self.available()?.clone();
@@ -1275,6 +1354,45 @@ impl State {
         Some(Command::Download(release))
     }
 
+    /// Downloads the release offered now, or goes back to offering nothing.
+    fn download_offered(&mut self) -> Option<Command> {
+        self.chosen = self.available().cloned();
+        self.phase = if self.chosen.is_some() {
+            Phase::Downloading {
+                received: 0,
+                total: 0,
+            }
+        } else {
+            Phase::Idle
+        };
+        self.chosen.clone().map(Command::Download)
+    }
+
+    /// Whether `release` is still the one offered. A check may have replaced
+    /// it since the user chose it: then the update stops, and the banner
+    /// offers the new answer, if it names a newer version.
+    fn still_offered(&mut self, release: &Release) -> bool {
+        let offered = self.available().is_some_and(|latest| {
+            (&latest.version, &latest.installer, &latest.sha256)
+                == (&release.version, &release.installer, &release.sha256)
+        });
+        if !offered {
+            tracing::info!(
+                version = %release.version,
+                offered = ?self.available().map(|latest| &latest.version),
+                "Update stopped: the website now offers another release"
+            );
+            self.chosen = None;
+            self.phase = Phase::Idle;
+        }
+        offered
+    }
+
+    /// The worker is about to download `release`.
+    fn download_starts(&mut self, release: &Release) -> bool {
+        matches!(self.phase, Phase::Downloading { .. }) && self.still_offered(release)
+    }
+
     /// "Update now" again while a stream runs: the user accepts the disconnect.
     fn force_now(&mut self) -> Option<Command> {
         tracing::info!("Stop and update clicked");
@@ -1285,14 +1403,7 @@ impl State {
                 self.phase = Phase::Ready(path);
                 None
             }
-            Phase::Queued(None) => {
-                self.phase = Phase::Downloading {
-                    received: 0,
-                    total: 0,
-                };
-                self.chosen = self.available().cloned();
-                self.chosen.clone().map(Command::Download)
-            }
+            Phase::Queued(None) => self.download_offered(),
             other => {
                 self.phase = other;
                 None
@@ -1325,14 +1436,7 @@ impl State {
                 self.phase = Phase::Ready(path);
                 None
             }
-            _ => {
-                self.phase = Phase::Downloading {
-                    received: 0,
-                    total: 0,
-                };
-                self.chosen = self.available().cloned();
-                self.chosen.clone().map(Command::Download)
-            }
+            _ => self.download_offered(),
         }
     }
 
@@ -1366,6 +1470,9 @@ impl State {
         }
         let path = path.clone();
         let release = self.chosen.clone()?;
+        if !self.still_offered(&release) {
+            return None;
+        }
         self.gate.claim(Handoff::Update).ok()?;
         self.phase = Phase::Installing;
         self.saved.pending = Some((self.current.clone(), release.version.clone()));
@@ -1702,6 +1809,11 @@ impl Updater {
         self.state.lock().check
     }
 
+    /// See [`State::rechecking`].
+    pub fn rechecking(&self) -> bool {
+        self.state.lock().rechecking()
+    }
+
     /// A newer version, unless automatic checks are off and nobody asked.
     pub fn available_version(&self) -> Option<String> {
         let state = self.state.lock();
@@ -1799,6 +1911,10 @@ impl Worker {
                     (self.wake)(notify.as_deref());
                 }
                 Command::Download(release) => {
+                    if !self.update(|state| state.download_starts(&release)) {
+                        (self.wake)(None);
+                        continue;
+                    }
                     let state = self.state.clone();
                     let wake = self.wake.clone();
                     let mut last = Instant::now();

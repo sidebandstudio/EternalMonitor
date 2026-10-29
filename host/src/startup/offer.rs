@@ -1,23 +1,34 @@
 //! A failure message offers a newer version when there is one: "Download it
 //! now?" opens the download page. The check starts as soon as a failure is
-//! known, beside the cleanup, and the message waits for it at most [`WAIT`].
-//! One check per process, whatever the number of messages.
+//! known, beside the cleanup, and the message waits for it at most
+//! [`FAILURE_CHECK`] after it started, then offers the saved answer. One
+//! check per process, whatever the number of messages.
 
 #[cfg(windows)]
 use std::sync::{Condvar, Mutex, OnceLock};
 #[cfg(windows)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// The website gets 3 s (`updates::FAILURE_CHECK`); this covers the rest.
 #[cfg(windows)]
-const WAIT: Duration = Duration::from_secs(4);
+use crate::updates::FAILURE_CHECK;
 
 #[cfg(windows)]
 struct Check {
-    started: Instant,
-    /// `Some` once the check finished: the version to offer, if any.
-    result: Mutex<Option<Option<String>>>,
+    /// One deadline for everything: the saved state, the name lookup and
+    /// the website's answer.
+    deadline: Instant,
+    answer: Mutex<Answer>,
     finished: Condvar,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct Answer {
+    /// The version to offer as known so far: the saved release's once it is
+    /// read, then the website's.
+    version: Option<String>,
+    /// The website answered, or the check gave up on it.
+    done: bool,
 }
 
 #[cfg(windows)]
@@ -44,58 +55,60 @@ pub(super) fn begin() {
         return;
     }
     let mut first = false;
-    CHECK.get_or_init(|| {
+    let check = CHECK.get_or_init(|| {
         first = true;
         Check {
-            started: Instant::now(),
-            result: Mutex::new(None),
+            deadline: Instant::now() + FAILURE_CHECK,
+            answer: Mutex::new(Answer::default()),
             finished: Condvar::new(),
         }
     });
     if !first {
         return;
     }
+    let deadline = check.deadline;
     let spawned = std::thread::Builder::new()
         .name("failure-offer".into())
-        .spawn(|| {
-            let offer = crate::updates::failure_offer_now();
-            // The message first: a slow disk must not hold it past WAIT.
+        .spawn(move || {
+            let lookup = crate::updates::failure_lookup();
+            note(lookup.saved_offer().version, false);
+            let offer = lookup.finish(deadline);
+            // The message first: a slow disk must not hold it past the deadline.
             let line = offer.describe();
-            finish(offer.version);
+            note(offer.version, true);
             record(&line);
         });
     if spawned.is_err() {
-        finish(None);
+        note(None, true);
         record("Update offer on the failure message: not offered source=none fetch=failed");
     }
 }
 
 #[cfg(windows)]
-fn finish(version: Option<String>) {
+fn note(version: Option<String>, done: bool) {
     if let Some(check) = CHECK.get() {
-        if let Ok(mut result) = check.result.lock() {
-            *result = Some(version);
+        if let Ok(mut answer) = check.answer.lock() {
+            *answer = Answer { version, done };
         }
         check.finished.notify_all();
     }
 }
 
 /// The version to offer: waits for the check, starting it if nothing did,
-/// until [`WAIT`] after it started.
+/// until its deadline, then takes the saved answer.
 #[cfg(windows)]
 pub(super) fn wait() -> Option<String> {
     begin();
     let check = CHECK.get()?;
-    let deadline = check.started + WAIT;
-    let mut result = check.result.lock().ok()?;
-    while result.is_none() {
-        let left = deadline.saturating_duration_since(Instant::now());
+    let mut answer = check.answer.lock().ok()?;
+    while !answer.done {
+        let left = check.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return None;
+            break;
         }
-        result = check.finished.wait_timeout(result, left).ok()?.0;
+        answer = check.finished.wait_timeout(answer, left).ok()?.0;
     }
-    result.clone().flatten()
+    answer.version.clone()
 }
 
 /// The line goes to the session log and the upload outbox. It names
@@ -113,7 +126,7 @@ fn record(line: &str) {
 /// The message's last paragraph when a newer version is available.
 #[cfg(any(windows, test))]
 fn question(version: &str) -> String {
-    format!("EternalMonitor {version} is available and may fix this. Download it now?")
+    format!("A newer version of EternalMonitor ({version}) is available. Download it now?")
 }
 
 /// The message with the offer added, when there is one.
@@ -189,7 +202,7 @@ mod tests {
         assert!(offered.starts_with(body), "{offered}");
         assert!(
             offered.ends_with(
-                "\n\nEternalMonitor 0.3.5 is available and may fix this. Download it now?"
+                "\n\nA newer version of EternalMonitor (0.3.5) is available. Download it now?"
             ),
             "{offered}"
         );

@@ -165,21 +165,54 @@ impl AnalyzerApp {
                 0.0,
                 |_| {},
             ),
-            Notice::Failed(message) => widgets::banner(
+            Notice::Failed(message) => {
+                // Try again waits until the launch check says which release
+                // is current.
+                let checking = self.updates.rechecking();
+                let body = if checking {
+                    format!("{message}\nChecking for the latest version…")
+                } else {
+                    message.clone()
+                };
+                widgets::banner(
+                    ui,
+                    WARNING,
+                    Icon::Warning,
+                    "The update did not finish",
+                    &body,
+                    340.0,
+                    |ui| {
+                        if widgets::button(ui, Tone::Ghost, None, "Later").clicked() {
+                            action = Some(Action::Later);
+                        }
+                        if widgets::button_ex(
+                            ui,
+                            Tone::Secondary,
+                            None,
+                            "Try again",
+                            !checking,
+                            0.0,
+                        )
+                        .clicked()
+                        {
+                            action = Some(Action::UpdateNow);
+                        }
+                        widgets::link(ui, "Download from the website", WEBSITE_DOWNLOAD);
+                    },
+                );
+            }
+            Notice::Incomplete(message) => widgets::banner(
                 ui,
                 WARNING,
                 Icon::Warning,
-                "The update did not finish",
+                "Part of the update did not finish",
                 message,
-                340.0,
+                260.0,
                 |ui| {
-                    if widgets::button(ui, Tone::Ghost, None, "Later").clicked() {
+                    widgets::link(ui, "Download from the website", WEBSITE_DOWNLOAD);
+                    if widgets::button(ui, Tone::Secondary, None, "OK").clicked() {
                         action = Some(Action::Later);
                     }
-                    if widgets::button(ui, Tone::Secondary, None, "Try again").clicked() {
-                        action = Some(Action::UpdateNow);
-                    }
-                    widgets::link(ui, "Download from the website", WEBSITE_DOWNLOAD);
                 },
             ),
             Notice::Updated(version) => widgets::banner(

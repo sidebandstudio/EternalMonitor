@@ -1014,11 +1014,12 @@ fn update_waits_for_the_stream_to_stop() {
     assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
 }
 
-/// A check can find a newer release while one is downloading or waiting for a
-/// stream to end. The file must still go to the helper with its own hash,
-/// which the helper checks, not the newer release's.
+/// A check can replace the offered release while one is downloading or
+/// waiting for a stream to end. The file never goes to the helper with
+/// another release's hash: the update stops at its handoff and the banner
+/// offers the new answer.
 #[test]
-fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
+fn a_release_found_mid_update_stops_it_and_is_offered() {
     let a = release("0.3.2");
     let b = Release {
         sha256: "1".repeat(64),
@@ -1036,19 +1037,93 @@ fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
         Some(Notice::Downloading("0.3.2".into(), None))
     );
     s.download_finished(Ok(path_a.clone()));
-    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
-    assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+    assert_eq!(s.take_ready(false), None);
+    assert_eq!((&s.phase, &s.chosen), (&Phase::Idle, &None));
+    assert_eq!(s.saved.pending, None);
+    assert_eq!(s.gate.holder(), None);
+    assert_eq!(s.notice(1001), Some(Notice::Available("0.3.3".into())));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r == b));
 
+    // The same answer again changes nothing.
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(a.clone()));
     s.update_now(false);
     s.download_finished(Ok(path_a.clone()));
     assert!(s.take_ready(true).is_none(), "waits for the stream");
-    s.finish_check(1001, false, Ok(b));
+    s.finish_check(1001, false, Ok(a.clone()));
     let start = Instant::now();
     assert!(s.tick(false, start).is_none());
     assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
-    assert_eq!(s.take_ready(false), Some((path_a, a)));
+    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
+
+    // Taken back while the download waited for the stream: nothing is
+    // offered and nothing downloads.
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.update_now(true);
+    s.finish_check(1001, false, Ok(release("0.3.1")));
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert_eq!(s.phase, Phase::Idle);
+    assert_eq!(s.notice(1001), None);
+}
+
+/// After a failed update the banner offers Try again while the launch check
+/// of the saved release runs. Until it answers, Try again starts nothing; a
+/// download already asked for checks the release again before it starts.
+#[test]
+fn try_again_waits_for_the_launch_check_of_a_saved_release() {
+    let now = 100_000;
+    let failed = || {
+        let (mut saved, dir) = pending_saved("0.3.1", "0.3.2", Some("setup_exit=5\n"));
+        saved.checked_at = Some(now - RECHECK_OFFER);
+        let mut s = state(saved);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(s.launch_check(now));
+        s
+    };
+    // Withdrawn on the website.
+    let mut s = failed();
+    assert!(failed_message(&s).starts_with("The update was cancelled"));
+    assert!(s.rechecking());
+    assert!(s.update_now(false).is_none(), "Try again waits");
+    assert!(matches!(s.phase, Phase::Failed(_)));
+    s.finish_check(now + 1, false, Ok(release("0.3.1")));
+    assert!(!s.rechecking());
+    assert!(s.update_now(false).is_none(), "nothing newer to install");
+    // Replaced by a newer release: that one is installed.
+    let mut s = failed();
+    s.finish_check(now + 1, false, Ok(release("0.3.3")));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r.version == "0.3.3"));
+    // Offline: the saved release, as before.
+    let mut s = failed();
+    s.finish_check(now + 1, false, Err(UpdateError::Network("offline".into())));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r.version == "0.3.2"));
+
+    // Through the worker: a download asked for before a check replaced the
+    // release stops without a request and the new answer is offered. The
+    // fake site answers nothing, so a download that went ahead would fail.
+    let site = serve(Box::new(|_, _| (404, vec![], Vec::new())));
+    let mut s = failed();
+    s.finish_check(now + 1, false, Err(UpdateError::Network("offline".into())));
+    let Some(Command::Download(chosen)) = s.update_now(false) else {
+        panic!("no download");
+    };
+    s.finish_check(now + 2, false, Ok(release("0.3.3")));
+    let mut worker = worker(
+        s,
+        Arc::new(Mutex::new(crate::transport::session::Session::new(1))),
+    );
+    worker.endpoints = Endpoints::local(&site).unwrap();
+    let state = worker.state.clone();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Command::Download(chosen)).unwrap();
+    drop(tx);
+    worker.run(rx);
+    let s = state.lock();
+    assert_eq!((&s.phase, &s.chosen), (&Phase::Idle, &None));
+    assert_eq!(s.notice(now + 2), Some(Notice::Available("0.3.3".into())));
 }
 
 #[test]
@@ -1673,24 +1748,45 @@ fn the_failure_message_check_is_validated_and_bounded() {
         _ => (404, vec![], Vec::new()),
     }));
     let endpoints = Endpoints::local(&base).unwrap();
-    let release = fetch_within(endpoints.clone(), Duration::from_secs(3)).unwrap();
-    assert_eq!(release.version, "0.3.5");
+    let soon = || Instant::now() + Duration::from_secs(3);
+    let fetched = fetch_by(endpoints.clone(), soon()).unwrap();
+    assert_eq!(fetched.version, "0.3.5");
     // The installer must be where the manifest checks say.
     let elsewhere = Endpoints {
         installer_prefix: "https://example.invalid/".into(),
         ..endpoints
     };
     assert!(matches!(
-        fetch_within(elsewhere, Duration::from_secs(3)),
+        fetch_by(elsewhere, soon()),
         Err(UpdateError::BadManifest(_))
     ));
-    // A site that accepts the connection and never answers.
+    // A site that accepts the connection and never answers: the saved
+    // release by the deadline, which counts from before the request.
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = silent.local_addr().unwrap().port();
     let stuck = Endpoints::local(&format!("http://127.0.0.1:{port}")).unwrap();
+    let lookup = FailureLookup {
+        saved: Some(release("0.3.9")),
+        checks: true,
+    };
+    assert_eq!(
+        lookup.saved_offer().describe(),
+        "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
+    );
     let started = Instant::now();
-    assert!(fetch_within(stuck, Duration::from_millis(300)).is_err());
-    assert!(started.elapsed() < Duration::from_secs(5));
+    let deadline = started + Duration::from_millis(300);
+    let offer = lookup.finish_from(stuck.clone(), deadline);
+    let took = started.elapsed();
+    assert_eq!(
+        offer.describe(),
+        "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
+    );
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_millis(450),
+        "{took:?}"
+    );
+    // A deadline already past makes no request.
+    assert!(fetch_by(stuck, Instant::now()).is_err());
     drop(silent);
 }
 
@@ -1745,6 +1841,80 @@ fn a_finished_update_is_logged_with_setup_s_exit_code() {
     assert!(log.contains("Update finished from=0.3.3 to=0.3.4"), "{log}");
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(other).unwrap();
+}
+
+/// Setup replaces the app before it repairs the virtual display driver, so
+/// the new version runs even when Setup then fails. Only Setup's 0, or no
+/// result from an older helper, counts as a finished update.
+#[test]
+fn a_setup_that_failed_after_installing_the_new_version_is_reported() {
+    let case = |current: &str, result: Option<&str>| {
+        let (saved, dir) = pending_saved("0.3.4", "0.3.5", result);
+        let mut state = None;
+        let log = logged(|| state = Some(State::new(current, true, saved)));
+        std::fs::remove_dir_all(dir).unwrap();
+        let state = state.unwrap();
+        assert_eq!(
+            (&state.saved.pending, &state.saved.pending_result),
+            (&None, &None),
+            "reported once"
+        );
+        (log, state.notice(0))
+    };
+    // 0 and the new version: finished.
+    let (log, notice) = case("0.3.5", Some("setup_exit=0\n"));
+    assert!(
+        log.contains("INFO") && log.contains("Update finished from=0.3.4 to=0.3.5 setup_exit=0"),
+        "{log}"
+    );
+    assert_eq!(notice, Some(Notice::Updated("0.3.5".into())));
+    // 20, the driver repair, after the new version was installed.
+    let (log, notice) = case("0.3.5", Some("setup_exit=20\n"));
+    assert!(
+        log.contains("WARN")
+            && log.contains("Update finished with problems from=0.3.4 to=0.3.5 setup_exit=20"),
+        "{log}"
+    );
+    assert!(!log.contains("Update finished from"), "{log}");
+    assert_eq!(
+        notice,
+        Some(Notice::Incomplete(
+            "EternalMonitor updated, but the virtual display driver couldn't be repaired. Second screen may not work. Reinstall from the website to fix it.".into()
+        ))
+    );
+    // Any other failure after the new version was installed.
+    let (log, notice) = case("0.3.5", Some("setup_exit=4\n"));
+    assert!(
+        log.contains("Update finished with problems from=0.3.4 to=0.3.5 setup_exit=4"),
+        "{log}"
+    );
+    assert_eq!(
+        notice,
+        Some(Notice::Incomplete(
+            "Some parts of the update didn't finish. Reinstall from the website.".into()
+        ))
+    );
+    // 5 and still the old version: did not finish, as before.
+    let (log, notice) = case("0.3.4", Some("setup_exit=5\n"));
+    assert!(
+        log.contains("WARN")
+            && log.contains("Update did not finish from=0.3.4 to=0.3.5 setup_exit=5"),
+        "{log}"
+    );
+    assert!(matches!(notice, Some(Notice::Failed(m)) if m.starts_with("The update was cancelled")));
+    // No result from an older helper and the new version: finished.
+    let (log, notice) = case("0.3.5", None);
+    assert!(
+        log.contains("INFO") && log.contains("Update finished from=0.3.4 to=0.3.5"),
+        "{log}"
+    );
+    assert_eq!(notice, Some(Notice::Updated("0.3.5".into())));
+    // The banner shows once: OK clears it.
+    let (saved, dir) = pending_saved("0.3.4", "0.3.5", Some("setup_exit=20\n"));
+    let mut state = State::new("0.3.5", true, saved);
+    std::fs::remove_dir_all(dir).unwrap();
+    state.later(0);
+    assert_eq!(state.notice(0), None);
 }
 
 #[test]
