@@ -8,6 +8,7 @@
       pull requests, also fail when any --secrets name is missing or empty.
       --optional names are checked the same way when set and are never
       required, for secrets a job has only once a feature is configured.
+      A name cannot be in both lists.
       Paths that do not exist are skipped. Prints names, never values.
 
 Artifact files are not masked like the job log.
@@ -67,7 +68,8 @@ def main():
         if paths[0] == "--optional":
             optional = [name for name in "".join(paths[1:2]).split(",") if name]
             paths = paths[2:] if optional else []
-        if names and paths and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", name) for name in names + optional):
+        if (names and paths and not set(names) & set(optional)
+                and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", name) for name in names + optional)):
             scan(names, optional, [pathlib.Path(p) for p in paths if pathlib.Path(p).exists()])
             return
     sys.exit(__doc__)

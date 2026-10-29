@@ -129,6 +129,15 @@ class ArtifactSecretsTest(unittest.TestCase):
         clean = self.run_scan(self.evidence("{}\n"), optional=",".join(OPTIONAL), **OPTIONAL)
         self.assertEqual(clean.returncode, 0, clean.stderr)
 
+    def test_a_name_cannot_be_both_required_and_optional(self):
+        clean = self.evidence("{}\n")
+        for value in ("", ENV["ETERNAL_DIAGNOSTICS_INGEST_KEY"]):
+            with self.subTest(value=value):
+                result = self.run_scan(clean, optional="ETERNAL_DIAGNOSTICS_INGEST_KEY",
+                                       ETERNAL_DIAGNOSTICS_INGEST_KEY=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("A name cannot be in both lists", result.stderr)
+
     def test_directories_are_scanned(self):
         (self.tmp / "logs").mkdir()
         (self.tmp / "logs" / "a.log").write_text("token cDEyLWJhc2U2NC10ZXN0")
