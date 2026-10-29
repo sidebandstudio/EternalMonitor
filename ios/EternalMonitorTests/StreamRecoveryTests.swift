@@ -59,7 +59,7 @@ final class StreamRecoveryTests: XCTestCase {
         // advertising contiguous numbering lets the gap show it.
         let units = try twoGOPs()
         let numbered = FakeUDPHost()
-        _ = try await streaming(numbered, hostCaps: ReferenceContinuity.hostCapContiguousFrameSeq)
+        _ = try await streaming(numbered, hostCaps: HelloAck.hostCapContiguousFrameSeq)
         numbered.sendFrame(units[5], seq: 3, isKeyframe: false)
         let asked = await Task.detached { numbered.keyframeRequests(within: 1) }.value
         XCTAssertEqual(asked.first, .decodeError)

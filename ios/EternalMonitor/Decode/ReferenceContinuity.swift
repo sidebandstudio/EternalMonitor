@@ -17,11 +17,12 @@ import Foundation
 ///   later contiguous pair disagrees, the stream's POC isn't constant, and
 ///   whole-frame loss isn't read from it again until the stream restarts.
 ///
-/// A PC that numbers sent frames contiguously per epoch (HELLO_ACK host cap
-/// `hostCapContiguousFrameSeq`) makes any forward gap in `frame_seq` a lost
-/// frame, whatever the codec says. That also covers a lost keyframe after the
-/// PC reopened its encoder (bitrate, size, codec, an AMF keyframe), which keeps
-/// the epoch and the numbering but starts the codec's counts again.
+/// A PC that numbers sent frames contiguously per epoch (0.3.4 and later,
+/// HELLO_ACK host cap `HelloAck.hostCapContiguousFrameSeq`) makes any forward
+/// gap in `frame_seq` a lost frame, whatever the codec says. That also covers
+/// a lost keyframe after the PC reopened its encoder (bitrate, size, codec, an
+/// AMF keyframe), which keeps the epoch and the numbering but starts the
+/// codec's counts again.
 ///
 /// A new stream epoch is a new encoder: its pictures can't follow the old
 /// stream's, so it starts again from its keyframe. So does a lower `frame_seq`
@@ -30,11 +31,6 @@ import Foundation
 /// treated as a loss: holding by mistake freezes a good picture. Parsing never
 /// traps on any input.
 struct ReferenceContinuity {
-    /// TODO(integration): the HELLO_ACK host cap from fix/stream-smoothness
-    /// (#77) meaning "frame_seq is contiguous per epoch". Assumed to be the
-    /// next free bit after HOSTCAP_PEN (1 << 4); replace with its constant.
-    static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
-
     /// Set from the session's host caps: a forward gap in `frame_seq` is a loss.
     var frameSeqContiguous = false
 
