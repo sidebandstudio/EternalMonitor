@@ -404,8 +404,9 @@ fn usb_framed_stream_end_to_end() {
         // gives up 10 s after the handshake, and over USB it was dialed again
         // into the same restart. Here the start fails at once (no driver
         // with synthetic capture), and the reconnect after it mirrors too.
-        // The epoch and generation checks prove there was no restart first;
-        // the 30 s deadlines are only backstops.
+        // The epoch and generation checks prove there was no restart first,
+        // and each mirror must decode within the iPad's 10 s. The 30 s
+        // deadlines after it are only backstops.
         use eternal_host::capture::second_screen;
         use eternal_host::control::{CaptureTarget, VddStatus};
         use eternal_host::supervisor::CURRENT_GENERATION;
@@ -419,7 +420,7 @@ fn usb_framed_stream_end_to_end() {
             let sent = Instant::now();
             write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
             let (frame_epoch, decoded) =
-                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(30)).await;
+                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(10)).await;
             assert_eq!(frame_epoch, epoch, "the mirror comes from the running pipeline");
             assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation,
                 "attempt {attempt}: connecting must not restart the pipeline");
