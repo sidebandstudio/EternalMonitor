@@ -80,6 +80,7 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.connectTimeout, duration: 10), ["accepted", "no_picture", "no_video", "timeout"]),
             (noFrame, ["accepted", "no_picture", "no_frame", "timeout"]),
             (summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90), ["steady", "streamed", "signal_lost", "liveness"]),
+            (summary(.pictureStalled, firstFrame: 0.3, duration: 90), ["steady", "streamed", "other", "error"]),
             (summary(.cableUnplugged, usb: true, firstFrame: 0.3), ["first_frame", "streamed", "usb_lost", "error"]),
             (summary(.usbLinkFailed, usb: true), ["accepted", "error", "usb_lost", "error"]),
             (summary(.closedBeforePicture, usb: true), ["accepted", "no_picture", "usb_lost", "error"]),
@@ -102,8 +103,8 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(AttemptEnd.appBackground.bye, .appBackground)
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
         for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
-                    .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed, .receiverFailed,
-                    .retriedWithCode] {
+                    .pictureStalled, .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed,
+                    .receiverFailed, .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")
         }
         XCTAssertEqual(AttemptEnd.linkFailed.name, "linkFailed")

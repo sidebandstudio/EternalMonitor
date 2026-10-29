@@ -489,7 +489,7 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connected else { return }
                 self.record(.warning, "decode", "Picture held 5 s without a keyframe — reconnecting")
-                self.beginReconnect(.pcStoppedResponding)
+                self.beginReconnect(.pcStoppedResponding, end: .pictureStalled)
             }
         }
 
