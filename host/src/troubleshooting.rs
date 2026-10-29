@@ -65,6 +65,17 @@ impl<T> Setting<T> {
     }
 }
 
+impl<T: Clone> Setting<T> {
+    /// The value to run with once the saved choice is `chosen`: a variable
+    /// keeps its own value, whatever the setting says (Reset included).
+    pub fn live(&self, chosen: T) -> T {
+        match self.source {
+            Source::Environment(_) => self.value.clone(),
+            _ => chosen,
+        }
+    }
+}
+
 pub const ENCODER_ENV: &str = "ETERNAL_ENCODER";
 pub const INPUT_ENV: &str = "ETERNAL_INPUT";
 pub const HEVC_ENV: &str = "ETERNAL_HEVC";
@@ -314,6 +325,59 @@ mod tests {
         assert_eq!(
             overrides.summary(Some(1)),
             "encoder=h264_qsv (setting), hevc=on (setting), packet=1200 (setting), fps=120 (setting), window=vulkan (setting), graphics_card=1 (windows)"
+        );
+    }
+
+    #[test]
+    fn a_variable_keeps_its_value_when_the_setting_changes() {
+        let saved_file = SettingsFile {
+            encoder_override: Some("h264_qsv".into()),
+            encoder_input: EncoderInput::Bgra,
+            hevc_enabled: true,
+            max_dgram: 1200,
+            target_fps: 120,
+            window_drawing: WindowDrawing::Vulkan,
+            ..Default::default()
+        };
+        let fixed = Overrides::resolve(
+            &saved_file,
+            env(&[
+                ("ETERNAL_ENCODER", "h264_amf"),
+                ("ETERNAL_INPUT", "auto"),
+                ("ETERNAL_HEVC", "1"),
+                ("ETERNAL_MAX_DGRAM", "1000"),
+                ("ETERNAL_FPS", "30"),
+                ("WGPU_BACKEND", "dx12"),
+            ]),
+        )
+        .unwrap();
+        // Each knob back to Automatic, as Reset does: the variables' values
+        // stay in effect.
+        assert_eq!(fixed.encoder.live(None).as_deref(), Some("h264_amf"));
+        assert_eq!(
+            fixed.encoder_input.live(EncoderInput::default()),
+            EncoderInput::Auto
+        );
+        assert!(fixed.hevc.live(false));
+        assert_eq!(fixed.max_dgram.live(FULL_PACKET), 1000);
+        assert_eq!(fixed.target_fps.live(DEFAULT_FPS), 30);
+        assert_eq!(
+            fixed.window.live(WindowDrawing::Automatic),
+            WindowDrawing::Automatic
+        );
+        // Without variables, the new choice is what runs.
+        let free = Overrides::resolve(&saved_file, env(&[])).unwrap();
+        assert_eq!(free.encoder.live(None), None);
+        assert_eq!(
+            free.encoder_input.live(EncoderInput::default()),
+            EncoderInput::default()
+        );
+        assert!(!free.hevc.live(false));
+        assert_eq!(free.max_dgram.live(FULL_PACKET), FULL_PACKET);
+        assert_eq!(free.target_fps.live(DEFAULT_FPS), DEFAULT_FPS);
+        assert_eq!(
+            free.window.live(WindowDrawing::Automatic),
+            WindowDrawing::Automatic
         );
     }
 

@@ -155,15 +155,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overrides.log(eternal_host::gpu_preference::preference_in(
         gpu_value.as_deref(),
     ));
-    // The helper copy that saved a switch has no log of its own.
-    if let Some(record) = persisted.gpu_switch.as_ref().filter(|r| r.checking) {
-        let saved = eternal_host::gpu_preference::switch_saved(record, gpu_value.as_deref());
+    // The helper copy that saved a switch has no log of its own: it leaves
+    // lines here when it could not finish.
+    for note in eternal_host::gpu_preference::take_helper_notes() {
+        tracing::warn!("{note}");
+    }
+    if let Some(record) = persisted.gpu_switch.as_mut().filter(|r| r.checking) {
+        let saved =
+            eternal_host::gpu_preference::started_after_switch(record, gpu_value.as_deref());
         info!(
             gpu = %record.gpu,
             preference = ?record.preference,
             saved,
             "Graphics card switch: started again after the switch"
         );
+        if !saved {
+            persisted.save();
+        }
     }
     let max_dgram = overrides.max_dgram.value;
     shared
@@ -324,6 +332,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
 
+    eternal_host::startup::simulate_slow_exit();
     info!("EternalMonitor shutting down");
     // process::exit skips destructors. Flush the log writers and the upload
     // outbox first, so a normal quit is told apart from a crash.

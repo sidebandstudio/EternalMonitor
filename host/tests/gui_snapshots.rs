@@ -594,6 +594,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
+    reset_keeps_environment_overrides(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
 }
@@ -746,6 +747,76 @@ fn troubleshooting_and_hybrid_notice(
     *shared.gpu_diagnosis.lock() = None;
     *shared.capture_block.lock() = None;
     *shared.gpu_facts.lock() = None;
+}
+
+/// Reset clears the saved Troubleshooting choices only: a value an
+/// environment variable sets stays in effect, and its row still says so.
+fn reset_keeps_environment_overrides(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::encoder::input::EncoderInput;
+    use eternal_host::troubleshooting::WindowDrawing;
+    let before = settings_file(dir);
+    SettingsFile {
+        encoder_override: Some("h264_qsv".into()),
+        encoder_input: EncoderInput::Bgra,
+        hevc_enabled: true,
+        max_dgram: 1200,
+        window_drawing: WindowDrawing::Vulkan,
+        ..before.clone()
+    }
+    .save();
+    let vars = [
+        ("ETERNAL_ENCODER", "h264_amf"),
+        ("ETERNAL_INPUT", "bgra"),
+        ("ETERNAL_HEVC", "1"),
+        ("ETERNAL_MAX_DGRAM", "1000"),
+    ];
+    for (name, value) in vars {
+        std::env::set_var(name, value);
+    }
+    // As main applies them before the window opens.
+    shared.max_dgram.store(1000, Ordering::SeqCst);
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    // The saved choices are back to Automatic.
+    let saved = settings_file(dir);
+    assert_eq!(saved.encoder_override, None);
+    assert_eq!(saved.encoder_input, EncoderInput::default());
+    assert!(!saved.hevc_enabled);
+    assert_eq!(saved.max_dgram, 1400);
+    assert_eq!(saved.window_drawing, WindowDrawing::Automatic);
+    // What runs is still what the variables say.
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1000);
+    assert_eq!(shared.encoder_override.lock().as_deref(), Some("h264_amf"));
+    assert_eq!(*shared.encoder_input.lock(), EncoderInput::Bgra);
+    assert!(shared.hevc_enabled.load(Ordering::SeqCst));
+    window.get_by_label_contains("Set by ETERNAL_MAX_DGRAM on this PC");
+    // Nothing the variables fix asks for a stream restart.
+    nav(&mut window, "Stream");
+    assert!(window
+        .query_by_label("Restart the stream to apply your changes")
+        .is_none());
+    results.extend_harness(&mut window);
+
+    for (name, _) in vars {
+        std::env::remove_var(name);
+    }
+    before.save();
+    shared.max_dgram.store(1400, Ordering::SeqCst);
+    *shared.encoder_override.lock() = None;
+    *shared.encoder_input.lock() = EncoderInput::default();
+    shared.hevc_enabled.store(false, Ordering::SeqCst);
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture

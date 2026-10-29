@@ -557,6 +557,7 @@ impl AnalyzerApp {
             return;
         }
         self.settings_fps_target = fps;
+        let fps = self.overrides.target_fps.live(fps);
         self.control.shared.target_fps.store(fps, Ordering::SeqCst);
         info!(target_fps = fps, "Capture target FPS updated from GUI");
         self.persist_settings();
@@ -564,7 +565,11 @@ impl AnalyzerApp {
 
     fn set_packet_size(&mut self, bytes: u32) {
         self.settings_packet_size = bytes;
-        self.control.shared.max_dgram.store(bytes, Ordering::SeqCst);
+        let bytes = self.overrides.max_dgram.live(bytes as u16);
+        self.control
+            .shared
+            .max_dgram
+            .store(u32::from(bytes), Ordering::SeqCst);
         info!(max_dgram = bytes, "Media packet size changed");
         self.persist_settings();
     }
@@ -574,9 +579,9 @@ impl AnalyzerApp {
             return;
         }
         self.settings_encoder_input = input;
-        *self.control.shared.encoder_input.lock() = input;
+        *self.control.shared.encoder_input.lock() = self.overrides.encoder_input.live(input);
         self.persist_settings();
-        self.restart_pending = true;
+        self.restart_pending |= self.overrides.encoder_input.env().is_none();
     }
 
     fn set_encoder_choice(&mut self, label: &str) {
@@ -588,16 +593,18 @@ impl AnalyzerApp {
             .iter()
             .find(|(choice, _)| *choice == label)
             .map(|(_, ffmpeg)| (*ffmpeg).to_string());
-        *self.control.shared.encoder_override.lock() = ffmpeg_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        *self.control.shared.encoder_override.lock() = self.overrides.encoder.live(
+            ffmpeg_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
         info!(
             encoder = self.settings_encoder_choice,
             "Encoder override set — takes effect on next stream restart"
         );
         self.persist_settings();
-        self.restart_pending = true;
+        self.restart_pending |= self.overrides.encoder.env().is_none();
     }
 
     fn set_capture_display(&mut self, display: String) {
@@ -663,6 +670,7 @@ impl AnalyzerApp {
 
     fn set_hevc(&mut self, enabled: bool) {
         self.settings_hevc_enabled = enabled;
+        let enabled = self.overrides.hevc.live(enabled);
         self.control
             .shared
             .hevc_enabled
@@ -836,8 +844,10 @@ impl AnalyzerApp {
         self.persist_settings();
     }
 
-    /// Every Troubleshooting option back to Automatic. The graphics card
-    /// waits for "Restart EternalMonitor", like any change to it.
+    /// Every Troubleshooting option back to Automatic. A value an
+    /// environment variable sets stays in effect; only the saved choice
+    /// goes. The graphics card waits for "Restart EternalMonitor", like any
+    /// change to it.
     fn reset_troubleshooting(&mut self) {
         info!("Troubleshooting settings reset to Automatic");
         self.set_encoder_choice(ENCODER_AUTO_LABEL);

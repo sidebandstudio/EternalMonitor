@@ -817,19 +817,22 @@ fn resend_last_frame(
 
 /// Windows won't duplicate `output` from the card this process runs on (a
 /// hybrid PC running EternalMonitor on its other card). Works out which card
-/// the screen is wired to, once per screen, for the Stream page notice.
+/// the screen is wired to, for the Stream page notice: again on every
+/// refusal until Windows could say, and again after the cards or the
+/// screens' wiring change, but logged only when the answer is new.
 fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl) {
-    static CHECKED: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    static CHECK: parking_lot::Mutex<crate::gpu_preference::GpuCheck> =
+        parking_lot::Mutex::new(crate::gpu_preference::GpuCheck::new());
     note_gpu_outcome(shared, Outcome::StillUnsupported);
     let Ok(desc) = (unsafe { output.GetDesc() }) else {
         return;
     };
     let screen = utf16_to_string(&desc.DeviceName);
-    if CHECKED.lock().replace(screen.clone()).as_ref() == Some(&screen) {
+    let facts = crate::gpu_preference::facts();
+    let Some(diagnosis) = CHECK.lock().check(&screen, facts.clone()) else {
         return;
-    }
-    let facts = crate::gpu_preference::facts().unwrap_or_default();
-    let diagnosis = crate::gpu_preference::diagnose(&facts, &screen);
+    };
+    let facts = facts.unwrap_or_default();
     let card = |preference| {
         facts
             .card_for(preference)

@@ -210,6 +210,62 @@ pub fn diagnose(facts: &GpuFacts, screen: &str) -> Option<Diagnosis> {
     })
 }
 
+/// Repeats the check after each refused duplication only when it can say
+/// something new: once per screen and set of facts, again after the cards
+/// or the screens' wiring change (a monitor plugged in, a topology change),
+/// and on the next attempt when the facts couldn't be read at all.
+#[derive(Debug, Default)]
+pub struct GpuCheck {
+    checked: Option<(String, GpuFacts)>,
+}
+
+impl GpuCheck {
+    pub const fn new() -> Self {
+        Self { checked: None }
+    }
+
+    /// `facts` as just read for `screen`, or `None` when Windows couldn't
+    /// say. Returns the diagnosis to show and log, or `None` when it would
+    /// repeat the last one.
+    pub fn check(&mut self, screen: &str, facts: Option<GpuFacts>) -> Option<Option<Diagnosis>> {
+        let facts = facts?;
+        let key = (screen.to_ascii_uppercase(), facts);
+        if self.checked.as_ref() == Some(&key) {
+            return None;
+        }
+        let diagnosis = diagnose(&key.1, screen);
+        self.checked = Some(key);
+        Some(diagnosis)
+    }
+}
+
+/// A display configuration read that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRead {
+    /// The paths changed between sizing the buffers and reading them
+    /// (ERROR_INSUFFICIENT_BUFFER): read the sizes again.
+    Changed,
+    /// Any other error.
+    Failed,
+}
+
+/// Attempts at a display configuration read while the screens keep changing.
+const CONFIG_READ_ATTEMPTS: usize = 4;
+
+/// Runs `read` again after a [`ConfigRead::Changed`], as Microsoft documents
+/// for `QueryDisplayConfig` during a topology change. `None` after any other
+/// error, or when the configuration changed on every attempt.
+pub fn read_display_config<T>(mut read: impl FnMut() -> Result<T, ConfigRead>) -> Option<T> {
+    for _ in 0..CONFIG_READ_ATTEMPTS {
+        match read() {
+            Ok(value) => return Some(value),
+            Err(ConfigRead::Changed) => continue,
+            Err(ConfigRead::Failed) => return None,
+        }
+    }
+    None
+}
+
 /// A graphics card switch EternalMonitor made from the Stream page notice,
 /// kept in settings.json until the user undoes it or picks another choice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +477,132 @@ pub fn helper_request(args: &[String]) -> Option<(u32, Option<Change>)> {
     Some((pid, arg_after(args, CHANGE_ARG).and_then(Change::from_arg)))
 }
 
+/// How long a helper copy waits for the app to exit. Closing can take 40 s
+/// (the virtual display's Disable task may run 35 s, then its worker 5 s),
+/// and the copy must not start EternalMonitor before then: the new copy
+/// would find the old one's single-instance lock and quit, leaving no app.
+pub const WAIT_FOR_EXIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a helper copy needs from Windows. Tests fake it.
+pub trait HelperHost {
+    /// Waits for the app to exit; false when it still runs after `timeout`.
+    fn wait_for_exit(&mut self, timeout: std::time::Duration) -> bool;
+    /// Opens EternalMonitor again with the user's own arguments.
+    fn launch(&mut self) -> Result<(), String>;
+    /// Shows a message box and waits for OK.
+    fn tell(&mut self, title: &str, body: &str);
+    /// Leaves a line for the next start to log (and so upload). The helper
+    /// has no log of its own.
+    fn note(&mut self, line: &str);
+}
+
+/// How a helper copy ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperEnd {
+    Reopened,
+    /// The app exited but could not be started again; the user was told.
+    NotReopened,
+    /// The app was still running at the deadline: nothing was changed or
+    /// started, and the user was told.
+    StillRunning,
+}
+
+pub const SLOW_EXIT_TITLE: &str = "EternalMonitor is taking a long time to close";
+pub const REOPEN_FAILED_TITLE: &str = "EternalMonitor couldn't reopen";
+
+/// A helper copy's work: wait for the app to exit, then make `change` with
+/// `save` and open the app again. Nothing is written or started while the
+/// app may still run, and every way this can end without a window tells
+/// the user.
+pub fn run_helper(
+    host: &mut impl HelperHost,
+    change: Option<&Change>,
+    save: impl FnOnce(&Change) -> Result<(), String>,
+) -> HelperEnd {
+    if !host.wait_for_exit(WAIT_FOR_EXIT) {
+        host.note(&format!(
+            "Graphics card helper: EternalMonitor was still running after {} s; nothing was changed or reopened",
+            WAIT_FOR_EXIT.as_secs()
+        ));
+        let body = if change.is_some() {
+            "The graphics card wasn't changed. Wait until EternalMonitor has closed, then open it from the Start menu and choose the card again."
+        } else {
+            "Wait until EternalMonitor has closed, then open it from the Start menu."
+        };
+        host.tell(SLOW_EXIT_TITLE, body);
+        return HelperEnd::StillRunning;
+    }
+    // If saving fails, the app opens as before and offers the switch again.
+    let saved = change.map(save);
+    if let Some(Err(error)) = &saved {
+        host.note(&format!(
+            "Graphics card helper: the graphics setting was not saved ({error})"
+        ));
+    }
+    let Err(error) = host.launch() else {
+        return HelperEnd::Reopened;
+    };
+    let (saved_word, setting) = match saved {
+        None => ("no change", ""),
+        Some(Ok(())) => ("yes", " The graphics card setting was saved."),
+        Some(Err(_)) => ("no", " The graphics card setting couldn't be saved."),
+    };
+    host.note(&format!(
+        "Graphics card helper: EternalMonitor could not be reopened ({error}); setting saved: {saved_word}"
+    ));
+    host.tell(
+        REOPEN_FAILED_TITLE,
+        &format!("Open EternalMonitor from the Start menu.{setting}"),
+    );
+    HelperEnd::NotReopened
+}
+
+/// The file a helper copy leaves its lines in, beside settings.json.
+const HELPER_NOTES: &str = "graphics-helper-notes.txt";
+
+/// Adds `line` to the helper notes in `dir`.
+pub fn leave_note_in(dir: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(HELPER_NOTES))?;
+    writeln!(file, "{}", line.replace(['\r', '\n'], " "))
+}
+
+/// The lines helper copies left in `dir`, removed once read.
+pub fn take_notes_in(dir: &std::path::Path) -> Vec<String> {
+    let path = dir.join(HELPER_NOTES);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let _ = std::fs::remove_file(&path);
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The lines helper copies left for this start to log.
+pub fn take_helper_notes() -> Vec<String> {
+    crate::settings::app_data_dir()
+        .map(|dir| take_notes_in(&dir))
+        .unwrap_or_default()
+}
+
+/// Whether the switch `record` waits on reached Windows, as the relaunched
+/// app first sees it. A switch the helper couldn't save is no longer
+/// awaited, so a refused capture offers it again instead of blaming
+/// another app for choosing the card.
+pub fn started_after_switch(record: &mut SwitchRecord, value: Option<&str>) -> bool {
+    let saved = switch_saved(record, value);
+    if !saved {
+        record.checking = false;
+    }
+    saved
+}
+
 #[cfg(windows)]
 pub use windows_impl::{facts, read_value, relaunch, run_helper_if_requested};
 
@@ -457,7 +639,9 @@ mod windows_impl {
         DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
         QDC_ONLY_ACTIVE_PATHS,
     };
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LUID};
+    use windows::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID,
+    };
     use windows::Win32::Graphics::DXCore::{
         DXCoreAdapterProperty, IDXCoreAdapter, IDXCoreAdapterFactory, IDXCoreAdapterList,
         InstanceLuid, IsDetachable, IsHardware, IsIntegrated,
@@ -476,8 +660,6 @@ mod windows_impl {
     const PREFERENCES_KEY: PCWSTR = w!("Software\\Microsoft\\DirectX\\UserGpuPreferences");
     /// DXGI_ADAPTER_FLAG_SOFTWARE.
     const FLAG_SOFTWARE: u32 = 2;
-    /// How long a helper copy waits for the app to shut down.
-    const WAIT_FOR_EXIT: Duration = Duration::from_secs(30);
 
     fn id(luid: LUID) -> AdapterId {
         (luid.HighPart, luid.LowPart)
@@ -490,7 +672,8 @@ mod windows_impl {
     }
 
     /// The graphics cards, the card each preference selects and the card
-    /// each screen is wired to. Creates no device.
+    /// each screen is wired to. Creates no device. `None` when Windows
+    /// can't say which card a screen is wired to.
     pub fn facts() -> Option<GpuFacts> {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
         let adapters = (0..)
@@ -509,7 +692,7 @@ mod windows_impl {
             adapters,
             power_saving,
             high_performance,
-            screens: screens(),
+            screens: screens()?,
         })
     }
 
@@ -569,32 +752,11 @@ mod windows_impl {
 
     /// Each active screen's GDI name and the adapter the display
     /// configuration says scans it out: the physical wiring, unlike DXGI,
-    /// which lists screens under the adapter the process runs on.
-    fn screens() -> Vec<(String, AdapterId)> {
-        let (mut paths_len, mut modes_len) = (0u32, 0u32);
-        if unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths_len, &mut modes_len)
-        } != ERROR_SUCCESS
-        {
-            return Vec::new();
-        }
-        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); paths_len as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); modes_len as usize];
-        if unsafe {
-            QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut paths_len,
-                paths.as_mut_ptr(),
-                &mut modes_len,
-                modes.as_mut_ptr(),
-                None,
-            )
-        } != ERROR_SUCCESS
-        {
-            return Vec::new();
-        }
-        paths.truncate(paths_len as usize);
-        paths
+    /// which lists screens under the adapter the process runs on. `None`
+    /// when the configuration can't be read.
+    fn screens() -> Option<Vec<(String, AdapterId)>> {
+        let paths = super::read_display_config(read_paths)?;
+        let screens = paths
             .iter()
             .filter_map(|path| {
                 let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
@@ -614,7 +776,38 @@ mod windows_impl {
                     id(path.sourceInfo.adapterId),
                 ))
             })
-            .collect()
+            .collect();
+        Some(screens)
+    }
+
+    /// One read of the active paths: sized, then read.
+    fn read_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, super::ConfigRead> {
+        let (mut paths_len, mut modes_len) = (0u32, 0u32);
+        if unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths_len, &mut modes_len)
+        } != ERROR_SUCCESS
+        {
+            return Err(super::ConfigRead::Failed);
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); paths_len as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); modes_len as usize];
+        match unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut paths_len,
+                paths.as_mut_ptr(),
+                &mut modes_len,
+                modes.as_mut_ptr(),
+                None,
+            )
+        } {
+            ERROR_SUCCESS => {
+                paths.truncate(paths_len as usize);
+                Ok(paths)
+            }
+            ERROR_INSUFFICIENT_BUFFER => Err(super::ConfigRead::Changed),
+            _ => Err(super::ConfigRead::Failed),
+        }
     }
 
     /// This executable's value under HKCU.
@@ -776,6 +969,49 @@ mod windows_impl {
         )
     }
 
+    /// A helper copy's view of Windows: the app's process, this executable
+    /// and the user's own arguments.
+    struct Helper {
+        pid: u32,
+        args: Vec<String>,
+    }
+
+    impl super::HelperHost for Helper {
+        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+            // A process that can't be opened has already exited.
+            eternal_updater::win::open_process(self.pid).map_or(true, |process| {
+                eternal_updater::win::wait(&process, Some(timeout)).is_some()
+            })
+        }
+
+        fn launch(&mut self) -> Result<(), String> {
+            let exe = std::env::current_exe()
+                .map_err(|error| format!("could not open EternalMonitor again: {error}"))?;
+            start(&exe, &super::own_args(self.args.clone()))
+        }
+
+        fn tell(&mut self, title: &str, body: &str) {
+            use windows::core::HSTRING;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+            };
+            unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(body),
+                    &HSTRING::from(title),
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+                );
+            }
+        }
+
+        fn note(&mut self, line: &str) {
+            if let Some(dir) = crate::settings::app_data_dir() {
+                let _ = super::leave_note_in(&dir, line);
+            }
+        }
+    }
+
     /// In a helper copy: wait for the app to exit, make the change, open the
     /// app again and exit. Runs before logging and the single-instance check,
     /// so it touches neither the session log nor the running app.
@@ -784,24 +1020,11 @@ mod windows_impl {
         let Some((pid, change)) = super::helper_request(&args) else {
             return;
         };
-        if let Ok(process) = eternal_updater::win::open_process(pid) {
-            if eternal_updater::win::wait(&process, Some(WAIT_FOR_EXIT)).is_none() {
-                eprintln!("EternalMonitor did not exit in time");
-            }
-        }
-        if let Some(change) = change {
-            // If saving fails, the app opens as before; its notice then says
-            // how to choose the card in Windows Settings.
-            match OwnValue::new().and_then(|mut value| super::apply(&mut value, &change)) {
-                Ok((before, after)) => eprintln!("Graphics preference {before:?} -> {after:?}"),
-                Err(error) => eprintln!("{error}"),
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Err(error) = start(&exe, &super::own_args(args)) {
-                eprintln!("{error}");
-            }
-        }
+        super::run_helper(&mut Helper { pid, args }, change.as_ref(), |change| {
+            OwnValue::new()
+                .and_then(|mut value| super::apply(&mut value, change))
+                .map(drop)
+        });
         std::process::exit(0);
     }
 }
@@ -1199,6 +1422,276 @@ mod tests {
             helper_request(&args(&[AFTER_EXIT_ARG, "9", CHANGE_ARG, "3"])),
             Some((9, None))
         );
+    }
+
+    /// The old app and the single-instance lock it holds until it exits, as
+    /// a helper copy sees them. The app exits `exits_after` into the wait
+    /// (never when `None`). Events go to a log the test's save shares.
+    struct FakeApp {
+        exits_after: Option<std::time::Duration>,
+        clock: std::time::Duration,
+        events: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        launch_error: Option<String>,
+    }
+
+    impl FakeApp {
+        fn new(exits_after: Option<u64>) -> Self {
+            Self {
+                exits_after: exits_after.map(std::time::Duration::from_secs),
+                clock: std::time::Duration::ZERO,
+                events: Default::default(),
+                launch_error: None,
+            }
+        }
+
+        fn running(&self) -> bool {
+            self.exits_after.is_none_or(|at| self.clock < at)
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl HelperHost for FakeApp {
+        fn wait_for_exit(&mut self, timeout: std::time::Duration) -> bool {
+            self.clock = match self.exits_after {
+                Some(at) if at <= self.clock + timeout => at.max(self.clock),
+                _ => self.clock + timeout,
+            };
+            if !self.running() {
+                self.events
+                    .borrow_mut()
+                    .push(format!("exited after {} s", self.clock.as_secs()));
+            }
+            !self.running()
+        }
+        fn launch(&mut self) -> Result<(), String> {
+            // A new copy started while the old one holds the lock shows the
+            // old (closed) window and quits: no app at all.
+            assert!(!self.running(), "started while the old app holds the lock");
+            match self.launch_error.clone() {
+                Some(error) => Err(error),
+                None => {
+                    self.events.borrow_mut().push("launch".into());
+                    Ok(())
+                }
+            }
+        }
+        fn tell(&mut self, title: &str, body: &str) {
+            self.events
+                .borrow_mut()
+                .push(format!("tell: {title}: {body}"));
+        }
+        fn note(&mut self, line: &str) {
+            self.events.borrow_mut().push(format!("note: {line}"));
+        }
+    }
+
+    #[test]
+    fn a_helper_waits_out_a_slow_shutdown_before_saving_and_reopening() {
+        // Closing with a virtual display Disable that runs its full 35 s,
+        // then the worker's 5 s: past the old 30 s wait.
+        let mut app = FakeApp::new(Some(41));
+        let events = app.events.clone();
+        let mut store = key(None);
+        let change = Change::Set(Preference::HighPerformance);
+        let end = run_helper(&mut app, Some(&change), |change| {
+            events.borrow_mut().push("save".into());
+            apply(&mut store, change).map(drop)
+        });
+        assert_eq!(end, HelperEnd::Reopened);
+        assert_eq!(app.events(), ["exited after 41 s", "save", "launch"]);
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=2;"));
+    }
+
+    #[test]
+    fn a_helper_changes_and_starts_nothing_while_the_app_still_runs() {
+        let mut app = FakeApp::new(None);
+        let mut saved = false;
+        let end = run_helper(
+            &mut app,
+            Some(&Change::Set(Preference::PowerSaving)),
+            |_| {
+                saved = true;
+                Ok(())
+            },
+        );
+        assert_eq!(end, HelperEnd::StillRunning);
+        assert!(!saved, "wrote the preference while the app still ran");
+        assert_eq!(app.clock, WAIT_FOR_EXIT);
+        // No launch; one line for the next start and one message.
+        assert_eq!(app.events().len(), 2, "{:?}", app.events());
+        assert!(app.events()[0].starts_with(
+            "note: Graphics card helper: EternalMonitor was still running after 120 s"
+        ));
+        assert!(app.events()[1].starts_with(&format!(
+            "tell: {SLOW_EXIT_TITLE}: The graphics card wasn't changed."
+        )));
+        assert!(app.events()[1].contains("open it from the Start menu"));
+        // A plain restart (Window drawing) says only how to reopen.
+        let mut app = FakeApp::new(Some(500));
+        assert_eq!(
+            run_helper(&mut app, None, |_| Ok(())),
+            HelperEnd::StillRunning
+        );
+        assert_eq!(
+            app.events()[1],
+            format!("tell: {SLOW_EXIT_TITLE}: Wait until EternalMonitor has closed, then open it from the Start menu.")
+        );
+    }
+
+    #[test]
+    fn a_failed_reopen_tells_the_user_and_the_next_start() {
+        let mut app = FakeApp::new(Some(0));
+        app.launch_error =
+            Some("could not open EternalMonitor again: Access is denied. (0x80070005)".into());
+        let mut store = key(None);
+        let end = run_helper(
+            &mut app,
+            Some(&Change::Set(Preference::PowerSaving)),
+            |change| apply(&mut store, change).map(drop),
+        );
+        assert_eq!(end, HelperEnd::NotReopened);
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
+        assert_eq!(
+            app.events(),
+            [
+                "exited after 0 s".to_string(),
+                "note: Graphics card helper: EternalMonitor could not be reopened (could not open EternalMonitor again: Access is denied. (0x80070005)); setting saved: yes".to_string(),
+                format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu. The graphics card setting was saved."),
+            ]
+        );
+        // A refused write and a failed start: both noted, and the message
+        // doesn't claim the setting was saved.
+        let mut app = FakeApp::new(Some(0));
+        app.launch_error = Some("no".into());
+        let mut store = key(None);
+        store.denied = true;
+        run_helper(
+            &mut app,
+            Some(&Change::Set(Preference::PowerSaving)),
+            |change| apply(&mut store, change).map(drop),
+        );
+        assert_eq!(
+            app.events()[1],
+            "note: Graphics card helper: the graphics setting was not saved (access denied)"
+        );
+        assert!(app.events()[2].ends_with("setting saved: no"));
+        assert_eq!(
+            app.events()[3],
+            format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu. The graphics card setting couldn't be saved.")
+        );
+        // A plain restart that can't start again.
+        let mut app = FakeApp::new(Some(0));
+        app.launch_error = Some("no".into());
+        run_helper(&mut app, None, |_| unreachable!());
+        assert_eq!(
+            app.events()[2],
+            format!("tell: {REOPEN_FAILED_TITLE}: Open EternalMonitor from the Start menu.")
+        );
+    }
+
+    #[test]
+    fn the_next_start_reads_each_helper_note_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-helper-notes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(take_notes_in(&dir).is_empty());
+        leave_note_in(&dir, "first").unwrap();
+        leave_note_in(&dir, "second\r\nline").unwrap();
+        assert_eq!(take_notes_in(&dir), ["first", "second  line"]);
+        assert!(take_notes_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_switch_the_helper_never_saved_is_offered_again() {
+        let mut record = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
+        assert!(started_after_switch(&mut record, Some("GpuPreference=1;")));
+        assert!(record.checking);
+        // Not saved (the app took too long to close, or HKCU refused it):
+        // a refused capture must not read as another app choosing the card.
+        assert!(!started_after_switch(&mut record, None));
+        assert!(!record.checking);
+        assert!(!settle(&mut record, Outcome::StillUnsupported));
+        assert!(!record.failed);
+    }
+
+    #[test]
+    fn the_check_repeats_only_after_a_failed_read_or_a_change() {
+        let mut check = GpuCheck::new();
+        // QueryDisplayConfig failed: nothing is shown and nothing is marked.
+        assert_eq!(check.check(r"\\.\DISPLAY1", None), None);
+        let facts = laptop_on_nvidia();
+        let diagnosis = check.check(r"\\.\DISPLAY1", Some(facts.clone())).unwrap();
+        assert_eq!(diagnosis.unwrap().preference, Some(Preference::PowerSaving));
+        // The same screen and facts on the next retry: no new line.
+        assert_eq!(check.check(r"\\.\display1", Some(facts.clone())), None);
+        assert_eq!(check.check(r"\\.\DISPLAY1", None), None);
+        // A topology change (a monitor plugged into the NVIDIA card) is a
+        // new answer.
+        let mut changed = facts.clone();
+        changed.screens.push((r"\\.\DISPLAY2".into(), DGPU));
+        assert!(check
+            .check(r"\\.\DISPLAY1", Some(changed.clone()))
+            .is_some());
+        assert_eq!(
+            check
+                .check(r"\\.\DISPLAY2", Some(changed))
+                .unwrap()
+                .unwrap()
+                .preference,
+            None
+        );
+        // A screen no hardware card drives is checked once too.
+        let mut virtual_screen = facts;
+        virtual_screen.screens.push((r"\\.\DISPLAY9".into(), IDD));
+        assert_eq!(
+            check.check(r"\\.\DISPLAY9", Some(virtual_screen.clone())),
+            Some(None)
+        );
+        assert_eq!(check.check(r"\\.\DISPLAY9", Some(virtual_screen)), None);
+    }
+
+    #[test]
+    fn a_display_configuration_read_retries_while_the_screens_change() {
+        // The documented race: the paths change between sizing and reading.
+        let mut reads = 0;
+        let result = read_display_config(|| {
+            reads += 1;
+            if reads == 1 {
+                Err(ConfigRead::Changed)
+            } else {
+                Ok(vec!["DISPLAY1"])
+            }
+        });
+        assert_eq!(result, Some(vec!["DISPLAY1"]));
+        assert_eq!(reads, 2);
+        // Any other error gives up at once; endless changes give up too.
+        let mut reads = 0;
+        assert_eq!(
+            read_display_config(|| -> Result<(), _> {
+                reads += 1;
+                Err(ConfigRead::Failed)
+            }),
+            None
+        );
+        assert_eq!(reads, 1);
+        let mut reads = 0;
+        assert_eq!(
+            read_display_config(|| -> Result<(), _> {
+                reads += 1;
+                Err(ConfigRead::Changed)
+            }),
+            None
+        );
+        assert_eq!(reads, CONFIG_READ_ATTEMPTS);
     }
 
     #[test]
