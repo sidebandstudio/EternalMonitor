@@ -3,7 +3,7 @@ import XCTest
 
 /// The fixture changes cable availability; all handshake and video traffic
 /// comes from the real synthetic host started by scripts/test_ios.sh.
-final class USBStreamTests: XCTestCase {
+final class USBStreamTests: UITestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         cable("STOP")
@@ -47,7 +47,7 @@ final class USBStreamTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "YES", "-autoReconnect", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = autoconnect
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         return app
     }
 

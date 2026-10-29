@@ -1,6 +1,6 @@
 import XCTest
 
-final class StreamLifecycleTests: XCTestCase {
+final class StreamLifecycleTests: UITestCase {
     private var hostLog: URL {
         URL(fileURLWithPath: ProcessInfo.processInfo.environment["EM_INPUT_HOST_LOG"]!)
     }
@@ -12,7 +12,7 @@ final class StreamLifecycleTests: XCTestCase {
             "-playPCaudio", "NO", "-autoReconnect", "YES", "-autoResumeOnForeground", "YES", "-targetFPS", "60", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = ProcessInfo.processInfo.environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         waitForSignal("On air", app: app, timeout: 15)
         return app
     }

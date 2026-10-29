@@ -224,6 +224,8 @@ impl Drop for Uploader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake.try_send(Queued::Wake);
+        #[cfg(test)]
+        tests::before_quit_wait(&self.directory);
         if self.done.recv_timeout(SHUTDOWN_WAIT).is_ok() {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -534,7 +536,7 @@ fn run(
             return finish(&directory, &receiver, pending);
         }
         let received = match receiver.lock() {
-            Ok(receiver) => receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(receiver) => receiver.recv_timeout(receive_timeout(&directory)),
             Err(_) => break,
         };
         match received {
@@ -596,6 +598,15 @@ fn run(
     }
     Ok(())
 }
+/// How long the upload thread waits for a line before it checks its upload
+/// schedule. A test of the quit's wake makes it wait far longer.
+fn receive_timeout(_directory: &Path) -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = tests::receive_timeout(_directory) {
+        return timeout;
+    }
+    Duration::from_millis(100)
+}
 /// Writes the events this thread holds and those still queued, all under the
 /// receiver lock. The quit's fallback takes the same lock, so each queued
 /// line is written once.
@@ -644,9 +655,12 @@ mod tests {
         pub(super) static GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    /// Serves each upload after `delay`, acknowledging its batch. The counter
-    /// says how many requests have arrived.
-    fn slow_server(delay: Duration) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    /// Holds each upload until `answer` is set, for at most a minute, then
+    /// acknowledges its batch. The counter says how many requests have
+    /// arrived.
+    fn held_server(
+        answer: std::sync::Arc<AtomicBool>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = arrived.clone();
         use std::io::{Read, Write};
@@ -655,7 +669,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let counter = counter.clone();
+                let (counter, answer) = (counter.clone(), answer.clone());
                 std::thread::spawn(move || {
                     let mut bytes = Vec::new();
                     let mut buffer = [0; 4096];
@@ -681,7 +695,11 @@ mod tests {
                         }
                     };
                     counter.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(delay);
+                    let held = std::time::Instant::now();
+                    while !answer.load(Ordering::SeqCst) && held.elapsed() < Duration::from_secs(60)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let reply =
                         serde_json::json!({"accepted_batch": batch["batch_id"]}).to_string();
@@ -707,7 +725,9 @@ mod tests {
 
     /// The sharing setting is process-wide. Tests that need it on hold this;
     /// a test that turns it off holds it exclusively. So does a test that
-    /// stalls the outbox, which holds every outbox write in the process.
+    /// stalls the outbox, which holds every outbox write in the process, and
+    /// one that floods it: on a slow disk its writes kept the write lock
+    /// from other tests' threads for over a minute.
     static SHARING: std::sync::RwLock<()> = std::sync::RwLock::new(());
     fn sharing_on() -> std::sync::RwLockReadGuard<'static, ()> {
         SHARING
@@ -715,12 +735,62 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Quit as main does while the first upload is in flight. Returns how long
-    /// the quit took and whether it stopped waiting for the upload thread.
-    fn quit_waits(delay: Duration) -> (Duration, PathBuf, bool) {
+    /// How long a test waits for a step that takes milliseconds. Only a
+    /// hung test waits this long: a single small write on mainpc's shared
+    /// disk has taken 27 s.
+    const PATIENCE: Duration = Duration::from_secs(120);
+
+    /// The upload thread is in its first request: the server has seen it.
+    fn wait_for_upload(arrived: &std::sync::atomic::AtomicUsize) {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while arrived.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no upload started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Sets `answer` once the quit has told the upload thread to stop, so
+    /// the request in flight ends after the quit began on any machine.
+    fn answer_when_stopped(stop: std::sync::Arc<AtomicBool>, answer: std::sync::Arc<AtomicBool>) {
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer.store(true, Ordering::SeqCst);
+        });
+    }
+
+    /// Whether the upload thread has ended, waiting at most [`PATIENCE`]. `queue` is
+    /// a copy of its queue taken before the quit; the thread and the quit's
+    /// fallback hold the only others.
+    fn thread_ended(queue: &std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>) -> bool {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::sync::Arc::strong_count(queue) > 1 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    struct Quit {
+        waited: Duration,
+        directory: PathBuf,
+        gave_up: bool,
+        /// Requests the server has seen.
+        arrived: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        queue: std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>,
+    }
+
+    /// Quit as main does while the first upload is in flight. With `answered`
+    /// the server acknowledges it once the quit has begun; otherwise it
+    /// stalls past the request's own timeout.
+    fn quit_during_upload(answered: bool) -> Quit {
         let _sharing = sharing_on();
         let directory = outbox_with_batches(8);
-        let (endpoint, arrived) = slow_server(delay);
+        let answer = std::sync::Arc::new(AtomicBool::new(false));
+        let (endpoint, arrived) = held_server(answer.clone());
         let config = Config {
             endpoint,
             ingest_key: "write-only".into(),
@@ -728,27 +798,32 @@ mod tests {
             allow_http: true,
         };
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while arrived.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline, "no upload started");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_upload(&arrived);
         sender
             .send(Queued::Line(
                 "2026-10-21T17:11:31Z  INFO EternalMonitor shutting down".into(),
             ))
             .unwrap();
+        if answered {
+            answer_when_stopped(uploader.stop.clone(), answer);
+        }
+        let queue = uploader.receiver.clone();
         GAVE_UP.with(|gave_up| gave_up.set(false));
         let started = std::time::Instant::now();
         drop(uploader);
-        let waited = started.elapsed();
-        (waited, directory, GAVE_UP.with(|gave_up| gave_up.get()))
+        Quit {
+            waited: started.elapsed(),
+            directory,
+            gave_up: GAVE_UP.with(|gave_up| gave_up.get()),
+            arrived,
+            queue,
+        }
     }
 
-    /// The outbox's messages once `kept` holds for them, or after 10 s. The
+    /// The outbox's messages once `kept` holds for them, or after [`PATIENCE`]. The
     /// quit's fallback writes on its own thread and may finish after it.
     fn outbox_messages_once(directory: &Path, kept: impl Fn(&[String]) -> bool) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PATIENCE;
         loop {
             let messages = outbox_messages(directory);
             if kept(&messages) || std::time::Instant::now() >= deadline {
@@ -780,38 +855,113 @@ mod tests {
 
     #[test]
     fn quitting_stops_between_slow_uploads_and_keeps_the_rest() {
-        let (waited, directory, _) = quit_waits(Duration::from_millis(1500));
-        assert!(
-            waited < Duration::from_millis(2500),
-            "quit waited {waited:?}"
-        );
-        // A slow runner can still be writing when the bounded quit returns.
-        let messages = outbox_messages_once(&directory, shut_down);
+        let quit = quit_during_upload(true);
+        // Once the thread is done, the request in flight is the only one it
+        // sent: it started no other upload after the quit. The time the quit
+        // took no longer stands in for this; it measured the runner's speed.
+        assert!(thread_ended(&quit.queue), "the upload thread kept going");
+        assert_eq!(quit.arrived.load(Ordering::SeqCst), 1);
+        let messages = outbox_messages_once(&quit.directory, shut_down);
         assert!(shut_down(&messages), "{messages:?}");
-        // At most the request in flight was sent; the rest wait for next launch.
+        // The rest wait for next launch.
         assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
-        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(quit.directory).unwrap();
     }
 
-    /// Outbox whose final write pauses, to hold a drained queue past the
-    /// shutdown deadline.
-    static PAUSED_OUTBOX: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
-    pub(super) fn pause_before_final_write(directory: &Path) {
-        let pause = PAUSED_OUTBOX.lock().unwrap().clone();
-        if let Some((paused, pause)) = pause {
-            if paused == directory {
-                std::thread::sleep(pause);
+    /// A point in the upload code where a test holds the threads of one
+    /// outbox until it lets them go, and learns that one got there.
+    struct Hold {
+        directory: PathBuf,
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+    impl Hold {
+        fn new(directory: &Path) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                directory: directory.to_path_buf(),
+                reached: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+            })
+        }
+        /// Lets the threads go after `backstop` if the test has not, so a
+        /// quit that waits for them fails instead of hanging.
+        fn release_after(self: &std::sync::Arc<Self>, backstop: Duration) {
+            let hold = self.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + backstop;
+                while !hold.released() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hold.release();
+            });
+        }
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+        fn released(&self) -> bool {
+            self.released.load(Ordering::SeqCst)
+        }
+        /// Whether a thread got here, waiting at most [`PATIENCE`].
+        fn wait_until_reached(&self) -> bool {
+            let deadline = std::time::Instant::now() + PATIENCE;
+            while !self.reached.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            true
+        }
+        /// The hold in `slot`, if it is for `directory`.
+        fn for_outbox(
+            slot: &Mutex<Option<std::sync::Arc<Self>>>,
+            directory: &Path,
+        ) -> Option<std::sync::Arc<Self>> {
+            let hold = slot.lock().unwrap().clone();
+            hold.filter(|hold| hold.directory == directory)
+        }
+        /// Holds the calling thread here while a test keeps `slot` on.
+        fn wait_at(slot: &Mutex<Option<std::sync::Arc<Self>>>, directory: &Path) {
+            if let Some(hold) = Self::for_outbox(slot, directory) {
+                hold.reached.store(true, Ordering::SeqCst);
+                while !hold.released() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
     }
 
+    /// Outbox whose final write pauses, to hold a drained queue past the
+    /// shutdown deadline.
+    static PAUSED_FINAL_WRITE: Mutex<Option<std::sync::Arc<Hold>>> = Mutex::new(None);
+    pub(super) fn pause_before_final_write(directory: &Path) {
+        Hold::wait_at(&PAUSED_FINAL_WRITE, directory);
+    }
+
     /// Outbox whose writes block, holding the write lock, while a test
     /// keeps it here: a stalled disk.
-    static STALLED_OUTBOX: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static STALLED_WRITE: Mutex<Option<std::sync::Arc<Hold>>> = Mutex::new(None);
     pub(super) fn stall_while_held(directory: &Path) {
-        while STALLED_OUTBOX.lock().unwrap().as_deref() == Some(directory) {
-            std::thread::sleep(Duration::from_millis(10));
+        Hold::wait_at(&STALLED_WRITE, directory);
+    }
+
+    /// Outbox whose quit starts its deadline only once a thread reached this
+    /// hold.
+    static QUIT_AFTER: Mutex<Option<std::sync::Arc<Hold>>> = Mutex::new(None);
+    pub(super) fn before_quit_wait(directory: &Path) {
+        if let Some(hold) = Hold::for_outbox(&QUIT_AFTER, directory) {
+            hold.wait_until_reached();
         }
+    }
+
+    /// Outbox whose upload thread waits an hour for each line. Reaching the
+    /// hold means the thread is waiting.
+    static IDLE: Mutex<Option<std::sync::Arc<Hold>>> = Mutex::new(None);
+    pub(super) fn receive_timeout(directory: &Path) -> Option<Duration> {
+        Hold::for_outbox(&IDLE, directory).map(|hold| {
+            hold.reached.store(true, Ordering::SeqCst);
+            Duration::from_secs(3600)
+        })
     }
 
     #[test]
@@ -828,32 +978,41 @@ mod tests {
             allow_http: true,
         };
         // The worker's first write stalls while it holds the outbox lock.
-        *STALLED_OUTBOX.lock().unwrap() = Some(directory.clone());
+        let stall = Hold::new(&directory);
+        stall.release_after(PATIENCE);
+        *STALLED_WRITE.lock().unwrap() = Some(stall.clone());
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
         sender
             .send(Queued::Line("2026-10-21T17:11:31Z  INFO first line".into()))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(stall.wait_until_reached(), "the worker never wrote");
         sender
             .send(Queued::Line("2026-10-21T17:11:31Z  INFO last line".into()))
             .unwrap();
-        // The disk recovers long after the quit should have returned.
-        let release = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(5));
-            *STALLED_OUTBOX.lock().unwrap() = None;
-        });
+        GAVE_UP.with(|gave_up| gave_up.set(false));
         let started = std::time::Instant::now();
         drop(uploader);
         let waited = started.elapsed();
+        // The disk recovers only after the quit returned, so its return
+        // proves it did not wait for the write. Measuring it against
+        // SHUTDOWN_WAIT plus a margin measured the runner's speed instead.
         assert!(
-            STALLED_OUTBOX.lock().unwrap().is_some(),
+            !stall.released(),
             "quit waited for the stalled write: {waited:?}"
         );
         assert!(
-            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
-            "quit waited {waited:?}"
+            GAVE_UP.with(|gave_up| gave_up.get()),
+            "quit did not stop waiting for the worker"
         );
-        release.join().unwrap();
+        // So the quit waited only on its two bounded waits: SHUTDOWN_WAIT
+        // for the worker, then FINAL_WRITE_WAIT for the fallback's write.
+        // Pin them, so lengthening either fails here.
+        assert_eq!(
+            (SHUTDOWN_WAIT, FINAL_WRITE_WAIT),
+            (Duration::from_secs(2), Duration::from_millis(250))
+        );
+        stall.release();
+        *STALLED_WRITE.lock().unwrap() = None;
         let messages = outbox_messages_once(&directory, |messages| {
             ["first line", "last line"]
                 .iter()
@@ -867,18 +1026,24 @@ mod tests {
     fn quitting_near_the_deadline_keeps_every_drained_event() {
         let _sharing = sharing_on();
         let directory = outbox_with_batches(1);
+        let answer = std::sync::Arc::new(AtomicBool::new(false));
+        let (endpoint, arrived) = held_server(answer.clone());
         let config = Config {
-            endpoint: slow_server(Duration::from_millis(1700)).0,
+            endpoint,
             ingest_key: "write-only".into(),
             enabled: true,
             allow_http: true,
         };
-        // The acknowledgement arrives just before the deadline, and the
-        // worker is still writing the drained queue when the wait runs out.
-        // The write stalls far longer than a quit may wait.
-        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_secs(5)));
+        // The acknowledgement arrives after the quit began, and the worker
+        // is still writing the drained queue when the wait runs out: the
+        // quit's deadline starts once the worker holds the drained queue,
+        // and the write stalls until the quit has returned.
+        let final_write = Hold::new(&directory);
+        final_write.release_after(PATIENCE);
+        *PAUSED_FINAL_WRITE.lock().unwrap() = Some(final_write.clone());
+        *QUIT_AFTER.lock().unwrap() = Some(final_write.clone());
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_upload(&arrived);
         for index in 0..10 {
             sender
                 .send(Queued::Line(format!(
@@ -886,13 +1051,22 @@ mod tests {
                 )))
                 .unwrap();
         }
+        answer_when_stopped(uploader.stop.clone(), answer);
+        GAVE_UP.with(|gave_up| gave_up.set(false));
         let started = std::time::Instant::now();
         drop(uploader);
         let waited = started.elapsed();
         assert!(
-            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
-            "quit waited {waited:?}"
+            !final_write.released(),
+            "quit waited for the final write: {waited:?}"
         );
+        assert!(
+            GAVE_UP.with(|gave_up| gave_up.get()),
+            "the worker finished before the deadline"
+        );
+        final_write.release();
+        *PAUSED_FINAL_WRITE.lock().unwrap() = None;
+        *QUIT_AFTER.lock().unwrap() = None;
         // Whoever drained the queue writes all of it.
         let kept = |messages: &[String]| {
             (0..10)
@@ -951,7 +1125,8 @@ mod tests {
             sender.send(Queued::Line(line.into())).unwrap();
         }
         drop(uploader);
-        let mut messages = outbox_messages(&directory);
+        // A slow runner's quit can leave both lines to its fallback thread.
+        let mut messages = outbox_messages_once(&directory, |messages| messages.len() >= 2);
         messages.sort();
         assert_eq!(messages, ["", "after the empty line"]);
         fs::remove_dir_all(directory).unwrap();
@@ -961,30 +1136,41 @@ mod tests {
     fn an_idle_uploader_quits_without_waiting_for_its_receive_timeout() {
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
-        let mut waits = Vec::new();
-        for attempt in 0..10 {
-            let config = Config {
-                endpoint: "http://127.0.0.1:9/v1/events".into(),
-                ingest_key: "write-only".into(),
-                enabled: true,
-                allow_http: true,
-            };
-            let (_sender, uploader) = Uploader::spawn(config, directory.clone());
-            // Quit at different points of the thread's 100 ms receive.
-            std::thread::sleep(Duration::from_millis(150 + attempt * 7));
-            let started = std::time::Instant::now();
-            drop(uploader);
-            waits.push(started.elapsed());
-        }
-        waits.sort();
-        assert!(waits[5] < Duration::from_millis(20), "{waits:?}");
+        // The thread waits an hour for lines, so only the quit's wake can
+        // end the wait. Timing the quit against the real 100 ms receive
+        // measured the runner's speed instead.
+        let idle = Hold::new(&directory);
+        *IDLE.lock().unwrap() = Some(idle.clone());
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (_sender, uploader) = Uploader::spawn(config, directory.clone());
+        assert!(
+            idle.wait_until_reached(),
+            "the thread never waited for lines"
+        );
+        let queue = uploader.receiver.clone();
+        drop(uploader);
+        assert!(
+            thread_ended(&queue),
+            "the quit did not wake the idle thread"
+        );
+        *IDLE.lock().unwrap() = None;
         assert!(outbox_messages(&directory).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn quitting_during_a_stalled_upload_is_bounded_and_keeps_the_last_lines() {
-        let (waited, directory, gave_up) = quit_waits(Duration::from_secs(30));
+        let Quit {
+            waited,
+            directory,
+            gave_up,
+            ..
+        } = quit_during_upload(false);
         // What bounds the quit: it stops waiting for the stalled upload
         // thread after SHUTDOWN_WAIT instead of joining it. Waiting for the
         // request to time out (5 s) or for the thread would fail this.
@@ -1017,7 +1203,7 @@ mod tests {
         };
         fs::write(&path, serde_json::to_vec(&batch).unwrap()).unwrap();
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(3)))
+            .timeout_global(Some(Duration::from_secs(30)))
             .max_redirects(0)
             .build()
             .into();
@@ -1032,7 +1218,7 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .set_read_timeout(Some(Duration::from_secs(30)))
                     .unwrap();
                 let mut bytes = Vec::new();
                 let mut buffer = [0; 4096];
@@ -1154,6 +1340,9 @@ mod tests {
     }
     #[test]
     fn outbox_survives_reopen_and_is_bounded() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
         let mut batch = Batch {
