@@ -13,8 +13,17 @@
 //! abandoned when that process ends however it ends. A copy started by
 //! "Restart EternalMonitor" (`relaunch`) waits on it for the old host to exit
 //! instead of showing the old window; an ordinary launch never waits.
+//!
+//! The mutex's default security admits the creator's logon, so a normal
+//! launch opens one a "Run as administrator" copy of the same user created.
+//! A copy elevated with another account's password, as a standard user's
+//! is, creates one this launch may not open. Being refused it still means a
+//! host from this install is running.
 use std::path::Path;
 use std::time::Duration;
+
+/// How often a restart copy that may not open the mutex tries again.
+const DENIED_RETRY: Duration = Duration::from_millis(250);
 
 /// `Local\EternalMonitor-<hash>` for this executable and settings folder.
 pub fn mutex_name(exe: &Path, app_data: &Path) -> String {
@@ -67,8 +76,8 @@ pub trait NamedMutex {
     type Handle;
     /// Opens the mutex, creating it owned by the calling thread when it
     /// doesn't exist yet. Returns the handle and whether it existed (and so
-    /// is not ours).
-    fn create(&mut self) -> Result<(Self::Handle, bool), String>;
+    /// is not ours); `None` when it exists but this launch may not open it.
+    fn create(&mut self) -> Result<Option<(Self::Handle, bool)>, String>;
     /// Waits up to `timeout` to own the mutex: true once its owner released
     /// it or exited (abandoned), false at the deadline.
     fn wait(&mut self, handle: &Self::Handle, timeout: Duration) -> Result<bool, String>;
@@ -89,12 +98,26 @@ pub enum Claim<H> {
 /// Whether this launch may be the host. An ordinary launch (`wait` is
 /// `None`) loses to a running host at once; a restart copy waits up to
 /// `wait` for the host that started it to exit. Either way a manual launch
-/// meanwhile finds the mutex and shows the running window.
+/// meanwhile finds the mutex and shows the running window. A mutex this
+/// launch may not open is a running host too.
 pub fn claim<M: NamedMutex>(mutex: &mut M, wait: Option<Duration>) -> Claim<M::Handle> {
-    let (handle, existed) = match mutex.create() {
-        Ok(created) => created,
-        // Never refuse to start because the check itself failed.
-        Err(error) => return Claim::Unchecked(None, error),
+    let mut wait = wait;
+    let (handle, existed) = loop {
+        match mutex.create() {
+            Ok(Some(created)) => break created,
+            // Without a handle a restart copy can't wait on the mutex, so it
+            // tries to open it again until its time is up.
+            Ok(None) => match wait {
+                Some(left) if !left.is_zero() => {
+                    let pause = DENIED_RETRY.min(left);
+                    std::thread::sleep(pause);
+                    wait = Some(left - pause);
+                }
+                _ => return Claim::Running,
+            },
+            // Never refuse to start because the check itself failed.
+            Err(error) => return Claim::Unchecked(None, error),
+        }
     };
     if !existed {
         return Claim::Owned(handle);
@@ -170,12 +193,18 @@ struct Win32Mutex(windows::core::HSTRING);
 impl NamedMutex for Win32Mutex {
     type Handle = windows::Win32::Foundation::HANDLE;
 
-    fn create(&mut self) -> Result<(Self::Handle, bool), String> {
-        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    fn create(&mut self) -> Result<Option<(Self::Handle, bool)>, String> {
+        use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
         use windows::Win32::System::Threading::CreateMutexW;
-        let handle =
-            unsafe { CreateMutexW(None, true, &self.0) }.map_err(|error| error.to_string())?;
-        Ok((handle, unsafe { GetLastError() } == ERROR_ALREADY_EXISTS))
+        match unsafe { CreateMutexW(None, true, &self.0) } {
+            Ok(handle) => Ok(Some((
+                handle,
+                unsafe { GetLastError() } == ERROR_ALREADY_EXISTS,
+            ))),
+            // A host elevated as another user holds it.
+            Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn wait(&mut self, handle: &Self::Handle, timeout: Duration) -> Result<bool, String> {
@@ -396,6 +425,165 @@ mod tests {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&link);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Windows' mutex as a script: each `create` takes the next answer, and
+    /// `wait` says whether the owner let go.
+    #[derive(Default)]
+    struct Fake {
+        creates: Vec<Result<Option<(u32, bool)>, String>>,
+        released: bool,
+        calls: usize,
+        waited: Option<Duration>,
+        closed: Vec<u32>,
+    }
+
+    impl NamedMutex for Fake {
+        type Handle = u32;
+        fn create(&mut self) -> Result<Option<(u32, bool)>, String> {
+            self.calls += 1;
+            let next = self.creates.len().min(self.calls) - 1;
+            self.creates[next].clone()
+        }
+        fn wait(&mut self, _handle: &u32, timeout: Duration) -> Result<bool, String> {
+            self.waited = Some(timeout);
+            Ok(self.released)
+        }
+        fn close(&mut self, handle: u32) {
+            self.closed.push(handle);
+        }
+    }
+
+    fn fake(creates: Vec<Result<Option<(u32, bool)>, String>>) -> Fake {
+        Fake {
+            creates,
+            ..Fake::default()
+        }
+    }
+
+    /// A host elevated with another account's password made a mutex this
+    /// launch may not open: an ordinary launch shows that host's window
+    /// instead of starting a second one, and never waits.
+    #[test]
+    fn a_mutex_this_launch_may_not_open_means_a_host_is_running() {
+        use std::time::Instant;
+        let mut mutex = fake(vec![Ok(None)]);
+        let started = Instant::now();
+        assert_eq!(claim(&mut mutex, None), Claim::Running);
+        assert_eq!(mutex.calls, 1);
+        assert!(started.elapsed() < DENIED_RETRY);
+    }
+
+    /// A restart copy keeps trying until its deadline, then exits with its
+    /// "still closing" message; it never runs beside that host.
+    #[test]
+    fn a_restart_copy_that_may_not_open_the_mutex_gives_up_at_its_deadline() {
+        use std::time::Instant;
+        let mut mutex = fake(vec![Ok(None)]);
+        let started = Instant::now();
+        assert_eq!(
+            claim(&mut mutex, Some(Duration::from_millis(600))),
+            Claim::Running
+        );
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(mutex.calls >= 3, "{} tries", mutex.calls);
+    }
+
+    /// Once the elevated host exits, the restart copy creates the mutex, or
+    /// opens it and waits out the rest of its time for whoever holds it now.
+    #[test]
+    fn a_restart_copy_takes_the_mutex_once_it_may_open_it() {
+        let mut mutex = fake(vec![Ok(None), Ok(None), Ok(Some((7, false)))]);
+        assert_eq!(
+            claim(&mut mutex, Some(Duration::from_secs(20))),
+            Claim::Owned(7)
+        );
+        assert_eq!(mutex.waited, None);
+
+        let mut mutex = fake(vec![Ok(None), Ok(Some((8, true)))]);
+        mutex.released = true;
+        assert_eq!(
+            claim(&mut mutex, Some(Duration::from_secs(20))),
+            Claim::Owned(8)
+        );
+        assert_eq!(
+            mutex.waited,
+            Some(Duration::from_secs(20) - DENIED_RETRY),
+            "waits out the rest of its time"
+        );
+    }
+
+    /// #117's outcomes for a mutex this launch may open.
+    #[test]
+    fn an_openable_mutex_keeps_its_outcomes() {
+        assert_eq!(
+            claim(&mut fake(vec![Ok(Some((1, false)))]), None),
+            Claim::Owned(1)
+        );
+        let mut running = fake(vec![Ok(Some((2, true)))]);
+        assert_eq!(claim(&mut running, None), Claim::Running);
+        assert_eq!(running.closed, vec![2]);
+        assert_eq!(running.waited, None, "an ordinary launch never waits");
+        let mut still = fake(vec![Ok(Some((3, true)))]);
+        assert_eq!(
+            claim(&mut still, Some(Duration::from_millis(50))),
+            Claim::Running
+        );
+        assert_eq!(still.closed, vec![3]);
+        assert_eq!(
+            claim(&mut fake(vec![Err("no".into())]), None),
+            Claim::Unchecked(None, "no".into()),
+            "a failed check never refuses the launch"
+        );
+    }
+
+    /// The real mutex: an empty DACL refuses this process as another
+    /// account's elevated host would.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_mutex_this_launch_may_not_open_means_a_host_is_running() {
+        use std::time::Instant;
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{
+            InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        };
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let name = format!(r"Local\EternalMonitor-test-denied-{}", std::process::id());
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let pointer = PSECURITY_DESCRIPTOR(&mut descriptor as *mut _ as *mut _);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: pointer.0,
+            bInheritHandle: false.into(),
+        };
+        let first = unsafe {
+            // Revision 1; a present, empty DACL grants nobody access.
+            InitializeSecurityDescriptor(pointer, 1).unwrap();
+            SetSecurityDescriptorDacl(pointer, true, None, false).unwrap();
+            CreateMutexW(Some(&attributes), false, &HSTRING::from(name.as_str())).unwrap()
+        };
+        assert!(claim_named(&name, None).is_none(), "an ordinary launch");
+        let started = Instant::now();
+        assert!(
+            claim_named(&name, Some(Duration::from_millis(400))).is_none(),
+            "a restart copy at its deadline"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(400));
+
+        // The elevated host exits while a restart copy waits.
+        let raw = first.0 as isize;
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            unsafe {
+                let _ = CloseHandle(HANDLE(raw as *mut _));
+            }
+        });
+        let copy = claim_named(&name, Some(Duration::from_secs(20))).expect("the copy runs");
+        assert!(copy.problem.is_none(), "{:?}", copy.problem);
+        exit.join().unwrap();
     }
 
     #[cfg(windows)]

@@ -49,14 +49,14 @@ struct Mutex {
 impl NamedMutex for Mutex {
     type Handle = ();
 
-    fn create(&mut self) -> Result<((), bool), String> {
+    fn create(&mut self) -> Result<Option<((), bool)>, String> {
         let mut pc = self.pc.borrow_mut();
         pc.handles += 1;
         if pc.handles == 1 {
             pc.owner = Some(self.process);
-            return Ok(((), false));
+            return Ok(Some(((), false)));
         }
-        Ok(((), true))
+        Ok(Some(((), true)))
     }
 
     fn wait(&mut self, _: &(), timeout: Duration) -> Result<bool, String> {
