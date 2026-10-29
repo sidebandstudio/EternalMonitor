@@ -22,7 +22,7 @@ use eternal_host::gpu::GpuInfo;
 use eternal_host::pipeline;
 use eternal_host::transport::session::EndReason;
 use eternal_wire::h264::contains_nal_type;
-use eternal_wire::reassembly::{AddOutcome, Reassembler};
+use eternal_wire::reassembly::{AddOutcome, Reassembler, MAX_STALL_ALLOWANCE};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus,
     KeyframeReason, KeyframeRequest, ReceiverReport, CAP_DECODE_H264,
@@ -1700,6 +1700,32 @@ fn lossy_stream_recovers_and_adapts() {
         Duration::from_micros(16_667),
         Duration::from_millis(1),
     );
+    // Repair deadlines run on the fake iPad's own clock, which stops while
+    // this thread is descheduled: each pass of the loop below counts at most
+    // MAX_PASS. On the wall clock, a test thread descheduled past a deadline
+    // read its datagrams late, the repair already waiting among them, and
+    // expired that frame and asked for a keyframe. The capture clock fails
+    // the other way: draining that backlog moves it hundreds of ms at once,
+    // past the deadlines of gaps the backlog shows. A pass waits at most
+    // 1 ms on macOS and 2 ms elsewhere (about 16 ms with Windows' timer), so
+    // on a machine with time to spare this clock is the wall clock, and a
+    // repair the host sends late is late on it too.
+    const MAX_PASS: Duration = Duration::from_millis(20);
+    let mut ipad_now = Instant::now();
+    let mut pass_started = ipad_now;
+    // While the PC sends nothing, the iPad stops a waiting frame's repair
+    // deadline, by at most MAX_STALL_ALLOWANCE per frame; past that it asks
+    // for a keyframe, as specified. On a starved machine the host's sender
+    // went silent for 350-600 ms twice in one run with a frame waiting for
+    // its repair, and the fake iPad rightly asked twice. Each such silence
+    // on the iPad's clock, longer than the allowance while an incomplete
+    // frame waits, may cost one request. A slow encoder's quiet gaps between
+    // whole frames do not count. Without such a silence the bound stays one.
+    let mut last_media: Option<(Instant, u8)> = None;
+    let mut pc_silences = 0u32;
+    let silent_past_allowance = |last: Option<(Instant, u8)>, now: Instant| {
+        last.is_some_and(|(at, waiting)| waiting > 0 && now - at > MAX_STALL_ALLOWANCE)
+    };
     // Match the app's independent decode queue. Synchronous software decode
     // here can stall socket reads through a repair deadline on a busy runner,
     // even when the retransmit is already waiting in the kernel buffer.
@@ -1757,6 +1783,9 @@ fn lossy_stream_recovers_and_adapts() {
             );
             assert_eq!(unsafe { event.assume_init() }.flags & libc::EV_ERROR, 0);
         }
+        let woke = Instant::now();
+        ipad_now += (woke - pass_started).min(MAX_PASS);
+        pass_started = woke;
         if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
             if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
                 if header.session_id == receiver.session_id {
@@ -1766,13 +1795,22 @@ fn lossy_stream_recovers_and_adapts() {
                         header.frag_index,
                         header.is_retransmit,
                     ));
-                    assembler.add_media(header, payload, Instant::now());
+                    if silent_past_allowance(last_media, ipad_now) {
+                        pc_silences += 1;
+                        eprintln!(
+                            "NACK_E2E_PC_SILENT ms={} elapsed_ms={}",
+                            last_media.map_or(0, |(at, _)| (ipad_now - at).as_millis()),
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    assembler.add_media(header, payload, ipad_now);
+                    last_media = Some((ipad_now, assembler.counters().assembler_depth));
                 }
             } else if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&bytes[..len]) {
                 abr_down |= hb.stream_config.bitrate_bps < 15_000_000;
             }
         }
-        assembler.tick(Instant::now());
+        assembler.tick(ipad_now);
         for nack in assembler.take_nacks() {
             nack_trace.push((started.elapsed().as_micros(), nack.clone()));
             receiver.send(&ControlMessage::Nack(nack));
@@ -1814,6 +1852,7 @@ fn lossy_stream_recovers_and_adapts() {
             }));
         }
     }
+    pc_silences += u32::from(silent_past_allowance(last_media, ipad_now));
     let counters = assembler.counters();
     let (sent, retransmits) = {
         let stats = eternal_host::stats::PIPELINE_STATS.lock();
@@ -1850,7 +1889,7 @@ fn lossy_stream_recovers_and_adapts() {
             }
         }
     }
-    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
+    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} pc_silences={pc_silences} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
     assert!(
         sent >= 600,
         "fifteen-second stream must make sustained progress"
@@ -1860,8 +1899,9 @@ fn lossy_stream_recovers_and_adapts() {
         "at least 97% of sent frames must decode"
     );
     assert!(
-        requests <= 1,
-        "no keyframe storm during the fifteen-second window"
+        requests <= 1 + pc_silences,
+        "no keyframe storm during the fifteen-second window: {requests} requests, \
+         {pc_silences} silences of the PC past the iPad's allowance"
     );
     assert!(
         counters.frags_repaired > 0 && retransmits > 0,
