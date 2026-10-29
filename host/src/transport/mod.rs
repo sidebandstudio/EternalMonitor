@@ -444,7 +444,7 @@ pub async fn start_sender(
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
-                for (index, datagram) in stored.iter().enumerate() {
+                for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
                     // Keep serving audio even when there are no more pauses;
                     // otherwise a large IDR can fill its 60 ms capture queue.
@@ -453,14 +453,14 @@ pub async fn start_sender(
                         for due in fault.push(datagram, Instant::now()) {
                             if let Err(e) = links.send_to(&due, target_addr).await {
                                 if !send_failed {
-                                    warn!(seq = frame_seq, error = %e, "UDP send failed");
+                                    log_send_failed(target_addr.link, &e);
                                     send_failed = true;
                                 }
                             }
                         }
                     } else if let Err(e) = links.send_to(datagram, target_addr).await {
                         if !send_failed {
-                            warn!(seq = frame_seq, fragment = index, error = %e, "UDP send failed");
+                            log_send_failed(target_addr.link, &e);
                             send_failed = true;
                         }
                     }
@@ -520,6 +520,16 @@ pub(crate) enum FirstFrame {
     Send,
     Skip,
     SkipAndRequestKeyframe,
+}
+
+/// Says which link failed but not which frame or fragment, so a failing link
+/// repeats one identical line that the log collapser can fold.
+fn log_send_failed(link: LinkId, error: &std::io::Error) {
+    let link = match link {
+        LinkId::Udp => "wifi",
+        LinkId::Usb { .. } => "usb",
+    };
+    warn!(link = %link, error = %error, "UDP send failed");
 }
 
 /// A session's first frame must be a keyframe captured after it started. An
@@ -1005,5 +1015,45 @@ mod tests {
             assert_eq!(source, PeerId::udp(peer));
             assert_eq!(parse_control(&bytes).unwrap().1, expected);
         }
+    }
+
+    #[test]
+    fn a_failed_send_names_the_link_and_repeats_identically() {
+        let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = std::sync::Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
+            .finish();
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        tracing::subscriber::with_default(subscriber, || {
+            log_send_failed(LinkId::Usb { device_id: 3 }, &error);
+            log_send_failed(LinkId::Usb { device_id: 3 }, &error);
+            log_send_failed(LinkId::Udp, &error);
+        });
+        let text = String::from_utf8(out.lock().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0], lines[1], "the collapser needs identical lines");
+        assert_eq!(
+            lines[0].trim(),
+            "WARN UDP send failed link=usb error=connection reset"
+        );
+        assert_eq!(
+            lines[2].trim(),
+            "WARN UDP send failed link=wifi error=connection reset"
+        );
     }
 }
