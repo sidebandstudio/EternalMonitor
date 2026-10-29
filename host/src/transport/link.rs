@@ -32,9 +32,6 @@ const KEYFRAME_BACKOFF_RESET: Duration = Duration::from_secs(5);
 /// A write that waited this long means the tunnel stood still, not that it
 /// is slow: a datagram drains in milliseconds even through a slow usbmuxd.
 const STALL: Duration = Duration::from_millis(100);
-/// A queued frame that has waited two frame intervals, and never less than
-/// this, waits behind a tunnel that is behind, not a writer about to run.
-const STALE_MIN: Duration = Duration::from_millis(33);
 const CONTROL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -160,7 +157,6 @@ struct Frame {
     frag_count: u16,
     datagrams: Vec<Vec<u8>>,
     bytes: usize,
-    queued: Instant,
 }
 
 impl Frame {
@@ -182,9 +178,6 @@ struct VideoQueue {
     stream: Option<(u32, u32)>,
     /// When the writer started the write it is waiting in, if any.
     writing_since: Option<Instant>,
-    /// When the latest frame arrived, and how long after the one before.
-    last_frame: Option<Instant>,
-    frame_interval: Duration,
 }
 
 impl VideoQueue {
@@ -194,11 +187,11 @@ impl VideoQueue {
     /// iPad partial keyframes, each of which asked for another keyframe, the
     /// biggest frame of all. Dependents of a lost frame are discarded until a
     /// keyframe, and a keyframe always passes. It replaces what is still
-    /// queued only when the tunnel is behind, and those frames count as lost,
-    /// or periodic keyframes would hide a tunnel that never catches up. A
-    /// frame being written says nothing about the tunnel: the sender can push
-    /// two frames before the writer runs again, and on a healthy cable both
-    /// still go out ahead of the keyframe.
+    /// queued only when the keyframe might not fit behind it or the tunnel
+    /// stands still, and those frames count as lost. Neither how long a frame
+    /// waited nor how often frames arrive says the tunnel is behind: one
+    /// large frame can take a second to write through a slow cable that still
+    /// moves, and the frames queued behind it still decode.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
@@ -221,28 +214,17 @@ impl VideoQueue {
                 // backoff.
                 self.keyframes = KeyframeBackoff::default();
             }
-            // Two intervals between the frames before this one: a keyframe
-            // that took longer to encode must not stretch its own wait.
-            let stale_after = (self.frame_interval * 2).max(STALE_MIN);
-            if let Some(last) = self.last_frame.replace(now) {
-                self.frame_interval = now.saturating_duration_since(last);
-            }
             if header.is_keyframe {
                 // Queued frames are older and the keyframe needs none of them,
                 // but they still decode. They are replaced only when the
-                // tunnel is behind: the keyframe might not fit behind them,
-                // the oldest has waited longer than the stream can afford, or
-                // the write in progress has stood still.
+                // keyframe might not fit behind them or the write in progress
+                // has stood still.
                 let fits = self.frames.len() < FRAME_LIMIT
                     && self.bytes + usize::from(header.frag_count) * MAX_DGRAM_SIZE <= BYTE_LIMIT;
-                let stale = self
-                    .frames
-                    .front()
-                    .is_some_and(|frame| now.saturating_duration_since(frame.queued) > stale_after);
                 let stalled = self
                     .writing_since
                     .is_some_and(|at| now.saturating_duration_since(at) >= STALL);
-                if !fits || stale || stalled {
+                if !fits || stalled {
                     dropped = self.frames.len() as u64;
                     self.frames.clear();
                     self.bytes = 0;
@@ -262,7 +244,6 @@ impl VideoQueue {
                 frag_count: header.frag_count,
                 datagrams: Vec::with_capacity(usize::from(header.frag_count).min(1024)),
                 bytes: 0,
-                queued: now,
             });
         }
         let Some(frame) = self.frames.back_mut() else {
@@ -854,14 +835,16 @@ mod tests {
         assert_eq!(queue.frames.len(), FRAME_LIMIT, "queued frames stay");
         assert_eq!(queue.pop().unwrap().seq, 1);
         assert_eq!(queue.pop().unwrap().seq, 2);
-        // A keyframe replaces what has waited too long, and those frames are
-        // lost.
+        // A keyframe goes out after the frames still queued.
         assert_eq!(
             queue
-                .push(&packet(next + 2, true, 0, 1, 64), now + STALE_MIN * 2)
+                .push(&packet(next + 2, true, 0, 1, 64), now + STALL)
                 .unwrap(),
-            FRAME_LIMIT as u64 - 2
+            0
         );
+        for seq in 3..=FRAME_LIMIT as u32 {
+            assert_eq!(queue.pop().unwrap().seq, seq);
+        }
         assert_eq!(queue.pop().unwrap().seq, next + 2);
         assert!(queue.pop().is_none());
         assert_eq!(queue.bytes, 0);
@@ -896,25 +879,6 @@ mod tests {
         bytes
     }
 
-    /// Under a steady overload, periodic keyframes can clear the queue before
-    /// it ever overflows. The video they replace is lost, and must count, or
-    /// the bitrate never comes down.
-    #[test]
-    fn a_keyframe_counts_the_frames_it_replaces_as_dropped() {
-        let now = Instant::now();
-        let mut queue = VideoQueue::default();
-        queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
-        queue.pop().unwrap();
-        for seq in 2..=5 {
-            assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
-        }
-        let later = now + STALE_MIN * 2;
-        assert_eq!(queue.push(&packet(6, true, 0, 1, 64), later).unwrap(), 4);
-        assert_eq!(queue.pop().unwrap().seq, 6);
-        // An empty queue loses nothing to a keyframe.
-        assert_eq!(queue.push(&packet(7, true, 0, 1, 64), later).unwrap(), 0);
-    }
-
     /// A keyframe that might be cut short by the queue's bounds replaces
     /// what is queued, however briefly it waited.
     #[test]
@@ -945,36 +909,23 @@ mod tests {
         assert_eq!(queue.frames.len(), 1);
     }
 
-    /// A queued frame that has waited two frame intervals, and at least
-    /// `STALE_MIN`, waits behind a tunnel that is behind. One that waited
-    /// less is still sent ahead of the keyframe.
+    /// How long a frame waited, and how closely frames arrived, say nothing
+    /// about the tunnel: one large frame can take a second to write through
+    /// a slow cable that still moves. A keyframe that fits goes out after
+    /// the frames queued before it.
     #[test]
-    fn a_keyframe_replaces_queued_frames_that_waited_two_frame_intervals() {
-        let replaced = |interval: u64, keyframe_at: u64| {
-            let start = Instant::now();
-            let at = |ms| start + Duration::from_millis(ms);
-            let mut queue = VideoQueue::default();
-            queue.push(&packet(1, true, 0, 1, 64), start).unwrap();
-            queue.pop().unwrap();
-            queue
-                .push(&packet(2, false, 0, 1, 64), at(interval))
-                .unwrap();
-            queue
-                .push(&packet(3, false, 0, 1, 64), at(2 * interval))
-                .unwrap();
-            queue
-                .push(&packet(4, true, 0, 1, 64), at(keyframe_at))
-                .unwrap()
-        };
-        // 60 fps: frame 2 may wait 33 ms.
-        assert_eq!(replaced(16, 49), 0);
-        assert_eq!(replaced(16, 50), 2);
-        // 30 fps: two intervals are 66 ms.
-        assert_eq!(replaced(33, 99), 0);
-        assert_eq!(replaced(33, 100), 2);
-        // 120 fps: never less than 33 ms.
-        assert_eq!(replaced(8, 41), 0);
-        assert_eq!(replaced(8, 42), 2);
+    fn a_keyframe_keeps_queued_frames_however_long_they_waited() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut queue = VideoQueue::default();
+        queue.push(&packet(1, true, 0, 1, 64), start).unwrap();
+        queue.pop().unwrap();
+        queue.push(&packet(2, false, 0, 1, 64), at(65)).unwrap();
+        queue.push(&packet(3, false, 0, 1, 64), at(66)).unwrap();
+        assert_eq!(queue.push(&packet(4, true, 0, 1, 64), at(1066)).unwrap(), 0);
+        for seq in 2..=4 {
+            assert_eq!(queue.pop().unwrap().seq, seq);
+        }
     }
 
     /// A pipeline restart keeps the USB tunnel. Its new stream must not
