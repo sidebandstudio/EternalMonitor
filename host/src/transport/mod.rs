@@ -705,6 +705,9 @@ async fn execute_actions(
     if actions.force_idr {
         shared.force_next_idr.store(true, Ordering::SeqCst);
     }
+    if actions.reopen_encoder {
+        shared.reopen_encoder.store(true, Ordering::SeqCst);
+    }
 
     if actions.client_lost {
         shared.client_preferred_fps.store(0, Ordering::SeqCst);

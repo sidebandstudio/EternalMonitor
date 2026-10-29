@@ -241,6 +241,7 @@ fn run_encode_loop(
         // Latch requests before deciding whether to reopen. Requests received
         // during the rate limit must survive until AMF can emit an IDR.
         pending_keyframe |= shared.force_next_idr.swap(false, Ordering::SeqCst);
+        let resume_reopen = take_resume_reopen(&shared.reopen_encoder, encoder_state.is_some());
         let keyframe_reopen = pending_keyframe
             && encoder_state.as_ref().is_some_and(|state| {
                 reopen_for_keyframe(
@@ -325,7 +326,7 @@ fn run_encode_loop(
                         state.opened_fps,
                     ),
                     (&desired_encoder, desired_bitrate, target_fps),
-                    keyframe_reopen,
+                    keyframe_reopen || resume_reopen,
                     failed_reopen.as_ref(),
                     lane_clear,
                 )
@@ -334,9 +335,10 @@ fn run_encode_loop(
             // Bitrate changed (ABR rung or the user's slider), the
             // negotiated codec changed (HEVC toggle / client capability), the
             // capture size changed (display mode change), or AMF owes a
-            // keyframe: hardware encoders ignore parameter pokes on an open
-            // context, so each means a session reopen (~50-200ms hiccup, no
-            // transport teardown, same stream epoch) followed by a forced IDR.
+            // keyframe, or the client asked to restart a frozen stream:
+            // hardware encoders ignore parameter pokes on an open context, so
+            // each means a session reopen (~50-200ms hiccup, no transport
+            // teardown, same stream epoch) followed by a forced IDR.
             // So does a try of the preferred encoder after a stalled open.
             if keyframe_reopen {
                 last_keyframe_reopen = Some(Instant::now());
@@ -370,6 +372,7 @@ fn run_encode_loop(
                         height = raw_frame.height,
                         size_changed,
                         keyframe = keyframe_reopen,
+                        resume = resume_reopen,
                         "Reopened encoder session"
                     );
                     encoder_state = Some(state);
@@ -1265,6 +1268,12 @@ fn reopen_for_keyframe(
         && since_last_reopen.is_none_or(|elapsed| {
             elapsed >= crate::transport::session::KEYFRAME_REQUEST_MIN_INTERVAL
         })
+}
+
+/// Takes a pending client restart request. Without an open session there is
+/// nothing to reopen: the next open is fresh anyway.
+fn take_resume_reopen(flag: &std::sync::atomic::AtomicBool, encoder_open: bool) -> bool {
+    flag.swap(false, Ordering::SeqCst) && encoder_open
 }
 
 /// AMF can satisfy a request only on a fresh session's first frame. Keep it
@@ -3038,6 +3047,22 @@ mod tests {
         );
         assert_eq!(hevc_variant_of("libx264"), Some("libx265"));
         assert_eq!(hevc_variant_of("mystery_codec"), None);
+    }
+
+    #[test]
+    fn a_client_restart_request_reopens_an_open_encoder_once() {
+        let shared = crate::control::SharedControl::new(9876, 8_000_000);
+        assert!(!take_resume_reopen(&shared.reopen_encoder, true));
+        shared.reopen_encoder.store(true, Ordering::SeqCst);
+        assert!(take_resume_reopen(&shared.reopen_encoder, true));
+        assert!(
+            !take_resume_reopen(&shared.reopen_encoder, true),
+            "taken once"
+        );
+        // With no session open the next open is fresh; the request is used up.
+        shared.reopen_encoder.store(true, Ordering::SeqCst);
+        assert!(!take_resume_reopen(&shared.reopen_encoder, false));
+        assert!(!shared.reopen_encoder.load(Ordering::SeqCst));
     }
 
     #[test]
