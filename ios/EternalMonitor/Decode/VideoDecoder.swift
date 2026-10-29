@@ -36,8 +36,6 @@ final class VideoDecoder {
     /// a request can be lost or coalesced like any other.
     var onRestartStream: (() -> Void)?
     /// The picture has been held `reconnectAfterUs`: this session can't recover.
-    /// After a Resume to a 0.3.4 PC, while its heartbeats arrive, not before
-    /// `reopenGraceUs` past the first Resume.
     var onStalled: (() -> Void)?
 
     /// Which bitstream the host is sending. Sniffed from the NAL units
@@ -75,8 +73,6 @@ final class VideoDecoder {
         var resumeGeneration: UInt64?
         var restartedStream = false
         var reportedStall = false
-        /// When the first Resume of this hold went out.
-        var resumedAt: UInt64?
     }
     private let hold = OSAllocatedUnfairLock<Hold?>(initialState: nil)
     private var recoveryTimer: DispatchSourceTimer?
@@ -90,9 +86,6 @@ final class VideoDecoder {
     private var notReadyDrops = 0
     private var lastNotReadyLogUs: UInt64?
     static let notReadyLogIntervalUs: UInt64 = 5_000_000
-    /// Whether the PC's heartbeats still arrive; `nil` until the session
-    /// is accepted. Read on the decode queue.
-    private var hostAlive: ((UInt64) -> Bool)?
 
     typealias SessionFactory = (CMVideoFormatDescription, CFDictionary, CFDictionary) -> (OSStatus, VTDecompressionSession?)
     private let makeSession: SessionFactory
@@ -108,12 +101,6 @@ final class VideoDecoder {
     static let restartStreamAfterUs: UInt64 = 2_000_000
     /// Then the connection is rebuilt.
     static let reconnectAfterUs: UInt64 = 5_000_000
-    /// Unless a Resume went out to a 0.3.4 PC and its heartbeats still
-    /// arrive: it reopens its encoder for Resume, and a hardware reopen may
-    /// take up to 9 s (field QSV opens take up to 4.4 s). The reconnect then
-    /// waits until this long after the first Resume. A 0.3.1-0.3.3 PC only
-    /// forces an IDR for Resume, so waiting longer would not help it.
-    static let reopenGraceUs: UInt64 = 12_000_000
     /// A hold this long shows Restoring the picture and is logged.
     static let showRestoringAfterUs: UInt64 = 1_000_000
 
@@ -175,18 +162,6 @@ final class VideoDecoder {
         decodeQueue.async { [weak self] in self?.continuity.frameSeqContiguous = contiguous }
     }
 
-    /// The PC is alive while its last heartbeat (`lastHeartbeatUs`, client
-    /// clock, 0 for none) is at most `timeoutUs` old.
-    func setHostLiveness(lastHeartbeatUs: @escaping () -> UInt64, timeoutUs: UInt64) {
-        decodeQueue.async { [weak self] in
-            self?.hostAlive = { now in
-                let last = lastHeartbeatUs()
-                // A heartbeat stamped after `now` was read is fresh.
-                return last > 0 && (last >= now || now - last <= timeoutUs)
-            }
-        }
-    }
-
     private func beginWaitingForKeyframe() {
         guard !waitingForSyncSample else { return }
         waitingForSyncSample = true
@@ -207,12 +182,11 @@ final class VideoDecoder {
 
     /// Recovery while the picture is held, driven by time alone, so a silent
     /// stream recovers too: ask again every `keyframeRetryUs`, rebuild at
-    /// `restartStreamAfterUs`, give the session up at `reconnectAfterUs`, or
-    /// later while the PC reopens its encoder (`waitsForEncoderReopen`).
+    /// `restartStreamAfterUs`, give the session up at `reconnectAfterUs`.
     private func recoveryTick() {
         guard !isShutdown, let current = hold.withLock({ $0 }) else { return }
         let now = nowUs()
-        if now &- current.start >= Self.reconnectAfterUs, !waitsForEncoderReopen(current, at: now) {
+        if now &- current.start >= Self.reconnectAfterUs {
             guard !current.reportedStall else { return }
             hold.withLock { $0?.reportedStall = true }
             onStalled?()
@@ -221,18 +195,6 @@ final class VideoDecoder {
         rebuildIfHeldTooLong(at: now)
         guard now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
         requestKeyframe(at: now)
-    }
-
-    /// A Resume went out less than `reopenGraceUs` ago to a PC that reopens
-    /// its encoder for it, and the PC's heartbeats still arrive. Without
-    /// heartbeats the PC is gone, not reopening, and the reconnect keeps its
-    /// 5 s. The contiguous frame numbering cap (bit 5) marks a 0.3.4 PC, the
-    /// first to reopen for Resume; 0.3.1-0.3.3 PCs leave it clear.
-    private func waitsForEncoderReopen(_ current: Hold, at now: UInt64) -> Bool {
-        guard continuity.frameSeqContiguous,
-              let resumedAt = current.resumedAt, now &- resumedAt < Self.reopenGraceUs,
-              let hostAlive else { return false }
-        return hostAlive(now)
     }
 
     /// Ask (again) for a keyframe the host has not sent: a frame arrived that
@@ -252,7 +214,6 @@ final class VideoDecoder {
     private func requestKeyframe(at now: UInt64) {
         lastKeyframeRequestUs = now
         if let start = hold.withLock({ $0?.start }), now &- start >= Self.restartStreamAfterUs {
-            hold.withLock { if $0?.resumedAt == nil { $0?.resumedAt = now } }
             onRestartStream?()
         } else {
             onNeedsKeyframe?()

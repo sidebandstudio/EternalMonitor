@@ -38,8 +38,8 @@ final class StreamRecoveryTests: XCTestCase {
 
     func testFrozenPictureAsksThePCToRestartTheStream() async throws {
         // A frame is lost and nothing more arrives: after 2 s of frozen
-        // picture the iPad sends Resume, which a PC with this fix answers by
-        // reopening its encoder (0.3.1 PCs force a keyframe).
+        // picture the iPad sends Resume, which the PC answers with a keyframe
+        // like any other request.
         let host = FakeUDPHost()
         _ = try await streaming(host)
         let units = try twoGOPs()
@@ -51,6 +51,36 @@ final class StreamRecoveryTests: XCTestCase {
         let firstResume = try XCTUnwrap(reasons.firstIndex(of: .resume), "\(reasons)")
         XCTAssertGreaterThanOrEqual(firstResume, 3, "\(reasons)")
         XCTAssertTrue(reasons[..<firstResume].allSatisfy { $0 == .decodeError }, "\(reasons)")
+    }
+
+    func testAHeldPictureReconnectsAtFiveSecondsThoughHeartbeatsArrive() async throws {
+        // The PC keeps answering but no keyframe decodes. Resume asks the PC
+        // for a keyframe like any other reason, so nothing is gained by
+        // waiting: every PC, 0.3.4 or older, gets the 5 s reconnect.
+        for hostCaps in [HelloAck.hostCapContiguousFrameSeq, 0] {
+            let units = try twoGOPs()
+            let host = FakeUDPHost()
+            let manager = try await streaming(host, hostCaps: hostCaps)
+            host.sendFrame(units[1], seq: 2, isKeyframe: false)
+            host.sendFrame(units[3], seq: 4, isKeyframe: false)
+            let lostAt = Date()
+            let heartbeats = Task.detached {
+                for _ in 0..<16 {
+                    host.sendHeartbeat()
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+            let requests = Task.detached { host.keyframeRequests(within: 4.5) }
+            try await until("caps \(hostCaps): reconnects", seconds: 8) { manager.state != .connected }
+            let heldFor = Date().timeIntervalSince(lostAt)
+            heartbeats.cancel()
+            XCTAssertTrue((4.8...6.5).contains(heldFor), "caps \(hostCaps): reconnected after \(heldFor) s")
+            let asked = await requests.value
+            XCTAssertTrue(asked.contains(.resume), "caps \(hostCaps): Resume is still sent: \(asked)")
+            XCTAssertTrue(manager.diagnostics.contains { $0.message.contains("Picture held 5 s") }, "caps \(hostCaps)")
+            XCTAssertFalse(manager.diagnostics.contains { $0.message.contains("heartbeats stopped") }, "caps \(hostCaps)")
+            manager.cancel()
+        }
     }
 
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {

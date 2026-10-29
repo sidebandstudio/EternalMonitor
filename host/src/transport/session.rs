@@ -13,8 +13,8 @@ use super::link::{LinkId, PeerId};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeReason, KeyframeRequest,
-    Nack, ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
+    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, Nack,
+    ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
 };
 use tracing::{info, warn};
 
@@ -41,8 +41,6 @@ struct RefusalMinute {
 }
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
-/// Reopen the encoder for a `Resume` request at most once per this window.
-pub const RESUME_REOPEN_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What the transport must do after feeding the session an event.
 #[derive(Debug, Default)]
@@ -54,9 +52,6 @@ pub struct Actions {
     pub new_target: Option<PeerId>,
     /// Ask the encoder for an IDR (new/superseded session, keyframe request).
     pub force_idr: bool,
-    /// Reopen the encoder session: the client's picture has been frozen for
-    /// seconds and asked to restart the stream (`KeyframeReason::Resume`).
-    pub reopen_encoder: bool,
     /// The client is gone (BYE or liveness expiry): stop sending media and, if
     /// the virtual display is in use, restart the pipeline so it tears down.
     pub client_lost: bool,
@@ -133,7 +128,6 @@ struct ActiveSession {
     liveness_deadline: Instant,
     awaiting_takeover: bool,
     last_keyframe_grant: Option<Instant>,
-    last_resume_reopen: Option<Instant>,
     last_report: Option<ReceiverReport>,
     msg_seq_out: u32,
     /// When the first video went to this session.
@@ -547,7 +541,6 @@ impl Session {
             liveness_deadline: now + LIVENESS_TIMEOUT,
             awaiting_takeover: false,
             last_keyframe_grant: None,
-            last_resume_reopen: None,
             last_report: None,
             msg_seq_out: 0,
             first_video_at: None,
@@ -619,20 +612,6 @@ impl Session {
         if granted {
             session.last_keyframe_grant = Some(now);
             info!(reason = ?request.reason, "Keyframe requested by client — forcing IDR");
-            actions.force_idr = true;
-        }
-        // A forced IDR from a broken encoder session doesn't help; the iPad
-        // sends Resume after 2 s of frozen picture, and a new session might.
-        let reopen = request.reason == KeyframeReason::Resume
-            && !matches!(
-                session.last_resume_reopen,
-                Some(last) if now.duration_since(last) < RESUME_REOPEN_MIN_INTERVAL
-            );
-        if reopen {
-            session.last_resume_reopen = Some(now);
-            session.last_keyframe_grant = Some(now);
-            info!("Client asked to restart the stream — reopening the encoder");
-            actions.reopen_encoder = true;
             actions.force_idr = true;
         }
         actions
@@ -1484,7 +1463,11 @@ mod tests {
     }
 
     #[test]
-    fn resume_reopens_the_encoder_at_most_every_two_seconds() {
+    fn a_resume_is_an_ordinary_rate_limited_keyframe_request() {
+        // A 0.3.4 iPad holding a picture asks for a keyframe every 600 ms and
+        // sends Resume after 2 s. Resume asks for one IDR under the same
+        // 500 ms limit as any other reason, and for nothing else: the
+        // encoder reopens only on AMF, through its keyframe reopen.
         let mut session = Session::new(1234);
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
@@ -1496,40 +1479,35 @@ mod tests {
                 reason,
             })
         };
-        let at = |millis| now + Duration::from_millis(millis);
 
-        // Only the iPad's restart request reopens; the others force an IDR.
+        let mut granted = Vec::new();
         for (millis, reason) in [
-            (0, KeyframeReason::GapLoss),
-            (600, KeyframeReason::DecodeError),
+            (1_800, KeyframeReason::GapLoss),
+            (2_000, KeyframeReason::Resume),
+            (2_400, KeyframeReason::GapLoss),
+            (2_600, KeyframeReason::Resume),
         ] {
-            let actions =
-                session.handle_control_authed(peer, request(reason), &TestConfig, at(millis));
-            assert!(actions.force_idr && !actions.reopen_encoder, "{reason:?}");
+            let actions = session.handle_control_authed(
+                peer,
+                request(reason),
+                &TestConfig,
+                now + Duration::from_millis(millis),
+            );
+            assert!(actions.replies.is_empty(), "{millis} ms");
+            assert!(actions.new_target.is_none() && !actions.client_lost);
+            if actions.force_idr {
+                granted.push(millis);
+            }
         }
-        // Even inside the IDR window: a frozen picture outranks the PLI guard.
+        assert_eq!(granted, [1_800, 2_400]);
+
         let resume = session.handle_control_authed(
             peer,
             request(KeyframeReason::Resume),
             &TestConfig,
-            at(700),
+            now + Duration::from_millis(3_000),
         );
-        assert!(resume.reopen_encoder && resume.force_idr);
-        let again = session.handle_control_authed(
-            peer,
-            request(KeyframeReason::Resume),
-            &TestConfig,
-            at(2_600),
-        );
-        assert!(!again.reopen_encoder, "one reopen per 2 s");
-        assert!(again.force_idr, "but the keyframe request still counts");
-        let later = session.handle_control_authed(
-            peer,
-            request(KeyframeReason::Resume),
-            &TestConfig,
-            at(2_800),
-        );
-        assert!(later.reopen_encoder);
+        assert!(resume.force_idr, "granted once the window has passed");
     }
 
     fn input_event(event_id: u32) -> ControlMessage {

@@ -89,6 +89,12 @@ final class FakeUDPHost: @unchecked Sendable {
         send(Wire.encodeControl(sessionId: 41, msgSeq: 2, message: .bye(reason)))
     }
 
+    /// A session 41 heartbeat, as the PC sends one each second.
+    func sendHeartbeat() {
+        send(Wire.encodeControl(sessionId: 41, msgSeq: 3, message: .heartbeat(
+            Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig()))))
+    }
+
     /// The 64x64 H.264 keyframe fixture.
     static func keyframe() throws -> Data {
         guard let url = Bundle(for: FakeUDPHost.self).url(forResource: "single_idr_64x64", withExtension: "h264",
