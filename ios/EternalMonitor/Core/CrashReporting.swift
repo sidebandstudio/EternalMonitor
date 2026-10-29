@@ -71,11 +71,14 @@ struct MetricKitDiagnostic: Equatable {
         }
     }
 
-    /// One frame: the binary's name and the offset into its text segment,
-    /// which `atos` resolves with the build's dSYM.
+    /// One frame: the binary's name, the offset into its text segment,
+    /// which `atos` resolves with the build's dSYM, and the frame's address.
+    /// Early payloads can hold the binary's load address in the offset; the
+    /// address then still places the frame.
     struct Frame: Equatable {
         var binary: String
         var offset: UInt64
+        var address: UInt64 = 0
     }
 
     static let topFrames = 8
@@ -117,7 +120,7 @@ struct MetricKitDiagnostic: Equatable {
             parts.append("cpu_ms=\(Self.milliseconds(seconds)) sampled_ms=\(Self.milliseconds(sampledSeconds))")
         }
         parts.append("thread=\(frames.isEmpty ? "-" : attributed ? "attributed" : "first")")
-        parts.append("frames=\(frames.isEmpty ? "-" : frames.map { "\($0.binary)+0x\(String($0.offset, radix: 16))" }.joined(separator: ","))")
+        parts.append("frames=\(frames.isEmpty ? "-" : frames.map { "\($0.binary)+0x\(String($0.offset, radix: 16))@0x\(String($0.address, radix: 16))" }.joined(separator: ","))")
         if kind == .crash {
             parts.append("termination=\(terminationReason.map(Self.termination) ?? "-")")
         }
@@ -176,12 +179,14 @@ struct MetricKitDiagnostic: Equatable {
 
     /// The last pass over a whole line: UUIDs, long hex runs and long
     /// base64-like runs become `<id>`, wherever they are. A binary name can
-    /// carry one.
+    /// carry one. A frame's address, which the line formats from a number,
+    /// is kept.
     static func scrub(_ line: String) -> String {
         [#"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#,
          // 16 hex digits or more with a letter among them (offsets stay far
-         // shorter, and decimal counts and codes have no letter).
-         #"(?<![0-9A-Za-z])(0x)?(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Za-z])"#,
+         // shorter, and decimal counts and codes have no letter), except a
+         // frame's address after its `+0x<offset>@`.
+         #"(?<![0-9A-Za-z])(?<!\+0x[0-9a-f]{1,16}@)(0x)?(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Za-z])"#,
          // 20 letters, digits, `_` or `-` or more, with letters and digits
          // both present. `=`, `+` and `.` split it, as they split the fields.
          #"(?<![0-9A-Za-z_-])(?=[0-9A-Za-z_-]*[0-9])(?=[0-9A-Za-z_-]*[A-Za-z])[0-9A-Za-z_-]{20,}(?![0-9A-Za-z_-])"#]
@@ -223,6 +228,7 @@ struct MetricKitDiagnostic: Equatable {
         struct Node: Decodable {
             var binaryName: String?
             var offsetIntoBinaryTextSegment: UInt64?
+            var address: UInt64?
             var sampleCount: Int?
             var subFrames: [Node]?
         }
@@ -238,7 +244,7 @@ struct MetricKitDiagnostic: Equatable {
               let stacks = tree.callStacks, !stacks.isEmpty else { return ([], false) }
         let stack = stacks.first { $0.threadAttributed == true } ?? stacks[0]
         func frame(_ node: Tree.Node) -> Frame {
-            Frame(binary: token(node.binaryName ?? "-"), offset: node.offsetIntoBinaryTextSegment ?? 0)
+            Frame(binary: token(node.binaryName ?? "-"), offset: node.offsetIntoBinaryTextSegment ?? 0, address: node.address ?? 0)
         }
         var frames: [Frame] = []
         if tree.callStackPerThread ?? true {
