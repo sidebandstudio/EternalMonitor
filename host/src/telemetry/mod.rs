@@ -1596,7 +1596,7 @@ mod tests {
         assert!(messages[0].contains(" rr_lines=10 "), "{messages:?}");
         assert_eq!(
             messages[1],
-            r"EternalMonitor stopped unexpectedly: Host panic at %USERPROFILE%\src\x.rs"
+            r"EternalMonitor stopped unexpectedly: Host panic at C:\Users\%USERNAME%\src\x.rs"
         );
         drop(uploader);
         let summaries = outbox_messages(&directory)
@@ -1626,7 +1626,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&files(&directory).unwrap()[0]).unwrap()).unwrap();
         assert_eq!(
             saved.events[0].message,
-            r"EternalMonitor stopped unexpectedly: exception in %USERPROFILE%\AppData\Local\x.dll"
+            r"EternalMonitor stopped unexpectedly: exception in \\?\C:\Users\%USERNAME%\AppData\Local\x.dll"
         );
         fs::remove_dir_all(directory).unwrap();
     }

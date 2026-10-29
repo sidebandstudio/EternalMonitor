@@ -39,6 +39,10 @@ use Field::{Counter, Gauge, Last};
 struct Kind {
     message: &'static str,
     prefix: &'static str,
+    /// The field that names the stream the counters count. When it changes,
+    /// the counters belong to a new stream and its first line is their
+    /// baseline, as at a session's start.
+    generation: Option<&'static str>,
     fields: &'static [(&'static str, Field)],
 }
 
@@ -47,6 +51,7 @@ const KINDS: [Kind; 3] = [
     Kind {
         message: "Receiver report",
         prefix: "rr",
+        generation: Some("epoch"),
         fields: &[
             ("epoch", Last),
             ("complete", Counter),
@@ -67,6 +72,7 @@ const KINDS: [Kind; 3] = [
     Kind {
         message: "Audio stream stats",
         prefix: "audio",
+        generation: Some("audio_stream"),
         fields: &[
             ("kbps", Gauge),
             ("packets_per_sec", Gauge),
@@ -85,6 +91,7 @@ const KINDS: [Kind; 3] = [
     Kind {
         message: "Support stream summary",
         prefix: "stream",
+        generation: None,
         fields: &[
             ("running", Last),
             ("captured", Counter),
@@ -130,6 +137,8 @@ struct KindState {
     /// Each counter's last value, kept across windows so the first line of
     /// a window still counts what happened since the previous one.
     previous: Vec<Option<f64>>,
+    /// The generation field's last value.
+    generation: Option<String>,
 }
 
 #[derive(Default)]
@@ -163,6 +172,19 @@ fn fields(text: &str) -> Vec<(&str, &str)> {
             )
         })
         .collect()
+}
+
+/// `message` without a repeat count (`[repeated 4 more times from … to …]`),
+/// and how many identical lines the count stands for.
+fn repeats(message: &str) -> (&str, u32) {
+    let count = message
+        .strip_suffix(']')
+        .and_then(|message| message.rsplit_once(" [repeated "))
+        .and_then(|(line, count)| {
+            let (count, _) = count.split_once(" more times")?;
+            Some((line, count.parse().ok()?))
+        });
+    count.unwrap_or((message, 0))
 }
 
 /// `Some(7)` and `7` are the same session; `None` and `-` are no session.
@@ -217,21 +239,30 @@ impl Periodic {
             out.push(line.to_owned());
             return out;
         }
+        // The logger writes a burst of identical lines once and then their
+        // count: the count is that many more lines.
+        let (message, repeated) = repeats(message);
         if message.starts_with(KEYFRAME_REQUEST) {
-            self.keyframe_requests += 1;
+            self.keyframe_requests += repeated.max(1);
             out.push(line.to_owned());
             return out;
         }
-        // A count of identical lines is news (a frozen stream): it uploads
-        // as it is.
-        let repeated = message.ends_with(']') && message.contains(" [repeated ");
         let Some((index, text)) = KINDS.iter().enumerate().find_map(|(index, kind)| {
             let text = message.strip_prefix(kind.message)?;
-            (!repeated && (text.is_empty() || text.starts_with(' '))).then_some((index, text))
+            (text.is_empty() || text.starts_with(' ')).then_some((index, text))
         }) else {
             out.push(line.to_owned());
             return out;
         };
+        // A count of identical stats lines is news (a frozen stream): it
+        // uploads as it is, and its lines join the open window's count.
+        if repeated > 0 {
+            if self.started.is_some() {
+                self.kinds[index].lines += repeated;
+            }
+            out.push(line.to_owned());
+            return out;
+        }
         let fields = fields(text);
         if let Some((_, value)) = fields.iter().find(|(name, _)| *name == "session_id") {
             let session = session_value(value);
@@ -252,6 +283,16 @@ impl Periodic {
             state.values = kind.fields.iter().map(|_| Value::default()).collect();
         }
         state.previous.resize(kind.fields.len(), None);
+        if let Some(name) = kind.generation {
+            let generation = fields
+                .iter()
+                .find_map(|(found, value)| (*found == name).then(|| (*value).to_owned()));
+            if generation.is_some() && state.generation.is_some() && generation != state.generation
+            {
+                state.previous.fill(None);
+            }
+            state.generation = generation.or(state.generation.take());
+        }
         state.lines += 1;
         for (slot, (name, field)) in kind.fields.iter().enumerate() {
             let Some((_, text)) = fields.iter().find(|(found, _)| found == name) else {
@@ -312,6 +353,7 @@ impl Periodic {
         let out = self.flush_at(now);
         for kind in &mut self.kinds {
             kind.previous.clear();
+            kind.generation = None;
         }
         self.session = None;
         out
@@ -533,6 +575,71 @@ mod tests {
         periodic.push(&report(2, 5, 0, 1), start + Duration::from_secs(2));
         let line = periodic.flush().remove(0);
         assert!(line.contains(" rr_complete=5(+35) "), "{line}");
+    }
+
+    /// A new epoch or audio stream counts from its own first line, whether
+    /// or not its counters start below the old stream's.
+    #[test]
+    fn a_new_stream_is_its_own_baseline() {
+        let mut periodic = Periodic::default();
+        let start = Instant::now();
+        periodic.push(&report(0, 80, 0, 1), start);
+        periodic.push(&report(1, 100, 0, 1), start);
+        let next_epoch = report(2, 120, 0, 1).replace("epoch=1", "epoch=2");
+        periodic.push(&next_epoch, start);
+        let line = periodic.flush().remove(0);
+        assert!(line.contains(" rr_epoch=2 rr_complete=120(+20) "), "{line}");
+        periodic.push(&report(3, 150, 0, 1).replace("epoch=1", "epoch=2"), start);
+        let line = periodic.flush().remove(0);
+        assert!(line.contains(" rr_complete=150(+30) "), "{line}");
+
+        periodic.push(&audio(4, 10), start);
+        let next_stream =
+            |second, quiet| audio(second, quiet).replace("audio_stream=1", "audio_stream=2");
+        periodic.push(&next_stream(5, 40), start);
+        periodic.push(&next_stream(6, 45), start);
+        let line = periodic.flush().remove(0);
+        assert!(line.contains(" audio_quiet_packets=45(+5) "), "{line}");
+        assert!(line.contains(" audio_stream=2 "), "{line}");
+    }
+
+    /// Identical lines reach the upload as the first one and a repeat count.
+    /// The count still counts.
+    #[test]
+    fn repeated_lines_count_through_the_repeat_collapser() {
+        let mut collapser = crate::log_repeat::RepeatCollapser::default();
+        let start = Instant::now();
+        let mut logged = vec![summary(7, 0)];
+        logged.extend((1..=5).map(|second| {
+            format!(
+                "{}  INFO Keyframe request received reason=DecoderError",
+                stamp(second)
+            )
+        }));
+        logged.extend((6..=8).map(|second| report(second, 10, 0, 100)));
+        let mut uploaded: Vec<String> = logged
+            .iter()
+            .flat_map(|line| collapser.push(line, start))
+            .collect();
+        uploaded.extend(collapser.flush_all());
+        assert_eq!(uploaded.len(), 5, "{uploaded:#?}");
+        let mut periodic = Periodic::default();
+        let mut out: Vec<String> = uploaded
+            .iter()
+            .flat_map(|line| periodic.push(line, start))
+            .collect();
+        out.extend(periodic.flush());
+        let line = out.last().unwrap();
+        assert!(line.contains(" keyframe_requests=5 "), "{line}");
+        assert!(line.contains(" rr_lines=3 "), "{line}");
+        // Both counts still upload as they are.
+        assert_eq!(
+            out.iter()
+                .filter(|line| line.contains(" [repeated "))
+                .count(),
+            2,
+            "{out:#?}"
+        );
     }
 
     #[test]

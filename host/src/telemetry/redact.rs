@@ -2,17 +2,26 @@
 //! the user name and the PC's name. Support identifies a PC by its
 //! installation id. The session log and "Copy logs" keep them all.
 //!
-//! - `C:\Users\<name>`, with either separator, Debug-doubled backslashes or a
-//!   `\\?\` prefix, and the profile's own path (`%USERPROFILE%`, which may
-//!   be elsewhere), become `%USERPROFILE%`. `Public`, `Default`,
-//!   `Default User` and `All Users` stay.
-//! - The user name (`%USERNAME%`) and the PC name (`%COMPUTERNAME%`), as a
-//!   whole word in any case, become those names. A name shorter than three
-//!   characters, the line's time and level, and field names (`name=`) stay,
-//!   so a PC called `INFO` or a user called `input` leaves the line readable.
+//! - A profile path under any root (`C:\`, `\\server\share\`, `\\?\`,
+//!   `\\?\UNC\`), with either separator or Debug-doubled backslashes: this
+//!   user's profile (`%USERPROFILE%`, which may be outside `Users`) becomes
+//!   `%USERPROFILE%`; another profile's folder under `Users` becomes
+//!   `%USERNAME%`. `Public`, `Default`, `Default User` and `All Users` stay.
+//! - The user name and the PC name, as whole words in any case, become
+//!   `%USERNAME%` and `%COMPUTERNAME%`. A PC name ends at any character
+//!   outside `A-Z`, `a-z`, `0-9` and `-`, so `USB_DESKTOP-DEMO_Audio` loses
+//!   it and `DESKTOP-OTHER` keeps it.
+//! - What stays: the line's time and level; field names (`name=`); the
+//!   values of diagnostic fields and hardware descriptions, outside paths;
+//!   names that are common words (`Intel`, `display`, `DESKTOP`), except as
+//!   a profile folder; and names shorter than three characters, except as a
+//!   whole path segment. None of those identify anyone, and replacing them
+//!   would corrupt the values support reads.
+//!
+//! The scan works on characters and never slices at a computed index, so no
+//! line can make it panic.
 
 use once_cell::sync::Lazy;
-use regex::Regex;
 
 /// Folders under `Users` that name nobody. Support uses them.
 const SHARED_PROFILES: [&str; 4] = ["Default User", "All Users", "Default", "Public"];
@@ -21,74 +30,186 @@ const SHARED_PROFILES: [&str; 4] = ["Default User", "All Users", "Default", "Pub
 /// characters plus a suffix such as `.DOMAIN` or `.000`.
 const LOCAL_FOLDER_CHARS: usize = 32;
 
-/// Shorter names are left alone: replacing every `a` or `pc` would garble
-/// the line and hide little.
+/// Shorter names are replaced only as a whole path segment: replacing every
+/// `a` or `pc` would garble the line and hide little.
 const MIN_NAME_CHARS: usize = 3;
 
-/// A `\\?\` prefix, also Debug-doubled (`\\\\?\\`).
-const VERBATIM: &str = r"(?:[\\/]{2,4}\?[\\/]{1,2})?";
+/// Names that identify nobody on their own and are also hardware, vendor or
+/// UI words in the log. As a user or PC name they are replaced only as a
+/// profile folder.
+const COMMON_WORDS: &[&str] = &[
+    "user",
+    "users",
+    "admin",
+    "administrator",
+    "owner",
+    "guest",
+    "default",
+    "public",
+    "home",
+    "pc",
+    "desktop",
+    "laptop",
+    "notebook",
+    "computer",
+    "workstation",
+    "server",
+    "display",
+    "monitor",
+    "screen",
+    "intel",
+    "nvidia",
+    "amd",
+    "radeon",
+    "geforce",
+    "microsoft",
+    "windows",
+    "apple",
+    "qualcomm",
+    "realtek",
+];
+
+/// Fields whose values are tokens, numbers or hardware descriptions. Outside
+/// paths, a name inside their value stays.
+const DIAGNOSTIC_KEYS: &[&str] = &[
+    // session_summary v=1.
+    "v",
+    "role",
+    "session_id",
+    "nonce",
+    "transport",
+    "mode",
+    "stage",
+    "outcome",
+    "failure",
+    "fallback",
+    "end",
+    "ttff_ms",
+    "duration_ms",
+    "os",
+    "hw",
+    "gpu",
+    "hybrid",
+    // Enumerated and numeric fields the host logs.
+    "second_screen_fallback",
+    "block",
+    "reason",
+    "codec",
+    "encoder",
+    "input",
+    "hevc",
+    "cpu_fallback",
+    "resolution",
+    "backend",
+    "backends",
+    "phase",
+    "status",
+    "code",
+    "health",
+    "call",
+    "stall",
+    "stall_refused",
+    "stall_ended",
+    "avoided",
+    "attached",
+    "advertised_formats",
+    "usb_state",
+    "wire_stream",
+    "running",
+    "version",
+    "build",
+    // Hardware descriptions.
+    "adapter",
+    "vendor",
+    "display",
+    "vdd_device",
+    // The periodic stats summary.
+    "stream_codec",
+    "stream_input",
+    "stream_resolution",
+    "stream_usb_state",
+    "stream_running",
+    "stream_hevc",
+    "stream_cpu_fallback",
+];
+
+/// Messages that describe hardware: the rest of the line after the label,
+/// or the named field.
+const DESCRIPTIONS: [(&str, Option<&str>); 4] = [
+    ("GPU:", None),
+    ("Encoder:", None),
+    ("Capture:", None),
+    ("Found GPU adapter", Some("name")),
+];
+
+const USERPROFILE: &str = "%USERPROFILE%";
+const USERNAME: &str = "%USERNAME%";
+const COMPUTERNAME: &str = "%COMPUTERNAME%";
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    User,
+    Pc,
+}
+
+struct Word {
+    name: Vec<char>,
+    kind: Kind,
+    /// Shorter than [`MIN_NAME_CHARS`].
+    short: bool,
+}
 
 pub(super) struct Names {
-    /// This user's profile path, in any case and with any separator.
-    profile: Option<Regex>,
-    /// Folder names that start a profile segment: the profile's folder and
-    /// the user name, longest first.
-    folders: Vec<String>,
-    /// Whole-word names and what replaces them, longest first.
-    words: Vec<(Regex, &'static str)>,
+    /// This user's profile path without its root (`Users`, `Maria Lopez`).
+    profile: Vec<Vec<char>>,
+    /// Folder names that may end a profile segment without a separator:
+    /// the profile's folder, the user name and `%USERNAME%`, longest first.
+    folders: Vec<Vec<char>>,
+    /// The user and PC names that may be replaced, longest first.
+    words: Vec<Word>,
 }
 
 impl Names {
     pub(super) fn new(profile: Option<&str>, user: Option<&str>, pc: Option<&str>) -> Self {
-        let clean = |value: Option<&str>| {
-            value
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
+        fn clean(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|value| !value.is_empty())
+        }
+        let profile = clean(profile).map_or_else(Vec::new, path_parts);
+        let profile = if profile.len() >= 2 {
+            profile
+        } else {
+            Vec::new()
         };
-        let profile = clean(profile).map(|path| {
-            path.trim_start_matches(['\\', '/', '?'])
-                .trim_end_matches(['\\', '/'])
-                .to_owned()
-        });
         let (user, pc) = (clean(user), clean(pc));
-        let profile_pattern = profile.as_deref().and_then(|path| {
-            let parts: Vec<_> = path
-                .split(['\\', '/'])
-                .filter(|part| !part.is_empty())
-                .map(regex::escape)
-                .collect();
-            (parts.len() >= 2)
-                .then(|| Regex::new(&format!("(?i){VERBATIM}{}", parts.join(r"[\\/]+"))).ok())
-                .flatten()
-        });
-        let mut folders: Vec<String> = profile
-            .as_deref()
-            .and_then(|path| path.rsplit(['\\', '/']).next())
-            .map(str::to_owned)
+        let mut folders: Vec<Vec<char>> = profile
+            .last()
+            .cloned()
             .into_iter()
-            .chain(user.clone())
-            .filter(|name| !SHARED_PROFILES.iter().any(|s| s.eq_ignore_ascii_case(name)))
+            .chain(user.map(|user| user.chars().collect()))
+            .chain([USERNAME.chars().collect()])
+            .filter(|name: &Vec<char>| {
+                let name: String = name.iter().collect();
+                !SHARED_PROFILES
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&name))
+            })
             .collect();
-        folders.sort_by_key(|name| std::cmp::Reverse(name.chars().count()));
-        let mut words: Vec<(String, &'static str)> = [(pc, "%COMPUTERNAME%"), (user, "%USERNAME%")]
+        folders.sort_by_key(|name| std::cmp::Reverse(name.len()));
+        let mut words: Vec<Word> = [(pc, Kind::Pc), (user, Kind::User)]
             .into_iter()
-            .filter_map(|(name, token)| Some((name?, token)))
-            .filter(|(name, _)| name.chars().count() >= MIN_NAME_CHARS)
+            .filter_map(|(name, kind)| Some((name?, kind)))
+            .filter(|(name, _)| !COMMON_WORDS.iter().any(|w| w.eq_ignore_ascii_case(name)))
+            .map(|(name, kind)| Word {
+                short: name.chars().count() < MIN_NAME_CHARS,
+                name: name.chars().collect(),
+                kind,
+            })
             .collect();
-        words.sort_by_key(|(name, _)| std::cmp::Reverse(name.chars().count()));
+        words.sort_by_key(|word| std::cmp::Reverse(word.name.len()));
         Self {
-            profile: profile_pattern,
+            profile,
             folders,
-            words: words
-                .into_iter()
-                .filter_map(|(name, token)| {
-                    Some((
-                        Regex::new(&format!("(?i){}", regex::escape(&name))).ok()?,
-                        token,
-                    ))
-                })
-                .collect(),
+            words,
         }
     }
 
@@ -101,6 +222,28 @@ impl Names {
             var("COMPUTERNAME").as_deref(),
         )
     }
+
+    /// Where this user's profile path ends if it starts at `i`.
+    fn profile_at(&self, chars: &[char], i: usize) -> Option<usize> {
+        let mut end = i;
+        for (index, part) in self.profile.iter().enumerate() {
+            if index > 0 {
+                end = end
+                    .checked_add(seps(chars, end))
+                    .filter(|&after| after > end)?;
+            }
+            end = name_at(chars, end, part)?;
+        }
+        // A longer folder that starts with this name is another folder.
+        (!self.profile.is_empty() && !at(chars, end).is_some_and(continues_name)).then_some(end)
+    }
+
+    /// Whether `folder` is this user's profile folder.
+    fn is_own_folder(&self, folder: &[char]) -> bool {
+        self.profile
+            .last()
+            .is_some_and(|own| own.len() == folder.len() && name_at(folder, 0, own).is_some())
+    }
 }
 
 pub(super) static NAMES: Lazy<Names> = Lazy::new(Names::current);
@@ -108,20 +251,61 @@ pub(super) static NAMES: Lazy<Names> = Lazy::new(Names::current);
 /// `line` without the names in `names`. A log line's time and level stay.
 pub(super) fn redact(line: &str, names: &Names) -> String {
     let (head, message) = match crate::log_repeat::split_stamp(line) {
-        Some((stamp, rest)) => {
-            let level = rest.len() - rest.trim_start().len();
-            let level = level + rest[level..].find(' ').map_or(0, |end| end + 1);
-            line.split_at(stamp.len() + level)
+        Some((_, rest)) => {
+            let message = rest.trim_start().split_once(' ').map_or("", |(_, m)| m);
+            line.split_at_checked(line.len().saturating_sub(message.len()))
+                .unwrap_or(("", line))
         }
         None => ("", line),
     };
-    let message = redact_profile_path(message, names);
-    let message = redact_profiles(&message, names);
-    let mut message = message.into_owned();
-    for (pattern, token) in &names.words {
-        message = replace_words(&message, pattern, token);
+    let chars: Vec<char> = message.chars().collect();
+    let mut edits = profiles(&chars, names);
+    let fields = Fields::of(&chars);
+    let found = words(&chars, names, &edits, &fields);
+    edits.extend(found);
+    edits.sort_by_key(|edit| edit.start);
+    let mut out = String::with_capacity(line.len());
+    out.push_str(head);
+    let mut copied = 0;
+    for edit in edits {
+        if edit.start < copied || edit.end < edit.start {
+            continue;
+        }
+        out.extend(chars.get(copied..edit.start).unwrap_or_default());
+        out.push_str(edit.token);
+        copied = edit.end;
     }
-    format!("{head}{message}")
+    out.extend(chars.get(copied..).unwrap_or_default());
+    out
+}
+
+/// `chars[start..end]` becomes `token`.
+struct Edit {
+    start: usize,
+    end: usize,
+    token: &'static str,
+}
+
+fn at(chars: &[char], i: usize) -> Option<char> {
+    chars.get(i).copied()
+}
+
+fn before(chars: &[char], i: usize) -> Option<char> {
+    at(chars, i.checked_sub(1)?)
+}
+
+fn is_sep(c: char) -> bool {
+    matches!(c, '\\' | '/')
+}
+
+/// A separator, a character Windows forbids in file names (`: * ? " < > |`)
+/// or `'`: a path segment ends there.
+fn delimits(c: char) -> bool {
+    is_sep(c) || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\'')
+}
+
+fn ends_segment(c: char) -> bool {
+    delimits(c) || c.is_whitespace()
 }
 
 /// Whether `c` continues a name or path segment.
@@ -129,141 +313,331 @@ fn continues_name(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '%')
 }
 
-/// This user's profile path, ending at its folder name.
-fn redact_profile_path<'a>(text: &'a str, names: &Names) -> std::borrow::Cow<'a, str> {
-    let Some(pattern) = &names.profile else {
-        return text.into();
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// How many characters from `i` match `test`.
+fn count(chars: &[char], i: usize, test: impl Fn(char) -> bool) -> usize {
+    chars
+        .get(i..)
+        .map_or(0, |rest| rest.iter().take_while(|&&c| test(c)).count())
+}
+
+fn seps(chars: &[char], i: usize) -> usize {
+    count(chars, i, is_sep)
+}
+
+/// `name` at `i`, in any case: where it ends.
+fn name_at(chars: &[char], i: usize, name: &[char]) -> Option<usize> {
+    let end = i.checked_add(name.len())?;
+    let found = chars.get(i..end)?;
+    found
+        .iter()
+        .zip(name)
+        .all(|(&a, &b)| a == b || a.to_lowercase().eq(b.to_lowercase()))
+        .then_some(end)
+}
+
+/// A path's parts after its root: `\\?\C:\Users\maria` is `Users`, `maria`.
+fn path_parts(path: &str) -> Vec<Vec<char>> {
+    let chars: Vec<char> = path.chars().collect();
+    let mut i = seps(&chars, 0);
+    if matches!(at(&chars, i), Some('?' | '.')) && at(&chars, i + 1).is_some_and(is_sep) {
+        i += 1 + seps(&chars, i + 1);
+    }
+    if at(&chars, i).is_some_and(|c| c.is_ascii_alphabetic()) && at(&chars, i + 1) == Some(':') {
+        i += 2;
+    }
+    chars
+        .get(i..)
+        .unwrap_or_default()
+        .split(|&c| is_sep(c))
+        .filter(|part| !part.is_empty())
+        .map(<[char]>::to_vec)
+        .collect()
+}
+
+/// If a path starts at `i`, where its first separator is: after a drive
+/// (`C:\`), after a `\\?\` or `\\.\` prefix (and its drive), or a run of
+/// separators that starts a word (`\\server`, `\Users`).
+fn root(chars: &[char], i: usize) -> Option<usize> {
+    let drive = |j: usize| {
+        (at(chars, j).is_some_and(|c| c.is_ascii_alphabetic())
+            && at(chars, j + 1) == Some(':')
+            && at(chars, j + 2).is_some_and(is_sep))
+        .then_some(j + 2)
     };
-    pattern.replace_all(text, |captures: &regex::Captures| {
-        let whole = captures.get(0).expect("match");
-        // A longer folder that starts with this name is another folder.
-        let continued = text[whole.end()..]
-            .chars()
-            .next()
-            .is_some_and(continues_name)
-            || text[..whole.start()]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric);
-        if continued {
-            whole.as_str().to_owned()
-        } else {
-            "%USERPROFILE%".to_owned()
-        }
-    })
+    let c = at(chars, i)?;
+    let prev = before(chars, i);
+    if c.is_ascii_alphabetic() {
+        return drive(i)
+            .filter(|_| !prev.is_some_and(|p| p.is_alphanumeric() || p == '_' || p == '%'));
+    }
+    let word = prev.is_some_and(|p| {
+        p.is_alphanumeric() || is_sep(p) || matches!(p, '_' | '.' | '-' | '%' | '$' | '~' | ':')
+    });
+    if !is_sep(c) || word {
+        return None;
+    }
+    let after = i + seps(chars, i);
+    if after >= i + 2
+        && matches!(at(chars, after), Some('?' | '.'))
+        && at(chars, after + 1).is_some_and(is_sep)
+    {
+        let prefix = after + 1 + seps(chars, after + 1);
+        return Some(drive(prefix).unwrap_or(after + 1));
+    }
+    Some(i)
 }
 
-/// How a profile segment ended.
-#[derive(Clone, Copy, PartialEq)]
-enum SegmentEnd {
-    /// A separator, a character Windows forbids in file names
-    /// (`: * ? " < > |`) or `'`: the segment is exactly the folder name.
-    Delimiter,
-    /// The end of the line, or a space before the next `word=` field.
-    Open,
+/// Where the segment that starts at `i` ends. A `%` ends it too, so a path
+/// that runs into a replaced name reads the same in every pass.
+fn segment_end(chars: &[char], i: usize) -> usize {
+    i + count(chars, i, |c| !ends_segment(c) && c != '%')
 }
 
-/// The segment after `\Users\` in `rest`: its length in bytes and how it
-/// ended.
-fn segment(rest: &str) -> (usize, SegmentEnd) {
-    static FIELD: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s+[A-Za-z_][A-Za-z0-9_]*=").expect("field pattern"));
-    for (index, c) in rest.char_indices() {
-        if matches!(
-            c,
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\''
-        ) {
-            return (index, SegmentEnd::Delimiter);
+/// Whether ` name=` follows the space at `i`.
+fn field_follows(chars: &[char], i: usize) -> bool {
+    let start = i + count(chars, i, char::is_whitespace);
+    let first = at(chars, start).is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    first && at(chars, start + 1 + count(chars, start + 1, is_ident)) == Some('=')
+}
+
+/// Whether another path, or one replaced before, starts after the space at
+/// `i`.
+fn root_follows(chars: &[char], i: usize) -> bool {
+    let start = i + count(chars, i, char::is_whitespace);
+    let replaced: Vec<char> = USERPROFILE.chars().collect();
+    start > i && (root(chars, start).is_some() || name_at(chars, start, &replaced).is_some())
+}
+
+/// Where the profile folder that starts at `start` ends. It runs to the next
+/// separator, character Windows forbids in file names or quote; with none of
+/// those, to a known name followed by a space or punctuation, else to the
+/// next field or path if it is short enough to be a folder name, else to its
+/// first space.
+fn folder_end(chars: &[char], start: usize, names: &Names) -> usize {
+    // A folder replaced before is that name alone.
+    let replaced: Vec<char> = USERNAME.chars().collect();
+    if let Some(end) = name_at(chars, start, &replaced) {
+        return end;
+    }
+    let mut end = start;
+    while let Some(c) = at(chars, end) {
+        if delimits(c) {
+            return end;
         }
-        if c.is_whitespace() && FIELD.is_match(&rest[index..]) {
-            return (index, SegmentEnd::Open);
+        if c.is_whitespace() && (field_follows(chars, end) || root_follows(chars, end)) {
+            break;
+        }
+        end += 1;
+    }
+    let shared = SHARED_PROFILES.iter().map(|name| name.chars().collect());
+    let known = names
+        .folders
+        .iter()
+        .cloned()
+        .chain(shared)
+        .find_map(|name| {
+            name_at(chars, start, &name).filter(|&after| {
+                after <= end
+                    && at(chars, after)
+                        .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ')'))
+            })
+        });
+    if let Some(known) = known {
+        return known;
+    }
+    if end.saturating_sub(start) <= LOCAL_FOLDER_CHARS {
+        return end;
+    }
+    start + count(chars, start, |c| !c.is_whitespace()).min(end.saturating_sub(start))
+}
+
+/// The edits to every profile path in `chars`, in order.
+fn profiles(chars: &[char], names: &Names) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let Some(from) = root(chars, i) else {
+            i += 1;
+            continue;
+        };
+        // Scanning on after the folder, not after the path, finds a path
+        // inside it (`\\server\C:\Users\x`) the same way in every pass.
+        match profile(chars, i, from, names) {
+            Some(edit) => {
+                i = edit.end.max(i + 1);
+                edits.push(edit);
+            }
+            None => i += 1,
         }
     }
-    (rest.len(), SegmentEnd::Open)
+    edits
 }
 
-/// `name` at the start of `text`, in any case: the length in bytes it takes.
-fn starts_with_name(text: &str, name: &str) -> Option<usize> {
-    let mut chars = text.char_indices();
-    for expected in name.chars() {
-        let (_, found) = chars.next()?;
-        if !found.to_lowercase().eq(expected.to_lowercase()) {
+/// The edit to the profile in the path rooted at `start` whose separators
+/// begin at `from`.
+fn profile(chars: &[char], start: usize, mut from: usize, names: &Names) -> Option<Edit> {
+    loop {
+        let segment = from + seps(chars, from);
+        if segment == from {
             return None;
         }
+        if let Some(end) = names.profile_at(chars, segment) {
+            return Some(Edit {
+                start,
+                end,
+                token: USERPROFILE,
+            });
+        }
+        let end = segment_end(chars, segment);
+        if end == segment {
+            return None;
+        }
+        let users = chars.get(segment..end).is_some_and(|part| {
+            part.len() == 5 && name_at(part, 0, &['u', 's', 'e', 'r', 's']).is_some()
+        });
+        let folder = end + seps(chars, end);
+        if users && folder > end {
+            let folder_end = folder_end(chars, folder, names);
+            let name = chars.get(folder..folder_end).unwrap_or_default();
+            let text: String = name.iter().collect();
+            let shared = SHARED_PROFILES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&text));
+            return (!name.is_empty() && !shared).then(|| {
+                if names.is_own_folder(name) {
+                    Edit {
+                        start,
+                        end: folder_end,
+                        token: USERPROFILE,
+                    }
+                } else {
+                    Edit {
+                        start: folder,
+                        end: folder_end,
+                        token: USERNAME,
+                    }
+                }
+            });
+        }
+        from = end;
     }
-    Some(chars.next().map_or(text.len(), |(index, _)| index))
 }
 
-/// Every `<drive>:\Users\<folder>` becomes `%USERPROFILE%`. The folder runs
-/// to the next separator, character Windows forbids in file names or quote;
-/// with none of those, it is a known name followed by a space or
-/// punctuation, else the whole rest if it is short enough to be a folder
-/// name, else the rest up to its first space.
-fn redact_profiles<'a>(text: &'a str, names: &Names) -> std::borrow::Cow<'a, str> {
-    static PREFIX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(&format!(r"(?i){VERBATIM}\b[a-z]:[\\/]+users[\\/]+"))
-            .expect("profile prefix pattern")
-    });
-    let mut out = String::new();
-    let mut copied = 0;
-    for prefix in PREFIX.find_iter(text) {
-        let rest = &text[prefix.end()..];
-        let (length, end) = segment(rest);
-        let folder = &rest[..length];
-        if SHARED_PROFILES
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(folder))
-        {
-            continue;
-        }
-        let replaced = if end == SegmentEnd::Delimiter {
-            length
-        } else if let Some(name) = names.folders.iter().find_map(|name| {
-            starts_with_name(folder, name).filter(|&after| {
-                rest[after..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ')'))
-            })
-        }) {
-            name
-        } else if folder.chars().count() <= LOCAL_FOLDER_CHARS {
-            length
-        } else {
-            folder.find(char::is_whitespace).unwrap_or(length)
-        };
-        if replaced == 0 {
-            continue;
-        }
-        out.push_str(&text[copied..prefix.start()]);
-        out.push_str("%USERPROFILE%");
-        copied = prefix.end() + replaced;
-    }
-    if copied == 0 {
-        return text.into();
-    }
-    out.push_str(&text[copied..]);
-    out.into()
+/// Field names, and the values a name inside stays in.
+struct Fields {
+    names: Vec<(usize, usize)>,
+    kept: Vec<(usize, usize)>,
 }
 
-/// Each whole-word `pattern` match that is not a field name becomes `token`.
-fn replace_words(text: &str, pattern: &Regex, token: &str) -> String {
-    pattern
-        .replace_all(text, |captures: &regex::Captures| {
-            let whole = captures.get(0).expect("match");
-            let next = text[whole.end()..].chars().next();
-            let word = !text[..whole.start()]
-                .chars()
-                .next_back()
-                .is_some_and(continues_name)
-                && !next.is_some_and(|c| continues_name(c) || c == '=');
-            if word {
-                token.to_owned()
-            } else {
-                whole.as_str().to_owned()
+impl Fields {
+    fn of(chars: &[char]) -> Self {
+        let mut names = Vec::new();
+        // Fields after a space or at the start: `(name start, '=')`.
+        let mut fields = Vec::new();
+        for (equals, _) in chars.iter().enumerate().filter(|(_, &c)| c == '=') {
+            let length = chars.get(..equals).map_or(0, |head| {
+                head.iter().rev().take_while(|&&c| is_ident(c)).count()
+            });
+            let start = equals - length;
+            if length == 0 {
+                continue;
             }
-        })
-        .into_owned()
+            names.push((start, equals));
+            if before(chars, start).is_none_or(char::is_whitespace) {
+                fields.push((start, equals));
+            }
+        }
+        let leading = count(chars, 0, char::is_whitespace);
+        let description = DESCRIPTIONS.iter().find_map(|(label, field)| {
+            let label: Vec<char> = label.chars().collect();
+            Some((name_at(chars, leading, &label)?, *field))
+        });
+        let mut kept = Vec::new();
+        if let Some((after, None)) = description {
+            kept.push((after, chars.len()));
+        }
+        for (index, &(start, equals)) in fields.iter().enumerate() {
+            let key: String = chars
+                .get(start..equals)
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            let end = fields.get(index + 1).map_or(chars.len(), |next| next.0);
+            if DIAGNOSTIC_KEYS.contains(&key.as_str())
+                || description.is_some_and(|(_, field)| field == Some(key.as_str()))
+            {
+                kept.push((equals + 1, end));
+            }
+        }
+        Self { names, kept }
+    }
+}
+
+/// The user and PC names in `chars` outside `taken`, in order.
+fn words(chars: &[char], names: &Names, taken: &[Edit], fields: &Fields) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    let mut taken = taken.iter().peekable();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(edit) = taken.peek() {
+            if edit.end <= i {
+                taken.next();
+                continue;
+            }
+            if edit.start <= i {
+                i = edit.end;
+                continue;
+            }
+        }
+        let limit = taken.peek().map_or(chars.len(), |edit| edit.start);
+        let found = names.words.iter().find_map(|word| {
+            let end = name_at(chars, i, &word.name).filter(|&end| end > i && end <= limit)?;
+            replaces(chars, i, end, word, fields).then_some((end, word.kind))
+        });
+        match found {
+            Some((end, kind)) => {
+                let token = match kind {
+                    Kind::User => USERNAME,
+                    Kind::Pc => COMPUTERNAME,
+                };
+                edits.push(Edit {
+                    start: i,
+                    end,
+                    token,
+                });
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
+    edits
+}
+
+/// Whether the name `word` at `chars[start..end]` is replaced.
+fn replaces(chars: &[char], start: usize, end: usize, word: &Word, fields: &Fields) -> bool {
+    let continues = |c: char| {
+        c.is_alphanumeric()
+            || c == '%'
+            || match word.kind {
+                Kind::User => c == '_',
+                Kind::Pc => c == '-',
+            }
+    };
+    if before(chars, start).is_some_and(continues) || at(chars, end).is_some_and(continues) {
+        return false;
+    }
+    if fields.names.iter().any(|&(s, e)| s < end && start < e) {
+        return false;
+    }
+    let in_path = before(chars, start).is_some_and(is_sep);
+    if word.short {
+        return in_path && at(chars, end).is_none_or(ends_segment);
+    }
+    in_path || !fields.kept.iter().any(|&(s, e)| s <= start && start < e)
 }
 
 #[cfg(test)]
@@ -305,16 +679,19 @@ mod tests {
                 r"home=%USERPROFILE% next=1",
             ),
             (r"home=C:\Users\Maria Lopez", r"home=%USERPROFILE%"),
-            // Other profiles on the PC.
+            // Other profiles on the PC keep all but their name.
             (
                 r"Host panic at C:\Users\bob\.cargo\registry\src\renderer.rs:984:17:",
-                r"Host panic at %USERPROFILE%\.cargo\registry\src\renderer.rs:984:17:",
+                r"Host panic at C:\Users\%USERNAME%\.cargo\registry\src\renderer.rs:984:17:",
             ),
-            (r#"path='C:\Users\bob'"#, r#"path='%USERPROFILE%'"#),
-            (r"home=C:\Users\bob next=1", r"home=%USERPROFILE% next=1"),
+            (r#"path='C:\Users\bob'"#, r#"path='C:\Users\%USERNAME%'"#),
+            (
+                r"home=C:\Users\bob next=1",
+                r"home=C:\Users\%USERNAME% next=1",
+            ),
             (
                 r"module=\\?\D:\Users\Kim\x.dll",
-                r"module=%USERPROFILE%\x.dll",
+                r"module=\\?\D:\Users\%USERNAME%\x.dll",
             ),
             // Shared folders name nobody.
             (
@@ -423,8 +800,312 @@ mod tests {
     #[test]
     fn no_names_leaves_names_alone() {
         let names = Names::new(None, None, Some("  "));
-        assert!(names.words.is_empty() && names.profile.is_none());
+        assert!(names.words.is_empty() && names.profile.is_empty());
         let line = format!("{STAMP}  INFO host=MARIA-DESKTOP");
         assert_eq!(redact(&line, &names), line);
+    }
+
+    fn assert_cases(names: &Names, cases: &[(&str, &str)]) {
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(text, uploaded)| {
+                let got = redact(text, names);
+                (got != *uploaded).then(|| format!("{text}\n  want {uploaded}\n  got  {got}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn profiles_under_any_root_are_found() {
+        assert_cases(
+            &maria(),
+            &[
+                (
+                    r"module=\\server\Users\OtherPerson\AppData\x.dll",
+                    r"module=\\server\Users\%USERNAME%\AppData\x.dll",
+                ),
+                (
+                    r"module=\\?\UNC\server\share\Users\Kim\x.dll",
+                    r"module=\\?\UNC\server\share\Users\%USERNAME%\x.dll",
+                ),
+                (
+                    r#"path="\\\\server\\Users\\Kim\\x""#,
+                    r#"path="\\\\server\\Users\\%USERNAME%\\x""#,
+                ),
+                (
+                    r"dir=\\server\share\Users\Maria Lopez\Desktop",
+                    r"dir=%USERPROFILE%\Desktop",
+                ),
+                (
+                    r"dir=\\?\UNC\server\Users\maria lopez\x",
+                    r"dir=%USERPROFILE%\x",
+                ),
+                (r"dir=\Users\Kim\x", r"dir=\Users\%USERNAME%\x"),
+                // Two paths on one line: the first folder ends where the
+                // second path starts.
+                (
+                    r"move C:\Users\FirstPerson C:\Users\SecondPerson",
+                    r"move C:\Users\%USERNAME% C:\Users\%USERNAME%",
+                ),
+                (
+                    r"copy C:\Users\Maria Lopez D:\Users\Kim\x",
+                    r"copy %USERPROFILE% D:\Users\%USERNAME%\x",
+                ),
+                // Truncated paths.
+                (r"C:\Users\", r"C:\Users\"),
+                (r"C:\Users", r"C:\Users"),
+                (r"\\?\", r"\\?\"),
+                (r"C:\Users\Kim\\", r"C:\Users\%USERNAME%\\"),
+            ],
+        );
+    }
+
+    #[test]
+    fn short_names_are_replaced_only_as_a_path_segment() {
+        let names = Names::new(None, Some("Al"), Some("XY"));
+        assert_cases(
+            &names,
+            &[
+                (
+                    r"dir=C:\Users\Al\AppData",
+                    r"dir=C:\Users\%USERNAME%\AppData",
+                ),
+                (r"dir=D:\Al\Projects", r"dir=D:\%USERNAME%\Projects"),
+                (r"share=\\XY\share\x", r"share=\\%COMPUTERNAME%\share\x"),
+                (
+                    "Al said hi to XY; Albert al=1 xy=2",
+                    "Al said hi to XY; Albert al=1 xy=2",
+                ),
+                (r"dir=D:\Alan\x", r"dir=D:\Alan\x"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_pc_name_ends_at_punctuation_but_not_at_a_hyphen() {
+        let names = Names::new(None, None, Some("DESKTOP-DEMO"));
+        assert_cases(
+            &names,
+            &[
+                (
+                    "Audio device USB_DESKTOP-DEMO_Audio opened",
+                    "Audio device USB_%COMPUTERNAME%_Audio opened",
+                ),
+                ("host=desktop-demo.local.", "host=%COMPUTERNAME%.local."),
+                (
+                    "host=DESKTOP-DEMO-2 peer=xDESKTOP-DEMO",
+                    "host=DESKTOP-DEMO-2 peer=xDESKTOP-DEMO",
+                ),
+            ],
+        );
+    }
+
+    /// A user called Intel or display, or a PC called DESKTOP, leaves the
+    /// hardware it shares a word with alone. As a profile folder, the name
+    /// still goes.
+    #[test]
+    fn names_that_are_common_words_leave_hardware_alone() {
+        for (user, pc) in [("Intel", "DESKTOP"), ("display", "Microsoft")] {
+            let names = Names::new(None, Some(user), Some(pc));
+            for line in [
+                format!("{STAMP}  INFO   GPU:     Intel(R) UHD Graphics 630 (Intel)"),
+                format!(
+                    "{STAMP}  INFO Found GPU adapter adapter_index=0 name=Intel(R) Iris Xe \
+                     vendor=Intel vram_mb=128"
+                ),
+                format!(
+                    "{STAMP}  INFO Capture using adapter adapter=Microsoft Basic Display Adapter"
+                ),
+                format!("{STAMP}  INFO Display mode changed on DESKTOP-OTHER, an Intel desktop"),
+                format!("{STAMP}  INFO mDNS host=DESKTOP instance=EternalMonitor (DESKTOP)"),
+            ] {
+                assert_eq!(redact(&line, &names), line, "{user}/{pc}");
+            }
+            assert_eq!(
+                redact(&format!(r"dir=C:\Users\{user}\AppData"), &names),
+                r"dir=C:\Users\%USERNAME%\AppData"
+            );
+        }
+    }
+
+    /// Diagnostic fields keep their tokens, so the daily check still reads
+    /// `second_screen_fallback=no_frames` from a PC whose user is called
+    /// `no_frames`.
+    #[test]
+    fn diagnostic_values_keep_their_tokens() {
+        let fallback = regex::Regex::new(r#"second_screen_fallback="?([a-z_]{1,32})"#).unwrap();
+        for (user, pc) in [
+            ("no_frames", "SECOND"),
+            ("frames", "FALLBACK"),
+            ("steady", "SCREEN-2"),
+        ] {
+            let names = Names::new(Some(&format!(r"C:\Users\{user}")), Some(user), Some(pc));
+            for line in [
+                format!("{STAMP}  WARN Virtual display fell back second_screen_fallback=no_frames session_id=7"),
+                format!("{STAMP}  INFO Session end stage=steady outcome=streamed reason=no_frames"),
+                format!(
+                    "{STAMP}  INFO Periodic stats summary window_s=60 stream_codec=H.264 (NVENC) \
+                     stream_usb_state=Waiting for an iPad"
+                ),
+            ] {
+                let uploaded = redact(&line, &names);
+                assert_eq!(uploaded, line, "{user}/{pc}");
+                if line.contains("second_screen_fallback") {
+                    assert_eq!(&fallback.captures(&uploaded).unwrap()[1], "no_frames");
+                }
+            }
+        }
+        let names = Names::new(None, Some("no_frames"), None);
+        assert_cases(
+            &names,
+            &[
+                (
+                    "Logged on as no_frames device=no_frames's iPad",
+                    "Logged on as %USERNAME% device=%USERNAME%'s iPad",
+                ),
+                (
+                    r"log=C:\Users\no_frames\x.log",
+                    r"log=C:\Users\%USERNAME%\x.log",
+                ),
+                // A path inside a diagnostic value still loses the name.
+                (r"reason=D:\no_frames\x", r"reason=D:\%USERNAME%\x"),
+            ],
+        );
+    }
+
+    /// xorshift64*: enough to vary the fuzz lines, and the same every run.
+    struct Lines(u64);
+
+    impl Lines {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[(self.next() % from.len() as u64) as usize]
+        }
+
+        fn line(&mut self, names: &[&str]) -> String {
+            const PIECES: &[&str] = &[
+                r"C:",
+                r"c:",
+                r"\",
+                r"/",
+                r"\\",
+                r"\\\\",
+                r"\\?\",
+                r"\\\\?\\",
+                r"\\?\UNC\",
+                r"\\.\",
+                r"Users",
+                r"USERS",
+                r"Users\",
+                r"C:\Users\",
+                r"\\server\Users\",
+                r"\\?\C:\Users\",
+                r"Public",
+                r"Default User",
+                r"%USERNAME%",
+                r"%USERPROFILE%",
+                r"%COMPUTERNAME%",
+                " ",
+                "  ",
+                "\t",
+                "=",
+                "x=",
+                "name=",
+                "second_screen_fallback=",
+                "gpu=",
+                "no_frames",
+                "Intel",
+                "GPU:",
+                "Found GPU adapter",
+                "'",
+                "\"",
+                ":",
+                "?",
+                "*",
+                "%",
+                "_",
+                "-",
+                ".",
+                ",",
+                ")",
+                "(",
+                "0",
+                "42",
+                "AppData",
+                "é",
+                "ß",
+                "İ",
+                "e\u{301}",
+                "日本",
+                "🙂",
+                "\u{200B}",
+                "Ω",
+                "K",
+            ];
+            let mut line = String::new();
+            if self.next().is_multiple_of(3) {
+                line.push_str(STAMP);
+                line.push_str(self.pick(&["  INFO ", "  WARN ", " ERROR ", " INFO"]));
+            }
+            for _ in 0..self.next() % 40 {
+                if self.next().is_multiple_of(4) {
+                    line.push_str(self.pick(names));
+                } else {
+                    line.push_str(self.pick(PIECES));
+                }
+            }
+            line
+        }
+    }
+
+    /// Any line, including several paths, truncated paths, Unicode and
+    /// empty folder names: no panic, and redacting twice changes nothing.
+    #[test]
+    fn redaction_never_panics_and_is_idempotent() {
+        let sets: [(Option<&str>, Option<&str>, Option<&str>); 7] = [
+            (
+                Some(r"C:\Users\Maria Lopez"),
+                Some("maria"),
+                Some("MARIA-DESKTOP"),
+            ),
+            (
+                Some(r"D:\Profiles\maria.CORP"),
+                Some("maria"),
+                Some("DESKTOP-DEMO"),
+            ),
+            (Some(r"\\?\C:\Users\Al"), Some("Al"), Some("PC")),
+            (
+                Some(r"C:\Users\no_frames"),
+                Some("no_frames"),
+                Some("USERNAME"),
+            ),
+            (Some(r"C:\Users\İrem"), Some("İrem"), Some("日本-PC")),
+            (Some(r"C:\Users\K"), Some("K"), Some("Ω")),
+            (Some(r"\\"), Some(""), None),
+        ];
+        let mut lines = Lines(0x9E37_79B9_7F4A_7C15);
+        for (profile, user, pc) in sets {
+            let names = Names::new(profile, user, pc);
+            let pieces: Vec<&str> = [profile, user, pc, Some("Maria Lopez"), Some("Kim")]
+                .into_iter()
+                .flatten()
+                .collect();
+            for _ in 0..3000 {
+                let line = lines.line(&pieces);
+                let once = redact(&line, &names);
+                let twice = redact(&once, &names);
+                assert_eq!(
+                    twice, once,
+                    "not idempotent for {line:?} with {user:?}/{pc:?}"
+                );
+            }
+        }
     }
 }
