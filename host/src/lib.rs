@@ -17,6 +17,7 @@ pub mod log_repeat;
 pub mod logging;
 pub mod pairing;
 pub mod pipeline;
+pub mod remote_config;
 pub mod settings;
 pub mod single_instance;
 pub mod stall;

@@ -181,7 +181,8 @@ impl State {
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
-                if let Some(hold) = self.memory.hold(now) {
+                let hold = self.memory.hold(now);
+                if let Some(hold) = hold.or_else(|| self.memory.hold_for_rule(now)) {
                     *status = VddStatus::Failed;
                     self.failure = Some(hold.reason);
                     log_hold(hold);
@@ -339,12 +340,16 @@ pub fn load_memory(shared: &SharedControl) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let memory = Memory::load(
+    let fingerprint = memory::Fingerprint::current();
+    let rule = fingerprint.matches_rule(crate::remote_config::current());
+    crate::remote_config::note_second_screen_rule(rule);
+    let mut memory = Memory::load(
         dir.join(memory::FILE_NAME),
-        memory::Fingerprint::current(),
+        fingerprint,
         wall,
         Instant::now(),
     );
+    memory.set_rule(rule, dir.join(memory::RULE_FILE_NAME));
     shared.second_screen.lock().memory = memory;
     #[cfg(not(test))]
     display_power::watch();
