@@ -6,7 +6,7 @@
 //! Stream page names the program holding it and the supervisor checks again
 //! every [`RECHECK`]; the stream starts as soon as the port is free.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -43,8 +43,16 @@ pub fn held() -> Option<Held> {
     HELD.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Whether binding the stream port failed because something else has it:
+/// another socket on it (10048), or on Windows one that holds it
+/// exclusively (`SO_EXCLUSIVEADDRUSE`) or a range Windows reserved (10013).
+pub fn is_held(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::AddrInUse
+        || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied)
+}
+
 /// Whether the stream may start: binds `port` as the stream does and lets go
-/// at once. A port in use is recorded with its holder for the Stream page; a
+/// at once. A held port is recorded with its holder for the Stream page; a
 /// free port clears that. Any other failure is left for the stream's own bind
 /// to report.
 pub fn check(port: u16) -> bool {
@@ -54,7 +62,7 @@ pub fn check(port: u16) -> bool {
 /// As [`check`], for the host whose process is `own`.
 fn check_as(port: u16, own: u32) -> bool {
     match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
-        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+        Err(error) if is_held(&error) => {
             note(Some(Held {
                 port,
                 by: holder(port, own),

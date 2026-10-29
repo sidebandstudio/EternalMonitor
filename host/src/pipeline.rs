@@ -121,7 +121,7 @@ pub async fn run_pipeline_supervised(
 fn transport_failure(error: &(dyn std::error::Error + 'static)) -> StageOutcome {
     if error
         .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        .is_some_and(crate::startup::port::is_held)
     {
         warn!(%error, "The stream port was taken before the stream could bind it");
         return StageOutcome::PortInUse;
@@ -140,8 +140,16 @@ mod tests {
         let in_use: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::from(std::io::ErrorKind::AddrInUse).into();
         assert_eq!(transport_failure(&*in_use), StageOutcome::PortInUse);
-        let other: Box<dyn std::error::Error + Send + Sync> =
+        // WSAEACCES: a program holds it exclusively, or Windows reserved it.
+        let exclusive: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        let waits = cfg!(windows);
+        assert_eq!(
+            transport_failure(&*exclusive) == StageOutcome::PortInUse,
+            waits
+        );
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            std::io::Error::from(std::io::ErrorKind::AddrNotAvailable).into();
         assert!(matches!(
             transport_failure(&*other),
             StageOutcome::Failed(_)
