@@ -234,44 +234,60 @@ fn holder(port: u16, own: u32, family: Family) -> Option<HeldBy> {
     Some(identify(pid, own, image_path, description))
 }
 
-/// Who process `pid` is. Its image path (`image`) needs no file I/O, so
-/// Windows, a service host and another copy are named at once, even while an
-/// earlier lookup is stuck. Only the file's description (`describe`), which
-/// can hang on a network share, waits on another thread.
+/// The process holding the port: its pid, when it started (a later process
+/// given the same pid starts later) and the file it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Process {
+    pid: u32,
+    started: Option<u64>,
+    image: String,
+}
+
+/// Who process `pid` is. Its image path and start time (`image`) need no
+/// file I/O, so Windows, a service host and another copy are named at once,
+/// even while an earlier lookup is stuck. Only the file's description
+/// (`describe`), which can hang on a network share, waits on another thread.
 fn identify(
     pid: u32,
     own: u32,
-    image: impl FnOnce(u32) -> Option<String>,
+    image: impl FnOnce(u32) -> Option<(String, Option<u64>)>,
     describe: impl FnOnce(&str) -> Option<String> + Send + 'static,
 ) -> HeldBy {
     if pid == own {
         return HeldBy::ThisCopy;
     }
-    let image = (pid != 4).then(|| image(pid)).flatten();
-    named(pid, image.as_deref(), |image| described(image, describe))
+    let (image, started) = (pid != 4).then(|| image(pid)).flatten().unzip();
+    named(pid, image.as_deref(), |image| {
+        let process = Process {
+            pid,
+            started: started.flatten(),
+            image: image.to_owned(),
+        };
+        described(process, describe)
+    })
 }
 
-/// The description of the file at `image`, as `describe` reads it within
-/// [`LOOKUP`]. A description once read is kept, so a later slow read of the
-/// same file doesn't change what the Stream page calls the program.
+/// The description of the file `process` runs, as `describe` reads it within
+/// [`LOOKUP`]. The description read for a process is kept, so a later slow
+/// read doesn't change what the Stream page calls it. Another process, even
+/// one running the same file, is read again.
 fn described(
-    image: &str,
+    process: Process,
     describe: impl FnOnce(&str) -> Option<String> + Send + 'static,
 ) -> Option<String> {
     static LOOKING: AtomicBool = AtomicBool::new(false);
-    static READ: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+    static READ: Mutex<Option<(Process, Option<String>)>> = Mutex::new(None);
     if let Some((_, description)) = READ
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .filter(|(path, _)| path == image)
+        .filter(|(read, _)| *read == process)
     {
         return description.clone();
     }
-    let image = image.to_owned();
     within(&LOOKING, LOOKUP, move || {
-        let description = describe(&image);
-        *READ.lock().unwrap_or_else(|e| e.into_inner()) = Some((image, description.clone()));
+        let description = describe(&process.image);
+        *READ.lock().unwrap_or_else(|e| e.into_inner()) = Some((process, description.clone()));
         description
     })
     .flatten()
@@ -389,8 +405,9 @@ fn owner(_port: u16, _family: Family) -> Option<u32> {
     None
 }
 
+/// The file process `pid` runs, and when it started.
 #[cfg(windows)]
-fn image_path(pid: u32) -> Option<String> {
+fn image_path(pid: u32) -> Option<(String, Option<u64>)> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
@@ -407,14 +424,15 @@ fn image_path(pid: u32) -> Option<String> {
             PWSTR(path.as_mut_ptr()),
             &mut size,
         );
+        let started = super::process::created_at(process);
         let _ = CloseHandle(process);
         named.ok()?;
-        Some(String::from_utf16_lossy(&path[..size as usize]))
+        Some((String::from_utf16_lossy(&path[..size as usize]), started))
     }
 }
 
 #[cfg(not(windows))]
-fn image_path(_pid: u32) -> Option<String> {
+fn image_path(_pid: u32) -> Option<(String, Option<u64>)> {
     None
 }
 
@@ -805,8 +823,12 @@ mod tests {
         assert!(log.contains("Windows is blocking"), "{log}");
     }
 
-    fn image(path: &'static str) -> impl FnOnce(u32) -> Option<String> {
-        move |_| Some(path.to_string())
+    fn image(path: &'static str) -> impl FnOnce(u32) -> Option<(String, Option<u64>)> {
+        started(path, 1)
+    }
+
+    fn started(path: &'static str, at: u64) -> impl FnOnce(u32) -> Option<(String, Option<u64>)> {
+        move |_| Some((path.to_string(), Some(at)))
     }
 
     fn not_read(_: &str) -> Option<String> {
@@ -869,10 +891,11 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the slow one ends");
             thread::sleep(Duration::from_millis(10));
         }
-        // A later read of the same file that would be slow isn't waited for.
+        // A later read for the same process that would be slow isn't waited
+        // for.
         let started = std::time::Instant::now();
         assert_eq!(
-            identify(5678, 0, image(slow), |_| {
+            identify(1234, 0, image(slow), |_| {
                 thread::sleep(LOOKUP * 2);
                 None
             }),
@@ -880,6 +903,33 @@ mod tests {
         );
         assert!(started.elapsed() < LOOKUP, "didn't read again");
         assert_eq!(identify(7, 7, |_| None, not_read), HeldBy::ThisCopy);
+    }
+
+    /// Another process running the same file, under a new pid or a reused
+    /// one that started later, isn't given the description read for the
+    /// first. It goes by its file name until its own is read.
+    #[test]
+    fn another_process_at_the_same_path_is_read_again() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let tool = r"C:\Tools\tool.exe";
+        for (pid, at) in [(1234, 1), (5678, 1), (1234, 2)] {
+            let own = format!("Tool {pid} from {at}");
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let by = identify(pid, 0, started(tool, at), {
+                let own = own.clone();
+                move |_| {
+                    let _ = release_rx.recv();
+                    Some(own)
+                }
+            });
+            assert_eq!(by, HeldBy::Program("tool.exe".into()), "{own}");
+            drop(release_tx);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while identify(pid, 0, started(tool, at), |_| None) != HeldBy::Program(own.clone()) {
+                assert!(std::time::Instant::now() < deadline, "{own} is read");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     /// The description is read on another thread. Its log lines go where the
