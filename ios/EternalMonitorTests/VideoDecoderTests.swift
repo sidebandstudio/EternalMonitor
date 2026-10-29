@@ -539,14 +539,16 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertEqual(result.stalls, 0, "before 5 s: \(result)")
     }
 
-    /// A held picture whose PC heartbeats at `heartbeatUntil` seconds
+    /// A held picture whose PC heartbeats until `heartbeatUntil` seconds
     /// (forever if nil), with the recovery timer driven by `tick(at:)`.
-    /// Returns the reconnect count after each tick.
-    private func holdWithHeartbeats(until heartbeatUntil: Double?) throws
+    /// `contiguous`: the PC sets bit 5, as 0.3.4 PCs do. Returns the
+    /// reconnect count after each tick.
+    private func holdWithHeartbeats(until heartbeatUntil: Double?, contiguous: Bool = true) throws
         -> (tick: (Double) -> Int, restarts: () -> Int, done: () -> Void) {
         let units = try twoGOPs("h264")
         let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
         let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } }, runsRecoveryTimer: false)
+        decoder.setFrameSeqContiguous(contiguous)
         struct Calls { var requests = 0; var restarts = 0; var stalls = 0 }
         let calls = OSAllocatedUnfairLock(initialState: Calls())
         decoder.onNeedsKeyframe = { calls.withLock { $0.requests += 1 } }
@@ -587,6 +589,19 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertGreaterThan(hold.restarts(), 1, "Resume is still asked for meanwhile")
         XCTAssertEqual(hold.tick(14.1), 1, "12 s after the first Resume")
         XCTAssertEqual(hold.tick(15.0), 1, "once per hold")
+    }
+
+    func testAnOlderPCKeepsTheFiveSecondReconnectThoughHeartbeatsArrive() throws {
+        // A 0.3.1-0.3.3 PC leaves bit 5 clear and only forces an IDR for
+        // Resume: waiting for a reopen that never comes would only keep the
+        // picture frozen longer than before.
+        let hold = try holdWithHeartbeats(until: nil, contiguous: false)
+        defer { hold.done() }
+        XCTAssertEqual(hold.tick(2.05), 0)
+        XCTAssertEqual(hold.restarts(), 1, "Resume is still asked for")
+        XCTAssertEqual(hold.tick(4.9), 0)
+        XCTAssertEqual(hold.tick(5.05), 1, "5 s, as before")
+        XCTAssertEqual(hold.tick(8.0), 1, "once per hold")
     }
 
     func testWithoutHeartbeatsTheReconnectKeepsItsDeadline() throws {

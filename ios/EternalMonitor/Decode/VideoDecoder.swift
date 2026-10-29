@@ -36,7 +36,7 @@ final class VideoDecoder {
     /// a request can be lost or coalesced like any other.
     var onRestartStream: (() -> Void)?
     /// The picture has been held `reconnectAfterUs`: this session can't recover.
-    /// After a Resume, while the PC's heartbeats arrive, not before
+    /// After a Resume to a 0.3.4 PC, while its heartbeats arrive, not before
     /// `reopenGraceUs` past the first Resume.
     var onStalled: (() -> Void)?
 
@@ -108,10 +108,11 @@ final class VideoDecoder {
     static let restartStreamAfterUs: UInt64 = 2_000_000
     /// Then the connection is rebuilt.
     static let reconnectAfterUs: UInt64 = 5_000_000
-    /// Unless a Resume went out and the PC's heartbeats still arrive: a 0.3.4
-    /// PC reopens its encoder for it, and a hardware reopen may take up to
-    /// 9 s (field QSV opens take up to 4.4 s). The reconnect then waits until
-    /// this long after the first Resume.
+    /// Unless a Resume went out to a 0.3.4 PC and its heartbeats still
+    /// arrive: it reopens its encoder for Resume, and a hardware reopen may
+    /// take up to 9 s (field QSV opens take up to 4.4 s). The reconnect then
+    /// waits until this long after the first Resume. A 0.3.1-0.3.3 PC only
+    /// forces an IDR for Resume, so waiting longer would not help it.
     static let reopenGraceUs: UInt64 = 12_000_000
     /// A hold this long shows Restoring the picture and is logged.
     static let showRestoringAfterUs: UInt64 = 1_000_000
@@ -222,11 +223,14 @@ final class VideoDecoder {
         requestKeyframe(at: now)
     }
 
-    /// A Resume went out less than `reopenGraceUs` ago and the PC's
-    /// heartbeats still arrive. Without heartbeats the PC is gone, not
-    /// reopening, and the reconnect keeps its 5 s.
+    /// A Resume went out less than `reopenGraceUs` ago to a PC that reopens
+    /// its encoder for it, and the PC's heartbeats still arrive. Without
+    /// heartbeats the PC is gone, not reopening, and the reconnect keeps its
+    /// 5 s. The contiguous frame numbering cap (bit 5) marks a 0.3.4 PC, the
+    /// first to reopen for Resume; 0.3.1-0.3.3 PCs leave it clear.
     private func waitsForEncoderReopen(_ current: Hold, at now: UInt64) -> Bool {
-        guard let resumedAt = current.resumedAt, now &- resumedAt < Self.reopenGraceUs,
+        guard continuity.frameSeqContiguous,
+              let resumedAt = current.resumedAt, now &- resumedAt < Self.reopenGraceUs,
               let hostAlive else { return false }
         return hostAlive(now)
     }
