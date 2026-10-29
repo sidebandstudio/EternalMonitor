@@ -131,6 +131,16 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "to",
     "arch",
     "installation_type",
+    // Troubleshooting and the graphics card switch.
+    "overrides",
+    "encoder_input",
+    "packet",
+    "fps",
+    "window",
+    "graphics_card",
+    "preference",
+    "switch",
+    "choice",
     // The virtual display snapshot.
     "driver",
     "tech",
@@ -154,6 +164,10 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "identifier",
     "adapters",
     "outputs",
+    "screen_gpu",
+    "app_gpu",
+    "power_saving_gpu",
+    "high_performance_gpu",
     // The periodic stats summary.
     "stream_codec",
     "stream_input",
@@ -1053,6 +1067,22 @@ mod tests {
                 "INFO Windows os=10.0 registry_product=Windows 11 Pro installation_type=Client display_version=24H2",
             ),
             ("Family", "INFO CPU=x identifier=Intel64 Family 6 Model 154"),
+            (
+                "vulkan",
+                "INFO Troubleshooting settings in effect overrides=encoder_input=bgra (setting), \
+                 packet=1200 (environment), window=vulkan (setting), graphics_card=2 (windows)",
+            ),
+            (
+                "HighPerformance",
+                "INFO Graphics card switch outcome: capture works gpu=NVIDIA preference=Some(HighPerformance) \
+                 app_gpu=\"NVIDIA\"",
+            ),
+            (
+                "Radeon780M",
+                "INFO Graphics card check screen_gpu=Radeon780M app_gpu=GeForce4060 \
+                 switch=Some(PowerSaving) cards=2 power_saving_gpu=Radeon780M high_performance_gpu=GeForce4060",
+            ),
+            ("Dx12", "INFO Window renderer instance backends=DX12 choice=Some(Dx12) chosen_failed=false"),
         ];
         for (name, message) in cases {
             let line = format!("{STAMP}  {message}");
