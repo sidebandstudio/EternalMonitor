@@ -776,8 +776,11 @@ fn slow_usb_link_measurement() {
     assert!(run.tunnel_open, "the tunnel must stay open");
 }
 
+/// A port for the host's stream, which binds every address: a port that is
+/// free on loopback only may be taken on another, by a connected UDP socket
+/// such as a QUIC or NTP client's, and the host then waits for it.
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
+    UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
         .expect("ephemeral port")
