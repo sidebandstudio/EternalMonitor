@@ -79,6 +79,10 @@ final class FrameAssembler {
     }
 
     let counters = OSAllocatedUnfairLock<Counters>(initialState: Counters())
+    /// Fragments ignored for a fragment count that differs from their
+    /// frame's, as an older PC sends, in this assembler's session. Only the
+    /// first is logged; the stream summary gives the count. `reset()` keeps it.
+    let mismatchedCountFragments = OSAllocatedUnfairLock<Int>(initialState: 0)
 
     private var pending: [UInt32: PendingFrame] = [:]
     private var pendingBytes = 0
@@ -229,7 +233,11 @@ final class FrameAssembler {
         tick(at: now)
         if repairEnabled && retiredSeq > 0 && seq <= retiredSeq { return }
         if let existing = pending[seq], existing.fragmentCount != count {
-            onDiagnostic?("Ignored fragment for seq=\(seq) with mismatched count \(count) (frame has \(existing.fragmentCount))")
+            let ignored = mismatchedCountFragments.withLock { $0 += 1; return $0 }
+            if ignored == 1 {
+                onDiagnostic?("Ignored fragment for seq=\(seq) with mismatched count \(count) (frame has \(existing.fragmentCount));"
+                    + " later ones this session are counted in the stream summary")
+            }
             return
         }
         if pending[seq]?.fragments[index] != nil { return }

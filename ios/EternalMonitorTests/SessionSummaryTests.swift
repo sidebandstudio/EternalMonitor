@@ -151,6 +151,9 @@ final class SessionSummaryTests: XCTestCase {
         link.onError?(LinkError(.localNetworkDenied, "UDP path not ready: Local network prohibited"))
         try await until("ended") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .localNetworkBlocked)
+        // This iPad's setting, not a fault: one warning.
+        XCTAssertEqual(manager.diagnostics.filter { $0.category == "udp" }.map { "\($0.level) \($0.message)" },
+                       ["warning state=connecting UDP path not ready: Local network prohibited"])
         XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
                        ["Disconnect state=connecting reason=linkFailed"])
         let summaries = logged(manager, "summary")
