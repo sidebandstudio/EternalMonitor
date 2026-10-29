@@ -21,24 +21,26 @@
 //! the mirror until the wait after it ends, the user clicks Try again,
 //! restarts the stream, or changes the mode.
 
+#[cfg(debug_assertions)]
+pub mod fake;
 mod memory;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use tracing::info;
 use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
 use memory::{Hold, Memory};
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use super::{wait_for_virtual_output, AttachResult, OutputInfo};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use crate::vdd::EnableReport;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use crate::vdd_device::{DeviceState, VddProblem};
 
 /// How long the second screen stays on after its iPad leaves. A USB redial
@@ -50,7 +52,7 @@ pub(crate) const RELEASE_GRACE: Duration = Duration::from_secs(10);
 /// The host never turns the virtual display on or off again sooner than this
 /// after its previous change. Each change adds or removes a display adapter:
 /// the PC's screens blink and Windows plays its device sound.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) const MIN_TOGGLE_GAP: Duration = Duration::from_secs(10);
 
 /// How long the second screen has, from the switch onto it, to capture a
@@ -65,13 +67,13 @@ pub const PROVE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 pub(crate) const PROOF_NEEDS_IMAGE: bool = true;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 const WAIT_STEP: Duration = Duration::from_millis(100);
 
 /// How long a stopped pipeline may take to come back before the display is
 /// left off: a restart joins the old generation for up to 5 s, while a quit
 /// or Stop leaves it stopped.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 const STOPPED_WAIT: Duration = Duration::from_secs(6);
 
 /// How long the attempt after "kept your desktop off it" waits, while the
@@ -79,7 +81,7 @@ const STOPPED_WAIT: Duration = Duration::from_secs(6);
 /// mirror meanwhile, so it stays connected. The usual wait is as long, so
 /// this only matters when `ETERNAL_VDD_TIMEOUT_SECS` sets a shorter one; the
 /// two are never added.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long quitting waits for the worker to exit after the last Enable.
@@ -269,18 +271,18 @@ impl State {
 
     /// Whether a capture generation with no viewer should leave an attached
     /// display on: only the grace period's end turns it off.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn keep_without_viewer(&self) -> bool {
         !self.release_requested
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn note_toggle(&mut self, now: Instant) {
         self.last_toggle = Some(now);
         self.release_requested = false;
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn toggle_delay(&self, now: Instant) -> Duration {
         self.last_toggle.map_or(Duration::ZERO, |at| {
             (at + MIN_TOGGLE_GAP).saturating_duration_since(now)
@@ -304,7 +306,7 @@ pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
 /// prove itself, before anything else: a supervisor restart (a capture
 /// error that ended the stage, or the watchdog) must not erase the failure.
 /// Returns why it failed.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn take_unproven(shared: &SharedControl, now: Instant) -> Option<&'static str> {
     let mut status = shared.vdd_status.lock();
     shared.second_screen.lock().fail_unproven(&mut status, now)
@@ -435,7 +437,7 @@ pub fn note_attached(shared: &SharedControl, device_name: String) {
 /// is held while the display is recorded, so a mode change either comes
 /// first and is seen here, or comes after, and its capture generation finds
 /// the display to turn off.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> bool {
     let mode = shared.capture_target.lock();
     if *mode != CaptureTarget::VirtualExtended || quitting(shared) {
@@ -723,7 +725,8 @@ pub(crate) enum Command {
     Attach,
     /// Turn off the display this host turned on, unless a start claimed it
     /// again since.
-    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // Sent by capture's reconcile.
+    #[cfg_attr(not(any(windows, test, debug_assertions)), allow(dead_code))]
+    // Sent by capture's reconcile.
     Release,
     /// The display showed no picture, for this reason: log how Windows sees
     /// it while it is still on, then release it.
@@ -740,8 +743,11 @@ pub(crate) struct Worker {
     enable: Mutex<()>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// A cancelled start logged its snapshot; see `snapshot_cancelled_attach`.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     cancelled_snapshot: std::sync::atomic::AtomicBool,
+    /// The fake display an end-to-end test installed, in place of the driver.
+    #[cfg(debug_assertions)]
+    fake: Mutex<Option<fake::FakeDisplay>>,
 }
 
 #[derive(Default)]
@@ -752,6 +758,12 @@ struct Queue {
 
 /// Ask the worker to change the display. Returns at once.
 pub(crate) fn send(shared: &SharedControl, command: Command) {
+    // End-to-end tests: the worker turns a fake display on and off.
+    #[cfg(debug_assertions)]
+    if let Some(display) = fake::installed(shared) {
+        fake::send(shared, display, command);
+        return;
+    }
     if !driver_available() {
         without_driver(shared, command);
         return;
@@ -865,14 +877,14 @@ pub fn shut_down(shared: &SharedControl) {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn quitting(shared: &SharedControl) -> bool {
     shared.vdd_worker.queue.lock().quitting
 }
 
 /// The worker: one command at a time, until the app quits. With `wait`
 /// false it returns once the queue is empty, for tests on a paused clock.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn run(
     shared: &SharedControl,
     driver: &impl Driver,
@@ -908,7 +920,7 @@ pub(crate) fn run(
 
 /// What turning the display on needs from Windows, so tests can supply a
 /// clock and a driver that attaches late or never.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) trait Driver {
     fn outputs(&self) -> Vec<OutputInfo>;
     /// Prepare the driver's settings for the connected iPad, just before the
@@ -938,7 +950,7 @@ pub(crate) trait Driver {
 }
 
 /// Why a second screen failed, for [`Driver::report`].
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// The Enable task failed.
@@ -954,10 +966,10 @@ pub(crate) enum Failure {
 
 /// However [`attach`] ends, its claim ends with it: a start that did not
 /// finish leaves the status for the next tick to claim again.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 struct AttachExit<'a>(&'a SharedControl);
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 impl Drop for AttachExit<'_> {
     fn drop(&mut self) {
         let mut status = self.0.vdd_status.lock();
@@ -971,7 +983,7 @@ impl Drop for AttachExit<'_> {
 /// Turn the display on, wait for it to attach, and record the result. A
 /// viewer leaving does not cancel it; a change of mode or quitting does.
 /// Capture keeps mirroring throughout.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Duration) {
     let _exit = AttachExit(shared);
     let selected =
@@ -1107,7 +1119,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
 
 /// The only Enable: never once quitting has begun, and quitting waits for
 /// one in flight. None when quitting.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn enable(shared: &SharedControl, driver: &impl Driver) -> Option<Result<(), EnableReport>> {
     let _enable = shared.vdd_worker.enable.lock();
     if quitting(shared) {
@@ -1120,7 +1132,7 @@ fn enable(shared: &SharedControl, driver: &impl Driver) -> Option<Result<(), Ena
 
 /// Turn the display off after the gap. Quitting skips it: the quit turns it
 /// off at once.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn disable(shared: &SharedControl, driver: &impl Driver) {
     if wait_for_toggle_gap(shared, driver, &|| !quitting(shared)) {
         driver.set_enabled(false);
@@ -1132,7 +1144,7 @@ fn disable(shared: &SharedControl, driver: &impl Driver) {
 /// Turn off a display this host turned on, unless a start claimed it since.
 /// Only the claim counts, not the status: a capture generation may publish
 /// the status after asking for this.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn release(shared: &SharedControl, driver: &impl Driver) {
     let wanted = || {
         *shared.capture_target.lock() == CaptureTarget::VirtualExtended
@@ -1153,7 +1165,7 @@ pub(crate) fn release(shared: &SharedControl, driver: &impl Driver) {
 }
 
 /// Wait out [`MIN_TOGGLE_GAP`]. False when `go_on` turned false meanwhile.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn wait_for_toggle_gap(
     shared: &SharedControl,
     driver: &impl Driver,
