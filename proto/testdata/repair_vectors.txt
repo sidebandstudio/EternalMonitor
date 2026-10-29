@@ -122,6 +122,63 @@ expect 0 0 2 0 0 5 1 - 0 1:1|1:1|1:1|1:1|1:1
 tick 345000
 expect 1 1 2 1 0 5 0 2 1 1:1|1:1|1:1|1:1|1:1
 
+# A starved PC sent nothing for 350 ms while frames 352 and 353 were both
+# incomplete, then both repairs at once. Nothing complete waits behind 352,
+# so dropping it gains nothing: it is held and asked for again, and both
+# frames are shown without a keyframe.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+add 16667 1 353 1 2 0 4
+tick 124999
+expect 0 0 2 0 0 4 2 - 0 352:0|352:0|353:0|353:0
+tick 125000
+tick 141667
+tick 150000
+tick 200000
+tick 300000
+expect 0 0 2 0 0 8 2 - 0 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0
+add 348000 1 352 0 2 1 1
+add 348000 1 353 0 2 1 3
+expect 2 0 2 0 2 9 0 352,353 0 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0|353:0
+
+# A complete frame waiting behind them keeps the stall allowance: each
+# incomplete frame is dropped 100 ms past its deadline.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+add 16667 1 353 1 2 0 4
+add 33334 1 354 0 1 0 5
+tick 124999
+expect 0 0 3 0 0 4 2 - 0 352:0|352:0|353:0|353:0
+tick 125000
+expect 0 1 3 1 0 4 1 - 1 352:0|352:0|353:0|353:0
+tick 141666
+expect 0 1 3 1 0 4 1 - 1 352:0|352:0|353:0|353:0
+tick 141667
+expect 1 2 3 2 0 4 0 354 2 352:0|352:0|353:0|353:0
+
+# A dead stream still recovers. The first hold deadline a second past the
+# gap retires both frames with one keyframe request; a late repair is then
+# ignored and the keyframe is shown.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+add 16667 1 353 1 2 0 4
+tick 124999
+tick 125000
+tick 150000
+tick 200000
+tick 300000
+tick 500000
+tick 700000
+tick 900000
+tick 1099999
+expect 0 0 2 0 0 11 2 - 0 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+tick 1100000
+expect 0 2 2 2 0 11 0 - 1 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+tick 2000000
+add 2100000 1 353 0 2 1 3
+add 2200000 1 354 0 1 0 5 1
+expect 1 2 3 2 0 11 0 354 1 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+
 # Eviction at the 32-frame bound requests a keyframe. The bound covers the
 # longest repair deadline at 120 fps twice over.
 reset 16667 10000
@@ -239,6 +296,8 @@ tick 255000
 expect 1 2 3 2 0 4 0 249 2 247:0|247:0|248:0|248:0
 
 # A partial keyframe cannot cover loss until every fragment has arrived.
+# Nothing complete waits behind the held frame, so nothing is dropped; the
+# keyframe retires both older frames once it completes.
 reset 16667 10000
 add 0 1 247 1 2 0 1
 tick 125000
@@ -246,9 +305,23 @@ add 130000 1 248 1 2 0 2
 add 140000 1 249 0 2 0 3 1
 tick 254999
 tick 255000
-expect 0 2 3 2 0 5 1 - 2 247:0|247:0|248:0|248:0|249:1
+expect 0 0 3 0 0 6 3 - 0 247:0|247:0|248:0|247:0|248:0|249:1
 add 256000 1 249 1 2 0 4 1
-expect 1 2 4 2 0 5 0 249 2 247:0|247:0|248:0|248:0|249:1
+expect 1 2 4 2 0 6 0 249 0 247:0|247:0|248:0|247:0|248:0|249:1
+
+# With a complete delta frame behind them, the older frames are dropped at
+# their deadlines, and a partial keyframe does not stop the requests.
+reset 16667 10000
+add 0 1 247 1 2 0 1
+tick 125000
+add 130000 1 248 1 2 0 2
+add 140000 1 249 0 2 0 3 1
+add 150000 1 250 0 1 0 5
+tick 254999
+tick 255000
+expect 0 2 4 2 0 7 1 - 2 247:0|247:0|248:0|247:0|248:0|249:1|249:1
+add 256000 1 249 1 2 0 4 1
+expect 2 2 5 2 0 7 0 249,250 2 247:0|247:0|248:0|247:0|248:0|249:1|249:1
 
 # A complete keyframe needs no earlier frame. It is shown at once and retires
 # the partial frame and the complete delta frame waiting behind it, without
