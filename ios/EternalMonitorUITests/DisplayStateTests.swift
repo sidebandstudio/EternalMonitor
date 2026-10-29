@@ -1,13 +1,12 @@
 import XCTest
 
 /// Stream states that need no PC, shown through the debug UI preview.
-final class DisplayStateTests: XCTestCase {
+final class DisplayStateTests: UITestCase {
     func testHeldPictureSaysItIsBeingRestored() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "restoring"
-        app.launch()
-        defer { app.terminate() }
+        launchCleanly(app)
         let note = app.otherElements["display.restoringPicture"]
         XCTAssertTrue(note.waitForExistence(timeout: 10), "a held picture must not look like a live one")
         XCTAssertEqual(note.label, "Restoring the picture")

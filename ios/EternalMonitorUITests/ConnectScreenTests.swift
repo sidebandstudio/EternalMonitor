@@ -141,6 +141,42 @@ final class ConnectScreenTests: UITestCase {
         XCTAssertTrue(title.waitForExistence(timeout: 15))
     }
 
+    /// Local Network off: the card says where the switch is, that the
+    /// cable works without it, and offers Open Settings and Try again.
+    func testLocalNetworkOffSaysWhereToTurnItOn() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "error-local-network"
+        launchCleanly(app)
+        let title = app.staticTexts["connect.problemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertEqual(title.label, "Local Network is turned off for EternalMonitor")
+        let detail = app.staticTexts["connect.problemDetail"].label
+        XCTAssertTrue(detail.contains("Settings > Privacy & Security > Local Network"), detail)
+        XCTAssertTrue(detail.contains("A USB cable works without this setting."), detail)
+        XCTAssertTrue(app.buttons["connect.openSettings"].isHittable)
+        XCTAssertTrue(app.buttons["connect.retry"].isHittable)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "local-network-off"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    /// Search blocked by Local Network: Open Settings, and Search again for
+    /// after it is turned on.
+    func testABlockedSearchOffersSettingsAndSearchAgain() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "searchBlocked"
+        launchCleanly(app)
+        let title = app.staticTexts["connect.scanProblemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertEqual(title.label, "EternalMonitor can't look for PCs")
+        XCTAssertTrue(app.staticTexts["connect.scanEmpty"].label.contains("Privacy & Security > Local Network"))
+        XCTAssertTrue(app.buttons["Open Settings"].exists)
+        XCTAssertTrue(app.buttons["Search again"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "search-blocked"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     /// An address where nothing answers ends in plain words and a retry,
     /// not a transport trace.
     func testUnreachablePCSaysWhatToDo() {
