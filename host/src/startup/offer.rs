@@ -59,12 +59,14 @@ pub(super) fn begin() {
         .name("failure-offer".into())
         .spawn(|| {
             let offer = crate::updates::failure_offer_now();
-            record(&offer.describe());
+            // The message first: a slow disk must not hold it past WAIT.
+            let line = offer.describe();
             finish(offer.version);
+            record(&line);
         });
     if spawned.is_err() {
-        record("Update offer on the failure message: not offered source=none fetch=failed");
         finish(None);
+        record("Update offer on the failure message: not offered source=none fetch=failed");
     }
 }
 
