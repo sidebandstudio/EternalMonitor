@@ -317,6 +317,8 @@ pub struct AnalyzerApp {
     restart_pending: bool,
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
+    /// The home network address offered under a VPN's or virtual switch's.
+    address_hint: crate::network::HintCache,
     copied: Option<(Copied, Instant)>,
     /// The Send feedback dialog, while open.
     feedback: Option<feedback_panel::Draft>,
@@ -483,6 +485,7 @@ impl AnalyzerApp {
             restart_pending: false,
             show_qr_modal: false,
             qr_cache: None,
+            address_hint: Default::default(),
             copied: None,
             feedback: None,
             feedback_ask: crate::feedback::Ask::new(
@@ -1327,7 +1330,10 @@ impl AnalyzerApp {
             .next()
             .and_then(|p| p.parse::<u16>().ok())
         {
-            PIPELINE_STATS.lock().set_listen_addr(detect_local_ip(port));
+            // Resolved before locking: the stats lock is shared with every
+            // pipeline thread.
+            let listen_addr = detect_local_ip(port);
+            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
         }
         self.show_qr_modal = true;
     }
@@ -1591,19 +1597,25 @@ fn value_or_unknown(value: &str) -> &str {
 }
 
 pub fn detect_local_ip(listen_port: u16) -> String {
-    // The home network's Wi-Fi or Ethernet first: a VPN or a Hyper-V/WSL switch can own the
-    // default route, and an iPad on Wi-Fi can't reach those addresses. Otherwise the interface
-    // the OS would route toward a public address, then (no default route: isolated LAN, no
-    // internet) the first adapter's IPv4, so the displayed address and QR still work.
-    let adapters = crate::network::adapters();
-    match crate::network::pick(
-        adapters.as_deref(),
-        crate::network::default_route(),
-        first_lan_ipv4,
-    ) {
-        Some(ip) => format!("{ip}:{listen_port}"),
-        None => format!("unknown:{listen_port}"),
+    // Primary: ask the OS which local interface would route toward a public address. This is the
+    // happy path on any machine with a normal default route.
+    if let Ok(addr) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+        s.connect("8.8.8.8:80")?;
+        s.local_addr()
+    }) {
+        let ip = addr.ip();
+        if !ip.is_unspecified() && !ip.is_loopback() {
+            return format!("{}:{}", ip, listen_port);
+        }
     }
+
+    // Fallback: no default route (isolated LAN / no internet / blocked) — enumerate local
+    // adapters and use the first real LAN IPv4 so the displayed address and QR still work.
+    if let Some(ip) = first_lan_ipv4() {
+        return format!("{}:{}", ip, listen_port);
+    }
+
+    format!("unknown:{listen_port}")
 }
 
 /// Launch the GUI window. Blocks the calling thread.

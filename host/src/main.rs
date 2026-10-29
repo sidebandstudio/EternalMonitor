@@ -214,10 +214,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
+    let listen_addr = gui::detect_local_ip(listen_port);
     {
         let mut stats = stats::PIPELINE_STATS.lock();
         stats.set_bitrate(initial_bitrate);
-        stats.set_listen_addr(gui::detect_local_ip(listen_port));
+        stats.set_listen_addr(listen_addr);
         stats.set_target_addr(shared.target_addr.lock().to_string());
         stats.set_gpu_name(gpu_info.name.clone());
         stats.set_codec_name(gpu_info.codec_display_name.clone());
