@@ -20,7 +20,7 @@ mod page_settings;
 mod page_stream;
 mod page_troubleshooting;
 mod port_notice;
-mod renderer;
+pub(crate) mod renderer;
 mod theme;
 mod update_banner;
 mod update_toast;
