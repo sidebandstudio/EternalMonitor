@@ -189,11 +189,12 @@ impl VideoQueue {
     /// is never cut short. Dropping the queue to admit newer frames sent the
     /// iPad partial keyframes, each of which asked for another keyframe, the
     /// biggest frame of all. Dependents of a lost frame are discarded until a
-    /// keyframe, and a keyframe always passes, replacing what is still queued.
-    /// Replaced frames count as lost, or periodic keyframes would hide a
-    /// tunnel that never catches up. They show congestion only while the
-    /// writer is busy: a frame can also wait because the sender ran twice
-    /// before the writer was scheduled, with the tunnel idle.
+    /// keyframe, and a keyframe always passes, replacing what is still queued
+    /// behind a busy writer. Replaced frames count as lost, or periodic
+    /// keyframes would hide a tunnel that never catches up. A frame can also
+    /// wait because the sender ran twice before the writer was scheduled,
+    /// with the tunnel idle: it is kept when the keyframe fits behind it, and
+    /// counts as lost but not as congestion when it does not.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
@@ -218,12 +219,20 @@ impl VideoQueue {
             }
             if header.is_keyframe {
                 // Queued frames are older and the keyframe needs none of them.
-                dropped = self.frames.len() as u64;
-                if !self.writer_busy {
-                    self.unscheduled += dropped;
+                // While the writer is busy they wait behind a tunnel that is
+                // behind, and the keyframe replaces them. While it is idle
+                // they wait only for it to be scheduled, so they still go
+                // out first when the keyframe is sure to fit behind them.
+                let fits = self.frames.len() < FRAME_LIMIT
+                    && self.bytes + usize::from(header.frag_count) * MAX_DGRAM_SIZE <= BYTE_LIMIT;
+                if self.writer_busy || !fits {
+                    dropped = self.frames.len() as u64;
+                    if !self.writer_busy {
+                        self.unscheduled += dropped;
+                    }
+                    self.frames.clear();
+                    self.bytes = 0;
                 }
-                self.frames.clear();
-                self.bytes = 0;
                 self.awaiting_keyframe = false;
                 self.keyframes.arrived();
             } else if self.awaiting_keyframe {
@@ -882,8 +891,9 @@ mod tests {
     }
 
     /// A frame replaced while the writer is busy waited behind real writing:
-    /// the tunnel is behind. One replaced before the writer even ran shows
-    /// only scheduling, although its picture is lost all the same.
+    /// the tunnel is behind. One queued before the writer even ran shows
+    /// only scheduling: it goes out ahead of the keyframe when that fits, and
+    /// when it does not, its picture is lost without counting as congestion.
     #[test]
     fn replacements_show_congestion_only_while_the_writer_is_busy() {
         let now = Instant::now();
@@ -892,12 +902,19 @@ mod tests {
         queue.pop().unwrap();
         assert!(queue.pop().is_none(), "the writer finds the queue empty");
         queue.push(&packet(2, false, 0, 1, 64), now).unwrap();
-        assert_eq!(queue.push(&packet(3, true, 0, 1, 64), now).unwrap(), 1);
-        assert_eq!(std::mem::take(&mut queue.unscheduled), 1, "writer idle");
-        queue.pop().unwrap();
+        assert_eq!(queue.push(&packet(3, true, 0, 1, 64), now).unwrap(), 0);
+        assert_eq!(queue.pop().unwrap().seq, 2, "writer idle: frame 2 is kept");
         queue.push(&packet(4, false, 0, 1, 64), now).unwrap();
-        assert_eq!(queue.push(&packet(5, true, 0, 1, 64), now).unwrap(), 1);
-        assert_eq!(queue.unscheduled, 0, "writer busy with frame 3");
+        assert_eq!(queue.push(&packet(5, true, 0, 1, 64), now).unwrap(), 2);
+        assert_eq!(queue.unscheduled, 0, "writer busy with frame 2");
+        queue.pop().unwrap();
+        assert!(queue.pop().is_none());
+        // A keyframe that may not fit behind an idle writer's queue still
+        // passes, and what it replaces is not congestion.
+        queue.push(&packet(6, false, 0, 1, 64), now).unwrap();
+        let count = (BYTE_LIMIT / MAX_DGRAM_SIZE) as u16 + 1;
+        assert_eq!(queue.push(&packet(7, true, 0, count, 64), now).unwrap(), 1);
+        assert_eq!(queue.unscheduled, 1);
     }
 
     /// A pipeline restart keeps the USB tunnel. Its new stream must not

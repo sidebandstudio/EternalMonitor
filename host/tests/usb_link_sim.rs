@@ -292,10 +292,10 @@ async fn keyframes_that_clear_a_backlog_still_step_the_bitrate_down() {
 }
 
 /// A tunnel with room to spare, where the frame before each keyframe reaches
-/// the link just before the keyframe, before the writer has run. The keyframe
-/// replaces it: that picture is lost, but the tunnel is not behind, and the
-/// bitrate must not come down. Counting every replacement as congestion
-/// stepped this stream down to the 4 Mbps floor in 13 s.
+/// the link just before the keyframe, before the writer has run. The tunnel
+/// is not behind: that frame still goes out, and the bitrate must not come
+/// down. Counting every replacement as congestion stepped this stream down
+/// to the 4 Mbps floor in 13 s, and replacing the frame lost its picture.
 #[tokio::test(start_paused = true)]
 async fn a_frame_replaced_before_the_writer_ran_does_not_cut_the_bitrate() {
     let stream = Stream {
@@ -305,7 +305,8 @@ async fn a_frame_replaced_before_the_writer_ran_does_not_cut_the_bitrate() {
     };
     let outcome = simulate_stream(stream, 10_000_000.0, Duration::from_secs(20)).await;
     eprintln!("USB_SIM healthy-batched {outcome:?}");
-    assert_eq!(outcome.host_drops, 40, "each replaced frame is still lost");
+    assert_eq!(outcome.host_drops, 0, "no picture is lost");
+    assert_eq!(outcome.decodable, outcome.encoded, "{outcome:?}");
     assert_eq!(outcome.congestion_drops, 0);
     assert!(outcome.final_bps >= 15_000_000, "{outcome:?}");
 }
