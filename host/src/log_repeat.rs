@@ -38,7 +38,7 @@ pub struct RepeatCollapser {
 
 /// `2026-10-21T03:10:19.347613Z  WARN message` splits into the timestamp and
 /// the rest. Continuation lines (no leading timestamp) are never collapsed.
-fn split_stamp(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_stamp(line: &str) -> Option<(&str, &str)> {
     let end = line.find(' ')?;
     let (stamp, rest) = line.split_at(end);
     let looks_like_stamp = stamp.len() >= 20
