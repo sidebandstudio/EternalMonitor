@@ -414,6 +414,12 @@ final class ConnectionManager: ObservableObject {
                 self.record(.warning, "assembly", message)
             }
         }
+        assembler.onInfo = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.info, "assembly", message)
+            }
+        }
 
         decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
@@ -497,6 +503,16 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.record(.info, "decode", message)
+            }
+        }
+        decoder.onFailure = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else {
+                    // A late failure of an ended attempt still reaches the support log.
+                    SupportDiagnostics.shared.record("error", "decode", message)
+                    return
+                }
+                self.record(.error, "decode", message)
             }
         }
 

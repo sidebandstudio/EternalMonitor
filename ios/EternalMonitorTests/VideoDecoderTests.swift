@@ -298,7 +298,11 @@ final class VideoDecoderTests: XCTestCase {
         var shown: [UInt32] = []
         var requests = 0
         var errors = 0
+        /// Events and failures, in order.
         var events: [String] = []
+        var failures: [String] = []
+        /// Messages that arrived as plain events.
+        var plainEvents: [String] = []
     }
 
     /// Decodes (seq, access unit index) pairs and reports which seqs were shown.
@@ -312,9 +316,11 @@ final class VideoDecoderTests: XCTestCase {
         let state = OSAllocatedUnfairLock(initialState: Run())
         decoder.onFrameDecoded = { _, timestamp in state.withLock { $0.shown.append(UInt32(timestamp / 16_667)) } }
         decoder.onNeedsKeyframe = { state.withLock { $0.requests += 1 } }
-        decoder.onEvent = { message in
+        decoder.onEvent = { message in state.withLock { $0.events.append(message); $0.plainEvents.append(message) } }
+        decoder.onFailure = { message in
             state.withLock {
                 $0.events.append(message)
+                $0.failures.append(message)
                 if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") { $0.errors += 1 }
             }
         }
@@ -542,7 +548,7 @@ final class VideoDecoderTests: XCTestCase {
         let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } })
         defer { decoder.shutdown() }
         let failed = expectation(description: "keyframe rejected")
-        decoder.onEvent = { message in if message.hasPrefix("Decoder callback") { failed.fulfill() } }
+        decoder.onFailure = { message in if message.hasPrefix("Decoder callback") { failed.fulfill() } }
         for (seq, index) in [(1, 0), (2, 1), (4, 3)] {
             decoder.decode(packet: packet(seq: UInt32(seq), data: units[index], keyframe: index == 0))
         }
@@ -583,6 +589,35 @@ final class VideoDecoderTests: XCTestCase {
                        "the outage is logged once")
         XCTAssertTrue(result.events.contains { $0.contains("after 3 failed attempts") })
         XCTAssertEqual(result.events.filter { $0.hasPrefix("Dropped access unit") }.count, 1)
+        // Failures reach the owner once, as failures, and not again as events.
+        XCTAssertEqual(result.failures.filter { $0.hasPrefix("Failed to create VideoToolbox session") }.count, 1)
+        XCTAssertFalse(result.plainEvents.contains { $0.hasPrefix("Failed to create VideoToolbox session") })
+    }
+
+    func testDropsWhileNotReadyAreLoggedFirstThenEveryFiveSeconds() throws {
+        // No session ever opens: every keyframe is dropped. One second apart,
+        // twelve of them log the first drop, then a count at 5 s and 10 s.
+        let (factory, _) = failingSessions(.max)
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000))
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } }, makeSession: factory, runsRecoveryTimer: false)
+        defer { decoder.shutdown() }
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let idr = try gopFixture().idr
+        for seq in UInt32(1)...12 {
+            decoder.decode(packet: packet(seq: seq, data: idr, keyframe: true))
+            let done = expectation(description: "frame \(seq) decoded")
+            decoder.runRecoveryTick { done.fulfill() }
+            wait(for: [done], timeout: 10)
+            clock.withLock { $0 += 1_000_000 }
+        }
+        let drops = events.withLock { $0 }.filter { $0.hasPrefix("Dropped") }
+        XCTAssertEqual(drops.count, 3, "\(drops)")
+        XCTAssertTrue(drops.first?.hasPrefix("Dropped access unit") == true, "\(drops)")
+        XCTAssertEqual(Array(drops.dropFirst()), [
+            "Dropped 5 more access units in 5 s because decoder is not ready",
+            "Dropped 5 more access units in 5 s because decoder is not ready",
+        ])
     }
 
     func testSessionThatFailsMidStreamHoldsThePictureAndAsksForAKeyframe() throws {

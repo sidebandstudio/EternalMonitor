@@ -20,10 +20,13 @@ private let verboseDecodeLogging = false
 final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
     var onEvent: ((String) -> Void)?
+    /// Failures, which the owner logs once as errors. Without an owner they
+    /// go to the support log directly. Both used to log each one, so every
+    /// failure appeared twice.
+    var onFailure: ((String) -> Void)?
 
     private func reportFailure(_ message: String) {
-        SupportDiagnostics.shared.record("error", "decode", message)
-        onEvent?(message)
+        if let onFailure { onFailure(message) } else { SupportDiagnostics.shared.record("error", "decode", message) }
     }
     /// The decoder cannot make progress until the next keyframe (session died, decode error).
     /// Protocol v2 turns this into a keyframe request to the host.
@@ -78,7 +81,11 @@ final class VideoDecoder {
     private var continuity = ReferenceContinuity()
     /// Session creation attempts that failed since a session last opened.
     private var failedSessionAttempts = 0
-    private var loggedNotReady = false
+    /// Access units dropped while no session is ready: the first is logged,
+    /// then a count at most every `notReadyLogIntervalUs`.
+    private var notReadyDrops = 0
+    private var lastNotReadyLogUs: UInt64?
+    static let notReadyLogIntervalUs: UInt64 = 5_000_000
 
     typealias SessionFactory = (CMVideoFormatDescription, CFDictionary, CFDictionary) -> (OSStatus, VTDecompressionSession?)
     private let makeSession: SessionFactory
@@ -634,7 +641,11 @@ final class VideoDecoder {
         decompressionSession = session
         recoveryGeneration &+= 1
         beginWaitingForKeyframe()
-        loggedNotReady = false
+        if notReadyDrops > 0 {
+            onEvent?("Dropped \(notReadyDrops) more access units because decoder was not ready")
+        }
+        notReadyDrops = 0
+        lastNotReadyLogUs = nil
         let retried = failedSessionAttempts > 0 ? " after \(failedSessionAttempts) failed attempts" : ""
         failedSessionAttempts = 0
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
@@ -649,12 +660,19 @@ final class VideoDecoder {
     private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32, epoch: UInt32) {
         guard let session = decompressionSession, let formatDescription else {
             requestKeyframeIfOverdue()
-            if !loggedNotReady {
-                loggedNotReady = true
+            let now = nowUs()
+            if lastNotReadyLogUs == nil {
+                lastNotReadyLogUs = now
                 let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
                 onEvent?(
                     "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
                 )
+            } else if let last = lastNotReadyLogUs, now &- last >= Self.notReadyLogIntervalUs {
+                lastNotReadyLogUs = now
+                onEvent?("Dropped \(notReadyDrops + 1) more access units in \((now &- last) / 1_000_000) s because decoder is not ready")
+                notReadyDrops = 0
+            } else {
+                notReadyDrops += 1
             }
             return
         }
