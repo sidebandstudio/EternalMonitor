@@ -9,6 +9,7 @@
 
 pub(crate) mod display;
 pub(crate) mod lock;
+mod offer;
 mod process;
 mod record;
 mod reporter;
@@ -340,6 +341,12 @@ fn save(detail: &str) -> Option<(&'static str, String)> {
     let _ = crate::telemetry::queue_now(&format!("{summary}: {detail}"), "error");
     eprintln!("{summary}: {detail}");
     reporter::mark(reporter::DONE);
+    // The message may offer a newer version: whoever shows it checks while
+    // this process cleans up.
+    reporter::mark(reporter::FAILED);
+    if !reporter::started() {
+        offer::begin();
+    }
     Some((
         summary,
         message_body(detail, &log_path.display().to_string(), false),
@@ -585,18 +592,11 @@ fn raise_access_violation() {
 /// respond to OK.
 #[cfg(windows)]
 fn show_message(title: &str, body: &str) {
-    use windows::core::HSTRING;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SERVICE_NOTIFICATION,
-    };
-    unsafe {
-        MessageBoxW(
-            None,
-            &HSTRING::from(body),
-            &HSTRING::from(title),
-            MB_OK | MB_ICONERROR | MB_SERVICE_NOTIFICATION,
-        );
-    }
+    offer::show_box(
+        title,
+        body,
+        windows::Win32::UI::WindowsAndMessaging::MB_SERVICE_NOTIFICATION,
+    );
 }
 
 #[cfg(not(windows))]
