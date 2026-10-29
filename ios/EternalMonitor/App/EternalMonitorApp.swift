@@ -38,7 +38,9 @@ struct EternalMonitorApp: App {
                     connectionManager.refreshAudioPreference(enabled)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-                    SupportDiagnostics.shared.record("warning", "device", "Memory warning")
+                    let footprint = MemoryFootprint.megabytes().map(String.init) ?? "unknown"
+                    let video = connectionManager.videoSize
+                    SupportDiagnostics.shared.record("warning", "device", "Memory warning footprint_mb=\(footprint) video=\(Int(video.width))x\(Int(video.height)) state=\(connectionManager.state)")
                 }
                 .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
                     SupportDiagnostics.shared.record("warning", "device", "Thermal state changed to \(ProcessInfo.processInfo.thermalState.rawValue)")

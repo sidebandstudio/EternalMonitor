@@ -13,8 +13,7 @@ final class KeyboardRelayTests: UITestCase {
         launchCleanly(app)
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
-        keyboard.tap()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        app.tapHUDControl("display.keyboard", until: app.keyboards.firstMatch, reveal: .threeFingersTogether)
         app.typeText("Hi!\n")
         let commands = ["Unicode(72)", "Unicode(105)", "Unicode(33)", "KeyDown { scan: 28, extended: false }", "KeyUp { scan: 28, extended: false }"]
         let relayed = NSPredicate { _, _ in
@@ -34,14 +33,13 @@ final class KeyboardRelayTests: UITestCase {
         verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         capture("keyboard-dismissed", app: app)
         // A slow screenshot can use up the HUD's 5 s timer (CI took 2.3 s
-        // here while the simulator's decoder stalled), and the button can
-        // vanish mid-tap. Let the HUD hide, reveal it, and tap at once.
+        // here while the simulator's decoder stalled), and on a starved runner
+        // XCTest's own idle wait and hit test outlasted it (5 s on #75), so the
+        // button vanished mid-tap. Let the HUD hide, then reveal and tap in
+        // one step, again if it hides first.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
-        revealHUD(app: app)
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-        keyboard.tap()
-        XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
+        app.tapHUDControl("display.keyboard", until: app.buttons["keyboard.done"], reveal: .threeFingersTogether)
         app.buttons["keyboard.done"].tap()
         verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         app.buttons["display.disconnect"].tap()
@@ -67,13 +65,7 @@ final class KeyboardRelayTests: UITestCase {
     /// is near the end of the hide animation, which opened the keyboard
     /// again in CI. Tap with three fingers together in the middle instead.
     private func revealHUD(app: XCUIApplication) {
-        let frame = app.frame
-        let tapped = expectation(description: "Three-finger tap")
-        EMTapFingers([-60.0, 0, 60].map { NSValue(cgPoint: CGPoint(x: frame.midX + $0, y: frame.midY)) }) { success, error in
-            XCTAssertTrue(success, error?.localizedDescription ?? "Touch synthesis failed")
-            tapped.fulfill()
-        }
-        wait(for: [tapped], timeout: 10)
+        app.revealHUD(.threeFingersTogether)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

@@ -18,6 +18,9 @@ enum AttemptEnd: Equatable {
     case connectTimeout
     /// Heartbeats stopped during a session.
     case pcStoppedResponding
+    /// The picture stayed held 5 s without a keyframe, though the PC still
+    /// answered: the app reconnects.
+    case pictureStalled
     case cableUnplugged
     case usbLinkFailed
     /// The PC closed the cable before a picture, too many times in a row.
@@ -101,7 +104,7 @@ struct SessionSummary: Equatable {
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
-        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed: return "other"
+        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled: return "other"
         default: return "none"
         }
     }

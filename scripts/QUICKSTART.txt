@@ -115,8 +115,9 @@ What the iPad says, and what to do:
   Address from this window, not the Pairing code.
 - "That code didn't match. Check the PC and try again.": type the six
   digits shown in this window now.
-- "EternalMonitor isn't allowed on your local network": tap Open Settings
-  and turn on Local Network.
+- "Local Network is turned off for EternalMonitor": tap Open Settings and
+  turn on Local Network (or Settings > Privacy & Security > Local Network >
+  EternalMonitor), then tap Try again. A USB cable works without it.
 - "The connection over the cable stopped": keep EternalMonitor and Apple
   Devices open, unlock the iPad, then unplug the cable and plug it in again.
 - "This iPad app is older than EternalMonitor on your PC, so they can't

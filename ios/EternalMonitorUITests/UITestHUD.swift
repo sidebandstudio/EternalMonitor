@@ -6,6 +6,10 @@ extension XCUIApplication {
     enum HUDReveal {
         case tap
         case threeFingerTap
+        /// Three fingers side by side mid-screen. XCTest's own three-finger
+        /// tap spreads them to the screen edges, where the bottom one can land
+        /// on a HUD button as the bar slides away.
+        case threeFingersTogether
     }
 
     /// Taps the HUD control `identifier` until `result` appears.
@@ -34,6 +38,13 @@ extension XCUIApplication {
         switch reveal {
         case .tap: coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         case .threeFingerTap: tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        case .threeFingersTogether:
+            let tapped = XCTestExpectation(description: "Three-finger tap")
+            EMTapFingers([-60.0, 0, 60].map { NSValue(cgPoint: CGPoint(x: frame.midX + $0, y: frame.midY)) }) { success, error in
+                XCTAssertTrue(success, error?.localizedDescription ?? "Touch synthesis failed")
+                tapped.fulfill()
+            }
+            _ = XCTWaiter().wait(for: [tapped], timeout: 10)
         }
     }
 

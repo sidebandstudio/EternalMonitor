@@ -62,14 +62,34 @@ final class AudioPlayer {
                 self.retireTimeline()
             }
         })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
-            object: AVAudioSession.sharedInstance(), queue: nil) { [weak self] _ in
+        let rebuild: (Notification) -> Void = { [weak self] _ in
             self?.queue.async { [weak self] in
                 // Rebuild the output on the next packet after headphones,
                 // speakers or the hardware sample rate changes.
                 self?.closeOutput(deactivate: false)
             }
-        })
+        }
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil, using: rebuild))
+        // A media services reset and an engine configuration change both stop
+        // the engine for good; without a rebuild the PC stays silent until
+        // the next connection. Either may also be what made a start fail, so
+        // each clears the failure and lets the next packet try once more. A
+        // start that fails again latches until the next such notification.
+        let restart: (Notification) -> Void = { [weak self] _ in
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                self.closeOutput(deactivate: false)
+                if self.failed {
+                    self.failed = false
+                    self.measurements.withLock { $0.error = nil }
+                }
+            }
+        }
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil, using: restart))
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange,
+            object: nil, queue: nil, using: restart))
     }
 
     deinit {

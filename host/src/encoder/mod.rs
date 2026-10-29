@@ -3226,6 +3226,40 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_keyframe_request_reopens_only_amf_and_only_after_its_cooldown() {
+        // The encode loop's keyframe calls, one frame every 16 ms. The session
+        // grants the iPad's requests (Resume among them) at most every 500 ms
+        // and sets `force_next_idr` for each; the loop reopens AMF for one at
+        // most every 500 ms and forces an IDR on the others' open session.
+        let grants = [0, 500, 1_000, 1_600];
+        for name in ["h264_amf", "hevc_amf", "h264_nvenc", "h264_qsv", "libx264"] {
+            let mut pending = false;
+            let mut frames_submitted = 300;
+            let mut last_keyframe_reopen: Option<u64> = None;
+            let (mut reopens, mut idrs) = (Vec::new(), 0);
+            for now in (0..3_000).step_by(16) {
+                pending |= grants.iter().any(|&at| (now..now + 16).contains(&at));
+                let since = last_keyframe_reopen.map(|at| Duration::from_millis(now - at));
+                if pending && reopen_for_keyframe(name, frames_submitted, since) {
+                    last_keyframe_reopen = Some(now);
+                    frames_submitted = 0;
+                    reopens.push(now);
+                }
+                if take_keyframe_request(&mut pending, name, frames_submitted) {
+                    idrs += 1;
+                }
+                frames_submitted += 1;
+            }
+            assert_eq!(idrs, grants.len(), "{name}: one IDR per grant");
+            if ignores_forced_keyframes(name) {
+                assert_eq!(reopens, [0, 512, 1_024, 1_600], "{name}: 500 ms apart");
+            } else {
+                assert!(reopens.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn amf_keeps_keyframe_requests_pending_until_a_fresh_session() {
         for name in ["h264_amf", "hevc_amf"] {
             let mut pending = true;
