@@ -7,7 +7,7 @@ use eframe::egui;
 use eframe::egui::accesskit::Role;
 use egui_kittest::{kittest, kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
-use eternal_host::control::{GuiControl, SharedControl, VddStatus};
+use eternal_host::control::{GuiControl, SharedControl, SupervisorCommand, VddStatus};
 use eternal_host::gui::AnalyzerApp;
 use eternal_host::settings::SettingsFile;
 use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
@@ -324,6 +324,16 @@ fn harness(
     pixels_per_point: f32,
 ) -> Harness<'static, AnalyzerApp> {
     let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
+    harness_with(shared, size, pixels_per_point, supervisor_tx)
+}
+
+/// As [`harness`], sending the window's Start and Stop to `supervisor_tx`.
+fn harness_with(
+    shared: &SharedControl,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+    supervisor_tx: std::sync::mpsc::Sender<SupervisorCommand>,
+) -> Harness<'static, AnalyzerApp> {
     let control = GuiControl {
         shared: shared.clone(),
         supervisor_tx,
@@ -596,8 +606,56 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
     reset_keeps_environment_overrides(&shared, &dir, &mut results);
+    waiting_for_the_port_can_be_stopped(&shared, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// Another program holds the stream port: the Stream page says so and
+/// offers Stop, which cancels the start that would follow. Start streaming
+/// comes back once the port is free.
+fn waiting_for_the_port_can_be_stopped(shared: &SharedControl, results: &mut SnapshotResults) {
+    use eternal_host::startup::port;
+    let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let held = holder.local_addr().unwrap().port();
+    PIPELINE_STATS.lock().pipeline_running = false;
+    // As the supervisor checks before a start.
+    assert!(!port::check(held));
+    let (supervisor_tx, supervisor_rx) = std::sync::mpsc::channel();
+    let mut window = harness_with(shared, egui::vec2(1040.0, 900.0), 1.0, supervisor_tx);
+    window.get_by_label("Another program is using EternalMonitor's network port");
+    window.get_by_label("Waiting for the stream port…");
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Start streaming")
+        .is_none());
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Restart")
+        .is_none());
+    // The port is random; its text is masked after it is checked, out to
+    // the banner's edge whatever its width.
+    window.run_steps(4);
+    mask_pairing_code(&mut window, shared);
+    let body = format!("uses port {held}.");
+    let body = window.get_by_label_contains(&body).rect();
+    window.mask(body.with_max_x(990.0));
+    window.snapshot("stream-waiting-for-port");
+    results.extend_harness(&mut window);
+
+    window.get_by_role_and_label(Role::Button, "Stop").click();
+    window.run_steps(4);
+    assert_eq!(supervisor_rx.try_recv(), Ok(SupervisorCommand::Stop));
+
+    drop(holder);
+    assert!(port::check(held));
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("Another program is using EternalMonitor's network port")
+        .is_none());
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Stop")
+        .is_none());
+    window.get_by_role_and_label(Role::Button, "Start streaming");
+    PIPELINE_STATS.lock().pipeline_running = true;
 }
 
 /// A hybrid laptop: the panel on the Radeon iGPU, EternalMonitor on the

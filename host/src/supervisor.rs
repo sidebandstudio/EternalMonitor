@@ -1,6 +1,7 @@
 //! Pipeline supervisor v2: owns the pipeline thread across restarts, watches
 //! stage health, auto-restarts crashed/wedged generations with backoff, and
-//! brakes restart storms into an explicit Failed state.
+//! brakes restart storms into an explicit Failed state. A stream port held
+//! by another program is not a failure: the supervisor waits for it.
 //!
 //! The state machine is pure (injected clock, message-driven) so every rule
 //! is unit-testable; the thin runtime loop at the bottom does the actual
@@ -48,6 +49,9 @@ pub enum StageOutcome {
     Completed,
     /// The stage died with an error while the pipeline was supposed to run.
     Failed(String),
+    /// The transport could not bind the stream port: another program holds
+    /// it. Taken after the supervisor's own check found it free.
+    PortInUse,
 }
 
 #[derive(Debug)]
@@ -75,6 +79,11 @@ pub enum SupervisorState {
     BackingOff {
         until: Instant,
         attempt: u32,
+    },
+    /// Another program holds the stream port; it is checked again at
+    /// `next_check`, and the stream starts once it is free.
+    WaitingForPort {
+        next_check: Instant,
     },
     /// Too many automatic restarts in the window; a manual Start is required.
     Failed {
@@ -128,14 +137,18 @@ impl Machine {
                 }
             },
             SupervisorCommand::Stop => match self.state {
-                SupervisorState::Running { .. } | SupervisorState::BackingOff { .. } => {
+                SupervisorState::Running { .. }
+                | SupervisorState::BackingOff { .. }
+                | SupervisorState::WaitingForPort { .. } => {
                     self.state = SupervisorState::Stopped;
                     Effect::StopPipeline
                 }
                 _ => Effect::None,
             },
             SupervisorCommand::Start => match self.state {
-                SupervisorState::Stopped | SupervisorState::Failed { .. } => {
+                SupervisorState::Stopped
+                | SupervisorState::Failed { .. }
+                | SupervisorState::WaitingForPort { .. } => {
                     self.attempt = 0;
                     self.restarts.clear();
                     Effect::Start
@@ -178,7 +191,17 @@ impl Machine {
         match outcome {
             StageOutcome::Completed => Effect::None,
             StageOutcome::Failed(reason) => self.auto_restart(stage, reason, now),
+            // Taken between the check and the bind: check again now.
+            StageOutcome::PortInUse => self.wait_for_port(now),
         }
+    }
+
+    /// The stream port is held: stop, and check it again at `next_check`.
+    /// Not counted as a failure, so a port held for hours never trips the
+    /// storm brake.
+    pub fn wait_for_port(&mut self, next_check: Instant) -> Effect {
+        self.state = SupervisorState::WaitingForPort { next_check };
+        Effect::StopPipeline
     }
 
     /// A watchdog decided the live pipeline is wedged.
@@ -221,14 +244,18 @@ impl Machine {
         Effect::StopPipeline
     }
 
-    /// Called on ticks while backing off; returns Start when the wait is over.
+    /// Called on ticks while backing off or waiting for the port; returns
+    /// Start when the wait is over.
     pub fn on_tick(&mut self, now: Instant) -> Effect {
-        if let SupervisorState::BackingOff { until, .. } = self.state {
-            if now >= until {
-                return Effect::Start;
+        match self.state {
+            SupervisorState::BackingOff { until, .. }
+            | SupervisorState::WaitingForPort { next_check: until }
+                if now >= until =>
+            {
+                Effect::Start
             }
+            _ => Effect::None,
         }
-        Effect::None
     }
 
     pub fn note_started(&mut self, generation: u64) {
@@ -286,14 +313,19 @@ pub fn run(
 
     let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let mut machine = Machine::new(generation);
-    let mut pipeline = Some(spawn_generation(
-        generation,
-        listen_port,
-        shared.clone(),
-        gpu_info.clone(),
-        sup_tx.clone(),
-        command_tx.clone(),
-    ));
+    let mut pipeline = None;
+    if crate::startup::port::check(listen_port) {
+        pipeline = Some(spawn_generation(
+            generation,
+            listen_port,
+            shared.clone(),
+            gpu_info.clone(),
+            sup_tx.clone(),
+            command_tx.clone(),
+        ));
+    } else {
+        machine.wait_for_port(Instant::now() + crate::startup::port::RECHECK);
+    }
     let mut healthy_since = Instant::now();
 
     loop {
@@ -337,6 +369,12 @@ pub fn run(
             Effect::Restart | Effect::Start => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                // Before anything of the new generation starts: a held port
+                // leaves capture and the encoder closed while it waits.
+                if !crate::startup::port::check(listen_port) {
+                    machine.wait_for_port(now + crate::startup::port::RECHECK);
+                    continue;
+                }
                 crate::audio::restart_stats(&PIPELINE_STATS, |stats| {
                     stats.set_target_addr(shared.target_addr.lock().to_string());
                     stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
@@ -358,6 +396,10 @@ pub fn run(
                 bounded_join(&mut pipeline, generation);
                 break;
             }
+        }
+        // Stopped by the user (or given up) while waiting: no notice.
+        if !matches!(machine.state, SupervisorState::WaitingForPort { .. }) {
+            crate::startup::port::forget();
         }
     }
     info!("Supervisor loop ended");
@@ -674,6 +716,80 @@ mod tests {
         let effect = machine.on_wedged("no frames for 5s", Instant::now());
         assert_eq!(effect, Effect::StopPipeline);
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+    }
+
+    /// A port another program holds for an hour: checked every 2 s, never
+    /// a failure, never parked in Failed, and started at the first check
+    /// that finds it free.
+    #[test]
+    fn a_held_port_is_waited_for_without_a_storm() {
+        use crate::startup::port::RECHECK;
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        assert_eq!(machine.wait_for_port(t0 + RECHECK), Effect::StopPipeline);
+        let mut checks = 0;
+        let mut now = t0;
+        while now < t0 + Duration::from_secs(3600) {
+            now += Duration::from_millis(250);
+            if machine.on_tick(now) == Effect::Start {
+                checks += 1;
+                // Still held.
+                machine.wait_for_port(now + RECHECK);
+            }
+        }
+        assert!((1790..=1800).contains(&checks), "{checks} checks");
+        assert!(matches!(
+            machine.state,
+            SupervisorState::WaitingForPort { .. }
+        ));
+        // Free at the next check: the stream starts.
+        let next = now + RECHECK;
+        assert_eq!(machine.on_tick(next), Effect::Start);
+        machine.note_started(2);
+        // The hour of waiting used none of the failure budget.
+        for i in 0..STORM_LIMIT as u64 {
+            let at = next + Duration::from_secs(i);
+            machine.on_stage_exit(2 + i, Stage::Encoder, &failed("flap"), at);
+            assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+            machine.note_started(3 + i);
+        }
+    }
+
+    /// The port was free at the check, then another program took it before
+    /// the stream's bind: the transport's exit waits for the port and checks
+    /// again at once, however often it happens.
+    #[test]
+    fn a_port_taken_before_the_bind_is_checked_again_at_once() {
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        for generation in 1..=STORM_LIMIT as u64 * 3 {
+            let at = t0 + Duration::from_millis(generation * 10);
+            assert_eq!(
+                machine.on_stage_exit(generation, Stage::Transport, &StageOutcome::PortInUse, at),
+                Effect::StopPipeline
+            );
+            assert_eq!(machine.on_tick(at), Effect::Start);
+            machine.note_started(generation + 1);
+        }
+        assert!(matches!(machine.state, SupervisorState::Running { .. }));
+    }
+
+    /// Stop while waiting leaves the stream off when the port frees up;
+    /// Start retries at once.
+    #[test]
+    fn stop_while_waiting_for_the_port_stays_stopped() {
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        machine.wait_for_port(t0);
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.state, SupervisorState::Stopped);
+        assert_eq!(machine.on_tick(t0 + Duration::from_secs(10)), Effect::None);
+
+        machine.wait_for_port(t0 + Duration::from_secs(60));
+        assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
     }
 
     #[test]

@@ -80,6 +80,7 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.connectTimeout, duration: 10), ["accepted", "no_picture", "no_video", "timeout"]),
             (noFrame, ["accepted", "no_picture", "no_frame", "timeout"]),
             (summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90), ["steady", "streamed", "signal_lost", "liveness"]),
+            (summary(.pictureStalled, firstFrame: 0.3, duration: 90), ["steady", "streamed", "other", "error"]),
             (summary(.cableUnplugged, usb: true, firstFrame: 0.3), ["first_frame", "streamed", "usb_lost", "error"]),
             (summary(.usbLinkFailed, usb: true), ["accepted", "error", "usb_lost", "error"]),
             (summary(.closedBeforePicture, usb: true), ["accepted", "no_picture", "usb_lost", "error"]),
@@ -102,8 +103,8 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(AttemptEnd.appBackground.bye, .appBackground)
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
         for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
-                    .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed, .receiverFailed,
-                    .retriedWithCode] {
+                    .pictureStalled, .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed,
+                    .receiverFailed, .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")
         }
         XCTAssertEqual(AttemptEnd.linkFailed.name, "linkFailed")
@@ -159,6 +160,35 @@ final class SessionSummaryTests: XCTestCase {
             + " stage=started outcome=error failure=other fallback=none end=error ttff_ms=- duration_ms="), line)
         XCTAssertFalse(line.contains("192.168"), line)
         Self.assertContract(line)
+    }
+
+    /// Try again opens a new connection, which asks iPadOS again: once
+    /// Local Network is on, the old denial isn't shown or remembered.
+    func testTryAgainAfterLocalNetworkDeniedAsksIPadOSAgain() async throws {
+        let links = Links()
+        let manager = ConnectionManager(udpReceiver: { _ in links.make() })
+        manager.connect(host: "192.168.1.20", port: 9876)
+        links.all.last?.onError?(LinkError(.localNetworkDenied, "UDP path not ready: Local network prohibited"))
+        try await until("blocked") { manager.problem == .localNetworkBlocked }
+        XCTAssertEqual(manager.problem?.actions, [.openSettings, .retry])
+
+        manager.retry()
+        XCTAssertEqual(links.all.count, 2, "a new connection, not the failed one")
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        // Still off: the new connection says so again.
+        links.all.last?.onError?(LinkError(.localNetworkDenied, "UDP path not ready: Local network prohibited"))
+        try await until("blocked again") { manager.problem == .localNetworkBlocked }
+
+        // Turned on: the third connection opens, and nothing says Local Network.
+        manager.retry()
+        XCTAssertEqual(links.all.count, 3)
+        links.all.last?.onListenerReady?(50000)
+        links.all.last?.onConnectionEstablished?()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        manager.disconnect()
     }
 
     /// Heartbeats stop during a session: after the grace the app ends it as
@@ -278,6 +308,15 @@ final class SessionSummaryTests: XCTestCase {
 }
 
 /// A Wi-Fi link that never gets ready, as when Local Network access is off.
+private final class Links {
+    private(set) var all: [DeniedLink] = []
+    func make() -> DeniedLink {
+        let link = DeniedLink()
+        all.append(link)
+        return link
+    }
+}
+
 private final class DeniedLink: MediaLink {
     let datagrams = MediaDatagrams()
     let controlQueue = DispatchQueue(label: "test.denied-link")

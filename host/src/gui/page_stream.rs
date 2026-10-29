@@ -54,6 +54,7 @@ impl AnalyzerApp {
 
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+        self.port_notice(ui);
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
@@ -374,6 +375,11 @@ impl AnalyzerApp {
                 "Windows stopped screen capture. See the message above.".to_string(),
             ),
         };
+        // Off only until another program lets go of the stream port.
+        let waiting = crate::startup::port::held().is_some();
+        let (title, subtitle) =
+            super::port_notice::waiting_status(state == StreamState::Off, waiting)
+                .unwrap_or((title, subtitle));
 
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -423,11 +429,15 @@ impl AnalyzerApp {
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if snap.pipeline_running {
+                        if snap.pipeline_running || waiting {
+                            // While waiting for the port, Stop cancels the
+                            // start that would follow.
                             if widgets::button(ui, Tone::Danger, Some(Icon::Stop), "Stop").clicked()
                             {
                                 action = Some(HeaderAction::Stop);
                             }
+                        }
+                        if snap.pipeline_running {
                             if widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
                                 .on_hover_text(
                                     "Restart capture and encoding. The iPad reconnects on its own.",
@@ -436,13 +446,14 @@ impl AnalyzerApp {
                             {
                                 action = Some(HeaderAction::Restart);
                             }
-                        } else if widgets::button(
-                            ui,
-                            Tone::Primary,
-                            Some(Icon::Play),
-                            "Start streaming",
-                        )
-                        .clicked()
+                        } else if !waiting
+                            && widgets::button(
+                                ui,
+                                Tone::Primary,
+                                Some(Icon::Play),
+                                "Start streaming",
+                            )
+                            .clicked()
                         {
                             action = Some(HeaderAction::Start);
                         }

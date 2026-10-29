@@ -47,6 +47,10 @@ struct DisplayView: View {
                 reconnectingCard
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .allowsHitTesting(false)
+            } else if connectionManager.pictureRestoring {
+                restoringPill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
             }
 
             VStack {
@@ -104,6 +108,7 @@ struct DisplayView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
             appeared = true
@@ -383,6 +388,24 @@ struct DisplayView: View {
         .padding(.vertical, 24)
         .frame(maxWidth: 360)
         .background(glass(RoundedRectangle(cornerRadius: 22, style: .continuous)))
+    }
+
+    /// The PC is still connected but a lost frame left the picture waiting
+    /// for a fresh one; usually gone in well under a second.
+    private var restoringPill: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(Theme.text)
+            Text("Restoring the picture…")
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Restoring the picture")
+        .accessibilityIdentifier("display.restoringPicture")
     }
 
     private func glass<S: InsettableShape>(_ shape: S) -> some View {
