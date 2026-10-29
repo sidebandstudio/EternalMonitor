@@ -129,6 +129,9 @@ fn run_encode_loop(
     // or the codec negotiation does (see `forget_failed_reopen`).
     let mut failed_reopen: Option<(String, u32, u32)> = None;
     let mut negotiated: Option<(bool, Option<u32>)> = None;
+    // Except when the client cannot decode what streams: then the reopen is
+    // tried again with backoff.
+    let mut undecodable_retry = UndecodableRetry::default();
     // HEVC gating memory: warn only once when no HEVC sibling exists, and
     // don't retry an HEVC open that failed until the preference or the
     // session changes (hevc_wanted going false resets it).
@@ -224,6 +227,12 @@ fn run_encode_loop(
             (hevc_wanted, session_id),
             &desired_encoder,
         );
+        let undecodable = session_id.is_some()
+            && !client_hevc
+            && encoder_state
+                .as_ref()
+                .is_some_and(|state| is_hevc_encoder(&state.opened_encoder));
+        undecodable_retry.frame(undecodable, &mut failed_reopen, Instant::now());
 
         if let Some(state) = encoder_state.as_mut() {
             if state.update_bitrate_without_reopening(&desired_encoder, desired_bitrate, target_fps)
@@ -1176,6 +1185,66 @@ fn reopen_needed(
         || (opened != wanted
             && failed_reopen
                 .is_none_or(|(encoder, bitrate, fps)| (encoder.as_str(), *bitrate, *fps) != wanted))
+}
+
+/// The first wait before an H.264 reopen that failed is tried again for a
+/// client that cannot decode the HEVC session; each wait doubles, up to
+/// [`UNDECODABLE_RETRY_MAX`].
+const UNDECODABLE_RETRY_FIRST: Duration = Duration::from_secs(2);
+const UNDECODABLE_RETRY_MAX: Duration = Duration::from_secs(8);
+
+/// Tries again a reopen that failed while the open session's codec is one
+/// the client cannot decode (HEVC to an H.264-only client). Such a client
+/// has no picture, so the failure is never left to wait for an ABR step.
+#[derive(Default)]
+struct UndecodableRetry {
+    /// When the failed reopen is tried again.
+    due: Option<Instant>,
+    /// The last wait; zero before the first.
+    wait: Duration,
+    tries: u32,
+}
+
+impl UndecodableRetry {
+    /// Each frame, before the reopen decision. `undecodable`: the client
+    /// cannot decode the open session's codec. Forgets `failed_reopen` once
+    /// a try is due.
+    fn frame(
+        &mut self,
+        undecodable: bool,
+        failed_reopen: &mut Option<(String, u32, u32)>,
+        now: Instant,
+    ) {
+        if !undecodable {
+            *self = Self::default();
+            return;
+        }
+        let Some((encoder, _, _)) = failed_reopen.as_ref() else {
+            return;
+        };
+        match self.due {
+            None => {
+                self.wait = if self.wait.is_zero() {
+                    UNDECODABLE_RETRY_FIRST
+                } else {
+                    (self.wait * 2).min(UNDECODABLE_RETRY_MAX)
+                };
+                self.due = Some(now + self.wait);
+            }
+            Some(due) if now >= due => {
+                self.tries += 1;
+                info!(
+                    encoder = %encoder,
+                    attempt = self.tries,
+                    waited_ms = self.wait.as_millis() as u64,
+                    "Trying the H.264 reopen again: the client cannot decode HEVC"
+                );
+                self.due = None;
+                *failed_reopen = None;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// Forgets a failed reopen once what chose it changes: the codec negotiation
@@ -2237,17 +2306,22 @@ mod tests {
 
     /// The encode loop's choice of encoder for a session that is open, one
     /// frame at a time, making the loop's calls in its order. The test sets
-    /// the inputs (HEVC wanted, the client's session, bitrate, frame rate,
-    /// the lane, the clock) and says how each reopen ends.
+    /// the inputs (HEVC wanted, the client's session and whether it decodes
+    /// HEVC, bitrate, frame rate, the lane, the clock) and says how each
+    /// reopen ends.
     struct Pipeline {
         recovery: StallRecovery,
         encoder_name: String,
         hevc_open_failed: bool,
         failed_reopen: Option<(String, u32, u32)>,
         negotiated: Option<(bool, Option<u32>)>,
-        session: u32,
+        undecodable_retry: UndecodableRetry,
+        /// The client's session; `None` with no client.
+        session: Option<u32>,
+        client_hevc: bool,
         /// Encoder, bitrate and frame rate of the open session.
         opened: (String, u32, u32),
+        /// The user's preference.
         hevc_wanted: bool,
         bitrate: u32,
         fps: u32,
@@ -2266,7 +2340,9 @@ mod tests {
                 hevc_open_failed: false,
                 failed_reopen: None,
                 negotiated: None,
-                session: 1,
+                undecodable_retry: UndecodableRetry::default(),
+                session: Some(1),
+                client_hevc: true,
                 opened: (opened.to_string(), 8_000_000, 60),
                 hevc_wanted: is_hevc_encoder(opened),
                 bitrate: 8_000_000,
@@ -2279,10 +2355,12 @@ mod tests {
 
         /// One frame. The encoder it reopened to, if it reopened.
         fn frame(&mut self, reopen: Reopen) -> Option<String> {
-            if !self.hevc_wanted {
+            let client_hevc = self.session.is_some() && self.client_hevc;
+            let hevc_wanted = self.hevc_wanted && client_hevc;
+            if !hevc_wanted {
                 self.hevc_open_failed = false;
             }
-            let preferred = if self.hevc_wanted && !self.hevc_open_failed {
+            let preferred = if hevc_wanted && !self.hevc_open_failed {
                 hevc_variant_of(&self.encoder_name).unwrap().to_string()
             } else {
                 self.encoder_name.clone()
@@ -2293,9 +2371,13 @@ mod tests {
             forget_failed_reopen(
                 &mut self.failed_reopen,
                 &mut self.negotiated,
-                (self.hevc_wanted, Some(self.session)),
+                (hevc_wanted, self.session),
                 &desired,
             );
+            let undecodable =
+                self.session.is_some() && !client_hevc && is_hevc_encoder(&self.opened.0);
+            self.undecodable_retry
+                .frame(undecodable, &mut self.failed_reopen, self.now);
             let opened = (self.opened.0.as_str(), self.opened.1, self.opened.2);
             if !reopen_needed(
                 opened,
@@ -2705,9 +2787,95 @@ mod tests {
         }
         assert_eq!(p.opened.0, "hevc_nvenc");
         // An iPad that decodes only H.264 connects: it gets H.264.
-        p.session = 2;
+        p.session = Some(2);
         assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
         assert_eq!(p.frame(Reopen::Opens), None);
+    }
+
+    #[test]
+    fn an_h264_only_client_gets_h264_when_the_downgrade_is_tried_again() {
+        // HEVC streams and an iPad that decodes only H.264 connects. The
+        // H.264 reopen fails for real: the iPad cannot decode what streams.
+        let mut p = Pipeline::new("h264_nvenc", "hevc_nvenc", Instant::now());
+        p.session = Some(2);
+        p.client_hevc = false;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened.0, "hevc_nvenc");
+        // It is tried again 2 s after the next frame, with no bitrate
+        // change, and opens.
+        for _ in 0..125 {
+            p.later(16);
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+        p.later(16);
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened, ("h264_nvenc".to_string(), 8_000_000, 60));
+        for _ in 0..1_000 {
+            p.later(16);
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+    }
+
+    #[test]
+    fn a_downgrade_for_an_h264_only_client_backs_off_to_every_8_s() {
+        let mut p = Pipeline::new("h264_nvenc", "hevc_nvenc", Instant::now());
+        p.session = Some(2);
+        p.client_hevc = false;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("h264_nvenc"));
+        // A frame every 10 ms. Each try fails, and the next waits 2, 4, 8,
+        // then 8 s again, counted from the frame after the failure.
+        let mut tries = Vec::new();
+        for frame in 1..=3_400 {
+            p.later(10);
+            if p.frame(Reopen::Fails).is_some() {
+                tries.push(frame * 10);
+            }
+        }
+        assert_eq!(tries, [2_010, 6_020, 14_030, 22_040, 30_050]);
+        assert_eq!(p.opened.0, "hevc_nvenc");
+        assert_eq!(p.recovery.tries, 0, "a real error is not a stall try");
+        // An iPad that decodes HEVC connects instead: nothing is retried,
+        // and the next H.264 failure is not either.
+        p.session = Some(3);
+        p.client_hevc = true;
+        p.hevc_wanted = false;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("h264_nvenc"));
+        for _ in 0..3_000 {
+            p.later(10);
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+    }
+
+    #[test]
+    fn a_failed_downgrade_is_tried_once_when_the_client_leaves() {
+        // HEVC streams to an H.264-only iPad whose H.264 reopen failed.
+        let mut p = Pipeline::new("h264_nvenc", "hevc_nvenc", Instant::now());
+        p.session = Some(2);
+        p.client_hevc = false;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("h264_nvenc"));
+        // The iPad leaves before the retry: no client, a new negotiation,
+        // one try. It fails too, and with nobody to decode, the HEVC
+        // session streams on without further tries.
+        p.later(1_000);
+        p.session = None;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("h264_nvenc"));
+        for _ in 0..6_000 {
+            p.later(10);
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+        assert_eq!(p.opened.0, "hevc_nvenc");
+        // An iPad that wants HEVC comes back: HEVC streams on as it is.
+        p.session = Some(3);
+        p.client_hevc = true;
+        p.hevc_wanted = true;
+        for _ in 0..100 {
+            p.later(10);
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+        // Had an H.264-only iPad come back, it would get H.264 at once.
+        p.session = Some(4);
+        p.client_hevc = false;
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
     }
 
     #[test]

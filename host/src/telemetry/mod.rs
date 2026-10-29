@@ -16,6 +16,10 @@ mod redact;
 use periodic::Periodic;
 
 const MAX_FILES: usize = 512;
+/// The longest line or message that uploads. Redaction slows down faster
+/// than the length grows on some punctuation-heavy lines, and a fatal
+/// report runs it on the main thread.
+const MAX_LINE_BYTES: usize = 8192;
 const BATCH_SIZE: usize = 4;
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -29,6 +33,12 @@ static SENDER: OnceLock<mpsc::SyncSender<Queued>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
+/// What Settings tells the user, in plain words; [`STATUS`] is for support.
+static SHARING_STATE: Mutex<Sharing> = Mutex::new(Sharing::Unavailable);
+/// When the backend last acknowledged a batch.
+static LAST_SENT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// The sharing preference could not be saved.
+static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
 /// The uploader's summary window, for fatal reports.
@@ -122,6 +132,68 @@ fn set_status(text: impl Into<String>) {
         *value = text.into();
     }
 }
+
+#[derive(Clone, Copy)]
+enum Sharing {
+    /// This build has no upload endpoint.
+    Unavailable,
+    /// The outbox could not be written.
+    Stopped,
+    Ready,
+    /// The last upload failed; it is retried.
+    Retrying,
+}
+fn set_sharing(sharing: Sharing) {
+    *lock(&SHARING_STATE) = sharing;
+}
+/// What Settings shows about uploads, without field names or ids.
+pub fn summary() -> String {
+    let last_sent = lock(&LAST_SENT).map(|at| at.elapsed());
+    plain_summary(
+        *lock(&SHARING_STATE),
+        enabled(),
+        last_sent,
+        DROPPED.load(Ordering::Relaxed),
+        SAVE_FAILED.load(Ordering::Relaxed),
+    )
+}
+fn plain_summary(
+    sharing: Sharing,
+    enabled: bool,
+    last_sent: Option<Duration>,
+    dropped: u64,
+    save_failed: bool,
+) -> String {
+    let mut text = match sharing {
+        Sharing::Unavailable => "Sharing diagnostics isn't available in this build.".to_string(),
+        Sharing::Stopped => {
+            "Sharing diagnostics stopped: they could not be saved on this PC.".to_string()
+        }
+        _ if !enabled => "Sharing diagnostics: off.".to_string(),
+        Sharing::Retrying => "Sharing diagnostics: on. Waiting for a connection.".to_string(),
+        Sharing::Ready => match last_sent {
+            Some(ago) => format!("Sharing diagnostics: on. Last sent {}.", ago_text(ago)),
+            None => "Sharing diagnostics: on. Nothing sent yet.".to_string(),
+        },
+    };
+    if enabled && dropped > 0 && !matches!(sharing, Sharing::Unavailable) {
+        text.push_str(" Some diagnostics were dropped while offline.");
+    }
+    if save_failed {
+        text.push_str(" This setting could not be saved.");
+    }
+    text
+}
+fn ago_text(ago: Duration) -> String {
+    let minutes = ago.as_secs() / 60;
+    let (count, unit) = match minutes {
+        0 => return "just now".to_string(),
+        1..60 => (minutes, "minute"),
+        60..1440 => (minutes / 60, "hour"),
+        _ => (minutes / 1440, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
 pub fn status() -> String {
     format!(
         "{}{}; queue_dropped={}",
@@ -156,10 +228,12 @@ pub fn set_enabled(value: bool) {
             fs::write(path, b"disabled")
         };
         if result.is_err() {
+            SAVE_FAILED.store(true, Ordering::Relaxed);
             set_status("Could not save automatic upload preference");
             return;
         }
     }
+    SAVE_FAILED.store(false, Ordering::Relaxed);
     ENABLED.store(value, Ordering::Relaxed);
     set_status(if value {
         "Automatic upload enabled"
@@ -236,6 +310,7 @@ impl Uploader {
             );
             std::thread::spawn(move || {
                 if run(config, directory, receiver, periodic, stop).is_err() {
+                    set_sharing(Sharing::Stopped);
                     set_status("Automatic upload stopped: local outbox unavailable");
                 }
                 let _ = done_tx.send(());
@@ -338,6 +413,7 @@ impl UploadGuard {
         let identity = match identity(&directory) {
             Ok(identity) => identity,
             Err(_) => {
+                set_sharing(Sharing::Stopped);
                 set_status("Automatic upload stopped: local outbox unavailable");
                 return Self { _uploader: None };
             }
@@ -365,18 +441,22 @@ impl Drop for UploadGuard {
 pub fn record(line: &str) {
     if enabled() {
         if let Some(sender) = SENDER.get() {
-            let mut end = line.len().min(8192);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
             if sender
-                .try_send(Queued::Line(line[..end].to_owned()))
+                .try_send(Queued::Line(capped(line).to_owned()))
                 .is_err()
             {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+}
+/// `line`'s first [`MAX_LINE_BYTES`], whole characters only.
+fn capped(line: &str) -> &str {
+    let mut end = line.len().min(MAX_LINE_BYTES);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 /// Queue one event (`level` is `error` or `info`) on disk now, after the
 /// open periodic summary. The upload thread sends them, or the next launch
@@ -406,7 +486,7 @@ fn queue_into(
     let mut events: Vec<Event> = periodic.map_or_else(Vec::new, |periodic| {
         events_of(lock(periodic).flush()).collect()
     });
-    events.push(event(message, level));
+    events.push(event(capped(message), level));
     persist(directory, &batch(events)?)
 }
 /// Queue an event for another launch of this installation, from the failure
@@ -442,7 +522,7 @@ fn queue_foreign(
     level: &str,
 ) -> std::io::Result<()> {
     let installation_id = fs::read_to_string(directory.join("installation-id"))?;
-    let mut event = event(message, level);
+    let mut event = event(capped(message), level);
     event.sequence = FOREIGN_SEQUENCE_BASE + index;
     let mut batch = batch(vec![event])?;
     batch.installation_id = installation_id.trim().to_string();
@@ -590,6 +670,7 @@ fn upload(
         return Err("Upload acknowledgement mismatch".into());
     }
     fs::remove_file(path)?;
+    *lock(&LAST_SENT) = Some(std::time::Instant::now());
     Ok(())
 }
 fn run(
@@ -608,6 +689,7 @@ fn run(
     let mut next = std::time::Instant::now();
     let mut backoff = 5;
     let mut last_persist = std::time::Instant::now();
+    set_sharing(Sharing::Ready);
     set_status("Automatic upload enabled; waiting for events");
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -665,12 +747,14 @@ fn run(
                 }
             }
             if failed {
+                set_sharing(Sharing::Retrying);
                 set_status(format!(
                     "Automatic upload waiting to retry; pending_batches={}",
                     files(&directory)?.len()
                 ));
                 backoff = (backoff * 2).min(300);
             } else {
+                set_sharing(Sharing::Ready);
                 set_status(format!(
                     "Automatic upload connected; pending_batches={}",
                     files(&directory)?.len()
@@ -1440,6 +1524,90 @@ mod tests {
             .any(|b| b.events[0].message == "EternalMonitor could not start: token=[REDACTED]"));
         assert_ne!(saved[0].events[0].sequence, saved[1].events[0].sequence);
         fs::remove_dir_all(directory).unwrap();
+    }
+    /// A fatal report is redacted on the main thread, before the virtual
+    /// display is turned off. A crafted message costs no more than a capped
+    /// log line.
+    #[test]
+    fn a_long_fatal_report_is_capped_before_redaction() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("installation-id"), "ab".repeat(16)).unwrap();
+        let message = format!("EternalMonitor could not start: {}", r"=\a".repeat(200_000));
+        // Uncapped, this message takes minutes in a release build. Capped,
+        // it takes tens of milliseconds, and about a second unoptimized.
+        let limit = Duration::from_millis(if cfg!(debug_assertions) { 20_000 } else { 100 });
+        let started = std::time::Instant::now();
+        queue_into(&directory, None, &message, "error").unwrap();
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        queue_foreign(&directory, "launch", 1, &message, "error").unwrap();
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+        for path in files(&directory).unwrap() {
+            let saved: Batch = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let uploaded = &saved.events[0].message;
+            assert!(uploaded.starts_with("EternalMonitor could not start: "));
+            assert!(uploaded.len() <= MAX_LINE_BYTES, "{}", uploaded.len());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+    /// Settings says what happens in words: no field names, ids or counts.
+    #[test]
+    fn settings_shows_sharing_in_plain_words() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        let cases = [
+            (
+                plain_summary(Sharing::Ready, true, minutes(2), 0, false),
+                "Sharing diagnostics: on. Last sent 2 minutes ago.",
+            ),
+            (
+                plain_summary(
+                    Sharing::Ready,
+                    true,
+                    Some(Duration::from_secs(20)),
+                    0,
+                    false,
+                ),
+                "Sharing diagnostics: on. Last sent just now.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(61), 0, false),
+                "Sharing diagnostics: on. Last sent 1 hour ago.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(3 * 1440), 0, false),
+                "Sharing diagnostics: on. Last sent 3 days ago.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, None, 0, false),
+                "Sharing diagnostics: on. Nothing sent yet.",
+            ),
+            (
+                plain_summary(Sharing::Retrying, true, minutes(1), 3, false),
+                "Sharing diagnostics: on. Waiting for a connection. \
+                 Some diagnostics were dropped while offline.",
+            ),
+            (
+                plain_summary(Sharing::Ready, false, minutes(1), 3, false),
+                "Sharing diagnostics: off.",
+            ),
+            (
+                plain_summary(Sharing::Ready, true, minutes(1), 0, true),
+                "Sharing diagnostics: on. Last sent 1 minute ago. This setting could not be saved.",
+            ),
+            (
+                plain_summary(Sharing::Unavailable, true, None, 0, false),
+                "Sharing diagnostics isn't available in this build.",
+            ),
+            (
+                plain_summary(Sharing::Stopped, true, None, 0, false),
+                "Sharing diagnostics stopped: they could not be saved on this PC.",
+            ),
+        ];
+        for (shown, expected) in cases {
+            assert_eq!(shown, expected);
+            assert!(!shown.contains(['=', '_']), "{shown}");
+        }
     }
     #[test]
     fn drained_events_keep_their_level() {
