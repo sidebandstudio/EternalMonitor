@@ -140,6 +140,8 @@ fn run_encode_loop(
     let mut stall_recovery = StallRecovery::default();
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
+    // A client's Resume, kept until a reopen can be tried for it.
+    let mut pending_resume = false;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -250,7 +252,30 @@ fn run_encode_loop(
         // Latch requests before deciding whether to reopen. Requests received
         // during the rate limit must survive until AMF can emit an IDR.
         pending_keyframe |= shared.force_next_idr.swap(false, Ordering::SeqCst);
-        let resume_reopen = take_resume_reopen(&shared.reopen_encoder, encoder_state.is_some());
+        pending_resume = take_resume_request(
+            &shared.reopen_encoder,
+            pending_resume,
+            encoder_state.is_some(),
+        );
+        let resume_reopen = pending_resume
+            && match resume_action(
+                (&desired_encoder, desired_bitrate, target_fps),
+                failed_reopen.as_ref(),
+                &stall_recovery,
+                lane_clear,
+            ) {
+                ResumeAction::Reopen => true,
+                ResumeAction::Wait => false,
+                ResumeAction::Idr => {
+                    info!(
+                        encoder = %desired_encoder,
+                        "Client asked to restart the stream — a reopen of this encoder failed or stalled, forcing an IDR instead"
+                    );
+                    pending_resume = false;
+                    pending_keyframe = true;
+                    false
+                }
+            };
         let keyframe_reopen = pending_keyframe
             && encoder_state.as_ref().is_some_and(|state| {
                 reopen_for_keyframe(
@@ -352,6 +377,8 @@ fn run_encode_loop(
             if keyframe_reopen {
                 last_keyframe_reopen = Some(Instant::now());
             }
+            // Any reopen tried answers a pending Resume.
+            pending_resume = false;
             let (previous, current_encoder) = encoder_state
                 .as_ref()
                 .map(|s| (s.opened_bitrate, s.opened_encoder.clone()))
@@ -1160,6 +1187,12 @@ impl StallRecovery {
         true
     }
 
+    /// Whether opens in the lane stalled until no tries were left this
+    /// generation.
+    fn exhausted(&self) -> bool {
+        self.tries >= STALL_RETRY_WAITS.len()
+    }
+
     /// No more tries this generation.
     fn end(&mut self) {
         self.owed = None;
@@ -1339,10 +1372,49 @@ fn reopen_for_keyframe(
         })
 }
 
-/// Takes a pending client restart request. Without an open session there is
-/// nothing to reopen: the next open is fresh anyway.
-fn take_resume_reopen(flag: &std::sync::atomic::AtomicBool, encoder_open: bool) -> bool {
-    flag.swap(false, Ordering::SeqCst) && encoder_open
+/// Whether a client restart request is pending: a new one, or `pending`,
+/// one not yet tried. Without an open session there is nothing to reopen:
+/// the next open is fresh anyway.
+fn take_resume_request(
+    flag: &std::sync::atomic::AtomicBool,
+    pending: bool,
+    encoder_open: bool,
+) -> bool {
+    (flag.swap(false, Ordering::SeqCst) || pending) && encoder_open
+}
+
+/// What a pending client restart request does this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeAction {
+    /// Reopen the session for `wanted`.
+    Reopen,
+    /// Stay pending: a stuck open holds the lane, and a reopen in it would
+    /// only be refused.
+    Wait,
+    /// Force an IDR on the open session instead. A reopen for `wanted`
+    /// failed and is suppressed (`failed_reopen`), or the lane used up its
+    /// stall tries ([`StallRecovery::exhausted`]): a Resume must not cost
+    /// another driver stall.
+    Idr,
+}
+
+fn resume_action(
+    wanted: (&str, u32, u32),
+    failed_reopen: Option<&(String, u32, u32)>,
+    recovery: &StallRecovery,
+    lane_clear: bool,
+) -> ResumeAction {
+    let in_lane = takes_codec_lock(wanted.0);
+    if failed_reopen
+        .is_some_and(|(encoder, bitrate, fps)| (encoder.as_str(), *bitrate, *fps) == wanted)
+        || (in_lane && recovery.exhausted())
+    {
+        ResumeAction::Idr
+    } else if in_lane && !lane_clear {
+        ResumeAction::Wait
+    } else {
+        ResumeAction::Reopen
+    }
 }
 
 /// AMF can satisfy a request only on a fresh session's first frame. Keep it
@@ -2335,6 +2407,10 @@ mod tests {
         bitrate: u32,
         fps: u32,
         keyframe: bool,
+        /// A client's Resume is pending.
+        resume: bool,
+        /// IDRs forced on the open session in place of a Resume reopen.
+        resume_idrs: usize,
         lane_clear: bool,
         now: Instant,
     }
@@ -2357,6 +2433,8 @@ mod tests {
                 bitrate: 8_000_000,
                 fps: 60,
                 keyframe: false,
+                resume: false,
+                resume_idrs: 0,
                 lane_clear: true,
                 now,
             }
@@ -2388,15 +2466,32 @@ mod tests {
             self.undecodable_retry
                 .frame(undecodable, &mut self.failed_reopen, self.now);
             let opened = (self.opened.0.as_str(), self.opened.1, self.opened.2);
+            let wanted = (desired.as_str(), self.bitrate, self.fps);
+            let resume = self.resume
+                && match resume_action(
+                    wanted,
+                    self.failed_reopen.as_ref(),
+                    &self.recovery,
+                    self.lane_clear,
+                ) {
+                    ResumeAction::Reopen => true,
+                    ResumeAction::Wait => false,
+                    ResumeAction::Idr => {
+                        self.resume = false;
+                        self.resume_idrs += 1;
+                        false
+                    }
+                };
             if !reopen_needed(
                 opened,
-                (&desired, self.bitrate, self.fps),
-                self.keyframe,
+                wanted,
+                self.keyframe || resume,
                 self.failed_reopen.as_ref(),
                 self.lane_clear,
             ) {
                 return None;
             }
+            self.resume = false;
             self.recovery.starting(&desired);
             if reopen == Reopen::Opens {
                 self.opened = (desired.clone(), self.bitrate, self.fps);
@@ -3218,19 +3313,96 @@ mod tests {
     }
 
     #[test]
-    fn a_client_restart_request_reopens_an_open_encoder_once() {
+    fn a_client_restart_request_stays_pending_until_tried() {
         let shared = crate::control::SharedControl::new(9876, 8_000_000);
-        assert!(!take_resume_reopen(&shared.reopen_encoder, true));
+        assert!(!take_resume_request(&shared.reopen_encoder, false, true));
         shared.reopen_encoder.store(true, Ordering::SeqCst);
-        assert!(take_resume_reopen(&shared.reopen_encoder, true));
+        assert!(take_resume_request(&shared.reopen_encoder, false, true));
         assert!(
-            !take_resume_reopen(&shared.reopen_encoder, true),
+            !take_resume_request(&shared.reopen_encoder, false, true),
             "taken once"
+        );
+        assert!(
+            take_resume_request(&shared.reopen_encoder, true, true),
+            "kept while not tried"
         );
         // With no session open the next open is fresh; the request is used up.
         shared.reopen_encoder.store(true, Ordering::SeqCst);
-        assert!(!take_resume_reopen(&shared.reopen_encoder, false));
+        assert!(!take_resume_request(&shared.reopen_encoder, true, false));
         assert!(!shared.reopen_encoder.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_resume_waits_for_a_busy_lane_then_reopens() {
+        // Sol: the request was taken before the lane was checked, so a busy
+        // lane lost it, and the lane clearing later reopened nothing.
+        let t0 = Instant::now();
+        let mut p = Pipeline::new("h264_qsv", "h264_qsv", t0);
+        p.lane_clear = false;
+        p.resume = true;
+        for _ in 0..3 {
+            assert_eq!(p.frame(Reopen::Opens), None);
+            p.later(16);
+        }
+        assert!(p.resume, "still pending");
+        assert_eq!(p.resume_idrs, 0);
+        p.lane_clear = true;
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_qsv"));
+        assert!(!p.resume);
+        assert_eq!(p.frame(Reopen::Opens), None, "once");
+        // x264 does not take the lane, so its Resume never waits.
+        let mut x264 = Pipeline::new("libx264", "libx264", t0);
+        x264.lane_clear = false;
+        x264.resume = true;
+        assert_eq!(x264.frame(Reopen::Opens).as_deref(), Some("libx264"));
+    }
+
+    #[test]
+    fn a_resume_forces_an_idr_instead_of_a_reopen_the_stall_budget_or_a_failure_forbids() {
+        // Sol: Resume reopened whatever `failed_reopen` and #119's spent
+        // stall budget held back, risking more driver stalls.
+        let t0 = Instant::now();
+        // A live NVENC session whose Resume reopens stall: the first, then
+        // the three tries #119 allows.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", t0);
+        p.resume = true;
+        assert_eq!(p.frame(Reopen::Stalls).as_deref(), Some("h264_nvenc"));
+        for _ in 0..3 {
+            p.lane_clear = true;
+            p.later(30_000);
+            p.resume = true;
+            assert_eq!(p.frame(Reopen::Stalls).as_deref(), Some("h264_nvenc"));
+        }
+        assert_eq!(p.recovery.tries, 3);
+        assert_eq!(p.resume_idrs, 0);
+        // Spent: a Resume is an IDR on the open session, for good.
+        p.lane_clear = true;
+        for hours in [1, 24] {
+            p.later(hours * 3_600_000);
+            p.resume = true;
+            assert_eq!(p.frame(Reopen::Opens), None);
+        }
+        assert_eq!(p.resume_idrs, 2);
+        // A new client forgets the failed config, not the spent budget.
+        p.session = Some(2);
+        p.resume = true;
+        assert_eq!(p.frame(Reopen::Opens), None);
+        assert!(p.failed_reopen.is_none());
+        assert_eq!(p.resume_idrs, 3);
+
+        // A reopen that failed outright, no stall: the same config is not
+        // reopened for a Resume either.
+        let mut failed = Pipeline::new("h264_amf", "h264_amf", t0);
+        failed.bitrate = 6_000_000;
+        assert_eq!(failed.frame(Reopen::Fails).as_deref(), Some("h264_amf"));
+        failed.resume = true;
+        assert_eq!(failed.frame(Reopen::Opens), None);
+        assert_eq!(failed.resume_idrs, 1);
+        // A new bitrate is a new config: reopened as before, Resume or not.
+        failed.bitrate = 4_000_000;
+        failed.resume = true;
+        assert_eq!(failed.frame(Reopen::Opens).as_deref(), Some("h264_amf"));
+        assert_eq!(failed.resume_idrs, 1);
     }
 
     #[test]
