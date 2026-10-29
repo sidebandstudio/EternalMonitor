@@ -9,6 +9,7 @@
 //! the Swift side is the specification.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Bound;
 use std::time::{Duration, Instant};
 
 use crate::v2::control::Nack;
@@ -81,6 +82,9 @@ struct PendingFrame {
     keyframe_requested: bool,
     /// The wait before the next request while held; zero when not held.
     hold_retry: Duration,
+    /// When a held frame goes once a complete frame waits behind it (see
+    /// `FrameAssembler.PendingFrame.dropBy`).
+    drop_by: Option<Instant>,
 }
 
 impl PendingFrame {
@@ -297,6 +301,16 @@ impl Reassembler {
                 }
             }
         }
+        if self.repair_enabled && self.pending.keys().all(|&s| s < seq) {
+            // A held frame now delays a newer one: one more repair window
+            // once a complete frame waits.
+            let latest = now + self.repair_window();
+            for frame in self.pending.values_mut() {
+                if !frame.hold_retry.is_zero() {
+                    frame.drop_by = Some(frame.drop_by.map_or(latest, |by| by.min(latest)));
+                }
+            }
+        }
         let frame = self.pending.entry(seq).or_insert_with(|| PendingFrame {
             header,
             fragments: HashMap::new(),
@@ -317,6 +331,7 @@ impl Reassembler {
             retried: false,
             keyframe_requested: false,
             hold_retry: Duration::ZERO,
+            drop_by: None,
         });
         frame.fragments.insert(index, payload.to_vec());
         frame.last_fragment_at = now;
@@ -342,7 +357,6 @@ impl Reassembler {
         self.counters.stream_epoch = epoch;
         self.counters.jitter_us = self.jitter as u32;
         let complete = frame.complete();
-        let created_at = frame.created_at;
         if complete {
             frame.completed_at = Some(now);
         }
@@ -359,9 +373,8 @@ impl Reassembler {
                     self.drop_pending(s);
                 }
             } else if complete {
-                // A held frame now delays a complete one: one more repair
-                // window from that frame's first fragment.
-                let latest = created_at + self.repair_window();
+                // A held frame now delays a complete one: it goes at its
+                // `drop_by`, at once if that has passed.
                 let older: Vec<_> = self
                     .pending
                     .range(..seq)
@@ -371,11 +384,13 @@ impl Reassembler {
                 for (s, through) in older {
                     self.begin_gap(s, through, now);
                     if let Some(frame) = self.pending.get_mut(&s) {
-                        if !frame.hold_retry.is_zero() {
-                            frame.deadline = frame.deadline.map(|deadline| deadline.min(latest));
+                        if let (false, Some(by)) = (frame.hold_retry.is_zero(), frame.drop_by) {
+                            frame.deadline =
+                                Some(frame.deadline.map_or(by, |deadline| deadline.min(by)));
                         }
                     }
                 }
+                self.tick(now);
             }
             self.drain_ready(now);
         } else if complete {
@@ -424,19 +439,27 @@ impl Reassembler {
                             self.retired_seq = self.retired_seq.max(seq);
                             self.drain_ready(now);
                         } else {
-                            // Held for `MAX_HOLD`: every frame behind it is
-                            // incomplete and needs it, so they all go, under
-                            // one keyframe request.
-                            let waiting: Vec<_> = self.pending.keys().copied().collect();
-                            for later in &waiting[1..] {
+                            // Held for `MAX_HOLD`: the incomplete frames
+                            // behind it need it and go with it, under one
+                            // keyframe request, up to a keyframe (see
+                            // `FrameAssembler.tick(at:)`).
+                            let behind: Vec<_> = self
+                                .pending
+                                .range((Bound::Excluded(seq), Bound::Unbounded))
+                                .take_while(|(_, f)| !f.header.is_keyframe)
+                                .map(|(&s, _)| s)
+                                .collect();
+                            for later in &behind {
                                 if let Some(frame) = self.pending.get_mut(later) {
                                     frame.keyframe_requested = true;
                                 }
                             }
-                            for &stale in &waiting {
+                            self.drop_pending(seq);
+                            for &stale in &behind {
                                 self.drop_pending(stale);
                             }
-                            self.retired_seq = self.retired_seq.max(waiting[waiting.len() - 1]);
+                            let last = behind.last().copied().unwrap_or(seq);
+                            self.retired_seq = self.retired_seq.max(last);
                         }
                     }
                 } else if frame.deadline.is_none()
@@ -492,6 +515,7 @@ impl Reassembler {
     /// each time.
     fn hold(&mut self, seq: u32, now: Instant) {
         let window = self.repair_window();
+        let newer_waiting = self.pending.len() > 1;
         let Some(frame) = self.pending.get_mut(&seq) else {
             return;
         };
@@ -502,6 +526,9 @@ impl Reassembler {
         };
         frame.hold_retry = wait;
         frame.deadline = Some(now + wait);
+        if newer_waiting {
+            frame.drop_by = Some(frame.drop_by.map_or(now, |by| by.min(now)));
+        }
         frame.stall_used = MAX_STALL_ALLOWANCE;
         frame.retried = true;
         let through = frame.header.frag_count - 1;
@@ -1202,6 +1229,59 @@ mod tests {
         assert_eq!(shown, [vec![5]]);
         assert!(r.take_keyframe_request().is_none());
         assert!(r.take_nacks().is_empty(), "and no longer asked for");
+    }
+
+    /// The backstop retires a held frame but not a keyframe arriving behind
+    /// it (see `FrameAssemblerTests`).
+    #[test]
+    fn the_hold_backstop_keeps_a_keyframe_that_is_still_arriving() {
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut r = repairing();
+        r.add_media(media(352, 1, 2, false), &[2], start);
+        tick_every_ms(&mut r, start, 1_000, 1_090_000);
+        r.add_media(media(353, 0, 2, true), &[3], at(1_090_000));
+        r.tick(at(1_100_000));
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert!(r.take_keyframe_request().is_some());
+        r.add_media(media(353, 1, 2, true), &[4], at(1_105_000));
+        let shown: Vec<_> = r.take_ready().into_iter().map(|f| f.payload).collect();
+        assert_eq!(shown, [vec![3, 4]]);
+        assert!(r.take_keyframe_request().is_none());
+    }
+
+    /// A held frame with a complete frame behind it waits one repair window
+    /// from the first newer frame's first fragment, partial or not.
+    #[test]
+    fn a_held_frame_waits_one_window_from_the_first_newer_frame() {
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut r = repairing();
+        r.add_media(media(352, 1, 2, false), &[2], start);
+        r.tick(at(125_000));
+        r.tick(at(150_000));
+        r.add_media(media(353, 1, 2, false), &[4], at(160_000));
+        r.add_media(media(354, 0, 1, false), &[5], at(170_000));
+        r.tick(at(184_999));
+        assert_eq!(r.counters().frames_dropped, 0);
+        assert!(r.take_keyframe_request().is_none());
+        r.tick(at(185_000));
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert!(r.take_keyframe_request().is_some());
+    }
+
+    /// A frame held with newer frames already behind it goes as soon as a
+    /// complete frame arrives.
+    #[test]
+    fn a_complete_frame_ends_a_hold_that_newer_frames_overran() {
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut r = two_incomplete_frames(start);
+        r.tick(at(125_000));
+        assert_eq!(r.counters().frames_dropped, 0);
+        r.add_media(media(354, 0, 1, false), &[5], at(130_000));
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert!(r.take_keyframe_request().is_some());
     }
 
     #[test]

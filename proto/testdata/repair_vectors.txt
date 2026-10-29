@@ -179,6 +179,54 @@ add 2100000 1 353 0 2 1 3
 add 2200000 1 354 0 1 0 5 1
 expect 1 2 3 2 0 11 0 354 1 352:0|352:0|353:0|353:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
 
+# A keyframe behind a frame held for a second needs no earlier frame. The
+# backstop retires the held frame, asking for a keyframe as any drop with a
+# partial keyframe behind it does, and the keyframe is still shown when its
+# last fragment arrives.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+tick 125000
+tick 150000
+tick 200000
+tick 300000
+tick 500000
+tick 700000
+tick 900000
+add 1090000 1 353 0 2 0 3 1
+tick 1099999
+expect 0 0 2 0 0 8 2 - 0 352:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+tick 1100000
+expect 0 1 2 1 0 8 1 - 1 352:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+add 1105000 1 353 1 2 0 4 1
+expect 1 1 3 1 0 8 0 353 1 352:0|352:0|352:0|352:0|352:0|352:0|352:0|352:0
+
+# With a complete frame behind it, a held frame waits one repair window from
+# the first newer frame's first fragment, even when that frame is partial.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+tick 125000
+tick 150000
+add 160000 1 353 1 2 0 4
+add 170000 1 354 0 1 0 5
+tick 184999
+expect 0 0 3 0 0 5 2 - 0 352:0|352:0|352:0|353:0|353:0
+tick 185000
+expect 0 1 3 1 0 5 1 - 1 352:0|352:0|352:0|353:0|353:0
+
+# A frame held with newer frames already behind it goes as soon as a
+# complete frame arrives: without them it would not have been held.
+reset 16667 10000
+add 0 1 352 1 2 0 2
+add 16667 1 353 1 2 0 4
+tick 124999
+tick 125000
+add 130000 1 354 0 1 0 5
+expect 0 1 3 1 0 5 1 - 1 352:0|352:0|353:0|353:0|352:0
+tick 141666
+expect 0 1 3 1 0 5 1 - 1 352:0|352:0|353:0|353:0|352:0
+tick 141667
+expect 1 2 3 2 0 5 0 354 2 352:0|352:0|353:0|353:0|352:0
+
 # Eviction at the 32-frame bound requests a keyframe. The bound covers the
 # longest repair deadline at 120 fps twice over.
 reset 16667 10000

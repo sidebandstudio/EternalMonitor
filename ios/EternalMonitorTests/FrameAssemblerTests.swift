@@ -274,6 +274,59 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(nacks.count, nacksBefore, "and no longer asked for")
     }
 
+    /// A frame held for a second is retired, but a keyframe arriving behind
+    /// it needs no earlier frame. It used to be retired too, and its last
+    /// fragment was then ignored.
+    func testTheHoldBackstopKeepsAKeyframeThatIsStillArriving() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        for at in stride(from: UInt64(1_000), to: 1_090_000, by: 1_000) { assembler.tick(at: at) }
+        now = 1_090_000
+        add(seq: 353, index: 0, count: 2, byte: 3, keyframe: true)
+        assembler.tick(at: 1_100_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+        now = 1_105_000
+        add(seq: 353, index: 1, count: 2, byte: 4, keyframe: true)
+        XCTAssertEqual(completed, [Data([3, 4])])
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    /// A held frame with a complete frame behind it waits one repair window
+    /// from the first newer frame's first fragment, partial or not. It used
+    /// to wait from the complete frame's, 10 ms longer here.
+    func testAHeldFrameWaitsOneWindowFromTheFirstNewerFrame() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        assembler.tick(at: 125_000)
+        assembler.tick(at: 150_000)
+        now = 160_000
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        now = 170_000
+        add(seq: 354, index: 0, count: 1, byte: 5)
+        assembler.tick(at: 184_999)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 185_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    /// A frame held with newer frames already behind it goes as soon as a
+    /// complete frame arrives: without them it would not have been held.
+    func testACompleteFrameEndsAHoldThatNewerFramesOverran() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        now = 16_667
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        assembler.tick(at: 125_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        now = 130_000
+        add(seq: 354, index: 0, count: 1, byte: 5)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
     /// A complete keyframe needs no earlier frame. Received at 320 ms behind a
     /// held frame, it used to wait out that frame's repair window until 345 ms.
     func testCompleteKeyframeIsShownAtOnceAndRetiresAHeldFrame() {

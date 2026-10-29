@@ -143,6 +143,10 @@ final class FrameAssembler {
         var keyframeRequested = false
         /// The wait before the next request while held; 0 when not held.
         var holdRetryUs: UInt64 = 0
+        /// When a held frame goes once a complete frame waits behind it: one
+        /// repair window after the first newer frame began, or when it was
+        /// held if newer frames already waited.
+        var dropBy: UInt64?
 
         var isComplete: Bool {
             fragments.count == Int(fragmentCount)
@@ -253,10 +257,20 @@ final class FrameAssembler {
                 if seq <= retiredSeq { return }
             }
         }
+        let isNewest = pending.keys.allSatisfy { $0 < seq }
         var frame = pending.removeValue(forKey: seq) ?? PendingFrame(
             fragmentCount: count, isKeyframe: isKeyframe, captureTimestampUs: captureTimestampUs,
             fragments: [:], byteCount: 0, createdAt: now
         )
+        if repairEnabled && frame.fragments.isEmpty && isNewest {
+            // A held frame now delays a newer one: one more repair window
+            // once a complete frame waits.
+            let latest = now + repairWindow()
+            for held in pending.keys where pending[held]?.holdRetryUs ?? 0 > 0 {
+                let dropBy = min(pending[held]?.dropBy ?? latest, latest)
+                pending[held]?.dropBy = dropBy
+            }
+        }
         frame.fragments[index] = payload
         frame.lastFragmentAt = now
         frame.byteCount += payload.count
@@ -296,18 +310,18 @@ final class FrameAssembler {
             } else if frame.isComplete {
                 // Completion of a newer frame also proves older trailing
                 // fragments are absent, even if no later index exposed them.
-                // A held frame now delays a complete one: it waits at most
-                // one more repair window from that frame's first fragment.
-                let latest = frame.createdAt + repairWindow()
+                // A held frame now delays a complete one: it goes at its
+                // `dropBy`, at once if that has passed.
                 for older in pending.keys.sorted() where older < seq {
                     if let partial = pending[older], !partial.isComplete {
                         beginGap(older, through: partial.fragmentCount - 1, now: now)
-                        if partial.holdRetryUs > 0 {
-                            let deadline = min(pending[older]?.deadline ?? latest, latest)
+                        if partial.holdRetryUs > 0, let dropBy = partial.dropBy {
+                            let deadline = min(pending[older]?.deadline ?? dropBy, dropBy)
                             pending[older]?.deadline = deadline
                         }
                     }
                 }
+                tick(at: now)
             }
             drainReady(at: now)
         } else if frame.isComplete {
@@ -353,13 +367,16 @@ final class FrameAssembler {
                             retiredSeq = max(retiredSeq, seq)
                             drainReady(at: now)
                         } else {
-                            // Held for `maxHoldUs`: every frame behind it is
-                            // incomplete and needs it, so they all go, under
-                            // one keyframe request.
-                            let waiting = pending.keys.sorted()
-                            for later in waiting.dropFirst() { pending[later]?.keyframeRequested = true }
-                            for stale in waiting { dropPending(stale) }
-                            retiredSeq = max(retiredSeq, waiting.last ?? seq)
+                            // Held for `maxHoldUs`: the incomplete frames
+                            // behind it need it and go with it, under one
+                            // keyframe request. A keyframe needs no earlier
+                            // frame, so it and the frames after it stay.
+                            let behind = pending.keys.sorted().dropFirst()
+                                .prefix(while: { pending[$0]?.isKeyframe == false })
+                            for later in behind { pending[later]?.keyframeRequested = true }
+                            dropPending(seq)
+                            for stale in behind { dropPending(stale) }
+                            retiredSeq = max(retiredSeq, behind.last ?? seq)
                         }
                     }
                 } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
@@ -439,6 +456,7 @@ final class FrameAssembler {
             ? repairWindow() : min(frame.holdRetryUs * 2, Self.maxHoldRetryUs)
         pending[seq]?.holdRetryUs = wait
         pending[seq]?.deadline = now + wait
+        if pending.count > 1 { pending[seq]?.dropBy = min(frame.dropBy ?? now, now) }
         pending[seq]?.stallAllowanceUsed = Self.maxStallAllowanceUs
         pending[seq]?.retried = true
         request(seq, through: frame.fragmentCount - 1, again: true, now: now)
