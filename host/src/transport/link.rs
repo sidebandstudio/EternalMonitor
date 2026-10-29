@@ -32,6 +32,9 @@ const KEYFRAME_BACKOFF_RESET: Duration = Duration::from_secs(5);
 /// A write that waited this long means the tunnel stood still, not that it
 /// is slow: a datagram drains in milliseconds even through a slow usbmuxd.
 const STALL: Duration = Duration::from_millis(100);
+/// A queued frame that has waited two frame intervals, and never less than
+/// this, waits behind a tunnel that is behind, not a writer about to run.
+const STALE_MIN: Duration = Duration::from_millis(33);
 const CONTROL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +160,7 @@ struct Frame {
     frag_count: u16,
     datagrams: Vec<Vec<u8>>,
     bytes: usize,
+    queued: Instant,
 }
 
 impl Frame {
@@ -176,11 +180,11 @@ struct VideoQueue {
     keyframes: KeyframeBackoff,
     /// The session and stream epoch of the latest frame.
     stream: Option<(u32, u32)>,
-    /// The writer has taken a frame and not yet found the queue empty.
-    writer_busy: bool,
-    /// Frames replaced since the last count while the writer was idle: their
-    /// pictures are lost, but the tunnel was not behind.
-    unscheduled: u64,
+    /// When the writer started the write it is waiting in, if any.
+    writing_since: Option<Instant>,
+    /// When the latest frame arrived, and how long after the one before.
+    last_frame: Option<Instant>,
+    frame_interval: Duration,
 }
 
 impl VideoQueue {
@@ -189,12 +193,12 @@ impl VideoQueue {
     /// is never cut short. Dropping the queue to admit newer frames sent the
     /// iPad partial keyframes, each of which asked for another keyframe, the
     /// biggest frame of all. Dependents of a lost frame are discarded until a
-    /// keyframe, and a keyframe always passes, replacing what is still queued
-    /// behind a busy writer. Replaced frames count as lost, or periodic
-    /// keyframes would hide a tunnel that never catches up. A frame can also
-    /// wait because the sender ran twice before the writer was scheduled,
-    /// with the tunnel idle: it is kept when the keyframe fits behind it, and
-    /// counts as lost but not as congestion when it does not.
+    /// keyframe, and a keyframe always passes. It replaces what is still
+    /// queued only when the tunnel is behind, and those frames count as lost,
+    /// or periodic keyframes would hide a tunnel that never catches up. A
+    /// frame being written says nothing about the tunnel: the sender can push
+    /// two frames before the writer runs again, and on a healthy cable both
+    /// still go out ahead of the keyframe.
     fn push(&mut self, bytes: &[u8], now: Instant) -> io::Result<u64> {
         let (header, _) = MediaHeader::decode(bytes).map_err(|_| invalid("video header"))?;
         let key = (header.stream_epoch, header.frame_seq);
@@ -217,19 +221,29 @@ impl VideoQueue {
                 // backoff.
                 self.keyframes = KeyframeBackoff::default();
             }
+            // Two intervals between the frames before this one: a keyframe
+            // that took longer to encode must not stretch its own wait.
+            let stale_after = (self.frame_interval * 2).max(STALE_MIN);
+            if let Some(last) = self.last_frame.replace(now) {
+                self.frame_interval = now.saturating_duration_since(last);
+            }
             if header.is_keyframe {
-                // Queued frames are older and the keyframe needs none of them.
-                // While the writer is busy they wait behind a tunnel that is
-                // behind, and the keyframe replaces them. While it is idle
-                // they wait only for it to be scheduled, so they still go
-                // out first when the keyframe is sure to fit behind them.
+                // Queued frames are older and the keyframe needs none of them,
+                // but they still decode. They are replaced only when the
+                // tunnel is behind: the keyframe might not fit behind them,
+                // the oldest has waited longer than the stream can afford, or
+                // the write in progress has stood still.
                 let fits = self.frames.len() < FRAME_LIMIT
                     && self.bytes + usize::from(header.frag_count) * MAX_DGRAM_SIZE <= BYTE_LIMIT;
-                if self.writer_busy || !fits {
+                let stale = self
+                    .frames
+                    .front()
+                    .is_some_and(|frame| now.saturating_duration_since(frame.queued) > stale_after);
+                let stalled = self
+                    .writing_since
+                    .is_some_and(|at| now.saturating_duration_since(at) >= STALL);
+                if !fits || stale || stalled {
                     dropped = self.frames.len() as u64;
-                    if !self.writer_busy {
-                        self.unscheduled += dropped;
-                    }
                     self.frames.clear();
                     self.bytes = 0;
                 }
@@ -248,6 +262,7 @@ impl VideoQueue {
                 frag_count: header.frag_count,
                 datagrams: Vec::with_capacity(usize::from(header.frag_count).min(1024)),
                 bytes: 0,
+                queued: now,
             });
         }
         let Some(frame) = self.frames.back_mut() else {
@@ -296,12 +311,10 @@ impl VideoQueue {
 
     fn pop(&mut self) -> Option<Frame> {
         if !self.frames.front().is_some_and(Frame::complete) {
-            self.writer_busy = false;
             return None;
         }
         let frame = self.frames.pop_front().unwrap();
         self.bytes -= frame.bytes;
-        self.writer_busy = true;
         Some(frame)
     }
 }
@@ -446,14 +459,23 @@ impl WriterState {
         }
     }
 
+    /// Starts a write, so that a keyframe arriving meanwhile can see a
+    /// tunnel that stands still.
+    fn start_write(&self) -> Instant {
+        let now = Instant::now();
+        self.queue.lock().video.writing_since = Some(now);
+        now
+    }
+
     /// After a write that started at `started`: whether the tunnel stood
     /// still, in which case queued video and `in_flight` frames are dropped.
     fn check_stall(&self, started: Instant, in_flight: u64) -> bool {
         let now = Instant::now();
+        let mut queue = self.queue.lock();
+        queue.video.writing_since = None;
         if now.saturating_duration_since(started) < STALL {
             return false;
         }
-        let mut queue = self.queue.lock();
         let dropped = queue.video.stalled(now) + in_flight;
         self.record_drops(&mut queue.video, dropped, now);
         true
@@ -463,11 +485,10 @@ impl WriterState {
         self.stats
             .frames_dropped
             .fetch_add(dropped, Ordering::Relaxed);
-        let congested = dropped.saturating_sub(std::mem::take(&mut video.unscheduled));
         self.stats
             .congestion_drops
-            .fetch_add(congested, Ordering::Relaxed);
-        TUNNEL_CONGESTION.fetch_add(congested, Ordering::Relaxed);
+            .fetch_add(dropped, Ordering::Relaxed);
+        TUNNEL_CONGESTION.fetch_add(dropped, Ordering::Relaxed);
         if video.keyframes.due(now) {
             self.force_idr.store(true, Ordering::SeqCst);
         }
@@ -693,7 +714,7 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             None => (None, state.queue.lock().video.pop()),
         };
         if let Some((packet, control)) = priority {
-            let started = Instant::now();
+            let started = state.start_write();
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
@@ -707,7 +728,7 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
             // Only after a stall is the rest stale and abandoned.
             let count = frame.datagrams.len();
             for (index, packet) in frame.datagrams.into_iter().enumerate() {
-                let started = Instant::now();
+                let started = state.start_write();
                 tokio::select! {
                     biased;
                     _ = closed.changed() => return Ok(()),
@@ -717,7 +738,7 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
                 while let Some((priority, control)) = state.take_priority() {
-                    let started = Instant::now();
+                    let started = state.start_write();
                     tokio::select! {
                         biased;
                         _ = closed.changed() => return Ok(()),
@@ -833,9 +854,12 @@ mod tests {
         assert_eq!(queue.frames.len(), FRAME_LIMIT, "queued frames stay");
         assert_eq!(queue.pop().unwrap().seq, 1);
         assert_eq!(queue.pop().unwrap().seq, 2);
-        // A keyframe replaces what is still queued, and those frames are lost.
+        // A keyframe replaces what has waited too long, and those frames are
+        // lost.
         assert_eq!(
-            queue.push(&packet(next + 2, true, 0, 1, 64), now).unwrap(),
+            queue
+                .push(&packet(next + 2, true, 0, 1, 64), now + STALE_MIN * 2)
+                .unwrap(),
             FRAME_LIMIT as u64 - 2
         );
         assert_eq!(queue.pop().unwrap().seq, next + 2);
@@ -884,37 +908,73 @@ mod tests {
         for seq in 2..=5 {
             assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
         }
-        assert_eq!(queue.push(&packet(6, true, 0, 1, 64), now).unwrap(), 4);
+        let later = now + STALE_MIN * 2;
+        assert_eq!(queue.push(&packet(6, true, 0, 1, 64), later).unwrap(), 4);
         assert_eq!(queue.pop().unwrap().seq, 6);
         // An empty queue loses nothing to a keyframe.
-        assert_eq!(queue.push(&packet(7, true, 0, 1, 64), now).unwrap(), 0);
+        assert_eq!(queue.push(&packet(7, true, 0, 1, 64), later).unwrap(), 0);
     }
 
-    /// A frame replaced while the writer is busy waited behind real writing:
-    /// the tunnel is behind. One queued before the writer even ran shows
-    /// only scheduling: it goes out ahead of the keyframe when that fits, and
-    /// when it does not, its picture is lost without counting as congestion.
+    /// A keyframe that might be cut short by the queue's bounds replaces
+    /// what is queued, however briefly it waited.
     #[test]
-    fn replacements_show_congestion_only_while_the_writer_is_busy() {
+    fn a_keyframe_replaces_queued_frames_it_might_not_fit_behind() {
         let now = Instant::now();
         let mut queue = VideoQueue::default();
         queue.push(&packet(1, true, 0, 1, 64), now).unwrap();
         queue.pop().unwrap();
-        assert!(queue.pop().is_none(), "the writer finds the queue empty");
-        queue.push(&packet(2, false, 0, 1, 64), now).unwrap();
-        assert_eq!(queue.push(&packet(3, true, 0, 1, 64), now).unwrap(), 0);
-        assert_eq!(queue.pop().unwrap().seq, 2, "writer idle: frame 2 is kept");
-        queue.push(&packet(4, false, 0, 1, 64), now).unwrap();
-        assert_eq!(queue.push(&packet(5, true, 0, 1, 64), now).unwrap(), 2);
-        assert_eq!(queue.unscheduled, 0, "writer busy with frame 2");
-        queue.pop().unwrap();
-        assert!(queue.pop().is_none());
-        // A keyframe that may not fit behind an idle writer's queue still
-        // passes, and what it replaces is not congestion.
-        queue.push(&packet(6, false, 0, 1, 64), now).unwrap();
+        for seq in 2..=FRAME_LIMIT as u32 + 1 {
+            assert_eq!(queue.push(&packet(seq, false, 0, 1, 64), now).unwrap(), 0);
+        }
+        let next = FRAME_LIMIT as u32 + 2;
+        assert_eq!(
+            queue.push(&packet(next, true, 0, 1, 64), now).unwrap(),
+            FRAME_LIMIT as u64,
+            "no room for another frame"
+        );
+        assert_eq!(queue.pop().unwrap().seq, next);
+        queue.push(&packet(next + 1, false, 0, 1, 64), now).unwrap();
         let count = (BYTE_LIMIT / MAX_DGRAM_SIZE) as u16 + 1;
-        assert_eq!(queue.push(&packet(7, true, 0, count, 64), now).unwrap(), 1);
-        assert_eq!(queue.unscheduled, 1);
+        assert_eq!(
+            queue
+                .push(&packet(next + 2, true, 0, count, 64), now)
+                .unwrap(),
+            1,
+            "the keyframe might not fit in the bytes left"
+        );
+        assert_eq!(queue.frames.len(), 1);
+    }
+
+    /// A queued frame that has waited two frame intervals, and at least
+    /// `STALE_MIN`, waits behind a tunnel that is behind. One that waited
+    /// less is still sent ahead of the keyframe.
+    #[test]
+    fn a_keyframe_replaces_queued_frames_that_waited_two_frame_intervals() {
+        let replaced = |interval: u64, keyframe_at: u64| {
+            let start = Instant::now();
+            let at = |ms| start + Duration::from_millis(ms);
+            let mut queue = VideoQueue::default();
+            queue.push(&packet(1, true, 0, 1, 64), start).unwrap();
+            queue.pop().unwrap();
+            queue
+                .push(&packet(2, false, 0, 1, 64), at(interval))
+                .unwrap();
+            queue
+                .push(&packet(3, false, 0, 1, 64), at(2 * interval))
+                .unwrap();
+            queue
+                .push(&packet(4, true, 0, 1, 64), at(keyframe_at))
+                .unwrap()
+        };
+        // 60 fps: frame 2 may wait 33 ms.
+        assert_eq!(replaced(16, 49), 0);
+        assert_eq!(replaced(16, 50), 2);
+        // 30 fps: two intervals are 66 ms.
+        assert_eq!(replaced(33, 99), 0);
+        assert_eq!(replaced(33, 100), 2);
+        // 120 fps: never less than 33 ms.
+        assert_eq!(replaced(8, 41), 0);
+        assert_eq!(replaced(8, 42), 2);
     }
 
     /// A pipeline restart keeps the USB tunnel. Its new stream must not
@@ -1154,6 +1214,70 @@ mod tests {
         assert!(
             force_idr.load(Ordering::SeqCst),
             "the deferred request is sent"
+        );
+    }
+
+    /// Sends frame 1 in four full datagrams to a link whose peer has not
+    /// read yet, so that the writer is left in the middle of it.
+    async fn link_writing_frame_one() -> (FramedLink, tokio::io::DuplexStream, PeerId) {
+        let (host, mut client) = tokio::io::duplex(4096);
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        for index in 0..4 {
+            link.send(peer, &packet(1, true, index, 4, 1400))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        let queue = link.state.queue.lock();
+        assert!(queue.video.frames.is_empty() && queue.video.writing_since.is_some());
+        drop(queue);
+        (link, client, peer)
+    }
+
+    /// A frame in flight says nothing about the tunnel. On a healthy cable
+    /// the sender can push a frame and a keyframe while the writer is still
+    /// on the frame before; every picture goes out, and nothing counts as
+    /// congestion.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyframe_behind_a_busy_writer_keeps_frames_that_did_not_wait() {
+        let (link, mut client, peer) = link_writing_frame_one().await;
+        link.send(peer, &packet(2, false, 0, 1, 1400))
+            .await
+            .unwrap();
+        link.send(peer, &packet(3, true, 0, 1, 1400)).await.unwrap();
+        let mut delivered = Vec::new();
+        for _ in 0..6 {
+            let datagram = read_datagram(&mut client).await.unwrap();
+            let header = MediaHeader::decode(&datagram).unwrap().0;
+            if header.frag_index == 0 {
+                delivered.push(header.frame_seq);
+            }
+        }
+        assert_eq!(delivered, [1, 2, 3]);
+        assert_eq!(link.stats().frames_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// A keyframe that arrives while a write has stood still for `STALL`
+    /// replaces what is queued, even a frame that has only just arrived.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyframe_replaces_queued_frames_while_a_write_stands_still() {
+        let (link, _client, peer) = link_writing_frame_one().await;
+        tokio::time::advance(STALL).await;
+        link.send(peer, &packet(2, false, 0, 1, 1400))
+            .await
+            .unwrap();
+        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 0);
+        link.send(peer, &packet(3, true, 0, 1, 1400)).await.unwrap();
+        assert_eq!(link.stats().congestion_drops.load(Ordering::Relaxed), 1);
+        let queue = link.state.queue.lock();
+        assert_eq!(
+            queue.video.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            [3]
         );
     }
 
