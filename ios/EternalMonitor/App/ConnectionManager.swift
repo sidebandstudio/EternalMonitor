@@ -68,6 +68,14 @@ struct ConnectionDebugState {
         }
         return "Received \(decodedFrames) decoded frames, but the connection did not transition cleanly."
     }
+
+    /// The timeout line's level. A HELLO no one answered is a warning (a PC
+    /// that is off, asleep or elsewhere) unless the PC at this address
+    /// accepted a session earlier in this launch.
+    func timeoutLevel(handshakeDone: Bool, answeredHereBefore: Bool) -> DiagnosticLevel {
+        let unanswered = listenerReadyPort != nil && helloAttempts > 0 && datagramsReceived == 0 && !handshakeDone
+        return unanswered && !answeredHereBefore ? .warning : .error
+    }
 }
 
 @MainActor
@@ -159,6 +167,8 @@ final class ConnectionManager: ObservableObject {
     /// No-picture timeouts in a row at one PC; at the limit, attempts that
     /// start by themselves stop.
     private var noPictureStreak = NoPictureStreak()
+    /// "host:port" of each PC that accepted a session in this launch.
+    private var acceptedAddresses = Set<String>()
     /// System uptime when the current attempt started, and when its PC
     /// accepted the session, for the support log's timings.
     private var attemptStartedAt: TimeInterval = 0
@@ -575,6 +585,7 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.sessionAcceptedAt = acceptedAt
+                self.acceptedAddresses.insert("\(normalizedHost):\(port)")
                 self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
@@ -748,7 +759,10 @@ final class ConnectionManager: ObservableObject {
         receiver.onError = { [weak self] error in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
+                // A path that isn't ready yet (no network, Local Network off)
+                // is this iPad's situation, not a fault: a warning.
+                let waiting = error.kind == .pathUnavailable || error.kind == .localNetworkDenied
+                self.record(waiting ? .warning : .error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
                 let failure = ConnectionProblem.linkFailure(error, isUSB: isUSB, host: normalizedHost)
                 // A live stream rides out transient errors; a USB link that
                 // failed for good closes next, and that close reports this.
@@ -1007,7 +1021,9 @@ final class ConnectionManager: ObservableObject {
                 let debug = self.debugState
                 let handshakeDone = self.hostInfo != nil
                 let isUSB = self.transportMode == "USB"
-                self.record(.error, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
+                let level = debug.timeoutLevel(handshakeDone: handshakeDone,
+                                               answeredHereBefore: self.acceptedAddresses.contains("\(debug.host):\(debug.port)"))
+                self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
                 self.problem = self.noPictureStreak.shown(.timeout(
@@ -1275,7 +1291,7 @@ final class ConnectionManager: ObservableObject {
     private func recordStreamSummary(reason: String) {
         let counters = frameAssembler?.counters.withLock { $0 } ?? .init()
         let clock = controlChannel?.clockSnapshot.withLock { $0 }
-        SupportDiagnostics.shared.record("info", "stream", "reason=\(reason) state=\(state) transport=\(transportMode) session_id=\(hostInfo?.sessionId ?? 0) decoded=\(debugState.decodedFrames) assembled=\(debugState.assembledFrames) datagrams=\(debugState.datagramsReceived) bytes=\(debugState.datagramBytesReceived) fps=\(fps) size=\(videoSize) depth=\(videoDecoder?.decodeDepth ?? 0) dropped=\(counters.framesDropped) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) rtt_us=\(clock?.rttUs ?? 0) e2e_ms=\(lagMs) audio=\(audioStats) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
+        SupportDiagnostics.shared.record("info", "stream", "reason=\(reason) state=\(state) transport=\(transportMode) session_id=\(hostInfo?.sessionId ?? 0) decoded=\(debugState.decodedFrames) assembled=\(debugState.assembledFrames) datagrams=\(debugState.datagramsReceived) bytes=\(debugState.datagramBytesReceived) fps=\(fps) size=\(videoSize) depth=\(videoDecoder?.decodeDepth ?? 0) dropped=\(counters.framesDropped) mismatched_count_frags=\(frameAssembler?.mismatchedCountFragments.withLock { $0 } ?? 0) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) rtt_us=\(clock?.rttUs ?? 0) e2e_ms=\(lagMs) audio=\(audioStats) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
     }
 
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
