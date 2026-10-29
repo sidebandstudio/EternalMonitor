@@ -11,6 +11,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod periodic;
+mod redact;
+use periodic::Periodic;
+
 const MAX_FILES: usize = 512;
 const BATCH_SIZE: usize = 4;
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
@@ -27,6 +31,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
+/// The uploader's summary window, for fatal reports.
+static PERIODIC: OnceLock<std::sync::Arc<Mutex<Periodic>>> = OnceLock::new();
 // Shared by the upload thread and fatal reports, so events never reuse a number.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -169,12 +175,29 @@ enum Queued {
     Wake,
 }
 
-/// The log lines among `queued`, as events.
-fn events(queued: impl Iterator<Item = Queued>) -> impl Iterator<Item = Event> {
-    queued.filter_map(|queued| match queued {
-        Queued::Line(line) => Some(event(&line, level(&line))),
-        Queued::Wake => None,
-    })
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn events_of(lines: Vec<String>) -> impl Iterator<Item = Event> {
+    lines.into_iter().map(|line| event(&line, level(&line)))
+}
+
+/// The log lines among `queued`, as events, with the periodic stats in a
+/// summary. The open summary window closes too: the uploader is stopping.
+fn events(queued: impl Iterator<Item = Queued>, periodic: &Mutex<Periodic>) -> Vec<Event> {
+    let mut periodic = lock(periodic);
+    let now = std::time::Instant::now();
+    let mut lines = Vec::new();
+    for queued in queued {
+        if let Queued::Line(line) = queued {
+            lines.extend(periodic.push(&line, now));
+        }
+    }
+    lines.extend(periodic.flush());
+    events_of(lines).collect()
 }
 
 pub struct UploadGuard {
@@ -190,6 +213,9 @@ struct Uploader {
     /// its receive timeout.
     wake: mpsc::SyncSender<Queued>,
     receiver: std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>,
+    /// The summary window the thread is filling, closed by whichever of the
+    /// thread and the shutdown fallback writes the last events.
+    periodic: std::sync::Arc<Mutex<Periodic>>,
     directory: PathBuf,
     done: mpsc::Receiver<()>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -199,11 +225,17 @@ impl Uploader {
         let (sender, receiver) = mpsc::sync_channel(256);
         let receiver = std::sync::Arc::new(Mutex::new(receiver));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let periodic = std::sync::Arc::new(Mutex::new(Periodic::default()));
         let (done_tx, done) = mpsc::channel();
         let thread = {
-            let (receiver, stop, directory) = (receiver.clone(), stop.clone(), directory.clone());
+            let (receiver, periodic, stop, directory) = (
+                receiver.clone(),
+                periodic.clone(),
+                stop.clone(),
+                directory.clone(),
+            );
             std::thread::spawn(move || {
-                if run(config, directory, receiver, stop).is_err() {
+                if run(config, directory, receiver, periodic, stop).is_err() {
                     set_status("Automatic upload stopped: local outbox unavailable");
                 }
                 let _ = done_tx.send(());
@@ -213,6 +245,7 @@ impl Uploader {
             stop,
             wake: sender.clone(),
             receiver,
+            periodic,
             directory,
             done,
             thread: Some(thread),
@@ -237,20 +270,30 @@ impl Drop for Uploader {
         // and writing here made the quit last as long as the stall.
         #[cfg(test)]
         tests::GAVE_UP.with(|gave_up| gave_up.set(true));
-        let (receiver, directory, sharing) =
-            (self.receiver.clone(), self.directory.clone(), enabled());
+        let (receiver, periodic, directory, sharing) = (
+            self.receiver.clone(),
+            self.periodic.clone(),
+            self.directory.clone(),
+            enabled(),
+        );
         let (written_tx, written) = mpsc::channel();
         let _ = std::thread::Builder::new().spawn(move || {
-            keep_queued(&receiver, &directory, sharing);
+            keep_queued(&receiver, &periodic, &directory, sharing);
             let _ = written_tx.send(());
         });
         let _ = written.recv_timeout(FINAL_WRITE_WAIT);
     }
 }
-/// The quit's fallback: writes the lines still queued, or clears everything
-/// pending when sharing is off. If the upload thread is writing the queue
-/// itself, this waits for it and finds nothing left.
-fn keep_queued(receiver: &Mutex<mpsc::Receiver<Queued>>, directory: &Path, sharing: bool) {
+/// The quit's fallback: writes the lines still queued and the open summary
+/// window, or clears everything pending, the window too, when sharing is
+/// off. If the upload thread is writing the queue itself, this waits for it
+/// and finds nothing left.
+fn keep_queued(
+    receiver: &Mutex<mpsc::Receiver<Queued>>,
+    periodic: &Mutex<Periodic>,
+    directory: &Path,
+    sharing: bool,
+) {
     let Ok(receiver) = receiver.lock() else {
         return;
     };
@@ -263,9 +306,10 @@ fn keep_queued(receiver: &Mutex<mpsc::Receiver<Queued>>, directory: &Path, shari
             }
         }
         while receiver.try_recv().is_ok() {}
+        *lock(periodic) = Periodic::default();
         return;
     }
-    let events: Vec<Event> = events(receiver.try_iter()).collect();
+    let events = events(receiver.try_iter(), periodic);
     for chunk in events.chunks(BATCH_SIZE) {
         if let Ok(batch) = batch(chunk.to_vec()) {
             let _ = persist(directory, &batch);
@@ -304,6 +348,7 @@ impl UploadGuard {
         let _ = IDENTITY.set(identity);
         let _ = OUTBOX.set(directory.clone());
         let (sender, uploader) = Uploader::spawn(config, directory);
+        let _ = PERIODIC.set(uploader.periodic.clone());
         let _ = SENDER.set(sender);
         Self {
             _uploader: Some(uploader),
@@ -333,9 +378,10 @@ pub fn record(line: &str) {
         }
     }
 }
-/// Queue one event (`level` is `error` or `info`) on disk now. The upload
-/// thread sends it, or the next launch does if this process ends first. Ok
-/// when the event is saved or uploads are off.
+/// Queue one event (`level` is `error` or `info`) on disk now, after the
+/// open periodic summary. The upload thread sends them, or the next launch
+/// does if this process ends first. Ok when the event is saved or uploads
+/// are off.
 pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
     if !enabled() {
         return Ok(());
@@ -343,14 +389,25 @@ pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
     let Some(directory) = OUTBOX.get() else {
         return Ok(());
     };
-    let queued = queue_into(directory, message, level);
+    let queued = queue_into(directory, PERIODIC.get().map(|x| &**x), message, level);
     if queued.is_err() {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
     queued
 }
-fn queue_into(directory: &Path, message: &str, level: &str) -> std::io::Result<()> {
-    persist(directory, &batch(vec![event(message, level)])?)
+/// The open summary window goes first, in the same batch: a crash after
+/// this skips the uploader's shutdown, which would otherwise write it.
+fn queue_into(
+    directory: &Path,
+    periodic: Option<&Mutex<Periodic>>,
+    message: &str,
+    level: &str,
+) -> std::io::Result<()> {
+    let mut events: Vec<Event> = periodic.map_or_else(Vec::new, |periodic| {
+        events_of(lock(periodic).flush()).collect()
+    });
+    events.push(event(message, level));
+    persist(directory, &batch(events)?)
 }
 /// Queue an event for another launch of this installation, from the failure
 /// reporter process. `index` keeps several such events distinct. Ok when the
@@ -425,9 +482,17 @@ pub(crate) fn session_summary(line: &str) -> Option<&str> {
         .filter(|message| message.starts_with("session_summary v="))
 }
 fn event(line: &str, level: &str) -> Event {
+    event_with(line, level, &redact::NAMES)
+}
+/// A session summary uploads as written. Other lines leave out the user's
+/// and the PC's names (see [`redact`]).
+fn event_with(line: &str, level: &str, names: &redact::Names) -> Event {
     let (category, message) = match session_summary(line) {
-        Some(summary) => ("summary", summary),
-        None => ("host", line),
+        Some(summary) => ("summary", crate::logging::redact_support_text(summary)),
+        None => (
+            "host",
+            redact::redact(&crate::logging::redact_support_text(line), names),
+        ),
     };
     Event {
         sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
@@ -437,7 +502,7 @@ fn event(line: &str, level: &str) -> Event {
             .as_millis() as u64,
         level: level.into(),
         category: category.into(),
-        message: crate::logging::redact_support_text(message),
+        message,
     }
 }
 fn batch(events: Vec<Event>) -> std::io::Result<Batch> {
@@ -531,6 +596,7 @@ fn run(
     config: Config,
     directory: PathBuf,
     receiver: std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>,
+    periodic: std::sync::Arc<Mutex<Periodic>>,
     stop: std::sync::Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -545,7 +611,7 @@ fn run(
     set_status("Automatic upload enabled; waiting for events");
     loop {
         if stop.load(Ordering::SeqCst) {
-            return finish(&directory, &receiver, pending);
+            return finish(&directory, &receiver, &periodic, pending);
         }
         let received = match receiver.lock() {
             Ok(receiver) => receiver.recv_timeout(receive_timeout(&directory)),
@@ -553,15 +619,19 @@ fn run(
         };
         match received {
             Ok(Queued::Wake) => {}
-            Ok(Queued::Line(line)) => pending.push(event(&line, level(&line))),
+            Ok(Queued::Line(line)) => {
+                let lines = lock(&periodic).push(&line, std::time::Instant::now());
+                pending.extend(events_of(lines));
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if stop.load(Ordering::SeqCst) {
-            return finish(&directory, &receiver, pending);
+            return finish(&directory, &receiver, &periodic, pending);
         }
         if !enabled() {
             pending.clear();
+            *lock(&periodic) = Periodic::default();
             for path in files(&directory)? {
                 fs::remove_file(path)?;
             }
@@ -570,6 +640,8 @@ fn run(
             }
             continue;
         }
+        let due = lock(&periodic).flush_due(std::time::Instant::now());
+        pending.extend(events_of(due));
         if pending.len() >= BATCH_SIZE
             || (!pending.is_empty() && last_persist.elapsed() >= Duration::from_secs(1))
         {
@@ -625,6 +697,7 @@ fn receive_timeout(_directory: &Path) -> Duration {
 fn finish(
     directory: &Path,
     receiver: &Mutex<mpsc::Receiver<Queued>>,
+    periodic: &Mutex<Periodic>,
     mut pending: Vec<Event>,
 ) -> std::io::Result<()> {
     let Ok(receiver) = receiver.lock() else {
@@ -637,7 +710,7 @@ fn finish(
         while receiver.try_recv().is_ok() {}
         return Ok(());
     }
-    pending.extend(events(receiver.try_iter()));
+    pending.extend(events(receiver.try_iter(), periodic));
     #[cfg(test)]
     tests::pause_before_final_write(directory);
     for chunk in pending.chunks(BATCH_SIZE) {
@@ -1093,32 +1166,74 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
-    #[test]
-    fn quitting_with_sharing_off_during_a_stalled_upload_keeps_nothing() {
-        let _sharing = SHARING
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    /// Quits an uploader whose request in flight never finishes, so the quit
+    /// wait runs out, with periodic lines queued and a summary window open.
+    /// Returns what the outbox holds afterwards.
+    fn quit_stalled_with_an_open_window(sharing: bool) -> Vec<String> {
         let directory = outbox_with_batches(1);
+        let lines = streaming_lines(2);
+        let mut window = Periodic::default();
+        for line in &lines[..3] {
+            assert!(window.push(line, std::time::Instant::now()).is_empty());
+        }
+        assert!(window.is_open());
         let (sender, receiver) = mpsc::sync_channel(256);
+        for line in &lines[3..] {
+            sender.send(Queued::Line(line.clone())).unwrap();
+        }
         sender
             .send(Queued::Line("2026-10-21T17:11:31Z  INFO last line".into()))
             .unwrap();
-        // The request in flight never finishes, so the quit wait runs out.
         let (_request, done) = mpsc::channel();
         let uploader = Uploader {
             stop: std::sync::Arc::new(AtomicBool::new(false)),
             wake: sender,
             receiver: std::sync::Arc::new(Mutex::new(receiver)),
+            periodic: std::sync::Arc::new(Mutex::new(window)),
             directory: directory.clone(),
             done,
             thread: None,
         };
-        ENABLED.store(false, Ordering::Relaxed);
+        ENABLED.store(sharing, Ordering::Relaxed);
         drop(uploader);
         ENABLED.store(true, Ordering::Relaxed);
-        let messages = outbox_messages_once(&directory, |messages| messages.is_empty());
-        assert!(messages.is_empty(), "{messages:?}");
+        let messages = outbox_messages_once(&directory, |messages| {
+            messages.is_empty() != sharing
+                && (!sharing
+                    || messages
+                        .iter()
+                        .any(|m| m.contains("Periodic stats summary")))
+        });
         fs::remove_dir_all(directory).unwrap();
+        messages
+    }
+
+    #[test]
+    fn quitting_with_sharing_off_during_a_stalled_upload_keeps_nothing() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Neither the queued lines, the outbox, nor the open summary window.
+        let messages = quit_stalled_with_an_open_window(false);
+        assert!(messages.is_empty(), "{messages:?}");
+    }
+
+    /// The same quit with sharing on writes the open window as a summary, so
+    /// the test above would see one if sharing off let it through.
+    #[test]
+    fn quitting_during_a_stalled_upload_keeps_the_open_window() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let messages = quit_stalled_with_an_open_window(true);
+        let summaries: Vec<_> = messages
+            .iter()
+            .filter(|m| m.contains("INFO Periodic stats summary"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "{messages:?}");
+        assert!(summaries[0].contains(" rr_lines=4 "), "{messages:?}");
+        assert!(!messages.iter().any(|m| m.contains("Receiver report")));
+        assert!(messages.iter().any(|m| m.ends_with("last line")));
     }
 
     #[test]
@@ -1297,11 +1412,18 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         queue_into(
             &directory,
+            None,
             "EternalMonitor could not start: token=abc",
             "error",
         )
         .unwrap();
-        queue_into(&directory, "EternalMonitor could not start: again", "error").unwrap();
+        queue_into(
+            &directory,
+            None,
+            "EternalMonitor could not start: again",
+            "error",
+        )
+        .unwrap();
         let saved: Vec<Batch> = files(&directory)
             .unwrap()
             .iter()
@@ -1358,6 +1480,186 @@ mod tests {
             );
         }
     }
+    /// Lines a streaming host logs over `seconds`, at their real rates.
+    fn streaming_lines(seconds: u32) -> Vec<String> {
+        let mut lines = Vec::new();
+        for half in 0..seconds * 2 {
+            let stamp = format!("2026-10-29T17:46:{:02}.{}00000Z", half / 2, half % 2 * 5);
+            if half % 20 == 0 {
+                lines.push(format!(
+                    "{stamp}  INFO Support stream summary session_id=Some(7) running=true \
+                     captured={half} capture_fps=60.0"
+                ));
+            }
+            lines.push(format!(
+                "{stamp}  INFO Receiver report epoch=1 complete={half} dropped=0 repaired=0 \
+                 nacks=0 jitter_us=190 decode_fps_x10=558 decode_depth=0 retransmits=0 \
+                 frags_received={half} frags_lost=0 rtt_ms_x10=31 latency_ms_x10=0 audio_lost=0"
+            ));
+            if half % 2 == 0 {
+                lines.push(format!(
+                    "{stamp}  INFO Audio stream stats device=Speakers kbps=96.0 \
+                     packets_per_sec=50.0 quiet_packets=0 dropped=0"
+                ));
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn periodic_stats_reach_the_outbox_as_one_summary() {
+        let _sharing = sharing_on();
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        let lines = streaming_lines(30);
+        assert_eq!(lines.len(), 60 + 30 + 3);
+        for line in lines {
+            sender.send(Queued::Line(line)).unwrap();
+        }
+        let other = "2026-10-29T17:46:30.000000Z  WARN Client liveness expired";
+        sender.send(Queued::Line(other.into())).unwrap();
+        drop(uploader);
+        let messages = outbox_messages_once(&directory, |messages| messages.len() >= 2);
+        assert!(
+            !messages.iter().any(|m| m.contains("Receiver report")
+                || m.contains("Audio stream stats")
+                || m.contains("Support stream summary")),
+            "{messages:?}"
+        );
+        let summaries: Vec<_> = messages
+            .iter()
+            .filter(|m| m.contains("INFO Periodic stats summary"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "{messages:?}");
+        assert!(summaries[0].contains(" session_id=7 keyframe_requests=0 rr_lines=60 "));
+        assert!(summaries[0].contains(" rr_rtt_ms_x10=31/31/31 "));
+        assert!(summaries[0].contains(" audio_lines=30 "));
+        assert!(summaries[0].contains(" stream_lines=3 "));
+        assert!(!summaries[0].contains("Speakers"), "no device names");
+        assert!(messages.iter().any(|m| m == other));
+        assert_eq!(messages.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A crash ends the process without the uploader's shutdown: the fatal
+    /// report carries the open summary window, in order before it.
+    #[test]
+    fn a_fatal_report_carries_the_open_summary_window() {
+        let _sharing = sharing_on();
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        for line in streaming_lines(5) {
+            sender.send(Queued::Line(line)).unwrap();
+        }
+        // Wait for the thread to take every line: 10 reports, 5 audio lines
+        // and a stream summary.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while lock(&uploader.periodic).lines() < 16 {
+            assert!(std::time::Instant::now() < deadline, "lines not taken");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let fatal = r"EternalMonitor stopped unexpectedly: Host panic at C:\Users\bob\src\x.rs";
+        queue_into(&directory, Some(&uploader.periodic), fatal, "error").unwrap();
+        let batches: Vec<Batch> = files(&directory)
+            .unwrap()
+            .iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        let with_fatal = batches
+            .iter()
+            .find(|b| b.events.iter().any(|e| e.level == "error"))
+            .expect("fatal event saved");
+        let messages: Vec<_> = with_fatal
+            .events
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[0].contains("INFO Periodic stats summary"),
+            "{messages:?}"
+        );
+        assert!(messages[0].contains(" rr_lines=10 "), "{messages:?}");
+        assert_eq!(
+            messages[1],
+            r"EternalMonitor stopped unexpectedly: Host panic at C:\Users\%USERNAME%\src\x.rs"
+        );
+        drop(uploader);
+        let summaries = outbox_messages(&directory)
+            .iter()
+            .filter(|m| m.contains("Periodic stats summary"))
+            .count();
+        assert_eq!(summaries, 1, "the window is not uploaded twice");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The failure reporter relays another launch's event: it leaves names
+    /// out too.
+    #[test]
+    fn relayed_reporter_events_leave_out_profile_paths() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("installation-id"), "ab".repeat(16)).unwrap();
+        queue_foreign(
+            &directory,
+            "launch",
+            1,
+            r"EternalMonitor stopped unexpectedly: exception in \\?\C:\Users\Maria\AppData\Local\x.dll",
+            "error",
+        )
+        .unwrap();
+        let saved: Batch =
+            serde_json::from_slice(&fs::read(&files(&directory).unwrap()[0]).unwrap()).unwrap();
+        assert_eq!(
+            saved.events[0].message,
+            r"EternalMonitor stopped unexpectedly: exception in \\?\C:\Users\%USERNAME%\AppData\Local\x.dll"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Names that are also the summary's own tokens leave it byte for byte,
+    /// while the same words elsewhere are names.
+    #[test]
+    fn a_session_summary_is_never_redacted() {
+        let names = redact::Names::new(Some(r"C:\Users\steady"), Some("mirror"), Some("wifi"));
+        let summary = "session_summary v=1 role=pc session_id=7 nonce=00000000e2e00001 \
+                       transport=wifi mode=mirror stage=steady outcome=streamed failure=none \
+                       fallback=none end=goodbye ttff_ms=210 duration_ms=90000 \
+                       os=win:26200.9457 hw=pc gpu=Intel+NVIDIA hybrid=true";
+        let uploaded = event_with(
+            &format!("2026-10-29T17:46:01.000000Z  INFO {summary}"),
+            "info",
+            &names,
+        );
+        assert_eq!(
+            (uploaded.category.as_str(), uploaded.message.as_str()),
+            ("summary", summary)
+        );
+        let other = event_with(
+            "2026-10-29T17:46:01.000000Z  INFO Display mode mirror on wifi",
+            "info",
+            &names,
+        );
+        assert_eq!(
+            other.message,
+            "2026-10-29T17:46:01.000000Z  INFO Display mode %USERNAME% on %COMPUTERNAME%"
+        );
+    }
+
     #[test]
     fn rejects_plaintext_and_credentials_in_urls() {
         let mut c = Config {
