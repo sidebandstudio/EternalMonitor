@@ -1127,6 +1127,23 @@ fn try_again_waits_for_the_launch_check_of_a_saved_release() {
 }
 
 #[test]
+fn a_worker_that_cannot_start_does_not_hold_the_saved_release() {
+    let now = 100_000;
+    let mut s = state(Saved {
+        latest: Some(release("0.3.2")),
+        checked_at: Some(now - RECHECK_OFFER),
+        ..Saved::default()
+    });
+    assert!(s.launch_check(now));
+    assert!(s.rechecking());
+    let s = Mutex::new(s);
+    start_worker(&s, || Err(std::io::Error::other("no threads left")));
+    let s = s.lock();
+    assert!(!s.rechecking());
+    assert_eq!(s.notice(now), Some(Notice::Available("0.3.2".into())));
+}
+
+#[test]
 fn update_now_while_streaming_can_be_forced_or_cancelled() {
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(release("0.3.2")));

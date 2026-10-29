@@ -154,11 +154,14 @@ impl ClientSnapshot {
         }
     }
 
-    fn link_name(&self) -> &'static str {
-        if self
-            .peer
+    /// Whether an iPad is streaming over the USB cable right now.
+    fn on_usb(&self) -> bool {
+        self.peer
             .is_some_and(|p| matches!(p.link, LinkId::Usb { .. }))
-        {
+    }
+
+    fn link_name(&self) -> &'static str {
+        if self.on_usb() {
             "USB"
         } else {
             "Wi-Fi"
