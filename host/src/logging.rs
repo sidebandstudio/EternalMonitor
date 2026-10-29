@@ -244,7 +244,9 @@ impl MemoryLogWriter {
             .to_string();
         self.current_line.clear();
         let line = redact_support_text(&line);
-        if let Some(repeats) = self.repeats.clone() {
+        // A session summary uploads exactly as written: never collapsed.
+        let summary = crate::telemetry::session_summary(&line).is_some();
+        if let Some(repeats) = self.repeats.clone().filter(|_| !summary) {
             let lines = repeats.lock().push(&line, std::time::Instant::now());
             for line in lines {
                 self.emit(line);
@@ -645,6 +647,32 @@ mod tests {
         let lines: Vec<_> = shared.lock().iter().cloned().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("access lost [repeated 19 more times"));
+    }
+
+    #[test]
+    fn session_summaries_are_never_collapsed() {
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+            repeats: Some(Default::default()),
+        };
+        let summary =
+            b"2026-10-21T03:10:19.347613Z  INFO session_summary v=1 role=pc session_id=- \
+            nonce=0000000000000001 transport=wifi mode=mirror stage=hello_sent outcome=error \
+            failure=other fallback=none end=error ttff_ms=- duration_ms=0 os=win:0.0 hw=pc gpu=- \
+            hybrid=-\n";
+        for _ in 0..3 {
+            writer.write_all(summary).unwrap();
+        }
+        writer.emit_repeat_summaries(None);
+        let lines: Vec<_> = shared.lock().iter().cloned().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().all(|line| line.ends_with(" hybrid=-")),
+            "{lines:?}"
+        );
     }
 
     #[test]

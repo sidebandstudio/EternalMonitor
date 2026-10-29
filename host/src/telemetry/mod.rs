@@ -416,7 +416,19 @@ fn level(line: &str) -> &'static str {
         "info"
     }
 }
+/// The message of a session summary line (`crate::diagnostics::session_summary`):
+/// the backend copies category `summary` events whose message is exactly that.
+pub(crate) fn session_summary(line: &str) -> Option<&str> {
+    let (_stamp, rest) = line.split_once(' ')?;
+    rest.trim_start()
+        .strip_prefix("INFO ")
+        .filter(|message| message.starts_with("session_summary v="))
+}
 fn event(line: &str, level: &str) -> Event {
+    let (category, message) = match session_summary(line) {
+        Some(summary) => ("summary", summary),
+        None => ("host", line),
+    };
     Event {
         sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
         at_ms: SystemTime::now()
@@ -424,8 +436,8 @@ fn event(line: &str, level: &str) -> Event {
             .unwrap_or_default()
             .as_millis() as u64,
         level: level.into(),
-        category: "host".into(),
-        message: crate::logging::redact_support_text(line),
+        category: category.into(),
+        message: crate::logging::redact_support_text(message),
     }
 }
 fn batch(events: Vec<Event>) -> std::io::Result<Batch> {
@@ -1318,6 +1330,33 @@ mod tests {
             level("2026-10-20T20:47:20Z  INFO EternalMonitor shutting down"),
             "info"
         );
+    }
+    #[test]
+    fn a_session_summary_uploads_alone_in_its_own_category() {
+        let summary = "session_summary v=1 role=pc session_id=7 nonce=00000000e2e00001 \
+                       transport=wifi mode=mirror stage=accepted outcome=user_ended failure=none \
+                       fallback=none end=goodbye ttff_ms=- duration_ms=900 os=win:0.0 hw=pc gpu=- \
+                       hybrid=-";
+        let uploaded = event(
+            &format!("2026-10-28T02:03:04.123456Z  INFO {summary}"),
+            "info",
+        );
+        assert_eq!(
+            (uploaded.category.as_str(), uploaded.message.as_str()),
+            ("summary", summary)
+        );
+        // Only the line's own message, at info.
+        for line in [
+            format!("2026-10-28T02:03:04Z  WARN {summary}"),
+            format!("2026-10-28T02:03:04Z  INFO Client session established device=\"x {summary}\""),
+            summary.to_string(),
+        ] {
+            let uploaded = event(&line, level(&line));
+            assert_eq!(
+                (uploaded.category.as_str(), uploaded.message),
+                ("host", line)
+            );
+        }
     }
     #[test]
     fn rejects_plaintext_and_credentials_in_urls() {
