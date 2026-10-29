@@ -76,9 +76,12 @@ environment down before adding the variable that turns signing on.
 1. Under Settings, Environments, `release` (create it if it isn't there), set
    Deployment branches and tags to Selected branches and tags. Add the branch
    `main` and the tag pattern `v*`.
-2. Under Settings, Rules, Rulesets, add a tag ruleset that targets `v*` and
-   restricts creations, updates and deletions to maintainers. A version tag
-   on any commit otherwise reaches the signing step.
+2. Under Settings, Rules, Rulesets, add a tag ruleset. Set Enforcement status
+   to Active (new rulesets start Disabled), target tags matching `v*`, tick
+   Restrict creations, Restrict updates and Restrict deletions, and put only
+   the people who cut releases on the bypass list. Without it, anyone who can
+   push a tag starting with `v` can point it at unreviewed code and reach the
+   signing step.
 3. Optionally add a required reviewer to the environment, so each signing run
    waits for an approval.
 
