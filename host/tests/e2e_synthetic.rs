@@ -12,6 +12,7 @@
 //! - BYE stops the media stream promptly,
 //! - shutdown is bounded.
 
+use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -130,26 +131,43 @@ fn init_test_tracing() {
 
 /// The host's `session_summary` lines, as logged.
 static SUMMARIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The reasons the supervisor gave for its automatic restarts, as logged.
+static RESTARTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 struct SummaryCapture;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SummaryCapture {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Message(Option<String>);
+        #[derive(Default)]
+        struct Message {
+            message: Option<String>,
+            reason: Option<String>,
+        }
         impl tracing::field::Visit for Message {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "reason" {
+                    self.reason = Some(value.to_owned());
+                }
+            }
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
-                    self.0 = Some(format!("{value:?}"));
+                    self.message = Some(format!("{value:?}"));
                 }
             }
         }
-        let mut message = Message(None);
+        let mut message = Message::default();
         event.record(&mut message);
-        if let Some(line) = message
-            .0
-            .filter(|line| line.starts_with("session_summary "))
-        {
-            SUMMARIES.lock().unwrap().push(line);
+        match message.message {
+            Some(line) if line.starts_with("session_summary ") => {
+                SUMMARIES.lock().unwrap().push(line);
+            }
+            Some(line) if line == "Pipeline stage failed — automatic restart scheduled" => {
+                RESTARTS
+                    .lock()
+                    .unwrap()
+                    .push(message.reason.unwrap_or_default());
+            }
+            _ => {}
         }
     }
 }
@@ -824,6 +842,25 @@ fn rising_within_epochs(frames: &[(u32, u64)]) -> bool {
     frames
         .windows(2)
         .all(|pair| pair[0].0 != pair[1].0 || pair[1].1 > pair[0].1)
+}
+
+/// Adds one silence of a starved host to what each frame waiting through it
+/// has waited in such silences, forgetting frames no longer waiting. True
+/// when that takes a frame past the iPad's stall allowance, after which its
+/// repair deadline runs out.
+fn credit_starved_silence(
+    waited: &mut HashMap<u32, Duration>,
+    waiting: &[u32],
+    gap: Duration,
+) -> bool {
+    waited.retain(|seq, _| waiting.contains(seq));
+    let mut past = false;
+    for &seq in waiting {
+        let wait = waited.entry(seq).or_default();
+        past |= *wait <= MAX_STALL_ALLOWANCE && *wait + gap > MAX_STALL_ALLOWANCE;
+        *wait += gap;
+    }
+    past
 }
 
 /// The sequence numbers in host stats ranges written like `3-5,9`.
@@ -1714,18 +1751,43 @@ fn lossy_stream_recovers_and_adapts() {
     let mut ipad_now = Instant::now();
     let mut pass_started = ipad_now;
     // While the PC sends nothing, the iPad stops a waiting frame's repair
-    // deadline, by at most MAX_STALL_ALLOWANCE per frame; past that it asks
-    // for a keyframe, as specified. On a starved machine the host's sender
-    // went silent for 350-600 ms twice in one run with a frame waiting for
-    // its repair, and the fake iPad rightly asked twice. Each such silence
-    // on the iPad's clock, longer than the allowance while an incomplete
-    // frame waits, may cost one request. A slow encoder's quiet gaps between
-    // whole frames do not count. Without such a silence the bound stays one.
-    let mut last_media: Option<(Instant, u8)> = None;
-    let mut pc_silences = 0u32;
-    let silent_past_allowance = |last: Option<(Instant, u8)>, now: Instant| {
-        last.is_some_and(|(at, waiting)| waiting > 0 && now - at > MAX_STALL_ALLOWANCE)
+    // deadline, by at most MAX_STALL_ALLOWANCE in all per frame; past that it
+    // asks for a keyframe, as specified. On a starved machine the host's
+    // sender went silent for 350-600 ms twice in one run with a frame
+    // waiting for its repair, and the fake iPad rightly asked twice. So a
+    // stall episode, a waiting frame whose silences on the iPad's clock add
+    // up past the allowance, may cost one request, at most
+    // MAX_STALL_EPISODES a run. Only a starved host's silences add up: one
+    // longer than two frame periods, in which the encoder finished at most
+    // the frame that ends it, with at most STARVED_BACKLOG frames encoded
+    // and unsent at its end. A sender that stops to serve each NACK while
+    // the encoder runs on has frames piling up behind it, its four-frame
+    // channel full and one more held, so its silences never count. Without
+    // an episode the bound stays one.
+    const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
+    const MAX_STALL_EPISODES: u32 = 3;
+    const STARVED_BACKLOG: u64 = 3;
+    let host_frames = || {
+        let stats = eternal_host::stats::PIPELINE_STATS.lock();
+        (stats.encode_frame_count, stats.transport_packets_sent)
     };
+    let starved_silence =
+        |last: Option<(Instant, u64)>, now: Instant, encoded: u64, unsent: u64| {
+            last.and_then(|(at, encoded_then)| {
+                let gap = now - at;
+                (gap > FRAME_PERIOD * 2 && encoded <= encoded_then + 1 && unsent <= STARVED_BACKLOG)
+                    .then_some(gap)
+            })
+        };
+    // The iPad's time and the host's encoded frames at the last media
+    // datagram, and the frames waiting after it.
+    let mut last_media: Option<(Instant, u64)> = None;
+    let mut waiting: Vec<u32> = Vec::new();
+    // The fewest frames encoded and not sent: those the host skipped before
+    // the session's first keyframe.
+    let mut never_sent = u64::MAX;
+    let mut starved_waits = HashMap::new();
+    let mut stall_episodes = 0u32;
     // Match the app's independent decode queue. Synchronous software decode
     // here can stall socket reads through a repair deadline on a busy runner,
     // even when the retransmit is already waiting in the kernel buffer.
@@ -1795,16 +1857,24 @@ fn lossy_stream_recovers_and_adapts() {
                         header.frag_index,
                         header.is_retransmit,
                     ));
-                    if silent_past_allowance(last_media, ipad_now) {
-                        pc_silences += 1;
-                        eprintln!(
-                            "NACK_E2E_PC_SILENT ms={} elapsed_ms={}",
-                            last_media.map_or(0, |(at, _)| (ipad_now - at).as_millis()),
-                            started.elapsed().as_millis()
-                        );
+                    let (encoded, sent) = host_frames();
+                    let unsent = encoded.saturating_sub(sent);
+                    never_sent = never_sent.min(unsent);
+                    if let Some(gap) =
+                        starved_silence(last_media, ipad_now, encoded, unsent - never_sent)
+                    {
+                        if credit_starved_silence(&mut starved_waits, &waiting, gap) {
+                            stall_episodes += 1;
+                            eprintln!(
+                                "NACK_E2E_STALL_EPISODE silent_ms={} elapsed_ms={}",
+                                gap.as_millis(),
+                                started.elapsed().as_millis()
+                            );
+                        }
                     }
                     assembler.add_media(header, payload, ipad_now);
-                    last_media = Some((ipad_now, assembler.counters().assembler_depth));
+                    last_media = Some((ipad_now, encoded));
+                    waiting = assembler.waiting_frames().collect();
                 }
             } else if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&bytes[..len]) {
                 abr_down |= hb.stream_config.bitrate_bps < 15_000_000;
@@ -1852,7 +1922,11 @@ fn lossy_stream_recovers_and_adapts() {
             }));
         }
     }
-    pc_silences += u32::from(silent_past_allowance(last_media, ipad_now));
+    let (encoded, sent) = host_frames();
+    let unsent = encoded.saturating_sub(sent).saturating_sub(never_sent);
+    if let Some(gap) = starved_silence(last_media, ipad_now, encoded, unsent) {
+        stall_episodes += u32::from(credit_starved_silence(&mut starved_waits, &waiting, gap));
+    }
     let counters = assembler.counters();
     let (sent, retransmits) = {
         let stats = eternal_host::stats::PIPELINE_STATS.lock();
@@ -1889,7 +1963,7 @@ fn lossy_stream_recovers_and_adapts() {
             }
         }
     }
-    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} pc_silences={pc_silences} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
+    eprintln!("NACK_E2E decoded={decoded} sent={sent} requests={requests} stall_episodes={stall_episodes} retransmits={retransmits} decode_queue_drops={decode_queue_drops} counters={counters:?}");
     assert!(
         sent >= 600,
         "fifteen-second stream must make sustained progress"
@@ -1899,9 +1973,10 @@ fn lossy_stream_recovers_and_adapts() {
         "at least 97% of sent frames must decode"
     );
     assert!(
-        requests <= 1 + pc_silences,
+        requests <= 1 + stall_episodes.min(MAX_STALL_EPISODES),
         "no keyframe storm during the fifteen-second window: {requests} requests, \
-         {pc_silences} silences of the PC past the iPad's allowance"
+         {stall_episodes} stall episodes of a starved host, at most \
+         {MAX_STALL_EPISODES} excused"
     );
     assert!(
         counters.frags_repaired > 0 && retransmits > 0,
@@ -2065,7 +2140,9 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 /// encoder watchdog, which restarts the pipeline: a known limitation of
 /// that watchdog, not of HEVC. The restarted stream is a new epoch and must
 /// negotiate HEVC again, from an IRAP with parameter sets, so every check
-/// here holds within each epoch.
+/// here holds within each epoch. Only one such restart, the watchdog's, is
+/// allowed, and the last epoch alone must decode the frames: an encoder that
+/// keeps failing does not pass by adding up short epochs.
 #[test]
 fn hevc_stream_negotiates_and_decodes() {
     use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
@@ -2124,16 +2201,24 @@ fn hevc_stream_negotiates_and_decodes() {
     let mut hevc_codec_advertised = false;
     let mut highest_seq = 0u32;
     let origin = Instant::now();
+    // The supervisor's restarts logged before the first HEVC epoch.
+    let mut restarts_before = 0;
+    let decoded_last_epoch = |decoded: &[(u32, u64)], epochs: &[u32]| {
+        decoded
+            .iter()
+            .filter(|(epoch, _)| Some(epoch) == epochs.last())
+            .count()
+    };
 
-    while decoded_hevc.len() < WANT_DECODED_FRAMES
+    while decoded_last_epoch(&decoded_hevc, &hevc_epochs) < WANT_DECODED_FRAMES
         || !hevc_parameter_sets_seen
         || !hevc_codec_advertised
     {
         assert!(
             Instant::now() < deadline,
-            "timed out: decoded={}, vps_seen={hevc_parameter_sets_seen}, \
+            "timed out: decoded={}, epochs={hevc_epochs:?}, vps_seen={hevc_parameter_sets_seen}, \
              advertised={hevc_codec_advertised} (reassembly: {:?})",
-            decoded_hevc.len(),
+            decoded_last_epoch(&decoded_hevc, &hevc_epochs),
             reassembler.counters()
         );
 
@@ -2178,6 +2263,19 @@ fn hevc_stream_negotiates_and_decodes() {
                     if parameter_sets {
                         hevc_parameter_sets_seen = true;
                         hevc_epochs.push(header.stream_epoch);
+                        let restarts = RESTARTS.lock().unwrap().clone();
+                        if hevc_epochs.len() == 1 {
+                            restarts_before = restarts.len();
+                        } else {
+                            let restarts = &restarts[restarts_before..];
+                            assert!(
+                                hevc_epochs.len() == 2
+                                    && restarts.len() == 1
+                                    && restarts[0].starts_with("encoder silent for "),
+                                "only the encoder watchdog, once, may restart the HEVC \
+                                 stream: epochs {hevc_epochs:?}, restarts {restarts:?}"
+                            );
+                        }
                         assert!(
                             eternal_wire::hevc::contains_keyframe(&frame_bytes),
                             "the first HEVC frame must be an IRAP keyframe"

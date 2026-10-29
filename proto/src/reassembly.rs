@@ -163,6 +163,13 @@ impl Reassembler {
     pub fn pending_frames(&self) -> usize {
         self.pending.len()
     }
+    /// The frames still missing fragments, oldest first.
+    pub fn waiting_frames(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pending
+            .iter()
+            .filter(|(_, frame)| !frame.complete())
+            .map(|(&seq, _)| seq)
+    }
     pub fn latest_completed_seq(&self) -> u32 {
         self.latest_completed_seq
     }
