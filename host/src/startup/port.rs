@@ -310,23 +310,57 @@ mod tests {
         assert_eq!(super::held(), None);
     }
 
-    /// The check binds IPv4 like the stream; a dual-stack IPv6 socket on the
-    /// port blocks the stream too, and the check sees it.
+    /// The stream binds IPv4 only. Whether a dual-stack IPv6 socket on the
+    /// port blocks it is Windows' choice (a plain one doesn't); the check
+    /// agrees with the stream's own bind either way, and names the holder
+    /// from the IPv6 table when blocked.
     #[cfg(windows)]
     #[test]
-    fn a_dual_stack_holder_is_seen() {
+    fn a_dual_stack_holder_blocks_the_check_exactly_when_it_blocks_the_stream() {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET};
+        const SO_EXCLUSIVEADDRUSE: i32 = !4;
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let socket =
-            socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None).unwrap();
-        socket.set_only_v6(false).unwrap();
-        socket
-            .bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
-            .unwrap();
-        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
-        assert!(!check_as(port, 0));
-        assert!(matches!(super::held().unwrap().by, HeldBy::Program(_)));
-        drop(socket);
-        assert!(check_as(port, 0));
+        for exclusive in [false, true] {
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None).unwrap();
+            socket.set_only_v6(false).unwrap();
+            if exclusive {
+                let on = 1i32.to_ne_bytes();
+                let set = unsafe {
+                    setsockopt(
+                        SOCKET(socket.as_raw_socket() as usize),
+                        SOL_SOCKET,
+                        SO_EXCLUSIVEADDRUSE,
+                        Some(&on),
+                    )
+                };
+                assert_eq!(set, 0);
+            }
+            socket
+                .bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
+                .unwrap();
+            let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+            let free = check_as(port, 0);
+            // As `transport::start_sender` binds.
+            let stream = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+                .unwrap()
+                .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into());
+            assert_eq!(free, stream.is_ok(), "exclusive: {exclusive}");
+            if !free {
+                assert!(
+                    matches!(super::held().unwrap().by, HeldBy::Program(_)),
+                    "{:?}",
+                    super::held()
+                );
+            }
+            eprintln!(
+                "dual-stack, exclusive {exclusive}: blocks the stream: {}",
+                !free
+            );
+            drop(socket);
+            assert!(check_as(port, 0));
+        }
     }
 
     #[test]

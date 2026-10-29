@@ -537,8 +537,9 @@ mod tests {
         );
     }
 
-    /// The real mutex: an empty DACL refuses this process as another
-    /// account's elevated host would.
+    /// The real mutex: an empty DACL (not a null one, which admits
+    /// everyone) refuses this process as another account's elevated host
+    /// would.
     #[cfg(windows)]
     #[test]
     fn a_real_mutex_this_launch_may_not_open_means_a_host_is_running() {
@@ -546,12 +547,13 @@ mod tests {
         use windows::core::HSTRING;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Security::{
-            InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
-            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL,
+            ACL_REVISION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
         };
         use windows::Win32::System::Threading::CreateMutexW;
 
         let name = format!(r"Local\EternalMonitor-test-denied-{}", std::process::id());
+        let mut acl = ACL::default();
         let mut descriptor = SECURITY_DESCRIPTOR::default();
         let pointer = PSECURITY_DESCRIPTOR(&mut descriptor as *mut _ as *mut _);
         let attributes = SECURITY_ATTRIBUTES {
@@ -560,9 +562,10 @@ mod tests {
             bInheritHandle: false.into(),
         };
         let first = unsafe {
-            // Revision 1; a present, empty DACL grants nobody access.
+            // Revision 1; a present DACL with no entries grants nobody access.
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION).unwrap();
             InitializeSecurityDescriptor(pointer, 1).unwrap();
-            SetSecurityDescriptorDacl(pointer, true, None, false).unwrap();
+            SetSecurityDescriptorDacl(pointer, true, Some(&acl as *const ACL), false).unwrap();
             CreateMutexW(Some(&attributes), false, &HSTRING::from(name.as_str())).unwrap()
         };
         assert!(claim_named(&name, None).is_none(), "an ordinary launch");
