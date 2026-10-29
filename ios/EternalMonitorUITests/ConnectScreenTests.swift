@@ -26,6 +26,10 @@ final class ConnectScreenTests: UITestCase {
     func testSettingsOpenAndDismiss() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
+        // Any free port for the USB listener: on a Mac running another
+        // simulator's app, 9877 can be taken, and the card then says the
+        // cable can't be used instead of asking for one.
+        app.launchEnvironment["EM_USB_PORT"] = "0"
         launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
@@ -35,27 +39,24 @@ final class ConnectScreenTests: UITestCase {
         let allowUSB = app.switches["settings.allowUSB"]
         XCTAssertTrue(allowUSB.exists)
         // Start from USB on. The setting is saved, so a run that failed
-        // between the two taps below left it off for every later run. A
+        // between the two presses below left it off for every later run. A
         // launch argument can't set it: it would shadow the toggle.
-        if allowUSB.value as? String == "0" {
-            allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        }
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "1"), "\(allowUSB.value ?? "nil")")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "settings"
         screenshot.lifetime = .keepAlways
         add(screenshot)
-        // SwiftUI exposes the whole form row as a switch. Tap its thumb.
-        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        // The switch's value can update a moment after the tap returns.
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "0"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "0"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
+        // The connect screen stays in the tree under the sheet, so wait for
+        // the sheet itself to go before opening it again.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.navigationBars["Settings"])
+        waitForExpectations(timeout: 30)
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
         XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "Off. Turn on to connect with a cable.")
         settings.tap()
         XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
-        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "1"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
@@ -241,5 +242,24 @@ final class ConnectScreenTests: UITestCase {
         let changed = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@", value), object: element)
         return XCTWaiter().wait(for: [changed], timeout: 5) == .completed
+    }
+
+    /// Presses `element` until its value is `value`, at most three times. On
+    /// CI a tap on the settled sheet was lost: the switch kept its value for
+    /// 5 s. As in AudioStreamTests, the press lasts more than one busy frame,
+    /// and the value is read again before pressing again, so a late press
+    /// is never undone. A switch that doesn't change still fails.
+    private func setSwitch(_ element: XCUIElement, to value: String) -> Bool {
+        // Read the value directly: a predicate wait polls about once a
+        // second, so a short one may never look.
+        for _ in 0..<3 where element.value as? String != value {
+            expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: element)
+            waitForExpectations(timeout: 5)
+            // SwiftUI exposes the whole form row as a switch. Press its thumb.
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).press(forDuration: 0.15)
+            // The switch's value can update a moment after the press returns.
+            if switchValue(of: element, becomes: value) { return true }
+        }
+        return element.value as? String == value
     }
 }

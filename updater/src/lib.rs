@@ -688,8 +688,12 @@ mod tests {
             &app,
             format!(
                 "#!/bin/sh
+# A copy that runs but never says so, for the cleanup test.
+[ \"$1\" = hang ] && while :; do sleep 1; done
 if [ \"$1\" = linger ]; then
   touch '{d}/lingering'
+  # Until killed, a second at a time, so no sleep outlives it for long.
+  [ \"$2\" = forever ] && while :; do sleep 1; done
   sleep \"$2\"
   rm '{d}/lingering'
   exit 0
@@ -737,14 +741,55 @@ touch '{d}/setup-ran'
         pid
     }
 
+    /// A copy of the app in its own process group. Dropping it kills the
+    /// group, the script and its sleep, and reaps the script, so a test
+    /// that fails, even before the copy started, leaves nothing running.
     #[cfg(unix)]
-    fn linger(app: &Path, seconds: &str, dir: &Path) -> std::process::Child {
-        let child = Command::new(app).args(["linger", seconds]).spawn().unwrap();
+    struct Copy(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for Copy {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn linger(app: &Path, seconds: &str, dir: &Path) -> Copy {
+        linger_within(app, &["linger", seconds], dir, Duration::from_secs(60))
+    }
+
+    /// Starts a copy with `args` and waits up to `backstop` for it to say it
+    /// is running; the helper must not look before then.
+    #[cfg(unix)]
+    fn linger_within(app: &Path, args: &[&str], dir: &Path, backstop: Duration) -> Copy {
+        use std::os::unix::process::CommandExt;
+        let copy = Copy(
+            Command::new(app)
+                .args(args)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
         let start = std::time::Instant::now();
-        while !dir.join("lingering").exists() && start.elapsed() < Duration::from_secs(5) {
+        while !dir.join("lingering").exists() {
+            assert!(start.elapsed() < backstop, "the copy never started");
             std::thread::sleep(Duration::from_millis(20));
         }
-        child
+        copy
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_never_starts_is_killed_with_the_failing_test() {
+        let (dir, args) = lingering_case("never-starts");
+        let failed = std::panic::catch_unwind(|| {
+            linger_within(&args.app, &["hang"], &dir, Duration::from_millis(300))
+        });
+        assert!(failed.is_err(), "the copy said it started");
+        assert_eq!(unix_processes_running(&args.app), Ok(Vec::new()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -755,7 +800,7 @@ touch '{d}/setup-ran'
         args.host_pid = closing_host();
         let mut out = Vec::new();
         run_with(args.clone(), &mut out, Duration::from_secs(10));
-        let _ = copy.wait();
+        let _ = copy.0.wait();
         let log = std::fs::read_to_string(&args.log).unwrap();
         assert!(dir.join("setup-ran").exists(), "{log}");
         assert!(
@@ -769,12 +814,13 @@ touch '{d}/setup-ran'
     #[test]
     fn a_copy_of_the_app_that_does_not_close_skips_setup_and_relaunches() {
         let (dir, mut args) = lingering_case("stuck-copy");
-        let mut copy = linger(&args.app, "30", &dir);
+        // It lingers until killed: on a loaded Mac, ps took 132 s to list
+        // the processes, and a copy that left meanwhile was not in the list.
+        let copy = linger(&args.app, "forever", &dir);
         args.host_pid = closing_host();
         let mut out = Vec::new();
         let code = run_with(args.clone(), &mut out, Duration::from_millis(2000));
-        copy.kill().unwrap();
-        let _ = copy.wait();
+        drop(copy);
         let log = std::fs::read_to_string(&args.log).unwrap();
         assert_eq!(code, 0, "{log}");
         assert!(!dir.join("setup-ran").exists(), "{log}");
@@ -782,9 +828,9 @@ touch '{d}/setup-ran'
             log.contains("another EternalMonitor process did not close"),
             "{log}"
         );
-        // The user still gets the app back.
+        // The user still gets the app back; the wait is only a backstop.
         let start = std::time::Instant::now();
-        while !dir.join("relaunched").exists() && start.elapsed() < Duration::from_secs(5) {
+        while !dir.join("relaunched").exists() && start.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(dir.join("relaunched").exists(), "{log}");
