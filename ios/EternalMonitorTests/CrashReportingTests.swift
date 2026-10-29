@@ -36,18 +36,18 @@ final class CrashReportingTests: XCTestCase {
             + " exception_type=1(EXC_BAD_ACCESS) exception_code=2 signal=11(SIGSEGV) objc_exception=- thread=attributed"
             + " frames=libsystem_kernel.dylib+0x1a2b00,EternalMonitor+0x1a2b10,EternalMonitor+0x1a2b20,EternalMonitor+0x1a2b30,"
             + "EternalMonitor+0x1a2b40,EternalMonitor+0x1a2b50,EternalMonitor+0x1a2b60,EternalMonitor+0x1a2b70"
-            + " termination_reason=\"Namespace SIGNAL, Code 11 Segmentation fault: 11\"")
+            + " termination=namespace:SIGNAL code:11")
         var objc = crash(perThreadTree(frames: 2), reason: nil)
         objc.exceptionType = 10
         objc.signal = 6
         objc.objcException = "NSRangeException"
         XCTAssertTrue(objc.line.hasSuffix("exception_type=10(EXC_CRASH) exception_code=2 signal=6(SIGABRT)"
             + " objc_exception=NSRangeException thread=attributed frames=libsystem_kernel.dylib+0x1a2b00,EternalMonitor+0x1a2b10"
-            + " termination_reason=-"), objc.line)
+            + " termination=-"), objc.line)
         // Values MetricKit left out, and a tree it couldn't give.
         let bare = MetricKitDiagnostic(kind: .crash, appVersion: "", build: "", osVersion: "", at: at)
         XCTAssertEqual(bare.line, "MetricKit crash app=- build=- os=ipados:0.0 os_build=- at=2026-10-26T07:33:20Z exception_type=-"
-            + " exception_code=- signal=- objc_exception=- thread=- frames=- termination_reason=-")
+            + " exception_code=- signal=- objc_exception=- thread=- frames=- termination=-")
         XCTAssertEqual(MetricKitDiagnostic.topFrames(Data("not json".utf8)).frames, [])
     }
 
@@ -78,20 +78,65 @@ final class CrashReportingTests: XCTestCase {
             + " \"quoted\" \\ " + String(repeating: "watchdog transgression ", count: 2000)
         let long = crash(perThreadTree(frames: 50, binary: String(repeating: "ß/x", count: 500)), reason: reason)
         let line = long.line
-        XCTAssertLessThanOrEqual(line.utf8.count, 8192)
         XCTAssertLessThan(line.utf8.count, 2048, "every field is bounded")
         XCTAssertFalse(line.contains("\n"))
-        XCTAssertFalse(line.contains("/private"), line)
-        XCTAssertFalse(line.contains("@rpath"), line)
-        XCTAssertTrue(line.contains("termination_reason=\"Namespace DYLD, Code 1 Library missing Library not loaded: <path> | Referenced from: <path> quoted watchdog"), line)
-        let shown = line.components(separatedBy: "termination_reason=\"")[1].dropLast()
-        XCTAssertLessThanOrEqual(shown.utf8.count, MetricKitDiagnostic.maxReasonBytes)
-        XCTAssertFalse(shown.contains("\""))
+        XCTAssertTrue(line.hasSuffix(" termination=namespace:DYLD code:1"), line)
         let frames = line.components(separatedBy: " frames=")[1].components(separatedBy: " ")[0].split(separator: ",")
         XCTAssertEqual(frames.count, MetricKitDiagnostic.topFrames)
         XCTAssertEqual(frames[1], Substring(String(repeating: "__x", count: 21) + "_+0x1a2b10"), "names are ASCII tokens of 64 at most")
         // The support log and the upload cut at 8 KiB anyway; the line is far inside.
         XCTAssertEqual(SupportDiagnostics.redact(line), line)
+    }
+
+    /// The termination reason's description can name a file, and so the
+    /// user: only its namespace and code reach the line.
+    func testOnlyTheTerminationNamespaceAndCodeAreKept() {
+        let leak = "/private/var/mobile/Containers/Data/Application/1D2C/Documents/Ali Younes Reports/private.dylib"
+        let uuid = "70B89F27-1634-3580-A695-57CDB41D7743"
+        let cases: [(String, String)] = [
+            ("Namespace DYLD, Code 1 Library missing | Library not loaded: \(leak)", "namespace:DYLD code:1"),
+            ("Library not loaded: \(leak)", "other"),
+            ("Namespace CODESIGNING, Code 2 Invalid Page in \(uuid)", "namespace:CODESIGNING code:2"),
+            ("\(uuid) Namespace SIGNAL, Code 11", "other"),
+            ("Namespace SPRINGBOARD, Code 0x8badf00d", "namespace:SPRINGBOARD code:0x8badf00d"),
+            ("Namespace Ali Younes, Code 1", "other"),
+            ("Namespace SIGNAL, Code 11Younes", "other"),
+            ("", "other"),
+        ]
+        for (reason, shown) in cases {
+            let line = crash(reason: reason).line
+            XCTAssertTrue(line.hasSuffix(" termination=\(shown)"), line)
+            for word in ["Ali", "Younes", "Reports", "private", "Documents", uuid] {
+                XCTAssertFalse(line.contains(word), "\(word) in \(line)")
+            }
+        }
+    }
+
+    /// An exception name is only Apple's kind of name; anything else could
+    /// be text an app or library chose.
+    func testOnlyApplesExceptionNamesAreKept() {
+        for (name, shown) in [("NSRangeException", "NSRangeException"), ("NSInvalidArgumentException", "NSInvalidArgumentException"),
+                              ("CALayerInvalidGeometry", "CALayerInvalidGeometry"), ("AliYounes", "other"),
+                              ("Ali Younes", "other"), ("NSAli YounesException", "other"), ("NSRangeException\n", "other"),
+                              ("NS\(String(repeating: "A", count: 61))Exception", "other"), ("", "other")] {
+            var objc = crash()
+            objc.objcException = name
+            XCTAssertTrue(objc.line.contains(" objc_exception=\(shown) thread="), objc.line)
+        }
+    }
+
+    /// UUIDs and long hex or base64 runs are taken out of any part of a
+    /// line, such as a binary name.
+    func testIdentifiersAreTakenOutOfTheWholeLine() {
+        for (binary, shown) in [("70B89F27-1634-3580-A695-57CDB41D7743", "<id>"), ("lib70b89f2716343580a6.dylib", "<id>.dylib"),
+                                ("Plugin_0123456789abcdef", "Plugin_<id>"), ("dGhpcyBpcyBhIHNlY3JldDEyMw", "<id>"),
+                                ("libswiftCore.dylib", "libswiftCore.dylib"), ("AGXMetalG13X", "AGXMetalG13X"),
+                                ("ScreenTimeSettingsUIExtension", "ScreenTimeSettingsUIExtension")] {
+            let line = crash(perThreadTree(frames: 2, binary: binary)).line
+            XCTAssertTrue(line.contains(",\(shown)+0x1a2b10 "), line)
+        }
+        XCTAssertEqual(MetricKitDiagnostic.scrub("exception_code=-9223372036854775808 frames=dyld+0x1a2b00"),
+                       "exception_code=-9223372036854775808 frames=dyld+0x1a2b00", "decimal numbers and offsets stay")
     }
 
     func testExitCountsAreOneLineOfCounts() {
@@ -102,7 +147,18 @@ final class CrashReportingTests: XCTestCase {
         XCTAssertEqual(exits.line, "MetricKit exits app=0.3.4 build=370 os=ipados:26.1 os_build=23B85 versions=one"
             + " from=2026-10-25T07:33:20Z to=2026-10-26T07:33:20Z"
             + " fg_normal=12 fg_abnormal=1 fg_memory_limit=2 fg_watchdog=3 fg_bad_access=4 fg_illegal_instruction=5"
-            + " bg_normal=30 bg_abnormal=0 bg_memory_limit=6 bg_watchdog=0 bg_bad_access=0 bg_illegal_instruction=0")
+            + " bg_normal=30 bg_abnormal=0 bg_memory_limit=6 bg_watchdog=0 bg_bad_access=0 bg_illegal_instruction=0"
+            + " bg_cpu_limit=0 bg_memory_pressure=0 bg_locked_file=0 bg_task_timeout=0")
+    }
+
+    /// The exits only a background app has are counted on their own.
+    func testBackgroundOnlyExitsAreCounted() {
+        let exits = MetricKitExits(appVersion: "0.3.4", build: "370", osVersion: "iPadOS 26.1 (23B85)", multipleVersions: false,
+                                   from: at.addingTimeInterval(-86_400), to: at, foreground: .init(), background: .init(),
+                                   backgroundOnly: .init(cpuLimit: 1, memoryPressure: 2, lockedFile: 3, taskTimeout: 4))
+        XCTAssertTrue(exits.line.hasSuffix(" fg_normal=0 fg_abnormal=0 fg_memory_limit=0 fg_watchdog=0 fg_bad_access=0 fg_illegal_instruction=0"
+            + " bg_normal=0 bg_abnormal=0 bg_memory_limit=0 bg_watchdog=0 bg_bad_access=0 bg_illegal_instruction=0"
+            + " bg_cpu_limit=1 bg_memory_pressure=2 bg_locked_file=3 bg_task_timeout=4"), exits.line)
     }
 
     func testEachReportHasItsLevelAndCategory() {

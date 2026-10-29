@@ -52,9 +52,11 @@ final class CrashReporting: NSObject, MXMetricManagerSubscriber, @unchecked Send
 }
 
 /// One MetricKit crash, hang or CPU exception, reduced to what its log line
-/// shows: the exception, the signal, the termination reason, the versions
-/// and the top of the stack. The VM region info is left out, since it can
-/// name the files mapped near the faulting address.
+/// shows: the exception, the signal, the termination namespace and code, the
+/// versions and the top of the stack. No free text from MetricKit reaches the
+/// line: the VM region info, the termination reason's description and the
+/// Objective-C exception's message can name files or the user, so they are
+/// left out.
 struct MetricKitDiagnostic: Equatable {
     enum Kind: String {
         case crash, hang
@@ -77,7 +79,6 @@ struct MetricKitDiagnostic: Equatable {
     }
 
     static let topFrames = 8
-    static let maxReasonBytes = 512
 
     var kind: Kind
     var appVersion: String
@@ -90,6 +91,8 @@ struct MetricKitDiagnostic: Equatable {
     var signal: Int64? = nil
     /// An uncaught Objective-C exception's name, such as NSRangeException.
     var objcException: String? = nil
+    /// MetricKit's termination reason, such as "Namespace SIGNAL, Code 11
+    /// Segmentation fault: 11". Only its namespace and code are shown.
     var terminationReason: String? = nil
     var seconds: Double? = nil
     var sampledSeconds: Double? = nil
@@ -107,7 +110,7 @@ struct MetricKitDiagnostic: Equatable {
             parts.append("exception_type=\(Self.number(exceptionType, Self.exceptionNames))")
             parts.append("exception_code=\(exceptionCode.map(String.init) ?? "-")")
             parts.append("signal=\(Self.number(signal, Self.signalNames))")
-            parts.append("objc_exception=\(objcException.map(Self.token) ?? "-")")
+            parts.append("objc_exception=\(objcException.map(Self.exceptionName) ?? "-")")
         case .hang:
             parts.append("duration_ms=\(Self.milliseconds(seconds))")
         case .cpuException:
@@ -116,10 +119,9 @@ struct MetricKitDiagnostic: Equatable {
         parts.append("thread=\(frames.isEmpty ? "-" : attributed ? "attributed" : "first")")
         parts.append("frames=\(frames.isEmpty ? "-" : frames.map { "\($0.binary)+0x\(String($0.offset, radix: 16))" }.joined(separator: ","))")
         if kind == .crash {
-            // Free text goes last, so every token before it parses alike.
-            parts.append("termination_reason=\(terminationReason.map { "\"\(Self.reason($0))\"" } ?? "-")")
+            parts.append("termination=\(terminationReason.map(Self.termination) ?? "-")")
         }
-        return parts.joined(separator: " ")
+        return Self.scrub(parts.joined(separator: " "))
     }
 
     // MARK: - Tokens
@@ -147,14 +149,43 @@ struct MetricKitDiagnostic: Equatable {
         return ["os=\(SessionSummary.osToken(version))", "os_build=\(build)"]
     }
 
-    /// A termination reason on one line, without paths or quotes, within
-    /// `maxReasonBytes`. A dyld or code-signing reason can name a file.
-    static func reason(_ text: String) -> String {
-        let words = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).map { word in
-            word.contains("/") ? "<path>" : String(word.unicodeScalars.filter { $0.value >= 0x20 && $0 != "\"" && $0 != "\\" }.map(Character.init))
-        }.filter { !$0.isEmpty }
-        var bytes = 0
-        return String(words.joined(separator: " ").prefix { bytes += $0.utf8.count; return bytes <= maxReasonBytes })
+    /// `namespace:<NAMESPACE> code:<code>` from a termination reason that
+    /// starts "Namespace SIGNAL, Code 11" or "Namespace SPRINGBOARD, Code
+    /// 0x8badf00d"; the description after the code is dropped. Any other
+    /// reason is `other`.
+    static func termination(_ text: String) -> String {
+        guard let match = text.range(of: #"^\s*Namespace [A-Z][A-Z0-9_]{0,31}, Code (0x[0-9A-Fa-f]{1,16}|[0-9]{1,20})(?![0-9A-Za-z])"#,
+                                     options: .regularExpression) else { return "other" }
+        let words = text[match].split(whereSeparator: { $0 == " " || $0 == "," })
+        return "namespace:\(words[1]) code:\(words[3])"
+    }
+
+    /// An Objective-C exception name as Apple's classes name them, such as
+    /// NSRangeException; any other name, which an app or library could fill
+    /// with anything, is `other`.
+    static func exceptionName(_ name: String) -> String {
+        name.range(of: #"\ANS[A-Za-z]{1,60}Exception\z"#, options: .regularExpression) != nil
+            || appleExceptionNames.contains(name) ? name : "other"
+    }
+
+    /// Apple's exception names that don't follow the NS…Exception pattern.
+    static let appleExceptionNames: Set<String> = [
+        "CALayerInvalid", "CALayerInvalidGeometry", "UIViewControllerHierarchyInconsistency",
+        "UIApplicationInvalidInterfaceOrientation",
+    ]
+
+    /// The last pass over a whole line: UUIDs, long hex runs and long
+    /// base64-like runs become `<id>`, wherever they are. A binary name can
+    /// carry one.
+    static func scrub(_ line: String) -> String {
+        [#"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#,
+         // 16 hex digits or more with a letter among them (offsets stay far
+         // shorter, and decimal counts and codes have no letter).
+         #"(?<![0-9A-Za-z])(0x)?(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Za-z])"#,
+         // 20 letters, digits, `_` or `-` or more, with letters and digits
+         // both present. `=`, `+` and `.` split it, as they split the fields.
+         #"(?<![0-9A-Za-z_-])(?=[0-9A-Za-z_-]*[0-9])(?=[0-9A-Za-z_-]*[A-Za-z])[0-9A-Za-z_-]{20,}(?![0-9A-Za-z_-])"#]
+            .reduce(line) { $0.replacingOccurrences(of: $1, with: "<id>", options: .regularExpression) }
     }
 
     private static func milliseconds(_ seconds: Double?) -> String {
@@ -261,6 +292,19 @@ extension MetricKitDiagnostic {
 /// MetricKit's daily app exit counts, in the foreground and the background.
 /// Counts only, one line per payload.
 struct MetricKitExits: Equatable {
+    /// The exits only a background app has.
+    struct BackgroundOnly: Equatable {
+        var cpuLimit = 0
+        var memoryPressure = 0
+        var lockedFile = 0
+        var taskTimeout = 0
+
+        var tokens: [String] {
+            [("cpu_limit", cpuLimit), ("memory_pressure", memoryPressure), ("locked_file", lockedFile), ("task_timeout", taskTimeout)]
+                .map { "bg_\($0.0)=\(max(0, $0.1))" }
+        }
+    }
+
     struct Counts: Equatable {
         var normal = 0
         var abnormal = 0
@@ -285,13 +329,14 @@ struct MetricKitExits: Equatable {
     var to: Date
     var foreground: Counts
     var background: Counts
+    var backgroundOnly = BackgroundOnly()
 
     var line: String {
-        (["MetricKit exits", "app=\(MetricKitDiagnostic.token(appVersion))", "build=\(MetricKitDiagnostic.token(build))"]
-            + MetricKitDiagnostic.osTokens(osVersion)
-            + ["versions=\(multipleVersions ? "multiple" : "one")", "from=\(timestamp(from))", "to=\(timestamp(to))"]
-            + foreground.tokens("fg") + background.tokens("bg"))
-            .joined(separator: " ")
+        var parts = ["MetricKit exits", "app=\(MetricKitDiagnostic.token(appVersion))", "build=\(MetricKitDiagnostic.token(build))"]
+        parts += MetricKitDiagnostic.osTokens(osVersion)
+        parts += ["versions=\(multipleVersions ? "multiple" : "one")", "from=\(timestamp(from))", "to=\(timestamp(to))"]
+        parts += foreground.tokens("fg") + background.tokens("bg") + backgroundOnly.tokens
+        return MetricKitDiagnostic.scrub(parts.joined(separator: " "))
     }
 }
 
@@ -316,7 +361,11 @@ extension MetricKitExits {
                                badAccess: fg.cumulativeBadAccessExitCount, illegalInstruction: fg.cumulativeIllegalInstructionExitCount),
             background: Counts(normal: bg.cumulativeNormalAppExitCount, abnormal: bg.cumulativeAbnormalExitCount,
                                memoryLimit: bg.cumulativeMemoryResourceLimitExitCount, watchdog: bg.cumulativeAppWatchdogExitCount,
-                               badAccess: bg.cumulativeBadAccessExitCount, illegalInstruction: bg.cumulativeIllegalInstructionExitCount))
+                               badAccess: bg.cumulativeBadAccessExitCount, illegalInstruction: bg.cumulativeIllegalInstructionExitCount),
+            backgroundOnly: BackgroundOnly(cpuLimit: bg.cumulativeCPUResourceLimitExitCount,
+                                           memoryPressure: bg.cumulativeMemoryPressureExitCount,
+                                           lockedFile: bg.cumulativeSuspendedWithLockedFileExitCount,
+                                           taskTimeout: bg.cumulativeBackgroundTaskAssertionTimeoutExitCount))
     }
 }
 
