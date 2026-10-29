@@ -9,7 +9,10 @@ config never blocks or degrades a PC or iPad that works.** It may only
   default (a shorter wait would fail PCs and iPads that are slow but work),
 - start Second screen sessions in the mirror on narrowly named hardware
   where the second screen is known not to start, which the user can always
-  override with Try again.
+  override with Try again,
+- choose how the PC's window draws (DX12, Vulkan or WARP) on a named
+  graphics vendor and driver range, from the next launch, below the user's
+  own choice and the PC's memory of renderers that crashed.
 
 It has no kill switch, no minimum version, no forced update or downgrade,
 and nothing that turns a feature off for everyone. Every field is optional.
@@ -37,6 +40,7 @@ top-level `schema` stays 1; a newer one would stop old apps' update checks.
 | `windows.config.schema`, `ipad.config.schema` | integer | 1 | whole `config` ignored |
 | `windows.config.attach_timeout_s` | integer seconds | 30–60 | 30 |
 | `windows.config.second_screen_rules` | list of rules | at most 8 | no rules |
+| `windows.config.renderer_rules` | list of rules | at most 8 | no rules |
 | `ipad.config.first_frame_timeout_s` | integer seconds | 10–20 | 10 |
 
 ### Staged update prompt
@@ -117,6 +121,72 @@ mirror. Mirror mode is never affected, and Second screen is never hidden.
 When the manifest drops the rule, or the PC is exempt, a saved
 `hardware_rule` failure is forgotten at the next launch, in that app run
 even if the state file can't be cleared yet.
+
+### Window renderer rules
+
+A driver that crashes the PC's window at start can be steered to another
+backend without a release. Example: Intel driver 31.0.101.x crashes in
+Vulkan, so draw with DX12 there:
+
+```json
+"renderer_rules": [
+  {
+    "vendor": "intel",
+    "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+    "backend": "dx12"
+  }
+]
+```
+
+- `vendor` is `amd`, `intel` or `nvidia`.
+- `driver` is optional: a Windows driver version range with inclusive
+  bounds, `min`, `max` or both. Each bound has four numbers, and `min` ≤
+  `max`. Without `driver`, the rule names every driver of that vendor. The
+  PC compares the bounds with the driver version DXGI reports for the card,
+  which is how its renderer crash memory keys drivers. A card whose driver
+  version isn't known only matches a rule without a range.
+- `backend` is `dx12`, `vulkan` or `warp` (Windows' software renderer).
+- A rule with a key or value the app doesn't know is ignored, so a newer
+  constraint can't widen it on an older app. More than 8 rules, or
+  `renderer_rules` that isn't a list: none apply. As with
+  `second_screen_rules`, `check-versions.sh` refuses the whole manifest for
+  any bad rule.
+
+A rule applies **at the next launch only**: the window's renderer is chosen
+when it starts, from the last manifest the update check saved, and a running
+window never changes renderer. The rule is matched against the graphics card
+the window would draw on anyway (the built-in choice decides, for example
+the NVIDIA card on a laptop that also has an Intel or AMD iGPU), and the
+first rule that names its vendor and driver applies.
+
+What decides the window's backend, highest first:
+
+1. the `WGPU_BACKEND` environment variable;
+2. Settings > Troubleshooting > Window drawing, when it isn't Automatic.
+   A chosen backend that already failed to start the window is set aside,
+   as before, and the automatic choice below draws;
+3. the PC's renderer crash memory: a rule never draws with a backend that
+   failed on that card and driver before, even one the PC would retry
+   after some clean launches;
+4. a matching remote rule;
+5. the built-in choice.
+
+A rule can only choose among the backends the PC lists for that card, or
+WARP. It is ignored when its backend isn't listed (for example after the PC
+narrowed itself to DX12), when the backend lacks the features the window
+needs (Intel's old Vulkan drivers, issue #59), or on a PC with two cards of
+the same model. Each launch logs one line when a rule names the card:
+`renderer_rule applied=intel:31.0.101.2111->dx12`, or `renderer_rule
+ignored reason=env|choice|set_aside|unavailable|incapable|twin_gpus
+rule=…`. Nothing else about the card is logged.
+
+**A bad rule costs at most one failed start per driver version.** The
+launch it steers leaves the same start marker as any other, so if the
+window never appears, the next launch records that backend as failed on
+that card and driver, ignores the rule (`reason=set_aside`) and draws as
+before. The record stays until that backend draws on that driver, the user
+resets crash avoidance in Troubleshooting, or the driver changes. A new
+driver the rule still names gets one try of its own.
 
 The PC saves the manifest's values in `remote-config.json` after each check
 and applies them at the next launch for up to 14 days; with automatic

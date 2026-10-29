@@ -109,6 +109,36 @@ def check_rules(rules):
                         "one Windows build with an update range, like 26100.0 to 26100.2999")
 
 
+def check_renderer_rules(rules):
+    if rules is None:
+        return
+    if not isinstance(rules, list) or len(rules) > 8:
+        raise ValueError("windows.config.renderer_rules must be a list of at most 8 rules")
+    vendors = {"amd", "intel", "nvidia"}
+    backends = {"dx12", "vulkan", "warp"}
+    for index, rule in enumerate(rules):
+        where = f"windows.config.renderer_rules[{index}]"
+        if not isinstance(rule, dict):
+            raise ValueError(f"{where} must be an object")
+        unknown = set(rule) - {"vendor", "driver", "backend"}
+        if unknown:
+            raise ValueError(f"{where} has unknown keys {sorted(unknown)}")
+        if not isinstance(rule.get("vendor"), str) or rule["vendor"] not in vendors:
+            raise ValueError(f"{where}.vendor must be one of {sorted(vendors)}")
+        if not isinstance(rule.get("backend"), str) or rule["backend"] not in backends:
+            raise ValueError(f"{where}.backend must be one of {sorted(backends)}")
+        if "driver" not in rule:
+            continue
+        driver = rule["driver"]
+        if not isinstance(driver, dict) or not driver or set(driver) - {"min", "max"}:
+            raise ValueError(f"{where}.driver must have \"min\", \"max\" or both")
+        ends = {key: version_numbers(value) for key, value in driver.items()}
+        if any(not end or len(end) != 4 for end in ends.values()):
+            raise ValueError(f"{where}.driver ends must be driver versions like 31.0.101.2111")
+        if len(ends) == 2 and ends["min"] > ends["max"]:
+            raise ValueError(f"{where}.driver.min must not be above its max")
+
+
 def check(windows, ipad):
     """Raise ValueError naming the first bad optional field."""
     known = {
@@ -124,6 +154,7 @@ def check(windows, ipad):
         check_note(where, entry.get("note"))
         check_rollout(where, entry.get("rollout"))
     check_config("windows", windows.get("config"),
-                 {"attach_timeout_s": (30, 60), "second_screen_rules": None})
+                 {"attach_timeout_s": (30, 60), "second_screen_rules": None, "renderer_rules": None})
     check_rules((windows.get("config") or {}).get("second_screen_rules"))
+    check_renderer_rules((windows.get("config") or {}).get("renderer_rules"))
     check_config("ipad", ipad.get("config"), {"first_frame_timeout_s": (10, 20)})

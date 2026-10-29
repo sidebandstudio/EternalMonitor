@@ -21,6 +21,13 @@
           "gpu_driver": { "gpu": "amd", "min": "31.0.21001.45000", "max": "31.0.21001.45099" },
           "windows": { "min": "26100.0", "max": "26100.2999" }
         }
+      ],
+      "renderer_rules": [
+        {
+          "vendor": "intel",
+          "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+          "backend": "dx12"
+        }
       ]
     }
   },
