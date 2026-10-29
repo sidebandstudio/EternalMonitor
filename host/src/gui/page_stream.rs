@@ -242,7 +242,8 @@ impl AnalyzerApp {
         self.gpu_error_line(ui);
     }
 
-    /// Why the graphics card setting wasn't saved, when it wasn't.
+    /// Why the graphics card setting wasn't saved, or its restart didn't
+    /// start, when it wasn't.
     pub(super) fn gpu_error_line(&self, ui: &mut Ui) {
         if let Some(error) = &self.gpu_error {
             ui.add(
@@ -254,6 +255,25 @@ impl AnalyzerApp {
                 .wrap(),
             );
         }
+        if matches!(
+            self.restart_refused,
+            Some(crate::relaunch::Reason::GraphicsCard | crate::relaunch::Reason::Plain)
+        ) {
+            self.handoff_line(ui, crate::handoff::Handoff::Update);
+        }
+    }
+
+    /// Where the user asked for an update or a restart: why it waits for
+    /// `refused_by`, which hands over.
+    pub(super) fn handoff_line(&self, ui: &mut Ui, refused_by: crate::handoff::Handoff) {
+        ui.add(
+            egui::Label::new(
+                RichText::new(refused_by.refusal())
+                    .size(SMALL)
+                    .color(WARNING),
+            )
+            .wrap(),
+        );
     }
 
     /// "Restart EternalMonitor" on every page: while the new copy starts,
@@ -951,6 +971,9 @@ pub(super) fn gpu_switch_body(gpu: &str, app_gpu: &str) -> String {
 
 /// A graphics card setting that couldn't be saved: nothing else changed.
 pub(super) fn gpu_error_text(error: &str) -> String {
+    if error == crate::gpu_preference::SETTINGS_NOT_SAVED {
+        return error.into();
+    }
     format!("Couldn't save the graphics card setting ({error}). Nothing was changed.")
 }
 

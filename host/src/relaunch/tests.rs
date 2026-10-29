@@ -367,18 +367,23 @@ fn two_quick_clicks_restart_once() {
     let runs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut restart = Restart::default();
     let counted = runs.clone();
-    assert!(restart.begin(Reason::GraphicsCard, move |_| {
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        released.recv().unwrap();
-        Ok(())
-    }));
+    assert!(restart
+        .begin(Reason::GraphicsCard, move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            released.recv().unwrap();
+            Ok(())
+        })
+        .is_ok());
     assert!(restart.busy());
     // The second click while the first copy starts does nothing.
     let counted = runs.clone();
-    assert!(!restart.begin(Reason::GraphicsCard, move |_| {
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }));
+    assert_eq!(
+        restart.begin(Reason::GraphicsCard, move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+        Err(Handoff::Restart)
+    );
     assert!(!restart.poll());
     release.send(()).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -394,7 +399,9 @@ fn two_quick_clicks_restart_once() {
 #[test]
 fn a_failed_restart_is_remembered_and_can_be_tried_again() {
     let mut restart = Restart::default();
-    assert!(restart.begin(Reason::Settings, |_| Err("no".into())));
+    assert!(restart
+        .begin(Reason::Settings, |_| Err("no".into()))
+        .is_ok());
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while restart.busy() {
         assert!(!restart.poll());
@@ -403,8 +410,59 @@ fn a_failed_restart_is_remembered_and_can_be_tried_again() {
     }
     assert_eq!(restart.failed(), Some(Reason::Settings));
     // The copy was stopped, so another try can't start a second one.
-    assert!(restart.begin(Reason::Plain, |_| Ok(())));
+    assert!(restart.begin(Reason::Plain, |_| Ok(())).is_ok());
     assert_eq!(restart.failed(), None);
+}
+
+fn wait_for(restart: &mut Restart) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if restart.poll() {
+            return true;
+        }
+        if !restart.busy() {
+            return false;
+        }
+        assert!(std::time::Instant::now() < deadline, "never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_restart_waits_for_an_update_handing_over() {
+    let gate = crate::handoff::Gate::default();
+    let mut restart = Restart::new(gate.clone());
+    gate.claim(Handoff::Update).unwrap();
+    assert_eq!(restart.blocked(), Some(Handoff::Update));
+    assert_eq!(
+        restart.begin(Reason::GraphicsCard, |_| unreachable!("no copy starts")),
+        Err(Handoff::Update)
+    );
+    assert!(!restart.busy());
+    // The update went back to waiting (or failed): the restart may go.
+    gate.release(Handoff::Update);
+    assert_eq!(restart.blocked(), None);
+    assert!(restart.begin(Reason::GraphicsCard, |_| Ok(())).is_ok());
+    assert!(wait_for(&mut restart));
+}
+
+#[test]
+fn an_update_waits_for_a_restart_and_goes_after_a_failed_one() {
+    let gate = crate::handoff::Gate::default();
+    let mut restart = Restart::new(gate.clone());
+    assert!(restart
+        .begin(Reason::Settings, |_| Err("no".into()))
+        .is_ok());
+    assert_eq!(gate.claim(Handoff::Update), Err(Handoff::Restart));
+    assert!(!wait_for(&mut restart));
+    // This window stays: the update may hand over now.
+    gate.claim(Handoff::Update).unwrap();
+    gate.release(Handoff::Update);
+    // A restart whose copy runs keeps the gate while this window closes.
+    assert!(restart.begin(Reason::Plain, |_| Ok(())).is_ok());
+    assert!(wait_for(&mut restart));
+    assert_eq!(gate.claim(Handoff::Update), Err(Handoff::Restart));
+    assert_eq!(restart.blocked(), Some(Handoff::Restart));
 }
 
 #[test]

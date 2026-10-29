@@ -13,6 +13,7 @@ pub mod encoder;
 pub mod feedback;
 pub mod gpu_preference;
 pub mod gui;
+pub mod handoff;
 pub mod input;
 pub mod log_repeat;
 pub mod logging;

@@ -51,11 +51,14 @@ pub struct SharedControl {
     /// This process saved a graphics card change. Windows applies it only
     /// when EternalMonitor starts, so this process's own captures say
     /// nothing about whether it helped (a restart that didn't happen, or
-    /// the moments before this process leaves).
+    /// the moments before this process leaves). Set and read under
+    /// `gpu_switch`'s lock (`capture::recovery::save_gpu_switch`).
     pub gpu_changed_here: Arc<std::sync::atomic::AtomicBool>,
     /// The graphics cards and screens, for Settings > Troubleshooting. The
     /// GUI reads them on Windows when the section opens.
     pub gpu_facts: Arc<Mutex<Option<crate::gpu_preference::GpuFacts>>>,
+    /// An update or a restart handing over to another copy (one at a time).
+    pub handoff: crate::handoff::Gate,
     /// The one thread that turns the virtual display on and off, and its
     /// queue.
     pub(crate) vdd_worker: Arc<crate::capture::second_screen::Worker>,
@@ -174,6 +177,7 @@ impl SharedControl {
             gpu_switch: Arc::new(Mutex::new(None)),
             gpu_changed_here: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gpu_facts: Arc::new(Mutex::new(None)),
+            handoff: Default::default(),
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
             second_screen: Arc::new(Mutex::new(Default::default())),

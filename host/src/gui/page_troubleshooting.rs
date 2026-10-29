@@ -218,6 +218,9 @@ impl AnalyzerApp {
         if restart {
             self.restart_now(crate::relaunch::Reason::Settings);
         }
+        if self.restart_refused == Some(crate::relaunch::Reason::Settings) {
+            self.handoff_line(ui, crate::handoff::Handoff::Update);
+        }
         ui.add_space(8.0);
     }
 

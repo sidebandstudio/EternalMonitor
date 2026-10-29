@@ -26,6 +26,8 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::handoff::{Gate, Handoff};
+
 /// Added to the copy's arguments, with the nonce after it.
 pub const WAIT_ARG: &str = "--relaunch-wait";
 /// Added with what the restart applies ([`Reason::word`]), which only
@@ -232,17 +234,32 @@ pub fn take_over<T: Takeover>(host: &mut T, reason: Reason) -> Option<T::Guard> 
 }
 
 /// The window's restart: at most one at a time, waited for off the UI
-/// thread.
+/// thread, and never while an update hands over (see `handoff`).
 #[derive(Default)]
 pub struct Restart {
+    gate: Gate,
     waiting: Option<(Reason, mpsc::Receiver<Result<(), String>>)>,
     failed: Option<Reason>,
 }
 
 impl Restart {
+    /// A restart sharing the process's handoff gate with the updater.
+    pub fn new(gate: Gate) -> Self {
+        Self {
+            gate,
+            ..Default::default()
+        }
+    }
+
     /// A restart is waiting for its copy: every restart button does nothing.
     pub fn busy(&self) -> bool {
         self.waiting.is_some()
+    }
+
+    /// The handoff a restart would wait for now: an update, or this
+    /// restart (waiting for its copy, or the window closing after it).
+    pub fn blocked(&self) -> Option<Handoff> {
+        self.gate.holder()
     }
 
     /// The last restart's copy never said it was running.
@@ -250,23 +267,24 @@ impl Restart {
         self.failed
     }
 
-    /// Runs `hand_over` on its own thread unless a restart already waits.
-    /// Returns whether it started.
+    /// Runs `hand_over` on its own thread unless a restart already waits or
+    /// an update hands over; then says which.
     pub fn begin(
         &mut self,
         reason: Reason,
         hand_over: impl FnOnce(Reason) -> Result<(), String> + Send + 'static,
-    ) -> bool {
+    ) -> Result<(), Handoff> {
         if self.busy() {
-            return false;
+            return Err(Handoff::Restart);
         }
+        self.gate.claim(Handoff::Restart)?;
         let (done, result) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = done.send(hand_over(reason));
         });
         self.waiting = Some((reason, result));
         self.failed = None;
-        true
+        Ok(())
     }
 
     /// True once the copy is running and the window should quit.
@@ -289,6 +307,7 @@ impl Restart {
             Err(error) => {
                 tracing::warn!(%error, "Restart: EternalMonitor couldn't restart by itself");
                 self.failed = Some(reason);
+                self.gate.release(Handoff::Restart);
                 false
             }
         }

@@ -147,7 +147,8 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let checked_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -749,6 +750,31 @@ fn troubleshooting_and_hybrid_notice(
     assert!(settings_file(dir)
         .gpu_switch
         .is_some_and(|record| record.failed));
+    // While an update hands over, Restart and Undo wait for it, say so and
+    // change nothing.
+    shared
+        .handoff
+        .claim(eternal_host::handoff::Handoff::Update)
+        .unwrap();
+    let before = shared.gpu_switch.lock().clone();
+    for button in ["Restart EternalMonitor", "Undo the change"] {
+        window.get_by_role_and_label(Role::Button, button).click();
+        window.run_steps(4);
+        window.get_by_label("An update is installing; try again in a minute.");
+        assert!(window.query_by_label("Restarting EternalMonitor").is_none());
+        assert!(window
+            .query_by_label_contains("Couldn't save the graphics card setting")
+            .is_none());
+        assert_eq!(*shared.gpu_switch.lock(), before);
+    }
+    // The update went back to waiting: the line goes.
+    shared
+        .handoff
+        .release(eternal_host::handoff::Handoff::Update);
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("An update is installing; try again in a minute.")
+        .is_none());
     // The user changed the card in the NVIDIA app and restarts. Off Windows
     // no copy starts: the window stays and says how to restart by hand.
     window
@@ -794,7 +820,8 @@ fn reset_keeps_environment_overrides(
         window_drawing: WindowDrawing::Vulkan,
         ..before.clone()
     }
-    .save();
+    .save()
+    .unwrap();
     let vars = [
         ("ETERNAL_ENCODER", "h264_amf"),
         ("ETERNAL_INPUT", "bgra"),
@@ -839,7 +866,7 @@ fn reset_keeps_environment_overrides(
     for (name, _) in vars {
         std::env::remove_var(name);
     }
-    before.save();
+    before.save().unwrap();
     shared.max_dgram.store(1400, Ordering::SeqCst);
     *shared.encoder_override.lock() = None;
     *shared.encoder_input.lock() = EncoderInput::default();
@@ -879,7 +906,8 @@ fn popup_waits_while_the_ipad_has_a_session(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     connect_ipad(shared);
     let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
@@ -1006,7 +1034,8 @@ fn update_arrives_while_feedback_is_open(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     std::env::set_var("ETERNAL_UPDATE_BASE", &base);
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     std::env::remove_var("ETERNAL_UPDATE_BASE");
@@ -1281,7 +1310,8 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
         feedback_sessions: 3,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let streaming = harness(shared, size, 1.0);
     assert!(streaming
         .query_by_label("How's EternalMonitor working for you? :)")
@@ -1368,7 +1398,8 @@ fn review_screens() {
         capture_display: Some(eternal_host::control::CAPTURE_VIRTUAL_SENTINEL.into()),
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     *shared.vdd_status.lock() = VddStatus::WaitingForClient;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "extend-waiting");
@@ -1393,7 +1424,8 @@ fn review_screens() {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
 
     // Windows keeping the screen from the app, in each way it can.
     for (name, block) in [
@@ -1452,7 +1484,8 @@ fn review_screens() {
         check_for_updates: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     disconnect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     wait_for_popup(&mut h);

@@ -103,7 +103,7 @@ impl SettingsFile {
         }
         let token = crate::pairing::new_token()?;
         self.auth_token_hex = crate::pairing::token_hex(&token);
-        self.save();
+        let _ = self.save();
         Ok(token)
     }
 
@@ -132,9 +132,11 @@ impl SettingsFile {
         }
     }
 
-    pub fn save(&self) {
+    /// Writes settings.json atomically. Failures are logged here too;
+    /// callers that can go on without the file ignore the error.
+    pub fn save(&self) -> Result<(), String> {
         let Some(path) = settings_path() else {
-            return;
+            return Err("no folder for settings".into());
         };
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
@@ -143,7 +145,7 @@ impl SettingsFile {
                     error = %error,
                     "Failed to create settings directory"
                 );
-                return;
+                return Err(error.to_string());
             }
         }
         match serde_json::to_string_pretty(self) {
@@ -159,10 +161,13 @@ impl SettingsFile {
                         error = %error,
                         "Failed to write settings.json"
                     );
+                    return Err(error.to_string());
                 }
+                Ok(())
             }
             Err(error) => {
                 warn!(error = %error, "Failed to serialize settings");
+                Err(error.to_string())
             }
         }
     }

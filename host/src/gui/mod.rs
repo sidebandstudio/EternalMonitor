@@ -38,6 +38,7 @@ use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
+use crate::handoff::Handoff;
 use crate::relaunch::Reason;
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
@@ -336,6 +337,10 @@ pub struct AnalyzerApp {
     gpu_error: Option<String>,
     /// "Restart EternalMonitor": waiting for the new copy, or failed.
     restart: crate::relaunch::Restart,
+    /// A restart an update refused (its reason says which button), and an
+    /// update a restart refused, while what refused it hands over.
+    restart_refused: Option<Reason>,
+    update_refused: bool,
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
@@ -441,6 +446,7 @@ impl AnalyzerApp {
             crate::updates::Updater::start(
                 persisted.check_for_updates,
                 control.shared.session.clone(),
+                control.shared.handoff.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
                     if let Some(version) = version {
                         update_toast::show(&ctx, version);
@@ -451,6 +457,7 @@ impl AnalyzerApp {
         };
         *control.shared.encoder_input.lock() = overrides.encoder_input.value;
         let saved_gpu_switch = control.shared.gpu_switch.lock().clone();
+        let restart = crate::relaunch::Restart::new(control.shared.handoff.clone());
         Self {
             settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
@@ -489,7 +496,9 @@ impl AnalyzerApp {
             gpu_choice: None,
             saved_gpu_switch,
             gpu_error: None,
-            restart: Default::default(),
+            restart,
+            restart_refused: None,
+            update_refused: false,
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
@@ -497,6 +506,11 @@ impl AnalyzerApp {
     }
 
     fn persist_settings(&self) {
+        // Logged in `save`; nothing here depends on the file.
+        let _ = self.settings_file().save();
+    }
+
+    fn settings_file(&self) -> SettingsFile {
         let encoder_override = ENCODER_CHOICES
             .iter()
             .find(|(label, _)| *label == self.settings_encoder_choice)
@@ -508,7 +522,7 @@ impl AnalyzerApp {
                 }
             });
         let pairing = self.control.shared.pairing.lock();
-        let file = SettingsFile {
+        SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
             max_dgram: self.settings_packet_size as u16,
@@ -534,8 +548,7 @@ impl AnalyzerApp {
             star_clicked: self.star_clicked,
             window_drawing: self.settings_window_drawing,
             gpu_switch: self.control.shared.gpu_switch.lock().clone(),
-        };
-        file.save();
+        }
     }
 }
 
@@ -740,7 +753,7 @@ impl AnalyzerApp {
     /// is wired to. The value is saved now; Windows applies it when the app
     /// starts, so EternalMonitor then restarts.
     fn switch_graphics_card(&mut self, preference: Preference, gpu: &str) {
-        if self.restart.busy() {
+        if !self.restart_allowed() {
             return;
         }
         info!(
@@ -758,7 +771,7 @@ impl AnalyzerApp {
     /// Puts EternalMonitor's graphics card setting back as it was before the
     /// switch, and restarts. A refused write keeps the switch and its Undo.
     fn undo_graphics_switch(&mut self) {
-        if self.restart.busy() {
+        if !self.restart_allowed() {
             return;
         }
         let Some(record) = self.control.shared.gpu_switch.lock().clone() else {
@@ -776,31 +789,38 @@ impl AnalyzerApp {
     }
 
     /// Runs `save` on EternalMonitor's own graphics preference with the
-    /// switch record; each record it keeps is shared with capture and saved
-    /// to settings.json. False, with the reason shown, when it failed: then
-    /// nothing changed.
+    /// switch record; each record it keeps is saved to settings.json, and
+    /// the last one is shared with capture once it worked (see
+    /// `save_gpu_switch`). False, with the reason shown, when it failed:
+    /// then nothing changed.
     fn save_gpu(
         &mut self,
         save: impl FnOnce(
             &mut crate::gpu_preference::OwnValue,
             &mut Option<SwitchRecord>,
-            &mut dyn FnMut(&Option<SwitchRecord>),
+            &mut dyn FnMut(&Option<SwitchRecord>) -> Result<(), String>,
         ) -> Result<(), String>,
     ) -> bool {
-        let mut record = self.control.shared.gpu_switch.lock().clone();
-        let result = crate::gpu_preference::OwnValue::new().and_then(|mut store| {
-            save(&mut store, &mut record, &mut |record| {
-                *self.control.shared.gpu_switch.lock() = record.clone();
-                self.persist_settings();
+        let last_saved = std::cell::RefCell::new(None);
+        let result = crate::capture::recovery::save_gpu_switch(&self.control.shared, |record| {
+            let mut store = crate::gpu_preference::OwnValue::new()?;
+            save(&mut store, record, &mut |record| {
+                let file = SettingsFile {
+                    gpu_switch: record.clone(),
+                    ..self.settings_file()
+                };
+                file.save()?;
+                *last_saved.borrow_mut() = Some(record.clone());
+                Ok(())
             })
         });
-        self.saved_gpu_switch = self.control.shared.gpu_switch.lock().clone();
+        // A verdict capture made meanwhile (a refused write leaves it
+        // shared) is saved by the next frame.
+        if let Some(saved) = last_saved.into_inner() {
+            self.saved_gpu_switch = saved;
+        }
         match result {
             Ok(()) => {
-                self.control
-                    .shared
-                    .gpu_changed_here
-                    .store(true, Ordering::SeqCst);
                 self.gpu_error = None;
                 self.gpu_value = crate::gpu_preference::read_value().ok().flatten();
                 true
@@ -814,10 +834,31 @@ impl AnalyzerApp {
     }
 
     /// Starts the new copy and closes this window once it runs (see
-    /// `relaunch`). Every restart button does nothing while one waits.
+    /// `relaunch`). Every restart button does nothing while one waits, and
+    /// says why while an update hands over.
     fn restart_now(&mut self, reason: Reason) {
-        if self.restart.begin(reason, crate::relaunch::hand_over_now) {
-            info!(?reason, "Restarting EternalMonitor");
+        match self.restart.begin(reason, crate::relaunch::hand_over_now) {
+            Ok(()) => info!(?reason, "Restarting EternalMonitor"),
+            Err(handoff) => self.refuse_restart(handoff, reason),
+        }
+    }
+
+    /// Whether a graphics card restart could start now. Checked before the
+    /// change is saved, so a change is never saved without its restart.
+    fn restart_allowed(&mut self) -> bool {
+        match self.restart.blocked() {
+            Some(handoff) => {
+                self.refuse_restart(handoff, Reason::GraphicsCard);
+                false
+            }
+            None => true,
+        }
+    }
+
+    fn refuse_restart(&mut self, handoff: Handoff, reason: Reason) {
+        if handoff == Handoff::Update {
+            info!(?reason, "Restart refused: an update is installing");
+            self.restart_refused = Some(reason);
         }
     }
 
@@ -837,7 +878,7 @@ impl AnalyzerApp {
     }
 
     fn apply_graphics_card(&mut self) {
-        if self.restart.busy() {
+        if !self.restart_allowed() {
             return;
         }
         let Some(change) = self.gpu_choice.clone() else {
@@ -951,6 +992,14 @@ impl eframe::App for AnalyzerApp {
         }
         if self.restart.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // A refusal is shown while what refused it still hands over.
+        let holder = self.control.shared.handoff.holder();
+        if holder != Some(Handoff::Update) {
+            self.restart_refused = None;
+        }
+        if holder != Some(Handoff::Restart) {
+            self.update_refused = false;
         }
         // Capture recorded how a graphics card switch went: save that.
         let gpu_switch = self.control.shared.gpu_switch.lock().clone();

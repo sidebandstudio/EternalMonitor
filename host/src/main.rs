@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Graphics card switch: started again after the switch"
         );
         if !saved {
-            persisted.save();
+            let _ = persisted.save();
         }
     }
     let max_dgram = overrides.max_dgram.value;

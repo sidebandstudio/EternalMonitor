@@ -411,35 +411,44 @@ pub fn apply(
     Ok((before, after))
 }
 
+/// The whole error when settings.json can't hold the record Undo needs.
+pub const SETTINGS_NOT_SAVED: &str =
+    "EternalMonitor couldn't save its settings, so nothing was changed.";
+
 /// Writes `change` to EternalMonitor's own value while the app runs: Windows
 /// reads it only when a process starts, so this process keeps its card.
 /// `record` becomes `next` only when the write succeeds, and `persist` saves
 /// each record it holds (settings.json). A `next` that keeps an Undo value is
 /// saved before the write, so a crash between the two never loses what Undo
-/// restores. A failed write puts the earlier record back and changes nothing
-/// else.
+/// restores; when it can't be saved, nothing is written
+/// ([`SETTINGS_NOT_SAVED`]). A failed write puts the earlier record back and
+/// changes nothing else.
 pub fn save_change(
     store: &mut impl PreferenceStore,
     record: &mut Option<SwitchRecord>,
     change: &Change,
     next: Option<SwitchRecord>,
-    mut persist: impl FnMut(&Option<SwitchRecord>),
+    mut persist: impl FnMut(&Option<SwitchRecord>) -> Result<(), String>,
 ) -> Result<(), String> {
     let previous = record.clone();
     if next.is_some() && next != previous {
+        persist(&next).map_err(|_| SETTINGS_NOT_SAVED.to_string())?;
         *record = next.clone();
-        persist(record);
     }
     if let Err(error) = apply(store, change) {
         if *record != previous {
             *record = previous;
-            persist(record);
+            // Unsaved, the file keeps `next`: the next start sees the
+            // switch isn't in the value (`started_after_switch`).
+            let _ = persist(record);
         }
         return Err(error);
     }
     if *record != next {
         *record = next;
-        persist(record);
+        // The value is written, so this worked; a file that keeps the old
+        // record gets this one at its next save.
+        let _ = persist(record);
     }
     Ok(())
 }
@@ -451,7 +460,7 @@ pub fn switch(
     record: &mut Option<SwitchRecord>,
     preference: Preference,
     gpu: &str,
-    persist: impl FnMut(&Option<SwitchRecord>),
+    persist: impl FnMut(&Option<SwitchRecord>) -> Result<(), String>,
 ) -> Result<(), String> {
     let current = store.read()?;
     let next = SwitchRecord::new(record.as_ref(), current, preference, gpu);
@@ -464,7 +473,7 @@ pub fn switch(
 pub fn undo(
     store: &mut impl PreferenceStore,
     record: &mut Option<SwitchRecord>,
-    persist: impl FnMut(&Option<SwitchRecord>),
+    persist: impl FnMut(&Option<SwitchRecord>) -> Result<(), String>,
 ) -> Result<(), String> {
     let Some(before) = record.as_ref().map(|record| record.before.clone()) else {
         return Ok(());
@@ -1191,10 +1200,11 @@ mod tests {
     }
 
     impl Saved {
-        fn persist(&mut self) -> impl FnMut(&Option<SwitchRecord>) + '_ {
+        fn persist(&mut self) -> impl FnMut(&Option<SwitchRecord>) -> Result<(), String> + '_ {
             |record| {
                 self.file = record.clone();
                 self.saves += 1;
+                Ok(())
             }
         }
     }
@@ -1286,12 +1296,52 @@ mod tests {
             Preference::PowerSaving,
             "AMD",
         ));
-        undo(&mut store, &mut record, |_| {}).unwrap();
+        undo(&mut store, &mut record, |_| Ok(())).unwrap();
         assert_eq!(store.values.len(), 1);
         assert_eq!(store.values[r"C:\Games\game.exe"], "GpuPreference=2;");
         // Nothing to undo writes nothing.
         let mut none = None;
         assert!(undo(&mut store, &mut none, |_| unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn a_switch_whose_undo_record_cant_be_saved_writes_nothing() {
+        // settings.json can't be written (its folder is read-only, the disk
+        // is full) while HKCU can.
+        let mut store = key(Some("AutoHDREnable=1;"));
+        let mut record = None;
+        let mut tries = 0;
+        let error = switch(
+            &mut store,
+            &mut record,
+            Preference::HighPerformance,
+            "NVIDIA",
+            |_| {
+                tries += 1;
+                Err("Access is denied. (os error 5)".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, SETTINGS_NOT_SAVED);
+        assert_eq!(tries, 1);
+        assert_eq!(store.read().unwrap().as_deref(), Some("AutoHDREnable=1;"));
+        assert_eq!(record, None);
+        // A second switch over an earlier one keeps that one's record.
+        let earlier = SwitchRecord::new(None, None, Preference::PowerSaving, "AMD");
+        let mut store = key(Some("GpuPreference=1;"));
+        let mut record = Some(earlier.clone());
+        assert_eq!(
+            switch(
+                &mut store,
+                &mut record,
+                Preference::HighPerformance,
+                "NVIDIA",
+                |_| Err("full".into()),
+            ),
+            Err(SETTINGS_NOT_SAVED.to_string())
+        );
+        assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
+        assert_eq!(record, Some(earlier));
     }
 
     #[test]
