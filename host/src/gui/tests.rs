@@ -1,5 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -309,6 +310,25 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
     ] {
         assert!(body.contains("Wi-Fi") && !body.contains("WiFi"), "{body}");
     }
+}
+
+#[test]
+fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
+    let body = software_fallback_body(false, true);
+    assert!(
+        body.contains("NVIDIA driver to version 570 or newer"),
+        "{body}"
+    );
+    assert!(body.contains("Restart"), "{body}");
+    for jargon in ["NVENC", "API", "libx264", "encoder", "http"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // Custom settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(true, true),
+        software_fallback_body(true, false)
+    );
+    assert!(!software_fallback_body(false, false).contains("570"));
 }
 
 #[test]

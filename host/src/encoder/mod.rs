@@ -110,6 +110,7 @@ fn run_encode_loop(
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
         // libx264 override is not a fallback, so it intentionally leaves this false.
         stats.set_software_fallback(false);
+        stats.nvidia_driver_outdated = false;
     }
 
     let mut encoder_state: Option<EncoderState> = None;
@@ -752,6 +753,7 @@ impl EncoderState {
         let encoder = match open_encoder(encoder, encoder_name, opening, progress) {
             Ok(Ok(encoder)) => encoder,
             Ok(Err(error)) => {
+                note_nvidia_driver(encoder_name, error, crate::gpu::nvidia_driver_versions);
                 let code: i32 = error.into();
                 return Err(format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
             }
@@ -1062,6 +1064,65 @@ fn open_remaining_encoders<T>(
             note(&mut reasons, "libx264", error.to_string());
             error!(encoders = %reasons.join(" | "), "No encoder could open");
         })
+}
+
+/// The oldest NVIDIA driver the bundled FFmpeg 7.1.1's NVENC opens with. Its
+/// NVENC headers are nv-codec-headers 13.0.19 (Video Codec SDK 13.0), whose
+/// README requires driver 570.0 or newer on Windows. Older drivers fail with
+/// "Driver does not support the required nvenc API version", and FFmpeg 7.1
+/// prints the minimum as "(unknown)".
+pub const NVENC_MIN_DRIVER: &str = "570";
+/// [`NVENC_MIN_DRIVER`] in hundredths, as [`nvidia_release`] returns it.
+const NVENC_MIN_RELEASE: u32 = 57_000;
+
+/// NVIDIA's driver number in hundredths (56607 for 566.07) from the Windows
+/// driver version packed as DXGI reports it (32.0.15.6607): the last digit
+/// of the third part followed by the four digits of the fourth.
+fn nvidia_release(windows_version: u64) -> u32 {
+    let third = ((windows_version >> 16) & 0xffff) as u32;
+    let fourth = (windows_version & 0xffff) as u32;
+    (third % 10) * 10_000 + fourth
+}
+
+/// The newest NVIDIA driver on the PC when an NVENC open failed because it is
+/// too old: FFmpeg returned ENOSYS, and every NVIDIA driver is older than
+/// NVENC needs. ENOSYS alone is not enough: FFmpeg also returns it for
+/// parameters the encoder does not support. `driver_versions` (the NVIDIA
+/// adapters' Windows driver versions) are read only then; none known means
+/// not outdated.
+fn outdated_nvidia_driver(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: impl FnOnce() -> Vec<u64>,
+) -> Option<u32> {
+    if !encoder_name.ends_with("_nvenc")
+        || !matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
+    {
+        return None;
+    }
+    let newest = driver_versions().into_iter().map(nvidia_release).max()?;
+    (newest < NVENC_MIN_RELEASE).then_some(newest)
+}
+
+/// Says once, in the log and on the Stream page's fallback notice, that
+/// NVENC refused an NVIDIA driver older than it needs.
+fn note_nvidia_driver(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: impl FnOnce() -> Vec<u64>,
+) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(driver) = outdated_nvidia_driver(encoder_name, error, driver_versions) else {
+        return;
+    };
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        warn!(
+            driver = %format!("{}.{:02}", driver / 100, driver % 100),
+            minimum = NVENC_MIN_DRIVER,
+            "The NVIDIA driver is too old for the graphics card to encode video; video is encoded on the processor unless another graphics card can, and updating the NVIDIA driver enables hardware encoding"
+        );
+    }
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
 }
 
 /// An encoder open that its time limit gave up on, or refused while an
@@ -2494,6 +2555,57 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains(" ERROR ")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_nvencs_refusal_of_a_driver_older_than_570_means_an_outdated_driver() {
+        let version = |a: u64, b: u64, c: u64, d: u64| a << 48 | b << 32 | c << 16 | d;
+        // Field drivers: GTX 1650 on 517.18, RTX 4060 laptop on 566.07.
+        let old = version(31, 0, 15, 1718);
+        let laptop = version(32, 0, 15, 6607);
+        let first_new_enough = version(32, 0, 15, 7000);
+        let current = version(32, 0, 16, 2101);
+        assert_eq!(nvidia_release(old), 51_718);
+        assert_eq!(nvidia_release(laptop), 56_607);
+        assert_eq!(nvidia_release(first_new_enough), NVENC_MIN_RELEASE);
+        assert_eq!(nvidia_release(current), 62_101);
+        assert_eq!(nvidia_release(version(21, 21, 13, 7654)), 37_654);
+        assert_eq!(
+            NVENC_MIN_RELEASE,
+            NVENC_MIN_DRIVER.parse::<u32>().unwrap() * 100
+        );
+
+        let enosys = ffmpeg_next::Error::Other {
+            errno: libc::ENOSYS,
+        };
+        let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
+        let outdated = |name: &str, error, drivers: &[u64]| {
+            outdated_nvidia_driver(name, error, || drivers.to_vec())
+        };
+        assert_eq!(outdated("h264_nvenc", enosys, &[old]), Some(51_718));
+        assert_eq!(outdated("hevc_nvenc", enosys, &[laptop]), Some(56_607));
+        // 570.00 itself is new enough.
+        assert_eq!(outdated("h264_nvenc", enosys, &[first_new_enough]), None);
+        // ENOSYS with a driver new enough is an unsupported parameter.
+        assert_eq!(outdated("h264_nvenc", enosys, &[current]), None);
+        assert_eq!(outdated("h264_nvenc", enosys, &[old, current]), None);
+        // No NVIDIA driver version known.
+        assert_eq!(outdated("h264_nvenc", enosys, &[]), None);
+        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
+        assert_eq!(outdated("h264_nvenc", eperm, &[old]), None);
+        assert_eq!(
+            outdated("h264_nvenc", ffmpeg_next::Error::External, &[old]),
+            None
+        );
+        // Other encoders' failures never read the NVIDIA drivers.
+        assert_eq!(
+            outdated_nvidia_driver("h264_amf", enosys, || panic!("read")),
+            None
+        );
+        assert_eq!(
+            outdated_nvidia_driver("h264_nvenc", eperm, || panic!("read")),
+            None
         );
     }
 
