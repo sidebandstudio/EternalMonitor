@@ -16,6 +16,10 @@ mod redact;
 use periodic::Periodic;
 
 const MAX_FILES: usize = 512;
+/// The longest line or message that uploads. Redaction slows down faster
+/// than the length grows on some punctuation-heavy lines, and a fatal
+/// report runs it on the main thread.
+const MAX_LINE_BYTES: usize = 8192;
 const BATCH_SIZE: usize = 4;
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -365,18 +369,22 @@ impl Drop for UploadGuard {
 pub fn record(line: &str) {
     if enabled() {
         if let Some(sender) = SENDER.get() {
-            let mut end = line.len().min(8192);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
             if sender
-                .try_send(Queued::Line(line[..end].to_owned()))
+                .try_send(Queued::Line(capped(line).to_owned()))
                 .is_err()
             {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+}
+/// `line`'s first [`MAX_LINE_BYTES`], whole characters only.
+fn capped(line: &str) -> &str {
+    let mut end = line.len().min(MAX_LINE_BYTES);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 /// Queue one event (`level` is `error` or `info`) on disk now, after the
 /// open periodic summary. The upload thread sends them, or the next launch
@@ -406,7 +414,7 @@ fn queue_into(
     let mut events: Vec<Event> = periodic.map_or_else(Vec::new, |periodic| {
         events_of(lock(periodic).flush()).collect()
     });
-    events.push(event(message, level));
+    events.push(event(capped(message), level));
     persist(directory, &batch(events)?)
 }
 /// Queue an event for another launch of this installation, from the failure
@@ -442,7 +450,7 @@ fn queue_foreign(
     level: &str,
 ) -> std::io::Result<()> {
     let installation_id = fs::read_to_string(directory.join("installation-id"))?;
-    let mut event = event(message, level);
+    let mut event = event(capped(message), level);
     event.sequence = FOREIGN_SEQUENCE_BASE + index;
     let mut batch = batch(vec![event])?;
     batch.installation_id = installation_id.trim().to_string();
@@ -1439,6 +1447,32 @@ mod tests {
             .iter()
             .any(|b| b.events[0].message == "EternalMonitor could not start: token=[REDACTED]"));
         assert_ne!(saved[0].events[0].sequence, saved[1].events[0].sequence);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    /// A fatal report is redacted on the main thread, before the virtual
+    /// display is turned off. A crafted message costs no more than a capped
+    /// log line.
+    #[test]
+    fn a_long_fatal_report_is_capped_before_redaction() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("installation-id"), "ab".repeat(16)).unwrap();
+        let message = format!("EternalMonitor could not start: {}", r"=\a".repeat(200_000));
+        // Uncapped, this message takes minutes in a release build. Capped,
+        // it takes tens of milliseconds, and about a second unoptimized.
+        let limit = Duration::from_millis(if cfg!(debug_assertions) { 20_000 } else { 100 });
+        let started = std::time::Instant::now();
+        queue_into(&directory, None, &message, "error").unwrap();
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        queue_foreign(&directory, "launch", 1, &message, "error").unwrap();
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+        for path in files(&directory).unwrap() {
+            let saved: Batch = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let uploaded = &saved.events[0].message;
+            assert!(uploaded.starts_with("EternalMonitor could not start: "));
+            assert!(uploaded.len() <= MAX_LINE_BYTES, "{}", uploaded.len());
+        }
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]
