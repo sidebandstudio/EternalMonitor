@@ -5,10 +5,15 @@
 //! device, with no error to catch. Prefer a fully capable adapter of the same
 //! GPU type, usually DX12 there.
 //!
+//! Intel's Vulkan driver also crashes while the window is created on some UHD
+//! PCs whose Vulkan adapter looks fully capable, so on Intel GPUs DX12 comes
+//! first. Other vendors keep wgpu's order.
+//!
 //! Each launch also leaves a marker naming its GPU, driver and backend until
 //! the window is confirmed working. A marker whose process has exited means
-//! that launch never got there, so that backend is avoided on that GPU and
-//! driver, and tried again after some clean launches or a driver change.
+//! that launch never got there, so that backend is avoided on that GPU until
+//! its driver changes. A GPU whose driver version is unknown cannot show a
+//! change, so there the backend is tried again after some clean launches.
 //!
 //! On Windows the instance is created without OpenGL. Listing GL adapters
 //! makes a context on the display GPU, and AMD's OpenGL driver can crash the
@@ -38,8 +43,11 @@ use tracing::{info, warn};
 use crate::startup::ProcessId;
 use crate::troubleshooting::WindowDrawing;
 
-/// Clean launches, per recorded failure, before an avoided backend is retried.
+/// Clean launches, per recorded failure, before an avoided backend is retried
+/// on a GPU whose driver version is unknown.
 const RETRY_AFTER: u32 = 5;
+/// PCI vendor id of Intel GPUs.
+const INTEL: u32 = 0x8086;
 const HISTORY_FILE: &str = "history.json";
 /// Held while one instance reads, changes and saves the history.
 const HISTORY_LOCK: &str = "history.lock";
@@ -158,6 +166,7 @@ impl Plan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
     backend: Backend,
+    vendor: u32,
     device_type: DeviceType,
     compliant: bool,
     avoided: bool,
@@ -413,6 +422,7 @@ fn select(
             let info = adapter.get_info();
             Candidate {
                 backend: info.backend,
+                vendor: info.vendor,
                 device_type: info.device_type,
                 compliant: adapter.get_downlevel_capabilities().is_webgpu_compliant(),
                 avoided: avoided(history, gpu, info.backend.to_str()),
@@ -432,6 +442,7 @@ fn select(
         adapter = %info.name,
         gpu = %marker.gpu,
         compliant = candidates[index].compliant,
+        reason = selection_reason(&candidates, index),
         avoided = ?history.iter().filter(|f| avoided(history, &f.gpu, &f.backend)).map(|f| (&f.gpu, &f.backend)).collect::<Vec<_>>(),
         "Window renderer selected"
     );
@@ -450,7 +461,7 @@ fn select(
 }
 
 /// The best candidate: not avoided, then wgpu's high-performance GPU type order,
-/// then fully capable, then wgpu's own backend order.
+/// then fully capable, then wgpu's own backend order with DX12 first on Intel.
 fn pick(candidates: &[Candidate]) -> Option<usize> {
     let type_rank = |device_type| match device_type {
         DeviceType::DiscreteGpu => 0,
@@ -459,11 +470,12 @@ fn pick(candidates: &[Candidate]) -> Option<usize> {
         DeviceType::VirtualGpu => 3,
         DeviceType::Cpu => 4,
     };
-    let backend_rank = |backend| match backend {
-        Backend::Vulkan | Backend::Metal => 0,
-        Backend::Dx12 => 1,
-        Backend::Gl => 2,
-        _ => 3,
+    let backend_rank = |c: &Candidate| match c.backend {
+        Backend::Dx12 if c.vendor == INTEL => 0,
+        Backend::Vulkan | Backend::Metal => 1,
+        Backend::Dx12 => 2,
+        Backend::Gl => 3,
+        _ => 4,
     };
     candidates
         .iter()
@@ -473,10 +485,33 @@ fn pick(candidates: &[Candidate]) -> Option<usize> {
                 c.avoided,
                 type_rank(c.device_type),
                 !c.compliant,
-                backend_rank(c.backend),
+                backend_rank(c),
             )
         })
         .map(|(index, _)| index)
+}
+
+/// Why [`pick`] chose the candidate at `index`: the rule without which it
+/// would have chosen another, for the selection log line.
+fn selection_reason(candidates: &[Candidate], index: usize) -> &'static str {
+    let mut without: Vec<Candidate> = candidates
+        .iter()
+        .map(|c| Candidate {
+            avoided: false,
+            ..*c
+        })
+        .collect();
+    if pick(&without) != Some(index) {
+        return "avoiding crashed backend until driver changes";
+    }
+    for c in &mut without {
+        c.vendor = 0;
+    }
+    if pick(&without) != Some(index) {
+        "intel default"
+    } else {
+        "default"
+    }
 }
 
 /// The GPU and its driver version, so a driver update gives every backend a
@@ -537,9 +572,23 @@ fn dxgi_adapters() -> Vec<(u32, u32, String)> {
     Vec::new()
 }
 
+/// A failure stays avoided until the driver changes, which changes the GPU
+/// key. Failures from earlier versions carry the same key and are kept the
+/// same way, as retrying them would bring their crash back.
 fn avoided(history: &[Failure], gpu: &str, backend: &str) -> bool {
     history.iter().any(|f| {
-        f.gpu == gpu && f.backend == backend && f.clean_launches < RETRY_AFTER * f.failures
+        f.gpu == gpu
+            && f.backend == backend
+            && (knows_driver(&f.gpu) || f.clean_launches < RETRY_AFTER * f.failures)
+    })
+}
+
+/// Whether every GPU in a key names its driver version, so a driver update
+/// shows as a new key.
+fn knows_driver(gpu: &str) -> bool {
+    gpu.split(", ").all(|gpu| {
+        gpu.split_once(' ')
+            .is_some_and(|(_, driver)| !driver.trim().is_empty())
     })
 }
 
@@ -561,9 +610,10 @@ fn record_failure(history: &mut Vec<Failure>, marker: &Marker) {
     }
 }
 
-/// A backend that drew is cleared; every other failure moves toward a retry,
-/// also when this launch drew on another GPU or on WARP, so a fallback never
-/// keeps the failed backend avoided for good.
+/// A backend that drew is cleared; every other failure counts the clean
+/// launch, also when this launch drew on another GPU or on WARP. The count
+/// retries only failures on a GPU with an unknown driver, and keeps the file
+/// as earlier versions read it.
 fn record_success(history: &mut Vec<Failure>, marker: &Marker) {
     history.retain(|f| !(f.gpu == marker.gpu && f.backend == marker.backend));
     for failure in history.iter_mut() {
@@ -639,7 +689,7 @@ fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
                 warn!(
                     gpu = %marker.gpu,
                     backend = %marker.backend,
-                    "A previous launch closed before its window appeared; avoiding that renderer for now"
+                    "A previous launch closed before its window appeared; avoiding that renderer until its driver changes"
                 );
                 record_failure(history, &marker);
             }
@@ -653,9 +703,18 @@ fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
 mod tests {
     use super::*;
 
+    const NVIDIA: u32 = 0x10de;
+    const AMD: u32 = 0x1002;
+    const MICROSOFT: u32 = 0x1414;
+
     fn candidate(backend: Backend, device_type: DeviceType, compliant: bool) -> Candidate {
+        on(NVIDIA, backend, device_type, compliant)
+    }
+
+    fn on(vendor: u32, backend: Backend, device_type: DeviceType, compliant: bool) -> Candidate {
         Candidate {
             backend,
+            vendor,
             device_type,
             compliant,
             avoided: false,
@@ -666,9 +725,19 @@ mod tests {
     /// OpenGL one the instance no longer lists.
     fn uhd_620() -> Vec<Candidate> {
         vec![
-            candidate(Backend::Vulkan, DeviceType::IntegratedGpu, false),
-            candidate(Backend::Dx12, DeviceType::IntegratedGpu, true),
-            candidate(Backend::Dx12, DeviceType::Cpu, true),
+            on(INTEL, Backend::Vulkan, DeviceType::IntegratedGpu, false),
+            on(INTEL, Backend::Dx12, DeviceType::IntegratedGpu, true),
+            on(MICROSOFT, Backend::Dx12, DeviceType::Cpu, true),
+        ]
+    }
+
+    /// An Intel UHD PC whose Vulkan adapter is fully capable, as on the PCs
+    /// where igvk64.dll crashed while the window was created.
+    fn uhd_capable() -> Vec<Candidate> {
+        vec![
+            on(INTEL, Backend::Vulkan, DeviceType::IntegratedGpu, true),
+            on(INTEL, Backend::Dx12, DeviceType::IntegratedGpu, true),
+            on(MICROSOFT, Backend::Dx12, DeviceType::Cpu, true),
         ]
     }
 
@@ -728,6 +797,62 @@ mod tests {
             candidate(Backend::Dx12, DeviceType::IntegratedGpu, true),
         ];
         assert_eq!(pick(&candidates), Some(0));
+        assert_eq!(selection_reason(&candidates, 0), "default");
+    }
+
+    #[test]
+    fn intel_draws_with_dx12_even_with_capable_vulkan() {
+        let candidates = uhd_capable();
+        assert_eq!(pick(&candidates), Some(1));
+        assert_eq!(selection_reason(&candidates, 1), "intel default");
+        // Listed in the other order too.
+        let reversed: Vec<Candidate> = candidates.iter().rev().copied().collect();
+        assert_eq!(pick(&reversed), Some(1));
+        // #59's driver chose DX12 for being incomplete before; it still does.
+        assert_eq!(selection_reason(&uhd_620(), 1), "default");
+    }
+
+    #[test]
+    fn nvidia_and_amd_keep_vulkan() {
+        for vendor in [NVIDIA, AMD] {
+            for device_type in [DeviceType::DiscreteGpu, DeviceType::IntegratedGpu] {
+                let candidates = [
+                    on(vendor, Backend::Dx12, device_type, true),
+                    on(vendor, Backend::Vulkan, device_type, true),
+                    on(MICROSOFT, Backend::Dx12, DeviceType::Cpu, true),
+                ];
+                assert_eq!(pick(&candidates), Some(1), "{vendor:04x} {device_type:?}");
+                assert_eq!(selection_reason(&candidates, 1), "default");
+            }
+        }
+        // A hybrid laptop still draws on its discrete GPU's Vulkan.
+        let mut hybrid = uhd_capable();
+        hybrid.push(on(NVIDIA, Backend::Dx12, DeviceType::DiscreteGpu, true));
+        hybrid.push(on(NVIDIA, Backend::Vulkan, DeviceType::DiscreteGpu, true));
+        assert_eq!(pick(&hybrid), Some(4));
+    }
+
+    #[test]
+    fn a_chosen_backend_or_wgpu_backend_wins_over_the_intel_default() {
+        let gpus = "8086:9bc4 31.0.101.2111";
+        // Vulkan chosen in Troubleshooting, or WGPU_BACKEND=vulkan: the
+        // instance lists only Vulkan adapters, so Vulkan draws.
+        assert_eq!(
+            chosen_plan(&[], gpus, WindowDrawing::Vulkan),
+            (Plan::Vulkan, false)
+        );
+        assert_eq!(instance_backends(None, Plan::Vulkan), Backends::VULKAN);
+        let vulkan = Backends::from_comma_list("vulkan");
+        assert_eq!(
+            instance_backends(Some(vulkan), Plan::Full),
+            Backends::VULKAN
+        );
+        let listed: Vec<Candidate> = uhd_capable()
+            .into_iter()
+            .filter(|c| c.backend == Backend::Vulkan)
+            .collect();
+        assert_eq!(pick(&listed), Some(0));
+        assert_eq!(selection_reason(&listed, 0), "default");
     }
 
     #[test]
@@ -754,30 +879,94 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_backend_is_retried_after_clean_launches_or_a_driver_update() {
+    fn a_failed_backend_is_retried_only_after_a_driver_update() {
         let old = marker("8086:5917 23.20.16.5038", "vulkan");
         let fallback = marker("8086:5917 23.20.16.5038", "dx12");
         let mut history = Vec::new();
         record_failure(&mut history, &old);
         assert!(avoided(&history, &old.gpu, "vulkan"));
         assert!(!avoided(&history, &old.gpu, "dx12"));
-        // A newer driver for the same GPU starts clean.
-        assert!(!avoided(&history, "8086:5917 31.0.101.2127", "vulkan"));
-        for _ in 0..RETRY_AFTER - 1 {
+        // Clean launches on the fallback never bring the crash back.
+        for _ in 0..100 * RETRY_AFTER {
             record_success(&mut history, &fallback);
         }
         assert!(avoided(&history, &old.gpu, "vulkan"));
+        let mut candidates = uhd_capable();
+        candidates[0].vendor = NVIDIA;
+        candidates[1].vendor = NVIDIA;
+        candidates[0].avoided = true;
+        assert_eq!(pick(&candidates), Some(1));
+        assert_eq!(
+            selection_reason(&candidates, 1),
+            "avoiding crashed backend until driver changes"
+        );
+        // A newer driver for the same GPU starts clean.
+        assert!(!avoided(&history, "8086:5917 31.0.101.2127", "vulkan"));
+        // Drawing with it clears the entry.
+        record_success(&mut history, &old);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn without_a_driver_version_a_failure_is_retried_after_clean_launches() {
+        // DXGI did not list the GPU and wgpu named no driver.
+        let gpu = "8086:5917 ";
+        assert!(!knows_driver(gpu));
+        assert!(!knows_driver(""));
+        assert!(!knows_driver("8086:5917 23.20.16.5038, 10de:1c8d "));
+        assert!(knows_driver(
+            "8086:5917 23.20.16.5038, 10de:1c8d 31.0.15.3623"
+        ));
+        let old = marker(gpu, "vulkan");
+        let fallback = marker(gpu, "dx12");
+        let mut history = Vec::new();
+        record_failure(&mut history, &old);
+        for _ in 0..RETRY_AFTER - 1 {
+            record_success(&mut history, &fallback);
+        }
+        assert!(avoided(&history, gpu, "vulkan"));
         record_success(&mut history, &fallback);
-        assert!(!avoided(&history, &old.gpu, "vulkan"));
+        assert!(!avoided(&history, gpu, "vulkan"));
         // Failing again waits twice as long.
         record_failure(&mut history, &old);
         for _ in 0..2 * RETRY_AFTER - 1 {
             record_success(&mut history, &fallback);
         }
-        assert!(avoided(&history, &old.gpu, "vulkan"));
-        // Drawing with it clears the entry.
-        record_success(&mut history, &old);
-        assert!(history.is_empty());
+        assert!(avoided(&history, gpu, "vulkan"));
+    }
+
+    #[test]
+    fn files_from_earlier_versions_load_and_stay_readable() {
+        let directory = temp_dir("renderer-old");
+        // 0.3.3's history: Vulkan crashed once, then 40 clean launches on
+        // DX12, so 0.3.3 would retry it now. Its key names the driver.
+        let gpu = "8086:9bc4 31.0.101.2111";
+        fs::write(
+            directory.join(HISTORY_FILE),
+            format!(r#"[{{"gpu":"{gpu}","backend":"vulkan","failures":1,"clean_launches":40}}]"#),
+        )
+        .unwrap();
+        // And a marker an exited 0.3.3 launch left.
+        let dead = exited_process();
+        fs::write(
+            marker_path(&directory, dead),
+            format!(r#"{{"gpu":"{gpu}","backend":"dx12"}}"#),
+        )
+        .unwrap();
+        let history = sweep(&directory, ProcessId::current());
+        assert_eq!(history.len(), 2);
+        assert!(avoided(&history, gpu, "vulkan"));
+        assert!(avoided(&history, gpu, "dx12"));
+        // The saved file keeps the fields earlier versions need to read it.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join(HISTORY_FILE)).unwrap()).unwrap();
+        for entry in saved.as_array().unwrap() {
+            assert!(entry["failures"].is_u64() && entry["clean_launches"].is_u64());
+        }
+        // Troubleshooting's reset forgets them all.
+        update_history(&directory, Vec::clear);
+        assert!(sweep(&directory, ProcessId::current()).is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -906,22 +1095,24 @@ mod tests {
     }
 
     #[test]
-    fn clean_launches_bring_the_full_instance_back() {
+    fn a_driver_update_brings_the_full_instance_back() {
         let gpus = "1002:150e 32.0.21025.1024";
         let drew = marker("1002:150e 32.0.21025.1024", "dx12");
         let mut history = Vec::new();
         record_failure(&mut history, &marker(gpus, Plan::Full.stage()));
-        for _ in 0..RETRY_AFTER - 1 {
+        for _ in 0..10 * RETRY_AFTER {
             record_success(&mut history, &drew);
         }
         assert_eq!(instance_plan(&history, gpus), Plan::Dx12);
-        record_success(&mut history, &drew);
-        assert_eq!(instance_plan(&history, gpus), Plan::Full);
+        assert_eq!(
+            instance_plan(&history, "1002:150e 32.0.21030.2001"),
+            Plan::Full
+        );
     }
 
     #[test]
     fn a_fallback_to_another_gpu_still_ages_the_failure() {
-        let failed = marker("8086:5917 23.20.16.5038", "vulkan");
+        let failed = marker("8086:5917 ", "vulkan");
         let warp = marker("1414:008c 10.0.22621.1", "dx12");
         let mut history = Vec::new();
         record_failure(&mut history, &failed);
