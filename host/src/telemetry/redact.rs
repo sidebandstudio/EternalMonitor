@@ -118,11 +118,56 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "running",
     "version",
     "build",
+    "slow",
+    "changed",
+    "remote_config",
+    "rollout",
+    "ss_rule",
+    "problem",
+    "requested",
+    "preferred",
+    "using",
+    "from",
+    "to",
+    "arch",
+    "installation_type",
+    // Troubleshooting and the graphics card switch.
+    "overrides",
+    "encoder_input",
+    "packet",
+    "fps",
+    "window",
+    "graphics_card",
+    "preference",
+    "switch",
+    "choice",
+    // The virtual display snapshot.
+    "driver",
+    "tech",
+    "vdd",
+    "src",
+    "tgt",
+    "hags",
+    "settings_path",
+    "paths",
+    "pin_matched",
+    "pin_reason",
+    "render_is_pin",
     // Hardware descriptions.
     "adapter",
     "vendor",
     "display",
     "vdd_device",
+    "pin",
+    "render",
+    "registry_product",
+    "identifier",
+    "adapters",
+    "outputs",
+    "screen_gpu",
+    "app_gpu",
+    "power_saving_gpu",
+    "high_performance_gpu",
     // The periodic stats summary.
     "stream_codec",
     "stream_input",
@@ -972,6 +1017,82 @@ mod tests {
                 (r"reason=D:\no_frames\x", r"reason=D:\%USERNAME%\x"),
             ],
         );
+    }
+
+    /// Every enumerated field the host logs keeps its value when the user or
+    /// the PC has that name.
+    #[test]
+    fn every_logged_token_survives_a_name_equal_to_it() {
+        let cases = [
+            (
+                "encoder_open",
+                "WARN A Windows or driver call was slow but returned slow=encoder_open took_ms=1200 warn_ms=1000",
+            ),
+            (
+                "graphics",
+                "INFO The second screen failed on this PC before reason=no_frames changed=windows,graphics",
+            ),
+            ("applied", "INFO remote_config=applied rollout=none ss_rule=match attach_s=6"),
+            ("none", "INFO remote_config=applied rollout=none ss_rule=none attach_s=6"),
+            ("defaults", "INFO remote_config=defaults reason=offline rollout=7d"),
+            ("NotInstalled", "vdd_device=missing problem=NotInstalled"),
+            (
+                "unknown",
+                r#"WARN Virtual display failure snapshot vdd_device=no_monitor pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
+            ),
+            (
+                "Iris",
+                r#"WARN Virtual display failure snapshot pin="Intel(R) Iris(R) Xe" pin_matched=true render="Intel(R) Iris(R) Xe" render_is_pin=true"#,
+            ),
+            (
+                "GeForce3050",
+                r#"WARN Virtual display failure snapshot adapters=[d2c1 "Intel(R) Iris(R) Xe" 8086:46a6 driver=32.0.101.7092 outputs=1 | 10000e5f0 "GeForce3050" 10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 tech=5 vdd=yes]"#,
+            ),
+            ("yes", "WARN Virtual display failure snapshot paths=[active src=d2c1/0 tgt=d2c1/4352 tech=5 vdd=yes]"),
+            (
+                "hevc_nvenc",
+                "INFO Staying on the encoder that streams for this pipeline from=hevc_nvenc to=h264_nvenc",
+            ),
+            (
+                "h264_nvenc",
+                "INFO Trying the preferred encoder again after a stalled open preferred=h264_nvenc using=libx264 attempt=2",
+            ),
+            (
+                "modes",
+                "INFO Second screen mode mode=2732x2048 requested=the driver's modes",
+            ),
+            ("arm64", "INFO EternalMonitor host 0.3.4 revision=x | OS=Windows arch=arm64 logical_cpus=8"),
+            (
+                "Client",
+                "INFO Windows os=10.0 registry_product=Windows 11 Pro installation_type=Client display_version=24H2",
+            ),
+            ("Family", "INFO CPU=x identifier=Intel64 Family 6 Model 154"),
+            (
+                "vulkan",
+                "INFO Troubleshooting settings in effect overrides=encoder_input=bgra (setting), \
+                 packet=1200 (environment), window=vulkan (setting), graphics_card=2 (windows)",
+            ),
+            (
+                "HighPerformance",
+                "INFO Graphics card switch outcome: capture works gpu=NVIDIA preference=Some(HighPerformance) \
+                 app_gpu=\"NVIDIA\"",
+            ),
+            (
+                "Radeon780M",
+                "INFO Graphics card check screen_gpu=Radeon780M app_gpu=GeForce4060 \
+                 switch=Some(PowerSaving) cards=2 power_saving_gpu=Radeon780M high_performance_gpu=GeForce4060",
+            ),
+            ("Dx12", "INFO Window renderer instance backends=DX12 choice=Some(Dx12) chosen_failed=false"),
+        ];
+        for (name, message) in cases {
+            let line = format!("{STAMP}  {message}");
+            for names in [
+                Names::new(Some(&format!(r"C:\Users\{name}")), Some(name), None),
+                Names::new(None, None, Some(name)),
+            ] {
+                assert_eq!(redact(&line, &names), line, "{name}");
+            }
+        }
     }
 
     /// xorshift64*: enough to vary the fuzz lines, and the same every run.

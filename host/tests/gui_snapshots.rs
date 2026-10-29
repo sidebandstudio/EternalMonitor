@@ -1196,6 +1196,18 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.run_steps(4);
     snapshot(&mut window, shared, "settings-about");
 
+    // The diagnostics line is in words, without field names or ids. Uploads
+    // are not configured in tests.
+    window
+        .get_by_role_and_label(Role::CheckBox, "Automatically share diagnostics")
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Sharing diagnostics isn't available in this build.");
+    assert!(window.query_by_label_contains("queue_dropped").is_none());
+    snapshot(&mut window, shared, "settings-diagnostics");
+    window.get_by_label("Source code").scroll_to_me();
+    window.run_steps(4);
+
     // The panel: kind, message, details and the ways to send.
     window
         .get_all_by_role_and_label(Role::Button, "Send feedback")
