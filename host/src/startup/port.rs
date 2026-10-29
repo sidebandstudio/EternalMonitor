@@ -26,9 +26,9 @@ use tracing::{info, warn};
 /// How often the supervisor checks a held port again.
 pub const RECHECK: Duration = Duration::from_secs(2);
 
-/// How long a check waits to learn which program holds the port. Reading an
-/// executable on a slow network share can take much longer; its holder is
-/// then [`HeldBy::Unknown`].
+/// How long a check waits for the description of the program holding the
+/// port. Reading an executable on a slow network share can take much longer;
+/// the program then goes by its file name.
 const LOOKUP: Duration = Duration::from_millis(500);
 
 /// Refused binds in a row, with no program on the port, before the Stream
@@ -231,22 +231,55 @@ enum Family {
 /// when Windows lists no program on it.
 fn holder(port: u16, own: u32, family: Family) -> Option<HeldBy> {
     let pid = owner(port, family)?;
-    Some(identify(pid, own, |pid| {
-        named(pid, image_path(pid).as_deref())
-    }))
+    Some(identify(pid, own, image_path, description))
 }
 
-/// Who process `pid` is, as `name` finds out within [`LOOKUP`].
-fn identify(pid: u32, own: u32, name: impl FnOnce(u32) -> HeldBy + Send + 'static) -> HeldBy {
-    static LOOKING: AtomicBool = AtomicBool::new(false);
+/// Who process `pid` is. Its image path (`image`) needs no file I/O, so
+/// Windows, a service host and another copy are named at once, even while an
+/// earlier lookup is stuck. Only the file's description (`describe`), which
+/// can hang on a network share, waits on another thread.
+fn identify(
+    pid: u32,
+    own: u32,
+    image: impl FnOnce(u32) -> Option<String>,
+    describe: impl FnOnce(&str) -> Option<String> + Send + 'static,
+) -> HeldBy {
     if pid == own {
         return HeldBy::ThisCopy;
     }
-    within(&LOOKING, LOOKUP, move || name(pid)).unwrap_or(HeldBy::Unknown)
+    let image = (pid != 4).then(|| image(pid)).flatten();
+    named(pid, image.as_deref(), |image| described(image, describe))
 }
 
-/// Runs `lookup` on its own thread and waits up to `limit` for it; None if
-/// it takes longer. While one is still running (`busy`), none is started.
+/// The description of the file at `image`, as `describe` reads it within
+/// [`LOOKUP`]. A description once read is kept, so a later slow read of the
+/// same file doesn't change what the Stream page calls the program.
+fn described(
+    image: &str,
+    describe: impl FnOnce(&str) -> Option<String> + Send + 'static,
+) -> Option<String> {
+    static LOOKING: AtomicBool = AtomicBool::new(false);
+    static READ: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+    if let Some((_, description)) = READ
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(path, _)| path == image)
+    {
+        return description.clone();
+    }
+    let image = image.to_owned();
+    within(&LOOKING, LOOKUP, move || {
+        let description = describe(&image);
+        *READ.lock().unwrap_or_else(|e| e.into_inner()) = Some((image, description.clone()));
+        description
+    })
+    .flatten()
+}
+
+/// Runs `lookup` on its own thread, logging where the caller logs, and waits
+/// up to `limit` for it; None if it takes longer. While one is still running
+/// (`busy`), none is started.
 fn within<T: Send + 'static>(
     busy: &'static AtomicBool,
     limit: Duration,
@@ -256,10 +289,11 @@ fn within<T: Send + 'static>(
         return None;
     }
     let (found_tx, found_rx) = mpsc::channel();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let spawned = thread::Builder::new()
         .name("port-holder".into())
         .spawn(move || {
-            let found = lookup();
+            let found = tracing::dispatcher::with_default(&dispatch, lookup);
             busy.store(false, Ordering::Release);
             let _ = found_tx.send(found);
         });
@@ -271,8 +305,9 @@ fn within<T: Send + 'static>(
 }
 
 /// Who process `pid`, running `image`, is. Windows' own processes get a
-/// plain name rather than "System" or a service host.
-fn named(pid: u32, image: Option<&str>) -> HeldBy {
+/// plain name rather than "System" or a service host. `describe` is asked
+/// only for any other program.
+fn named(pid: u32, image: Option<&str>, describe: impl FnOnce(&str) -> Option<String>) -> HeldBy {
     if pid == 4 {
         return HeldBy::Windows;
     }
@@ -287,7 +322,7 @@ fn named(pid: u32, image: Option<&str>) -> HeldBy {
         return HeldBy::WindowsService;
     }
     // What Task Manager shows: the file's description, else its file name.
-    HeldBy::Program(description(image).unwrap_or_else(|| file.to_string()))
+    HeldBy::Program(describe(image).unwrap_or_else(|| file.to_string()))
 }
 
 fn is_eternal_monitor(image: &str) -> bool {
@@ -530,7 +565,7 @@ mod tests {
         }
     }
 
-    /// Log lines `run` writes on this thread.
+    /// Log lines `run` writes, on this thread and the lookup threads it starts.
     fn logged(run: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
@@ -654,19 +689,29 @@ mod tests {
             r"D:\build\target\debug\eternal-host.exe"
         ));
         assert!(!is_eternal_monitor(r"C:\Program Files\VLC\vlc.exe"));
-        assert_eq!(named(4, None), HeldBy::Windows);
+        assert_eq!(named(4, None, not_read), HeldBy::Windows);
         assert_eq!(
-            named(1234, Some(r"C:\Windows\System32\svchost.exe")),
+            named(1234, Some(r"C:\Windows\System32\svchost.exe"), not_read),
             HeldBy::WindowsService
         );
         assert_eq!(
             named(
                 1234,
-                Some(r"C:\Program Files\EternalMonitor\EternalMonitor.exe")
+                Some(r"C:\Program Files\EternalMonitor\EternalMonitor.exe"),
+                not_read
             ),
             HeldBy::OtherCopy
         );
-        assert_eq!(named(1234, None), HeldBy::Unknown, "unreadable");
+        assert_eq!(named(1234, None, not_read), HeldBy::Unknown, "unreadable");
+        let vlc = r"C:\Program Files\VLC\vlc.exe";
+        assert_eq!(
+            named(1234, Some(vlc), |_| Some("VLC media player".into())),
+            HeldBy::Program("VLC media player".into())
+        );
+        assert_eq!(
+            named(1234, Some(vlc), |_| None),
+            HeldBy::Program("vlc.exe".into())
+        );
     }
 
     /// Windows' IPv6 sockets are IPv6-only unless they say otherwise, so a
@@ -737,6 +782,12 @@ mod tests {
             ] {
                 check_with(9876, Bind::InUse, || Some(by), || None);
             }
+            // Named through the lookup thread.
+            let by = identify(1234, 0, image(r"C:\Tools\AliceTool.exe"), |_| {
+                Some("Alice's Tool".into())
+            });
+            assert_eq!(by, HeldBy::Program("Alice's Tool".into()));
+            check_with(9876, Bind::InUse, || Some(by), || None);
             forget();
         });
         assert!(!log.contains("Alice"), "{log}");
@@ -754,41 +805,95 @@ mod tests {
         assert!(log.contains("Windows is blocking"), "{log}");
     }
 
-    /// A program whose file is slow to read (a network share) is Unknown
-    /// after [`LOOKUP`], and no second lookup starts while it runs.
+    fn image(path: &'static str) -> impl FnOnce(u32) -> Option<String> {
+        move |_| Some(path.to_string())
+    }
+
+    fn not_read(_: &str) -> Option<String> {
+        panic!("the path already names it")
+    }
+
+    /// A program whose file is slow to read (a network share) goes by its
+    /// file name after [`LOOKUP`], and no second read starts while it runs.
+    /// Its path still names Windows, a service host and another copy at
+    /// once, and once read, its description stays.
     #[test]
-    fn a_slow_lookup_is_unknown_after_half_a_second() {
+    fn a_slow_description_leaves_the_program_named_by_its_file() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let slow = r"\\share\tools\slow.exe";
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let started = std::time::Instant::now();
-        let by = identify(1234, 0, move |_| {
+        let by = identify(1234, 0, image(slow), move |_| {
             let _ = release_rx.recv();
-            HeldBy::Program("Slow".into())
+            Some("Slow Tool".into())
         });
         let took = started.elapsed();
-        assert_eq!(by, HeldBy::Unknown);
+        assert_eq!(by, HeldBy::Program("slow.exe".into()));
         assert!(took >= LOOKUP && took < LOOKUP * 4, "{took:?}");
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let started = std::time::Instant::now();
-        let by = identify(1234, 0, {
+        let by = identify(1234, 0, image(r"C:\Tools\quick.exe"), {
             let ran = ran.clone();
             move |_| {
                 ran.store(true, Ordering::SeqCst);
-                HeldBy::Program("Quick".into())
+                Some("Quick".into())
             }
         });
-        assert_eq!(by, HeldBy::Unknown, "the slow one still runs");
+        assert_eq!(
+            by,
+            HeldBy::Program("quick.exe".into()),
+            "the slow one still runs"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "no second read");
+        assert_eq!(identify(4, 0, |_| None, not_read), HeldBy::Windows);
+        assert_eq!(
+            identify(
+                1234,
+                0,
+                image(r"C:\Program Files\EternalMonitor\EternalMonitor.exe"),
+                not_read
+            ),
+            HeldBy::OtherCopy
+        );
+        assert_eq!(
+            identify(1234, 0, image(r"C:\Windows\System32\svchost.exe"), not_read),
+            HeldBy::WindowsService
+        );
+        assert_eq!(identify(1234, 0, |_| None, not_read), HeldBy::Unknown);
         assert!(started.elapsed() < LOOKUP, "didn't wait");
-        assert!(!ran.load(Ordering::SeqCst), "no second lookup");
 
         drop(release_tx);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while identify(1234, 0, |_| HeldBy::Program("Quick".into())) == HeldBy::Unknown {
+        while identify(1234, 0, image(slow), |_| None) != HeldBy::Program("Slow Tool".into()) {
             assert!(std::time::Instant::now() < deadline, "the slow one ends");
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(identify(7, 7, |_| HeldBy::Unknown), HeldBy::ThisCopy);
+        // A later read of the same file that would be slow isn't waited for.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            identify(5678, 0, image(slow), |_| {
+                thread::sleep(LOOKUP * 2);
+                None
+            }),
+            HeldBy::Program("Slow Tool".into())
+        );
+        assert!(started.elapsed() < LOOKUP, "didn't read again");
+        assert_eq!(identify(7, 7, |_| None, not_read), HeldBy::ThisCopy);
+    }
+
+    /// The description is read on another thread. Its log lines go where the
+    /// check's go, so the log tests here see them.
+    #[test]
+    fn the_lookup_thread_logs_where_the_check_logs() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let log = logged(|| {
+            let read = within(&BUSY, Duration::from_secs(5), || {
+                warn!("read on the lookup thread")
+            });
+            assert_eq!(read, Some(()));
+        });
+        assert!(log.contains("read on the lookup thread"), "{log}");
     }
 
     /// The Stream page reads the holder every frame; a check whose lookup is
