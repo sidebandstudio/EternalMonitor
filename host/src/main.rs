@@ -105,6 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // queued for support instead of the window closing without a word.
     eternal_host::startup::install_failure_hooks();
     eternal_host::startup::take_previous_crashes();
+    // Before the renderer: a new version that fails to start still logs how
+    // the update to it went.
+    eternal_host::updates::report_previous_update();
 
     let listen_port: u16 = std::env::args()
         .nth(1)

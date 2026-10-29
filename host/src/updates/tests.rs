@@ -1014,11 +1014,12 @@ fn update_waits_for_the_stream_to_stop() {
     assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
 }
 
-/// A check can find a newer release while one is downloading or waiting for a
-/// stream to end. The file must still go to the helper with its own hash,
-/// which the helper checks, not the newer release's.
+/// A check can replace the offered release while one is downloading or
+/// waiting for a stream to end. The file never goes to the helper with
+/// another release's hash: the update stops at its handoff and the banner
+/// offers the new answer.
 #[test]
-fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
+fn a_release_found_mid_update_stops_it_and_is_offered() {
     let a = release("0.3.2");
     let b = Release {
         sha256: "1".repeat(64),
@@ -1036,19 +1037,93 @@ fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
         Some(Notice::Downloading("0.3.2".into(), None))
     );
     s.download_finished(Ok(path_a.clone()));
-    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
-    assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+    assert_eq!(s.take_ready(false), None);
+    assert_eq!((&s.phase, &s.chosen), (&Phase::Idle, &None));
+    assert_eq!(s.saved.pending, None);
+    assert_eq!(s.gate.holder(), None);
+    assert_eq!(s.notice(1001), Some(Notice::Available("0.3.3".into())));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r == b));
 
+    // The same answer again changes nothing.
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(a.clone()));
     s.update_now(false);
     s.download_finished(Ok(path_a.clone()));
     assert!(s.take_ready(true).is_none(), "waits for the stream");
-    s.finish_check(1001, false, Ok(b));
+    s.finish_check(1001, false, Ok(a.clone()));
     let start = Instant::now();
     assert!(s.tick(false, start).is_none());
     assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
-    assert_eq!(s.take_ready(false), Some((path_a, a)));
+    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
+
+    // Taken back while the download waited for the stream: nothing is
+    // offered and nothing downloads.
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.update_now(true);
+    s.finish_check(1001, false, Ok(release("0.3.1")));
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert_eq!(s.phase, Phase::Idle);
+    assert_eq!(s.notice(1001), None);
+}
+
+/// After a failed update the banner offers Try again while the launch check
+/// of the saved release runs. Until it answers, Try again starts nothing; a
+/// download already asked for checks the release again before it starts.
+#[test]
+fn try_again_waits_for_the_launch_check_of_a_saved_release() {
+    let now = 100_000;
+    let failed = || {
+        let (mut saved, dir) = pending_saved("0.3.1", "0.3.2", Some("setup_exit=5\n"));
+        saved.checked_at = Some(now - RECHECK_OFFER);
+        let mut s = state(saved);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(s.launch_check(now));
+        s
+    };
+    // Withdrawn on the website.
+    let mut s = failed();
+    assert!(failed_message(&s).starts_with("The update was cancelled"));
+    assert!(s.rechecking());
+    assert!(s.update_now(false).is_none(), "Try again waits");
+    assert!(matches!(s.phase, Phase::Failed(_)));
+    s.finish_check(now + 1, false, Ok(release("0.3.1")));
+    assert!(!s.rechecking());
+    assert!(s.update_now(false).is_none(), "nothing newer to install");
+    // Replaced by a newer release: that one is installed.
+    let mut s = failed();
+    s.finish_check(now + 1, false, Ok(release("0.3.3")));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r.version == "0.3.3"));
+    // Offline: the saved release, as before.
+    let mut s = failed();
+    s.finish_check(now + 1, false, Err(UpdateError::Network("offline".into())));
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r.version == "0.3.2"));
+
+    // Through the worker: a download asked for before a check replaced the
+    // release stops without a request and the new answer is offered. The
+    // fake site answers nothing, so a download that went ahead would fail.
+    let site = serve(Box::new(|_, _| (404, vec![], Vec::new())));
+    let mut s = failed();
+    s.finish_check(now + 1, false, Err(UpdateError::Network("offline".into())));
+    let Some(Command::Download(chosen)) = s.update_now(false) else {
+        panic!("no download");
+    };
+    s.finish_check(now + 2, false, Ok(release("0.3.3")));
+    let mut worker = worker(
+        s,
+        Arc::new(Mutex::new(crate::transport::session::Session::new(1))),
+    );
+    worker.endpoints = Endpoints::local(&site).unwrap();
+    let state = worker.state.clone();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Command::Download(chosen)).unwrap();
+    drop(tx);
+    worker.run(rx);
+    let s = state.lock();
+    assert_eq!((&s.phase, &s.chosen), (&Phase::Idle, &None));
+    assert_eq!(s.notice(now + 2), Some(Notice::Available("0.3.3".into())));
 }
 
 #[test]
@@ -1585,4 +1660,433 @@ fn mismatch_names_the_older_side() {
     assert_eq!(log.recent(), Some(OlderSide::Ipad));
     log.clear();
     assert_eq!(log.recent(), None);
+}
+
+// ── Recovery from a failed start or update ──────────────────────────────────
+
+/// The lines `run` logs, without ANSI colours.
+fn logged(run: impl FnOnce()) -> String {
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let sink = Sink(out.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let text = String::from_utf8(out.lock().clone()).unwrap();
+    text
+}
+
+#[test]
+fn the_failure_message_offers_only_a_newer_stable_version() {
+    let offline = || Some(Err(UpdateError::Network("offline".into())));
+    // The website names a newer version.
+    let live = failure_offer("0.3.4", None, Some(Ok(release("0.3.5"))));
+    assert_eq!(live.version.as_deref(), Some("0.3.5"));
+    assert_eq!((live.source, live.fetch), ("live", "ok"));
+    assert_eq!(
+        live.describe(),
+        "Update offer on the failure message: offered version=0.3.5 source=live fetch=ok"
+    );
+    // The same version is not offered.
+    let equal = failure_offer("0.3.5", Some(&release("0.3.5")), Some(Ok(release("0.3.5"))));
+    assert_eq!(equal.version, None);
+    assert_eq!(
+        equal.describe(),
+        "Update offer on the failure message: not offered source=live fetch=ok"
+    );
+    // A preview is never offered, saved or fetched (the manifest refuses it).
+    let preview = failure_offer("0.3.4", Some(&release("0.3.5-beta.1")), None);
+    assert_eq!(preview.version, None);
+    let bad = parse_manifest(
+        &manifest("0.3.5-beta.1", &production_installer("0.3.5-beta.1"), SHA),
+        &Endpoints::production(),
+    );
+    assert!(bad.is_err());
+    assert_eq!(failure_offer("0.3.4", None, Some(bad)).version, None);
+    // Update checks off: no request, the saved release only.
+    let off = failure_offer("0.3.4", Some(&release("0.3.5")), None);
+    assert_eq!(off.version.as_deref(), Some("0.3.5"));
+    assert_eq!((off.source, off.fetch), ("saved", "off"));
+    // The website can't be reached: the saved release.
+    let failed = failure_offer("0.3.4", Some(&release("0.3.5")), offline());
+    assert_eq!(failed.version.as_deref(), Some("0.3.5"));
+    assert_eq!(
+        failed.describe(),
+        "Update offer on the failure message: offered version=0.3.5 source=saved fetch=failed"
+    );
+    let nothing = failure_offer("0.3.4", None, offline());
+    assert_eq!((nothing.version, nothing.source), (None, "none"));
+    // A release taken back on the website is not offered from the saved one.
+    let taken_back = failure_offer("0.3.4", Some(&release("0.3.5")), Some(Ok(release("0.3.4"))));
+    assert_eq!(taken_back.version, None);
+}
+
+#[test]
+fn the_failure_message_check_is_validated_and_bounded() {
+    let base = serve(Box::new(|base, path| match path {
+        "/latest.json" => (
+            200,
+            vec![],
+            manifest(
+                "0.3.5",
+                &format!("{base}/releases/download/v0.3.5/EternalMonitor-Setup.exe"),
+                SHA,
+            ),
+        ),
+        _ => (404, vec![], Vec::new()),
+    }));
+    let endpoints = Endpoints::local(&base).unwrap();
+    let soon = || Instant::now() + Duration::from_secs(3);
+    let fetched = fetch_by(endpoints.clone(), soon()).unwrap();
+    assert_eq!(fetched.version, "0.3.5");
+    // The installer must be where the manifest checks say.
+    let elsewhere = Endpoints {
+        installer_prefix: "https://example.invalid/".into(),
+        ..endpoints
+    };
+    assert!(matches!(
+        fetch_by(elsewhere, soon()),
+        Err(UpdateError::BadManifest(_))
+    ));
+    // A site that accepts the connection and never answers: the saved
+    // release by the deadline, which counts from before the request.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let stuck = Endpoints::local(&format!("http://127.0.0.1:{port}")).unwrap();
+    let lookup = FailureLookup {
+        saved: Some(release("0.3.9")),
+        checks: true,
+    };
+    assert_eq!(
+        lookup.saved_offer().describe(),
+        "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
+    );
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(300);
+    let offer = lookup.finish_from(stuck.clone(), deadline);
+    let took = started.elapsed();
+    assert_eq!(
+        offer.describe(),
+        "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
+    );
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_millis(450),
+        "{took:?}"
+    );
+    // A deadline already past makes no request.
+    assert!(fetch_by(stuck, Instant::now()).is_err());
+    drop(silent);
+}
+
+fn pending_saved(from: &str, to: &str, result: Option<&str>) -> (Saved, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "eternal-update-result-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(eternal_updater::RESULT_FILE);
+    if let Some(text) = result {
+        std::fs::write(&path, text).unwrap();
+    }
+    let saved = Saved {
+        pending: Some((from.into(), to.into())),
+        pending_result: Some(path),
+        latest: Some(release(to)),
+        ..Saved::default()
+    };
+    (saved, dir)
+}
+
+fn failed_message(state: &State) -> String {
+    match state.notice(0) {
+        Some(Notice::Failed(message)) => message,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_finished_update_is_logged_with_setup_s_exit_code() {
+    let (saved, dir) = pending_saved("0.3.4", "0.3.5", Some("setup_exit=0\n"));
+    let mut state = None;
+    let log = logged(|| state = Some(State::new("0.3.5", true, saved)));
+    let state = state.unwrap();
+    assert!(
+        log.contains("INFO") && log.contains("Update finished from=0.3.4 to=0.3.5 setup_exit=0"),
+        "{log}"
+    );
+    assert_eq!(state.notice(0), Some(Notice::Updated("0.3.5".into())));
+    assert_eq!(
+        (&state.saved.pending, &state.saved.pending_result),
+        (&None, &None)
+    );
+    // From a helper that leaves no result, the line has no exit code.
+    let (saved, other) = pending_saved("0.3.3", "0.3.4", None);
+    let log = logged(|| drop(State::new("0.3.4", true, saved)));
+    assert!(log.contains("Update finished from=0.3.3 to=0.3.4"), "{log}");
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(other).unwrap();
+}
+
+/// Setup replaces the app before it repairs the virtual display driver, so
+/// the new version runs even when Setup then fails. Only Setup's 0, or no
+/// result from an older helper, counts as a finished update.
+#[test]
+fn a_setup_that_failed_after_installing_the_new_version_is_reported() {
+    let case = |current: &str, result: Option<&str>| {
+        let (saved, dir) = pending_saved("0.3.4", "0.3.5", result);
+        let mut state = None;
+        let log = logged(|| state = Some(State::new(current, true, saved)));
+        std::fs::remove_dir_all(dir).unwrap();
+        let state = state.unwrap();
+        assert_eq!(
+            (&state.saved.pending, &state.saved.pending_result),
+            (&None, &None),
+            "reported once"
+        );
+        (log, state.notice(0))
+    };
+    // 0 and the new version: finished.
+    let (log, notice) = case("0.3.5", Some("setup_exit=0\n"));
+    assert!(
+        log.contains("INFO") && log.contains("Update finished from=0.3.4 to=0.3.5 setup_exit=0"),
+        "{log}"
+    );
+    assert_eq!(notice, Some(Notice::Updated("0.3.5".into())));
+    // 20, the driver repair, after the new version was installed.
+    let (log, notice) = case("0.3.5", Some("setup_exit=20\n"));
+    assert!(
+        log.contains("WARN")
+            && log.contains("Update finished with problems from=0.3.4 to=0.3.5 setup_exit=20"),
+        "{log}"
+    );
+    assert!(!log.contains("Update finished from"), "{log}");
+    assert_eq!(
+        notice,
+        Some(Notice::Incomplete(
+            "EternalMonitor updated, but the virtual display driver couldn't be repaired. Second screen may not work. Reinstall from the website to fix it.".into()
+        ))
+    );
+    // Any other failure after the new version was installed.
+    let (log, notice) = case("0.3.5", Some("setup_exit=4\n"));
+    assert!(
+        log.contains("Update finished with problems from=0.3.4 to=0.3.5 setup_exit=4"),
+        "{log}"
+    );
+    assert_eq!(
+        notice,
+        Some(Notice::Incomplete(
+            "Some parts of the update didn't finish. Reinstall from the website.".into()
+        ))
+    );
+    // 5 and still the old version: did not finish, as before.
+    let (log, notice) = case("0.3.4", Some("setup_exit=5\n"));
+    assert!(
+        log.contains("WARN")
+            && log.contains("Update did not finish from=0.3.4 to=0.3.5 setup_exit=5"),
+        "{log}"
+    );
+    assert!(matches!(notice, Some(Notice::Failed(m)) if m.starts_with("The update was cancelled")));
+    // No result from an older helper and the new version: finished.
+    let (log, notice) = case("0.3.5", None);
+    assert!(
+        log.contains("INFO") && log.contains("Update finished from=0.3.4 to=0.3.5"),
+        "{log}"
+    );
+    assert_eq!(notice, Some(Notice::Updated("0.3.5".into())));
+    // The banner shows once: OK clears it.
+    let (saved, dir) = pending_saved("0.3.4", "0.3.5", Some("setup_exit=20\n"));
+    let mut state = State::new("0.3.5", true, saved);
+    std::fs::remove_dir_all(dir).unwrap();
+    state.later(0);
+    assert_eq!(state.notice(0), None);
+}
+
+#[test]
+fn a_failed_update_is_logged_and_explained_from_the_helper_s_result() {
+    let case = |result: Option<&str>| {
+        let (saved, dir) = pending_saved("0.3.4", "0.3.5", result);
+        let mut state = None;
+        let log = logged(|| state = Some(State::new("0.3.4", true, saved)));
+        std::fs::remove_dir_all(dir).unwrap();
+        let state = state.unwrap();
+        assert_eq!(state.saved.pending, None, "reported once");
+        (log, failed_message(&state))
+    };
+    // No result file: an older helper, as before.
+    let (log, message) = case(None);
+    assert!(
+        log.contains("WARN")
+            && log.contains("Update did not finish from=0.3.4 to=0.3.5 reason=\"no-result\""),
+        "{log}"
+    );
+    assert!(
+        message.contains("you still have version 0.3.4") && message.contains("click Yes"),
+        "{message}"
+    );
+    // Declined permission prompt or Cancel before installing.
+    let (log, message) = case(Some("setup_exit=2\n"));
+    assert!(log.contains("setup_exit=2 files_in_use=false"), "{log}");
+    assert!(
+        message.starts_with("The update was cancelled, so you still have version 0.3.4."),
+        "{message}"
+    );
+    // Cancel while installing.
+    let (_, message) = case(Some("setup_exit=5\n"));
+    assert!(message.starts_with("The update was cancelled"), "{message}");
+    // The same code after a file in use.
+    let (log, message) = case(Some("setup_exit=5\nfiles_in_use=1\n"));
+    assert!(log.contains("setup_exit=5 files_in_use=true"), "{log}");
+    assert!(
+        message.starts_with("Another program was using EternalMonitor's files")
+            && message.contains("Restart the PC"),
+        "{message}"
+    );
+    // Another copy did not close, so Setup never ran.
+    let (log, message) = case(Some("reason=another-copy-open\n"));
+    assert!(log.contains("reason=another-copy-open"), "{log}");
+    assert!(
+        message.starts_with("Another copy of EternalMonitor was still open"),
+        "{message}"
+    );
+    let (_, message) = case(Some("reason=host-still-open\n"));
+    assert!(
+        message.starts_with("Another copy of EternalMonitor was still open"),
+        "{message}"
+    );
+    // Setup failed.
+    let (log, message) = case(Some("setup_exit=4\n"));
+    assert!(log.contains("setup_exit=4"), "{log}");
+    assert!(
+        message.starts_with("The installer could not finish"),
+        "{message}"
+    );
+    let (_, message) = case(Some("reason=setup-not-started\n"));
+    assert!(
+        message.starts_with("The installer could not finish"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_launch_reports_a_previous_update_once_before_the_window() {
+    let (mut saved, dir) = pending_saved("0.3.4", "0.3.5", Some("setup_exit=5\n"));
+    let previous = take_pending("0.3.4", &mut saved);
+    assert!(matches!(&previous, Some(Previous::Failed(m)) if m.contains("cancelled")));
+    assert_eq!(
+        (saved.pending.clone(), saved.pending_result.clone()),
+        (None, None)
+    );
+    // The window's state shows what the launch took, and logs nothing again.
+    let mut state = None;
+    let log = logged(|| state = Some(State::resume("0.3.4", true, saved, previous)));
+    assert!(!log.contains("Update did not finish"), "{log}");
+    assert!(failed_message(&state.unwrap()).contains("cancelled"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_handoff_records_where_the_helper_writes_its_result() {
+    let mut s = state(Saved::default());
+    s.finish_check(10, false, Ok(release("0.3.2")));
+    s.update_now(false);
+    let setup = PathBuf::from("updates")
+        .join("0a1b")
+        .join("EternalMonitor-Setup-0.3.2.exe");
+    s.download_finished(Ok(setup.clone()));
+    s.take_ready(false).unwrap();
+    assert_eq!(
+        s.saved.pending_result,
+        Some(setup.with_file_name(eternal_updater::RESULT_FILE))
+    );
+    s.install_failed(&UpdateError::Launch("x".into()));
+    assert_eq!(
+        (s.saved.pending.clone(), s.saved.pending_result.clone()),
+        (None, None)
+    );
+}
+
+#[test]
+fn a_saved_release_is_checked_again_before_it_is_offered() {
+    let saved = |checked_at| Saved {
+        checked_at: Some(checked_at),
+        latest: Some(release("0.3.2")),
+        ..Saved::default()
+    };
+    let now = 100_000;
+    // Checked minutes ago: offered at once, no extra request.
+    let mut fresh = state(saved(now - 60));
+    assert!(!fresh.launch_check(now));
+    assert_eq!(fresh.notice(now), Some(Notice::Available("0.3.2".into())));
+    // Older: checked again, and nothing is offered until it answers.
+    let mut stale = state(saved(now - RECHECK_OFFER));
+    assert!(stale.launch_check(now));
+    assert_eq!(stale.notice(now), None);
+    assert_eq!(stale.popup(now), None);
+    // The website took the release back: it is not offered.
+    stale.finish_check(now + 1, false, Ok(release("0.3.1")));
+    assert_eq!(stale.notice(now + 1), None);
+    // Offline: the saved release is offered as before.
+    let mut offline = state(saved(now - 2 * RECHECK_OFFER));
+    assert!(offline.launch_check(now));
+    offline.finish_check(now + 1, false, Err(UpdateError::Network("offline".into())));
+    assert_eq!(
+        offline.notice(now + 1),
+        Some(Notice::Available("0.3.2".into()))
+    );
+    // Nothing to offer, or checks off: only the hourly rule applies.
+    let mut current = state(Saved {
+        checked_at: Some(now - RECHECK_OFFER),
+        latest: Some(release("0.3.1")),
+        ..Saved::default()
+    });
+    assert!(!current.launch_check(now));
+    let mut off = State::new("0.3.1", false, saved(now - DAY));
+    assert!(!off.launch_check(now));
+}
+
+#[test]
+fn the_update_funnel_is_logged_without_identifiers() {
+    let mut s = state(Saved::default());
+    let log = logged(|| {
+        s.finish_check(10, false, Ok(release("0.3.2")));
+        s.popup_shown("0.3.2");
+        s.popup_shown("0.3.2");
+        s.update_now(false);
+    });
+    assert!(
+        log.contains("Update available version=0.3.2 manual=false"),
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("Update popup shown version=0.3.2").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("Update now clicked version=0.3.2 streaming=false"),
+        "{log}"
+    );
+    let log = logged(|| {
+        state(Saved::default()).finish_check(10, true, Ok(release("0.3.1")));
+    });
+    assert!(
+        log.contains("Update check found no newer version manual=true"),
+        "{log}"
+    );
 }
