@@ -29,7 +29,8 @@ pub enum Call {
     /// Opening an NVENC, AMF or QSV encoder, libx265, or libopus for PC audio.
     /// They share one lane: FFmpeg opens all of them under one process-wide
     /// lock (FF_CODEC_CAP_NOT_INIT_THREADSAFE), so after one hangs the others
-    /// would only wait behind it. libx264 does not take that lock and opens
+    /// would only wait behind it. Each has its own limit, from
+    /// [`encoder_open_limits`]. libx264 does not take that lock and opens
     /// without a limit.
     EncoderOpen,
     /// The Enable and Disable driver tasks: a PowerShell process, killed at
@@ -70,9 +71,10 @@ impl Call {
 
     /// Normal durations are from the logs 18 Windows PCs uploaded on
     /// 25-28 Oct 2026. A limit must never trip on a slow PC that works, so
-    /// each is at least four times the slowest call seen, and none is below
-    /// the 3 s after which the watchdog already restarted a stuck capture or
-    /// encoder. The caller's heartbeats keep the watchdog off meanwhile.
+    /// each is at least four times the slowest call seen (an encoder open,
+    /// twice: see [`ENCODER_OPENS`]), and none is below the 3 s after which
+    /// the watchdog already restarted a stuck capture or encoder. The
+    /// caller's heartbeats keep the watchdog off meanwhile.
     pub const fn limits(self) -> Limits {
         match self {
             // 235 device creations on 15 PCs: median 29 ms, p99 607 ms,
@@ -82,9 +84,8 @@ impl Call {
             // access-lost retries, which the logs do not time, so it keeps
             // the 3 s the watchdog gave it.
             Self::DuplicateOutput => Limits::ms(500, 3_000),
-            // About 1,500 hardware opens on 9 PCs: NVENC slowest 716 ms, AMF
-            // 169 ms, QSV 1,376 ms. 6 s is four times the slowest.
-            Self::EncoderOpen => Limits::ms(2_000, 6_000),
+            // The hardware encoders'; libx265 and libopus have their own.
+            Self::EncoderOpen => HARDWARE_OPEN,
             // 24 runs on 11 PCs: Enable median 2.9 s, slowest 6.3 s; Disable
             // median 3.0 s, slowest 7.1 s. vdd_task.ps1 waits up to 10 s for
             // an earlier run and 15 s for its own; 30 s is four times the
@@ -92,6 +93,53 @@ impl Call {
             Self::VddEnable | Self::VddDisable => Limits::ms(10_000, 30_000),
         }
     }
+}
+
+/// NVENC, AMF and QSV opens. Slower than the other calls, so the limit is
+/// set from a larger sample: "Opening encoder session" to "Encoder opened" in
+/// the logs 31 Windows PCs uploaded from 0.3.3 over 7 h on 29 Oct 2026. The
+/// first limit, 6 s, assumed QSV took at most 1.4 s (18 PCs, 25-28 Oct), and
+/// left the slowest QSV open seen since only 1.4 times as long.
+const HARDWARE_OPEN: Limits = Limits::ms(5_000, 15_000);
+
+/// Each encoder in the [`Call::EncoderOpen`] lane by name suffix, its
+/// limits, and the slowest open of it seen. A limit stays at least twice
+/// that, so a slow PC that works keeps its encoder; the warning comes after
+/// it, so a `slow=encoder_open` line marks an open slower than any seen.
+const ENCODER_OPENS: [(&str, Limits, Duration); 5] = [
+    // 87 opens on 3 PCs: median 428 ms, p99 3.2 s, slowest 4.4 s at
+    // 1080p. One 0.3.2 Intel PC's opens were slow enough, again and
+    // again, to trip the 3 s watchdog this replaced.
+    ("_qsv", HARDWARE_OPEN, Duration::from_millis(4_376)),
+    // 392 opens: median 102 ms, p99 522 ms, slowest 2.6 s at 2560x1600.
+    ("_nvenc", HARDWARE_OPEN, Duration::from_millis(2_603)),
+    // 98 opens: slowest 1.2 s.
+    ("_amf", HARDWARE_OPEN, Duration::from_millis(1_167)),
+    // CPU-bound, so slowest on a busy laptop. No PC opened it in the
+    // window. On a 16-thread test PC with every core busy and the Power
+    // saver plan: 110-366 ms at 1080p to 4K (50 ms idle).
+    (
+        "libx265",
+        Limits::ms(10_000, 20_000),
+        Duration::from_millis(366),
+    ),
+    // Not logged in the field. A small CPU-only open that holds up only
+    // audio, which retries; it keeps #110's 6 s. On the same loaded PC:
+    // 9-44 ms.
+    (
+        "libopus",
+        Limits::ms(2_000, 6_000),
+        Duration::from_millis(44),
+    ),
+];
+
+/// The limits for opening FFmpeg encoder `encoder` in the
+/// [`Call::EncoderOpen`] lane.
+pub fn encoder_open_limits(encoder: &str) -> Limits {
+    ENCODER_OPENS
+        .iter()
+        .find(|(suffix, ..)| encoder.ends_with(suffix))
+        .map_or(HARDWARE_OPEN, |&(_, limits, _)| limits)
 }
 
 /// Abandoned calls of one kind that may still run. One: calls that hang wait
@@ -140,7 +188,6 @@ impl Lanes {
         Self([const { AtomicUsize::new(0) }; CALLS])
     }
 
-    #[cfg(test)]
     pub(crate) fn abandoned(&self, call: Call) -> usize {
         self.0[call as usize].load(SeqCst)
     }
@@ -153,10 +200,9 @@ pub(crate) fn lanes() -> &'static Lanes {
     &LANES
 }
 
-/// Abandoned calls of this kind still running, process-wide. For the native
-/// Windows tests.
-#[cfg(all(test, windows))]
-pub(crate) fn abandoned(call: Call) -> usize {
+/// Abandoned calls of this kind still running, process-wide: while one
+/// runs, the next of its kind is refused.
+pub fn abandoned(call: Call) -> usize {
     LANES.abandoned(call)
 }
 
@@ -174,13 +220,15 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    run_on(&LANES, call, f, progress)
+    run_on(&LANES, call, call.limits(), f, progress)
 }
 
-/// [`run`] counting abandoned calls in `lanes`.
+/// [`run`] counting abandoned calls in `lanes`, under `limits` (an encoder's
+/// own, from [`encoder_open_limits`]).
 pub(crate) fn run_on<T, F>(
     lanes: &'static Lanes,
     call: Call,
+    limits: Limits,
     f: F,
     progress: impl FnMut(),
 ) -> Result<T, Stall>
@@ -189,11 +237,11 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let wait = Wait {
-        limits: call.limits(),
+        limits,
         slice: WAIT_SLICE,
         now: Instant::now,
     };
-    let delay = simulated_delay(call);
+    let delay = simulated_delay(call, limits);
     let hooks = Hooks {
         before: move || {
             if let Some(delay) = delay {
@@ -293,7 +341,7 @@ where
     let started = (wait.now)();
     let finish = |outcome: Outcome<T>, took: Duration| match outcome {
         Ok(value) => {
-            note_finished(call, took);
+            note_finished(call, wait.limits, took);
             Ok(value)
         }
         Err(panic) => resume_unwind(panic),
@@ -319,7 +367,7 @@ where
             *gave_up = true;
             lane.fetch_add(1, SeqCst);
             drop(gave_up);
-            log_timed_out(call, after);
+            log_timed_out(call, wait.limits, after);
             return Err(Stall::TimedOut { call, after });
         }
         progress();
@@ -327,23 +375,23 @@ where
 }
 
 /// A limited call returned after `took`: log it if that was slow.
-pub(crate) fn note_finished(call: Call, took: Duration) {
-    if took >= call.limits().warn {
+pub(crate) fn note_finished(call: Call, limits: Limits, took: Duration) {
+    if took >= limits.warn {
         warn!(
             slow = %call.name(),
             took_ms = took.as_millis() as u64,
-            warn_ms = call.limits().warn.as_millis() as u64,
+            warn_ms = limits.warn.as_millis() as u64,
             "A Windows or driver call was slow but returned"
         );
     }
 }
 
 /// The one line per stall.
-pub(crate) fn log_timed_out(call: Call, after: Duration) {
+pub(crate) fn log_timed_out(call: Call, limits: Limits, after: Duration) {
     warn!(
         stall = %call.name(),
         after_ms = after.as_millis() as u64,
-        limit_ms = call.limits().limit.as_millis() as u64,
+        limit_ms = limits.limit.as_millis() as u64,
         "A Windows or driver call did not return in time — continuing without it"
     );
 }
@@ -352,7 +400,7 @@ pub(crate) fn log_timed_out(call: Call, after: Duration) {
 /// `ETERNAL_SIMULATE_STALL=d3d11_create_device,encoder_open` holds the first
 /// such call of this process for twice its limit before making it.
 #[cfg(debug_assertions)]
-fn simulated_delay(call: Call) -> Option<Duration> {
+fn simulated_delay(call: Call, limits: Limits) -> Option<Duration> {
     static USED: AtomicUsize = AtomicUsize::new(0);
     let wanted = std::env::var("ETERNAL_SIMULATE_STALL").ok()?;
     if !wanted.split(',').any(|name| name.trim() == call.name()) {
@@ -363,11 +411,11 @@ fn simulated_delay(call: Call) -> Option<Duration> {
         return None;
     }
     warn!(call = %call.name(), "Simulating a stuck Windows or driver call");
-    Some(call.limits().limit * 2)
+    Some(limits.limit * 2)
 }
 
 #[cfg(not(debug_assertions))]
-fn simulated_delay(_call: Call) -> Option<Duration> {
+fn simulated_delay(_call: Call, _limits: Limits) -> Option<Duration> {
     None
 }
 
@@ -726,6 +774,98 @@ mod tests {
     }
 
     #[test]
+    fn each_encoder_open_limit_is_at_least_twice_the_slowest_seen() {
+        for (suffix, limits, slowest) in ENCODER_OPENS {
+            assert!(
+                slowest > Duration::ZERO,
+                "{suffix}: no slowest open recorded"
+            );
+            assert!(
+                limits.limit >= slowest * 2,
+                "{suffix}: {limits:?}, slowest {slowest:?}"
+            );
+            // A slow line means slower than any open seen, and it comes
+            // before the limit and after the watchdog's 3 s.
+            assert!(
+                limits.warn > slowest,
+                "{suffix}: {limits:?}, slowest {slowest:?}"
+            );
+            assert!(limits.warn < limits.limit, "{suffix}: {limits:?}");
+            assert!(
+                limits.limit >= Duration::from_secs(3),
+                "{suffix}: {limits:?}"
+            );
+        }
+        for (names, limit) in [
+            (
+                &[
+                    "h264_nvenc",
+                    "hevc_nvenc",
+                    "h264_amf",
+                    "hevc_amf",
+                    "h264_qsv",
+                    "hevc_qsv",
+                ][..],
+                15,
+            ),
+            (&["libx265"][..], 20),
+            (&["libopus"][..], 6),
+        ] {
+            for name in names {
+                assert_eq!(
+                    encoder_open_limits(name).limit,
+                    Duration::from_secs(limit),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(Call::EncoderOpen.limits(), encoder_open_limits("h264_qsv"));
+    }
+
+    #[test]
+    fn libopus_keeps_its_6_s_limit_in_the_lane_it_shares() {
+        let lanes = lanes();
+        let (release, call) = hang(());
+        let wait = |encoder: &str| Wait {
+            limits: encoder_open_limits(encoder),
+            slice: Duration::from_millis(1),
+            now: stepping_clock(),
+        };
+        let result = run_in(
+            lanes,
+            Call::EncoderOpen,
+            wait("libopus"),
+            call,
+            || {},
+            no_hooks(),
+        );
+        let Err(Stall::TimedOut { after, .. }) = result else {
+            panic!("{result:?}")
+        };
+        assert!(after >= Duration::from_secs(6), "{after:?}");
+        assert!(after <= Duration::from_millis(6_100), "{after:?}");
+        // The lane is shared: a hardware open is refused behind it.
+        let refused = run_in(
+            lanes,
+            Call::EncoderOpen,
+            wait("h264_nvenc"),
+            || (),
+            || panic!("a refused call waited"),
+            no_hooks(),
+        );
+        assert_eq!(
+            refused,
+            Err(Stall::Refused {
+                call: Call::EncoderOpen
+            })
+        );
+        release.send(()).unwrap();
+        wait_until("the stuck open's lane did not free", || {
+            lanes.abandoned(Call::EncoderOpen) == 0
+        });
+    }
+
+    #[test]
     fn the_stall_line_is_unquoted_for_counting() {
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
         struct Sink(Arc<Mutex<Vec<u8>>>);
@@ -744,11 +884,38 @@ mod tests {
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            log_timed_out(Call::D3d11CreateDevice, Duration::from_millis(4_012))
+            log_timed_out(
+                Call::D3d11CreateDevice,
+                Call::D3d11CreateDevice.limits(),
+                Duration::from_millis(4_012),
+            )
         });
         let line = String::from_utf8(out.lock().clone()).unwrap();
         assert!(
             line.contains("stall=d3d11_create_device after_ms=4012 limit_ms=4000"),
+            "{line}"
+        );
+        // An encoder's line gives that encoder's own limit.
+        out.lock().clear();
+        tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer({
+                    let writer = Arc::clone(&out);
+                    move || Sink(Arc::clone(&writer))
+                })
+                .finish(),
+            || {
+                log_timed_out(
+                    Call::EncoderOpen,
+                    encoder_open_limits("libx265"),
+                    Duration::from_millis(20_012),
+                )
+            },
+        );
+        let line = String::from_utf8(out.lock().clone()).unwrap();
+        assert!(
+            line.contains("stall=encoder_open after_ms=20012 limit_ms=20000"),
             "{line}"
         );
     }
