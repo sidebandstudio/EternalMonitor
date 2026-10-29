@@ -675,3 +675,192 @@ fn a_remembered_second_screen_failure_says_it_tries_again_later() {
     add_later_retry(&mut hung, true);
     assert!(!hung.body.contains("later"), "{}", hung.body);
 }
+
+#[test]
+fn the_hybrid_notice_names_the_card_and_never_loops() {
+    use super::page_stream::{
+        gpu_choice_body, gpu_notice, gpu_overridden_body, gpu_switch_body, gpu_switch_button,
+        GpuNotice,
+    };
+    use crate::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    let diagnosis = Diagnosis {
+        screen_gpu: "AMD Radeon 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    };
+    assert_eq!(
+        gpu_notice(Some(&diagnosis), None),
+        GpuNotice::Switch {
+            gpu: "AMD Radeon 780M Graphics".into(),
+            app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            preference: Preference::PowerSaving,
+        }
+    );
+    assert_eq!(
+        gpu_switch_button("AMD Radeon(TM) 780M Graphics"),
+        "Use the AMD Radeon 780M"
+    );
+    let body = gpu_switch_body(&diagnosis.screen_gpu, &diagnosis.app_gpu);
+    assert!(
+        body.contains("connected to the AMD Radeon 780M Graphics"),
+        "{body}"
+    );
+    assert!(body.contains("running on the NVIDIA"), "{body}");
+    assert!(body.contains("restarts"), "{body}");
+    assert!(body.contains("Settings > Troubleshooting"), "{body}");
+    // A switch that was made and did not help: no second switch, but what
+    // overrides it and an undo.
+    let mut record = SwitchRecord::new(None, None, Preference::PowerSaving, &diagnosis.screen_gpu);
+    record.checking = false;
+    record.failed = true;
+    let notice = gpu_notice(Some(&diagnosis), Some(&record));
+    assert!(matches!(notice, GpuNotice::Overridden { .. }), "{notice:?}");
+    let overridden = gpu_overridden_body("AMD Radeon 780M Graphics", Some(&diagnosis.app_gpu));
+    assert!(
+        overridden.contains("NVIDIA app or NVIDIA Control Panel"),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("\"Let Windows decide\""),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("\"Integrated graphics\""),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("Restart EternalMonitor"),
+        "{overridden}"
+    );
+    // Needing the NVIDIA card: its own setting.
+    let to_nvidia = gpu_overridden_body("NVIDIA GeForce RTX 5080", Some("AMD Radeon(TM) Graphics"));
+    assert!(
+        to_nvidia.contains("High-performance NVIDIA processor"),
+        "{to_nvidia}"
+    );
+    // An AMD card in the way: AMD's app, not NVIDIA's.
+    let amd = gpu_overridden_body("Intel(R) Iris(R) Xe Graphics", Some("AMD Radeon RX 7600S"));
+    assert!(
+        amd.contains("AMD Software") && !amd.contains("NVIDIA"),
+        "{amd}"
+    );
+    // No certain preference: the card is named for Windows Settings.
+    let third = Diagnosis {
+        preference: None,
+        ..diagnosis.clone()
+    };
+    assert_eq!(
+        gpu_notice(Some(&third), None),
+        GpuNotice::Choose {
+            gpu: "AMD Radeon 780M Graphics".into()
+        }
+    );
+    assert!(
+        gpu_choice_body("AMD Radeon 780M Graphics").contains("pick the AMD Radeon 780M Graphics")
+    );
+    // Already on the screen's card, or no card found: the general steps.
+    let same = Diagnosis {
+        app_gpu: diagnosis.screen_gpu.clone(),
+        preference: None,
+        ..diagnosis
+    };
+    assert_eq!(gpu_notice(Some(&same), None), GpuNotice::Plain);
+    assert_eq!(gpu_notice(None, None), GpuNotice::Plain);
+    // A switch that worked leaves nothing to say.
+    record.failed = false;
+    assert_eq!(gpu_notice(None, Some(&record)), GpuNotice::Plain);
+}
+
+#[test]
+fn troubleshooting_names_each_cards_choice_in_plain_words() {
+    use super::page_troubleshooting::{
+        drawing_status_lines, gpu_option_label, graphics_card_description, short_gpu_name,
+        window_drawing_label, wiring_lines,
+    };
+    use crate::gpu_preference::{Adapter, GpuFacts, Preference};
+    use crate::troubleshooting::WindowDrawing;
+    let facts = GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: (0, 2),
+                name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            },
+            Adapter {
+                id: (0, 1),
+                name: "AMD Radeon(TM) 780M Graphics".into(),
+            },
+        ],
+        power_saving: Some((0, 1)),
+        high_performance: Some((0, 2)),
+        screens: vec![
+            (r"\\.\DISPLAY1".into(), (0, 1)),
+            (r"\\.\DISPLAY2".into(), (0, 2)),
+            (r"\\.\DISPLAY9".into(), (0, 7)),
+        ],
+    };
+    assert_eq!(
+        gpu_option_label(&facts, Preference::Automatic),
+        "Automatic (Windows decides)"
+    );
+    assert_eq!(
+        gpu_option_label(&facts, Preference::PowerSaving),
+        "Power saving (AMD Radeon 780M)"
+    );
+    assert_eq!(
+        gpu_option_label(&facts, Preference::HighPerformance),
+        "High performance (NVIDIA GeForce RTX 5060 Laptop)"
+    );
+    assert_eq!(
+        short_gpu_name("Intel(R) UHD Graphics 620"),
+        "Intel UHD Graphics 620"
+    );
+    assert_eq!(
+        wiring_lines(&facts),
+        [
+            "EternalMonitor runs on the NVIDIA GeForce RTX 5060 Laptop GPU now.",
+            "DISPLAY1 is connected to the AMD Radeon(TM) 780M Graphics.",
+            "DISPLAY2 is connected to the NVIDIA GeForce RTX 5060 Laptop GPU.",
+        ]
+    );
+    assert!(graphics_card_description(Some(&facts)).contains("On a laptop"));
+    let single = GpuFacts {
+        adapters: vec![facts.adapters[0].clone()],
+        power_saving: Some((0, 2)),
+        high_performance: Some((0, 2)),
+        screens: Vec::new(),
+    };
+    assert!(graphics_card_description(Some(&single)).contains("one graphics card"));
+    assert!(wiring_lines(&single).is_empty());
+    // Two cards whose ranks Windows can't settle: no choice offered, but the
+    // wiring still shows and the text points at Windows Settings.
+    let uncertain = GpuFacts {
+        power_saving: None,
+        high_performance: None,
+        ..facts.clone()
+    };
+    assert!(graphics_card_description(Some(&uncertain)).contains("Windows Settings"));
+    assert_eq!(wiring_lines(&uncertain).len(), 3);
+    for drawing in [
+        WindowDrawing::Automatic,
+        WindowDrawing::Dx12,
+        WindowDrawing::Vulkan,
+        WindowDrawing::Warp,
+    ] {
+        assert!(!window_drawing_label(drawing).contains("WGPU"));
+    }
+    let status = super::renderer::Status {
+        choice: WindowDrawing::Vulkan,
+        chosen_failed: true,
+        backend: Some("DirectX 12".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        drawing_status_lines(&status, WindowDrawing::Vulkan),
+        [
+            "Drawing with DirectX 12 now.",
+            "Vulkan didn't start last time, so EternalMonitor chose automatically."
+        ]
+    );
+    // A new choice made this run replaces the old one's story.
+    assert_eq!(drawing_status_lines(&status, WindowDrawing::Dx12).len(), 1);
+}

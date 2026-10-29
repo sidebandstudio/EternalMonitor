@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
+use egui_kittest::{kittest, kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
 use eternal_host::gui::AnalyzerApp;
@@ -147,7 +147,8 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let checked_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -403,12 +404,17 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     snapshot(&mut harness, &shared, "performance");
 
     nav(&mut harness, "Settings");
-    harness.get_by_label("Encoder input");
-    harness.get_by_label("ADVANCED");
+    harness.get_by_label("TROUBLESHOOTING");
     harness.get_by_label("120").click();
     harness.run_steps(4);
     assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
-    // Encoder input sits under Advanced, below the fold.
+    // Encoder input sits under Troubleshooting, closed until clicked.
+    assert!(harness.query_by_label("Encoder input").is_none());
+    harness.get_by_label("Show options").scroll_to_me();
+    harness.run_steps(4);
+    harness.get_by_label("Show options").click();
+    harness.run_steps(4);
+    harness.get_by_label("Encoder input");
     harness.get_by_label("BGRA").scroll_to_me();
     harness.run_steps(4);
     harness.get_by_label("BGRA").click();
@@ -588,8 +594,283 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     disconnect_ipad(&shared);
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
+    troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
+    reset_keeps_environment_overrides(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// A hybrid laptop: the panel on the Radeon iGPU, EternalMonitor on the
+/// NVIDIA card (the 0.3.3 field case).
+fn hybrid_laptop() -> eternal_host::gpu_preference::GpuFacts {
+    use eternal_host::gpu_preference::{Adapter, GpuFacts};
+    GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: (0, 0x2222),
+                name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            },
+            Adapter {
+                id: (0, 0x1111),
+                name: "AMD Radeon(TM) 780M Graphics".into(),
+            },
+        ],
+        power_saving: Some((0, 0x1111)),
+        high_performance: Some((0, 0x2222)),
+        screens: vec![
+            (r"\\.\DISPLAY1".into(), (0, 0x1111)),
+            (r"\\.\DISPLAY2".into(), (0, 0x2222)),
+        ],
+    }
+}
+
+/// Settings > Troubleshooting on a hybrid laptop, and the Stream page
+/// notice that moves EternalMonitor onto the card its screen is wired to.
+/// Nothing here writes Windows settings: off Windows the graphics card
+/// setting can't be saved and a restart can't start, which the test checks.
+fn troubleshooting_and_hybrid_notice(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    for label in [
+        "Graphics card for EternalMonitor",
+        "Window drawing",
+        "Video encoder",
+        "Sharper video format (HEVC)",
+        "Smaller network packets",
+        "Reset troubleshooting settings",
+        "EternalMonitor runs on the NVIDIA GeForce RTX 5060 Laptop GPU now.",
+        "DISPLAY1 is connected to the AMD Radeon(TM) 780M Graphics.",
+    ] {
+        window.get_by_label(label);
+    }
+    // Every choice starts at Automatic.
+    let graphics_card = || {
+        kittest::by()
+            .role(Role::ComboBox)
+            .value("Automatic (Windows decides)")
+    };
+    window.get(graphics_card());
+    window
+        .get_by_label("Graphics card for EternalMonitor")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-troubleshooting");
+
+    // Picking a card waits for a restart, which Windows needs.
+    window.get(graphics_card()).click();
+    window.run_steps(4);
+    window
+        .get_by_label("Power saving (AMD Radeon 780M)")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Windows applies this when EternalMonitor starts again.");
+    window.get_by_label("Restart EternalMonitor").click();
+    window.run_steps(4);
+    // Saved before any restart; refused here, so nothing restarts.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
+    // Smaller packets is the VPN size; Reset puts it back.
+    window
+        .get_by_label("Use smaller network packets")
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Use smaller network packets").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1200);
+    assert_eq!(settings_file(dir).max_dgram, 1200);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1400);
+    assert_eq!(settings_file(dir).max_dgram, 1400);
+    assert_eq!(
+        settings_file(dir).window_drawing,
+        eternal_host::troubleshooting::WindowDrawing::Automatic
+    );
+    results.extend_harness(&mut window);
+
+    // Windows won't share the panel from the NVIDIA card.
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_diagnosis.lock() = Some(Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    });
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window
+        .get_by_label("Windows won't share this screen from the graphics card EternalMonitor uses");
+    window.get_by_label_contains("Your screen is connected to the AMD Radeon(TM) 780M Graphics");
+    snapshot(&mut window, shared, "stream-hybrid-switch");
+    window
+        .get_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .click();
+    window.run_steps(4);
+    // Off Windows the setting can't be saved: nothing restarts, and no
+    // switch is recorded.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
+    assert!(shared.gpu_switch.lock().is_none());
+    assert!(settings_file(dir).gpu_switch.is_none());
+    results.extend_harness(&mut window);
+
+    // After the restart Windows still refused: another app picks the card.
+    let mut record = SwitchRecord::new(
+        None,
+        None,
+        Preference::PowerSaving,
+        "AMD Radeon(TM) 780M Graphics",
+    );
+    record.checking = false;
+    record.failed = true;
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    // Capture records the outcome while the window is open.
+    *shared.gpu_switch.lock() = Some(record);
+    window.run_steps(4);
+    window.get_by_label("Another app is choosing EternalMonitor's graphics card");
+    window.get_by_role_and_label(Role::Button, "Undo the change");
+    window.get_by_role_and_label(Role::Button, "Restart EternalMonitor");
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .is_none());
+    snapshot(&mut window, shared, "stream-hybrid-overridden");
+    // The window saved the record capture changed.
+    assert!(settings_file(dir)
+        .gpu_switch
+        .is_some_and(|record| record.failed));
+    // While an update hands over, Restart and Undo wait for it, say so and
+    // change nothing.
+    shared
+        .handoff
+        .claim(eternal_host::handoff::Handoff::Update)
+        .unwrap();
+    let before = shared.gpu_switch.lock().clone();
+    for button in ["Restart EternalMonitor", "Undo the change"] {
+        window.get_by_role_and_label(Role::Button, button).click();
+        window.run_steps(4);
+        window.get_by_label("An update is installing; try again in a minute.");
+        assert!(window.query_by_label("Restarting EternalMonitor").is_none());
+        assert!(window
+            .query_by_label_contains("Couldn't save the graphics card setting")
+            .is_none());
+        assert_eq!(*shared.gpu_switch.lock(), before);
+    }
+    // The update went back to waiting: the line goes.
+    shared
+        .handoff
+        .release(eternal_host::handoff::Handoff::Update);
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("An update is installing; try again in a minute.")
+        .is_none());
+    // The user changed the card in the NVIDIA app and restarts. Off Windows
+    // no copy starts: the window stays and says how to restart by hand.
+    window
+        .get_by_role_and_label(Role::Button, "Restart EternalMonitor")
+        .click();
+    for _ in 0..200 {
+        window.run_steps(1);
+        if window
+            .query_by_label("EternalMonitor couldn't restart by itself")
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    window.get_by_label("EternalMonitor couldn't restart by itself");
+    window.get_by_label("Quit EternalMonitor and open it again.");
+    window.get_by_role_and_label(Role::Button, "Quit EternalMonitor");
+    snapshot(&mut window, shared, "stream-restart-failed");
+    results.extend_harness(&mut window);
+
+    *shared.gpu_switch.lock() = None;
+    *shared.gpu_diagnosis.lock() = None;
+    *shared.capture_block.lock() = None;
+    *shared.gpu_facts.lock() = None;
+}
+
+/// Reset clears the saved Troubleshooting choices only: a value an
+/// environment variable sets stays in effect, and its row still says so.
+fn reset_keeps_environment_overrides(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::encoder::input::EncoderInput;
+    use eternal_host::troubleshooting::WindowDrawing;
+    let before = settings_file(dir);
+    SettingsFile {
+        encoder_override: Some("h264_qsv".into()),
+        encoder_input: EncoderInput::Bgra,
+        hevc_enabled: true,
+        max_dgram: 1200,
+        window_drawing: WindowDrawing::Vulkan,
+        ..before.clone()
+    }
+    .save()
+    .unwrap();
+    let vars = [
+        ("ETERNAL_ENCODER", "h264_amf"),
+        ("ETERNAL_INPUT", "bgra"),
+        ("ETERNAL_HEVC", "1"),
+        ("ETERNAL_MAX_DGRAM", "1000"),
+    ];
+    for (name, value) in vars {
+        std::env::set_var(name, value);
+    }
+    // As main applies them before the window opens.
+    shared.max_dgram.store(1000, Ordering::SeqCst);
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    // The saved choices are back to Automatic.
+    let saved = settings_file(dir);
+    assert_eq!(saved.encoder_override, None);
+    assert_eq!(saved.encoder_input, EncoderInput::default());
+    assert!(!saved.hevc_enabled);
+    assert_eq!(saved.max_dgram, 1400);
+    assert_eq!(saved.window_drawing, WindowDrawing::Automatic);
+    // What runs is still what the variables say.
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1000);
+    assert_eq!(shared.encoder_override.lock().as_deref(), Some("h264_amf"));
+    assert_eq!(*shared.encoder_input.lock(), EncoderInput::Bgra);
+    assert!(shared.hevc_enabled.load(Ordering::SeqCst));
+    window.get_by_label_contains("Set by ETERNAL_MAX_DGRAM on this PC");
+    // Nothing the variables fix asks for a stream restart.
+    nav(&mut window, "Stream");
+    assert!(window
+        .query_by_label("Restart the stream to apply your changes")
+        .is_none());
+    results.extend_harness(&mut window);
+
+    for (name, _) in vars {
+        std::env::remove_var(name);
+    }
+    before.save().unwrap();
+    shared.max_dgram.store(1400, Ordering::SeqCst);
+    *shared.encoder_override.lock() = None;
+    *shared.encoder_input.lock() = EncoderInput::default();
+    shared.hevc_enabled.store(false, Ordering::SeqCst);
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture
@@ -625,7 +906,8 @@ fn popup_waits_while_the_ipad_has_a_session(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     connect_ipad(shared);
     let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
@@ -752,7 +1034,8 @@ fn update_arrives_while_feedback_is_open(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     std::env::set_var("ETERNAL_UPDATE_BASE", &base);
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     std::env::remove_var("ETERNAL_UPDATE_BASE");
@@ -1039,7 +1322,8 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
         feedback_sessions: 3,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let streaming = harness(shared, size, 1.0);
     assert!(streaming
         .query_by_label("How's EternalMonitor working for you? :)")
@@ -1126,7 +1410,8 @@ fn review_screens() {
         capture_display: Some(eternal_host::control::CAPTURE_VIRTUAL_SENTINEL.into()),
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     *shared.vdd_status.lock() = VddStatus::WaitingForClient;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "extend-waiting");
@@ -1151,7 +1436,8 @@ fn review_screens() {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
 
     // Windows keeping the screen from the app, in each way it can.
     for (name, block) in [
@@ -1165,6 +1451,15 @@ fn review_screens() {
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
         save(&mut h, &format!("problem-{name}"));
     }
+    *shared.gpu_diagnosis.lock() = Some(eternal_host::gpu_preference::Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(eternal_host::gpu_preference::Preference::PowerSaving),
+    });
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_diagnosis.lock() = None;
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);
@@ -1180,6 +1475,12 @@ fn review_screens() {
     let mut tall = harness(&shared, egui::vec2(1040.0, 1720.0), 2.0);
     nav(&mut tall, "Settings");
     save(&mut tall, "settings-full");
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut tall = harness(&shared, egui::vec2(1040.0, 2300.0), 2.0);
+    nav(&mut tall, "Settings");
+    tall.get_by_label("Show options").click();
+    save(&mut tall, "settings-troubleshooting-full");
+    *shared.gpu_facts.lock() = None;
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
 
@@ -1195,7 +1496,8 @@ fn review_screens() {
         check_for_updates: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     disconnect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     wait_for_popup(&mut h);

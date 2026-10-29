@@ -42,6 +42,23 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
+    /// With `UnsupportedOnThisGpu`: the card the captured screen is wired to
+    /// and the switch that would move EternalMonitor onto it.
+    pub gpu_diagnosis: Arc<Mutex<Option<crate::gpu_preference::Diagnosis>>>,
+    /// A switch made from that notice, as saved in settings. Capture
+    /// records its outcome here; the GUI saves it.
+    pub gpu_switch: Arc<Mutex<Option<crate::gpu_preference::SwitchRecord>>>,
+    /// This process saved a graphics card change. Windows applies it only
+    /// when EternalMonitor starts, so this process's own captures say
+    /// nothing about whether it helped (a restart that didn't happen, or
+    /// the moments before this process leaves). Set and read under
+    /// `gpu_switch`'s lock (`capture::recovery::save_gpu_switch`).
+    pub gpu_changed_here: Arc<std::sync::atomic::AtomicBool>,
+    /// The graphics cards and screens, for Settings > Troubleshooting. The
+    /// GUI reads them on Windows when the section opens.
+    pub gpu_facts: Arc<Mutex<Option<crate::gpu_preference::GpuFacts>>>,
+    /// An update or a restart handing over to another copy (one at a time).
+    pub handoff: crate::handoff::Gate,
     /// The one thread that turns the virtual display on and off, and its
     /// queue.
     pub(crate) vdd_worker: Arc<crate::capture::second_screen::Worker>,
@@ -156,6 +173,11 @@ impl SharedControl {
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
+            gpu_diagnosis: Arc::new(Mutex::new(None)),
+            gpu_switch: Arc::new(Mutex::new(None)),
+            gpu_changed_here: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gpu_facts: Arc::new(Mutex::new(None)),
+            handoff: Default::default(),
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
             second_screen: Arc::new(Mutex::new(Default::default())),

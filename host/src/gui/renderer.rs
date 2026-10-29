@@ -16,6 +16,12 @@
 //! every Windows 10 PC. A launch that dies while wgpu lists adapters leaves a
 //! marker for that stage too, and the next launch narrows the instance to
 //! DX12, then to WARP.
+//!
+//! Settings > Troubleshooting > Window drawing picks DX12, Vulkan or WARP for
+//! the next start, in place of the WGPU_BACKEND variable (which still wins).
+//! A chosen backend leaves the same markers; one that dies is set aside and
+//! the automatic choice draws the window, so a bad choice can't lock a user
+//! out of the setting.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::startup::ProcessId;
+use crate::troubleshooting::WindowDrawing;
 
 /// Clean launches, per recorded failure, before an avoided backend is retried.
 const RETRY_AFTER: u32 = 5;
@@ -47,13 +54,60 @@ static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
 static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+static STATUS: Mutex<Option<Status>> = Mutex::new(None);
 
-/// The backends the instance is created with, from widest to safest.
+/// How this launch draws its window, for Settings > Troubleshooting.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Status {
+    /// The saved Window drawing choice.
+    pub choice: WindowDrawing,
+    /// WGPU_BACKEND decides, so the choice does not apply.
+    pub from_env: bool,
+    /// The chosen backend failed to start the window before, so the
+    /// automatic choice draws it.
+    pub chosen_failed: bool,
+    /// Crash avoidance set a backend aside after a launch that never showed
+    /// its window.
+    pub avoiding: bool,
+    /// What draws the window now, in words.
+    pub backend: Option<String>,
+    /// The user reset crash avoidance; it applies at the next start.
+    pub reset_pending: bool,
+}
+
+/// How this launch draws its window. `None` before the window starts.
+pub fn status() -> Option<Status> {
+    STATUS.lock().ok().and_then(|status| status.clone())
+}
+
+fn update_status(change: impl FnOnce(&mut Status)) {
+    if let Ok(mut status) = STATUS.lock() {
+        change(status.get_or_insert_with(Status::default));
+    }
+}
+
+/// Forget every backend crash avoidance set aside; the next start tries
+/// them all again.
+pub fn reset_avoidance() {
+    if let Some(directory) = STATE_DIR.get() {
+        update_history(directory, Vec::clear);
+    }
+    update_status(|status| {
+        status.avoiding = false;
+        status.chosen_failed = false;
+        status.reset_pending = true;
+    });
+    info!("Window renderer crash avoidance reset; applies at the next start");
+}
+
+/// The backends the instance is created with: the automatic plans, from
+/// widest to safest, then the one only a user's choice picks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Plan {
     Full,
     Dx12,
     Warp,
+    Vulkan,
 }
 
 impl Plan {
@@ -65,6 +119,7 @@ impl Plan {
             Plan::Full => "enumerate",
             Plan::Dx12 => "enumerate dx12",
             Plan::Warp => "enumerate warp",
+            Plan::Vulkan => "enumerate vulkan",
         }
     }
 
@@ -73,6 +128,29 @@ impl Plan {
         match self {
             Plan::Full => Backends::DX12 | Backends::VULKAN,
             Plan::Dx12 | Plan::Warp => Backends::DX12,
+            Plan::Vulkan => Backends::VULKAN,
+        }
+    }
+
+    /// The plan a Window drawing choice asks for.
+    fn chosen(choice: WindowDrawing) -> Option<Plan> {
+        match choice {
+            WindowDrawing::Automatic => None,
+            WindowDrawing::Dx12 => Some(Plan::Dx12),
+            WindowDrawing::Vulkan => Some(Plan::Vulkan),
+            WindowDrawing::Warp => Some(Plan::Warp),
+        }
+    }
+
+    /// Whether a failure recorded while drawing (a backend on one adapter)
+    /// was this plan's. Microsoft's software adapter (1414:008c) is WARP.
+    fn drew_with(self, failure: &Failure) -> bool {
+        let warp = failure.gpu.starts_with("1414:");
+        match self {
+            Plan::Dx12 => failure.backend == "dx12" && !warp,
+            Plan::Warp => failure.backend == "dx12" && warp,
+            Plan::Vulkan => failure.backend == "vulkan",
+            Plan::Full => false,
         }
     }
 }
@@ -114,8 +192,9 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         }
         None => Vec::new(),
     };
+    let choice = crate::settings::SettingsFile::load().window_drawing;
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
-        let plan = choose_backends(&mut setup.instance_descriptor, &history);
+        let plan = choose_backends(&mut setup.instance_descriptor, &history, choice);
         setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
             select(adapters, surface, &history, plan)
         }));
@@ -128,14 +207,19 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
 }
 
 /// `WGPU_BACKEND` decides when set, as in wgpu, and nothing is narrowed or
-/// recorded then.
-fn choose_backends(descriptor: &mut wgpu::InstanceDescriptor, history: &[Failure]) -> Plan {
+/// recorded then. Otherwise the saved choice, unless it failed before.
+fn choose_backends(
+    descriptor: &mut wgpu::InstanceDescriptor,
+    history: &[Failure],
+    choice: WindowDrawing,
+) -> Plan {
     let forced = Backends::from_env();
     let mut plan = Plan::Full;
+    let mut chosen_failed = false;
     if cfg!(windows) {
         if forced.is_none() {
             let gpus = system_gpus();
-            plan = instance_plan(history, &gpus);
+            (plan, chosen_failed) = chosen_plan(history, &gpus, choice);
             start(Marker {
                 gpu: gpus,
                 backend: plan.stage().to_string(),
@@ -143,13 +227,38 @@ fn choose_backends(descriptor: &mut wgpu::InstanceDescriptor, history: &[Failure
         }
         descriptor.backends = instance_backends(forced, plan);
     }
+    update_status(|status| {
+        status.choice = choice;
+        status.from_env = forced.is_some();
+        status.chosen_failed = chosen_failed;
+        status.avoiding = history.iter().any(|f| avoided(history, &f.gpu, &f.backend));
+    });
     info!(
         backends = ?descriptor.backends,
         from_env = forced.is_some(),
-        narrowed = plan != Plan::Full,
+        choice = ?choice,
+        chosen_failed,
+        narrowed = plan != Plan::Full && Plan::chosen(choice) != Some(plan),
         "Window renderer instance"
     );
     plan
+}
+
+/// The plan for a saved choice, or the automatic one when the choice is
+/// Automatic or its backend failed to start the window before (`true`).
+fn chosen_plan(history: &[Failure], gpus: &str, choice: WindowDrawing) -> (Plan, bool) {
+    match Plan::chosen(choice) {
+        Some(plan)
+            if avoided(history, gpus, plan.stage())
+                || history
+                    .iter()
+                    .any(|f| plan.drew_with(f) && avoided(history, &f.gpu, &f.backend)) =>
+        {
+            (instance_plan(history, gpus), true)
+        }
+        Some(plan) => (plan, false),
+        None => (instance_plan(history, gpus), false),
+    }
 }
 
 fn instance_backends(forced: Option<Backends>, plan: Plan) -> Backends {
@@ -326,6 +435,15 @@ fn select(
         avoided = ?history.iter().filter(|f| avoided(history, &f.gpu, &f.backend)).map(|f| (&f.gpu, &f.backend)).collect::<Vec<_>>(),
         "Window renderer selected"
     );
+    let drawing = match info.backend {
+        _ if info.device_type == DeviceType::Cpu => "the software renderer (WARP)",
+        Backend::Dx12 => "DirectX 12",
+        Backend::Vulkan => "Vulkan",
+        Backend::Metal => "Metal",
+        Backend::Gl => "OpenGL",
+        other => other.to_str(),
+    };
+    update_status(|status| status.backend = Some(drawing.to_string()));
     start(marker);
     crate::startup::simulate_renderer_failure()?;
     Ok(adapter)
@@ -729,6 +847,62 @@ mod tests {
         let history = crash(Plan::Warp);
         assert_eq!(instance_plan(&history, gpus), Plan::Warp);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_chosen_backend_draws_until_it_fails_then_automatic_takes_over() {
+        let gpus = "1002:150e 32.0.21025.1024, 10de:2d59 32.0.15.9186";
+        assert_eq!(
+            chosen_plan(&[], gpus, WindowDrawing::Automatic),
+            (Plan::Full, false)
+        );
+        assert_eq!(
+            chosen_plan(&[], gpus, WindowDrawing::Dx12),
+            (Plan::Dx12, false)
+        );
+        assert_eq!(
+            chosen_plan(&[], gpus, WindowDrawing::Vulkan),
+            (Plan::Vulkan, false)
+        );
+        assert_eq!(
+            chosen_plan(&[], gpus, WindowDrawing::Warp),
+            (Plan::Warp, false)
+        );
+        assert_eq!(instance_backends(None, Plan::Vulkan), Backends::VULKAN);
+        assert_eq!(instance_backends(None, Plan::Warp), Backends::DX12);
+        // A Vulkan driver that died creating the device: the next start
+        // draws automatically, so the user can still reach the setting.
+        let mut history = Vec::new();
+        record_failure(&mut history, &marker("10de:2d59 32.0.15.9186", "vulkan"));
+        assert_eq!(
+            chosen_plan(&history, gpus, WindowDrawing::Vulkan),
+            (Plan::Full, true)
+        );
+        // Other choices are unaffected by it.
+        assert_eq!(
+            chosen_plan(&history, gpus, WindowDrawing::Dx12),
+            (Plan::Dx12, false)
+        );
+        // Dying while listing adapters with the chosen set counts too, and
+        // the automatic plan then still narrows on its own record.
+        let mut history = Vec::new();
+        record_failure(&mut history, &marker(gpus, Plan::Dx12.stage()));
+        record_failure(&mut history, &marker(gpus, Plan::Full.stage()));
+        assert_eq!(
+            chosen_plan(&history, gpus, WindowDrawing::Dx12),
+            (Plan::Warp, true)
+        );
+        // WARP is told apart from hardware DX12 by Microsoft's adapter.
+        let mut history = Vec::new();
+        record_failure(&mut history, &marker("1414:008c 10.0.22621.1", "dx12"));
+        assert_eq!(
+            chosen_plan(&history, gpus, WindowDrawing::Warp),
+            (Plan::Full, true)
+        );
+        assert_eq!(
+            chosen_plan(&history, gpus, WindowDrawing::Dx12),
+            (Plan::Dx12, false)
+        );
     }
 
     #[test]

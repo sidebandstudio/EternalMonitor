@@ -442,6 +442,29 @@ fn native_detail(record: record::Record, module: Option<(&str, u64)>) -> String 
     )
 }
 
+/// Test hook: `ETERNAL_SIMULATE_SLOW_EXIT_S=<seconds>` keeps a quitting host
+/// alive that long after its cleanup, as a virtual display task that runs to
+/// its limit does. Same builds as [`SIMULATE_ENV`].
+pub const SLOW_EXIT_ENV: &str = "ETERNAL_SIMULATE_SLOW_EXIT_S";
+
+pub fn simulate_slow_exit() {
+    let seconds = simulation_value(SIMULATION_ALLOWED, || std::env::var(SLOW_EXIT_ENV).ok());
+    if let Ok(seconds) = seconds.trim().parse::<u64>() {
+        tracing::warn!(seconds, "Simulating a slow exit");
+        std::thread::sleep(Duration::from_secs(seconds));
+    }
+}
+
+/// Test hook: `ETERNAL_SIMULATE_RELAUNCH=no-ready` makes a copy started by
+/// "Restart EternalMonitor" exit before it tells the old window it runs, as
+/// a copy that fails to start does. The copy inherits it from the window
+/// that starts it. Same builds as [`SIMULATE_ENV`].
+pub const RELAUNCH_ENV: &str = "ETERNAL_SIMULATE_RELAUNCH";
+
+pub fn simulate_relaunch_without_ready() -> bool {
+    simulation_value(SIMULATION_ALLOWED, || std::env::var(RELAUNCH_ENV).ok()).trim() == "no-ready"
+}
+
 /// Which builds obey [`SIMULATE_ENV`]: debug builds and builds with the
 /// `fault-injection` feature. A function of the two flags, so a debug test
 /// can check the release combination too.
