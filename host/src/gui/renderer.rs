@@ -558,7 +558,8 @@ fn select(
 
 /// The best candidate: not avoided, then wgpu's high-performance GPU type order,
 /// then fully capable, then wgpu's own backend order. That chooses the GPU; an
-/// Intel GPU then draws with DX12 first.
+/// Intel GPU then draws with DX12 first, unless a second card of its model
+/// makes the same GPU impossible to find on DX12.
 fn pick(candidates: &[Candidate]) -> Option<usize> {
     pick_with(candidates, true)
 }
@@ -594,11 +595,25 @@ fn pick_with(candidates: &[Candidate], intel_dx12: bool) -> Option<usize> {
             .map(|(index, _)| index)
     };
     let index = best(None)?;
-    if intel_dx12 && candidates[index].vendor == INTEL {
+    if intel_dx12 && candidates[index].vendor == INTEL && !twins(candidates, &candidates[index]) {
         best(Some(&candidates[index]))
     } else {
         Some(index)
     }
+}
+
+/// Whether another card of `gpu`'s model is listed. Backends list identical
+/// cards in their own order, so the DX12 adapter of the same model may be the
+/// other card.
+fn twins(candidates: &[Candidate], gpu: &Candidate) -> bool {
+    let model = |c: &Candidate| (c.vendor, c.device) == (gpu.vendor, gpu.device);
+    candidates.iter().filter(|c| model(c)).any(|c| {
+        candidates
+            .iter()
+            .filter(|o| model(o) && o.backend == c.backend)
+            .count()
+            > 1
+    })
 }
 
 /// Why [`pick`] chose the candidate at `index`: the rule without which it
@@ -1079,6 +1094,39 @@ mod tests {
             arc(Backend::Dx12),
         ];
         assert_eq!(pick(&pair), Some(3));
+        // Two Arc A770s, cards A and B. Each backend lists them in its own
+        // order, and nothing in a candidate tells which DX12 adapter is the
+        // chosen card, so the choice stays as before in every order.
+        for vulkan_first in [true, false] {
+            for dx12_order in [["A", "B"], ["B", "A"]] {
+                let vulkan = ["A", "B"].map(|card| (arc(Backend::Vulkan), card));
+                let dx12 = dx12_order.map(|card| (arc(Backend::Dx12), card));
+                let listed: Vec<(Candidate, &str)> = if vulkan_first {
+                    vulkan.into_iter().chain(dx12).collect()
+                } else {
+                    dx12.into_iter().chain(vulkan).collect()
+                };
+                let two: Vec<Candidate> = listed.iter().map(|(c, _)| *c).collect();
+                let before = pick_with(&two, false).unwrap();
+                let case = format!("vulkan first {vulkan_first}, dx12 {dx12_order:?}");
+                assert_eq!(pick(&two), Some(before), "{case}");
+                assert_eq!(listed[before], (arc(Backend::Vulkan), "A"), "{case}");
+                assert_eq!(selection_reason(&two, before), "default", "{case}");
+            }
+        }
+        // A second card that lists only DX12 still makes the model ambiguous.
+        let lopsided = [arc(Backend::Vulkan), arc(Backend::Dx12), arc(Backend::Dx12)];
+        assert_eq!(pick(&lopsided), Some(0));
+        // An Arc beside a different Intel model keeps the DX12 preference.
+        let other_model = [
+            arc(Backend::Vulkan),
+            arc(Backend::Dx12),
+            Candidate {
+                device: 0x56a1,
+                ..arc(Backend::Vulkan)
+            },
+        ];
+        assert_eq!(pick(&other_model), Some(1));
     }
 
     #[test]
