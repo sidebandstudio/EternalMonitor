@@ -432,7 +432,14 @@ pub fn save_change(
 ) -> Result<(), String> {
     let previous = record.clone();
     if next.is_some() && next != previous {
-        persist(&next).map_err(|_| SETTINGS_NOT_SAVED.to_string())?;
+        // The user sees only SETTINGS_NOT_SAVED; the log keeps why.
+        persist(&next).map_err(|error| {
+            tracing::warn!(
+                %error,
+                "Could not save the graphics switch record before the switch"
+            );
+            SETTINGS_NOT_SAVED.to_string()
+        })?;
         *record = next.clone();
     }
     if let Err(error) = apply(store, change) {
@@ -1342,6 +1349,46 @@ mod tests {
         );
         assert_eq!(store.read().unwrap().as_deref(), Some("GpuPreference=1;"));
         assert_eq!(record, Some(earlier));
+    }
+
+    /// The user is told only that nothing was changed; the log says why.
+    #[test]
+    fn a_record_that_cannot_be_saved_logs_why() {
+        use std::sync::{Arc, Mutex};
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(Arc::clone(&writer)))
+            .finish();
+        let mut store = key(None);
+        let error = tracing::subscriber::with_default(subscriber, || {
+            switch(
+                &mut store,
+                &mut None,
+                Preference::HighPerformance,
+                "NVIDIA",
+                |_| Err("Access is denied. (os error 5)".into()),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error, SETTINGS_NOT_SAVED);
+        let log = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("Could not save the graphics switch record")
+                && log.contains("error=Access is denied. (os error 5)"),
+            "{log}"
+        );
     }
 
     #[test]
