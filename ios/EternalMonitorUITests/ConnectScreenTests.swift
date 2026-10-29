@@ -1,6 +1,6 @@
 import XCTest
 
-final class ConnectScreenTests: XCTestCase {
+final class ConnectScreenTests: UITestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
@@ -8,7 +8,7 @@ final class ConnectScreenTests: XCTestCase {
     func testConnectControls() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.textFields["connect.port"].exists)
@@ -26,7 +26,11 @@ final class ConnectScreenTests: XCTestCase {
     func testSettingsOpenAndDismiss() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
-        app.launch()
+        // Any free port for the USB listener: on a Mac running another
+        // simulator's app, 9877 can be taken, and the card then says the
+        // cable can't be used instead of asking for one.
+        app.launchEnvironment["EM_USB_PORT"] = "0"
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         settings.tap()
@@ -35,27 +39,24 @@ final class ConnectScreenTests: XCTestCase {
         let allowUSB = app.switches["settings.allowUSB"]
         XCTAssertTrue(allowUSB.exists)
         // Start from USB on. The setting is saved, so a run that failed
-        // between the two taps below left it off for every later run. A
+        // between the two presses below left it off for every later run. A
         // launch argument can't set it: it would shadow the toggle.
-        if allowUSB.value as? String == "0" {
-            allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        }
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "1"), "\(allowUSB.value ?? "nil")")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "settings"
         screenshot.lifetime = .keepAlways
         add(screenshot)
-        // SwiftUI exposes the whole form row as a switch. Tap its thumb.
-        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        // The switch's value can update a moment after the tap returns.
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "0"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "0"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
+        // The connect screen stays in the tree under the sheet, so wait for
+        // the sheet itself to go before opening it again.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.navigationBars["Settings"])
+        waitForExpectations(timeout: 30)
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
         XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "Off. Turn on to connect with a cable.")
         settings.tap()
         XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
-        allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
+        XCTAssertTrue(setSwitch(allowUSB, to: "1"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
@@ -67,7 +68,7 @@ final class ConnectScreenTests: XCTestCase {
     func testScrollingFromThePictureRowKeepsTheChoice() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-pictureFit", "fit"]
-        app.launch()
+        launchCleanly(app)
         let settings = app.buttons["settings.button"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         let picture = app.buttons["settings.pictureFit"]
@@ -111,7 +112,7 @@ final class ConnectScreenTests: XCTestCase {
     func testPairingCodeAsAddressIsExplainedAtOnce() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "390756", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -128,7 +129,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
         app.launchEnvironment["EM_UI_PREVIEW"] = "searchFailed"
-        app.launch()
+        launchCleanly(app)
         let title = app.staticTexts["connect.scanProblemTitle"]
         XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
         XCTAssertEqual(title.label, "Couldn't search for PCs")
@@ -146,7 +147,7 @@ final class ConnectScreenTests: XCTestCase {
         let app = XCUIApplication()
         // 192.0.2.1 is a documentation address: nothing ever answers.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "192.0.2.1", "-lastPort", "9876"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         app.buttons["connect.button"].tap()
         let title = app.staticTexts["connect.problemTitle"]
@@ -166,7 +167,7 @@ final class ConnectScreenTests: XCTestCase {
     func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let diagnostics = app.buttons["settings.diagnostics"]
@@ -182,26 +183,37 @@ final class ConnectScreenTests: XCTestCase {
         let share = app.navigationBars["UIActivityContentView"]
         // On a cold simulator, Apple's remote share-sheet container can appear
         // before its contents finish loading. Still require the document and
-        // export actions once the remote interface is ready.
-        XCTAssertTrue(share.waitForExistence(timeout: 30), app.debugDescription)
-        XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
-        let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
-        XCTAssertTrue(documentType.waitForExistence(timeout: 5))
+        // export actions once the remote interface is ready. The waits are
+        // long because a loaded simulator is slow, not because speed is
+        // tested here: on a busy Mac the remote sheet took 78 s to draw.
+        XCTAssertTrue(share.waitForExistence(timeout: 120), app.debugDescription)
+        // The header names our file. Once the file's preview has loaded it
+        // shows the title over "Text Document"; while it hasn't, and on a
+        // loaded simulator it can stay that way, it shows the file name,
+        // whose extension names the type.
+        let title = "EternalMonitor-iPad-diagnostics"
+        let header = share.otherElements.matching(NSPredicate(
+            format: "label == %@ OR label == %@", title, "\(title).txt")).firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 30), app.debugDescription)
+        if header.label == title {
+            let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
+            XCTAssertTrue(documentType.waitForExistence(timeout: 30), app.debugDescription)
+        }
         let save = app.cells["Save to Files"]
-        XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(save.waitForExistence(timeout: 30), app.debugDescription)
         XCTAssertTrue(save.isEnabled)
         // Verify our exported attachment and share actions. The Files provider
         // can remain uninitialized on a fresh simulator after its picker opens.
         app.buttons["header.closeButton"].tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
-        waitForExpectations(timeout: 5)
+        waitForExpectations(timeout: 30)
         XCTAssertTrue(app.buttons["diagnostics.export"].isEnabled)
     }
 
     func testFrameRatePreference() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let rate = app.buttons["settings.targetFPS"]
@@ -215,7 +227,7 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "settings-fps120"; shot.lifetime = .keepAlways; add(shot)
         app.terminate()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         XCTAssertTrue(rate.waitForExistence(timeout: 5))
@@ -230,5 +242,24 @@ final class ConnectScreenTests: XCTestCase {
         let changed = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@", value), object: element)
         return XCTWaiter().wait(for: [changed], timeout: 5) == .completed
+    }
+
+    /// Presses `element` until its value is `value`, at most three times. On
+    /// CI a tap on the settled sheet was lost: the switch kept its value for
+    /// 5 s. As in AudioStreamTests, the press lasts more than one busy frame,
+    /// and the value is read again before pressing again, so a late press
+    /// is never undone. A switch that doesn't change still fails.
+    private func setSwitch(_ element: XCUIElement, to value: String) -> Bool {
+        // Read the value directly: a predicate wait polls about once a
+        // second, so a short one may never look.
+        for _ in 0..<3 where element.value as? String != value {
+            expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: element)
+            waitForExpectations(timeout: 5)
+            // SwiftUI exposes the whole form row as a switch. Press its thumb.
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).press(forDuration: 0.15)
+            // The switch's value can update a moment after the press returns.
+            if switchValue(of: element, becomes: value) { return true }
+        }
+        return element.value as? String == value
     }
 }

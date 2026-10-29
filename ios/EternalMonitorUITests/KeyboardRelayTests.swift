@@ -1,6 +1,6 @@
 import XCTest
 
-final class KeyboardRelayTests: XCTestCase {
+final class KeyboardRelayTests: UITestCase {
     func testKeyboardRelay() throws {
         continueAfterFailure = false
         let environment = ProcessInfo.processInfo.environment
@@ -10,7 +10,7 @@ final class KeyboardRelayTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         let keyboard = app.buttons["display.keyboard"]
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
         keyboard.tap()

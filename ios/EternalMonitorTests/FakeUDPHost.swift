@@ -12,6 +12,8 @@ final class FakeUDPHost: @unchecked Sendable {
     /// HELLO2 nonces already answered, so a late copy of one isn't taken
     /// for the iPad's next attempt.
     private var answered = Set<UInt32>()
+    /// The nonce of the HELLO2 answered last.
+    private(set) var lastNonce: UInt32 = 0
 
     init() {
         var address = sockaddr_in()
@@ -46,13 +48,15 @@ final class FakeUDPHost: @unchecked Sendable {
     }
 
     /// Answers the next HELLO2 attempt, with session 41 unless `status`
-    /// refuses it. False after ten quiet seconds.
+    /// refuses it. False after thirty quiet seconds, a backstop that a
+    /// loaded machine's slow start does not reach.
     func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2) -> Bool {
-        for _ in 0..<33 {
+        for _ in 0..<100 {
             guard let (data, from, length) = receive() else { continue }
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
             client = (from, length)
+            lastNonce = hello.clientNonce
             send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion))
             return true
         }

@@ -320,6 +320,7 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
+        CaptureBlock::DriverNotResponding,
     ];
     assert!(capture_block_notice(None, true).is_none());
     let mut titles = Vec::new();
@@ -345,6 +346,10 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     assert!(gpu.contains("open it again"), "{gpu}");
     let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
     assert!(lock.contains("lock screen"), "{lock}");
+    let (_, stuck, body) =
+        capture_block_notice(Some(CaptureBlock::DriverNotResponding), true).unwrap();
+    assert_eq!(stuck, "The graphics driver isn't responding");
+    assert!(body.contains("restart the PC"), "{body}");
 }
 
 #[test]

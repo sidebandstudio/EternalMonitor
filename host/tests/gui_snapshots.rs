@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
@@ -36,6 +36,32 @@ impl ConfigSource for Fixture {
 }
 
 const POPUP_QUIET_MS: u64 = 3000;
+/// How far the popup's clock moves between frames.
+const FRAME_MS: u64 = 100;
+
+/// The popup's quiet period runs on a clock only these tests move, so how
+/// long a frame takes never decides whether the popup waited.
+static POPUP_CLOCK: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn start_popup_clock() {
+    let now = Instant::now();
+    *POPUP_CLOCK.lock().unwrap() = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
+
+fn popup_clock() -> Instant {
+    POPUP_CLOCK
+        .lock()
+        .unwrap()
+        .expect("the fixture starts the popup clock")
+}
+
+fn advance_popup_clock(millis: u64) {
+    let mut clock = POPUP_CLOCK.lock().unwrap();
+    let now = clock.expect("the fixture starts the popup clock") + Duration::from_millis(millis);
+    *clock = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
 
 fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
     harness
@@ -45,26 +71,46 @@ fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
 
 /// The popup opens once no iPad has been connected for the quiet period.
 fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
-    let deadline = Instant::now() + std::time::Duration::from_millis(POPUP_QUIET_MS + 7000);
+    let deadline = popup_clock() + Duration::from_millis(POPUP_QUIET_MS + 7000);
     while !popup_shown(harness) {
-        assert!(Instant::now() < deadline, "the popup never opened");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(popup_clock() < deadline, "the popup never opened");
+        advance_popup_clock(FRAME_MS);
         harness.run_steps(1);
     }
     harness.run_steps(4);
 }
 
-/// Draws frames for `millis` and checks the popup stays closed in each.
-fn no_popup_for(harness: &mut Harness<'_, AnalyzerApp>, millis: u64, why: &str) {
-    let end = Instant::now() + std::time::Duration::from_millis(millis);
+/// Draws a frame every [`FRAME_MS`] of the popup's clock for `millis` and
+/// checks the popup stays closed in each one within the quiet period after
+/// `seen`, when the app last saw an iPad (or launched). With `ipad`
+/// connected, every frame is checked, and each one moves `seen` on.
+/// Returns it.
+fn no_popup_for(
+    harness: &mut Harness<'_, AnalyzerApp>,
+    mut seen: Instant,
+    ipad: bool,
+    millis: u64,
+    why: &str,
+) -> Instant {
+    let quiet = Duration::from_millis(POPUP_QUIET_MS);
+    let end = popup_clock() + Duration::from_millis(millis);
+    let mut checked = 0;
     loop {
-        harness.run_steps(1);
-        assert!(!popup_shown(harness), "{why}");
-        if Instant::now() >= end {
-            return;
+        if ipad {
+            seen = popup_clock();
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        harness.run_steps(1);
+        if ipad || popup_clock() < seen + quiet {
+            assert!(!popup_shown(harness), "{why}");
+            checked += 1;
+        }
+        if popup_clock() >= end {
+            break;
+        }
+        advance_popup_clock(FRAME_MS);
     }
+    assert!(checked > 0, "no frame fell within the quiet period: {why}");
+    seen
 }
 
 fn snapshot(harness: &mut Harness<'_, AnalyzerApp>, shared: &SharedControl, name: &str) {
@@ -96,6 +142,7 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
     std::env::set_var("APPDATA", &dir);
     // The popup's quiet period after an iPad leaves, shortened from 20 s.
     std::env::set_var("ETERNAL_UPDATE_POPUP_QUIET_MS", POPUP_QUIET_MS.to_string());
+    start_popup_clock();
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
@@ -580,30 +627,39 @@ fn popup_waits_while_the_ipad_has_a_session(
     }
     .save();
     connect_ipad(shared);
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, 200, "the iPad is streaming");
+    let mut seen = no_popup_for(&mut window, launched, true, 200, "the iPad is streaming");
 
     // The pipeline restarts; the session stays. Longer than the quiet period.
     PIPELINE_STATS.lock().pipeline_running = false;
-    no_popup_for(
+    seen = no_popup_for(
         &mut window,
+        seen,
+        true,
         POPUP_QUIET_MS + 1000,
         "the iPad is still connected while the stream restarts",
     );
     PIPELINE_STATS.lock().pipeline_running = true;
-    no_popup_for(&mut window, 200, "the stream is back");
+    seen = no_popup_for(&mut window, seen, true, 200, "the stream is back");
 
     // Three USB drops, each followed by the iPad reconnecting.
     for _ in 0..3 {
         shared.session.lock().link_lost(PeerId::usb(7).link);
-        no_popup_for(&mut window, 300, "the iPad is reconnecting");
+        no_popup_for(&mut window, seen, false, 300, "the iPad is reconnecting");
         connect_ipad(shared);
-        no_popup_for(&mut window, 100, "the iPad reconnected");
+        seen = no_popup_for(&mut window, seen, true, 100, "the iPad reconnected");
     }
     // It stays away this time: the popup opens after the quiet period.
     shared.session.lock().link_lost(PeerId::usb(7).link);
-    no_popup_for(&mut window, 500, "too soon after the iPad left");
+    no_popup_for(
+        &mut window,
+        seen,
+        false,
+        500,
+        "too soon after the iPad left",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
@@ -627,9 +683,16 @@ fn popup_waits_after_launch(
     cached["popup"] = serde_json::Value::Null;
     cached["later"] = serde_json::Value::Null;
     std::fs::write(&state, cached.to_string()).unwrap();
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, POPUP_QUIET_MS - 1000, "too soon after launch");
+    no_popup_for(
+        &mut window,
+        launched,
+        false,
+        POPUP_QUIET_MS - 1000,
+        "too soon after launch",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
@@ -648,10 +711,9 @@ fn update_arrives_while_feedback_is_open(
     results: &mut SnapshotResults,
 ) {
     use std::io::{BufRead, BufReader, Write};
-    // A site that answers the check only when told to.
+    // A site that answers the check at once.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (answer, answered) = std::sync::mpsc::channel::<()>();
     let manifest = serde_json::json!({
         "schema": 1,
         "windows": {
@@ -668,7 +730,6 @@ fn update_arrives_while_feedback_is_open(
         while reader.read_line(&mut line).unwrap_or(0) > 2 {
             line.clear();
         }
-        let _ = answered.recv();
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
@@ -676,7 +737,10 @@ fn update_arrives_while_feedback_is_open(
         );
     });
     // Never checked, so the window checks as it opens; already announced,
-    // so no notification.
+    // so no notification. The check waits until Send feedback is open:
+    // its request times out after 10 s, which drawing the panel on a
+    // loaded machine can take.
+    eternal_host::updates::hold_checks(true);
     std::fs::write(
         dir.join("EternalMonitor/update-state.json"),
         serde_json::json!({ "notified": "99.1.0" }).to_string(),
@@ -699,23 +763,33 @@ fn update_arrives_while_feedback_is_open(
         .click();
     window.run_steps(4);
     window.get_by_label("Tell us how it's going");
-    answer.send(()).unwrap();
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    eternal_host::updates::hold_checks(false);
+    // Only a backstop for a check that never finishes.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while window
         .query_by_label("EternalMonitor 99.1.0 is available")
         .is_none()
     {
         assert!(Instant::now() < deadline, "the check never finished");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         window.run_steps(1);
     }
     window.run_steps(4);
-    assert!(
-        window
-            .query_by_role_and_label(Role::Dialog, "Update ready")
-            .is_none(),
-        "the popup must not open over Send feedback"
-    );
+    // Past the quiet period, so only the open panel keeps the popup away.
+    for frame in 0..(POPUP_QUIET_MS / FRAME_MS + 5) {
+        advance_popup_clock(FRAME_MS);
+        window.run_steps(1);
+        assert!(
+            window.query_by_label("Tell us how it's going").is_some(),
+            "Send feedback closed by itself after {frame} frames"
+        );
+        assert!(
+            window
+                .query_by_role_and_label(Role::Dialog, "Update ready")
+                .is_none(),
+            "the popup must not open over Send feedback (frame {frame})"
+        );
+    }
     window.get_by_label("Close").click();
     wait_for_popup(&mut window);
     window

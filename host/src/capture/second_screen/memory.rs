@@ -1188,6 +1188,122 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// PR #110, review 4: D3D creation took 2.5 s, then DuplicateOutput
+    /// stalled. The proof's deadline passes at 5 s while that call is
+    /// outstanding, and its timeout lands at 5.5 s, after the proof is gone.
+    /// Nothing is saved.
+    #[test]
+    fn a_proof_that_ends_during_a_time_limited_call_saves_nothing() {
+        use super::super::{driver_call, note_capture_error, note_interruption};
+        let path = temp_file("proof-during-call");
+        let (shared, start) = proving_second_screen(&path);
+        // The device call returned within its limit.
+        drop(driver_call(&shared, 1));
+        assert_eq!(next_step(&shared, start + secs(2)), Step::Nothing);
+        let duplicating = driver_call(&shared, 1);
+        assert_eq!(next_step(&shared, start + secs(4)), Step::Nothing);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        // The stall's error path, after the proof ended.
+        drop(duplicating);
+        note_interruption(&shared, 1);
+        note_capture_error(&shared, 1);
+        assert_eq!(next_step(&shared, start + secs(6)), Step::Nothing);
+        assert!(!path.exists(), "a failure during a driver call was saved");
+        assert!(!retries_later(&shared));
+
+        // Unchanged otherwise: a call of another generation does not cover
+        // this proof, and with none outstanding the same timeline is saved.
+        let path = temp_file("proof-without-call");
+        let (shared, start) = proving_second_screen(&path);
+        drop(driver_call(&shared, 1));
+        let _other = driver_call(&shared, 2);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// PR #110 on 945873d's rule: the last duplication retry decides. A
+    /// retry that stalls after one that failed for good passes, like a hung
+    /// device; one that fails for good after a stall is the PC's.
+    #[test]
+    fn a_stalled_duplication_retry_counts_as_the_last_try() {
+        use super::super::{
+            driver_call, note_interruption, note_passing_retry_error, note_persistent_error,
+        };
+        let path = temp_file("unsupported-then-stall");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        note_persistent_error(&shared, 1);
+        // What the access-lost ladder does with a retry that timed out.
+        let retry = driver_call(&shared, 1);
+        assert_eq!(next_step(&shared, start + secs(3)), Step::Nothing);
+        drop(retry);
+        note_passing_retry_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(!path.exists(), "a failure whose last try stalled was saved");
+
+        let path = temp_file("stall-then-unsupported");
+        let (shared, start) = proving_second_screen(&path);
+        note_interruption(&shared, 1);
+        drop(driver_call(&shared, 1));
+        note_passing_retry_error(&shared, 1);
+        note_persistent_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// PR #110, review 5: a restart during a time-limited call. The new
+    /// generation's own real failure is saved, the old call's guard cannot
+    /// cover it or clear the new generation's own call.
+    #[test]
+    fn a_call_from_before_a_restart_does_not_cover_the_new_generation() {
+        use super::super::{driver_call, note_capture_error, note_persistent_error};
+        let path = temp_file("call-across-restart");
+        let (shared, start) = proving_second_screen(&path);
+        let old_call = driver_call(&shared, 1);
+        // The supervisor restarts; generation 2 fails while opening the
+        // display, before any call of its own.
+        start_proving(&shared, 2, start + secs(1));
+        note_persistent_error(&shared, 2);
+        note_capture_error(&shared, 2);
+        assert_eq!(
+            next_step(&shared, start + secs(2)),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        drop(old_call);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // The old guard ending does not clear the new generation's call.
+        let path = temp_file("old-guard-new-call");
+        let (shared, start) = proving_second_screen(&path);
+        let old_call = driver_call(&shared, 1);
+        start_proving(&shared, 2, start + secs(1));
+        let _new_call = driver_call(&shared, 2);
+        drop(old_call);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(
+            !path.exists(),
+            "a failure during generation 2's call was saved"
+        );
+    }
+
     /// Round 4: a full window after the desktop came back, with no picture,
     /// is the PC's failure.
     #[test]

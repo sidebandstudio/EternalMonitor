@@ -160,6 +160,12 @@ final class ConnectionManager: ObservableObject {
     /// accepted the session, for the support log's timings.
     private var attemptStartedAt: TimeInterval = 0
     private var sessionAcceptedAt: TimeInterval?
+    private var firstFrameAt: TimeInterval?
+    /// When the HELLO2 the next summary describes was started: the attempt's
+    /// start, or the latest pairing code's.
+    private var summaryStartedAt: TimeInterval = 0
+    /// The latest nonces that have their summary.
+    private var summarizedNonces: [UInt32] = []
 
     let frameSlot = FrameSlot()
     /// Lets hot-path closures reach the CURRENT control channel without
@@ -187,17 +193,22 @@ final class ConnectionManager: ObservableObject {
 
     /// Connect and reconnect timing. The app uses the defaults, with the
     /// first-picture wait the update manifest may set (10–20 s); tests pass
-    /// shorter ones when they create the manager.
+    /// shorter ones when they create the manager, and may shorten them once
+    /// a session streams, so a slow machine's first connect isn't cut off.
     struct Timing {
         var connectTimeoutSeconds = Double(RemoteConfig.launch.firstFrameTimeoutSeconds
             ?? Int(ConnectionManager.connectionTimeoutSeconds))
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
     }
-    private let timing: Timing
+    var timing: Timing
+    /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
+    /// to fail a lookup without asking DNS.
+    var makeUDPLink: (UInt16) -> any MediaLink
 
-    init(timing: Timing = Timing()) {
+    init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }) {
         self.timing = timing
+        self.makeUDPLink = udpReceiver
     }
 
     func refreshUSBAvailability() {
@@ -210,7 +221,7 @@ final class ConnectionManager: ObservableObject {
             return
         }
         guard usbListener == nil else { return }
-        let listener = USBListener()
+        let listener = USBListener(port: E2E.usbListenPort)
         usbListener = listener
         listener.onState = { [weak self, weak listener] state in
             Task { @MainActor in
@@ -239,7 +250,7 @@ final class ConnectionManager: ObservableObject {
         endReconnectCycle()
         if state != .disconnected {
             E2E.linkSwitch(from: "udp", to: "usb")
-            disconnect(reason: .superseded)
+            disconnect(.superseded)
         }
         connect(target: .usb(link))
     }
@@ -289,6 +300,10 @@ final class ConnectionManager: ObservableObject {
 
     func submitPairing() {
         guard awaitingPairing, let code = pairingPrompt?.submit() else { return }
+        // The code goes in a new HELLO2. The refused one ends here, as on the
+        // PC, which wrote a line for its nonce.
+        recordSummary(.retriedWithCode)
+        summaryStartedAt = ProcessInfo.processInfo.systemUptime
         controlChannel?.retryPairing(code: code)
     }
 
@@ -329,7 +344,7 @@ final class ConnectionManager: ObservableObject {
             normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedHost.isEmpty, targetPort != 0 else { return }
             port = targetPort
-            receiver = UDPReceiver(port: port)
+            receiver = makeUDPLink(port)
             lastTarget = (normalizedHost, port)
         case .usb(let link):
             normalizedHost = "USB"
@@ -362,6 +377,8 @@ final class ConnectionManager: ObservableObject {
         didExtendTimeout = false
         attemptStartedAt = ProcessInfo.processInfo.systemUptime
         sessionAcceptedAt = nil
+        firstFrameAt = nil
+        summaryStartedAt = attemptStartedAt
         videoSize = .zero
         let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
         sessionDrawingMode = drawing.enabled
@@ -409,6 +426,7 @@ final class ConnectionManager: ObservableObject {
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
+                    self.firstFrameAt = ProcessInfo.processInfo.systemUptime
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
                     self.timeoutTask?.cancel()
                     self.noPictureStreak = NoPictureStreak()
@@ -580,7 +598,7 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
-                self.disconnect()
+                self.disconnect(.pcRefused)
             }
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
@@ -595,7 +613,7 @@ final class ConnectionManager: ObservableObject {
                     self.versionMismatch = .pcLegacy
                     self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
-                    self.disconnect()
+                    self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
                 }
@@ -610,26 +628,26 @@ final class ConnectionManager: ObservableObject {
                     // Only Stop and update on the PC sends this. The PC comes
                     // back on the new version, so reconnect as for a restart.
                     if self.reconnectCycleID != nil {
-                        self.disconnect()
+                        self.disconnect(.pcGoodbye)
                         self.reconnectFailure = .pcUpdating(.reconnecting)
                         self.problem = .pcUpdating(.reconnecting)
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting))
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting), end: .pcGoodbye)
                     }
                 case .userDisconnect, .superseded:
                     // Disconnected from the PC, or another device took over:
                     // stay away until the user connects again.
                     self.endReconnectCycle()
-                    self.disconnect()
+                    self.disconnect(.pcGoodbye)
                     self.problem = .pcEndedSession
                 default:
                     // A PC that stops or restarts its stream may come back.
                     // A running cycle keeps going; otherwise start one.
                     if self.reconnectCycleID != nil {
-                        self.disconnect()
+                        self.disconnect(.pcGoodbye)
                         self.problem = .pcEndedSession
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession)
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession, end: .pcGoodbye)
                     }
                 }
             }
@@ -707,7 +725,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect()
+                    self.disconnect(.linkFailed)
                     self.problem = failure
                     return
                 }
@@ -742,7 +760,7 @@ final class ConnectionManager: ObservableObject {
         guard receiver.start(host: normalizedHost) else {
             connectionError = "Couldn't start streaming on this iPad. Try again."
             record(.error, "connection", "Receiver failed to start")
-            disconnect()
+            disconnect(.receiverFailed)
             return
         }
 
@@ -863,7 +881,10 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil) {
+    /// Ends the session that `reason` interrupted (`end` when it was not
+    /// the link: the PC said goodbye) and reconnects if that is on.
+    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil,
+                                end: AttemptEnd? = nil) {
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
         // Support logs keep the original wording so reports stay comparable.
@@ -874,7 +895,11 @@ final class ConnectionManager: ObservableObject {
         case .usbTurnedOff: logged = "USB connections turned off"
         }
         record(.warning, "ctrl", "Connection lost (\(logged))")
-        disconnect()
+        switch reason {
+        case .pcStoppedResponding: disconnect(end ?? .pcStoppedResponding)
+        case .cableUnplugged: disconnect(end ?? (failure == nil ? .cableUnplugged : .usbLinkFailed))
+        case .usbTurnedOff: disconnect(end ?? .usbTurnedOff)
+        }
         guard auto, let target else {
             problem = (failure ?? .lost(reason)).withoutReconnecting
             return
@@ -955,7 +980,7 @@ final class ConnectionManager: ObservableObject {
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
                 // The app gave up, not the user: the PC's log tells them apart.
-                self.disconnect(reason: .error)
+                self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
             }
         }
@@ -971,7 +996,7 @@ final class ConnectionManager: ObservableObject {
         guard noPictureStreak.stopsReconnecting else { return false }
         let isUSB = transportMode == "USB"
         record(.warning, "ctrl", "Connection closed by the PC before a picture" + attemptTimings)
-        disconnect(reason: .error)
+        disconnect(.closedBeforePicture)
         problem = .noPicture
         stopAutomaticAttempts(isUSB: isUSB)
         return true
@@ -1088,7 +1113,7 @@ final class ConnectionManager: ObservableObject {
         resumeOnForeground = true
         record(.info, "ctrl", "App backgrounded — sending BYE and disconnecting")
         let goodbye = backgroundGoodbyeTask
-        disconnect(reason: .appBackground)
+        disconnect(.appBackground)
         if let cycleOutcome { problem = cycleOutcome }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, self.backgroundGoodbyeTask == goodbye else { return }
@@ -1125,10 +1150,13 @@ final class ConnectionManager: ObservableObject {
         )
     }
 
-    func disconnect(reason: ByeReason = .userDisconnect) {
+    /// Ends the attempt. `end` says why; only the user's own action is
+    /// `.userDisconnect`.
+    func disconnect(_ end: AttemptEnd = .userDisconnect) {
         if state != .disconnected {
-            recordStreamSummary(reason: "disconnect=\(reason)")
-            record(.info, "connection", "Disconnect state=\(state) reason=\(reason)")
+            recordStreamSummary(reason: "disconnect=\(end.name)")
+            record(.info, "connection", "Disconnect state=\(state) reason=\(end.name)")
+            recordSummary(end)
         }
         awaitingPairing = false
         pairingPrompt = nil
@@ -1141,7 +1169,7 @@ final class ConnectionManager: ObservableObject {
 
         // Say goodbye first (fire-and-forget), then stop the socket, then shut
         // the decoder down on its own queue (provably after any in-flight decode).
-        controlChannel?.sendBye(reason)
+        controlChannel?.sendBye(end.bye)
         controlChannel?.stop()
         mediaLink?.stop()
         videoDecoder?.shutdown()
@@ -1173,6 +1201,28 @@ final class ConnectionManager: ObservableObject {
         hostInfo = nil
         hostStreamConfig = nil
         UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    /// Records the summary of the HELLO2 that ends with `end`: one per nonce,
+    /// whichever paths reach it.
+    private func recordSummary(_ end: AttemptEnd) {
+        let summary = summary(end)
+        if summary.nonce != 0 {
+            guard !summarizedNonces.contains(summary.nonce) else { return }
+            summarizedNonces.append(summary.nonce)
+            if summarizedNonces.count > 32 { summarizedNonces.removeFirst() }
+        }
+        record(.info, "summary", summary.line)
+    }
+
+    /// The attempt's summary as it ends with `end`.
+    private func summary(_ end: AttemptEnd) -> SessionSummary {
+        let now = ProcessInfo.processInfo.systemUptime
+        return SessionSummary(
+            end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
+            nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
+            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            duration: now - summaryStartedAt)
     }
 
     private func recordStreamSummary(reason: String) {

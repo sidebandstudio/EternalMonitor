@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod remote_config;
 pub mod settings;
 pub mod single_instance;
+pub mod stall;
 pub mod startup;
 pub mod stats;
 pub mod supervisor;
