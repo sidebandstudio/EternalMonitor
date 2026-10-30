@@ -16,8 +16,9 @@ SITE = "https://" + (DOCS / "CNAME").read_text().strip()
 
 
 def one_liner(page, code_id):
-    m = re.search(rf'<code id="{code_id}">([^<]+)</code>', page)
-    return m and m.group(1)
+    m = re.search(rf'<span id="{code_id}">(.+?)</span></code>', page)
+    # <wbr> only marks where a narrow screen may wrap; it copies as nothing.
+    return m and m.group(1).replace("<wbr>", "")
 
 
 class OneLiners(unittest.TestCase):

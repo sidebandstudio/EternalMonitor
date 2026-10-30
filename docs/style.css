@@ -991,11 +991,18 @@ html:not(.channel-beta) #windows-beta,
   .platform { width: 48px; height: 48px; }
 }
 /* The PowerShell one-liner, set on Windows PowerShell's own console blue. */
-.term { margin-top: 22px; }
-.term-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.term-what { font-size: 0.9375rem; color: var(--muted); }
+.term {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "what copy" "cmd cmd";
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 22px;
+}
+.term-what { grid-area: what; font-size: 0.9375rem; color: var(--muted); }
+.term-copy { grid-area: copy; }
 .term-cmd {
-  margin-top: 10px;
+  grid-area: cmd;
   padding: 14px 18px;
   border-radius: var(--r-md);
   background: #012456;
@@ -1006,7 +1013,7 @@ html:not(.channel-beta) #windows-beta,
   overflow-wrap: anywhere;
 }
 .term-cmd code { font: inherit; color: #ffffff; }
-.term-ps { color: #9fb4d8; }
+.term-cmd .term-ps { color: #9fb4d8; }
 .term-copy {
   flex: none;
   height: 34px;
@@ -1023,6 +1030,10 @@ html:not(.channel-beta) #windows-beta,
 .term-copy:active { transform: scale(0.96); }
 .term-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .channel-beta .term-copy:focus-visible { outline-color: #c3cbff; }
+@media (max-width: 760px) {
+  .term { grid-template-columns: 1fr; grid-template-areas: "what" "cmd" "copy"; }
+  .term-copy { height: 44px; }
+}
 .sha {
   margin-top: 18px;
   padding: 12px 14px;
