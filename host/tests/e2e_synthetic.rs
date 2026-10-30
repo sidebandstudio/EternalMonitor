@@ -775,7 +775,9 @@ fn slow_usb_link_measurement() {
 /// EMLINK preamble, as `read_preamble` reads it. Other programs dial a
 /// test's loopback listener too: a development tool that probes each new
 /// listening port with an HTTP GET and a TLS hello did, on a shared machine.
-/// Those are logged with their peer and first bytes, and dropped.
+/// Those are logged with their peer and first bytes, and dropped. Any other
+/// connection fails the test, so a bad first try of the host's own is not
+/// hidden by a good retry.
 async fn accept_host_tunnel(
     listener: &tokio::net::TcpListener,
     within: Duration,
@@ -788,14 +790,68 @@ async fn accept_host_tunnel(
             .await
             .expect("the host dials the tunnel")
             .unwrap();
-        let mut first = [0u8; 8];
-        let read =
-            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut first)).await;
-        if matches!(read, Ok(Ok(_))) && &first == PREAMBLE {
-            return stream;
+        let mut first = Vec::with_capacity(PREAMBLE.len());
+        let read = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut chunk = [0u8; 8];
+            while first.len() < PREAMBLE.len() {
+                let n = stream
+                    .read(&mut chunk[..PREAMBLE.len() - first.len()])
+                    .await?;
+                if n == 0 {
+                    break;
+                }
+                first.extend_from_slice(&chunk[..n]);
+            }
+            std::io::Result::Ok(())
+        })
+        .await;
+        match classify_dial(&first) {
+            Dial::Host => return stream,
+            Dial::Probe => {
+                eprintln!("FOREIGN_USB_DIAL peer={peer} first_bytes={first:02x?} read={read:?}")
+            }
+            Dial::Unknown => panic!(
+                "a tunnel connection from {peer} began {first:02x?}, not the EMLINK preamble \
+                 or a known probe (read {read:?})"
+            ),
         }
-        eprintln!("FOREIGN_USB_DIAL peer={peer} first_bytes={first:02x?} read={read:?}");
     }
+}
+
+/// Who dialed a test's tunnel listener, by the first bytes it sent.
+#[derive(Debug, PartialEq)]
+enum Dial {
+    /// The host, with its EMLINK preamble.
+    Host,
+    /// The port probe: an HTTP GET, or a TLS record (a client hello).
+    Probe,
+    /// Anything else, such as a short or wrong preamble from the host.
+    Unknown,
+}
+
+fn classify_dial(first: &[u8]) -> Dial {
+    use eternal_host::transport::link::PREAMBLE;
+    if first == PREAMBLE {
+        Dial::Host
+    } else if first.starts_with(b"GET ") || first.starts_with(&[0x16, 0x03]) {
+        Dial::Probe
+    } else {
+        Dial::Unknown
+    }
+}
+
+#[test]
+fn only_the_preamble_and_known_probes_are_told_apart() {
+    assert_eq!(classify_dial(b"EMLINK\x01\x00"), Dial::Host);
+    assert_eq!(classify_dial(b"GET / HT"), Dial::Probe);
+    assert_eq!(
+        classify_dial(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01]),
+        Dial::Probe
+    );
+    assert_eq!(classify_dial(b"EMLINK\x02\x00"), Dial::Unknown);
+    assert_eq!(classify_dial(b"EMLI"), Dial::Unknown);
+    assert_eq!(classify_dial(b""), Dial::Unknown);
+    assert_eq!(classify_dial(&[0xde, 0xad, 0xbe, 0xef]), Dial::Unknown);
 }
 
 /// A port for the host's stream, which binds every address: a port that is

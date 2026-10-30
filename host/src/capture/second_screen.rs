@@ -554,8 +554,12 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
 /// [`super::recovery::passing_error`]). A second screen that fails its proof
 /// before capture gets it back is not remembered beyond this app run.
 pub fn note_interruption(shared: &SharedControl, generation: u64) {
+    // Copied out first: an `if let` on the lock would hold it through the
+    // call, which locks it again.
     #[cfg(debug_assertions)]
-    if let Some(away) = shared.second_screen.lock().fake_desktop_away.clone() {
+    let fake_away = shared.second_screen.lock().fake_desktop_away.clone();
+    #[cfg(debug_assertions)]
+    if let Some(away) = fake_away {
         let away = away.load(std::sync::atomic::Ordering::Relaxed);
         note_interruption_while(shared, generation, away);
         return;

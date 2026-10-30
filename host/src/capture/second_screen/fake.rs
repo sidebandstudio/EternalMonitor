@@ -229,8 +229,44 @@ mod tests {
                 .second_screen
                 .lock()
                 .remember("attach_timeout", Instant::now(), false);
-            assert_eq!(dir.join(FILE_NAME).exists(), !away, "away={away}");
+            // The file may be written a moment after `remember` returns.
+            let file = dir.join(FILE_NAME);
+            if away {
+                std::thread::sleep(Duration::from_millis(500));
+                assert!(!file.exists(), "not saved while the desktop is away");
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !file.exists() {
+                    assert!(Instant::now() < deadline, "the failure is saved");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The fake's answer for the desktop is read before the proof is
+    /// locked to note a lost desktop, not under the same lock. A regression
+    /// fails here instead of hanging the run.
+    #[test]
+    fn an_interruption_is_noted_with_the_fake_installed() {
+        let dir =
+            std::env::temp_dir().join(format!("eternal-fake-interruption-{}", std::process::id()));
+        let shared = SharedControl::new(9876, 15_000_000);
+        let display = FakeDisplay::new(None, Duration::from_secs(1));
+        display.install(&shared, &dir, SystemTime::now());
+        super::super::start_proving(&shared, 1, Instant::now());
+        let (done, finished) = std::sync::mpsc::channel();
+        let noting = shared.clone();
+        std::thread::spawn(move || {
+            super::super::note_interruption(&noting, 1);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("note_interruption returns instead of deadlocking");
+        let proving = shared.second_screen.lock().proving.unwrap();
+        assert!(proving.interrupted);
+        assert_eq!(proving.losses, 1, "a loss while the desktop is there");
     }
 }

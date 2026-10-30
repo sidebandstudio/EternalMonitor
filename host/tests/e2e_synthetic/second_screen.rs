@@ -123,6 +123,19 @@ fn saved_failure(memory: &Path) -> Option<serde_json::Value> {
     Some(file["failure"].clone()).filter(|failure| !failure.is_null())
 }
 
+/// [`saved_failure`] once it is there, within 10 s: the host may write the
+/// file a moment after it decides to save.
+fn saved_failure_soon(memory: &Path) -> Option<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saved = saved_failure(memory);
+        if saved.is_some() || Instant::now() >= deadline {
+            return saved;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Plays the iPad on `receiver`: reassembles and decodes the stream and
 /// sends reports, until `done` holds for the pictures so far. Panics after
 /// `backstop`.
@@ -322,7 +335,7 @@ fn an_attach_timeout_mirrors_and_is_remembered_until_the_wait_ends() {
     );
     // Saved because the fake display says the desktop is there, whatever
     // session the test runs in.
-    let saved = saved_failure(&memory).expect("the failure is saved");
+    let saved = saved_failure_soon(&memory).expect("the failure is saved");
     assert_eq!(saved["reason"], "attach_timeout", "{saved}");
     assert_eq!(saved["failures"], 1, "{saved}");
     receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
