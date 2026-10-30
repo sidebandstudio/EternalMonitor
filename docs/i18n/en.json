@@ -108,6 +108,7 @@
   "download.channel.label": "Channel",
   "download.channel.stable": "Stable",
   "download.channel.beta": "Beta",
+  "download.channel.hint": "If you're having issues, try the Beta. Fixes land there much quicker.",
   "download.label": "Downloads",
   "download.usb": "For USB: Apple's free <0>Apple Devices</0> app, open while you stream (Windows 10 22H2 or 11)",
   "download.releaseNotes": "Release notes",
