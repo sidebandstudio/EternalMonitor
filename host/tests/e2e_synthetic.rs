@@ -191,7 +191,7 @@ const CATCH_UP_FRAMES: i64 = 6;
 #[test]
 fn usb_framed_stream_end_to_end() {
     use eternal_host::stats::PIPELINE_STATS;
-    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_host::transport::link::{read_datagram, write_datagram};
     use eternal_wire::v2::control::HOSTCAP_USB;
     use std::sync::atomic::Ordering;
 
@@ -233,10 +233,9 @@ fn usb_framed_stream_end_to_end() {
         runtime.block_on(async {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await.unwrap().unwrap();
+        let mut stream = accept_host_tunnel(&listener, Duration::from_secs(30)).await;
         stream.set_nodelay(true).unwrap();
         socket2::SockRef::from(&stream).set_recv_buffer_size(32 * 1024).unwrap();
-        read_preamble(&mut stream).await.unwrap();
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2, proto_max: 2, client_nonce: 1, listen_port: 0,
             decoder_caps: CAP_DECODE_H264, feature_caps: 0,
@@ -564,7 +563,7 @@ struct SlowUsbRun {
 /// it drops a partial frame, at most once per 500 ms.
 fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
     use eternal_host::stats::PIPELINE_STATS;
-    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_host::transport::link::{read_datagram, write_datagram};
 
     init_test_tracing();
     ffmpeg_next::init().unwrap();
@@ -602,15 +601,11 @@ fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let mut stream = accept_host_tunnel(&listener, Duration::from_secs(10)).await;
             stream.set_nodelay(true).unwrap();
             socket2::SockRef::from(&stream)
                 .set_recv_buffer_size(32 * 1024)
                 .unwrap();
-            read_preamble(&mut stream).await.unwrap();
             let hello = ControlMessage::Hello2(Hello2 {
                 proto_min: 2,
                 proto_max: 2,
@@ -774,6 +769,33 @@ fn slow_usb_link_measurement() {
     let run = run_slow_usb(rate, Duration::from_secs(20));
     eprintln!("SLOW_USB rate={rate} {run:?}");
     assert!(run.tunnel_open, "the tunnel must stay open");
+}
+
+/// Accepts the host's USB tunnel on `listener` within `within`, past its
+/// EMLINK preamble, as `read_preamble` reads it. Other programs dial a
+/// test's loopback listener too: a development tool that probes each new
+/// listening port with an HTTP GET and a TLS hello did, on a shared machine.
+/// Those are logged with their peer and first bytes, and dropped.
+async fn accept_host_tunnel(
+    listener: &tokio::net::TcpListener,
+    within: Duration,
+) -> tokio::net::TcpStream {
+    use eternal_host::transport::link::PREAMBLE;
+    use tokio::io::AsyncReadExt;
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let (mut stream, peer) = tokio::time::timeout_at(deadline, listener.accept())
+            .await
+            .expect("the host dials the tunnel")
+            .unwrap();
+        let mut first = [0u8; 8];
+        let read =
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut first)).await;
+        if matches!(read, Ok(Ok(_))) && &first == PREAMBLE {
+            return stream;
+        }
+        eprintln!("FOREIGN_USB_DIAL peer={peer} first_bytes={first:02x?} read={read:?}");
+    }
 }
 
 /// A port for the host's stream, which binds every address: a port that is

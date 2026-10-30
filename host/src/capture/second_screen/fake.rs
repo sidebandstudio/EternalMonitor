@@ -4,13 +4,15 @@
 //! and the transport's steps by hand. A test installs a [`FakeDisplay`] on a
 //! [`SharedControl`]: the real worker then turns it on and off, synthetic
 //! capture switches onto it the way DXGI capture switches onto the real one,
-//! and a failure is saved in a folder the test chooses. Release builds
+//! a failure is saved in a folder the test chooses, and the fake, not
+//! Windows, says whether the user's desktop is there. Release builds
 //! compile none of this, and nothing here reads the environment, so only a
 //! test that calls [`FakeDisplay::install`] gets it.
 //!
 //! [`attach`]: super::attach
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -36,6 +38,9 @@ struct Inner {
     /// When it was turned on, on its clock, while it is on.
     on_since: Mutex<Option<Instant>>,
     toggles: Mutex<Vec<(Duration, bool)>>,
+    /// What it answers for Windows' input desktop: see
+    /// [`FakeDisplay::set_desktop_away`].
+    desktop_away: Arc<AtomicBool>,
 }
 
 impl FakeDisplay {
@@ -51,6 +56,7 @@ impl FakeDisplay {
             advanced: Condvar::new(),
             on_since: Mutex::new(None),
             toggles: Mutex::new(Vec::new()),
+            desktop_away: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -68,8 +74,10 @@ impl FakeDisplay {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        shared.second_screen.lock().memory =
-            Memory::load(memory.join(FILE_NAME), fingerprint, wall, Instant::now());
+        let mut state = shared.second_screen.lock();
+        state.memory = Memory::load(memory.join(FILE_NAME), fingerprint, wall, Instant::now());
+        state.fake_desktop_away = Some(self.0.desktop_away.clone());
+        drop(state);
         *shared.vdd_worker.fake.lock() = Some(self.clone());
     }
 
@@ -79,6 +87,14 @@ impl FakeDisplay {
     pub fn advance(&self, by: Duration) {
         *self.0.ahead.lock() += by;
         self.0.advanced.notify_all();
+    }
+
+    /// Have the host see a secure screen or displays turned off (true) or
+    /// the user's desktop (false, at first), in place of asking Windows, which
+    /// has no input desktop in a service session such as CI's. A failure
+    /// while it is away is not saved for later app runs.
+    pub fn set_desktop_away(&self, away: bool) {
+        self.0.desktop_away.store(away, Ordering::Relaxed);
     }
 
     /// Each time it was turned on (true) or off, on its clock, since it was
@@ -187,4 +203,34 @@ pub(crate) fn capture_second_screen(shared: &SharedControl, generation: u64) -> 
     let target = crate::capture::reconcile_virtual_display(&requested, shared, generation)?;
     Some(matches!(&target, CaptureTarget::Output(name)
         if shared.vdd_output.lock().as_deref() == Some(name.as_str())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fake, not Windows, says whether the desktop is there, so a test
+    /// in a service session, which has no input desktop, still saves the
+    /// failure.
+    #[test]
+    fn a_failure_is_saved_unless_the_fake_desktop_is_away() {
+        for away in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "eternal-fake-desktop-{away}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let shared = SharedControl::new(9876, 15_000_000);
+            let display = FakeDisplay::new(None, Duration::from_secs(1));
+            display.install(&shared, &dir, SystemTime::now());
+            display.set_desktop_away(away);
+            shared
+                .second_screen
+                .lock()
+                .remember("attach_timeout", Instant::now(), false);
+            assert_eq!(dir.join(FILE_NAME).exists(), !away, "away={away}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

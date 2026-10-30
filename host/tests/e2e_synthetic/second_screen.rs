@@ -320,6 +320,8 @@ fn an_attach_timeout_mirrors_and_is_remembered_until_the_wait_ends() {
         [true, false],
         "turned on, then off after the wait: {toggles:?}"
     );
+    // Saved because the fake display says the desktop is there, whatever
+    // session the test runs in.
     let saved = saved_failure(&memory).expect("the failure is saved");
     assert_eq!(saved["reason"], "attach_timeout", "{saved}");
     assert_eq!(saved["failures"], 1, "{saved}");
@@ -352,12 +354,22 @@ fn an_attach_timeout_mirrors_and_is_remembered_until_the_wait_ends() {
     drop(host);
 
     // App run 3, once the hour after one failure is over: it is tried
-    // again, attaches, and its first image forgets the failure.
-    let display = FakeDisplay::new(Some(Duration::ZERO), Duration::from_secs(10));
+    // again, attaches, and its first image forgets the failure. The display
+    // attaches only once the mirror has shown, so both epochs reach the iPad.
+    // Moving the fake clock on is safe here: no failure is saved at it.
+    let display = FakeDisplay::new(Some(Duration::from_secs(25)), Duration::from_secs(30));
     let later = started + Duration::from_secs(60 * 60 + 60);
     let host = Host::start(&display, &memory, later);
     let mut receiver = host.connect(0x5707_1003);
+    let mut advanced = false;
     let pictures = watch(&mut receiver, Duration::from_secs(30), |pictures| {
+        if !advanced && !pictures.is_empty() && !display.toggles().is_empty() {
+            // Mirroring while the display attaches. Now its 25 s pass.
+            assert_eq!(epochs(pictures).len(), 1);
+            assert_eq!(host.status(), VddStatus::Attaching);
+            display.advance(Duration::from_secs(25));
+            advanced = true;
+        }
         after_first_epoch(pictures) >= 10
     });
     assert_eq!(epochs(&pictures).len(), 2, "one switch");
@@ -379,7 +391,7 @@ fn an_attach_timeout_mirrors_and_is_remembered_until_the_wait_ends() {
 /// tunnel, without a reconnect, and the picture goes on.
 #[test]
 fn a_late_attach_moves_the_stream_as_a_new_epoch_on_the_same_tunnel() {
-    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_host::transport::link::{read_datagram, write_datagram};
 
     let _env = test_env();
     synthetic_env();
@@ -398,12 +410,8 @@ fn a_late_attach_moves_the_stream_as_a_new_epoch_on_the_same_tunnel() {
         .unwrap();
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-            .await
-            .expect("the host dials the tunnel")
-            .unwrap();
+        let mut stream = accept_host_tunnel(&listener, Duration::from_secs(30)).await;
         stream.set_nodelay(true).unwrap();
-        read_preamble(&mut stream).await.unwrap();
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
             proto_max: 2,

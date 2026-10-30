@@ -152,6 +152,10 @@ pub(crate) struct State {
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
     memory: Memory,
+    /// Whether the user's desktop is away, as an end-to-end test's fake
+    /// display says in place of Windows: see [`desktop_away`].
+    #[cfg(debug_assertions)]
+    fake_desktop_away: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl State {
@@ -174,6 +178,8 @@ impl State {
                 last_toggle: self.last_toggle,
                 attaching: self.attaching,
                 memory: std::mem::take(&mut self.memory),
+                #[cfg(debug_assertions)]
+                fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
             };
             return Step::Nothing;
@@ -237,6 +243,8 @@ impl State {
             attaching: self.attaching,
             failure: Some(reason),
             memory: std::mem::take(&mut self.memory),
+            #[cfg(debug_assertions)]
+            fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
         };
         *status = VddStatus::Failed;
@@ -249,7 +257,7 @@ impl State {
     /// something that passes may explain it: then only this app run keeps
     /// mirroring, as before.
     fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool) {
-        if interrupted || desktop_away() {
+        if interrupted || self.desktop_away() {
             tracing::info!(
                 reason,
                 "The second screen failed while Windows withheld the desktop or the display may \
@@ -267,6 +275,16 @@ impl State {
                  mirror until it is tried again"
             );
         }
+    }
+
+    /// [`desktop_away`], or what the fake display an end-to-end test
+    /// installed says.
+    fn desktop_away(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if let Some(away) = &self.fake_desktop_away {
+            return away.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        desktop_away()
     }
 
     /// Whether a capture generation with no viewer should leave an attached
@@ -536,6 +554,12 @@ pub fn note_capture_error(shared: &SharedControl, generation: u64) {
 /// [`super::recovery::passing_error`]). A second screen that fails its proof
 /// before capture gets it back is not remembered beyond this app run.
 pub fn note_interruption(shared: &SharedControl, generation: u64) {
+    #[cfg(debug_assertions)]
+    if let Some(away) = shared.second_screen.lock().fake_desktop_away.clone() {
+        let away = away.load(std::sync::atomic::Ordering::Relaxed);
+        note_interruption_while(shared, generation, away);
+        return;
+    }
     note_interruption_while(shared, generation, desktop_away());
 }
 
