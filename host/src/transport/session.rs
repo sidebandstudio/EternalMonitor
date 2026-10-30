@@ -464,6 +464,7 @@ impl Session {
             None => crate::pairing::Grant {
                 token: [0; 16],
                 used_code: false,
+                new_pairing: false,
             },
         };
 
@@ -549,12 +550,18 @@ impl Session {
             bye: None,
         });
 
+        // Only a new pairing carries the token. iPads keep the token they
+        // have when an ACK carries none.
         let ack = self.make_ack_with_token(
             HelloStatus::Ok,
             hello.client_nonce,
             session_id,
             config,
-            grant.token,
+            if grant.new_pairing {
+                grant.token
+            } else {
+                [0; 16]
+            },
         );
         self.active.as_mut().unwrap().ack = ack.clone();
         actions.replies.push((source, ack));
@@ -1831,6 +1838,7 @@ mod tests {
         hello.pairing_code = 0;
         let reconnected = pair_send(&mut session, &config, peer, hello.clone(), now);
         assert_eq!(pair_ack(&reconnected).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&reconnected).auth_token, [0; 16]);
         assert_ne!(pair_ack(&reconnected).session_id, ack.session_id);
         config.0.lock().regenerate_token().unwrap();
         let stale = pair_send(&mut session, &config, peer, hello, now);
@@ -1909,10 +1917,9 @@ mod tests {
             HelloStatus::RateLimited
         );
         hello.auth_token = [7; 16];
-        assert_eq!(
-            pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now)).status,
-            HelloStatus::Ok
-        );
+        let paired = pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now));
+        assert_eq!(paired.status, HelloStatus::Ok);
+        assert_eq!(paired.auth_token, [0; 16]);
         hello.auth_token = [0; 16];
         hello.client_nonce += 1;
         assert_eq!(
@@ -1926,6 +1933,52 @@ mod tests {
             .status,
             HelloStatus::Ok
         );
+    }
+
+    #[test]
+    fn only_a_new_pairing_gets_the_token() {
+        let config = pair_config(true);
+        let now = Instant::now();
+        let wifi = addr([192, 0, 2, 1], 50000);
+        let usb = PeerId {
+            link: LinkId::Usb { device_id: 1 },
+            addr: None,
+        };
+        let mut session = Session::new(10);
+        let mut send = |peer, nonce, token: [u8; 16], code| {
+            let mut hello = pair_hello(nonce);
+            hello.auth_token = token;
+            hello.pairing_code = code;
+            pair_send(&mut session, &config, peer, hello, now)
+        };
+
+        // The code pairs, and a retransmit of that HELLO, after a lost ACK,
+        // gets the same ACK with the token.
+        let code = config.0.lock().code();
+        let paired = send(wifi, 1, [0; 16], code);
+        assert_eq!(pair_ack(&paired).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&paired).auth_token, [7; 16]);
+        assert_eq!(send(wifi, 1, [0; 16], code).replies, paired.replies);
+
+        // Reconnects with the token, over Wi-Fi or USB, don't get it again.
+        for (peer, nonce) in [(wifi, 2), (usb, 3)] {
+            let ack = pair_ack(&send(peer, nonce, [7; 16], 0));
+            assert_eq!(ack.status, HelloStatus::Ok);
+            assert_eq!(ack.auth_token, [0; 16]);
+        }
+
+        // USB pairs an iPad without the token, or with an old one.
+        for (nonce, token) in [(4, [0; 16]), (5, [9; 16])] {
+            let ack = pair_ack(&send(usb, nonce, token, 0));
+            assert_eq!(ack.status, HelloStatus::Ok);
+            assert_eq!(ack.auth_token, [7; 16]);
+        }
+
+        // With pairing off there is no token to give.
+        config.0.lock().required = false;
+        let ack = pair_ack(&send(usb, 6, [0; 16], 0));
+        assert_eq!(ack.status, HelloStatus::Ok);
+        assert_eq!(ack.auth_token, [0; 16]);
     }
 
     fn ended(actions: &Actions) -> SessionEnd {

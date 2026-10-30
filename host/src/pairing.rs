@@ -63,6 +63,9 @@ pub struct Pairing {
 pub struct Grant {
     pub token: [u8; 16],
     pub used_code: bool,
+    /// The iPad paired just now, with the code or over USB, and gets the
+    /// token in the ACK. An iPad that presented the token already has it.
+    pub new_pairing: bool,
 }
 
 impl Pairing {
@@ -123,12 +126,14 @@ impl Pairing {
             return Ok(Grant {
                 token: [0; 16],
                 used_code: false,
+                new_pairing: false,
             });
         }
         if bool::from(hello.auth_token.ct_eq(&self.token)) {
             return Ok(Grant {
                 token: self.token,
                 used_code: false,
+                new_pairing: false,
             });
         }
         let usb = matches!(peer.link, LinkId::Usb { .. });
@@ -143,12 +148,14 @@ impl Pairing {
             return Ok(Grant {
                 token: self.token,
                 used_code: true,
+                new_pairing: true,
             });
         }
         if usb {
             return Ok(Grant {
                 token: self.token,
                 used_code: false,
+                new_pairing: true,
             });
         }
         if let Some(addr) = peer.addr {
