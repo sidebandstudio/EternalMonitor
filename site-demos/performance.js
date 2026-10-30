@@ -12,9 +12,10 @@
   const tl = gsap.timeline({ paused: true });
   const SEAM = 8 / 3;                        // one session's turn
   const HALF = 0.22;                         // half a slide
-  // The chart and the Encoder and Session cards, a little closer by the end.
+  // The window from its title bar down, a little closer by the end. On the
+  // wide film the chip sits centred on the title bar.
   const FRAME = {
-    1480: { cx: 620, cy: 548, zoom: 1.25, push: 1.33, at: { x: 760, y: 548 } },
+    1480: { cx: 520, cy: -30, zoom: 1.1, push: 1.16, at: { x: 740, y: 30 } },
     728: { cx: 632, cy: 479, zoom: 0.96, push: 0.99, at: { x: 364, y: 520 } },
   }[W];
   const GAP = W + 120;                       // how far the next window waits
