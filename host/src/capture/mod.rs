@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::error;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use tracing::{info, warn};
 
 use crate::control::SharedControl;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
 use crate::vdd_device::DeviceState;
@@ -264,10 +264,10 @@ pub(crate) fn resolve_target(
 /// after connecting, and on some PCs the display attaches only after that.
 #[cfg(any(windows, test))]
 const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 30;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 enum AttachResult {
     Attached(OutputInfo),
     TimedOut,
@@ -276,7 +276,7 @@ enum AttachResult {
 
 /// Polling remains bounded even while startup heartbeats keep the watchdog alive.
 /// A cancelled generation returns before inspecting or changing display state.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn wait_for_virtual_output(
     before: &[String],
     timeout: Duration,
@@ -337,7 +337,7 @@ pub(crate) fn recovery_poll(shared: &SharedControl, now_ms: u64, since_send: Dur
     since_send >= IDLE_KEEPALIVE
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn capture_is_current(shared: &SharedControl, generation: u64) -> bool {
     shared.running.load(std::sync::atomic::Ordering::SeqCst)
         && crate::supervisor::generation_is_current(generation)
@@ -533,7 +533,7 @@ fn log_failure_snapshot(device: crate::vdd::EnableReport, request: Option<&VddRe
 /// A start that a mode change ended after this long without a display is
 /// worth a snapshot: on PCs where it works, the display attaches within
 /// milliseconds of the Enable task.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 const CANCELLED_SNAPSHOT_AFTER: Duration = Duration::from_secs(2);
 
 /// Whether a cancelled attach that waited `waited` logs a snapshot: once per
@@ -541,7 +541,7 @@ const CANCELLED_SNAPSHOT_AFTER: Duration = Duration::from_secs(2);
 /// on PCs whose display never attached, so no failure snapshot was ever
 /// written. The iPad no longer ends a start, which times out and logs its
 /// own snapshot; the user choosing another mode while it waits still does.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn snapshot_cancelled_attach(waited: Duration, logged: &std::sync::atomic::AtomicBool) -> bool {
     waited >= CANCELLED_SNAPSHOT_AFTER && !logged.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
@@ -594,6 +594,17 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
     shared.client_connected()
 }
 
+/// The displays to capture from: [`enumerate_outputs`], or in end-to-end
+/// tests the fake virtual display's.
+#[cfg(any(windows, test, debug_assertions))]
+fn outputs(shared: &SharedControl) -> Vec<OutputInfo> {
+    #[cfg(debug_assertions)]
+    if let Some(outputs) = second_screen::fake::outputs(shared) {
+        return outputs;
+    }
+    enumerate_outputs()
+}
+
 /// Reconcile the virtual display device to the requested target and return the concrete
 /// target to capture. `VirtualExtended` captures the virtual display once it is attached and
 /// a viewer is connected (or one left less than [`second_screen::RELEASE_GRACE`] ago), and
@@ -601,7 +612,7 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
 /// mirror, after it failed to, and with nobody connected. Any other target turns the display
 /// off. Never waits for the driver: the [`second_screen`] worker changes it, and the mirror
 /// must not wait behind a slow Enable or attach.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn reconcile_virtual_display(
     target: &CaptureTarget,
     shared: &SharedControl,
@@ -636,7 +647,7 @@ pub(crate) fn reconcile_virtual_display(
             // managed monitor, and the stream moves onto it this way once it
             // attaches. Reuse that output rather than turning it on again.
             let attached = owned.clone().filter(|name| {
-                enumerate_outputs()
+                outputs(shared)
                     .iter()
                     .any(|output| !output.is_primary && &output.device_name == name)
             });
@@ -851,7 +862,7 @@ fn run_platform_loop(
 /// not present in `before` (the snapshot taken just before enabling the VDD). Returns `None` when
 /// no new output has appeared yet, so the caller keeps polling instead of grabbing a pre-existing
 /// real second monitor.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Option<&'a OutputInfo> {
     now.iter()
         .filter(|o| !o.is_primary)

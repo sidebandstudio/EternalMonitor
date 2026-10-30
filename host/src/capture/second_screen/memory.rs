@@ -33,7 +33,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(super) const FILE_NAME: &str = "second-screen-state.json";
 
 /// The graphics cards of a PC where the second screen showed a picture, or
@@ -114,7 +114,7 @@ impl Fingerprint {
     }
 
     /// Which parts differ from `other`, for the log.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn changes(&self, other: &Self) -> Vec<&'static str> {
         [
             ("app", self.app != other.app),
@@ -227,7 +227,7 @@ struct Io {
     overwrite: fn(&Path, &[u8]) -> std::io::Result<()>,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 impl Io {
     const FILES: Io = Io {
         remove: remove_file,
@@ -257,12 +257,12 @@ impl Memory {
     /// is the time at `now` in seconds since 1970; later times count from
     /// `now` on the monotonic clock.
     /// Starts the thread that writes the files; call it holding no lock.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn load(path: PathBuf, fingerprint: Fingerprint, wall: u64, now: Instant) -> Self {
         Self::load_with(path, fingerprint, wall, now, spawn_writer)
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn load_with(
         path: PathBuf,
         fingerprint: Fingerprint,
@@ -531,15 +531,15 @@ pub(crate) struct Saver {
     work: Condvar,
     /// Wakes [`Saver::flush`]: a file was written.
     idle: Condvar,
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     spawn: Spawn,
 }
 
 /// Starts the writer's thread, so tests can count the threads or fail them.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 type Spawn = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn spawn_writer(write: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("second-screen-save".into())
@@ -549,7 +549,7 @@ fn spawn_writer(write: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
 
 /// How long after the writer's thread failed to start the 1st, 2nd, …
 /// time in a row it is started again; after the last, every minute.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 const START_RETRY: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(5),
@@ -576,7 +576,7 @@ struct Saving {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[cfg_attr(not(any(windows, test, debug_assertions)), allow(dead_code))]
 enum Writer {
     /// Not started yet, or ended with the memory.
     #[default]
@@ -615,7 +615,7 @@ const OVERRIDE_NOT_SAVED: &str = "Could not save that the second screen worked o
                                   update manifest rule may apply again at the next app run";
 
 impl Saver {
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn new(spawn: Spawn) -> Self {
         Self {
             saving: Mutex::default(),
@@ -627,7 +627,7 @@ impl Saver {
 
     /// Start the writer's thread. Only from a thread that holds no lock:
     /// starting a thread takes as long as Windows takes.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn start(self: &Arc<Self>, now: Instant) {
         let tries = {
             let mut saving = self.saving.lock();
@@ -665,7 +665,7 @@ impl Saver {
     /// Start the writer again if its thread could not start, once the wait
     /// after the last try is over. The caller holds no lock. When to call
     /// this again, while it still hasn't started.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn retry_start(self: &Arc<Self>, now: Instant) -> Option<Instant> {
         let due = self.saving.lock().writer.retry_at()?;
         if now >= due {
@@ -690,7 +690,7 @@ impl Saver {
 
     /// The writer's thread: sleeps until there is a file to write, until the
     /// memory is gone.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn write(&self) {
         let mut saving = self.saving.lock();
         loop {
@@ -741,7 +741,7 @@ impl Saver {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 impl Writer {
     fn retry_at(self) -> Option<Instant> {
         let Writer::Failed { tries, at } = self else {
@@ -833,7 +833,7 @@ fn remembered(reason: &str) -> Option<&'static str> {
 
 /// The saved record and its reason. `Ok(None)` without a file or without a
 /// failure in it; an error for one that cannot be used.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
     let data = match std::fs::read(path) {
         Ok(data) => data,
@@ -854,20 +854,20 @@ fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
     Ok(Some((record, reason)))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn remove_file(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
 /// Through a temporary file and a rename.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path))
 }
 
 /// The existing file, truncated and written where it is.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
