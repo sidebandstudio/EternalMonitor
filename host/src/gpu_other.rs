@@ -74,6 +74,16 @@ impl GpuInfo {
     }
 }
 
+/// No NVIDIA drivers to read outside Windows.
+pub fn nvidia_driver_versions() -> Vec<u64> {
+    Vec::new()
+}
+
+/// No hardware encoder fallback chain outside Windows.
+pub fn vendors_present() -> Option<Vec<GpuVendor>> {
+    None
+}
+
 /// No graphics card names off Windows; a feedback email leaves the line out.
 pub fn adapter_names() -> Vec<String> {
     Vec::new()

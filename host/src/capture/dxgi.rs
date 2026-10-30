@@ -142,6 +142,13 @@ pub fn run_capture_loop(
         );
     }
 
+    // Capture retries every few seconds while no output exists; say so once.
+    static NO_OUTPUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !outputs.is_empty() && NO_OUTPUTS.swap(false, Ordering::Relaxed) {
+        info!(outputs = outputs.len(), "A display output is back");
+    }
+    // A missing output (DXGI_ERROR_NOT_FOUND) is a display change the stage
+    // waits out, not a failure.
     let (adapter, output, adapter_name, capture_label) = match resolve_target(&outputs, &target) {
         Some(idx) => {
             let chosen = &outputs[idx];
@@ -153,14 +160,15 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for the chosen output's adapter — falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0)? }
+                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
                 Ok(desc) => utf16_to_string(&desc.Description),
                 Err(_) => chosen.adapter_name.clone(),
             };
-            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(chosen.output_index)? };
+            let output: IDXGIOutput =
+                unsafe { adapter.EnumOutputs(chosen.output_index) }.map_err(blocked_or_error)?;
             let label = format!(
                 "{} ({}x{})",
                 chosen.device_name, chosen.width, chosen.height
@@ -175,8 +183,11 @@ pub fn run_capture_loop(
             (adapter, output, adapter_name, label)
         }
         None => {
-            // No outputs enumerated (unusual) — preserve the legacy path exactly.
-            warn!("No display outputs enumerated — falling back to the detection adapter's first output");
+            // No outputs enumerated: a closed laptop lid or a screen that is
+            // off. Try the detection adapter's first output, as before.
+            if !NO_OUTPUTS.swap(true, Ordering::Relaxed) {
+                info!("No display outputs enumerated, as while a laptop's lid is closed — trying the detection adapter's first output");
+            }
             let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
                 Ok(a) => a,
                 Err(error) => {
@@ -185,14 +196,15 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0)? }
+                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
                 Ok(desc) => utf16_to_string(&desc.Description),
                 Err(_) => String::new(),
             };
-            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0)? };
+            let output: IDXGIOutput =
+                unsafe { adapter.EnumOutputs(0) }.map_err(blocked_or_error)?;
             (adapter, output, adapter_name, "primary (auto)".to_string())
         }
     };

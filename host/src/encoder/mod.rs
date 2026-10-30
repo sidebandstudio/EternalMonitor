@@ -16,7 +16,7 @@ use eternal_wire::h264::{
 
 use crate::capture::FrameSlot;
 use crate::control::SharedControl;
-use crate::gpu::GpuInfo;
+use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
 
 pub mod input;
@@ -110,6 +110,7 @@ fn run_encode_loop(
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
         // libx264 override is not a fallback, so it intentionally leaves this false.
         stats.set_software_fallback(false);
+        stats.nvidia_driver_outdated = false;
     }
 
     let mut encoder_state: Option<EncoderState> = None;
@@ -267,7 +268,7 @@ fn run_encode_loop(
                 desired_bitrate,
                 target_fps,
                 input_mode,
-                Opening::First,
+                first_open(&desired_encoder),
                 &mut opening,
             ) {
                 Ok(state) => {
@@ -299,18 +300,22 @@ fn run_encode_loop(
                         "Preferred encoder failed to open; trying remaining encoders"
                     );
                     let stalled = is_open_stall(e.as_ref());
-                    let (name, state) = open_remaining_encoders(&desired_encoder, |name| {
-                        EncoderState::new(
-                            name,
-                            raw_frame.width,
-                            raw_frame.height,
-                            desired_bitrate,
-                            target_fps,
-                            input_mode,
-                            Opening::First,
-                            &mut opening,
-                        )
-                    })?;
+                    let (name, state) = open_remaining_encoders(
+                        (&desired_encoder, &e.to_string()),
+                        crate::gpu::vendors_present,
+                        |name| {
+                            EncoderState::new(
+                                name,
+                                raw_frame.width,
+                                raw_frame.height,
+                                desired_bitrate,
+                                target_fps,
+                                input_mode,
+                                first_open(name),
+                                &mut opening,
+                            )
+                        },
+                    )?;
                     // After a stall the preferred encoder stays preferred,
                     // to be tried again; a real error leaves it for good.
                     if !stall_recovery.failed(stalled, &preferred, name, Instant::now()) {
@@ -748,6 +753,7 @@ impl EncoderState {
         let encoder = match open_encoder(encoder, encoder_name, opening, progress) {
             Ok(Ok(encoder)) => encoder,
             Ok(Err(error)) => {
+                note_nvidia_driver(encoder_name, error, crate::gpu::nvidia_driver_versions);
                 let code: i32 = error.into();
                 return Err(format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
             }
@@ -911,6 +917,10 @@ enum Opening {
     /// Nothing: the pipeline's first open and its fallbacks, or a reopen at
     /// a new capture size, which the old session cannot encode.
     First,
+    /// As `First`, with another encoder to try if this one fails: every
+    /// first open but libx264's. FFmpeg's errors while it opens are logged
+    /// as warnings (see [`crate::diagnostics::while_probing`]).
+    Probe,
     /// The live session, which goes on if the reopen is given up on. The
     /// picture freezes until then, so the limit is shorter.
     Reopen,
@@ -941,22 +951,41 @@ fn open_encoder_on(
     opening: Opening,
     progress: &mut dyn FnMut(),
 ) -> OpenResult {
-    if !takes_codec_lock(encoder_name) {
-        return Ok(encoder.open_with(encoder_options(encoder_name)));
-    }
     let name = encoder_name.to_string();
+    // On the thread that makes the call, where FFmpeg logs.
+    let open = move || {
+        let open = || encoder.open_with(encoder_options(&name));
+        if opening == Opening::Probe {
+            crate::diagnostics::while_probing(open)
+        } else {
+            open()
+        }
+    };
+    if !takes_codec_lock(encoder_name) {
+        return Ok(open());
+    }
     crate::stall::run_on(
         lanes,
         crate::stall::Call::EncoderOpen,
         open_limits(encoder_name, opening),
-        move || encoder.open_with(encoder_options(&name)),
+        open,
         progress,
     )
 }
 
+/// A pipeline's first open of `encoder_name`: anything but libx264 has
+/// another encoder after it.
+fn first_open(encoder_name: &str) -> Opening {
+    if encoder_name == "libx264" {
+        Opening::First
+    } else {
+        Opening::Probe
+    }
+}
+
 fn open_limits(encoder_name: &str, opening: Opening) -> crate::stall::Limits {
     match opening {
-        Opening::First => crate::stall::encoder_open_limits(encoder_name),
+        Opening::First | Opening::Probe => crate::stall::encoder_open_limits(encoder_name),
         Opening::Reopen => crate::stall::encoder_reopen_limits(encoder_name),
     }
 }
@@ -973,26 +1002,138 @@ fn takes_codec_lock(encoder_name: &str) -> bool {
             .any(|suffix| encoder_name.ends_with(suffix))
 }
 
+/// `vendors_present` lists the graphics cards' vendors when the fallback
+/// runs (see [`crate::gpu::vendors_present`]). The encoders of the vendors
+/// listed are tried first, so a PC with a working one never probes the
+/// others: AMF on a PC without an AMD card only logs that its DLL failed to
+/// load. Every other hardware encoder is still tried after them, because
+/// Windows does not list every card that can encode (an NVIDIA card in TCC
+/// mode). A hybrid laptop lists both of its cards; an unknown vendor moves
+/// no encoder. With no list, the order is NVENC, AMF, Quick Sync, as before.
+///
+/// `failed` is the encoder that failed first, and why. If every encoder
+/// fails, one error names each and its reason: their FFmpeg errors were
+/// warnings while they were tried.
 fn open_remaining_encoders<T>(
-    failed: &str,
+    (failed, why): (&str, &str),
+    vendors_present: impl FnOnce() -> Option<Vec<GpuVendor>>,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
-    let hardware: &[&str] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
-        &["h264_nvenc", "h264_amf", "h264_qsv"]
-    } else {
-        &[]
+    // Open errors already start with the encoder's name.
+    let mut reasons = vec![why.to_string()];
+    let note = |reasons: &mut Vec<String>, name: &str, reason: String| {
+        reasons.push(if reason.starts_with(name) {
+            reason
+        } else {
+            format!("{name}: {reason}")
+        });
     };
-    for &name in hardware {
+    let mut hardware = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
+        vec![
+            ("h264_nvenc", GpuVendor::Nvidia),
+            ("h264_amf", GpuVendor::Amd),
+            ("h264_qsv", GpuVendor::Intel),
+        ]
+    } else {
+        Vec::new()
+    };
+    let vendors = if hardware.is_empty() {
+        None
+    } else {
+        vendors_present()
+    };
+    if let Some(vendors) = &vendors {
+        // A stable sort: each group keeps NVENC, AMF, Quick Sync.
+        hardware.sort_by_key(|(_, vendor)| !vendors.contains(vendor));
+    }
+    for (name, vendor) in hardware {
         if name == failed {
             continue;
         }
+        if vendors
+            .as_ref()
+            .is_some_and(|vendors| !vendors.contains(&vendor))
+        {
+            info!(
+                encoder = name,
+                %vendor,
+                "No graphics card from this vendor is listed; trying its encoder after the listed ones"
+            );
+        }
         match open(name) {
             Ok(state) => return Ok((name, state)),
-            Err(error) => warn!(encoder = name, %error, "Hardware encoder did not open"),
+            Err(error) => {
+                warn!(encoder = name, %error, "Hardware encoder did not open");
+                note(&mut reasons, name, error.to_string());
+            }
         }
     }
     warn!("No hardware encoder opened; falling back to libx264 (software)");
-    open("libx264").map(|state| ("libx264", state))
+    open("libx264")
+        .map(|state| ("libx264", state))
+        .inspect_err(|error| {
+            note(&mut reasons, "libx264", error.to_string());
+            error!(encoders = %reasons.join(" | "), "No encoder could open");
+        })
+}
+
+/// The oldest NVIDIA driver the bundled FFmpeg 7.1.1's NVENC opens with. Its
+/// NVENC headers are nv-codec-headers 13.0.19 (Video Codec SDK 13.0), whose
+/// README requires driver 570.0 or newer on Windows. Older drivers fail with
+/// "Driver does not support the required nvenc API version", and FFmpeg 7.1
+/// prints the minimum as "(unknown)".
+pub const NVENC_MIN_DRIVER: &str = "570";
+/// [`NVENC_MIN_DRIVER`] in hundredths, as [`nvidia_release`] returns it.
+const NVENC_MIN_RELEASE: u32 = 57_000;
+
+/// NVIDIA's driver number in hundredths (56607 for 566.07) from the Windows
+/// driver version packed as DXGI reports it (32.0.15.6607): the last digit
+/// of the third part followed by the four digits of the fourth.
+fn nvidia_release(windows_version: u64) -> u32 {
+    let third = ((windows_version >> 16) & 0xffff) as u32;
+    let fourth = (windows_version & 0xffff) as u32;
+    (third % 10) * 10_000 + fourth
+}
+
+/// The newest NVIDIA driver on the PC when an NVENC open failed because it is
+/// too old: FFmpeg returned ENOSYS, and every NVIDIA driver is older than
+/// NVENC needs. ENOSYS alone is not enough: FFmpeg also returns it for
+/// parameters the encoder does not support. `driver_versions` (the NVIDIA
+/// adapters' Windows driver versions) are read only then; none known means
+/// not outdated.
+fn outdated_nvidia_driver(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: impl FnOnce() -> Vec<u64>,
+) -> Option<u32> {
+    if !encoder_name.ends_with("_nvenc")
+        || !matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
+    {
+        return None;
+    }
+    let newest = driver_versions().into_iter().map(nvidia_release).max()?;
+    (newest < NVENC_MIN_RELEASE).then_some(newest)
+}
+
+/// Says once, in the log and on the Stream page's fallback notice, that
+/// NVENC refused an NVIDIA driver older than it needs.
+fn note_nvidia_driver(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    driver_versions: impl FnOnce() -> Vec<u64>,
+) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(driver) = outdated_nvidia_driver(encoder_name, error, driver_versions) else {
+        return;
+    };
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        warn!(
+            driver = %format!("{}.{:02}", driver / 100, driver % 100),
+            minimum = NVENC_MIN_DRIVER,
+            "The NVIDIA driver is too old for the graphics card to encode video; video is encoded on the processor unless another graphics card can, and updating the NVIDIA driver enables hardware encoding"
+        );
+    }
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
 }
 
 /// An encoder open that its time limit gave up on, or refused while an
@@ -2170,7 +2311,7 @@ mod tests {
     #[test]
     fn startup_tries_other_hardware_before_software() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+        let (selected, ()) = open_remaining_encoders(("h264_nvenc", "test"), no_list, |name| {
             attempts.push(name.to_string());
             match name {
                 "h264_qsv" => Ok(()),
@@ -2180,6 +2321,382 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, ["h264_amf", "h264_qsv"]);
         assert_eq!(selected, "h264_qsv");
+    }
+
+    /// No adapter list: off Windows, or DXGI could not list every card.
+    fn no_list() -> Option<Vec<GpuVendor>> {
+        None
+    }
+
+    /// The encoders the fallback tries after `failed`, given the vendors
+    /// DXGI lists, and the one chosen: `opens` and libx264 open, nothing
+    /// else does.
+    fn fallback(
+        failed: &str,
+        vendors: Option<Vec<GpuVendor>>,
+        opens: &str,
+    ) -> (Vec<String>, &'static str) {
+        let mut attempts = Vec::new();
+        let (selected, ()) = open_remaining_encoders(
+            (failed, "test"),
+            || vendors,
+            |name| {
+                attempts.push(name.to_string());
+                if name == opens || name == "libx264" {
+                    Ok(())
+                } else {
+                    Err("device unavailable".into())
+                }
+            },
+        )
+        .unwrap();
+        (attempts, selected)
+    }
+
+    #[test]
+    fn the_fallback_tries_the_listed_cards_encoders_first() {
+        use GpuVendor::{Amd, Intel, Nvidia};
+        // An NVIDIA desktop whose NVENC failed: the other encoders are still
+        // tried, as before, but its own card has none.
+        assert_eq!(
+            fallback("h264_nvenc", Some(vec![Nvidia]), "none").0,
+            ["h264_amf", "h264_qsv", "libx264"]
+        );
+        // RTX + Radeon iGPU: AMF, then Quick Sync.
+        assert_eq!(
+            fallback("h264_nvenc", Some(vec![Nvidia, Amd]), "h264_amf"),
+            (vec!["h264_amf".to_string()], "h264_amf")
+        );
+        // An Intel PC whose Quick Sync failed once, then an AMD eGPU: AMF
+        // moves ahead of NVENC, because the adapters are read when the
+        // fallback runs, not at launch.
+        assert_eq!(
+            fallback("h264_qsv", Some(vec![Intel]), "none").0,
+            ["h264_nvenc", "h264_amf", "libx264"]
+        );
+        assert_eq!(
+            fallback("h264_qsv", Some(vec![Intel, Amd]), "h264_amf"),
+            (vec!["h264_amf".to_string()], "h264_amf")
+        );
+        // A non-Windows backend never asks.
+        let (selected, ()) = open_remaining_encoders(
+            ("h264_videotoolbox", "test"),
+            || panic!("asked"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(selected, "libx264");
+    }
+
+    #[test]
+    fn an_nvidia_card_windows_does_not_list_still_takes_over() {
+        // An Intel display adapter and an NVIDIA card in TCC mode, which DXGI
+        // does not list: Quick Sync fails, NVENC works.
+        assert_eq!(
+            fallback("h264_qsv", Some(vec![GpuVendor::Intel]), "h264_nvenc"),
+            (vec!["h264_nvenc".to_string()], "h264_nvenc")
+        );
+        // The same with an AMD display adapter.
+        assert_eq!(
+            fallback("h264_amf", Some(vec![GpuVendor::Amd]), "h264_nvenc"),
+            (vec!["h264_nvenc".to_string()], "h264_nvenc")
+        );
+    }
+
+    #[test]
+    fn an_incomplete_adapter_list_keeps_the_usual_order() {
+        // DXGI described the NVIDIA card, then failed on the Intel one (see
+        // `gpu::tests`): no list, so Quick Sync is tried, after AMF, as
+        // before.
+        assert_eq!(
+            fallback("h264_nvenc", None, "h264_qsv"),
+            (
+                vec!["h264_amf".to_string(), "h264_qsv".to_string()],
+                "h264_qsv"
+            )
+        );
+        assert_eq!(
+            fallback("h264_qsv", None, "none").0,
+            ["h264_nvenc", "h264_amf", "libx264"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_vendor_moves_no_encoder() {
+        use GpuVendor::{Intel, Unknown};
+        // A card DXGI lists under a vendor ID with no encoder here (Windows'
+        // basic display adapter before a driver is installed, a remote or
+        // virtual display card): every hardware encoder is still tried, in
+        // the usual order.
+        assert_eq!(
+            fallback("h264_nvenc", Some(vec![Unknown]), "h264_qsv"),
+            (
+                vec!["h264_amf".to_string(), "h264_qsv".to_string()],
+                "h264_qsv"
+            )
+        );
+        // Beside it, a listed vendor's encoder still comes first.
+        assert_eq!(
+            fallback("h264_nvenc", Some(vec![Unknown, Intel]), "none").0,
+            ["h264_qsv", "h264_amf", "libx264"]
+        );
+    }
+
+    #[test]
+    fn a_hybrid_pc_tries_both_listed_cards_before_the_others() {
+        use GpuVendor::{Amd, Intel, Nvidia};
+        // An Intel + NVIDIA laptop whose NVENC failed: Quick Sync, then AMF.
+        assert_eq!(
+            fallback("h264_nvenc", Some(vec![Intel, Nvidia]), "none").0,
+            ["h264_qsv", "h264_amf", "libx264"]
+        );
+        // A Radeon + Intel laptop whose AMF failed: Quick Sync before NVENC,
+        // which is not probed when Quick Sync works.
+        assert_eq!(
+            fallback("h264_amf", Some(vec![Amd, Intel]), "h264_qsv"),
+            (vec!["h264_qsv".to_string()], "h264_qsv")
+        );
+        assert_eq!(
+            fallback("h264_amf", Some(vec![Amd, Intel]), "none").0,
+            ["h264_qsv", "h264_nvenc", "libx264"]
+        );
+    }
+
+    /// What `run` logs on this thread, as the log file has it.
+    fn logged<R>(run: impl FnOnce() -> R) -> (R, Vec<String>) {
+        use std::sync::Arc;
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(Arc::clone(&writer)))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let lines = String::from_utf8(out.lock().clone()).unwrap();
+        (result, lines.lines().map(str::to_string).collect())
+    }
+
+    /// A real FFmpeg open that fails with an FFmpeg error line: libx264,
+    /// which opens on the calling thread, with no picture size.
+    fn failing_open(opening: Opening) -> Vec<String> {
+        ffmpeg_next::init().unwrap();
+        crate::diagnostics::install_ffmpeg_logging();
+        let codec = ffmpeg_next::encoder::find_by_name("libx264").expect("libx264");
+        let mut video = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .encoder()
+            .video()
+            .unwrap();
+        video.set_format(ffmpeg_next::format::Pixel::YUV420P);
+        video.set_time_base(ffmpeg_next::Rational(1, 60));
+        let (opened, lines) = logged(|| {
+            open_encoder_on(crate::stall::lanes(), video, "libx264", opening, &mut || {})
+        });
+        assert!(matches!(opened, Ok(Err(_))), "the open must fail");
+        lines
+            .into_iter()
+            .filter(|line| line.contains("ffmpeg"))
+            .collect()
+    }
+
+    #[test]
+    fn ffmpeg_errors_are_warnings_only_while_an_encoder_is_one_of_several() {
+        let probed = failing_open(Opening::Probe);
+        assert!(!probed.is_empty());
+        assert!(
+            probed
+                .iter()
+                .all(|line| line.contains(" WARN ") && line.contains("ffmpeg_level=16")),
+            "{probed:?}"
+        );
+        // After the probe, and for an open with nothing after it, FFmpeg's
+        // errors are errors again.
+        for opening in [Opening::First, Opening::Reopen] {
+            let lines = failing_open(opening);
+            assert!(
+                lines.iter().any(|line| line.contains(" ERROR ")),
+                "{opening:?}: {lines:?}"
+            );
+            assert_eq!(
+                lines.iter().filter(|line| line.contains(" WARN ")).count(),
+                0,
+                "{opening:?}: {lines:?}"
+            );
+        }
+        // The pipeline's first open probes, except the last resort.
+        assert_eq!(first_open("h264_nvenc"), Opening::Probe);
+        assert_eq!(first_open("hevc_amf"), Opening::Probe);
+        assert_eq!(first_open("libx265"), Opening::Probe);
+        assert_eq!(first_open("h264_videotoolbox"), Opening::Probe);
+        assert_eq!(first_open("libx264"), Opening::First);
+        // A probe has the first open's limits.
+        assert_eq!(
+            open_limits("h264_qsv", Opening::Probe),
+            open_limits("h264_qsv", Opening::First)
+        );
+    }
+
+    #[test]
+    fn a_probe_on_the_encoder_lane_thread_lowers_that_threads_errors() {
+        use crate::stall::{no_hooks, run_in, Call, Lanes, Wait};
+        use std::time::Duration;
+        crate::diagnostics::install_ffmpeg_logging();
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        let log_error = || {
+            let message = std::ffi::CString::new("probe check %d\n").unwrap();
+            unsafe {
+                ffmpeg_next::ffi::av_log(
+                    std::ptr::null_mut(),
+                    ffmpeg_next::ffi::AV_LOG_ERROR,
+                    message.as_ptr(),
+                    7i32,
+                );
+            }
+        };
+        // The call's thread logs to the caller's log here, as it does to the
+        // app's one log file in the app.
+        let lines = |probe: bool| {
+            let (result, lines) = logged(|| {
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                run_in(
+                    lanes,
+                    Call::EncoderOpen,
+                    Wait {
+                        limits: Call::EncoderOpen.limits(),
+                        slice: Duration::from_millis(1),
+                        now: Instant::now,
+                    },
+                    move || {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            if probe {
+                                crate::diagnostics::while_probing(log_error)
+                            } else {
+                                log_error()
+                            }
+                        })
+                    },
+                    || {},
+                    no_hooks(),
+                )
+            });
+            assert!(result.is_ok());
+            lines
+                .into_iter()
+                .filter(|line| line.contains("probe check 7"))
+                .collect::<Vec<_>>()
+        };
+        let probed = lines(true);
+        assert_eq!(probed.len(), 1);
+        assert!(probed[0].contains(" WARN "), "{probed:?}");
+        let plain = lines(false);
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].contains(" ERROR "), "{plain:?}");
+        // The caller's thread was never marked.
+        let (_, own) = logged(log_error);
+        assert!(own.iter().any(|line| line.contains(" ERROR ")), "{own:?}");
+    }
+
+    #[test]
+    fn one_error_names_every_encoder_when_none_opens() {
+        let ((result, attempts), lines) = logged(|| {
+            let mut attempts = Vec::new();
+            let result = open_remaining_encoders::<()>(
+                ("h264_nvenc", "h264_nvenc open failed: FFmpeg code=-38"),
+                || Some(vec![GpuVendor::Nvidia, GpuVendor::Intel]),
+                |name| {
+                    attempts.push(name.to_string());
+                    Err(format!("{name} open failed: device unavailable").into())
+                },
+            );
+            (result, attempts)
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, ["h264_qsv", "h264_amf", "libx264"]);
+        let errors: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains(" ERROR "))
+            .collect();
+        assert_eq!(errors.len(), 1, "{lines:?}");
+        for reason in [
+            "h264_nvenc open failed: FFmpeg code=-38",
+            "h264_qsv open failed: device unavailable",
+            "h264_amf open failed: device unavailable",
+            "libx264 open failed: device unavailable",
+        ] {
+            assert!(errors[0].contains(reason), "{reason}: {}", errors[0]);
+        }
+        // An encoder that opens logs no error.
+        let (_, lines) = logged(|| {
+            open_remaining_encoders(("h264_nvenc", "failed"), no_list, |name| match name {
+                "libx264" => Ok(()),
+                _ => Err("device unavailable".into()),
+            })
+            .unwrap()
+        });
+        assert!(
+            !lines.iter().any(|line| line.contains(" ERROR ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_nvencs_refusal_of_a_driver_older_than_570_means_an_outdated_driver() {
+        let version = |a: u64, b: u64, c: u64, d: u64| a << 48 | b << 32 | c << 16 | d;
+        // Field drivers: GTX 1650 on 517.18, RTX 4060 laptop on 566.07.
+        let old = version(31, 0, 15, 1718);
+        let laptop = version(32, 0, 15, 6607);
+        let first_new_enough = version(32, 0, 15, 7000);
+        let current = version(32, 0, 16, 2101);
+        assert_eq!(nvidia_release(old), 51_718);
+        assert_eq!(nvidia_release(laptop), 56_607);
+        assert_eq!(nvidia_release(first_new_enough), NVENC_MIN_RELEASE);
+        assert_eq!(nvidia_release(current), 62_101);
+        assert_eq!(nvidia_release(version(21, 21, 13, 7654)), 37_654);
+        assert_eq!(
+            NVENC_MIN_RELEASE,
+            NVENC_MIN_DRIVER.parse::<u32>().unwrap() * 100
+        );
+
+        let enosys = ffmpeg_next::Error::Other {
+            errno: libc::ENOSYS,
+        };
+        let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
+        let outdated = |name: &str, error, drivers: &[u64]| {
+            outdated_nvidia_driver(name, error, || drivers.to_vec())
+        };
+        assert_eq!(outdated("h264_nvenc", enosys, &[old]), Some(51_718));
+        assert_eq!(outdated("hevc_nvenc", enosys, &[laptop]), Some(56_607));
+        // 570.00 itself is new enough.
+        assert_eq!(outdated("h264_nvenc", enosys, &[first_new_enough]), None);
+        // ENOSYS with a driver new enough is an unsupported parameter.
+        assert_eq!(outdated("h264_nvenc", enosys, &[current]), None);
+        assert_eq!(outdated("h264_nvenc", enosys, &[old, current]), None);
+        // No NVIDIA driver version known.
+        assert_eq!(outdated("h264_nvenc", enosys, &[]), None);
+        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
+        assert_eq!(outdated("h264_nvenc", eperm, &[old]), None);
+        assert_eq!(
+            outdated("h264_nvenc", ffmpeg_next::Error::External, &[old]),
+            None
+        );
+        // Other encoders' failures never read the NVIDIA drivers.
+        assert_eq!(
+            outdated_nvidia_driver("h264_amf", enosys, || panic!("read")),
+            None
+        );
+        assert_eq!(
+            outdated_nvidia_driver("h264_nvenc", eperm, || panic!("read")),
+            None
+        );
     }
 
     #[test]
@@ -2232,7 +2749,7 @@ mod tests {
         // are refused at once, and x264 opens.
         let started = Instant::now();
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+        let (selected, ()) = open_remaining_encoders(("h264_nvenc", "test"), no_list, |name| {
             attempts.push(name.to_string());
             open(name)
         })
@@ -2444,7 +2961,7 @@ mod tests {
         );
         // NVENC and AMF are refused at once behind it; x264 gives a picture.
         let mut attempts = Vec::new();
-        let (name, opened) = open_remaining_encoders(preferred, |name| {
+        let (name, opened) = open_remaining_encoders((preferred, "stalled"), no_list, |name| {
             attempts.push(name.to_string());
             open_in(lanes, name, Opening::First, || {})
         })
@@ -3079,7 +3596,7 @@ mod tests {
     fn startup_uses_software_only_after_all_other_hardware_fails() {
         for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
             let mut attempts = Vec::new();
-            let (selected, ()) = open_remaining_encoders(failed, |name| {
+            let (selected, ()) = open_remaining_encoders((failed, "test"), no_list, |name| {
                 attempts.push(name.to_string());
                 if name == "libx264" {
                     Ok(())
@@ -3093,20 +3610,23 @@ mod tests {
             assert!(!attempts.iter().any(|name| name == failed));
             assert_eq!(attempts.last().unwrap(), "libx264");
         }
-        assert!(open_remaining_encoders::<()>("h264_amf", |_| {
-            Err("no encoder can open".into())
-        })
-        .is_err());
+        assert!(
+            open_remaining_encoders::<()>(("h264_amf", "test"), no_list, |_| {
+                Err("no encoder can open".into())
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn non_windows_backends_keep_their_software_fallback() {
         let mut attempts = Vec::new();
-        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", |name| {
-            attempts.push(name.to_string());
-            Ok(())
-        })
-        .unwrap();
+        let (selected, ()) =
+            open_remaining_encoders(("h264_videotoolbox", "test"), no_list, |name| {
+                attempts.push(name.to_string());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(selected, "libx264");
         assert_eq!(attempts, ["libx264"]);
     }

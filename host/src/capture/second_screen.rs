@@ -1026,8 +1026,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     if let Err(report) = enabled {
         warn!(
             second_screen_fallback = "enable_failed",
-            "Virtual display could not be enabled (installer task missing?) — \
-             capturing the primary display instead"
+            reason = crate::vdd::enable_failure_reason(report),
+            device = %report.map_or_else(|_| "unknown".to_string(), |device| device.to_string()),
+            "Virtual display could not be enabled — capturing the primary display instead"
         );
         driver.report(Failure::Enable(report));
         // The task enabled a device that cannot show a display.
@@ -2449,12 +2450,44 @@ mod tests {
     /// missing device or a task that could not say is left alone.
     #[test]
     fn a_failed_enable_is_reported_and_an_enabled_broken_device_turned_off() {
+        use std::sync::Arc;
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         let on_sleep = |_| {};
-        for (report, turned_off) in [
-            (Ok(DeviceState::Problem(43)), true),
-            (Ok(DeviceState::NoDriver), true),
-            (Ok(DeviceState::Missing), false),
-            (Err("display tasks missing"), false),
+        for (report, turned_off, logged) in [
+            (
+                Ok(DeviceState::Problem(43)),
+                true,
+                "reason=\"task_failed\" device=problem_43",
+            ),
+            (
+                Ok(DeviceState::NoDriver),
+                true,
+                "reason=\"task_failed\" device=no_driver",
+            ),
+            (
+                Ok(DeviceState::Missing),
+                false,
+                "reason=\"task_failed\" device=missing",
+            ),
+            (
+                Err("display tasks missing"),
+                false,
+                "reason=\"task_missing\" device=unknown",
+            ),
+            (
+                Err("display task timed out"),
+                false,
+                "reason=\"timeout\" device=unknown",
+            ),
         ] {
             let shared = second_screen_selected();
             connect_viewer(&shared);
@@ -2463,7 +2496,26 @@ mod tests {
                 enable_fails: Some(report),
                 ..FakeDriver::new(secs(3.0), None, &on_sleep)
             };
-            attach(&shared, &driver, ATTACH_TIMEOUT);
+            let out = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+            let writer = Arc::clone(&out);
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || Sink(Arc::clone(&writer)))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                attach(&shared, &driver, ATTACH_TIMEOUT)
+            });
+            let lines = String::from_utf8(out.lock().clone()).unwrap();
+            let line = lines
+                .lines()
+                .find(|line| line.contains("could not be enabled"))
+                .unwrap_or_else(|| panic!("{lines}"));
+            assert!(line.contains(logged), "{line}");
+            assert!(
+                line.contains("second_screen_fallback=\"enable_failed\""),
+                "{line}"
+            );
+            assert!(!line.contains('?'), "no guessing: {line}");
             let mut expected = vec![
                 Call::Prepare,
                 Call::Enable,
