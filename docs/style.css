@@ -357,15 +357,17 @@ small { font-size: 0.875rem; }
 .rig-laptop { left: 5.906%; top: 5.612%; width: 39.793%; height: 60.51%; }
 .rig-ipad { left: 66.002%; top: 24.694%; width: 32.226%; height: 61.224%; }
 .rig-laptop, .rig-ipad { overflow: hidden; background: #000; }
-.rig .scr { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 0.5s ease, transform 0.6s var(--ease-out); }
-.rig .scr.on { opacity: 1; }
-/* Mirroring, the iPad shows the laptop's 16:9 picture whole, with bars. */
-.rig-ipad .mirror { position: absolute; left: 0; right: 0; top: 50%; aspect-ratio: 16 / 9; transform: translateY(-50%); }
-.rig-ipad .mirror .scr { transform: scale(1.04); }
-.rig-ipad .mirror .scr.on { transform: none; }
-/* As a second screen, the iPad's desktop arrives from the laptop's side. */
-.rig-ipad .extend { transform: translateX(-8%); }
-.rig-ipad .extend.on { transform: none; }
+/* A switch lays the new picture over the old one, which stays whole beneath
+   it until the new one is complete and only then goes. On the laptop the new
+   picture fades in. */
+.rig .scr { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 0s linear 0.5s; }
+.rig .scr.on { z-index: 1; opacity: 1; transition: opacity 0.5s ease; }
+/* On the iPad it wipes in from the laptop's side. */
+.rig-ipad > .scr { opacity: 1; clip-path: inset(0 100% 0 0); transition: clip-path 0s linear 0.55s; }
+.rig-ipad > .scr.on { clip-path: inset(0); transition: clip-path 0.55s var(--ease-out); }
+/* Mirroring, the iPad shows the laptop's picture whole, with bars. */
+.rig-ipad .mirror { display: block; background: #000; }
+.rig-ipad .mirror img { object-fit: contain; }
 .rig-cable { left: 48.911%; top: 52.857%; width: 16.131%; height: auto; transition: opacity 0.5s ease; }
 .stage[data-link="wifi"] .rig-cable { opacity: 0; }
 /* Over Wi-Fi: the cable is gone and a calm signal sits between the devices.
@@ -384,7 +386,8 @@ small { font-size: 0.875rem; }
 }
 @keyframes air { 0%, 100% { opacity: 1; } 35% { opacity: 0.3; } }
 @media (prefers-reduced-motion: reduce) {
-  .rig .scr, .rig-cable, .rig-air { transition-duration: 0.01s; }
+  .rig .scr, .rig .scr.on, .rig-ipad > .scr, .rig-ipad > .scr.on { transition: none; }
+  .rig-cable, .rig-air { transition-duration: 0.01s; }
 }
 
 /* The two choices under the picture: what the iPad is, and how it is joined. */
