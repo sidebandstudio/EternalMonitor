@@ -103,10 +103,11 @@ final class StreamRecoveryTests: XCTestCase {
 
     // MARK: - A lost frame through the reassembler
 
-    /// Sends `frame` as frames `seqs`, 100 ms apart, off the main actor.
+    /// Sends `frame` as frames `seqs`, 100 ms apart, off the main actor,
+    /// until cancelled.
     private func stream(_ host: FakeUDPHost, _ frame: Data, seqs: ClosedRange<UInt32>) -> Task<Void, Never> {
         Task.detached {
-            for seq in seqs {
+            for seq in seqs where !Task.isCancelled {
                 host.sendFrame(frame, seq: seq, isKeyframe: false)
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
@@ -135,6 +136,13 @@ final class StreamRecoveryTests: XCTestCase {
     /// shown, the last picture stays, keyframe requests repeat until the next
     /// IDR, and that IDR ends the hold. A 0.3.4 PC's contiguous numbering
     /// and a 0.3.3 PC's H.264 frame_num both reveal the loss.
+    ///
+    /// Each step waits for the iPad's own requests, not for a fixed time.
+    /// Frames sent right behind the lost one let the reassembler and the
+    /// decoder see the loss within a millisecond on two queues, and the
+    /// first to ask sets the reason of the one request the 500 ms spacing
+    /// lets out. An IDR sent after a fixed run of frames came after the
+    /// 2 s Resume on a loaded runner (CI run 40969597183).
     func testALostPFrameHoldsThePictureAndAsksUntilTheNextIDR() async throws {
         for hostCaps in [HelloAck.hostCapContiguousFrameSeq, 0] {
             let units = try twoGOPs()
@@ -144,19 +152,26 @@ final class StreamRecoveryTests: XCTestCase {
             try await until("the P-frame before the loss is shown") { manager.debugState.decodedFrames == 2 }
 
             host.sendFirstFragment(units[2], seq: 3)
+            // Nothing newer has come, so only the reassembler sees the loss.
+            let dropped = await Task.detached { host.keyframeRequests(within: 3, count: 1) }.value
+            XCTAssertEqual(dropped, [.gapLoss], "caps \(hostCaps): the reassembler asks as it drops the frame")
+            // Past the spacing, so the held decoder's first request goes out too.
+            try await Task.sleep(nanoseconds: 600_000_000)
             let following = stream(host, units[3], seqs: 4...20)
-            let held = await Task.detached { host.timedKeyframeRequests(within: 1.9) }.value
+            // At once, then 600-700 ms apart: the third comes after 1.2 s.
+            let held = await Task.detached { host.timedKeyframeRequests(within: 4, count: 3) }.value
+            following.cancel()
             XCTAssertEqual(manager.debugState.decodedFrames, 2, "caps \(hostCaps): no frame after the loss is shown")
             XCTAssertNotNil(manager.videoDecoder?.keyframeWaitUs, "caps \(hostCaps): the last picture is held")
-            XCTAssertTrue(manager.pictureRestoring, "caps \(hostCaps): Restoring the picture after 1 s")
-            // The reassembler asks once as it drops the frame; the held decoder asks after.
-            XCTAssertEqual(held.first?.reason, .gapLoss, "caps \(hostCaps): \(held.map(\.reason))")
-            XCTAssertTrue(held.dropFirst().allSatisfy { $0.reason == .decodeError }, "caps \(hostCaps): \(held.map(\.reason))")
-            XCTAssertGreaterThanOrEqual(held.count, 3, "caps \(hostCaps): asked at once, then again")
+            try await until("caps \(hostCaps): Restoring the picture after 1 s") { manager.pictureRestoring }
+            XCTAssertEqual(held.map(\.reason), [KeyframeReason](repeating: .decodeError, count: 3),
+                           "caps \(hostCaps): asked at once, then again")
             assertRetrySpacing(held)
-            await following.value
 
+            // Before the next request is due, 600 ms after the last. A frame
+            // the stream still sends after it is older and is ignored.
             host.sendFrame(units[4], seq: 21, isKeyframe: true)
+            await following.value
             let resumed = stream(host, units[5], seqs: 22...22)
             await resumed.value
             try await until("caps \(hostCaps): the IDR and the frame after it are shown") {

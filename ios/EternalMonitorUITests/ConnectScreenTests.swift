@@ -240,6 +240,14 @@ final class ConnectScreenTests: UITestCase {
         diagnostics.tap()
         let copy = app.buttons["diagnostics.copy"]
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        // The upload status line above starts as one line and becomes three
+        // once loaded, moving the buttons below it down. On a loaded runner it
+        // loaded between XCTest finding Copy and its tap, which then missed
+        // (CI run 40969661205). Tap once the rows have stopped moving.
+        expectation(for: NSPredicate(format: "exists == false"),
+                    evaluatedWith: app.staticTexts["Checking automatic upload"])
+        waitForExpectations(timeout: 30)
+        XCTAssertTrue(app.swipeUp(toReveal: copy))
         copy.tap()
         XCTAssertTrue(app.buttons["Diagnostics copied"].waitForExistence(timeout: 5))
         let shot = XCTAttachment(screenshot: app.screenshot())

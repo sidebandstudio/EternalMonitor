@@ -607,8 +607,74 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
     reset_keeps_environment_overrides(&shared, &dir, &mut results);
     waiting_for_the_port_can_be_stopped(&shared, &mut results);
+    a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// Tailscale owns the default route. The Address row, its Copy and the QR
+/// code keep the address they always had; one line adds the Wi-Fi's IP,
+/// without the port, for the iPad's PC address field.
+fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind};
+    let vpn = "100.80.1.2:9876";
+    let hint = "If that doesn't connect and your iPad is on the same network as this PC, use 192.168.1.20 as the PC address.";
+    PIPELINE_STATS.lock().listen_addr = vpn.into();
+    let adapter = |kind, ip: [u8; 4]| Adapter {
+        kind,
+        up: true,
+        gateway: true,
+        ipv4: vec![ip.into()],
+    };
+    set_test_adapters(Some(vec![
+        adapter(Kind::Vpn, [100, 80, 1, 2]),
+        adapter(Kind::Wifi, [192, 168, 1, 20]),
+    ]));
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    // The adapters are listed off the window's thread.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while window.query_by_label(hint).is_none() {
+        assert!(Instant::now() < deadline, "the hint never showed");
+        std::thread::sleep(Duration::from_millis(10));
+        window.run_steps(1);
+    }
+    // The iPad has a Port field of its own: the hint gives the IP alone.
+    assert!(window.query_by_label_contains("192.168.1.20:").is_none());
+    window.get_by_label(vpn);
+    window.get_by_label("Copy address").click();
+    window.step();
+    assert_eq!(copied_text(&window).as_deref(), Some(vpn));
+
+    // Opening the QR code resolves the address as it always has.
+    window
+        .get_by_role_and_label(Role::Button, "QR code")
+        .click();
+    window.run_steps(4);
+    assert_eq!(
+        PIPELINE_STATS.lock().listen_addr,
+        eternal_host::gui::detect_local_ip(9876)
+    );
+    // The code encodes the address under it, the shown one.
+    PIPELINE_STATS.lock().listen_addr = vpn.into();
+    window.run_steps(4);
+    window.get_by_label("Scan to connect");
+    assert_eq!(window.get_all_by_label(vpn).count(), 2);
+    window.get_by_label("Done").click();
+    window.run_steps(4);
+
+    // Shown on the Wi-Fi itself: nothing more.
+    PIPELINE_STATS.lock().listen_addr = "192.168.1.20:9876".into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while window
+        .query_by_label_contains("as the PC address")
+        .is_some()
+    {
+        assert!(Instant::now() < deadline, "the hint stayed");
+        std::thread::sleep(Duration::from_millis(10));
+        window.run_steps(1);
+    }
+    set_test_adapters(None);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
 }
 
 /// Another program holds the stream port: the Stream page says so and
@@ -1478,6 +1544,10 @@ fn review_screens() {
     PIPELINE_STATS.lock().using_software_fallback = true;
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
     save(&mut h, "problems-display-task-and-encoder");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problem-nvidia-driver-outdated");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = false;
     *shared.vdd_status.lock() = VddStatus::Failed;
     PIPELINE_STATS.lock().using_software_fallback = false;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);

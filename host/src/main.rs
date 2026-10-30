@@ -145,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Capture: {}", capture_summary);
     info!("  Listen:  0.0.0.0:{}", listen_port);
     info!("══════════════════════════════════");
+    eternal_host::network::log_addresses();
 
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.
@@ -213,10 +214,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
+    let listen_addr = gui::detect_local_ip(listen_port);
     {
         let mut stats = stats::PIPELINE_STATS.lock();
         stats.set_bitrate(initial_bitrate);
-        stats.set_listen_addr(gui::detect_local_ip(listen_port));
+        stats.set_listen_addr(listen_addr);
         stats.set_target_addr(shared.target_addr.lock().to_string());
         stats.set_gpu_name(gpu_info.name.clone());
         stats.set_codec_name(gpu_info.codec_display_name.clone());
@@ -281,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_sample = std::time::Instant::now();
         while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(250));
+            eternal_host::capture::second_screen::retry_saving(&gui_control.shared);
             if log_e2e && last_sample.elapsed() >= std::time::Duration::from_secs(1) {
                 last_sample = std::time::Instant::now();
                 let sample = stats::PIPELINE_STATS.lock();
@@ -346,6 +349,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
+
+    // The window is gone and the display is off, so a slow disk keeps no one
+    // waiting on screen: give the second screen record up to 30 s to land.
+    eternal_host::capture::second_screen::finish_saving(&gui_control.shared);
 
     eternal_host::startup::simulate_slow_exit();
     info!("EternalMonitor shutting down");

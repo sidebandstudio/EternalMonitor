@@ -188,7 +188,14 @@ jobs:
         run: |
           # Indexing the SDK and build output competes with both software codecs.
           # This is a disposable CI VM, never a developer's machine.
-          sudo mdutil -a -i off
+          # A freshly booted VM's Preboot volume can still be changing its
+          # indexing state ("kMDConfigSearchLevelTransitioning"), which fails
+          # the whole command. That settles, so ask again.
+          for attempt in 1 2 3 4 5; do
+            sudo mdutil -a -i off && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 5
+          done
           xcrun simctl list devices booted
           xcrun simctl shutdown all
       - name: Install XcodeGen and streaming SDK

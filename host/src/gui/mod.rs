@@ -71,6 +71,7 @@ struct StatsSnapshot {
     bitrate_bps: u32,
     codec_name: String,
     using_software_fallback: bool,
+    nvidia_driver_outdated: bool,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -108,6 +109,7 @@ impl StatsSnapshot {
             bitrate_bps: s.bitrate_bps,
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
+            nvidia_driver_outdated: s.nvidia_driver_outdated,
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -320,6 +322,8 @@ pub struct AnalyzerApp {
     restart_pending: bool,
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
+    /// The home network address offered under a VPN's or virtual switch's.
+    address_hint: crate::network::HintCache,
     copied: Option<(Copied, Instant)>,
     /// The Send feedback dialog, while open.
     feedback: Option<feedback_panel::Draft>,
@@ -486,6 +490,7 @@ impl AnalyzerApp {
             restart_pending: false,
             show_qr_modal: false,
             qr_cache: None,
+            address_hint: Default::default(),
             copied: None,
             feedback: None,
             feedback_ask: crate::feedback::Ask::new(
@@ -986,6 +991,9 @@ impl eframe::App for AnalyzerApp {
         // encoder.
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Holds no lock: a second screen record writer that could not start
+        // is started here, once its wait is over.
+        crate::capture::second_screen::retry_saving(&self.control.shared);
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
@@ -1330,7 +1338,10 @@ impl AnalyzerApp {
             .next()
             .and_then(|p| p.parse::<u16>().ok())
         {
-            PIPELINE_STATS.lock().set_listen_addr(detect_local_ip(port));
+            // Resolved before locking: the stats lock is shared with every
+            // pipeline thread.
+            let listen_addr = detect_local_ip(port);
+            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
         }
         self.show_qr_modal = true;
     }

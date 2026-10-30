@@ -510,6 +510,20 @@ impl InputRelay {
         }
     }
 
+    /// When the transport should call `keep_pen_alive` for a pen frame held
+    /// back to keep frames `FRAME_SPACING` apart, which a backlog of samples
+    /// needs. Waiting for it never blocks the transport.
+    pub fn pen_spaced_until(&self) -> Option<std::time::Instant> {
+        #[cfg(windows)]
+        {
+            self.pen_device.spaced_until()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     pub fn pen_path(&self) -> PenPath {
         if cfg!(windows) {
             if self.pen_available() {
@@ -591,7 +605,8 @@ impl InputRelay {
     /// Windows expires stationary synthetic contacts unless they are refreshed.
     /// Real samples always win; never keep a released or disconnected tip down.
     /// `output` is the current capture rect: a held contact follows it if the
-    /// display moved or changed mode since the Pencil last moved.
+    /// display moved or changed mode since the Pencil last moved. Also sends
+    /// frames held back for their spacing.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
         self.pen_device
@@ -1545,9 +1560,23 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    thread_local! {
+        /// The time for every `RecordingTarget`, so frames stay spaced
+        /// across batches.
+        static CLOCK: std::cell::Cell<std::time::Instant> =
+            std::cell::Cell::new(std::time::Instant::now());
+    }
+
+    #[cfg(not(windows))]
     impl pen_contact::PenTarget for RecordingTarget {
         fn screen(&self) -> VirtualScreen {
             self.screen
+        }
+
+        /// Frames here are never close enough to be held back for their
+        /// spacing: each takes `FRAME_SPACING`.
+        fn now(&self) -> std::time::Instant {
+            CLOCK.get()
         }
 
         fn inject(
@@ -1555,6 +1584,7 @@ mod tests {
             frame: PenSample,
             _: pen_contact::PointerKind,
         ) -> pen_contact::Outcome {
+            CLOCK.set(CLOCK.get() + pen_contact::FRAME_SPACING);
             self.frames
                 .push(pen_contact::PointerFrame::new(frame, self.screen));
             self.outcome
