@@ -1867,6 +1867,11 @@ html:lang(ko) { word-break: keep-all; }
   }
   .not-english :is(.card, .form-actions, .hero-actions, .studio-actions) .btn-lg { min-height: 50px; }
 }
+/* Small phones: the hero buttons' labels get the room their padding took,
+   so "Windows 版をダウンロード" keeps its last kana. */
+@media (max-width: 360px) {
+  .not-english .hero-actions .btn-lg { padding-inline: 12px; }
+}
 /* Geist Mono has no Arabic, Devanagari or CJK: translated labels set in it
    (badges, the link chip, Copy) use the text font there. */
 html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) :is(.badge:not([data-win-version]), .sha .btn) { font-family: var(--font); }
