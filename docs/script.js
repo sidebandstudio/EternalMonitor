@@ -137,17 +137,45 @@
 
   /* --- Feature films ---------------------------------------------------------
      Each film in Watch it work plays while it is mostly on screen and pauses
-     when it leaves or the tab is hidden. With reduced motion the posters stay. */
+     when it leaves or the tab is hidden. Every film has its own Pause button,
+     and a film the visitor paused stays paused until they play it again. With
+     reduced motion the posters stay until a film's Play button is pressed. */
   var films = Array.prototype.slice.call(document.querySelectorAll('.demo-film'));
-  if (films.length && !reducedMotion && 'IntersectionObserver' in window) {
+  if (films.length && 'IntersectionObserver' in window) {
     var inView = new Set();
+    var held = new Set();
+    var ICONS = '<svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="2.5" width="3" height="11" rx="1"/><rect x="9.5" y="2.5" width="3" height="11" rx="1"/></svg>' +
+      '<svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.5 2.9v10.2a.8.8 0 0 0 1.2.7l8.3-5.1a.8.8 0 0 0 0-1.4L5.7 2.2a.8.8 0 0 0-1.2.7z"/></svg>';
     var playFilm = function (film) {
+      if (held.has(film) || document.hidden) return;
       var p = film.play();
       if (p && p.catch) p.catch(function () {});
     };
+    films.forEach(function (film) {
+      if (reducedMotion) held.add(film);
+      var card = film.closest('.demo');
+      var title = card && card.querySelector('h3');
+      var name = title ? title.textContent.trim() : 'this film';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'demo-toggle';
+      btn.innerHTML = ICONS;
+      var show = function () {
+        var playing = !held.has(film);
+        btn.setAttribute('aria-label', (playing ? 'Pause film: ' : 'Play film: ') + name);
+        btn.classList.toggle('is-paused', !playing);
+      };
+      btn.addEventListener('click', function () {
+        if (held.has(film)) { held.delete(film); if (inView.has(film)) playFilm(film); }
+        else { held.add(film); film.pause(); }
+        show();
+      });
+      show();
+      card.appendChild(btn);
+    });
     var filmWatcher = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
-        if (entry.isIntersecting) { inView.add(entry.target); if (!document.hidden) playFilm(entry.target); }
+        if (entry.isIntersecting) { inView.add(entry.target); playFilm(entry.target); }
         else { inView.delete(entry.target); entry.target.pause(); }
       });
     }, { threshold: 0.4 });
