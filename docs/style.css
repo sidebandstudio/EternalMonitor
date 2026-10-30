@@ -1007,7 +1007,7 @@ html:not(.channel-beta) #windows-beta,
   border-radius: var(--r-md);
   background: #012456;
   color: #eeedf0;
-  font-family: var(--mono);
+  font-family: var(--mono); /* taste-skill-ignore: the line is literal PowerShell code */
   font-size: 0.8125rem;
   line-height: 1.6;
   overflow-wrap: anywhere;
