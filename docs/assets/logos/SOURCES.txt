@@ -15,6 +15,9 @@ mit-lincoln-laboratory.svg
   MIT Lincoln Laboratory logo (from https://www.ll.mit.edu/)
   https://commons.wikimedia.org/wiki/File:MIT_Lincoln_Laboratory_logo.svg
   Coordinates rounded to 0.1 unit (the viewBox is 2025 units wide).
+  No compact lockup with the name exists: ll.mit.edu's small mark
+  (themes/mitll_theme/assets/logos/mitll-logo.svg) is the emblem alone, so the
+  strip gives this long lockup the widest place instead.
 
 sonos.svg
   Sonos wordmark, Simple Icons 16.36.0

@@ -1510,52 +1510,66 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 
 /* "Built by engineers from": the companies Sideband Studio's engineers have
    worked at. The logos are the companies' own files; one filter turns each into
-   flat white and the opacity mutes it, so they read the same on the plain page
-   and in the Beta night sky. Each logo has its own height, set by eye so the six
-   carry equal weight: a tall emblem sits lower than a thin, wide wordmark. */
-.pedigree { --s: 1; padding-top: clamp(56px, 7vw, 96px); }
+   flat white, slightly muted, so they read the same on the plain page and in the
+   Beta night sky. Each logo has its own height, set by eye so the six carry
+   equal weight: a tall emblem sits lower than a thin, wide wordmark, and the
+   long MIT Lincoln Laboratory lockup gets the widest place on every layout. */
+.pedigree { --s: 1; padding-top: clamp(64px, 8vw, 112px); }
 .pedigree.center .pedigree-title { text-align: center; }
-.pedigree-title { color: var(--faint); font-size: 0.9375rem; }
+.pedigree-title {
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 0.95rem + 0.45vw, 1.3125rem);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
 .pedigree-logos {
   list-style: none;
-  margin-top: 28px;
+  margin-top: clamp(28px, 3vw, 40px);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 32px;
 }
-.pedigree.center .pedigree-logos { max-width: 1000px; margin-inline: auto; }
 .pedigree-logos li { display: flex; justify-content: center; }
 .pedigree-logos img {
   display: block;
   width: auto;
   height: calc(var(--h) * var(--s));
   filter: brightness(0) invert(1);
-  opacity: 0.56;
+  opacity: 0.86;
 }
-.logo-aws { --h: 32px; }
-.logo-amazon { --h: 27px; }
-.logo-mit-lincoln-laboratory { --h: 18px; }
-.logo-sonos { --h: 16px; }
-.logo-summit-partners { --h: 22px; }
-.logo-philips { --h: 16px; }
+.logo-aws { --h: 46px; }
+.logo-amazon { --h: 38px; }
+.logo-sonos { --h: 24px; }
+.logo-mit-lincoln-laboratory { --h: 34px; }
+.logo-summit-partners { --h: 34px; }
+.logo-philips { --h: 21px; }
 /* The download page puts it under the cards, closer than a section break. */
-.dl-all + .pedigree { padding-top: clamp(48px, 6vw, 72px); }
+.dl-all + .pedigree { padding-top: clamp(48px, 6vw, 80px); }
 
-/* Tablets: two rows of three. Phones: three rows of two. Equal columns, the
-   logos centred in them on the home page and on the left edge on the download page. */
-@media (max-width: 860px) {
-  .pedigree { --s: 0.86; }
-  .pedigree-logos {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 32px 24px;
-  }
-  .pedigree-logos li { justify-content: flex-start; }
-  .pedigree.center .pedigree-logos li { justify-content: center; }
+/* Below 1160px the row no longer fits: two rows, AWS, Amazon and Sonos, then
+   MIT Lincoln Laboratory, Summit Partners and Philips. Each row runs from margin
+   to margin. The ::before is the line break (flex has none), its height the gap. */
+@media (max-width: 1160px) {
+  .pedigree { --s: 0.9; }
+  .pedigree-logos { flex-wrap: wrap; gap: 0 24px; }
+  .pedigree-logos::before { content: ""; order: 1; flex: 0 0 100%; height: 40px; }
+  .pedigree-logos li:nth-child(n+4) { order: 2; }
 }
-@media (max-width: 560px) {
-  .pedigree-logos { grid-template-columns: repeat(2, 1fr); gap: 28px 20px; }
+/* Phones and small tablets: three rows, MIT Lincoln Laboratory alone in the
+   middle at full width. */
+@media (max-width: 720px) {
+  .pedigree { --s: 0.8; }
+  .pedigree-logos { gap: 0 16px; }
+  .pedigree-logos::before, .pedigree-logos::after { content: ""; flex: 0 0 100%; height: 32px; }
+  .pedigree-logos::after { order: 3; }
+  .pedigree-logos li:nth-child(n+5) { order: 4; }
+  .pedigree-logos li:nth-child(4) { flex: 0 0 100%; justify-content: flex-start; }
+  .pedigree.center .pedigree-logos li:nth-child(4) { justify-content: center; }
+  .pedigree-logos .logo-mit-lincoln-laboratory { width: min(100%, 340px); height: auto; }
+}
+@media (max-width: 360px) {
+  .pedigree { --s: 0.72; }
 }
 
 /* The logos come in one after another, once, after the strip itself starts to rise. */
