@@ -571,6 +571,74 @@ small { font-size: 0.875rem; }
   .how { grid-template-columns: 1fr; }
 }
 
+/* --- Watch it work: short films of each feature ---------------------------------
+   Six columns: three small cards, then two wide ones. Each film is a muted
+   loop at twice the card's size; script.js plays it only while it is on screen. */
+
+.bento {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 16px;
+}
+.demo {
+  position: relative;
+  overflow: hidden;
+  border-radius: 24px;
+  background: var(--surface);
+  isolation: isolate;
+}
+.demo-sm { grid-column: span 2; aspect-ratio: 720 / 880; }
+.demo-wide { grid-column: span 3; aspect-ratio: 1104 / 880; }
+.demo-film {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--surface);
+}
+/* A neutral scrim keeps the label readable over the film. */
+.demo-foot {
+  position: absolute;
+  inset: auto 0 0 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 56px 22px 20px;
+  background: linear-gradient(to top, rgba(10, 10, 11, 0.92), rgba(10, 10, 11, 0.6) 55%, rgba(10, 10, 11, 0));
+}
+.demo-foot h3 { font-size: 1.125rem; letter-spacing: -0.015em; line-height: 1.25; }
+.demo-more {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9375rem;
+  color: var(--muted);
+  transition: color 0.15s ease-out;
+}
+.demo-more span { display: inline-block; transition: transform 0.2s var(--ease-out); }
+/* The whole card is the link's target. */
+.demo-more::after { content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
+.demo:hover .demo-more, .demo-more:focus-visible { color: var(--text); }
+.demo:hover .demo-more span { transform: translateX(3px); }
+.demo-more:focus-visible { outline: none; }
+.demo:has(.demo-more:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
+.demo-film { transition: transform 0.6s var(--ease-out); }
+.demo:hover .demo-film { transform: scale(1.015); }
+
+@media (max-width: 900px) {
+  .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .demo-sm { grid-column: span 1; }
+  .demo-wide { grid-column: span 2; }
+}
+@media (max-width: 600px) {
+  .bento { grid-template-columns: 1fr; gap: 12px; }
+  .demo-sm, .demo-wide { grid-column: auto; }
+  .demo-foot { padding: 48px 18px 16px; }
+}
+
 /* --- Device frames ---------------------------------------------------------- */
 
 .pc-window {

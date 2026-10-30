@@ -1,0 +1,6 @@
+ui/
+renders/
+art/*.png
+art/*.log
+snapshots/
+.hyperframes/

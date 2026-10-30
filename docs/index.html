@@ -111,104 +111,63 @@
 
     <section class="section" id="features" aria-labelledby="features-title">
       <div class="container">
-        <h2 id="features-title" class="visually-hidden">Features</h2>
-
-        <article class="show reveal" aria-labelledby="f-screen">
-          <div class="show-head">
-            <h3 id="f-screen">Mirror my screen, or a real second screen.</h3>
-          </div>
-          <div class="switch-demo">
-            <input type="radio" name="mode" id="mode-mirror" class="sw-input">
-            <input type="radio" name="mode" id="mode-second" class="sw-input" checked>
-            <div class="sw" role="group" aria-label="Use the iPad as">
-              <label for="mode-mirror">Mirror my screen</label>
-              <label for="mode-second">Second screen</label>
-            </div>
-            <div class="modes">
-              <div class="pc-window modes-pc">
-                <div class="pc-titlebar" aria-hidden="true">
-                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
-                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-                </div>
-                <div class="swap">
-                  <img class="swap-a" src="assets/mode-mirror.webp" srcset="assets/mode-mirror.webp 1040w, assets/mode-mirror@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Mirror my screen: the iPad shows the same picture as your main screen.">
-                  <img class="swap-b" src="assets/mode-second.webp" srcset="assets/mode-second.webp 1040w, assets/mode-second@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Second screen: the iPad becomes an extra screen next to your main one.">
-                </div>
-              </div>
-              <div class="displays" aria-hidden="true">
-                <div class="d-monitor"><span class="d-stand"></span></div>
-                <div class="d-ipad"></div>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="show reveal" aria-labelledby="f-fill">
-          <div class="show-head">
-            <h3 id="f-fill">Fit the picture, or fill the iPad.</h3>
-          </div>
-          <div class="switch-demo">
-            <input type="radio" name="picture" id="pic-fit" class="sw-input">
-            <input type="radio" name="picture" id="pic-fill" class="sw-input" checked>
-            <div class="sw" role="group" aria-label="Picture">
-              <label for="pic-fit">Fit</label>
-              <label for="pic-fill">Fill</label>
-            </div>
-            <div class="tablet fill-tablet">
-              <div class="screen swap">
-                <img class="swap-a" src="assets/ipad-fit.webp" srcset="assets/ipad-fit.webp 1180w, assets/ipad-fit@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fit: the whole PC picture, with black bars where the shapes differ.">
-                <img class="swap-b" src="assets/ipad-fill.webp" srcset="assets/ipad-fill.webp 1180w, assets/ipad-fill@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fill: the PC picture covers the whole iPad screen.">
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="show show-split reveal" aria-labelledby="f-pencil">
-          <div class="show-head">
-            <h3 id="f-pencil">Apple Pencil, like a real pen.</h3>
-            <p>Pressure and tilt, tuned with care, because we care about drawing.</p>
-          </div>
-          <div class="tablet">
-            <div class="screen">
-              <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
-            </div>
-          </div>
-        </article>
-
-        <article class="show show-split flip reveal" aria-labelledby="f-link">
-          <div class="show-head">
-            <h3 id="f-link">USB or Wi-Fi. Pair once.</h3>
-            <p>Or scan the QR code and skip the code.</p>
-          </div>
-            <div class="pair">
-              <div class="dialog-shot">
-                <img src="assets/host-qr.webp" srcset="assets/host-qr.webp 374w, assets/host-qr@2x.webp 748w" sizes="(max-width: 860px) 50vw, 280px" width="748" height="1050" loading="lazy" decoding="async" alt="The Windows app's Scan to connect dialog, with a QR code and the PC's address under it.">
-              </div>
-              <div class="tablet portrait">
-                <div class="screen">
-                  <img src="assets/ipad-pairing.webp" srcset="assets/ipad-pairing.webp 834w, assets/ipad-pairing@2x.webp 1668w" sizes="(max-width: 860px) 38vw, 210px" width="1668" height="2420" loading="lazy" decoding="async" alt="The iPad app's Pair with your PC sheet, with a six-digit code field, a Pair iPad button and the number keyboard.">
-                </div>
-              </div>
-            </div>
-        </article>
-
-        <div class="tiles reveal">
-          <article class="tile">
-            <h3>Your graphics card does the work.</h3>
-            <p>NVIDIA, AMD or Intel, in H.264 or HEVC.</p>
-            <div class="pc-window">
-              <div class="pc-titlebar" aria-hidden="true">
-                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
-                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-                </div>
-              <img src="assets/host-performance.webp" srcset="assets/host-performance.webp 1040w, assets/host-performance@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1095" loading="lazy" decoding="async" alt="The Windows app's Performance page: capture, encode and send rates, bandwidth, and a chart of encode time per frame.">
+        <div class="section-head reveal">
+          <h2 id="features-title">Watch it work.</h2>
+        </div>
+        <div class="bento reveal">
+          <article class="demo demo-sm" aria-labelledby="d-pair">
+            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
+                   poster="assets/demos/pair.webp" aria-label="Film: in the Windows app, the pointer clicks QR code, the Scan to connect dialog opens, and an iPad connects.">
+              <source src="assets/demos/pair.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/pair.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-pair">Pair with a QR code</h3>
+              <a class="demo-more" href="#how" aria-label="Explore pairing">Explore <span aria-hidden="true">&rarr;</span></a>
             </div>
           </article>
-          <article class="tile">
-            <h3>Send feedback from either app.</h3>
-            <p>One-click updates on the PC. The iPad updates through TestFlight.</p>
-            <div class="tile-shot">
-              <img src="assets/ipad-feedback.webp" srcset="assets/ipad-feedback.webp 580w, assets/ipad-feedback@2x.webp 1160w" sizes="(max-width: 860px) 92vw, 520px" width="1160" height="1114" loading="lazy" decoding="async" alt="The iPad app's settings: Send feedback, Check for updates automatically, and About with the version, source code, Star EternalMonitor on GitHub and Contact.">
+          <article class="demo demo-sm" aria-labelledby="d-pencil">
+            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
+                   poster="assets/demos/pencil.webp" aria-label="Film: an Apple Pencil taps Drawing mode on in the iPad app's settings, then off again.">
+              <source src="assets/demos/pencil.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/pencil.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-pencil">Apple Pencil drawing</h3>
+              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" aria-label="Explore Apple Pencil drawing" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-sm" aria-labelledby="d-fit">
+            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
+                   poster="assets/demos/fit.webp" aria-label="Film: on the iPad, the picture switches between Fit, with black bars, and Fill, edge to edge.">
+              <source src="assets/demos/fit.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/fit.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-fit">Fit or fill the iPad</h3>
+              <a class="demo-more" href="updates.html#v0-3-2" aria-label="Explore Fit and Fill">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-wide" aria-labelledby="d-second-screen">
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="880"
+                   poster="assets/demos/second-screen.webp" aria-label="Film: in the Windows app, the pointer switches Use the iPad as from Mirror my screen to Second screen and back.">
+              <source src="assets/demos/second-screen.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/second-screen.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-second-screen">Mirror, or a second screen</h3>
+              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#step-5-use-the-ipad-as-a-second-screen-optional" aria-label="Explore second screen setup" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-wide" aria-labelledby="d-performance">
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="880"
+                   poster="assets/demos/performance.webp" aria-label="Film: the Windows app's Performance page, its encode-time chart moving live while the GPU changes from NVIDIA to AMD to Intel.">
+              <source src="assets/demos/performance.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/performance.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-performance">Your graphics card does the work</h3>
+              <a class="demo-more" href="download.html" aria-label="Explore system requirements">Explore <span aria-hidden="true">&rarr;</span></a>
             </div>
           </article>
         </div>

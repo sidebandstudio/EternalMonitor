@@ -135,6 +135,28 @@
     }
   }
 
+  /* --- Feature films ---------------------------------------------------------
+     Each film in Watch it work plays while it is mostly on screen and pauses
+     when it leaves or the tab is hidden. With reduced motion the posters stay. */
+  var films = Array.prototype.slice.call(document.querySelectorAll('.demo-film'));
+  if (films.length && !reducedMotion && 'IntersectionObserver' in window) {
+    var inView = new Set();
+    var playFilm = function (film) {
+      var p = film.play();
+      if (p && p.catch) p.catch(function () {});
+    };
+    var filmWatcher = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) { inView.add(entry.target); if (!document.hidden) playFilm(entry.target); }
+        else { inView.delete(entry.target); entry.target.pause(); }
+      });
+    }, { threshold: 0.4 });
+    films.forEach(function (film) { filmWatcher.observe(film); });
+    document.addEventListener('visibilitychange', function () {
+      inView.forEach(function (film) { if (document.hidden) film.pause(); else playFilm(film); });
+    });
+  }
+
   /* --- GitHub stars -------------------------------------------------------------
      Shields' cached JSON first: it is shared by everyone, so a campus full of
      visitors behind one address can't exhaust GitHub's 60-an-hour limit. The

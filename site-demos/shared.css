@@ -1,0 +1,69 @@
+/* Shared look for the home page demo films. Sizes are in video pixels, which
+   are twice the CSS pixels the card shows them at. */
+
+@font-face { font-family: 'Geist'; font-weight: 400; src: url('ui/fonts/Geist-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Geist'; font-weight: 500; src: url('ui/fonts/Geist-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'Geist'; font-weight: 600; src: url('ui/fonts/Geist-SemiBold.woff2') format('woff2'); }
+
+html, body { margin: 0; background: #0a0a0b; }
+body { font-family: 'Geist', sans-serif; color: #f4f4f5; -webkit-font-smoothing: antialiased; }
+* { box-sizing: border-box; }
+
+#root { position: relative; width: 100%; height: 100%; overflow: hidden; background: #0a0a0b; }
+
+/* The painted night behind each scene. */
+.bg { position: absolute; inset: -4%; background-size: cover; background-position: center; }
+.bg-dim { position: absolute; inset: 0; background: rgba(6, 7, 10, 0.18); }
+
+/* Windows app window: the same chrome the site draws around host screenshots. */
+.win {
+  position: absolute;
+  border-radius: 22px;
+  overflow: hidden;
+  background: #0e0e10;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 50px 120px -40px rgba(0, 0, 0, 0.95), 0 0 0 1px rgba(0, 0, 0, 0.6);
+}
+.win-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 60px; padding: 0 22px 0 24px;
+  background: #0a0a0b; border-bottom: 2px solid rgba(255, 255, 255, 0.08);
+  font-size: 22px; color: #a1a1aa;
+}
+.win-bar .t { display: inline-flex; align-items: center; gap: 14px; }
+.win-bar .t img { width: 26px; height: 26px; border-radius: 7px; }
+.win-bar .wc { display: inline-flex; gap: 28px; color: #8f8f98; }
+.win-bar .wc svg { width: 18px; height: 18px; }
+.win-view { position: relative; overflow: hidden; }
+.win-view > img { position: absolute; left: 0; top: 0; max-width: none; }
+
+/* iPad: the site's tablet frame. */
+.ipad {
+  position: absolute;
+  background: #1c1c1f;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow: inset 0 0 0 2px rgba(0, 0, 0, 0.6), 0 60px 140px -50px rgba(0, 0, 0, 0.95);
+}
+.ipad-screen { position: absolute; overflow: hidden; background: #000; }
+.ipad-screen img, .ipad-screen video { position: absolute; max-width: none; }
+
+/* Status chip, like a recording timer on a product film. */
+.chip {
+  position: absolute;
+  display: inline-flex; align-items: center; gap: 14px;
+  height: 56px; padding: 0 26px 0 22px;
+  border-radius: 999px;
+  background: rgba(14, 14, 16, 0.92);
+  border: 2px solid rgba(255, 255, 255, 0.12);
+  font-size: 24px; font-weight: 500; letter-spacing: -0.01em; color: #f4f4f5;
+  white-space: nowrap;
+}
+.chip .dot { width: 14px; height: 14px; border-radius: 50%; background: #e8ff47; box-shadow: 0 0 0 6px rgba(232, 255, 71, 0.18); }
+
+/* Windows arrow pointer. Its tip is the element's top-left corner. */
+.cursor { position: absolute; left: 0; top: 0; width: 40px; height: 58px; }
+.cursor svg { width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.5)); }
+.ring {
+  position: absolute; width: 60px; height: 60px; margin: -30px 0 0 -30px;
+  border-radius: 50%; border: 3px solid rgba(232, 255, 71, 0.9); opacity: 0;
+}
