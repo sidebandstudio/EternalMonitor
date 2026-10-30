@@ -21,6 +21,9 @@ pub enum CaptureBlock {
     /// The display mode changed or a full-screen app took exclusive control
     /// of the display, and duplication has not come back yet.
     DisplayChanging,
+    /// No display is on: a laptop's lid is closed or its screen is off.
+    /// Capture resumes by itself when a display comes on.
+    NoDisplay,
     /// Windows refuses to duplicate this display from the GPU EternalMonitor
     /// runs on. Seen on hybrid laptops when the app runs on the discrete GPU
     /// while the screen is wired to the integrated one.
@@ -44,7 +47,7 @@ impl CaptureBlock {
             // DXGI_ERROR_NOT_FOUND: no display output, while a laptop's lid
             // is closed or its screen is off. It ended capture like a crash,
             // so the restart brake stopped it until the user clicked Start.
-            0x887A_0002 => Some(Self::DisplayChanging),
+            0x887A_0002 => Some(Self::NoDisplay),
             0x887A_0004 => Some(Self::UnsupportedOnThisGpu), // DXGI_ERROR_UNSUPPORTED
             0x887A_0022 => Some(Self::TooManyCaptureApps),   // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
             0x887A_0028 => Some(Self::SessionDisconnected),  // DXGI_ERROR_SESSION_DISCONNECTED
@@ -666,7 +669,7 @@ mod tests {
         let not_found = 0x887A_0002_u32 as i32;
         assert_eq!(
             CaptureBlock::from_hresult(not_found),
-            Some(CaptureBlock::DisplayChanging)
+            Some(CaptureBlock::NoDisplay)
         );
         // Not remembered against the second screen either.
         assert!(passing_code(not_found));
@@ -692,10 +695,7 @@ mod tests {
                     Ok(())
                 },
                 |delay| {
-                    assert_eq!(
-                        *shared.capture_block.lock(),
-                        Some(CaptureBlock::DisplayChanging)
-                    );
+                    assert_eq!(*shared.capture_block.lock(), Some(CaptureBlock::NoDisplay));
                     waits.borrow_mut().push(delay);
                     *waited.borrow_mut() += delay;
                     true
@@ -774,6 +774,7 @@ mod tests {
         for block in [
             CaptureBlock::SecureDesktop,
             CaptureBlock::DisplayChanging,
+            CaptureBlock::NoDisplay,
             CaptureBlock::TooManyCaptureApps,
             CaptureBlock::SessionDisconnected,
         ] {

@@ -789,6 +789,7 @@ fn simulate_problem(
     match name.as_str() {
         "secure-desktop" => *block = Some(CaptureBlock::SecureDesktop),
         "display-changing" => *block = Some(CaptureBlock::DisplayChanging),
+        "no-display" => *block = Some(CaptureBlock::NoDisplay),
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
@@ -1050,6 +1051,11 @@ pub(super) fn capture_block_notice(
             Icon::Display,
             "Windows is changing the display",
             "This happens when the resolution changes or a full-screen game or app starts. The picture comes back by itself when it's done.",
+        ),
+        CaptureBlock::NoDisplay => (
+            Icon::Display,
+            "No display is on",
+            "Open the laptop lid or turn a display on, and the picture comes back by itself. To keep streaming with the lid closed, choose Second screen.",
         ),
         CaptureBlock::UnsupportedOnThisGpu => (
             Icon::Display,

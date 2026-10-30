@@ -1505,6 +1505,7 @@ fn review_screens() {
     for (name, block) in [
         ("secure-desktop", CaptureBlock::SecureDesktop),
         ("display-changing", CaptureBlock::DisplayChanging),
+        ("no-display", CaptureBlock::NoDisplay),
         ("unsupported-gpu", CaptureBlock::UnsupportedOnThisGpu),
         ("too-many-capture-apps", CaptureBlock::TooManyCaptureApps),
         ("session-disconnected", CaptureBlock::SessionDisconnected),

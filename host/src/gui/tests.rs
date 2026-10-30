@@ -344,6 +344,7 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     let blocks = [
         CaptureBlock::SecureDesktop,
         CaptureBlock::DisplayChanging,
+        CaptureBlock::NoDisplay,
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
@@ -377,6 +378,17 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         capture_block_notice(Some(CaptureBlock::DriverNotResponding), true).unwrap();
     assert_eq!(stuck, "The graphics driver isn't responding");
     assert!(body.contains("restart the PC"), "{body}");
+    // A closed lid is not a display change.
+    let (_, off, body) = capture_block_notice(Some(CaptureBlock::NoDisplay), true).unwrap();
+    assert_eq!(off, "No display is on");
+    assert!(
+        body.contains("laptop lid") && body.contains("Second screen"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("resolution") && !body.contains("game"),
+        "{body}"
+    );
 }
 
 #[test]
