@@ -58,7 +58,7 @@ body { font-family: 'Geist', sans-serif; color: #f4f4f5; -webkit-font-smoothing:
   font-size: 24px; font-weight: 500; letter-spacing: -0.01em; color: #f4f4f5;
   white-space: nowrap;
 }
-.chip .dot { width: 14px; height: 14px; border-radius: 50%; background: #e8ff47; box-shadow: 0 0 0 6px rgba(232, 255, 71, 0.18); }
+.chip .dot { flex: none; width: 14px; height: 14px; border-radius: 50%; background: #e8ff47; box-shadow: 0 0 0 6px rgba(232, 255, 71, 0.18); }
 
 /* Windows arrow pointer. Its tip is the element's top-left corner. */
 .cursor { position: absolute; left: 0; top: 0; width: 40px; height: 58px; }
@@ -67,3 +67,11 @@ body { font-family: 'Geist', sans-serif; color: #f4f4f5; -webkit-font-smoothing:
   position: absolute; width: 60px; height: 60px; margin: -30px 0 0 -30px;
   border-radius: 50%; border: 3px solid rgba(232, 255, 71, 0.9); opacity: 0;
 }
+
+/* A fingertip on the iPad, the way screen recordings show touches. */
+.touch {
+  position: absolute; width: 64px; height: 64px; margin: -32px 0 0 -32px;
+  border-radius: 50%; background: rgba(255, 255, 255, 0.42);
+  border: 3px solid rgba(255, 255, 255, 0.85); opacity: 0;
+}
+.ipad, .ipad-screen { border-radius: 40px; }
