@@ -25,7 +25,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 DEMOS = HERE.parent
 OUT = DEMOS.parent / "docs" / "assets" / "hero"
 W, H = 2709, 980          # the canvas, which is the 2x picture
-LAPTOP_AT = (-153, 0)     # where the laptop render's corner sits on the canvas
+LAPTOP_AT = (-138, 4)     # where the laptop render's corner sits on the canvas
 BLEED = 3                 # screens run this far under their bezels
 
 
@@ -105,7 +105,7 @@ devices.alpha_composite(ipad)
 cable = np.array(load_layer(DEMOS / "renders" / "hero" / "cable.png")).astype(np.float32)
 cover = np.array(laptop)[..., 3].astype(np.float32) / 255
 near_port = np.zeros((H, W), bool)
-near_port[760:870, 1250:1360] = True
+near_port[770:880, 1260:1380] = True
 cable[..., 3] *= np.where(near_port, 1 - cover, 1)
 cable[..., 3] *= 1 - np.array(ipad)[..., 3].astype(np.float32) / 255
 cable[:, 1790:, 3] = 0  # the plug ends at the iPad's edge, x = 1760

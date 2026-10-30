@@ -264,8 +264,8 @@ dock = box("dock", (dock_w, dock_d, dock_h), alu_dock, col_ipad, bevel=2.4)
 dock.location = (IPAD_LEFT + IPAD_W / 2, 8.0, dock_h / 2)
 
 # Plugs. The laptop's port is in its right side, under the deck's edge at
-# canvas (1314, 815); the iPad's is in the middle of its left edge.
-laptop_port = canvas_to_world(1314, 815, 76.6)
+# canvas (1332, 819); the iPad's is in the middle of its left edge.
+laptop_port = canvas_to_world(1332, 819, 76.6)
 laptop_port.x -= 4.0  # the plug's inner end hides behind the laptop's side
 laptop_frame = Matrix.Translation(laptop_port)
 start = plug("laptop-plug", laptop_frame, (rubber_boot, seam, steel), col_cable)
@@ -282,7 +282,7 @@ r = CABLE_R
 path = [
     start,
     start + Vector((9, -1, -1)),
-    Vector((393, 68, r + 0.8)),
+    Vector((395, 68, r + 0.8)),
     Vector((399, 44, r)),
     Vector((408, 14, r)),
     Vector((418, -6, r)),
