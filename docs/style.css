@@ -350,7 +350,8 @@ small { font-size: 0.875rem; }
 
 /* Up to 1240px wide, a little past the text column, with the page's margins. */
 .stage { margin: clamp(32px, 3.5vw, 52px) calc(50% - min(620px, 50vw - 24px)) 0; }
-.rig { position: relative; aspect-ratio: 2709 / 980; }
+.rig-fit, .rig { aspect-ratio: 2709 / 980; }
+.rig { position: relative; }
 .rig > img, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
 .rig-devices { inset: 0; width: 100%; height: 100%; }
 .rig-laptop { left: 5.906%; top: 5.612%; width: 39.793%; height: 60.51%; }
@@ -413,6 +414,18 @@ small { font-size: 0.875rem; }
 .rig-controls input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
 .rig-controls label:active { transform: scale(0.97); }
 .no-js .rig-controls { display: none; }
+/* On a screen of ordinary height the whole hero fits it: the text keeps its
+   size, and the picture shrinks to the height that is left, so the picture and
+   its choices are both in view when the page opens. */
+@media (min-width: 721px) and (min-height: 600px) {
+  .hero { --hero-top: clamp(28px, 4.5svh, 64px); padding-top: var(--hero-top); }
+  .hero > .container { display: flex; flex-direction: column; max-height: calc(100svh - var(--nav-h) - var(--hero-top) - 20px); }
+  .hero-text { flex: none; width: 100%; }
+  .stage { display: flex; flex-direction: column; min-height: 0; margin-top: clamp(24px, 3.4svh, 52px); }
+  .rig-fit { flex: 0 1 auto; min-height: 0; container-type: size; }
+  .rig { width: min(100cqw, 100cqh * 2709 / 980); margin-inline: auto; }
+  .rig-controls { flex: none; margin-top: clamp(14px, 2.4svh, 32px); }
+}
 @media (max-width: 720px) {
   .stage { margin-inline: calc(50% - 50vw + 10px); }
   .rig-controls { flex-direction: column; align-items: center; gap: 12px; padding-inline: 16px; }
