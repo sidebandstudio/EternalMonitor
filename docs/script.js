@@ -176,14 +176,15 @@
       if (reducedMotion) held.add(film);
       var card = film.closest('.demo');
       var title = card && card.querySelector('h3');
-      var name = title ? title.textContent.trim() : 'this film';
       var btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'demo-toggle';
       btn.innerHTML = ICONS;
       var show = function () {
         var playing = !held.has(film);
-        btn.setAttribute('aria-label', (playing ? 'Pause film: ' : 'Play film: ') + name);
+        // The heading follows the language, so its text is read each time.
+        var name = title ? title.textContent.trim() : '';
+        btn.setAttribute('aria-label', (playing ? t('film.pause', 'Pause film: {name}') : t('film.play', 'Play film: {name}')).replace('{name}', name));
         btn.classList.toggle('is-paused', !playing);
       };
       btn.addEventListener('click', function () {
@@ -192,6 +193,7 @@
         show();
       });
       show();
+      onLanguage(show);
       card.appendChild(btn);
     });
     var filmWatcher = new IntersectionObserver(function (entries) {
@@ -473,6 +475,21 @@
     var BETA_KEY = 'gh-beta-v1', BETA_TTL = 1800000;
     var betaLoaded = false;
     var betaBuild = document.getElementById('beta-build');
+    // What the build line shows: null (the page's text), 'missing' (no Beta
+    // release yet) or the release. Redrawn when the language changes.
+    var betaShown = null;
+    var drawBuild = function () {
+      if (!betaBuild) return;
+      if (betaShown === 'missing') {
+        betaBuild.textContent = t('download.beta.missing', 'The first Beta build is on its way. Use Stable until then.');
+      } else if (betaShown) {
+        betaShown();
+      } else {
+        betaBuild.textContent = t('download.beta.build', 'A new build comes out each night with the fixes that landed that day.');
+      }
+    };
+    drawBuild();
+    onLanguage(drawBuild);
 
     var showBeta = function (release) {
       var body = release.body || '';
@@ -482,20 +499,30 @@
       var when = asset && asset.updated_at ? new Date(asset.updated_at)
         : version[1] ? new Date(Date.UTC(+version[2], +version[3] - 1, +version[4])) : null;
       if (betaBuild && version[1]) {
-        betaBuild.textContent = 'Version ' + version[1];
-        if (when && isFinite(when)) {
-          betaBuild.appendChild(document.createTextNode(', built ' +
-            when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })));
-        }
+        var link = null;
         if (commit) {
-          var link = document.createElement('a');
+          link = document.createElement('a');
           link.href = 'https://github.com/' + REPO + '/commit/' + commit;
           link.target = '_blank';
           link.rel = 'noopener';
           link.textContent = commit.slice(0, 7);
-          betaBuild.appendChild(document.createTextNode(' from '));
-          betaBuild.appendChild(link);
         }
+        betaShown = function () {
+          var dated = when && isFinite(when);
+          var line = dated && link ? t('download.beta.versionBuiltFrom', 'Version {version}, built {date} from {commit}')
+            : dated ? t('download.beta.versionBuilt', 'Version {version}, built {date}')
+            : link ? t('download.beta.versionFrom', 'Version {version} from {commit}')
+            : t('download.beta.version', 'Version {version}');
+          line = line.replace('{version}', version[1]);
+          if (dated) {
+            line = line.replace('{date}', when.toLocaleDateString(document.documentElement.lang || 'en-US',
+              { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }));
+          }
+          var around = line.split('{commit}');
+          betaBuild.textContent = around[0];
+          if (link) betaBuild.append(link, around[1] || '');
+        };
+        drawBuild();
       }
       var meta = document.getElementById('beta-meta');
       if (meta && asset && typeof asset.size === 'number') {
@@ -518,7 +545,7 @@
         headers: { Accept: 'application/vnd.github+json' }
       })
         .then(function (r) {
-          if (r.status === 404 && betaBuild) betaBuild.textContent = 'The first Beta build is on its way. Use Stable until then.';
+          if (r.status === 404) { betaShown = 'missing'; drawBuild(); }
           if (!r.ok) throw new Error(r.status);
           return r.json();
         })

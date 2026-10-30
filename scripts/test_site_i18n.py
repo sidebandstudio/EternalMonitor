@@ -125,11 +125,11 @@ class CheckTest(unittest.TestCase):
         data = self.strings("ja")
         data["download.form.send"] = "送信"
         data["common.req.windows"] = "Windows 10 または 11"
-        data["mac.text"] = "EternalMonitor は Windows PC から配信します。"
+        data["film.pause"] = "フィルムを一時停止"
         self.save("ja", data)
         self.assertReports("ja.json 'download.form.send': missing ['hello@sideband.studio']")
         self.assertReports("ja.json 'common.req.windows': missing ['1809', '64']")
-        self.assertReports("ja.json 'mac.text': placeholders differ")
+        self.assertReports("ja.json 'film.pause': placeholders differ")
 
     def test_empty_string(self):
         data = self.strings("ko")
@@ -152,8 +152,8 @@ class CheckTest(unittest.TestCase):
         self.assertReports("key 'nav.knownIssues' has two English texts")
 
     def test_attribute_key_needs_its_attribute(self):
-        self.edit_page("index.html", 'data-i18n-alt="index.gpu.alt" alt=', 'data-i18n-alt="index.gpu.alt" title=')
-        self.assertReports("data-i18n-alt='index.gpu.alt' on an element without alt")
+        self.edit_page("index.html", 'aria-label="Explore pairing" data-i18n-aria-label=', 'title="Explore pairing" data-i18n-aria-label=')
+        self.assertReports("data-i18n-aria-label='index.film.pair.more' on an element without aria-label")
 
     def test_extract_rewrites_english(self):
         self.edit_page("index.html", "Three steps.</h2>", "Four steps.</h2>")
