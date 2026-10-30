@@ -80,6 +80,7 @@ foreach ($doc in @("README.md", "LICENSE", "scripts\QUICKSTART.txt")) {
 }
 # The Geist fonts are embedded in the exe; the OFL requires their licence to ship with them.
 Copy-Item "host\assets\fonts\OFL.txt" (Join-Path $staging "Geist-OFL.txt")
+Copy-Item "host\assets\fonts\Noto-OFL.txt" (Join-Path $staging "Noto-OFL.txt")
 
 # --- Stage the bundled virtual display driver, if supplied -----------------------
 Write-Host "[3/5] Looking for the virtual display driver..."
