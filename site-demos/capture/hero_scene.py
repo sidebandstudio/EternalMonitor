@@ -235,8 +235,8 @@ col_env = bpy.data.collections.new("env")
 for c in (col_ipad, col_cable, col_env):
     scene.collection.children.link(c)
 
-alu = material("alu", (0.36, 0.36, 0.38), metallic=1.0, roughness=0.34, aniso=0.2)
-alu_dock = material("alu-dock", (0.42, 0.42, 0.44), metallic=1.0, roughness=0.38)
+alu = material("alu", (0.55, 0.55, 0.57), metallic=1.0, roughness=0.36, aniso=0.2)
+alu_dock = material("alu-dock", (0.6, 0.6, 0.62), metallic=1.0, roughness=0.55)
 glass = material("glass", (0.004, 0.004, 0.005), roughness=0.04, coat=1.0)
 camera_dot = material("camera-dot", (0.015, 0.018, 0.03), roughness=0.1, coat=1.0)
 screen = holdout("screen")
@@ -305,6 +305,10 @@ light("key", "AREA", (-250, -650, 650), (450, 60, 60), 9.0e6, (700, 500))
 light("fill", "AREA", (-700, -350, 150), (450, 0, 60), 1.6e6, (600, 300))
 light("rim", "AREA", (1150, 450, 420), (550, 0, 90), 3.2e6, (300, 500), color=(0.86, 0.92, 1.0))
 light("top", "AREA", (450, 100, 900), (450, 50, 0), 2.0e6, (900, 400))
+# A low softbox in front lights the dock's face and the aluminium edges. It sits
+# below the line the glass mirrors back to the camera (5 degrees up), so the
+# bezel stays black.
+light("low", "AREA", (560, -700, -160), (560, 0, 20), 0.35e6, (900, 160))
 
 cam_data = bpy.data.cameras.new("cam")
 cam_data.type = "ORTHO"

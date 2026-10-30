@@ -350,35 +350,38 @@ fn home_page_films() {
     }
 
     // Hero: the stills the home page's laptop shows, in each mode over USB
-    // and over Wi-Fi. The pointer rests outside the window. Only drawn when
+    // and over Wi-Fi. One session throughout, so the pairing code stays the
+    // same in all four; the pointer rests outside the window. Only drawn when
     // asked for by name (capture-hero.sh), so the films' run skips them.
-    for (name, wifi, second) in [
-        ("hero-mirror-usb", false, false),
-        ("hero-second-usb", false, true),
-        ("hero-mirror-wifi", true, false),
-        ("hero-second-wifi", true, true),
-    ] {
-        if !only.split(',').any(|n| n == "hero" || n == name) {
-            continue;
-        }
+    if only.split(',').any(|n| n == "hero") {
         let (_dir, shared) = fixture();
-        if wifi {
-            connect_wifi(&shared);
-        } else {
-            connect_named(&shared, "iPad Pro", 10, 20);
-        }
+        connect_named(&shared, "iPad Pro", 10, 20);
         PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
         let mut h = film_harness(&shared, size);
-        let mut f = Film::new(&root, name, egui::pos2(-50.0, -50.0));
-        if second {
-            f.pointer = centre(&h, None, "Second screen");
-            f.click(&mut h);
-            *shared.vdd_status.lock() = VddStatus::Active;
-            f.pointer = egui::pos2(-50.0, -50.0);
+        let away = egui::pos2(-50.0, -50.0);
+        let mut still = |h: &mut Harness<'_, AnalyzerApp>, name: &str, choose: Option<&str>, vdd: VddStatus| {
+            let mut f = Film::new(&root, name, away);
+            if let Some(label) = choose {
+                f.pointer = centre(h, None, label);
+                f.click(h);
+                f.pointer = away;
+            }
+            *shared.vdd_status.lock() = vdd;
+            let used = f.frame;
+            f.hold(h, 30 - used);
+            f.finish_at(30);
+        };
+        still(&mut h, "hero-mirror-usb", None, VddStatus::Inactive);
+        still(&mut h, "hero-second-usb", Some("Second screen"), VddStatus::Active);
+        {
+            let mut session = shared.session.lock();
+            let id = session.session_id().unwrap();
+            let usb = PeerId::usb(7);
+            session.handle_control(usb, id, ControlMessage::Bye(ByeReason::UserDisconnect), &Fixture, Instant::now());
         }
-        let used = f.frame;
-        f.hold(&mut h, 30 - used);
-        f.finish_at(30);
+        connect_wifi(&shared);
+        still(&mut h, "hero-second-wifi", None, VddStatus::Active);
+        still(&mut h, "hero-mirror-wifi", Some("Mirror my screen"), VddStatus::Inactive);
     }
 
     // Feedback: open the panel from the sidebar, write a line, send it to the email app.
