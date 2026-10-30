@@ -126,16 +126,18 @@ final class FakeUDPHost: @unchecked Sendable {
             captureTimestampUs: UInt64(seq) * 16_667, payloadLen: UInt16(frame.count)).encode(payload: frame))
     }
 
-    /// The reasons of the keyframe requests received within `seconds`.
-    func keyframeRequests(within seconds: Double) -> [KeyframeReason] {
-        timedKeyframeRequests(within: seconds).map(\.reason)
+    /// The reasons of the keyframe requests received within `seconds`, or
+    /// of the first `count`.
+    func keyframeRequests(within seconds: Double, count: Int = .max) -> [KeyframeReason] {
+        timedKeyframeRequests(within: seconds, count: count).map(\.reason)
     }
 
-    /// The keyframe requests received within `seconds`, with when each came.
-    func timedKeyframeRequests(within seconds: Double) -> [(reason: KeyframeReason, at: Date)] {
+    /// The keyframe requests received within `seconds`, with when each came,
+    /// or the first `count` of them as soon as they have come.
+    func timedKeyframeRequests(within seconds: Double, count: Int = .max) -> [(reason: KeyframeReason, at: Date)] {
         var requests: [(reason: KeyframeReason, at: Date)] = []
         let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
+        while Date() < deadline, requests.count < count {
             guard let (data, _, _) = receive() else { continue }
             if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { requests.append((request.reason, Date())) }
         }
