@@ -118,6 +118,67 @@ fn encode_sample(i: usize) -> f64 {
     wave + spike
 }
 
+/// The iPad that scanned the QR code joins over Wi-Fi, so the app says so.
+fn wifi_peer() -> PeerId {
+    PeerId::udp("192.0.2.40:9877".parse().unwrap())
+}
+
+fn connect_wifi(shared: &SharedControl) {
+    let now = Instant::now();
+    let mut session = shared.session.lock();
+    let hello = Hello2 {
+        proto_min: 2,
+        proto_max: 2,
+        client_nonce: 31,
+        listen_port: 9877,
+        decoder_caps: 3,
+        feature_caps: 3 | FEATURE_CHECKS_UPDATES,
+        screen_px_w: 2420,
+        screen_px_h: 1668,
+        screen_pt_w: 1210,
+        screen_pt_h: 834,
+        refresh_hz: 120,
+        device_name: "iPad Pro".into(),
+        device_id: 9,
+        preferred_fps: 60,
+        auth_token: [0x22; 16],
+        pairing_code: 0,
+    };
+    let actions = session.handle_control(wifi_peer(), 0, ControlMessage::Hello2(hello), &Fixture, now);
+    assert_eq!(actions.new_target, Some(wifi_peer()));
+    let session_id = session.session_id().unwrap();
+    session.handle_control(
+        wifi_peer(),
+        session_id,
+        ControlMessage::ReceiverReport(ReceiverReport {
+            stream_epoch: 1,
+            highest_seq: 1200,
+            frames_complete: 1200,
+            frames_dropped: 1,
+            frags_received: 970,
+            frags_lost: 10,
+            frags_repaired: 20,
+            jitter_us: 450,
+            decode_fps_x10: 599,
+            assembler_depth: 0,
+            decode_depth: 0,
+            e2e_latency_ms_x10: 184,
+            rtt_ms_x10: 32,
+            nacks_sent: 10,
+            audio_packets_lost: 0,
+            audio_buffer_ms: 60,
+        }),
+        &Fixture,
+        now,
+    );
+}
+
+fn disconnect_wifi(shared: &SharedControl) {
+    let mut session = shared.session.lock();
+    let session_id = session.session_id().unwrap();
+    session.handle_control(wifi_peer(), session_id, ControlMessage::Bye(ByeReason::UserDisconnect), &Fixture, Instant::now());
+}
+
 #[test]
 #[ignore = "writes film frames; run through site-demos/capture/capture-host.sh"]
 fn home_page_films() {
@@ -141,7 +202,7 @@ fn home_page_films() {
         note(&f, "dialog", h.get_by_label("Scan to connect").rect());
         f.glide(&mut h, egui::pos2(880.0, 610.0), 26);
         f.hold(&mut h, 50);
-        connect_named(&shared, "iPad Pro", 10, 20);
+        connect_wifi(&shared);
         f.hold(&mut h, 14);
         if let Some(done) = h.query_by_label("Done") {
             let done = done.rect().center();
@@ -152,7 +213,7 @@ fn home_page_films() {
         let used = f.frame;
         f.hold(&mut h, 212 - used);
         f.glide(&mut h, egui::pos2(760.0, 600.0), 22);
-        disconnect_ipad(&shared);
+        disconnect_wifi(&shared);
         f.hold(&mut h, 6);
         f.finish();
     }
@@ -200,6 +261,18 @@ fn home_page_films() {
             stats.codec_name = codec.into();
             stats.encode_time_history = (0..300).map(|i| encode_sample(i + frame * 2)).collect();
             stats.encode_time_us = (encode_sample(frame * 2 + 299) * 1000.0) as u128;
+            // Twenty-five minutes into a session at 60 fps and 15 Mbps. Frames
+            // are drawn slower than real time, so uptime is set, not measured.
+            let n = frame as u64;
+            stats.start_time =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(1_512_000 + n * 1000 / 30));
+            stats.capture_frame_count = 90_720 + n * 2;
+            stats.encode_frame_count = 90_718 + n * 2;
+            stats.nal_bytes_last = 30_600 + (n as usize * 7_919) % 2_400;
+            stats.transport_bytes_sent = 2_835_000_000 + n * 62_500;
+            stats.transport_packets_sent = 2_052_000 + n * 45;
+            stats.transport_fragments_sent = 2_052_000 + n * 45;
+            stats.transport_retransmits = 212;
         };
         feed(0);
         let mut h = film_harness(&shared, egui::vec2(1040.0, 1000.0));
@@ -243,7 +316,7 @@ fn home_page_films() {
         f.click(&mut h);
         // The pointer steps aside while the words go in, about 13 letters a second.
         f.glide(&mut h, field.right_bottom() + egui::vec2(-60.0, 40.0), 10);
-        let words = "Drawing on the iPad in Krita feels great.";
+        let words = "Drawing in Krita feels great.";
         for (i, ch) in words.chars().enumerate() {
             h.event(egui::Event::Text(ch.to_string()));
             f.shoot(&mut h, false);
