@@ -2,64 +2,73 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=720, height=880">
+  <meta name="viewport" content="width=1104, height=1040">
   <title>Apple Pencil drawing mode</title>
   <link rel="stylesheet" href="shared.css">
   <script src="vendor/gsap.min.js"></script>
   <style>
-    .bg { background-image: url('art/dunes.webp'); background-position: 50% 70%; }
-    /* The iPad's settings sheet, recorded in the app. */
-    #panel {
-      position: absolute; left: 28px; top: 44px; width: 664px; height: 870px;
-      border-radius: 34px 34px 0 0; overflow: hidden; background: #000;
-      border: 2px solid rgba(255, 255, 255, 0.14); border-bottom: 0;
-      box-shadow: 0 50px 120px -40px rgba(0, 0, 0, 0.95);
-    }
-    #panel video { display: block; width: 664px; height: 870px; }
-    /* The pencil's tip is at (34, 481) inside its 520px square. */
-    #pencil { position: absolute; left: 0; top: 0; width: 520px; height: 520px; }
-    #pencil img { width: 520px; height: 520px; display: block; filter: drop-shadow(-18px 30px 26px rgba(0, 0, 0, 0.55)); }
+    /* Close on the iPad app's Apple Pencil settings, recorded in the simulator
+       while it was connected to a PC. The footage is 1668 x 1560 pixels of
+       the iPad's screen; the camera holds it at 0.7. */
+    .bg { background-image: url('art/coast.webp'); background-position: 70% 50%; }
+    #cam { position: absolute; left: 0; top: 0; width: 1104px; height: 1040px; }
+    /* The iPad around its screen; only its right edge is in shot. */
+    #tab { left: -182px; top: -483px; width: 1212px; height: 1738px; border-radius: 62px; }
+    #tab .ipad-screen { left: 20px; top: 20px; width: 1168px; height: 1694px; border-radius: 44px; }
+    #sheet { left: 0; top: 420px; width: 1168px; height: 1092px; }
+    /* The pencil's tip is at (52, 740) inside its 800px square. */
+    #pencil { position: absolute; left: 0; top: 0; width: 800px; height: 800px; }
+    #pencil img { width: 800px; height: 800px; display: block; }
+    /* The shadow sits outside the turning pencil, so light stays put. */
+    #shadow { position: absolute; inset: 0; filter: drop-shadow(-26px 34px 28px rgba(0, 0, 0, 0.6)); }
   </style>
 </head>
 <body>
-  <div id="root" data-composition-id="pencil" data-start="0" data-width="720" data-height="880" data-duration="8">
+  <div id="root" data-composition-id="pencil" data-start="0" data-width="1104" data-height="1040" data-duration="8">
     <div class="bg" id="bg"></div>
     <div class="bg-dim"></div>
-    <div id="panel">
-      <video id="sheet" src="footage/pencil-settings.mp4" data-start="0" data-duration="8" muted playsinline></video>
+    <div id="cam">
+      <div class="ipad" id="tab">
+        <div class="ipad-screen">
+          <video id="sheet" src="footage/ipad-pencil.mp4" data-start="0" data-duration="8" muted playsinline></video>
+        </div>
+      </div>
     </div>
     <div class="ring" id="ring"></div>
-    <div id="pencil"><img src="art/stylus.webp" alt=""></div>
+    <div id="shadow"><div id="pencil"><img src="art/stylus.webp" alt=""></div></div>
   </div>
 
   <script>
     const tl = gsap.timeline({ paused: true });
-    const TIP = { x: 34, y: 481 };
+    const TIP = { x: 52, y: 740 };
     // Where the tip should be, in frame pixels; the pencil element is offset by its tip.
     const at = (x, y) => ({ x: x - TIP.x, y: y - TIP.y });
-    const SWITCH = { x: 622, y: 362 };
-    const HOVER = at(560, 470);
-    const NEAR = at(SWITCH.x + 18, SWITCH.y - 26);
+    // The Drawing mode switch, in frame pixels.
+    const SWITCH = { x: 741, y: 380 };
+    const HOVER = at(821, 560);
+    const NEAR = at(SWITCH.x + 26, SWITCH.y + 30);
     const TOUCH = at(SWITCH.x, SWITCH.y);
 
-    tl.fromTo('#bg', { scale: 1.05, x: 0 }, { scale: 1, x: 12, duration: 4, ease: 'sine.inOut' }, 0);
-    tl.to('#bg', { scale: 1.05, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+    // The camera breathes in on the switch and back out once per loop.
+    tl.fromTo('#cam', { scale: 1, transformOrigin: `${SWITCH.x}px ${SWITCH.y}px` },
+      { scale: 1.04, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#cam', { scale: 1, duration: 4, ease: 'sine.inOut' }, 4);
 
-    // The switch moves at 1.27 s and 6.60 s in the recording: the tip lands just before.
+    // The switch moves at 1.80 s and 6.33 s in the recording: the tip lands just before.
     const tap = (t) => {
-      tl.to('#pencil', { ...NEAR, rotation: -2, duration: 0.55, ease: 'power2.inOut' }, t - 0.75);
-      tl.to('#pencil', { ...TOUCH, rotation: 0, duration: 0.18, ease: 'power2.in' }, t - 0.2);
-      tl.set('#ring', { left: SWITCH.x, top: SWITCH.y }, t - 0.02);
-      tl.fromTo('#ring', { scale: 0.3, opacity: 0.9 }, { scale: 1.5, opacity: 0, duration: 0.6, ease: 'power2.out', immediateRender: false }, t);
-      tl.to('#pencil', { ...NEAR, duration: 0.22, ease: 'power2.out' }, t + 0.1);
+      tl.to('#pencil', { ...NEAR, rotation: 72, duration: 0.6, ease: 'power2.inOut' }, t - 0.8);
+      tl.to('#pencil', { ...TOUCH, rotation: 75, duration: 0.16, ease: 'power2.in' }, t - 0.2);
+      tl.set('#ring', { left: SWITCH.x, top: SWITCH.y }, t - 0.04);
+      tl.fromTo('#ring', { scale: 0.3, opacity: 0.9 }, { scale: 1.6, opacity: 0, duration: 0.6, ease: 'power2.out', immediateRender: false }, t - 0.04);
+      tl.to('#pencil', { ...NEAR, duration: 0.25, ease: 'power2.out' }, t);
     };
-    tl.set('#pencil', { ...HOVER, rotation: 3 }, 0);
-    tap(1.25);
-    tl.to('#pencil', { ...HOVER, rotation: 3, duration: 1.4, ease: 'power2.inOut' }, 1.75);
-    tl.to('#pencil', { y: HOVER.y - 16, rotation: 1, duration: 1.4, ease: 'sine.inOut' }, 3.2);
-    tl.to('#pencil', { ...HOVER, rotation: 3, duration: 1.2, ease: 'sine.inOut' }, 4.6);
-    tap(6.58);
-    tl.to('#pencil', { ...HOVER, rotation: 3, duration: 1.2, ease: 'power2.inOut' }, 6.8);
+    tl.set('#pencil', { ...HOVER, rotation: 80, transformOrigin: `${TIP.x}px ${TIP.y}px` }, 0);
+    tap(1.8);
+    tl.to('#pencil', { ...HOVER, rotation: 80, duration: 1.3, ease: 'power2.inOut' }, 2.2);
+    tl.to('#pencil', { y: HOVER.y - 18, rotation: 78, duration: 1.4, ease: 'sine.inOut' }, 3.5);
+    tl.to('#pencil', { ...HOVER, rotation: 80, duration: 0.6, ease: 'sine.inOut' }, 4.9);
+    tap(6.33);
+    tl.to('#pencil', { ...HOVER, rotation: 80, duration: 1.2, ease: 'power2.inOut' }, 6.75);
 
     window.__timelines['pencil'] = tl;
   </script>

@@ -23,7 +23,7 @@ prep
 [ "${1:-}" = "--prep" ] && exit 0
 
 # name, then the second (from the start of the loop) the poster is taken at.
-FILMS=(second-screen:0.6 pair:4.4 pencil:5.0 fit:5.5 performance:3.5)
+FILMS=(second-screen:0.6 pair:4.4 pencil:3.0 fit:4.0 performance:3.5 feedback:5.0)
 mkdir -p "$OUT" renders
 for entry in "${FILMS[@]}"; do
   name=${entry%%:*} poster=${entry#*:}
