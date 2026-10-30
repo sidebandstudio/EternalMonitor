@@ -631,7 +631,7 @@ impl AnalyzerApp {
             self.resume_code_pairing();
         }
         if open_qr {
-            self.open_qr(snap);
+            self.open_qr();
         }
         if let Some(error) = &self.settings_error {
             ui.add(egui::Label::new(RichText::new(error).size(SMALL).color(DANGER)).wrap());

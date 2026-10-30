@@ -214,7 +214,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
-    let listen_addr = gui::detect_local_ip(listen_port);
+    if persisted.listen_on != eternal_host::network::ListenOn::All {
+        info!(
+            listen_on = persisted.listen_on.label(),
+            "Stream listens on one network (Settings > Troubleshooting)"
+        );
+    }
+    *shared.listen_on.lock() = persisted.listen_on.clone();
+    let listen_addr = gui::listen_address(&persisted.listen_on, listen_port);
     {
         let mut stats = stats::PIPELINE_STATS.lock();
         stats.set_bitrate(initial_bitrate);

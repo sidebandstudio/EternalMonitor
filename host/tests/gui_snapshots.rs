@@ -608,6 +608,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     reset_keeps_environment_overrides(&shared, &dir, &mut results);
     waiting_for_the_port_can_be_stopped(&shared, &mut results);
     code_pairing_pause_says_why_and_resumes(&shared, &mut results);
+    listen_on_is_chosen_and_reset(&shared, &dir, &mut results);
     a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
@@ -666,6 +667,79 @@ fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut
     window.get_by_label("New code");
 }
 
+/// Listen on offers each network with its address, and Tailscale. A choice
+/// moves the Address row to that network and asks for a restart, a network
+/// that isn't connected says so, and Reset puts All networks back.
+fn listen_on_is_chosen_and_reset(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind, ListenOn};
+    let adapter = |name: &str, kind, ip: [u8; 4]| Adapter {
+        name: name.into(),
+        kind,
+        up: true,
+        gateway: kind != Kind::Vpn,
+        ipv4: vec![ip.into()],
+    };
+    let wifi = adapter("Wi-Fi", Kind::Wifi, [192, 168, 1, 20]);
+    set_test_adapters(Some(vec![
+        wifi.clone(),
+        adapter("Tailscale", Kind::Vpn, [100, 80, 1, 2]),
+    ]));
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let toggle = |window: &mut Harness<'_, AnalyzerApp>, label: &str| {
+        window.get_by_label(label).scroll_to_me();
+        window.run_steps(4);
+        window.get_by_label(label).click();
+        window.run_steps(4);
+    };
+    toggle(&mut window, "Show options");
+    let listen = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
+    window
+        .get(listen("All networks (Automatic)"))
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get(listen("All networks (Automatic)")).click();
+    window.run_steps(4);
+    window.get_by_label("Wi-Fi (192.168.1.20)");
+    window.get_by_label("Tailscale only (100.80.1.2)").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::Tailscale);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::Tailscale);
+    assert_eq!(PIPELINE_STATS.lock().listen_addr, "100.80.1.2:9876");
+    window.get_by_label("Restart the stream to apply your changes");
+    assert!(window
+        .query_by_label_contains("isn't connected now")
+        .is_none());
+
+    // Tailscale goes away: the row says what still works.
+    set_test_adapters(Some(vec![wifi]));
+    toggle(&mut window, "Hide options");
+    toggle(&mut window, "Show options");
+    window.get(listen("Tailscale only (not connected)"));
+    window.get_by_label(
+        "That network isn't connected now. Until it is, iPads can connect over USB only.",
+    );
+    window
+        .get_by_label("Reset troubleshooting settings")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-listen-on");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::All);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::All);
+    set_test_adapters(None);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+}
+
 /// Tailscale owns the default route. The Address row, its Copy and the QR
 /// code keep the address they always had; one line adds the Wi-Fi's IP,
 /// without the port, for the iPad's PC address field.
@@ -675,6 +749,7 @@ fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
     let hint = "If that doesn't connect and your iPad is on the same network as this PC, use 192.168.1.20 as the PC address.";
     PIPELINE_STATS.lock().listen_addr = vpn.into();
     let adapter = |kind, ip: [u8; 4]| Adapter {
+        name: format!("{kind:?}"),
         kind,
         up: true,
         gateway: true,

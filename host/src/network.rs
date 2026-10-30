@@ -44,11 +44,114 @@ impl Kind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Adapter {
+    /// The name Windows shows for it, such as "Wi-Fi". Never logged.
+    pub name: String,
     pub kind: Kind,
     pub up: bool,
     /// Has a default gateway: it leads to a real network.
     pub gateway: bool,
     pub ipv4: Vec<Ipv4Addr>,
+}
+
+/// Which network the stream listens on (Settings > Troubleshooting).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenOn {
+    /// Every network, as always.
+    #[default]
+    All,
+    /// One network adapter, by its name.
+    Adapter(String),
+    /// Tailscale's address alone.
+    Tailscale,
+}
+
+impl ListenOn {
+    /// For the log, which never names an adapter.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ListenOn::All => "all",
+            ListenOn::Adapter(_) => "adapter",
+            ListenOn::Tailscale => "tailscale",
+        }
+    }
+}
+
+/// Tailscale's adapter: a VPN with an address in its 100.64/10 range.
+fn tailscale_ip(adapter: &Adapter) -> Option<Ipv4Addr> {
+    let cgnat = |ip: &Ipv4Addr| ip.octets()[0] == 100 && ip.octets()[1] & 0xC0 == 64;
+    (adapter.kind == Kind::Vpn)
+        .then(|| adapter.ipv4.iter().copied().find(cgnat))
+        .flatten()
+}
+
+/// The address to listen on for `choice`: unspecified for All, `None` when
+/// the chosen network isn't connected.
+pub fn listen_ip(choice: &ListenOn, adapters: &[Adapter]) -> Option<Ipv4Addr> {
+    let up = adapters.iter().filter(|adapter| adapter.up);
+    match choice {
+        ListenOn::All => Some(Ipv4Addr::UNSPECIFIED),
+        ListenOn::Adapter(name) => up
+            .filter(|adapter| adapter.name == *name)
+            .flat_map(|adapter| &adapter.ipv4)
+            .copied()
+            .min_by_key(|ip| ip.is_link_local()),
+        ListenOn::Tailscale => up.filter_map(tailscale_ip).next(),
+    }
+}
+
+/// The address to listen on now. A chosen network that isn't connected
+/// gives loopback: nothing on the network reaches the stream, and USB, which
+/// doesn't use this address, still works.
+pub fn listen_ip_now(choice: &ListenOn) -> Ipv4Addr {
+    if *choice == ListenOn::All {
+        return Ipv4Addr::UNSPECIFIED;
+    }
+    listed()
+        .and_then(|adapters| listen_ip(choice, &adapters))
+        .unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
+/// What the Listen on choice offers now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListenChoices {
+    /// Adapters that are up, with a name and an address, not loopback.
+    pub adapters: Vec<(String, Ipv4Addr)>,
+    /// Tailscale's address, while it is connected.
+    pub tailscale: Option<Ipv4Addr>,
+}
+
+impl ListenChoices {
+    /// The address `choice` listens on now; unspecified for All.
+    pub fn ip(&self, choice: &ListenOn) -> Option<Ipv4Addr> {
+        match choice {
+            ListenOn::All => Some(Ipv4Addr::UNSPECIFIED),
+            ListenOn::Adapter(name) => self
+                .adapters
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, ip)| *ip),
+            ListenOn::Tailscale => self.tailscale,
+        }
+    }
+}
+
+pub fn listen_choices() -> ListenChoices {
+    let adapters = listed().unwrap_or_default();
+    let mut named: Vec<_> = adapters
+        .iter()
+        .filter(|adapter| !adapter.name.is_empty())
+        .filter_map(|adapter| {
+            let ip = listen_ip(&ListenOn::Adapter(adapter.name.clone()), &adapters)?;
+            (!ip.is_loopback()).then(|| (adapter.name.clone(), ip))
+        })
+        .collect();
+    named.sort();
+    named.dedup_by(|a, b| a.0 == b.0);
+    ListenChoices {
+        adapters: named,
+        tailscale: listen_ip(&ListenOn::Tailscale, &adapters),
+    }
 }
 
 /// How likely an iPad on the home Wi-Fi is to reach an address, best first.
@@ -424,6 +527,7 @@ pub fn adapters() -> Option<Vec<Adapter>> {
             unicast = address.Next;
         }
         out.push(Adapter {
+            name: text(adapter.FriendlyName),
             kind: classify(
                 adapter.IfType,
                 &text(adapter.Description),
@@ -445,6 +549,7 @@ mod tests {
 
     fn adapter(kind: Kind, gateway: bool, ip: [u8; 4]) -> Adapter {
         Adapter {
+            name: format!("{kind:?}"),
             kind,
             up: true,
             gateway,
@@ -454,6 +559,81 @@ mod tests {
 
     fn ip(ip: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(ip)
+    }
+
+    fn named(name: &str, kind: Kind, ip: [u8; 4]) -> Adapter {
+        Adapter {
+            name: name.into(),
+            ..adapter(kind, kind != Kind::Vpn, ip)
+        }
+    }
+
+    #[test]
+    fn each_listen_choice_finds_its_address_or_none() {
+        let mut wifi = named("Wi-Fi", Kind::Wifi, [192, 168, 1, 20]);
+        // A routable address beats a link-local one listed first.
+        wifi.ipv4.insert(0, ip([169, 254, 3, 4]));
+        let mut tailscale = named("Tailscale", Kind::Vpn, [100, 80, 1, 2]);
+        // Some ISPs hand out 100.64/10 to a network card. That isn't Tailscale.
+        let cgnat = named("Ethernet", Kind::Ethernet, [100, 64, 0, 9]);
+        let adapters = [cgnat.clone(), wifi.clone(), tailscale.clone()];
+
+        for list in [&adapters[..], &[]] {
+            assert_eq!(listen_ip(&ListenOn::All, list), Some(Ipv4Addr::UNSPECIFIED));
+        }
+        assert_eq!(
+            listen_ip(&ListenOn::Adapter("Wi-Fi".into()), &adapters),
+            Some(ip([192, 168, 1, 20]))
+        );
+        assert_eq!(
+            listen_ip(&ListenOn::Tailscale, &adapters),
+            Some(ip([100, 80, 1, 2]))
+        );
+        assert_eq!(listen_ip(&ListenOn::Tailscale, &[cgnat, wifi]), None);
+        assert_eq!(
+            listen_ip(&ListenOn::Adapter("Ethernet 2".into()), &adapters),
+            None
+        );
+        tailscale.up = false;
+        assert_eq!(listen_ip(&ListenOn::Tailscale, &[tailscale]), None);
+    }
+
+    #[test]
+    fn a_chosen_network_that_is_not_connected_listens_on_this_pc_only() {
+        set_test_adapters(Some(vec![
+            named("Wi-Fi", Kind::Wifi, [192, 168, 1, 20]),
+            named("Loopback", Kind::Virtual, [127, 0, 0, 1]),
+        ]));
+        assert_eq!(listen_ip_now(&ListenOn::All), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            listen_ip_now(&ListenOn::Adapter("Wi-Fi".into())),
+            ip([192, 168, 1, 20])
+        );
+        assert_eq!(listen_ip_now(&ListenOn::Tailscale), Ipv4Addr::LOCALHOST);
+        let choices = listen_choices();
+        assert_eq!(
+            choices.adapters,
+            vec![("Wi-Fi".to_string(), ip([192, 168, 1, 20]))]
+        );
+        assert_eq!(choices.tailscale, None);
+        assert_eq!(choices.ip(&ListenOn::Tailscale), None);
+        assert_eq!(
+            choices.ip(&ListenOn::Adapter("Wi-Fi".into())),
+            Some(ip([192, 168, 1, 20]))
+        );
+        set_test_adapters(None);
+    }
+
+    #[test]
+    fn the_listen_choice_is_saved_as_plain_values() {
+        for (choice, json) in [
+            (ListenOn::All, r#""all""#),
+            (ListenOn::Tailscale, r#""tailscale""#),
+            (ListenOn::Adapter("Wi-Fi".into()), r#"{"adapter":"Wi-Fi"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&choice).unwrap(), json);
+            assert_eq!(serde_json::from_str::<ListenOn>(json).unwrap(), choice);
+        }
     }
 
     #[test]
@@ -681,6 +861,7 @@ mod tests {
         let adapters = [
             adapter(Kind::Vpn, false, [100, 80, 1, 2]),
             Adapter {
+                name: "Wi-Fi".into(),
                 kind: Kind::Wifi,
                 up: true,
                 gateway: true,
