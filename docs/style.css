@@ -1463,3 +1463,35 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .policy .post-list { margin-top: 16px; }
 .policy .post-update { margin-top: 20px; }
 .policy .post-update dl { margin-top: 0; }
+
+/* --- Discord link and the "Built by engineers from" strip ------------------------
+   Kept in one block at the end of the file. The Discord link reuses .nav-link. The
+   header gained a link, so it now compacts earlier: below 900px GitHub and Discord
+   drop their words (screen readers still hear them), below 800px the text links
+   go, and on phones the right-hand group tightens so the brand keeps its name. */
+
+.nav-link { white-space: nowrap; }
+.nav-link svg { flex: none; }
+@media (max-width: 900px) {
+  .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
+  .nav-link[href^="https://discord.gg/"] > span {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
+}
+@media (max-width: 800px) {
+  .nav .hide-sm { display: none !important; }
+}
+@media (max-width: 480px) {
+  .nav-links { gap: 2px; }
+  .nav-link, .nav-link[href^="https://discord.gg/"] { padding-inline: 6px; }
+  .nav .btn-sm { padding-inline: 12px; }
+  .nav .count-star { display: none; }
+}
+/* At 380px and below the star count goes too, so the brand keeps its full name. */
+@media (max-width: 380px) {
+  .nav-link .count { display: none; }
+}
