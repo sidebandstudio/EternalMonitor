@@ -25,6 +25,7 @@
 //! again, no sooner than [`BLOCKED_EXTEND_RETRY`] after Windows kept the
 //! desktop off it.
 
+pub(crate) mod facts;
 #[cfg(debug_assertions)]
 pub mod fake;
 mod memory;
@@ -38,7 +39,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
-use crate::gpu_preference::{AdapterId, GpuFacts};
+use crate::gpu_preference::AdapterId;
 use memory::{Hold, Memory};
 
 #[cfg(any(windows, test, debug_assertions))]
@@ -179,10 +180,9 @@ pub(crate) struct State {
     /// `blocked_retry_at` when that is set.
     retry_blocked: bool,
     blocked_retry_at: Option<Instant>,
-    /// The display configuration as an end-to-end test's fake display, or a
-    /// unit test, says it in place of Windows: see [`facts_now`].
-    #[cfg(debug_assertions)]
-    fake_facts: Option<std::sync::Arc<Mutex<Option<GpuFacts>>>>,
+    /// The graphics cards and the screens' wiring, as last read off the
+    /// transport loop: see [`facts`].
+    facts: facts::Cache,
     /// Whether the user's desktop is away, as an end-to-end test's fake
     /// display says in place of Windows: see [`desktop_away`].
     #[cfg(debug_assertions)]
@@ -213,8 +213,7 @@ impl State {
                 attaching: self.attaching,
                 memory: std::mem::take(&mut self.memory),
                 mirror_refused: self.mirror_refused.take(),
-                #[cfg(debug_assertions)]
-                fake_facts: self.fake_facts.take(),
+                facts: std::mem::take(&mut self.facts),
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
@@ -322,8 +321,7 @@ impl State {
             failure: Some(reason),
             memory: std::mem::take(&mut self.memory),
             mirror_refused: self.mirror_refused.take(),
-            #[cfg(debug_assertions)]
-            fake_facts: self.fake_facts.take(),
+            facts: std::mem::take(&mut self.facts),
             #[cfg(debug_assertions)]
             fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
@@ -484,6 +482,9 @@ pub fn load_memory(shared: &SharedControl) {
 /// why the iPad gets the mirror, or tries again once the wait after a saved
 /// failure is over.
 pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
+    if shared.second_screen.lock().mirror_refused.is_some() {
+        facts_cache(shared).refresh(true);
+    }
     let blocked = mirror_blocked_now(shared, |status, _| status == VddStatus::Failed);
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
@@ -566,6 +567,7 @@ pub(crate) fn note_mirror_refused(shared: &SharedControl, refusal: Option<Mirror
         state.clear_blocked_retry();
     }
     let was = std::mem::replace(&mut state.mirror_refused, refusal);
+    let refused = state.mirror_refused.is_some();
     match (&was, &state.mirror_refused) {
         (None, Some(_)) => tracing::info!(
             "Windows won't let EternalMonitor mirror the screen from this graphics card — while \
@@ -574,6 +576,11 @@ pub(crate) fn note_mirror_refused(shared: &SharedControl, refusal: Option<Mirror
         ),
         (Some(_), None) => tracing::info!("EternalMonitor can mirror the screen again"),
         _ => {}
+    }
+    let cache = state.facts.clone();
+    drop(state);
+    if refused {
+        cache.refresh(was.is_none());
     }
 }
 
@@ -584,27 +591,43 @@ pub(crate) fn mirror_refused(shared: &SharedControl) -> bool {
 
 /// Whether the mirror is blocked now: Windows refused the mirror's screen
 /// from the card EternalMonitor captures on ([`note_mirror_refused`]), and
-/// the display configuration, read now, still wires that screen to another
-/// card. Never from the last capture alone: Windows may have moved the
-/// screen back since, while the second screen ran. Reads nothing unless
-/// such a refusal is recorded and `deciding` says the caller decides
-/// something now; takes the locks only to ask, and reads with none held.
+/// a fresh snapshot of the display configuration ([`facts`]) still wires
+/// that screen to another card. Never from the last capture alone: Windows
+/// may have moved the screen back since, while the second screen ran. A
+/// snapshot that is missing, stale or from a read given up on is no
+/// evidence: then the decision goes as on any PC where the mirror works.
+/// Never reads Windows, so it never waits on a driver: while a refusal is
+/// recorded it starts a refresh, every [`facts::REFRESH_EVERY`], for later
+/// decisions. Logs only when `deciding` says the caller decides something
+/// now.
 fn mirror_blocked_now(
     shared: &SharedControl,
     deciding: impl FnOnce(VddStatus, &State) -> bool,
 ) -> bool {
-    let refusal = {
+    let (refusal, cache) = {
         let status = shared.vdd_status.lock();
         let state = shared.second_screen.lock();
-        match &state.mirror_refused {
-            Some(refusal) if deciding(*status, &state) => refusal.clone(),
-            _ => return false,
-        }
+        let Some(refusal) = &state.mirror_refused else {
+            return false;
+        };
+        let deciding = deciding(*status, &state);
+        (deciding.then(|| refusal.clone()), state.facts.clone())
     };
-    let blocked =
-        facts_now(shared).is_some_and(|facts| facts.wired_elsewhere(&refusal.screen, refusal.card));
+    cache.refresh(false);
+    let Some(refusal) = refusal else {
+        return false;
+    };
+    let facts = cache.fresh();
+    let blocked = facts
+        .as_ref()
+        .is_some_and(|facts| facts.wired_elsewhere(&refusal.screen, refusal.card));
     if !blocked {
         tracing::info!(
+            facts = if facts.is_some() {
+                "same_card"
+            } else {
+                "unavailable"
+            },
             "Windows refused the mirror before, but doesn't list its screen on another \
              graphics card now — deciding as on any PC where the mirror works"
         );
@@ -612,36 +635,26 @@ fn mirror_blocked_now(
     blocked
 }
 
-/// The graphics cards and screens as Windows reports them now, or as the
-/// fake display of a test says. Unit tests never read the PC's own.
-fn facts_now(shared: &SharedControl) -> Option<GpuFacts> {
-    #[cfg(debug_assertions)]
-    {
-        let fake = shared.second_screen.lock().fake_facts.clone();
-        if let Some(facts) = fake {
-            return facts.lock().clone();
-        }
-    }
-    let _ = shared;
-    if cfg!(test) {
-        return None;
-    }
-    crate::gpu_preference::facts()
+fn facts_cache(shared: &SharedControl) -> facts::Cache {
+    shared.second_screen.lock().facts.clone()
 }
 
-/// Have [`mirror_blocked_now`] read `facts` from now on.
+/// Have [`mirror_blocked_now`] find `facts`, as just read.
 #[cfg(test)]
-pub(crate) fn set_facts(shared: &SharedControl, facts: Option<GpuFacts>) {
-    use_fake_facts(shared, std::sync::Arc::new(Mutex::new(facts)));
+pub(crate) fn set_facts(shared: &SharedControl, facts: Option<crate::gpu_preference::GpuFacts>) {
+    facts_cache(shared).set(Instant::now(), facts);
 }
 
-/// Have [`mirror_blocked_now`] read `facts` in place of Windows.
+/// Have refreshes read `facts` in place of Windows.
 #[cfg(debug_assertions)]
 pub(crate) fn use_fake_facts(
     shared: &SharedControl,
-    facts: std::sync::Arc<Mutex<Option<GpuFacts>>>,
+    facts: std::sync::Arc<Mutex<Option<crate::gpu_preference::GpuFacts>>>,
 ) {
-    shared.second_screen.lock().fake_facts = Some(facts);
+    let lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+    let read = move || facts.lock().clone();
+    let reader = facts::Reader::new(read, lanes, crate::stall::Call::GpuFacts.limits());
+    facts_cache(shared).use_reader(reader);
 }
 
 /// Why connections mirror instead of extending, after a failed start. The

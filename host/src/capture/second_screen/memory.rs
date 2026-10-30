@@ -1526,6 +1526,143 @@ mod tests {
         remove_folder(&path);
     }
 
+    /// Run `f` on a thread of its own, and fail if it hasn't returned
+    /// within 10 s: it waited on a read of the graphics cards.
+    fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(f());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what} waited on the graphics cards"))
+    }
+
+    /// The mirror refused with its screen on the other card, as the
+    /// capture's own read found it, while refreshes read `reader`.
+    fn refuse_reading(shared: &SharedControl, reader: super::super::facts::Reader) {
+        super::super::facts_cache(shared).use_reader(reader);
+        crate::capture::note_gpu_refused(
+            shared,
+            r"\\.\DISPLAY1",
+            Some(hybrid_laptop(true)),
+            Some(NVIDIA),
+        );
+    }
+
+    /// Review round 2: reading the graphics cards is a driver call. One that
+    /// never returns must not hold up the transport: a connection and the
+    /// steps after it go on at once, and decide as on a PC where the mirror
+    /// works (a saved failure keeps the iPad on the mirror). One read runs,
+    /// however many passes ask.
+    #[test]
+    fn a_stuck_graphics_card_read_never_delays_a_connection_or_a_step() {
+        use super::super::facts::tests::stuck_reader;
+        let path = temp_file("stuck-facts");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start).unwrap();
+        let (memory, start) = app_run(&path, Duration::from_secs(600));
+        let shared = second_screen_with(memory);
+        *shared.vdd_status.lock() = VddStatus::Failed;
+        let (reader, reads, release) =
+            stuck_reader(Some(hybrid_laptop(true)), super::super::facts::tests::QUICK);
+        refuse_reading(&shared, reader);
+        connect_viewer(&shared);
+        let deciding = shared.clone();
+        let steps = within("a connection", move || {
+            note_connected(&deciding, start);
+            (0..40)
+                .map(|tick| next_step(&deciding, start + Duration::from_millis(250 * tick)))
+                .collect::<Vec<_>>()
+        });
+        assert!(steps.iter().all(|step| *step == Step::Nothing), "{steps:?}");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed, "held");
+        let read = || reads.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while read() == 0 {
+            assert!(Instant::now() < deadline, "the refusal's refresh began");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(read(), 1, "one read");
+        drop(release);
+        remove_folder(&path);
+    }
+
+    /// A fresh snapshot that a refresh read, with the screen on the other
+    /// card, still keeps a start that times out from being saved for an
+    /// hour.
+    #[test]
+    fn a_fresh_card_mismatch_still_keeps_the_failure_unsaved() {
+        let path = temp_file("fresh-facts");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        let reader = super::super::facts::Reader::new(
+            || Some(hybrid_laptop(true)),
+            Box::leak(Box::new(crate::stall::Lanes::new())),
+            super::super::facts::tests::QUICK,
+        );
+        refuse_reading(&shared, reader);
+        let cache = super::super::facts_cache(&shared);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while cache.fresh().is_none() {
+            assert!(Instant::now() < deadline, "the refusal's refresh read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches::new(start);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert!(!exists(&path), "nothing saved");
+        let later = driver.now() + Duration::from_secs(60);
+        reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Attach, "tried again");
+        written(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Review round 2: a snapshot with the screen on the other card that is
+    /// stale, or whose refresh was given up on, is no evidence: the failure
+    /// is saved and the next connection mirrors, as on the candidate.
+    #[test]
+    fn a_stale_or_timed_out_card_mismatch_saves_the_failure_as_before() {
+        use super::super::facts::tests::{stuck_reader, PATIENT, QUICK};
+        use super::super::facts::FRESH_FOR;
+        for timed_out in [false, true] {
+            let path = temp_file("stale-facts");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            // A stale snapshot's refresh never returns meanwhile.
+            let limits = if timed_out { QUICK } else { PATIENT };
+            let (reader, _reads, release) = stuck_reader(Some(hybrid_laptop(true)), limits);
+            refuse_reading(&shared, reader);
+            let cache = super::super::facts_cache(&shared);
+            if timed_out {
+                set_facts(&shared, Some(hybrid_laptop(true)));
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while cache.fresh().is_some() {
+                    assert!(Instant::now() < deadline, "the stuck read is given up on");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                let old = Instant::now().checked_sub(FRESH_FOR).unwrap();
+                cache.set(old, Some(hybrid_laptop(true)));
+            }
+            connect_viewer(&shared);
+            let deciding = shared.clone();
+            let later = within("a start", move || {
+                assert_eq!(next_step(&deciding, start), Step::Attach);
+                let driver = NeverAttaches::new(start);
+                attach(&deciding, &driver, ATTACH_TIMEOUT);
+                driver.now() + Duration::from_secs(60)
+            });
+            assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+            reconnect(&shared, later);
+            assert_eq!(next_step(&shared, later), Step::Nothing, "the mirror");
+            drop(release);
+            remove_folder(&path);
+        }
+    }
+
     /// Review round 1: while the mirror is blocked and Windows keeps showing
     /// the second screen as a copy of the main one, every connection turned
     /// the display on and off again. Now the next start waits
