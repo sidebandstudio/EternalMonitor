@@ -1537,13 +1537,15 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 
 /* --- Discord link and the "Built by engineers from" strip ------------------------
    Kept in one block at the end of the file. The Discord link reuses .nav-link. The
-   header gained a link, so it now compacts earlier: below 900px GitHub and Discord
-   drop their words (screen readers still hear them), below 800px the text links
-   go, and on phones the right-hand group tightens so the brand keeps its name. */
+   header gained a link, so it now compacts earlier: below 940px GitHub and Discord
+   drop their words (screen readers still hear them), below 820px the text links
+   go, and on phones the right-hand group tightens so the brand keeps its name.
+   Away from English the labels run longer, so the two keep only their icons at
+   every width. */
 
 .nav-link { white-space: nowrap; }
 .nav-link svg { flex: none; }
-@media (max-width: 900px) {
+@media (max-width: 940px) {
   .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
   .nav-link[href^="https://discord.gg/"] > span {
     position: absolute;
@@ -1553,7 +1555,17 @@ html.js .reveal.visible { opacity: 1; transform: none; }
   }
   .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
 }
-@media (max-width: 800px) {
+.not-english .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
+.not-english .nav-link[href^="https://discord.gg/"] > span {
+  position: absolute;
+  width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media (min-width: 481px) {
+  .not-english .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
+}
+@media (max-width: 820px) {
   .nav .hide-sm { display: none !important; }
 }
 @media (max-width: 480px) {
@@ -1562,9 +1574,9 @@ html.js .reveal.visible { opacity: 1; transform: none; }
   .nav .btn-sm { padding-inline: 12px; }
   .nav .count-star { display: none; }
 }
-/* At 420px and below the star count goes too, so the brand keeps its full name
+/* At 500px and below the star count goes too, so the brand keeps its full name
    beside the language switcher. */
-@media (max-width: 420px) {
+@media (max-width: 500px) {
   .nav-link .count { display: none; }
 }
 
@@ -1573,6 +1585,15 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .brand-mark, .brand > img, .nav-links { flex: none; }
 @media (max-width: 360px) {
   .brand > span:last-child {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+/* Away from English the English toggle takes that room up to 374px. */
+@media (max-width: 374px) {
+  .not-english .brand > span:last-child {
     position: absolute;
     width: 1px; height: 1px;
     overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
@@ -1801,13 +1822,13 @@ html:lang(ko) { word-break: keep-all; }
     white-space: nowrap;
   }
 }
-@media (max-width: 380px) {
+@media (max-width: 390px) {
   .lang-button::after { display: none; }
 }
 /* Narrow desktops: the switcher keeps only its globe, and away from English
    the page links (also in the footer) give way to the toggle; with the
    Discord link in the bar, translated links need that room up to 1180px. */
-@media (max-width: 960px) {
+@media (max-width: 990px) {
   .lang-button .lang-name {
     position: absolute;
     width: 1px; height: 1px;
@@ -1818,7 +1839,8 @@ html:lang(ko) { word-break: keep-all; }
 @media (max-width: 1180px) {
   .not-english .nav-links > .hide-sm { display: none; }
 }
-@media (max-width: 340px) {
+/* English phones under 400px: the GitHub link (also in the footer) goes too. */
+@media (max-width: 400px) {
   .nav-links > a[href*="github.com"] { display: none; }
 }
 /* Longer translated labels may wrap on phones rather than widen the page. */
