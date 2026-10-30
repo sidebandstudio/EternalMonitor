@@ -21,7 +21,7 @@ impl AnalyzerApp {
         let copied = self.recently_copied(Copied::Logs);
         page_header(
             ui,
-            "Performance",
+            crate::i18n::tr("Performance"),
             "Live measurements from capture, encoding and the network on this PC.",
             |ui| {
                 let label = if copied { "Copied" } else { "Copy logs" };

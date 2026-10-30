@@ -1,14 +1,17 @@
 //! Components for the host window. Every interactive piece reports a role
 //! and label through AccessKit, so UI Automation and the snapshot harness
-//! address them by their visible text.
+//! address them by their visible text, in English: a translated label is
+//! named by its English text (`i18n::name`), in every language.
 
 use std::ops::RangeInclusive;
 
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Align, Color32, CursorIcon, FontFamily, FontId, Frame, Key,
-    Label, Layout, Margin, Mesh, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
-    TextFormat, Ui, WidgetInfo, WidgetType,
+    self, pos2, text::LayoutJob, vec2, Align, Color32, CursorIcon, FontFamily, FontId,
+    FontSelection, Frame, Key, Label, Layout, Margin, Mesh, Pos2, Rect, Response, RichText, Sense,
+    Shape, Stroke, StrokeKind, TextFormat, TextWrapMode, Ui, WidgetInfo, WidgetText, WidgetType,
 };
+
+use crate::i18n;
 
 use super::icons::{self, Icon};
 use super::theme::*;
@@ -59,7 +62,8 @@ pub fn card_header(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
         vec2(width, BUTTON_HEIGHT),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.label(heading(title));
+            let response = ui.label(heading(title));
+            name_label(&response, title);
             ui.with_layout(Layout::right_to_left(Align::Center), right);
         },
     );
@@ -74,13 +78,58 @@ pub fn divider(ui: &mut Ui) {
 
 pub fn section_label(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
-    ui.add(Label::new(overline(text)));
+    overline_label(ui, text);
     ui.add_space(2.0);
+}
+
+/// An [`overline`], named by its English text in capitals, as it reads.
+pub fn overline_label(ui: &mut Ui, text: &str) -> Response {
+    let response = ui.add(Label::new(overline(text)));
+    let name = i18n::name(text);
+    if name != text {
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, name.to_uppercase()));
+    }
+    response
 }
 
 /// Wrapped text that fills the available width.
 pub fn paragraph(ui: &mut Ui, text: RichText) -> Response {
     ui.add(Label::new(text).wrap())
+}
+
+/// Names a label showing a translation by its English text, for UI
+/// Automation (see `i18n::name`).
+pub fn name_label(response: &Response, shown: &str) {
+    let name = i18n::name(shown);
+    if name != shown {
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, name));
+    }
+}
+
+/// `shown` in `style`, wrapped to the available width. Arabic is broken into
+/// lines in reading order before each line is reordered for drawing (see
+/// `i18n::bidi`); egui would otherwise wrap the reordered text.
+pub fn wrapped(ui: &mut Ui, shown: &str, style: impl Fn(String) -> RichText) -> Response {
+    let Some(logical) = i18n::logical(shown) else {
+        let response = ui.add(Label::new(style(shown.to_string())).wrap());
+        name_label(&response, shown);
+        return response;
+    };
+    let width = ui.available_width() - 1.0;
+    let lines = i18n::bidi::wrap(logical, width, |line| {
+        WidgetText::from(style(line.to_string()))
+            .into_galley(
+                ui,
+                Some(TextWrapMode::Extend),
+                f32::INFINITY,
+                FontSelection::Default,
+            )
+            .size()
+            .x
+    });
+    let response = ui.add(Label::new(style(lines)).extend());
+    name_label(&response, shown);
+    response
 }
 
 // ── Buttons ─────────────────────────────────────────────────────────────────
@@ -120,7 +169,7 @@ pub fn button_ex(
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, i18n::name(label)));
 
     if ui.is_rect_visible(rect) {
         let hovered = enabled && response.hovered();
@@ -204,7 +253,7 @@ pub fn button_ex(
 /// Square icon-only button. `label` is its tooltip and accessible name.
 pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, i18n::name(label)));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let pressed = response.is_pointer_button_down_on();
@@ -253,7 +302,7 @@ fn link_like(ui: &mut Ui, label: &str, icon: Icon, role: WidgetType) -> Response
     );
     let size = galley.size() + vec2(16.0 + 5.0, 0.0);
     let (rect, response) = ui.allocate_exact_size(vec2(size.x, size.y.max(20.0)), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(role, true, label));
+    response.widget_info(|| WidgetInfo::labeled(role, true, i18n::name(label)));
     if ui.is_rect_visible(rect) {
         let hover =
             ui.ctx()
@@ -396,7 +445,12 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
     {
         let selected = *value == *option;
         response.widget_info(|| {
-            WidgetInfo::selected(WidgetType::SelectableLabel, enabled, selected, *label)
+            WidgetInfo::selected(
+                WidgetType::SelectableLabel,
+                enabled,
+                selected,
+                i18n::name(label),
+            )
         });
         let hover = ui.ctx().animate_bool_with_time(
             response.id.with("hover"),
@@ -570,9 +624,9 @@ fn row_with_leading(
             .allocate_ui_with_layout(vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(text_width);
                 ui.spacing_mut().item_spacing.y = 3.0;
-                ui.add(Label::new(strong(title)).wrap());
+                wrapped(ui, title, strong);
                 if !description.is_empty() {
-                    ui.add(Label::new(muted(description)).wrap());
+                    wrapped(ui, description, muted);
                 }
             })
             .response;
@@ -708,7 +762,7 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
     );
     let size = galley.size() + vec2(18.0, 8.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, i18n::name(text)));
     ui.painter().rect(
         rect,
         size.y / 2.0,
@@ -817,7 +871,7 @@ pub fn empty_state(ui: &mut Ui, icon: Icon, title: &str, hint: &str) {
             TEXT_MUTED,
         );
         ui.add_space(4.0);
-        ui.label(strong(title));
+        wrapped(ui, title, strong);
         ui.add(Label::new(muted(hint)).wrap());
         ui.add_space(6.0);
     });
@@ -959,8 +1013,17 @@ pub fn combo(
     selected: &str,
     width: f32,
 ) -> egui::ComboBox {
+    combo_rich(id, RichText::new(selected), width)
+}
+
+/// [`combo`] showing `selected` in its own font, e.g. a language's name.
+pub fn combo_rich(
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected: RichText,
+    width: f32,
+) -> egui::ComboBox {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(RichText::new(selected).size(13.0).color(TEXT))
+        .selected_text(selected.size(13.0).color(TEXT))
         .width(width)
         .height(360.0)
         .icon(|ui, rect, _visuals, open| {
@@ -1007,4 +1070,116 @@ pub fn card_pair(
     }
     a.end(left_ui);
     b.end(right_ui);
+}
+
+// ── Choices ─────────────────────────────────────────────────────────────────
+
+/// One of a few options, as a card: a radio mark, a title and a line under
+/// it. Setup's choices.
+pub fn choice_card(
+    ui: &mut Ui,
+    selected: bool,
+    title: &str,
+    description: &str,
+    size: egui::Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(WidgetType::RadioButton, true, selected, i18n::name(title))
+    });
+    if ui.is_rect_visible(rect) {
+        let hover =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+        let chosen = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("selected"), selected, 0.14);
+        ui.painter().rect(
+            rect,
+            10.0,
+            SURFACE
+                .lerp_to_gamma(SURFACE_RAISED, hover)
+                .lerp_to_gamma(mix(SURFACE, ACCENT, 7), chosen),
+            Stroke::new(1.0, BORDER_STRONG.lerp_to_gamma(ACCENT, chosen)),
+            StrokeKind::Inside,
+        );
+        focus_ring(ui, &response, rect, 10.0);
+        // The radio mark.
+        let mark = pos2(rect.left() + 22.0, rect.top() + 22.0);
+        ui.painter().circle_stroke(
+            mark,
+            7.0,
+            Stroke::new(1.5, TEXT_FAINT.lerp_to_gamma(ACCENT, chosen)),
+        );
+        if chosen > 0.0 {
+            ui.painter()
+                .circle_filled(mark, 3.5 * chosen, ACCENT.gamma_multiply(chosen));
+        }
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 42.0, rect.top() + 13.0),
+            pos2(rect.right() - 14.0, rect.bottom() - 10.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        child.spacing_mut().item_spacing.y = 2.0;
+        wrapped(&mut child, title, strong);
+        if !description.is_empty() {
+            wrapped(&mut child, description, muted);
+        }
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A compact option showing `text` in its own font: a language in setup.
+/// `name` is its automation name.
+pub fn choice_tile(
+    ui: &mut Ui,
+    selected: bool,
+    text: RichText,
+    name: &str,
+    size: egui::Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, selected, name));
+    if ui.is_rect_visible(rect) {
+        let hover =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+        let chosen = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("selected"), selected, 0.14);
+        ui.painter().rect(
+            rect,
+            9.0,
+            SURFACE
+                .lerp_to_gamma(SURFACE_RAISED, hover)
+                .lerp_to_gamma(mix(SURFACE, ACCENT, 7), chosen),
+            Stroke::new(1.0, BORDER_STRONG.lerp_to_gamma(ACCENT, chosen)),
+            StrokeKind::Inside,
+        );
+        focus_ring(ui, &response, rect, 9.0);
+        let galley = WidgetText::from(text.size(13.5).color(TEXT)).into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            rect.width() - 44.0,
+            FontSelection::Default,
+        );
+        let pos = pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(pos, galley, TEXT);
+        if chosen > 0.0 {
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    pos2(rect.right() - 18.0, rect.center().y),
+                    vec2(14.0, 14.0),
+                ),
+                Icon::Check,
+                ACCENT.gamma_multiply(chosen),
+            );
+        }
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }

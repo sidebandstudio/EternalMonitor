@@ -2,28 +2,35 @@
 
 use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense, Ui};
 
+use super::fonts::name_family;
 use super::page_performance::page_header;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{AnalyzerApp, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL};
+use crate::i18n::{self, tr, trf, Lang};
 
 impl AnalyzerApp {
     pub(super) fn settings_page(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
-        page_header(ui, "Settings", "Changes save automatically.", |_| {});
+        page_header(
+            ui,
+            tr("Settings"),
+            tr("Changes save automatically."),
+            |_| {},
+        );
         self.restart_notice(ui);
 
         // ── Display ─────────────────────────────────────────────────────────
-        widgets::section_label(ui, "Display");
+        widgets::section_label(ui, tr("Display"));
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut refresh = false;
             widgets::setting_row(
                 ui,
-                "How the iPad shows your PC",
+                tr("How the iPad shows your PC"),
                 "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
                 300.0,
                 |ui| {
-                    refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, "Refresh displays").clicked();
+                    refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, tr("Refresh displays")).clicked();
                     self.display_picker(ui, 250.0);
                 },
             );
@@ -35,7 +42,7 @@ impl AnalyzerApp {
             let extending = self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL;
             widgets::setting_row(
                 ui,
-                "Match the iPad's resolution",
+                tr("Match the iPad's resolution"),
                 vdd_match_description(extending),
                 64.0,
                 |ui| {
@@ -53,7 +60,7 @@ impl AnalyzerApp {
             };
             widgets::setting_row(
                 ui,
-                "Frame rate",
+                tr("Frame rate"),
                 &env_or(fps_env, "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less."),
                 230.0,
                 |ui| {
@@ -69,7 +76,7 @@ impl AnalyzerApp {
             let mut bitrate = self.settings_bitrate_mbps;
             widgets::setting_row(
                 ui,
-                "Video quality limit",
+                tr("Video quality limit"),
                 "Higher is sharper but needs a stronger network. The stream lowers it by itself when the network is busy.",
                 290.0,
                 |ui| {
@@ -87,7 +94,7 @@ impl AnalyzerApp {
         ui.add_space(GAP - 6.0);
 
         // ── Audio ───────────────────────────────────────────────────────────
-        widgets::section_label(ui, "Audio");
+        widgets::section_label(ui, tr("Audio"));
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let enabled = self
@@ -98,7 +105,7 @@ impl AnalyzerApp {
             let mut audio = enabled;
             widgets::setting_row(
                 ui,
-                "Stream PC audio",
+                tr("Stream PC audio"),
                 "Plays this PC's sound on the iPad. Video keeps streaming if audio fails.",
                 64.0,
                 |ui| {
@@ -112,14 +119,14 @@ impl AnalyzerApp {
         ui.add_space(GAP - 6.0);
 
         // ── Security ────────────────────────────────────────────────────────
-        widgets::section_label(ui, "Security");
+        widgets::section_label(ui, tr("Security"));
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let required = self.control.shared.pairing.lock().required;
             let mut require = required;
             widgets::setting_row(
                 ui,
-                "Require pairing",
+                tr("Require pairing"),
                 "New iPads on Wi-Fi type the pairing code shown on the Stream page once. USB needs no code.",
                 64.0,
                 |ui| {
@@ -133,11 +140,11 @@ impl AnalyzerApp {
             let mut forget = false;
             widgets::setting_row(
                 ui,
-                "Forget all iPads",
+                tr("Forget all iPads"),
                 "Creates a new pairing key. Every iPad has to pair again.",
-                170.0,
+                190.0,
                 |ui| {
-                    forget = widgets::button(ui, Tone::Danger, None, "Forget all iPads").clicked();
+                    forget = widgets::button(ui, Tone::Danger, None, tr("Forget all iPads")).clicked();
                 },
             );
             if forget {
@@ -151,14 +158,32 @@ impl AnalyzerApp {
         ui.add_space(GAP - 6.0);
 
         // ── General ─────────────────────────────────────────────────────────
-        widgets::section_label(ui, "General");
+        widgets::section_label(ui, tr("General"));
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            widgets::setting_row(ui, tr("Language"), "", 250.0, |ui| {
+                self.language_picker(ui, 230.0);
+            });
+            widgets::divider(ui);
+            let mut setup = false;
+            widgets::setting_row(
+                ui,
+                tr("Setup"),
+                "Go through the first-run choices again: language, startup, how the iPad connects and what it shows.",
+                210.0,
+                |ui| {
+                    setup = widgets::button(ui, Tone::Secondary, None, tr("Run setup again")).clicked();
+                },
+            );
+            if setup {
+                self.open_setup();
+            }
+            widgets::divider(ui);
             if cfg!(windows) {
                 let mut boot = self.settings_start_on_boot;
                 widgets::setting_row(
                     ui,
-                    "Start with Windows",
+                    tr("Start with Windows"),
                     "Opens EternalMonitor when you sign in, so your iPad can connect right away.",
                     64.0,
                     |ui| {
@@ -187,7 +212,7 @@ impl AnalyzerApp {
         ui.add_space(GAP - 6.0);
 
         // ── About ───────────────────────────────────────────────────────────
-        widgets::section_label(ui, "About");
+        widgets::section_label(ui, tr("About"));
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -205,8 +230,11 @@ impl AnalyzerApp {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(heading("EternalMonitor"));
                     ui.label(muted(format!(
-                        "Version {} · Built by Sideband Studio",
-                        env!("CARGO_PKG_VERSION")
+                        "{} · Built by Sideband Studio",
+                        trf(
+                            "Version {version}",
+                            &[("version", env!("CARGO_PKG_VERSION"))]
+                        )
                     )));
                 });
             });
@@ -217,17 +245,43 @@ impl AnalyzerApp {
                 widgets::link(ui, "sideband.studio", "https://sideband.studio");
                 widgets::link(
                     ui,
-                    "Source code",
+                    tr("Source code"),
                     "https://github.com/sidebandstudio/EternalMonitor",
                 );
-                feedback =
-                    widgets::link_button(ui, "Send feedback", super::icons::Icon::Mail).clicked();
+                feedback = widgets::link_button(ui, tr("Send feedback"), super::icons::Icon::Mail)
+                    .clicked();
                 widgets::link(ui, "hello@sideband.studio", "mailto:hello@sideband.studio");
             });
             if feedback {
                 self.open_feedback();
             }
         });
+    }
+}
+
+impl AnalyzerApp {
+    /// "System language" and the eleven languages, each by its own name.
+    fn language_picker(&mut self, ui: &mut Ui, width: f32) {
+        let chosen = self.language_choice();
+        let label = |lang: Option<Lang>| match lang {
+            None => RichText::new(tr("System language")),
+            Some(lang) => RichText::new(lang.native_name()).family(name_family(lang)),
+        };
+        let mut choice = None;
+        widgets::combo_rich(ui.id().with("language"), label(chosen), width).show_ui(ui, |ui| {
+            ui.set_min_width(width);
+            for option in std::iter::once(None).chain(Lang::ALL.map(Some)) {
+                if ui
+                    .selectable_label(option == chosen, label(option))
+                    .clicked()
+                {
+                    choice = Some(option.map_or(i18n::SYSTEM, Lang::code));
+                }
+            }
+        });
+        if let Some(choice) = choice {
+            self.set_language(&ui.ctx().clone(), choice);
+        }
     }
 }
 

@@ -11,9 +11,14 @@
 //!   opens when clicked;
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
 //! - in the sidebar, "Send feedback" and the GitHub star card (see
-//!   `feedback_panel.rs`).
+//!   `feedback_panel.rs`);
+//! - in first-run setup, "Next", "Back", "Skip setup" and "Done".
+//!
+//! These names stay English in every language: widgets name translated text
+//! by its English key (`crate::i18n::name`).
 
 mod feedback_panel;
+mod fonts;
 mod icons;
 mod page_performance;
 mod page_settings;
@@ -21,6 +26,7 @@ mod page_stream;
 mod page_troubleshooting;
 mod port_notice;
 pub(crate) mod renderer;
+mod setup;
 mod theme;
 mod update_banner;
 mod update_toast;
@@ -40,6 +46,7 @@ use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
+use crate::i18n::{self, tr, trf, Lang};
 use crate::relaunch::Reason;
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
@@ -352,15 +359,23 @@ pub struct AnalyzerApp {
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
+    /// The saved language choice (see `i18n::resolve`).
+    settings_language: Option<String>,
+    /// A language whose fonts were just installed; it shows from the next
+    /// frame, when egui uses them.
+    pending_language: Option<Lang>,
+    /// First-run setup, while open.
+    setup: Option<setup::Setup>,
 }
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
-        theme::install(&cc.egui_ctx);
-
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
+        let language = theme::install(&cc.egui_ctx, i18n::resolve(persisted.language.as_deref()));
+        i18n::activate(language);
+        info!(language = language.code(), "Window language");
 
         let runtime_bitrate_mbps =
             control.shared.bitrate_bps.load(Ordering::SeqCst) as f32 / 1_000_000.0;
@@ -511,6 +526,9 @@ impl AnalyzerApp {
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
+            settings_language: persisted.language,
+            pending_language: None,
+            setup: crate::settings::fresh_install().then(setup::Setup::default),
         }
     }
 
@@ -557,6 +575,7 @@ impl AnalyzerApp {
             star_clicked: self.star_clicked,
             window_drawing: self.settings_window_drawing,
             gpu_switch: self.control.shared.gpu_switch.lock().clone(),
+            language: self.settings_language.clone(),
         }
     }
 }
@@ -724,6 +743,34 @@ impl AnalyzerApp {
                 self.persist_settings();
             }
             Err(error) => self.settings_error = Some(error),
+        }
+    }
+
+    /// `choice` is a language code or `i18n::SYSTEM`. The window redraws in
+    /// it from the next frame, once its fonts are in.
+    fn set_language(&mut self, ctx: &egui::Context, choice: &str) {
+        if self.settings_language.as_deref() == Some(choice) {
+            return;
+        }
+        self.settings_language = Some(choice.to_string());
+        self.persist_settings();
+        let language = theme::set_language(ctx, i18n::resolve(Some(choice)));
+        info!(
+            choice,
+            language = language.code(),
+            "Window language changed"
+        );
+        self.pending_language = Some(language);
+        ctx.request_repaint();
+    }
+
+    /// What the language picker shows as chosen: `None` for System
+    /// language. Before a choice in the app, the installer's.
+    fn language_choice(&self) -> Option<Lang> {
+        match self.settings_language.as_deref() {
+            Some(i18n::SYSTEM) => None,
+            Some(code) => Lang::from_code(code).or_else(i18n::installer_language),
+            None => i18n::installer_language(),
         }
     }
 
@@ -979,6 +1026,9 @@ impl eframe::App for AnalyzerApp {
         renderer::frame_started(ui.ctx());
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
+        if let Some(language) = self.pending_language.take() {
+            i18n::activate(language);
+        }
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= Duration::from_millis(800) {
                 self.settings_dirty_at = None;
@@ -1059,6 +1109,7 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
+        self.draw_setup(&ctx, &snap);
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
     }
@@ -1119,10 +1170,10 @@ impl AnalyzerApp {
                 self.draw_brand(ui);
                 ui.add_space(26.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
-                let stream = self.nav_item(ui, Page::Stream, Icon::Display, "Stream");
+                let stream = self.nav_item(ui, Page::Stream, Icon::Display, tr("Stream"));
                 let performance =
-                    self.nav_item(ui, Page::Performance, Icon::Activity, "Performance");
-                let settings = self.nav_item(ui, Page::Settings, Icon::Sliders, "Settings");
+                    self.nav_item(ui, Page::Performance, Icon::Activity, tr("Performance"));
+                let settings = self.nav_item(ui, Page::Settings, Icon::Sliders, tr("Settings"));
                 // A lime bar marks the open page and slides to the one clicked.
                 let active = match self.page {
                     Page::Stream => stream,
@@ -1141,11 +1192,15 @@ impl AnalyzerApp {
                 );
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    ui.label(faint(trf(
+                        "Version {version}",
+                        &[("version", env!("CARGO_PKG_VERSION"))],
+                    )));
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
                     ui.add_space(6.0);
-                    if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
+                    if feedback_panel::sidebar_action(ui, Icon::Mail, tr("Send feedback")).clicked()
+                    {
                         self.open_feedback();
                     }
                     ui.add_space(2.0);
@@ -1185,7 +1240,9 @@ impl AnalyzerApp {
     fn nav_item(&mut self, ui: &mut egui::Ui, page: Page, icon: Icon, label: &str) -> Rect {
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, i18n::name(label))
+        });
         if response.clicked() {
             self.page = page;
         }
@@ -1240,13 +1297,19 @@ impl AnalyzerApp {
 fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
     let state = StreamState::of(snap, client);
     let (title, detail) = match state {
-        StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
-        StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
+        StreamState::Off => (
+            tr("Stopped").to_string(),
+            tr("Streaming is off").to_string(),
+        ),
+        StreamState::Ready => (
+            tr("Ready").to_string(),
+            tr("Waiting for an iPad").to_string(),
+        ),
         StreamState::Streaming | StreamState::Paused => (
             if state == StreamState::Paused {
-                "Paused"
+                tr("Paused")
             } else {
-                "Streaming"
+                tr("Streaming")
             }
             .to_string(),
             format!(
@@ -1273,8 +1336,10 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
                 widgets::status_dot(ui, dot.center(), state.color(), 4.0, state.dot());
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(strong(title));
-                    ui.add(egui::Label::new(faint(detail)).truncate());
+                    let response = ui.label(strong(&title));
+                    widgets::name_label(&response, &title);
+                    let response = ui.add(egui::Label::new(faint(&detail)).truncate());
+                    widgets::name_label(&response, &detail);
                 });
             });
         });
@@ -1326,29 +1391,21 @@ fn logo_texture(ctx: &egui::Context, pixels: usize) -> Option<egui::TextureHandl
 
 impl AnalyzerApp {
     fn open_qr(&mut self, snap: &StatsSnapshot) {
-        // Re-resolve the LAN address on open — DHCP renews and interface
-        // changes would otherwise leave the QR encoding a stale IP from
-        // process start.
-        if let Some(port) = snap
-            .listen_addr
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<u16>().ok())
-        {
-            // Resolved before locking: the stats lock is shared with every
-            // pipeline thread.
-            let listen_addr = detect_local_ip(port);
-            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
-        }
+        refresh_listen_addr(snap);
         self.show_qr_modal = true;
     }
 
-    fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
-        let listen_addr = if snap.listen_addr.is_empty() {
+    /// The address the QR code and the pairing step show.
+    fn qr_address(&self, snap: &StatsSnapshot) -> String {
+        if snap.listen_addr.is_empty() {
             self.control.shared.target_addr.lock().to_string()
         } else {
             snap.listen_addr.clone()
-        };
+        }
+    }
+
+    /// The pairing QR code on a white tile `tile` points wide.
+    fn qr_tile(&mut self, ui: &mut egui::Ui, listen_addr: &str, tile: f32) {
         let url = format!(
             "eternaldisplay://{}?t={}",
             listen_addr,
@@ -1370,7 +1427,43 @@ impl AnalyzerApp {
                 }
             }
         }
+        let (rect, _) = ui.allocate_exact_size(vec2(tile, tile), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 14.0, Color32::WHITE);
+        match self.qr_cache.as_ref().map(|(_, code)| code) {
+            Some(code) => {
+                let width = code.width();
+                let modules = code.to_colors();
+                let quiet = 16.0_f32 * tile / 244.0;
+                let module = ((tile - 2.0 * quiet) / width as f32).floor().max(1.0);
+                let offset = (tile - module * width as f32) / 2.0;
+                let origin = rect.min + vec2(offset, offset);
+                for y in 0..width {
+                    for x in 0..width {
+                        if matches!(modules[y * width + x], QrModuleColor::Dark) {
+                            let cell = Rect::from_min_size(
+                                origin + vec2(x as f32 * module, y as f32 * module),
+                                vec2(module, module),
+                            );
+                            painter.rect_filled(cell, 0.0, Color32::BLACK);
+                        }
+                    }
+                }
+            }
+            None => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "The QR code could not be created",
+                    egui::FontId::new(SMALL, egui::FontFamily::Proportional),
+                    DANGER,
+                );
+            }
+        }
+    }
 
+    fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
+        let listen_addr = self.qr_address(snap);
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::new("qr-dialog"))
             .backdrop_color(Color32::from_black_alpha(175))
@@ -1391,13 +1484,15 @@ impl AnalyzerApp {
                 ui.set_width(320.0);
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.vertical_centered(|ui| {
-                    ui.label(overline("QR code"));
-                    ui.label(
-                        egui::RichText::new("Scan to connect")
+                    widgets::overline_label(ui, tr("QR code"));
+                    let title = tr("Scan to connect");
+                    let response = ui.label(
+                        egui::RichText::new(title)
                             .family(semibold())
                             .size(20.0)
                             .color(TEXT),
                     );
+                    widgets::name_label(&response, title);
                     ui.add(
                         egui::Label::new(muted(
                             "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
@@ -1405,40 +1500,7 @@ impl AnalyzerApp {
                         .wrap(),
                     );
                     ui.add_space(12.0);
-                    let tile = 244.0;
-                    let (rect, _) = ui.allocate_exact_size(vec2(tile, tile), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 14.0, Color32::WHITE);
-                    match self.qr_cache.as_ref().map(|(_, code)| code) {
-                        Some(code) => {
-                            let width = code.width();
-                            let modules = code.to_colors();
-                            let quiet = 16.0_f32;
-                            let module = ((tile - 2.0 * quiet) / width as f32).floor().max(1.0);
-                            let offset = (tile - module * width as f32) / 2.0;
-                            let origin = rect.min + vec2(offset, offset);
-                            for y in 0..width {
-                                for x in 0..width {
-                                    if matches!(modules[y * width + x], QrModuleColor::Dark) {
-                                        let cell = Rect::from_min_size(
-                                            origin + vec2(x as f32 * module, y as f32 * module),
-                                            vec2(module, module),
-                                        );
-                                        painter.rect_filled(cell, 0.0, Color32::BLACK);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "The QR code could not be created",
-                                egui::FontId::new(SMALL, egui::FontFamily::Proportional),
-                                DANGER,
-                            );
-                        }
-                    }
+                    self.qr_tile(ui, &listen_addr, 244.0);
                     ui.add_space(12.0);
                     ui.label(mono(listen_addr.clone(), 14.0));
                     ui.add(
@@ -1449,7 +1511,7 @@ impl AnalyzerApp {
                     );
                     ui.add_space(14.0);
                     let width = ui.available_width();
-                    if widgets::button_ex(ui, Tone::Primary, None, "Done", true, width).clicked() {
+                    if widgets::button_ex(ui, Tone::Primary, None, tr("Done"), true, width).clicked() {
                         close = true;
                     }
                 });
@@ -1457,6 +1519,23 @@ impl AnalyzerApp {
         if close || modal.should_close() {
             self.show_qr_modal = false;
         }
+    }
+}
+
+/// Re-resolves the LAN address before it is shown for pairing — DHCP renews
+/// and interface changes would otherwise leave the QR encoding a stale IP
+/// from process start.
+fn refresh_listen_addr(snap: &StatsSnapshot) {
+    if let Some(port) = snap
+        .listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        // Resolved before locking: the stats lock is shared with every
+        // pipeline thread.
+        let listen_addr = detect_local_ip(port);
+        PIPELINE_STATS.lock().set_listen_addr(listen_addr);
     }
 }
 

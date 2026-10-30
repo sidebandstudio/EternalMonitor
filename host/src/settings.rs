@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -58,6 +59,11 @@ pub struct SettingsFile {
     /// after the relaunch and for Undo.
     #[serde(default)]
     pub gpu_switch: Option<crate::gpu_preference::SwitchRecord>,
+    /// The window's language: a code such as `de`, `system` for the
+    /// Windows display language, or none until one is picked in the app,
+    /// when the installer's choice applies (see `i18n::resolve`).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +96,7 @@ impl Default for SettingsFile {
             star_clicked: false,
             window_drawing: Default::default(),
             gpu_switch: None,
+            language: None,
         }
     }
 }
@@ -196,6 +203,21 @@ fn settings_path() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
 }
 
+static FRESH_INSTALL: OnceLock<bool> = OnceLock::new();
+
+/// Notes whether settings.json is missing, before this run saves it: then
+/// this is a fresh install, and the window opens first-run setup. Upgrades
+/// keep their file and never see it. Call once at launch.
+pub fn note_launch() {
+    let missing = settings_path().is_some_and(|path| !path.exists());
+    let _ = FRESH_INSTALL.set(missing);
+}
+
+/// See [`note_launch`]. False when it was never called (tests).
+pub fn fresh_install() -> bool {
+    FRESH_INSTALL.get().copied().unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +259,20 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    #[test]
+    fn language_defaults_to_unset_and_round_trips() {
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.language, None);
+        let settings = SettingsFile {
+            language: Some("pt-BR".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("pt-BR"));
     }
 
     #[test]

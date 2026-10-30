@@ -152,6 +152,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (Previously only the GUI applied them, seconds later — and headless
     // runs never did.) The GUI re-applies the same values at startup, which
     // is idempotent.
+    // Before the first save below: a missing file means a fresh install,
+    // which opens first-run setup.
+    eternal_host::settings::note_launch();
     let mut persisted = eternal_host::settings::SettingsFile::load();
     let auth_token = persisted
         .ensure_auth_token()

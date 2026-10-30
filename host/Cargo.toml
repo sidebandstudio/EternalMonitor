@@ -40,6 +40,10 @@ once_cell = "1"
 regex = "1"
 # Which characters an update note may hold (already used by egui)
 unicode-general-category = "1.1"
+# Arabic labels: the Unicode bidirectional algorithm, which egui lacks
+unicode-bidi = "0.3"
+# Picks the UI face out of a Windows font collection (already used by egui)
+skrifa = "0.44"
 
 # Socket options (send-buffer sizing) before handing the socket to tokio
 socket2 = "0.5"
@@ -89,6 +93,7 @@ features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
+    "Win32_Globalization",
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
