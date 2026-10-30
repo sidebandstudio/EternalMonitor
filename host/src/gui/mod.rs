@@ -745,6 +745,13 @@ impl AnalyzerApp {
         }
     }
 
+    fn resume_code_pairing(&mut self) {
+        let result = self.control.shared.pairing.lock().resume_code_pairing();
+        if let Err(error) = result {
+            self.settings_error = Some(format!("Could not create a pairing code: {error}"));
+        }
+    }
+
     fn forget_all_ipads(&mut self) {
         let result = self.control.shared.pairing.lock().regenerate_token();
         match result {
