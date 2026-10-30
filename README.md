@@ -1,5 +1,7 @@
 <div align="center">
 
+**English** · [Español](i18n/README.es.md) · [العربية](i18n/README.ar.md) · [简体中文](i18n/README.zh-Hans.md) · [हिन्दी](i18n/README.hi.md) · [Русский](i18n/README.ru.md) · [日本語](i18n/README.ja.md) · [Português (Brasil)](i18n/README.pt-BR.md) · [Français](i18n/README.fr.md) · [Deutsch](i18n/README.de.md) · [한국어](i18n/README.ko.md)
+
 <img src="docs/assets/icon.png" width="88" height="88" alt="EternalMonitor logo">
 
 # EternalMonitor
@@ -7,13 +9,14 @@
 Mirror or extend your Windows desktop onto an iPad over Wi-Fi or USB,<br>
 and control the PC with touch, a keyboard or Apple Pencil.
 
-[![Release](https://img.shields.io/github/v/release/sidebandstudio/EternalMonitor?include_prereleases&label=release&labelColor=111&color=e8ff47)](https://github.com/sidebandstudio/EternalMonitor/releases)
+[![Release](https://img.shields.io/github/v/release/sidebandstudio/EternalMonitor?label=release&labelColor=111&color=e8ff47)](https://github.com/sidebandstudio/EternalMonitor/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/sidebandstudio/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e8ff47?labelColor=111)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
+[![Discord](https://img.shields.io/badge/discord-Sideband-e8ff47?labelColor=111&logo=discord&logoColor=white)](https://discord.gg/Xc7NykBZ6z)
 
-[Download](#download) · [Setup guide](SETUP.md) · [Known issues](https://eternalmonitor.dev/known-issues.html) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
+[Download](#download) · [Setup guide](SETUP.md) · [Known issues](https://eternalmonitor.dev/known-issues.html) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md) · [Discord](https://discord.gg/Xc7NykBZ6z)
 
 </div>
 
@@ -32,8 +35,9 @@ the MIT license, and needs no account.
 <img src="docs/assets/ipad-app.webp" align="right" width="270" alt="The iPad app's connect screen with Connect, Scan QR code and Find PCs">
 
 - **Extend or mirror.** Add the iPad as an extra display beside your monitor, or
-  mirror any screen you have. The extra display exists only while the iPad is
-  connected, so Windows never keeps a phantom monitor around.
+  mirror any screen you have. The extra display goes away 10 seconds after the
+  iPad disconnects, so a quick reconnect reuses it and Windows never keeps a
+  phantom monitor around.
 - **Wi-Fi or USB.** Stream over your home network, or plug in a cable for a
   steadier picture that also charges the iPad. A cable takes over a running
   Wi-Fi session, and unplugging it falls back to Wi-Fi.
@@ -77,7 +81,8 @@ These versions work together even when their version numbers differ. The older
 v0.1 releases use a different protocol and cannot connect to the v0.3 iPad app.
 
 Testing it? Send bugs and feedback through the [form on the download page](https://eternalmonitor.dev/download.html#feedback),
-which emails hello@sideband.studio, or open a [GitHub issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose).
+which emails hello@sideband.studio, open a [GitHub issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose),
+or tell us on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
 
 The installer is not code-signed yet, so Windows SmartScreen asks before it runs.
 Choose **More info**, then **Run anyway**, only after checking that the file's
@@ -106,7 +111,8 @@ addresses, but exclude screen content, audio and pairing credentials. Disable
 automatic sharing in Settings. Diagnostics are kept up to 30 days and may be
 removed sooner. Deleted or expired diagnostics can remain in daily backups for
 up to 7 more days. See
-[Automatic diagnostics](SETUP.md#automatic-diagnostics).
+[Automatic diagnostics](SETUP.md#automatic-diagnostics) and the
+[privacy notice](https://eternalmonitor.dev/privacy.html).
 On iPad, open Settings > Support > Diagnostics to copy or export a report.
 
 The release checks passed on Windows, macOS and iPad simulators. Problems we
@@ -257,6 +263,7 @@ streaming system test on every pull request.
 | --- | --- |
 | [SETUP.md](SETUP.md) | Step-by-step setup for anyone, including USB and drawing |
 | [Known issues](https://eternalmonitor.dev/known-issues.html) | Problems we know about, and what to do about each (`docs/known-issues.html`) |
+| [Privacy](https://eternalmonitor.dev/privacy.html) | What the apps send, why, how long it is kept and how to turn it off (`docs/privacy.html`) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The pipeline, protocol v2 and each component |
 | [docs/decisions.md](docs/decisions.md) | Why things are the way they are, with measurements |
 | [docs/pencil-drawing.md](docs/pencil-drawing.md) | Apple Pencil, Windows Ink and Clip Studio Paint |
@@ -270,11 +277,17 @@ streaming system test on every pull request.
 
 Contributions are welcome, from transport and encoders to rendering and docs.
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. To talk an
-idea through first, message `aldobenches285` on Discord.
+idea through first, ask on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
+
+## Contact
+
+The [Sideband Discord](https://discord.gg/Xc7NykBZ6z) is the place for questions,
+setup help and ideas. You can also email
+[hello@sideband.studio](mailto:hello@sideband.studio).
 
 Found a bug? [Open an issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)
 with both app versions and the host log. Report security problems privately as
-described in [SECURITY.md](SECURITY.md).
+described in [SECURITY.md](SECURITY.md), not on Discord or in an issue.
 
 ## License
 
@@ -283,5 +296,4 @@ The Windows installer also ships third-party components under their own licenses
 including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 and FFmpeg.
 
-Built by [Sideband Studio](https://sideband.studio). Questions go to
-[hello@sideband.studio](mailto:hello@sideband.studio).
+Built by [Sideband Studio](https://sideband.studio).
