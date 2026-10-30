@@ -11,6 +11,7 @@ use super::widgets::{self, Tone};
 use super::{AnalyzerApp, StatsSnapshot, ENCODER_CHOICES};
 use crate::encoder::input::EncoderInput;
 use crate::gpu_preference::{Change, GpuFacts, Preference};
+use crate::network::ListenOn;
 use crate::troubleshooting::{WindowDrawing, FULL_PACKET, SMALL_PACKET};
 
 impl AnalyzerApp {
@@ -37,6 +38,7 @@ impl AnalyzerApp {
                 self.troubleshooting_open = !self.troubleshooting_open;
                 if self.troubleshooting_open {
                     self.refresh_gpu_facts();
+                    self.listen_choices = crate::network::listen_choices();
                 }
             }
             if !self.troubleshooting_open {
@@ -48,6 +50,8 @@ impl AnalyzerApp {
             self.window_drawing_row(ui);
             widgets::divider(ui);
             self.video_rows(ui, snap);
+            widgets::divider(ui);
+            self.listen_on_row(ui);
             widgets::divider(ui);
             let mut reset = false;
             widgets::setting_row(
@@ -220,6 +224,54 @@ impl AnalyzerApp {
         }
         if self.restart_refused == Some(crate::relaunch::Reason::Settings) {
             self.handoff_line(ui, crate::handoff::Handoff::Update);
+        }
+        ui.add_space(8.0);
+    }
+
+    fn listen_on_row(&mut self, ui: &mut Ui) {
+        let current = self.control.shared.listen_on.lock().clone();
+        let mut choices = vec![ListenOn::All, ListenOn::Tailscale];
+        choices.extend(
+            self.listen_choices
+                .adapters
+                .iter()
+                .map(|(name, _)| ListenOn::Adapter(name.clone())),
+        );
+        if !choices.contains(&current) {
+            choices.push(current.clone());
+        }
+        let mut picked = None;
+        widgets::setting_row(
+            ui,
+            "Listen on",
+            "Which network iPads connect over. All networks suits almost every PC; pick one to keep the others out. USB always works. Applies when the stream restarts.",
+            260.0,
+            |ui| {
+                let shown = listen_on_label(&current, &self.listen_choices);
+                widgets::combo("listen-on", &shown, 250.0).show_ui(ui, |ui| {
+                    for choice in &choices {
+                        let label = listen_on_label(choice, &self.listen_choices);
+                        if ui.selectable_label(*choice == current, label).clicked() {
+                            picked = Some(choice.clone());
+                        }
+                    }
+                });
+            },
+        );
+        if let Some(choice) = picked {
+            self.set_listen_on(choice);
+        }
+        if self.listen_choices.ip(&current).is_none() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "That network isn't connected now. Until it is, iPads can connect over USB only.",
+                    )
+                    .size(SMALL)
+                    .color(WARNING),
+                )
+                .wrap(),
+            );
         }
         ui.add_space(8.0);
     }
@@ -407,6 +459,19 @@ pub(super) fn wiring_lines(facts: &GpuFacts) -> Vec<String> {
         }
     }
     lines
+}
+
+/// A Listen on choice in words, with the address it listens on.
+pub(super) fn listen_on_label(choice: &ListenOn, now: &crate::network::ListenChoices) -> String {
+    let name = match choice {
+        ListenOn::All => return "All networks (Automatic)".to_string(),
+        ListenOn::Tailscale => "Tailscale only",
+        ListenOn::Adapter(name) => name,
+    };
+    match now.ip(choice) {
+        Some(ip) => format!("{name} ({ip})"),
+        None => format!("{name} (not connected)"),
+    }
 }
 
 pub(super) fn window_drawing_label(drawing: WindowDrawing) -> &'static str {

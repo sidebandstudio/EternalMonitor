@@ -98,6 +98,8 @@ pub struct SharedControl {
     /// resets the client's reassembly.
     pub session: Arc<Mutex<crate::transport::session::Session>>,
     pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
+    /// Which network the next stream listens on.
+    pub listen_on: Arc<Mutex<crate::network::ListenOn>>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -159,6 +161,7 @@ impl SharedControl {
                 )
                 .expect("OS entropy for pairing code"),
             )),
+            listen_on: Arc::new(Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),

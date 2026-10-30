@@ -331,6 +331,9 @@ pub struct AnalyzerApp {
     star_clicked: bool,
     /// Settings > Troubleshooting is open.
     troubleshooting_open: bool,
+    /// The networks Listen on offers, by name with their address, listed
+    /// when Troubleshooting opens.
+    listen_choices: crate::network::ListenChoices,
     /// Which Troubleshooting values an environment variable fixes.
     overrides: Overrides,
     settings_window_drawing: WindowDrawing,
@@ -499,6 +502,7 @@ impl AnalyzerApp {
             ),
             star_clicked: persisted.star_clicked,
             troubleshooting_open: false,
+            listen_choices: Default::default(),
             overrides,
             settings_window_drawing: persisted.window_drawing,
             gpu_value: None,
@@ -552,6 +556,7 @@ impl AnalyzerApp {
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
+            listen_on: self.control.shared.listen_on.lock().clone(),
             feedback_sessions: self.feedback_ask.long_sessions,
             feedback_ask_done: self.feedback_ask.done,
             star_clicked: self.star_clicked,
@@ -734,12 +739,23 @@ impl AnalyzerApp {
     }
 
     fn set_require_pairing(&mut self, required: bool) {
-        self.control.shared.pairing.lock().required = required;
+        {
+            let mut pairing = self.control.shared.pairing.lock();
+            pairing.required = required;
+            pairing.warn_if_off();
+        }
         self.persist_settings();
     }
 
     fn new_pairing_code(&mut self) {
         let result = self.control.shared.pairing.lock().rotate_code();
+        if let Err(error) = result {
+            self.settings_error = Some(format!("Could not create a pairing code: {error}"));
+        }
+    }
+
+    fn resume_code_pairing(&mut self) {
+        let result = self.control.shared.pairing.lock().resume_code_pairing();
         if let Err(error) = result {
             self.settings_error = Some(format!("Could not create a pairing code: {error}"));
         }
@@ -873,6 +889,39 @@ impl AnalyzerApp {
 
     /// Reads the graphics cards and EternalMonitor's own preference when
     /// Troubleshooting opens. Outside Windows the fixture's facts stay.
+    /// Troubleshooting's Listen on choice, applied when the stream restarts.
+    fn set_listen_on(&mut self, choice: crate::network::ListenOn) {
+        if *self.control.shared.listen_on.lock() == choice {
+            return;
+        }
+        info!(
+            listen_on = choice.label(),
+            "Listen on changed — takes effect on next stream restart"
+        );
+        *self.control.shared.listen_on.lock() = choice;
+        self.listen_choices = crate::network::listen_choices();
+        self.refresh_listen_addr();
+        self.persist_settings();
+        self.restart_pending = true;
+    }
+
+    /// The Address row and QR code follow the Listen on choice.
+    fn refresh_listen_addr(&self) {
+        let port = PIPELINE_STATS
+            .lock()
+            .listen_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok());
+        if let Some(port) = port {
+            // Resolved before locking: the stats lock is shared with every
+            // pipeline thread.
+            let choice = self.control.shared.listen_on.lock().clone();
+            let listen_addr = listen_address(&choice, port);
+            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
+        }
+    }
+
     fn refresh_gpu_facts(&mut self) {
         if let Some(facts) = crate::gpu_preference::facts() {
             *self.control.shared.gpu_facts.lock() = Some(facts);
@@ -939,6 +988,7 @@ impl AnalyzerApp {
             self.set_packet_size(u32::from(crate::troubleshooting::FULL_PACKET));
         }
         self.set_window_drawing(WindowDrawing::Automatic);
+        self.set_listen_on(crate::network::ListenOn::All);
         // A switch the notice made is undone, back to what the user had;
         // otherwise a preference is cleared.
         let record = self.control.shared.gpu_switch.lock().clone();
@@ -1328,21 +1378,11 @@ fn logo_texture(ctx: &egui::Context, pixels: usize) -> Option<egui::TextureHandl
 // ── QR dialog ───────────────────────────────────────────────────────────────
 
 impl AnalyzerApp {
-    fn open_qr(&mut self, snap: &StatsSnapshot) {
+    fn open_qr(&mut self) {
         // Re-resolve the LAN address on open — DHCP renews and interface
         // changes would otherwise leave the QR encoding a stale IP from
         // process start.
-        if let Some(port) = snap
-            .listen_addr
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<u16>().ok())
-        {
-            // Resolved before locking: the stats lock is shared with every
-            // pipeline thread.
-            let listen_addr = detect_local_ip(port);
-            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
-        }
+        self.refresh_listen_addr();
         self.show_qr_modal = true;
     }
 
@@ -1624,6 +1664,22 @@ pub fn detect_local_ip(listen_port: u16) -> String {
     }
 
     format!("unknown:{listen_port}")
+}
+
+/// Where iPads reach the stream: [`detect_local_ip`] when it listens on
+/// every network, else the chosen network's address. "unknown" while that
+/// network isn't connected.
+pub fn listen_address(choice: &crate::network::ListenOn, listen_port: u16) -> String {
+    shown_address(crate::network::listen_ip_now(choice), listen_port)
+}
+
+/// What the Address row shows for a stream listening on `ip`.
+pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
+    match ip {
+        ip if ip.is_unspecified() => detect_local_ip(listen_port),
+        ip if ip.is_loopback() => format!("unknown:{listen_port}"),
+        ip => format!("{ip}:{listen_port}"),
+    }
 }
 
 /// Launch the GUI window. Blocks the calling thread.
