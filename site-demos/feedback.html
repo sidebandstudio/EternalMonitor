@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1104, height=1040">
+  <title>Send feedback from the app</title>
+  <link rel="stylesheet" href="shared.css">
+  <script src="vendor/gsap.min.js"></script>
+  <script src="film.js"></script>
+  <style>
+    .bg { background-image: url('art/hills.webp'); background-position: 40% 60%; }
+    /* The Windows app draws every frame of footage/host-feedback.mp4 itself. */
+    #win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
+    #win .win-view { width: 2080px; height: 1440px; }
+    #win video { width: 2080px; height: 1440px; }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="feedback" data-start="0" data-width="1104" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <div class="win" id="win">
+      <div class="win-bar">
+        <span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span>
+        <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+      </div>
+      <div class="win-view">
+        <video id="app" src="footage/host-feedback.mp4" data-start="0" data-duration="8" muted playsinline></video>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const AT = { x: 552, y: 445 };
+    // Settings with the sidebar's Send feedback; the whole feedback panel;
+    // close on the message as it is typed.
+    const PAGE = pose(440, 345, 1.15, AT);
+    const PANEL = pose(520, 359, 1.48, AT);
+    const NOTE = pose(520, 330, 1.75, AT);
+
+    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -14, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+
+    // In the footage the pointer opens the panel at 1.5 s, picks Something I
+    // like at 2.7 s, types from 3.7 s to 5 s and closes the panel at 7.0 s.
+    tl.set('#win', PAGE, 0);
+    tl.to('#win', { ...PANEL, duration: 0.8, ease: 'power3.inOut' }, 1.55);
+    tl.to('#win', { ...NOTE, duration: 0.8, ease: 'power2.inOut' }, 3.2);
+    tl.to('#win', { ...PANEL, duration: 0.7, ease: 'power2.inOut' }, 5.2);
+    tl.to('#win', { ...PAGE, duration: 0.8, ease: 'power3.inOut' }, 7.05);
+
+    window.__timelines['feedback'] = tl;
+  </script>
+</body>
+</html>
