@@ -89,8 +89,10 @@ const QUIT_JOIN: Duration = Duration::from_secs(5);
 /// limit is 30 s.
 const QUIT_ENABLE_WAIT: Duration = Duration::from_secs(35);
 
-/// How long quitting waits for the saved failure to be written.
-const QUIT_SAVE_WAIT: Duration = Duration::from_secs(5);
+/// How long quitting waits for the second screen record to be written,
+/// once the window is gone. A spinning disk shared with a build stalled for
+/// more than 30 s at times.
+const QUIT_SAVE_WAIT: Duration = Duration::from_secs(30);
 
 /// What the transport does next for the second screen.
 #[derive(Debug, PartialEq, Eq)]
@@ -846,16 +848,8 @@ fn spawn_worker(shared: &SharedControl) -> std::io::Result<()> {
 
 /// Quitting: once this returns no Enable runs or will start, so the caller's
 /// Disable is the last change. Waits for an Enable in flight, then for the
-/// worker to exit, then for the saved failure to be written, all bounded.
+/// worker to exit, both bounded.
 pub fn shut_down(shared: &SharedControl) {
-    stop_worker(shared);
-    let saver = shared.second_screen.lock().memory.saver();
-    if saver.is_some_and(|saver| !saver.flush(QUIT_SAVE_WAIT)) {
-        warn!("The second screen record is still being written — quitting without it");
-    }
-}
-
-fn stop_worker(shared: &SharedControl) {
     let worker = &shared.vdd_worker;
     worker.queue.lock().quitting = true;
     worker.wake.notify_all();
@@ -876,6 +870,33 @@ fn stop_worker(shared: &SharedControl) {
     }
 }
 
+/// Quitting, once the window is gone and the display is off: wait up to
+/// [`QUIT_SAVE_WAIT`] for the second screen record to be written, or write
+/// it here if its writer never started.
+pub fn finish_saving(shared: &SharedControl) {
+    finish_saving_within(shared, QUIT_SAVE_WAIT);
+}
+
+/// Whether everything asked for was written.
+fn finish_saving_within(shared: &SharedControl, wait: Duration) -> bool {
+    let Some(saver) = shared.second_screen.lock().memory.saver() else {
+        return true;
+    };
+    let pending = saver.pending();
+    let started = Instant::now();
+    let written = saver.flush(wait);
+    let waited_ms = started.elapsed().as_millis() as u64;
+    if !written {
+        warn!(
+            waited_ms,
+            "The second screen record is still being written — quitting without it"
+        );
+    } else if pending {
+        tracing::info!(waited_ms, "Wrote the second screen record before quitting");
+    }
+    written
+}
+
 #[cfg(any(windows, test))]
 fn quitting(shared: &SharedControl) -> bool {
     shared.vdd_worker.queue.lock().quitting
@@ -891,6 +912,7 @@ pub(crate) fn run(
     wait: bool,
 ) {
     loop {
+        let start_saving = start_saving(shared, driver.now());
         let command = {
             let mut queue = shared.vdd_worker.queue.lock();
             loop {
@@ -898,13 +920,28 @@ pub(crate) fn run(
                     return;
                 }
                 if let Some(command) = queue.commands.pop_front() {
-                    break command;
+                    break Some(command);
                 }
                 if !wait {
                     return;
                 }
-                shared.vdd_worker.wake.wait(&mut queue);
+                match start_saving {
+                    Some(at) => {
+                        if shared
+                            .vdd_worker
+                            .wake
+                            .wait_until(&mut queue, at)
+                            .timed_out()
+                        {
+                            break None;
+                        }
+                    }
+                    None => shared.vdd_worker.wake.wait(&mut queue),
+                }
             }
+        };
+        let Some(command) = command else {
+            continue;
         };
         match command {
             Command::Attach => attach(shared, driver, attach_timeout),
@@ -915,6 +952,14 @@ pub(crate) fn run(
             }
         }
     }
+}
+
+/// Start the second screen record's writer if its thread could not start,
+/// here where no lock is held. When to try again, if it still can't.
+#[cfg(any(windows, test))]
+fn start_saving(shared: &SharedControl, now: Instant) -> Option<Instant> {
+    let saver = shared.second_screen.lock().memory.saver()?;
+    saver.retry_start(now)
 }
 
 /// What turning the display on needs from Windows, so tests can supply a

@@ -21,7 +21,8 @@
 //!
 //! The files are written by a [`Saver`] thread, never by the caller: the
 //! caller holds the locks the transport takes at every pass, and a write on
-//! a slow disk took 3 s, long enough for the iPad to give up.
+//! a slow disk took 3 s, long enough for the iPad to give up. The thread
+//! starts with the memory, before those locks, and lives as long as it.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -255,8 +256,20 @@ impl Memory {
     /// Read the failure saved at `path`, if it is for `fingerprint`. `wall`
     /// is the time at `now` in seconds since 1970; later times count from
     /// `now` on the monotonic clock.
+    /// Starts the thread that writes the files; call it holding no lock.
     #[cfg(any(windows, test))]
     pub(crate) fn load(path: PathBuf, fingerprint: Fingerprint, wall: u64, now: Instant) -> Self {
+        Self::load_with(path, fingerprint, wall, now, spawn_writer)
+    }
+
+    #[cfg(any(windows, test))]
+    fn load_with(
+        path: PathBuf,
+        fingerprint: Fingerprint,
+        wall: u64,
+        now: Instant,
+        spawn: Spawn,
+    ) -> Self {
         let failed = match read(&path) {
             Ok(None) => None,
             Err(error) => {
@@ -280,7 +293,8 @@ impl Memory {
                 failed_at: record.failed_at,
             }),
         };
-        let saver = Arc::new(Saver::default());
+        let saver = Arc::new(Saver::new(spawn));
+        saver.start(now);
         #[cfg(test)]
         SAVERS.lock().push((path.clone(), Arc::downgrade(&saver)));
         let memory = Self {
@@ -497,21 +511,60 @@ impl Store {
     }
 }
 
+/// The memory is gone: its writer ends once the files asked for are written.
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.saver.saving.lock().closed = true;
+        self.saver.work.notify_all();
+    }
+}
+
 /// Writes the files on its own thread, one at a time and in the order they
 /// were asked for, so the threads that decide what they hold never wait for
 /// the disk. A file's next state replaces one still waiting to be written:
-/// an earlier state never lands after a later one.
-#[derive(Debug, Default)]
+/// an earlier state never lands after a later one. Asking only queues and
+/// wakes the thread, which sleeps while there is nothing to write.
+#[derive(Debug)]
 pub(crate) struct Saver {
     saving: Mutex<Saving>,
+    /// Wakes the writer: a file to write, or the memory is gone.
+    work: Condvar,
+    /// Wakes [`Saver::flush`]: a file was written.
     idle: Condvar,
+    #[cfg(any(windows, test))]
+    spawn: Spawn,
 }
+
+/// Starts the writer's thread, so tests can count the threads or fail them.
+#[cfg(any(windows, test))]
+type Spawn = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+#[cfg(any(windows, test))]
+fn spawn_writer(write: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("second-screen-save".into())
+        .spawn(write)
+        .map(drop)
+}
+
+/// How long after the writer's thread failed to start the 1st, 2nd, …
+/// time in a row it is started again; after the last, every minute.
+#[cfg(any(windows, test))]
+const START_RETRY: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 #[derive(Debug, Default)]
 struct Saving {
     jobs: VecDeque<Job>,
-    /// The thread runs, or is about to.
-    writing: bool,
+    writer: Writer,
+    /// The writer is writing a file it took from `jobs`.
+    busy: bool,
+    /// The memory is gone; see [`Store`]'s `Drop`.
+    closed: bool,
     /// The forgotten failure may still be in the file: since this time, a
     /// clear is waiting, or removing, replacing and overwriting it all
     /// failed. This app run treats it as cleared and tries again at the next
@@ -520,6 +573,21 @@ struct Saving {
     uncleared: Option<Instant>,
     /// Clearing failed and was logged once in this app run.
     clear_failure_logged: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+enum Writer {
+    /// Not started yet, or ended with the memory.
+    #[default]
+    Stopped,
+    Running,
+    /// Its thread could not start, `tries` times in a row, the last at `at`.
+    /// The files wait for [`Saver::retry_start`], or quitting writes them.
+    Failed {
+        tries: u32,
+        at: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -547,8 +615,67 @@ const OVERRIDE_NOT_SAVED: &str = "Could not save that the second screen worked o
                                   update manifest rule may apply again at the next app run";
 
 impl Saver {
-    fn queue(self: &Arc<Self>, job: Job) {
-        let start = {
+    #[cfg(any(windows, test))]
+    fn new(spawn: Spawn) -> Self {
+        Self {
+            saving: Mutex::default(),
+            work: Condvar::new(),
+            idle: Condvar::new(),
+            spawn,
+        }
+    }
+
+    /// Start the writer's thread. Only from a thread that holds no lock:
+    /// starting a thread takes as long as Windows takes.
+    #[cfg(any(windows, test))]
+    fn start(self: &Arc<Self>, now: Instant) {
+        let tries = {
+            let mut saving = self.saving.lock();
+            let tries = match saving.writer {
+                Writer::Running => return,
+                Writer::Stopped => 0,
+                Writer::Failed { tries, .. } => tries,
+            };
+            saving.writer = Writer::Running;
+            tries
+        };
+        let saver = Arc::clone(self);
+        match (self.spawn)(Box::new(move || saver.write())) {
+            Ok(()) if tries > 0 => {
+                tracing::info!(tries, "Started saving the second screen record");
+            }
+            Ok(()) => {}
+            Err(error) => {
+                if tries == 0 {
+                    warn!(
+                        %error,
+                        "Could not start saving the second screen record — trying again later"
+                    );
+                }
+                self.saving.lock().writer = Writer::Failed {
+                    tries: tries.saturating_add(1),
+                    at: now,
+                };
+                // A quit waiting for the writer writes the files itself.
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    /// Start the writer again if its thread could not start, once the wait
+    /// after the last try is over. The caller holds no lock. When to call
+    /// this again, while it still hasn't started.
+    #[cfg(any(windows, test))]
+    pub(crate) fn retry_start(self: &Arc<Self>, now: Instant) -> Option<Instant> {
+        let due = self.saving.lock().writer.retry_at()?;
+        if now >= due {
+            self.start(now);
+        }
+        self.saving.lock().writer.retry_at()
+    }
+
+    fn queue(&self, job: Job) {
+        {
             let mut saving = self.saving.lock();
             match job.save {
                 Save::Failure(_) => saving.uncleared = None,
@@ -557,44 +684,71 @@ impl Saver {
             }
             saving.jobs.retain(|waiting| waiting.path != job.path);
             saving.jobs.push_back(job);
-            !std::mem::replace(&mut saving.writing, true)
-        };
-        if !start {
-            return;
         }
-        let saver = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("second-screen-save".into())
-            .spawn(move || saver.drain());
-        // Never written here, under the caller's locks: the next save tries
-        // again.
-        if let Err(error) = spawned {
-            self.saving.lock().writing = false;
-            warn!(%error, "Could not start saving the second screen record — trying again later");
-        }
+        self.work.notify_one();
     }
 
-    fn drain(&self) {
+    /// The writer's thread: sleeps until there is a file to write, until the
+    /// memory is gone.
+    #[cfg(any(windows, test))]
+    fn write(&self) {
         let mut saving = self.saving.lock();
-        while let Some(job) = saving.jobs.pop_front() {
-            let result = MutexGuard::unlocked(&mut saving, || job.run());
-            saving.finish(&job, result);
+        loop {
+            if let Some(job) = saving.jobs.pop_front() {
+                self.write_one(&mut saving, job);
+            } else if saving.closed {
+                break;
+            } else {
+                self.work.wait(&mut saving);
+            }
         }
-        saving.writing = false;
+        saving.writer = Writer::Stopped;
+    }
+
+    fn write_one(&self, saving: &mut MutexGuard<'_, Saving>, job: Job) {
+        saving.busy = true;
+        let result = MutexGuard::unlocked(saving, || job.run());
+        saving.busy = false;
+        saving.finish(&job, result);
         self.idle.notify_all();
     }
 
+    /// Whether a file asked for is not written yet.
+    pub(crate) fn pending(&self) -> bool {
+        let saving = self.saving.lock();
+        saving.busy || !saving.jobs.is_empty()
+    }
+
     /// Wait up to `timeout` for every file asked for to be written. Whether
-    /// they were.
+    /// they were. Without a writer, they are written here, however long that
+    /// takes: the caller, quitting, holds no lock.
     pub(crate) fn flush(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut saving = self.saving.lock();
-        while saving.writing {
+        loop {
+            if !matches!(saving.writer, Writer::Running) {
+                while let Some(job) = saving.jobs.pop_front() {
+                    self.write_one(&mut saving, job);
+                }
+            }
+            if !saving.busy && saving.jobs.is_empty() {
+                return true;
+            }
             if self.idle.wait_until(&mut saving, deadline).timed_out() {
-                break;
+                return !saving.busy && saving.jobs.is_empty();
             }
         }
-        !saving.writing && saving.jobs.is_empty()
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Writer {
+    fn retry_at(self) -> Option<Instant> {
+        let Writer::Failed { tries, at } = self else {
+            return None;
+        };
+        let index = (tries.max(1) as usize - 1).min(START_RETRY.len() - 1);
+        Some(at + START_RETRY[index])
     }
 }
 
@@ -2375,16 +2529,212 @@ mod tests {
         assert!(!next.saved() && next.hold(at).is_none());
     }
 
-    /// Quitting waits for the last failure to be written, for as long as the
-    /// quit's wait lasts.
+    /// What `act` logs on this thread.
+    fn logs<T>(act: impl FnOnce() -> T) -> (String, T) {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink(Arc::default());
+        let out = Arc::clone(&sink.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, act);
+        let log = String::from_utf8(out.lock().clone()).unwrap();
+        (log, value)
+    }
+
+    /// The thread each write in a test folder ran on.
+    static WRITERS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+
+    fn note_writer(path: &Path) {
+        let dir = path.parent().unwrap().to_path_buf();
+        WRITERS.lock().push((dir, std::thread::current().id()));
+    }
+
+    fn noted_remove(path: &Path) -> std::io::Result<()> {
+        note_writer(path);
+        remove_file(path)
+    }
+
+    fn noted_replace(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        note_writer(path);
+        replace_file(path, data)
+    }
+
+    /// One thread, started with the memory, writes every file, however long
+    /// it had nothing to write: none is started under the transport's locks.
     #[test]
-    fn quitting_waits_for_the_last_save() {
-        let path = temp_file("quit");
+    fn one_thread_writes_every_save() {
+        let path = temp_file("one-writer");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.store.as_mut().unwrap().io = Io {
+            remove: noted_remove,
+            replace: noted_replace,
+            overwrite: overwrite_file,
+        };
+        for round in 0..3 {
+            memory
+                .note_failure("attach_timeout", start + secs(round))
+                .unwrap();
+            written(&path);
+            assert!(memory.forget(start + secs(round), true));
+            written(&path);
+        }
+        let dir = path.parent().unwrap();
+        let writers: Vec<_> = WRITERS
+            .lock()
+            .iter()
+            .filter(|(written, _)| written == dir)
+            .map(|(_, writer)| *writer)
+            .collect();
+        assert_eq!(writers.len(), 6, "{writers:?}");
+        assert!(
+            writers.iter().all(|writer| *writer == writers[0]),
+            "{writers:?}"
+        );
+        assert_ne!(writers[0], std::thread::current().id());
+        remove_folder(&path);
+    }
+
+    thread_local! {
+        /// Writer threads started from this test's thread, and how many of
+        /// the next ones fail to start.
+        static STARTS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    }
+
+    fn counted_spawn(write: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        let (started, failing) = STARTS.get();
+        STARTS.set((started + 1, failing.saturating_sub(1)));
+        if failing > 0 {
+            return Err(std::io::Error::other("no threads left"));
+        }
+        spawn_writer(write)
+    }
+
+    fn starts() -> u32 {
+        STARTS.get().0
+    }
+
+    /// The first app run, its writer's start counted, with `failing` starts
+    /// failing first.
+    fn counted_run(path: &Path, failing: u32) -> (Memory, Instant) {
+        STARTS.set((0, failing));
+        let start = Instant::now();
+        let memory = Memory::load_with(path.to_path_buf(), laptop(), T0, start, counted_spawn);
+        (memory, start)
+    }
+
+    /// The writer starts when the memory loads, before anything is saved.
+    /// Remembering and forgetting, under the transport's locks, never start
+    /// a thread.
+    #[test]
+    fn saves_never_start_a_thread() {
+        let path = temp_file("no-start");
+        let (memory, start) = counted_run(&path, 0);
+        assert_eq!(starts(), 1, "started with the memory");
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        for round in 0..2 {
+            let now = start + hours(round);
+            assert_eq!(next_step(&shared, now), Step::Attach);
+            attach(&shared, &NeverAttaches::new(now), ATTACH_TIMEOUT);
+            assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+            shared.retry_second_screen();
+            assert!(!exists(&path), "Try again forgets it");
+        }
+        assert_eq!(next_step(&shared, start + hours(2)), Step::Attach);
+        attach(&shared, &NeverAttaches::new(start), ATTACH_TIMEOUT);
+        assert!(exists(&path));
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, start + hours(3)), Step::Nothing);
+        assert!(!exists(&path), "another mode forgets it");
+        assert_eq!(starts(), 1);
+        remove_folder(&path);
+    }
+
+    /// The writer's thread could not start when the memory loaded. The
+    /// failure is remembered all the same and its file waits; the second
+    /// screen worker, which holds no lock between commands, starts the
+    /// writer after a wait that grows. The failed start is logged once.
+    #[test]
+    fn a_writer_that_could_not_start_is_started_by_the_worker() {
+        use super::super::run;
+        let path = temp_file("no-writer");
+        let (log, ()) = logs(|| {
+            let (memory, start) = counted_run(&path, 2);
+            assert_eq!(starts(), 1);
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Attach);
+            attach(&shared, &NeverAttaches::new(start), ATTACH_TIMEOUT);
+            assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
+            assert!(retries_later(&shared));
+            let worker = NeverAttaches::new(start);
+            worker.sleep(Duration::from_millis(900));
+            run(&shared, &worker, ATTACH_TIMEOUT, false);
+            assert_eq!(starts(), 1, "the first wait is a second");
+            worker.sleep(Duration::from_millis(100));
+            run(&shared, &worker, ATTACH_TIMEOUT, false);
+            assert_eq!(starts(), 2, "tried, and failed again");
+            assert!(!Path::exists(&path), "no writer, nothing written");
+            worker.sleep(Duration::from_secs(4));
+            run(&shared, &worker, ATTACH_TIMEOUT, false);
+            assert_eq!(starts(), 2, "the second wait is 5 s");
+            worker.sleep(Duration::from_secs(1));
+            run(&shared, &worker, ATTACH_TIMEOUT, false);
+            assert_eq!(starts(), 3);
+            assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+            shared.retry_second_screen();
+            assert!(!exists(&path));
+            run(&shared, &worker, ATTACH_TIMEOUT, false);
+            assert_eq!(starts(), 3, "running: never started again");
+        });
+        let failed = "Could not start saving the second screen record";
+        assert_eq!(log.matches(failed).count(), 1, "{log}");
+        assert!(
+            log.contains("Started saving the second screen record tries=2"),
+            "{log}"
+        );
+        remove_folder(&path);
+    }
+
+    /// Without a writer, quitting writes the files itself: it holds no lock.
+    #[test]
+    fn quitting_writes_the_record_when_the_writer_never_started() {
+        use super::super::finish_saving_within;
+        let path = temp_file("quit-no-writer");
+        let (memory, start) = counted_run(&path, u32::MAX);
+        let shared = second_screen_with(memory);
+        let hold = shared
+            .second_screen
+            .lock()
+            .memory
+            .note_failure("no_frames", start);
+        assert!(hold.is_some());
+        assert!(!Path::exists(&path));
+        assert!(finish_saving_within(&shared, Duration::ZERO));
+        assert_eq!(read(&path).unwrap().unwrap().1, "no_frames");
+        remove_folder(&path);
+    }
+
+    /// A failure saved just before quitting, on a disk that answers once
+    /// the test opens the gate.
+    fn quitting_with_a_stuck_save(name: &str) -> (PathBuf, SharedControl, Arc<Gate>) {
+        let path = temp_file(name);
         let (memory, start) = app_run(&path, Duration::ZERO);
         let shared = second_screen_with(memory);
         slow_disk(&shared);
         let gate = gate(&path);
-        let _opens = Opens(Arc::clone(&gate));
         let hold = shared
             .second_screen
             .lock()
@@ -2392,19 +2742,55 @@ mod tests {
             .note_failure("no_frames", start);
         assert!(hold.is_some());
         assert!(gate.reached());
-        let stuck = Duration::from_millis(300);
+        (path, shared, gate)
+    }
+
+    /// mainpc's disk stalled for more than 30 s at times. Quitting, once the
+    /// window is gone, waits for a write stuck for 10 s, and the file is in
+    /// place when it returns.
+    #[test]
+    fn quitting_waits_for_a_save_stuck_for_10_s() {
+        let (path, shared, gate) = quitting_with_a_stuck_save("quit");
+        let _opens = Opens(Arc::clone(&gate));
+        let stuck = Duration::from_secs(10);
         let quitting = Instant::now();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(stuck);
-                gate.open();
-            });
-            super::super::shut_down(&shared);
+        let (log, (waited, landed)) = logs(|| {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(stuck);
+                    gate.open();
+                });
+                super::super::finish_saving(&shared);
+                (quitting.elapsed(), read(&path))
+            })
         });
-        // It returned no sooner than the stuck write could go on. A disk
-        // slower than the quit's own wait lets it return before the file
-        // lands, so the file is read after the writer is done.
-        assert!(quitting.elapsed() >= stuck, "{:?}", quitting.elapsed());
+        assert!(waited >= stuck, "{waited:?}");
+        assert_eq!(landed.unwrap().unwrap().1, "no_frames");
+        assert!(
+            log.contains("Wrote the second screen record before quitting"),
+            "{log}"
+        );
+        remove_folder(&path);
+    }
+
+    /// A write stuck past the quit's wait: quitting returns when the wait
+    /// ends, and says the record was left behind.
+    #[test]
+    fn quitting_gives_up_on_a_save_stuck_past_its_wait() {
+        use super::super::finish_saving_within;
+        let (path, shared, gate) = quitting_with_a_stuck_save("quit-stuck");
+        let opens = Opens(Arc::clone(&gate));
+        let wait = Duration::from_millis(300);
+        let quitting = Instant::now();
+        let (log, written) = logs(|| finish_saving_within(&shared, wait));
+        let waited = quitting.elapsed();
+        assert!(!written);
+        assert!(waited >= wait && waited < secs(5), "{waited:?}");
+        assert!(
+            log.contains("The second screen record is still being written — quitting without it"),
+            "{log}"
+        );
+        drop(opens);
         assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
         remove_folder(&path);
     }
