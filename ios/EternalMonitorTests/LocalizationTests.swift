@@ -173,45 +173,61 @@ final class RightToLeftMappingTests: XCTestCase {
 }
 
 /// A language switch relabels a keyboard bar that is already built:
-/// TouchRelayView calls `updateLanguage()` when the language changes.
+/// TouchRelayView observes the language and passes it on from updateUIView.
 @MainActor
 final class KeyboardBarLanguageTests: XCTestCase {
-    override func tearDown() {
-        LanguageStore.shared.choice = nil
-        super.tearDown()
+    private func find<View: UIView>(_ type: View.Type, in view: UIView, where match: (View) -> Bool = { _ in true }) -> View? {
+        if let view = view as? View, match(view) { return view }
+        for subview in view.subviews {
+            if let found = find(type, in: subview, where: match) { return found }
+        }
+        return nil
     }
 
     private func button(_ identifier: String, in view: UIView) -> UIButton? {
-        if let button = view as? UIButton, button.accessibilityIdentifier == identifier { return button }
-        return view.subviews.lazy.compactMap { self.button(identifier, in: $0) }.first
+        find(UIButton.self, in: view) { $0.accessibilityIdentifier == identifier }
+    }
+
+    /// Waits for SwiftUI to run updateUIView after the language changed.
+    private func waitUntil(_ condition: @escaping () -> Bool, _ message: String,
+                           file: StaticString = #filePath, line: UInt = #line) {
+        let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
+        if XCTWaiter().wait(for: [changed], timeout: 5) != .completed { XCTFail(message, file: file, line: line) }
     }
 
     func testSwitchRelabelsTheBuiltBar() throws {
+        let previous = LanguageStore.shared.choice
+        defer { LanguageStore.shared.choice = previous }
         LanguageStore.shared.choice = .en
-        let relay = RelayTouchUIView()
-        relay.keyboardSupported = true
-        // Without a sink `onEvents?(…)` skips the toggle it would send.
-        relay.onEvents = { _ in }
-        relay.updateLanguage()
-        let input = try XCTUnwrap(relay.subviews.lazy.compactMap { $0 as? RelayKeyboardInputView }.first)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        defer { window.isHidden = true }
+        window.rootViewController = UIHostingController(rootView:
+            TouchRelayView(keyboardVisible: .constant(false), active: true, onToggleHUD: {})
+                .environmentObject(ConnectionManager())
+                .environmentObject(AppSettings()))
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        let relay = try XCTUnwrap(find(RelayTouchUIView.self, in: window))
+        let input = try XCTUnwrap(find(RelayKeyboardInputView.self, in: relay))
         let bar = try XCTUnwrap(input.inputAccessoryView)
         let done = try XCTUnwrap(button("keyboard.done", in: bar))
         let control = try XCTUnwrap(button("keyboard.key.224", in: bar))
         let alt = try XCTUnwrap(button("keyboard.key.226", in: bar))
+        // No session, so updateUIView turned the keyboard off; Ctrl only
+        // needs it for this toggle.
+        relay.keyboardSupported = true
         relay.toggleRemoteModifier(0xe0)
         XCTAssertEqual(done.configuration?.title, "Done")
         XCTAssertEqual(control.accessibilityValue, "On")
         XCTAssertEqual(alt.accessibilityValue, "Off")
 
         LanguageStore.shared.choice = .ar
-        relay.updateLanguage()
-        XCTAssertEqual(done.configuration?.title, "تم")
+        waitUntil({ done.configuration?.title == "تم" }, "Done did not relabel to Arabic")
         XCTAssertEqual(control.accessibilityValue, "قيد التشغيل")
         XCTAssertEqual(alt.accessibilityValue, "متوقف")
 
         LanguageStore.shared.choice = .en
-        relay.updateLanguage()
-        XCTAssertEqual(done.configuration?.title, "Done")
+        waitUntil({ done.configuration?.title == "Done" }, "Done did not relabel to English")
         XCTAssertEqual(control.accessibilityValue, "On")
         XCTAssertEqual(alt.accessibilityValue, "Off")
     }
