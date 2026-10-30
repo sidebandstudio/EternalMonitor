@@ -132,6 +132,9 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "remote_config",
     "rollout",
     "ss_rule",
+    // renderer_rule.
+    "applied",
+    "rule",
     "problem",
     "requested",
     "preferred",
@@ -1614,6 +1617,8 @@ mod tests {
                  switch=Some(PowerSaving) cards=2 power_saving_gpu=Radeon780M high_performance_gpu=GeForce4060",
             ),
             ("Dx12", "INFO Window renderer instance backends=DX12 choice=Some(Dx12) chosen_failed=false"),
+            ("dx12", "INFO renderer_rule applied=intel:31.0.101.2111->dx12"),
+            ("set_aside", "INFO renderer_rule ignored reason=set_aside rule=nvidia:32.0.15.9186->vulkan"),
         ];
         for (name, message) in cases {
             let line = format!("{STAMP}  {message}");
