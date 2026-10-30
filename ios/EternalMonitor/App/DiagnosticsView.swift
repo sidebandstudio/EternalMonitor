@@ -73,7 +73,7 @@ struct DiagnosticsView: View {
                 .accessibilityIdentifier("diagnostics.copy")
                 if let error { Text("Could not export diagnostics: \(error)") }
             } footer: {
-                Text("Reports include the PC address you connect to. Pairing codes and tokens are removed.")
+                Text("Reports include the name and address of the PC you connect to. Pairing codes and tokens are removed.")
             }
             .listRowBackground(Theme.surfaceRaised)
 
