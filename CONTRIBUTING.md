@@ -1,8 +1,9 @@
 # Contributing to EternalMonitor
 
 Thanks for helping. Bug fixes, tests, docs and new ideas are all welcome. For
-anything bigger than a small fix, open an issue or message `aldobenches285` on
-Discord first, so we can agree on the approach before you write the code.
+anything bigger than a small fix, open an issue or ask on the
+[Sideband Discord](https://discord.gg/Xc7NykBZ6z) first, so we can agree on the
+approach before you write the code.
 
 ## Fork the repository
 
