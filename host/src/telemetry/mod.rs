@@ -1799,6 +1799,33 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The startup network line uploads byte for byte, even when the PC or
+    /// user is named like one of its tokens.
+    #[test]
+    fn the_network_line_is_never_redacted() {
+        let names = redact::Names::new(Some(r"C:\Users\vpn"), Some("vpn"), Some("wifi"));
+        let adapters = [
+            crate::network::Adapter {
+                kind: crate::network::Kind::Wifi,
+                up: true,
+                gateway: true,
+                ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+            },
+            crate::network::Adapter {
+                kind: crate::network::Kind::Vpn,
+                up: true,
+                gateway: false,
+                ipv4: vec![std::net::Ipv4Addr::new(100, 80, 1, 2)],
+            },
+        ];
+        let line = crate::network::summary(
+            Some(&adapters),
+            Some(std::net::Ipv4Addr::new(100, 80, 1, 2).into()),
+        );
+        let stamped = format!("2026-10-29T17:46:01.000000Z  INFO {line}");
+        assert_eq!(event_with(&stamped, "info", &names).message, stamped);
+    }
+
     /// Names that are also the summary's own tokens leave it byte for byte,
     /// while the same words elsewhere are names.
     #[test]
