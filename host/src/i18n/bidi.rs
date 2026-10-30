@@ -136,3 +136,27 @@ pub fn wrap(text: &str, width: f32, measure: impl Fn(&str) -> f32) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// `text`, one right-to-left line in reading order, in visual order and cut
+/// short with "…" at the end of the sentence, so that `measure` finds the
+/// drawn line no wider than `width`. egui cuts the drawn right end, which in
+/// Arabic is where the sentence starts.
+pub fn truncate(text: &str, width: f32, measure: impl Fn(&str) -> f32) -> String {
+    let whole = visual_line(text);
+    if measure(&whole) <= width {
+        return whole;
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let cut = |chars: usize| visual_line(&format!("{}…", text[..starts[chars]].trim_end()));
+    // The most characters that fit; a line only grows with more of them.
+    let (mut fits, mut over) = (0, starts.len());
+    while over - fits > 1 {
+        let mid = (fits + over) / 2;
+        if measure(&cut(mid)) <= width {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    cut(fits)
+}

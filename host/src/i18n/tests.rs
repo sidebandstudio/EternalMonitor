@@ -366,3 +366,16 @@ fn wrapped_arabic_breaks_in_reading_order() {
     let lines = bidi::wrap(text, 7.0, |line| line.chars().count() as f32);
     assert_eq!(lines, "ثجح ابت\nخدذ");
 }
+
+#[test]
+fn cut_arabic_loses_the_end_of_its_sentence() {
+    let width = |line: &str| line.chars().count() as f32;
+    // "البث إلى" (streaming to) and a long iPad name, isolated as `trf`
+    // makes it: the name loses its end, and the "…" ends the name.
+    let line = format!("البث إلى {}Test iPad Pro Max{}", bidi::FSI, bidi::PDI);
+    assert_eq!(bidi::truncate(&line, 19.0, width), "Test iPad… إلى البث");
+    // Arabic words go from the end of the sentence: the drawn left.
+    assert_eq!(bidi::truncate("ابت ثجح خدذ", 8.0, width), "…ثجح ابت");
+    // What fits stays whole.
+    assert_eq!(bidi::truncate("ابت ثجح", 8.0, width), "ثجح ابت");
+}

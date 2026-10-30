@@ -91,6 +91,9 @@ jobs:
       - name: Verify Setup repairs a preserved virtual display driver
         shell: powershell
         run: ./installer/tests/Test-VddDriverRepair.ps1
+      - name: Verify Setup hands its language to the app
+        shell: powershell
+        run: ./installer/tests/Test-InstallerLanguages.ps1
 
   rust-macos:
     name: Rust (macOS, full workspace + E2E)

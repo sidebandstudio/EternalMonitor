@@ -1345,8 +1345,7 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
                     ui.spacing_mut().item_spacing.y = 1.0;
                     let response = ui.label(strong(&title));
                     widgets::automation_id(&response, &title);
-                    let response = ui.add(egui::Label::new(faint(&detail)).truncate());
-                    widgets::automation_id(&response, &detail);
+                    widgets::truncated(ui, &detail, faint);
                 });
             });
         });

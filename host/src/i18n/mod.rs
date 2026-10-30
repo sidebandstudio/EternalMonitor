@@ -401,6 +401,22 @@ pub fn logical(shown: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// `shown`, right-to-left text [`tr`] or [`trf`] drew, in reading order;
+/// for widgets that cut it short (see [`bidi::truncate`]).
+pub fn reading_order(shown: &str) -> Option<String> {
+    if !is_rtl() {
+        return None;
+    }
+    DRAWN
+        .with(|drawn| {
+            drawn
+                .borrow()
+                .get(shown)
+                .map(|(_, logical)| logical.clone())
+        })
+        .or_else(|| logical(shown).map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests;
 

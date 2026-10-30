@@ -1,6 +1,7 @@
 //! First-run setup: the language, Start with Windows, how the iPad connects,
 //! what it shows, then pairing. It opens on a fresh install (no settings
-//! file at launch) and from Settings > Run setup again. Each choice applies
+//! folder at launch, or an empty one; see `settings::note_launch`) and from
+//! Settings > Run setup again. Each choice applies
 //! at once through the same actions as Settings, so Next without a change,
 //! or Skip setup, leaves today's defaults. Nothing the app detects (graphics
 //! card, encoder) is asked, and diagnostics sharing is not a step.

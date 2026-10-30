@@ -304,6 +304,53 @@ mod tests {
         assert!(at('i') < at('P') && at('P') < at('d'), "{glyphs:?}");
     }
 
+    /// A long iPad name in Arabic, cut where the line ends: the sentence
+    /// keeps its start, "البث إلى" (streaming to), rightmost, and the name
+    /// loses its end, where the "…" goes.
+    #[test]
+    fn a_long_ipad_name_is_cut_at_the_end_of_the_arabic_sentence() {
+        use eframe::egui::RichText;
+        crate::i18n::activate(Lang::Ar);
+        let shown = crate::i18n::trf(
+            "Streaming to {device}",
+            &[("device", "Test iPad Pro 13-inch with a very long name")],
+        );
+        let ctx = eframe::egui::Context::default();
+        assert_eq!(super::super::theme::set_language(&ctx, Lang::Ar), Lang::Ar);
+        let style = |text: String| RichText::new(text).size(14.0);
+        let (mut cut, mut cut_width, mut whole_width) = (String::new(), 0.0, 0.0);
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let width = |text: &str| {
+                ui.painter()
+                    .layout_no_wrap(
+                        text.to_string(),
+                        eframe::egui::FontId::proportional(14.0),
+                        eframe::egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            };
+            cut = super::super::widgets::fit_line(ui, &shown, 160.0, &style);
+            cut_width = width(&cut);
+            whole_width = width(&shown);
+        });
+        output.textures_delta.clear();
+        crate::i18n::activate(Lang::En);
+        assert!(whole_width > 160.0, "the whole line fits: {whole_width}");
+        assert!(cut_width <= 160.0, "{cut} is {cut_width} wide");
+        assert!(!cut.contains("name"), "{cut}");
+        let glyphs = laid_out(&cut);
+        let at = |c: char| {
+            glyphs
+                .iter()
+                .position(|g| *g == c)
+                .unwrap_or_else(|| panic!("{c} in {glyphs:?}"))
+        };
+        // Left to right: the name and its "…", then "إلى", then "البث".
+        assert!(at('T') < at('…') && at('…') < at('إ'), "{glyphs:?}");
+        assert!(at('إ') < at('ث'), "{glyphs:?}");
+    }
+
     /// The process's memory once the window's strings in `EM_MEMORY_LANG`
     /// (default `en`) are laid out and drawn into the font atlas. Compare a
     /// run per language:

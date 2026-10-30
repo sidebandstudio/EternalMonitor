@@ -152,6 +152,61 @@ pub fn wrapped(ui: &mut Ui, shown: &str, style: impl Fn(String) -> RichText) -> 
     response
 }
 
+/// `shown` in `style` on one line, cut short with "…" where it does not fit.
+/// Arabic is cut at the end of its sentence before it is reordered (see
+/// [`fit_line`]); egui would cut the drawn right end, its start.
+pub fn truncated(ui: &mut Ui, shown: &str, style: impl Fn(String) -> RichText) -> Response {
+    let text = fit_line(ui, shown, ui.available_width() - 1.0, &style);
+    let response = ui.add(Label::new(style(text)).truncate());
+    automation_id(&response, shown);
+    response
+}
+
+/// `shown` cut to `width` at the end of its sentence where it holds
+/// right-to-left text drawn reordered: a translation, or a status line of
+/// parts joined with " · " left to right, which keeps the parts that fit and
+/// cuts the first that does not. Other text is left for egui to cut.
+pub(super) fn fit_line(
+    ui: &Ui,
+    shown: &str,
+    width: f32,
+    style: &impl Fn(String) -> RichText,
+) -> String {
+    let measure = |text: &str| {
+        WidgetText::from(style(text.to_string()))
+            .into_galley(
+                ui,
+                Some(TextWrapMode::Extend),
+                f32::INFINITY,
+                FontSelection::Default,
+            )
+            .size()
+            .x
+    };
+    if !i18n::is_rtl() || measure(shown) <= width {
+        return shown.to_string();
+    }
+    if let Some(logical) = i18n::reading_order(shown) {
+        return i18n::bidi::truncate(&logical, width, measure);
+    }
+    let mut kept = String::new();
+    for part in shown.split_inclusive('·') {
+        let joined = format!("{kept}{part}");
+        if measure(&joined) <= width {
+            kept = joined;
+            continue;
+        }
+        let core = part.trim_end_matches('·').trim();
+        let Some(logical) = i18n::reading_order(core) else {
+            return joined;
+        };
+        let before = format!("{kept}{}", &part[..part.find(core).unwrap_or(0)]);
+        let rest = i18n::bidi::truncate(&logical, width - measure(&before), measure);
+        return before + &rest;
+    }
+    kept
+}
+
 // ── Buttons ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -921,7 +976,7 @@ pub fn empty_state(ui: &mut Ui, icon: Icon, title: &str, hint: &str) {
         );
         ui.add_space(4.0);
         wrapped(ui, title, strong);
-        ui.add(Label::new(muted(hint)).wrap());
+        wrapped(ui, hint, muted);
         ui.add_space(6.0);
     });
 }

@@ -345,7 +345,7 @@ impl AnalyzerApp {
         let (title, subtitle) = match state {
             StreamState::Off => (
                 tr("Streaming is off").to_string(),
-                "Click Start streaming so your iPad can connect.".to_string(),
+                tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
             StreamState::Ready => (
                 tr("Ready for your iPad").to_string(),
@@ -417,18 +417,13 @@ impl AnalyzerApp {
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.add_space(3.0);
-                            let response = ui.add(
-                                egui::Label::new(
-                                    RichText::new(&title)
-                                        .family(semibold())
-                                        .size(18.0)
-                                        .color(TEXT),
-                                )
-                                .truncate(),
-                            );
-                            widgets::automation_id(&response, &title);
-                            let response = ui.add(egui::Label::new(muted(&subtitle)).truncate());
-                            widgets::automation_id(&response, &subtitle);
+                            widgets::truncated(ui, &title, |text| {
+                                RichText::new(text)
+                                    .family(semibold())
+                                    .size(18.0)
+                                    .color(TEXT)
+                            });
+                            widgets::truncated(ui, &subtitle, muted);
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1194,7 +1189,7 @@ fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
                 ui,
                 Icon::Tablet,
                 tr("No iPad connected"),
-                "Start streaming, then connect from your iPad.",
+                tr("Start streaming, then connect from your iPad."),
             );
         }
         return;

@@ -1,5 +1,7 @@
 ﻿	; *** Inno Setup version 5.5.3+ Hindi messages ***
 ; Translated by Him Prasad Gautam [ drishtibachak at gmail.com ]
+; EternalMonitor corrected the messages its installer shows (spelling, wording,
+; "PC" for computer) against Inno Setup 6.7.3's Default.isl.
 ; To download user-contributed translations of this file, go to:
 ; http://www.jrsoftware.org/files/istrans/
 ;
@@ -11,7 +13,7 @@
 [LangOptions]
 ; The following three entries are very important. Be sure to read and 
 ; understand the '[LangOptions] section' topic in the help file.
-LanguageName=<0939><093F><0902><0926><0940>
+LanguageName=<0939><093F><0928><094D><0926><0940>
 LanguageID=$0439
 LanguageCodePage=0
 ; If the language you are translating to requires special font faces or
@@ -28,18 +30,18 @@ CopyrightFontSize=9
 [Messages]
 
 ; *** Application titles
-SetupAppTitle=स्थापना
-SetupWindowTitle=स्थापना - %1
-UninstallAppTitle=निस्कासन
-UninstallAppFullTitle=%1 कि निस्कासन
+SetupAppTitle=सेटअप
+SetupWindowTitle=सेटअप - %1
+UninstallAppTitle=अनइंस्टॉल
+UninstallAppFullTitle=%1 अनइंस्टॉल करें
 
 ; *** Misc. common
-InformationTitle=सुचना
-ConfirmTitle=पुष्टिकरण
-ErrorTitle=त्रुटी
+InformationTitle=जानकारी
+ConfirmTitle=पुष्टि करें
+ErrorTitle=त्रुटि
 
 ; *** SetupLdr messages
-SetupLdrStartupMessage=इस से %1 आपकि कल्पयन्त्र में अधिष्ठापन  होगा. क्या आप आगे बढ़ना चाहते है?
+SetupLdrStartupMessage=यह %1 इंस्टॉल करेगा। क्या आप जारी रखना चाहते हैं?
 LdrCannotCreateTemp=अस्थाई फ़ाइल नही बना पा रहा. स्थापना को बिच में ही रोकना पड़ा.
 LdrCannotExecTemp=अस्थाई फोल्डर में से फ़ाइल कार्यान्वयन नही कर पाया. स्थापना को बिच में ही रोकना पड़ा.
 
@@ -50,7 +52,7 @@ SetupFileCorrupt=स्थापना फाइल में त्रुटी
 SetupFileCorruptOrWrongVer=स्थापना फाइल में त्रुटी है या तो अलग प्रकार कि  है. कृपया समस्या-निदान करे या कार्यक्रम की नई प्रति लाइए.
 InvalidParameter=फोल्डर का नाम वैध नही है.
 SetupAlreadyRunning=स्थापना तो पहले से हि चल रहा है
-WindowsVersionNotSupported=इस से [name/ver] आपके कल्पयन्त्र में अधिष्ठापन होगा.%n%nये बहेतर होगा आगे बढने से पहेले आप अन्य सभी कार्यक्रम हाल तुरत के लिए बंध कर दे.
+WindowsVersionNotSupported=यह प्रोग्राम आपके PC पर चल रहे Windows संस्करण पर नहीं चलता।
 WindowsServicePackRequired=ये कार्यक्रम को %1 Service Pack %2 या पिछला संस्करण चाहिए.
 NotOnThisPlatform=ये कार्यक्रम %1 पे नही चलेगा.
 OnlyOnThisPlatform=ये कार्यक्रम केवल %1 पे ही चलेगा.
@@ -60,51 +62,51 @@ WinVersionTooLowError=ये कार्यक्रम चलने के ल
 WinVersionTooHighError=ये कार्यक्रम नही अधिष्ठापन किया जा सकता %1 संस्करण %2 या पिछला पे.
 AdminPrivilegesRequired=अगर आप प्रशासक खाते से आरम्भ करे तो ही ये कार्यक्रम अधिष्ठापन कर पाओगे.
 PowerUserPrivilegesRequired=आप प्रशासक खाते या शक्ति-प्रयोग कर्ता समूह के खाते से आरम्भ करे तो ही ये कार्यक्रम अधिष्ठापन कर पाओगे.
-SetupAppRunningError=स्थापना ने पकड़ा की %1 हाल चालू है..%n%n कृपया उसे बंध करे अभी, और बाद में आगे बढने वास्ते ठीक या निकल जाने वास्ते रद्द करेँ पे क्लिक करे.
-UninstallAppRunningError=निस्कासन को ये ज्ञात हुआ की %1 अभी चालू है.%n%n कृपया उसे बंध करे और फिर आगे बढने के लिए ठीक या बाहर जाने  के लिए रद्द करेँ पे क्लिक करे.
+SetupAppRunningError=सेटअप ने पाया कि %1 अभी चल रहा है।%n%nकृपया इसे पूरी तरह बंद करें, फिर जारी रखने के लिए ठीक है पर, या बाहर निकलने के लिए रद्द करें पर क्लिक करें।
+UninstallAppRunningError=अनइंस्टॉलर ने पाया कि %1 अभी चल रहा है।%n%nकृपया इसे पूरी तरह बंद करें, फिर जारी रखने के लिए ठीक है पर, या बाहर निकलने के लिए रद्द करें पर क्लिक करें।
 
 ; *** Misc. errors
 ErrorCreatingDir=स्थापना "%1" सङ्ग्रहिका बनाने में विफल रहा
 ErrorTooManyFilesInDir=%1 सङ्ग्रहिका में बहुत  फाइल मौजूद  होने के वजह से स्थापना फाइल बनाने में  विफल रहा.
 
 ; *** Setup common messages
-ExitSetupTitle=स्थापना कि बहिर्गमन
-ExitSetupMessage=स्थापना कि कार्य पूर्ण नही हुआ, यदि आप अभी बाहर जाने कि ईराधा करेंगे तो कार्यक्रम सहि ढंग से अधिष्ठापन नही होगा.%n%nआप किसी ओर वक्त फिर से अधिष्ठापन कर सकते हो.%n%nक्या बाहर जाए?
-AboutSetupMenuItem=स्थापना के बारे में...
-AboutSetupTitle=स्थापना के बारे में
+ExitSetupTitle=सेटअप से बाहर निकलें
+ExitSetupMessage=सेटअप पूरा नहीं हुआ है। अगर आप अभी बाहर निकलते हैं, तो प्रोग्राम इंस्टॉल नहीं होगा।%n%nइंस्टॉलेशन पूरा करने के लिए आप बाद में सेटअप फिर से चला सकते हैं।%n%nसेटअप से बाहर निकलें?
+AboutSetupMenuItem=सेटअप के &बारे में...
+AboutSetupTitle=सेटअप के बारे में
 AboutSetupMessage=%1 संस्करण %2%n%3%n%n%1 गृह पृष्ठ:%n%4
 AboutSetupNote=
-TranslatorNote= यह हिन्दी में अनुवाद कि कार्य हिम प्रसाद गौतम ने किया है. 
+TranslatorNote=हिन्दी अनुवाद: हिम प्रसाद गौतम।
 
 ; *** Buttons
-ButtonBack=< &पिछे हटो
-ButtonNext=&आगे बढो >
-ButtonInstall=&अधिष्ठापन
-ButtonOK=&ठीक
-ButtonCancel=&रद्द करेँ
+ButtonBack=< &पीछे
+ButtonNext=&आगे >
+ButtonInstall=&इंस्टॉल करें
+ButtonOK=ठीक है
+ButtonCancel=रद्द करें
 ButtonYes=&हाँ
 ButtonYesToAll=&सभी के लिए हाँ
-ButtonNo=&नही
-ButtonNoToAll=स&भी के लिए नही
-ButtonFinish=&समाप्त
-ButtonBrowse=&ब्राउज़...
-ButtonWizardBrowse=&ब्राउज़...
-ButtonNewFolder=&नया फोल्डर बनाए
+ButtonNo=&नहीं
+ButtonNoToAll=स&भी के लिए नहीं
+ButtonFinish=&समाप्त करें
+ButtonBrowse=&ब्राउज़ करें...
+ButtonWizardBrowse=&ब्राउज़ करें...
+ButtonNewFolder=&नया फ़ोल्डर बनाएँ
 
 ; "Select Language" dialog messages
-SelectLanguageTitle=स्थापना भाषा चयन
-SelectLanguageLabel=अधिष्ठापन  के दरम्यान इस्तेमाल होने वाली भाषा चयन करे:
+SelectLanguageTitle=सेटअप की भाषा चुनें
+SelectLanguageLabel=इंस्टॉलेशन के दौरान इस्तेमाल होने वाली भाषा चुनें।
 
 ; *** Common wizard text
-ClickNext=आगे बढने के लिए आगे बढो दबाए, या बाहर जाने के वास्ते रद्द करेँ दबाए.
-BeveledLabel= सौजन्यः हिम प्रसाद गौतम 
-BrowseDialogTitle=फोल्डर के लिए ब्राउज़ करे
-BrowseDialogLabel=नीचे की सुची में से एक फोल्डर चयन करके ठीक दबाए.
-NewFolderName=नया फोल्डर
+ClickNext=जारी रखने के लिए आगे पर, या सेटअप से बाहर निकलने के लिए रद्द करें पर क्लिक करें।
+BeveledLabel=
+BrowseDialogTitle=फ़ोल्डर ब्राउज़ करें
+BrowseDialogLabel=नीचे दी गई सूची में से एक फ़ोल्डर चुनें, फिर ठीक है पर क्लिक करें।
+NewFolderName=नया फ़ोल्डर
 
 ; "Welcome" wizard page
-WelcomeLabel1=यह [name] कि स्थापना  हो रही समारोह में आपका स्वागत है
-WelcomeLabel2=इस से [name/ver] आपके कल्पयन्त्र में अधिष्ठापन होगा.%n%nये बहेतर होगा आगे बढने से पहले आप अन्य सभी खुलि हुई कार्यक्रम हाल  के लिए बंध कर दे.
+WelcomeLabel1=[name] सेटअप विज़ार्ड में आपका स्वागत है
+WelcomeLabel2=यह आपके PC पर [name/ver] इंस्टॉल करेगा।%n%nजारी रखने से पहले बाकी सभी ऐप्लिकेशन बंद कर देना अच्छा रहेगा।
 
 ; "Password" wizard page
 WizardPassword=खुपियाशब्द
@@ -137,11 +139,11 @@ UserInfoSerial=क्रमाङ्क
 UserInfoNameRequired=आपको नाम तो डालना ही होगा.
 
 ; "Select Destination Location" wizard page
-WizardSelectDir=लक्ष्य पथ चयन करे
-SelectDirDesc=[name] को किधर अधिष्ठापन करना है?
-SelectDirLabel3=स्थापना [name] को निम्नलिखित फोल्डर में डालेगा.
-SelectDirBrowseLabel=आगे बढने वास्ते आगे बढो दबाए. यदि अन्य फोल्डर चयन करना है तो ब्राउज़ दबाए.
-DiskSpaceMBLabel=कमसेकम [mb] MB जितनी जगह तो जरूरी होगी.
+WizardSelectDir=इंस्टॉल करने की जगह चुनें
+SelectDirDesc=[name] कहाँ इंस्टॉल किया जाए?
+SelectDirLabel3=सेटअप [name] को इस फ़ोल्डर में इंस्टॉल करेगा।
+SelectDirBrowseLabel=जारी रखने के लिए आगे पर क्लिक करें। कोई दूसरा फ़ोल्डर चुनना हो, तो ब्राउज़ करें पर क्लिक करें।
+DiskSpaceMBLabel=कम से कम [mb] MB खाली डिस्क स्पेस चाहिए।
 CannotInstallToNetworkDrive=श्थापना ने नेटवर्क ड्राइभ नहि रख पाया.
 CannotInstallToUNCPath=स्थापना ने UNC path नहि रख पाया.
 InvalidPath=आपको ड्राइव अक्षर के साथ पूर्ण पथ देना होगा उदाहरण:%n%nC:\APP%n%n या तो UNC रास्ता यह रूप में:%n%n\\server\share
@@ -171,9 +173,9 @@ ComponentSize2=%1 MB
 ComponentsDiskSpaceMBLabel=इस चयन के साथ स्थापना वास्ते [mb] MB जगह चाहिए.
 
 ; "Select Additional Tasks" wizard page
-WizardSelectTasks=अतिरिक्त काम चयन करे.
-SelectTasksDesc=कोन से अतिरिक्त काम करने है?
-SelectTasksLabel2=[name] को अधिष्ठापन करते वक्त जो अतिरिक्त काम करने है उन्हें चयन करे और बाद में आगे बढो पे क्लिक करे.
+WizardSelectTasks=अतिरिक्त काम चुनें
+SelectTasksDesc=कौन-से अतिरिक्त काम किए जाएँ?
+SelectTasksLabel2=[name] इंस्टॉल करते समय सेटअप कौन-से अतिरिक्त काम करे, यह चुनें, फिर आगे पर क्लिक करें।
 
 ; "Select Start Menu Folder" wizard page
 WizardSelectProgramGroup=सुरु मेनू फोल्डर चयन करे.
@@ -187,46 +189,46 @@ BadGroupName=फोल्डर नाम में ये वाले अक�
 NoProgramGroupCheck2=सुरु मेनू फोल्डर नही बनाना है.
 
 ; "Ready to Install" wizard page
-WizardReady=अधिष्ठापन के लिए तयार
-ReadyLabel1=स्थापना अब [name] को आपके कल्पयन्त्रमें अधिष्ठापन करने के लिए तयार है.
-ReadyLabel2a=आगे बढने के लिए अधिष्ठापन दबाए, अगर कोई बदलाव करना है तो पिछे हटो दबाए.
-ReadyLabel2b=अधिष्ठापन में आगे बढने के लिए अधिष्ठापन दबाए.
-ReadyMemoUserInfo=प्रयोग कर्ता की सूचनाए:
-ReadyMemoDir=लक्ष्य सङ्ग्रहिका:
-ReadyMemoType=स्थापना का प्रकार:
-ReadyMemoComponents=चयन किये सहयोगियों:
-ReadyMemoGroup=सुरु मेनू फोल्डर:
+WizardReady=इंस्टॉल करने के लिए तैयार
+ReadyLabel1=सेटअप अब आपके PC पर [name] इंस्टॉल करने के लिए तैयार है।
+ReadyLabel2a=इंस्टॉलेशन जारी रखने के लिए इंस्टॉल करें पर क्लिक करें। कोई सेटिंग देखनी या बदलनी हो, तो पीछे पर क्लिक करें।
+ReadyLabel2b=इंस्टॉलेशन जारी रखने के लिए इंस्टॉल करें पर क्लिक करें।
+ReadyMemoUserInfo=उपयोगकर्ता की जानकारी:
+ReadyMemoDir=इंस्टॉल करने की जगह:
+ReadyMemoType=सेटअप का प्रकार:
+ReadyMemoComponents=चुने गए कॉम्पोनेंट:
+ReadyMemoGroup=स्टार्ट मेनू फ़ोल्डर:
 ReadyMemoTasks=अतिरिक्त काम:
 
 ; "Preparing to Install" wizard page
-WizardPreparing=अधिष्ठापन के लिए तैयारी कर रहा है.
-PreparingDesc=स्थापना [name] को आपके कल्पयन्त्र में डालने की तैयारीकर रहा है.
-PreviousInstallNotCompleted=पिछले कार्यक्रम का प्रतिस्थापन / अधिष्ठापन सही ढंग से पूरा नही हुआ था. आपको कल्पयन्त्र फिर सुरु करना पडेगा.%n%nकल्पयन्त्र फिर सुरु करने पश्चात आप फिर से [name] का अधिष्ठापन शुरू करे.
-CannotContinue=स्थापना आगे नही बढ़ सकता, कृपया रद्द करेँ बटन दबाएँ.
-ApplicationsFound=निचे वाली अनुप्रयोगो ने  स्थापना द्वारा अपडेट किया जाने वाला फाइलों को इस्तेमाल किया है. आपको यह मसवरा दिया जा ता है कि  आप स्थापना को यह अनुप्रयोगौं कि खुद ही बन्द करने कि इजाजत प्रदान करें.
-ApplicationsFound2=यह अनुप्रयोगो ने  स्थापना द्वारा अपडेट किया जाने वाला फाइलों को इस्तेमाल किया है. आपको यह मसवरा दिया जा ता है कि  आप स्थापना को यह अनुप्रयोगौं को खुद ही बन्द करने कि इजाजत प्रदान करें. अधिष्ठापन खतम होने के वाद, स्थापना यह अनुप्रयोग कों फिर सुरु करने कि कोसिस करेगा.
-CloseApplications=&खुद हि अनुप्रयोग कों बन्द करें
-DontCloseApplications=अनुप्रयोग कों बन्द &नहि करें
-ErrorCloseApplications=स्थापना खुद हि सभी अनुप्रयोगों को बन्द नहि कर सका. आपको यह मसवरा दिया जाता है कि  स्थापना ने अपडेट करने वाली फाइलों को इस्तमाल कर रहे अनुप्रयोगौं को आगे बढ्ने से पहले आप  खुद ही बन्द करें.
+WizardPreparing=इंस्टॉल करने की तैयारी
+PreparingDesc=सेटअप आपके PC पर [name] इंस्टॉल करने की तैयारी कर रहा है।
+PreviousInstallNotCompleted=किसी पिछले प्रोग्राम को इंस्टॉल करना या हटाना पूरा नहीं हुआ था। उसे पूरा करने के लिए आपको अपना PC रीस्टार्ट करना होगा।%n%nPC रीस्टार्ट करने के बाद, [name] का इंस्टॉलेशन पूरा करने के लिए सेटअप फिर से चलाएँ।
+CannotContinue=सेटअप जारी नहीं रह सकता। बाहर निकलने के लिए कृपया रद्द करें पर क्लिक करें।
+ApplicationsFound=नीचे दिए गए ऐप्लिकेशन ऐसी फ़ाइलें इस्तेमाल कर रहे हैं जिन्हें सेटअप को अपडेट करना है। सेटअप को इन ऐप्लिकेशन को अपने-आप बंद करने देना अच्छा रहेगा।
+ApplicationsFound2=नीचे दिए गए ऐप्लिकेशन ऐसी फ़ाइलें इस्तेमाल कर रहे हैं जिन्हें सेटअप को अपडेट करना है। सेटअप को इन ऐप्लिकेशन को अपने-आप बंद करने देना अच्छा रहेगा। इंस्टॉलेशन पूरा होने के बाद, सेटअप इन्हें फिर से शुरू करने की कोशिश करेगा।
+CloseApplications=ऐप्लिकेशन &अपने-आप बंद करें
+DontCloseApplications=ऐप्लिकेशन बंद &न करें
+ErrorCloseApplications=सेटअप सभी ऐप्लिकेशन अपने-आप बंद नहीं कर सका। जारी रखने से पहले उन सभी ऐप्लिकेशन को बंद कर दें जो ऐसी फ़ाइलें इस्तेमाल कर रहे हैं जिन्हें सेटअप को अपडेट करना है।
 
 ; "Installing" wizard page
-WizardInstalling=अधिष्ठापन हो रहा है.
-InstallingLabel=जब तक स्थापना आपके कल्पयन्त्र में [name] अधिष्ठापन करता है, उस वख्त तक कृपया प्रतीक्षा करे.
+WizardInstalling=इंस्टॉल हो रहा है
+InstallingLabel=कृपया प्रतीक्षा करें, सेटअप आपके PC पर [name] इंस्टॉल कर रहा है।
 
 ; "Setup Completed" wizard page
-FinishedHeadingLabel=[name] स्थापना कि कार्य पूरा हो रहा है.
-FinishedLabelNoIcons=स्थापना ने [name] को आपके कल्पयन्त्र में सफलतापूर्वक अधिष्ठापन कर दिया है.
-FinishedLabel=स्थापना ने [name] आपके कल्पयन्त्रमें अधिष्ठापन कर दिया है. आप उपयुक्त प्रतिमा पे क्लिक कर के कभी भी ये कार्यक्रम शुरू कर सकते है.
-ClickFinish=स्थापना से बाहर निकलने वास्ते समाप्त पे क्लिक करे.
-FinishedRestartLabel=[name] का अधिष्ठापन पूरा करने वास्ते कल्पयन्त्र फिर सुरु करना बेहद जरूरी है. %n%nक्या आप अभी रिसुरु करना चाहते है?
-FinishedRestartMessage=[name] का अधिष्ठापन पूरा करने हेतु कल्पयन्त्र फिर सुरु करना बेहद जरूरी है.%n%nक्या आप अभी फिर सुरु करना चाहते है?
-ShowReadmeCheck=हाँ मुझे हमें पढो file देखनी है.
-YesRadio=&हाँ, कल्पयन्त्र फिर सुरु कर दो.
-NoRadio=&नही मै अपना कल्पयन्त्र स्वयं बाद में फिर सुरु करूँगा.
+FinishedHeadingLabel=[name] सेटअप विज़ार्ड पूरा हो रहा है
+FinishedLabelNoIcons=सेटअप ने आपके PC पर [name] इंस्टॉल कर दिया है।
+FinishedLabel=सेटअप ने आपके PC पर [name] इंस्टॉल कर दिया है। आप इसे इंस्टॉल किए गए शॉर्टकट से खोल सकते हैं।
+ClickFinish=सेटअप से बाहर निकलने के लिए समाप्त करें पर क्लिक करें।
+FinishedRestartLabel=[name] का इंस्टॉलेशन पूरा करने के लिए सेटअप को आपका PC रीस्टार्ट करना होगा। क्या आप अभी रीस्टार्ट करना चाहते हैं?
+FinishedRestartMessage=[name] का इंस्टॉलेशन पूरा करने के लिए सेटअप को आपका PC रीस्टार्ट करना होगा।%n%nक्या आप अभी रीस्टार्ट करना चाहते हैं?
+ShowReadmeCheck=हाँ, README फ़ाइल दिखाएँ
+YesRadio=&हाँ, PC को अभी रीस्टार्ट करें
+NoRadio=&नहीं, PC को बाद में रीस्टार्ट करें
 ; used for example as 'Run MyProg.exe'
-RunEntryExec=रन %1
+RunEntryExec=%1 चलाएँ
 ; used for example as 'View Readme.txt'
-RunEntryShellExec=देखे %1
+RunEntryShellExec=%1 देखें
 
 ; "Setup Needs the Next Disk" stuff
 ChangeDiskTitle=स्थापना के लिए अगली डिस्क चाहिए.
@@ -236,21 +238,21 @@ FileNotInDir2=फाइल "%1" को "%2" में ढुढ नही पा
 SelectDirectoryLabel=अगली डिस्क का पता बताए.
 
 ; *** Installation phase messages
-SetupAborted=स्थापना पूरा नही हो पाया.%n%nकृपया त्रुटी ठीक करे और फिर से प्रयास करे.
+SetupAborted=सेटअप पूरा नहीं हुआ।%n%nकृपया समस्या ठीक करें और सेटअप फिर से चलाएँ।
 EntryAbortRetryIgnore=फिर से प्रयास करने वास्ते Retry दबाए, यदि ऐसे ही आगे बढ़ना है तो Ignore दबाए, या तो स्थापना रद्द करेँ करने वास्ते Abort दबाए.
 
 ; *** Installation status messages
-StatusClosingApplications=अनुप्रयोगकों बन्द किया जा रहा है.
-StatusCreateDirs=सङ्ग्रहिका बना रहा है...
-StatusExtractFiles=फाइल उत्खनन कर रहा है...
-StatusCreateIcons=छोटीरास्ता बना रहा है...
-StatusCreateIniEntries=INI एंट्री बना रहा है...
-StatusCreateRegistryEntries=पञ्जीका एंट्री बना रहा है...
-StatusRegisterFiles=फाइल पञ्जिकृत कर रहा है...
-StatusSavingUninstall=निस्कासन की सुचनाए बचतकर रहा है...
-StatusRunProgram=अधिष्ठापन पूरा कर रहा है...
-StatusRestartingApplications=अनुप्रयोगकों कि फिर सुरुवात
-StatusRollback=बदलावों को पिछे हट्ने कि काम कर रहा है...
+StatusClosingApplications=ऐप्लिकेशन बंद किए जा रहे हैं...
+StatusCreateDirs=फ़ोल्डर बनाए जा रहे हैं...
+StatusExtractFiles=फ़ाइलें निकाली जा रही हैं...
+StatusCreateIcons=शॉर्टकट बनाए जा रहे हैं...
+StatusCreateIniEntries=INI एंट्री बनाई जा रही हैं...
+StatusCreateRegistryEntries=रजिस्ट्री एंट्री बनाई जा रही हैं...
+StatusRegisterFiles=फ़ाइलें रजिस्टर की जा रही हैं...
+StatusSavingUninstall=अनइंस्टॉल की जानकारी सहेजी जा रही है...
+StatusRunProgram=इंस्टॉलेशन पूरा हो रहा है...
+StatusRestartingApplications=ऐप्लिकेशन फिर से शुरू किए जा रहे हैं...
+StatusRollback=बदलाव वापस लिए जा रहे हैं...
 
 ; *** Misc. errors
 ErrorInternal2=आंतरिक त्रुटी: %1
@@ -289,33 +291,33 @@ ErrorRegisterTypeLib=इस टाइप लाइब्रेरी को प�
 
 ; *** Post-installation errors
 ErrorOpeningReadme=मुझे पढो फ़ाइल खोलते वक्त त्रुटी हुई.
-ErrorRestartingComputer=स्थापना कल्पयन्त्र को फिर सुरु करने में असफल रहा. कृपया आप ही  इसको फिर सुरु करे.
+ErrorRestartingComputer=सेटअप PC को रीस्टार्ट नहीं कर सका। कृपया इसे खुद रीस्टार्ट करें।
 
 ; *** Uninstaller messages
 UninstallNotFound=फाइल "%1" मौजूद ही नही है. निस्कासन करना असंभव.
 UninstallOpenError=फ़ाइल "%1" खुल नही रही. निस्कासन करना असंभव.
 UninstallUnsupportedVer=निस्कासन लोग फ़ाइल "%1" जिस फोर्मेट में है उसे हम पहचान नही पा रहे. आगे बढ़ना नामुमकिन.
 UninstallUnknownEntry=निस्कासन लोग में एक अज्ञात प्रविष्टी  (%1)मिली.
-ConfirmUninstall=क्या पक्का आप %1 को निस्कासन करना चाहते हो?
+ConfirmUninstall=क्या आप वाकई %1 और इसके सभी कॉम्पोनेंट पूरी तरह हटाना चाहते हैं?
 UninstallOnlyOnWin64=केवल 64-bit Windows से ही इसे निस्कासन किया जा सकता है.
 OnlyAdminCanUninstall=केवल प्रशासक खातों से ही इसे निस्कासन किया जा सकता है..
-UninstallStatusLabel=जब तक %1 नही हड्ता, धैर्य रखे.
-UninstalledAll=%1 सफलतापूर्वक निस्कासन हुआ.
-UninstalledMost=%1 निस्कासन पूरा हुआ.%n%nकुछ तत्वों को निकाल नही पाए लेकिन आप उन्हें अपनि  तरह से हटा  सकते हो.
-UninstalledAndNeedsRestart=%1 का निस्कासन पूरा करने वास्ते कल्पयन्त्र को फिर सुरु करना जरूरी है.%n%nक्या अभी फिर सुरु करे?
+UninstallStatusLabel=कृपया प्रतीक्षा करें, %1 को आपके PC से हटाया जा रहा है।
+UninstalledAll=%1 को आपके PC से हटा दिया गया है।
+UninstalledMost=%1 अनइंस्टॉल हो गया।%n%nकुछ चीज़ें हटाई नहीं जा सकीं। आप उन्हें खुद हटा सकते हैं।
+UninstalledAndNeedsRestart=%1 को अनइंस्टॉल करना पूरा करने के लिए आपका PC रीस्टार्ट करना होगा।%n%nक्या आप अभी रीस्टार्ट करना चाहते हैं?
 UninstallDataCorrupted=%1 फ़ाइल में त्रुटी. निस्कासन नामुमकिन.
 
 ; *** Uninstallation phase messages
 ConfirmDeleteSharedFileTitle=क्या शेरेड-फाइल को निकाल देना है?
-ConfirmDeleteSharedFile2=प्रणाली से ये ज्ञात होता है की निम्नलिखिती शेरेड-फ़ाइल अब आगे इस्तेमाल में नही आएगी. क्या आप उन्हें भी निस्कासन करना चाहते है?%n%n यदि कोई अन्य कार्यक्रम इन फाइल पे आधारित है तो वो शायद इन्हें निकाल देने पर ढंग से काम ना भी करे. यदि आप फैसला नही कर पा रहे तो 'नही' पे क्लिक करे. इन फाइल को कल्पयन्त्र में पड़े रहेने दोगे तो भी कोई नुकसान नही होगा.
+ConfirmDeleteSharedFile2=सिस्टम के अनुसार नीचे दी गई साझा फ़ाइल अब किसी प्रोग्राम के इस्तेमाल में नहीं है। क्या अनइंस्टॉलर इस साझा फ़ाइल को हटा दे?%n%nअगर कोई प्रोग्राम अब भी इस फ़ाइल को इस्तेमाल कर रहा है और इसे हटा दिया जाता है, तो वह प्रोग्राम ठीक से काम नहीं कर सकता। अगर आपको पक्का पता नहीं है, तो नहीं चुनें। फ़ाइल को सिस्टम पर रहने देने से कोई नुकसान नहीं होगा।
 SharedFileNameLabel=फाइल नाम:
 SharedFileLocationLabel=पता:
-WizardUninstalling=निस्कासन स्थिति
-StatusUninstalling=निस्कासन हो रहा है %1...
+WizardUninstalling=अनइंस्टॉल की स्थिति
+StatusUninstalling=%1 अनइंस्टॉल हो रहा है...
 
 ; *** Shutdown block reasons
-ShutdownBlockReasonInstallingApp= %1 कि अधिष्ठआपन हो रही है.
-ShutdownBlockReasonUninstallingApp=%1 कि निस्कासन हो रही है.
+ShutdownBlockReasonInstallingApp=%1 इंस्टॉल हो रहा है।
+ShutdownBlockReasonUninstallingApp=%1 अनइंस्टॉल हो रहा है।
 
 ; The custom messages below aren't used by Setup itself, but if you make
 ; use of them in your scripts, you'll want to translate them.
