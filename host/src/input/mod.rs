@@ -1560,22 +1560,23 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    thread_local! {
+        /// The time for every `RecordingTarget`, so frames stay spaced
+        /// across batches.
+        static CLOCK: std::cell::Cell<std::time::Instant> =
+            std::cell::Cell::new(std::time::Instant::now());
+    }
+
+    #[cfg(not(windows))]
     impl pen_contact::PenTarget for RecordingTarget {
         fn screen(&self) -> VirtualScreen {
             self.screen
         }
 
         /// Frames here are never close enough to be held back for their
-        /// spacing.
+        /// spacing: each takes `FRAME_SPACING`.
         fn now(&self) -> std::time::Instant {
-            thread_local! {
-                static CLOCK: std::cell::Cell<std::time::Instant> =
-                    std::cell::Cell::new(std::time::Instant::now());
-            }
-            CLOCK.with(|clock| {
-                clock.set(clock.get() + pen_contact::FRAME_SPACING);
-                clock.get()
-            })
+            CLOCK.get()
         }
 
         fn inject(
@@ -1583,6 +1584,7 @@ mod tests {
             frame: PenSample,
             _: pen_contact::PointerKind,
         ) -> pen_contact::Outcome {
+            CLOCK.set(CLOCK.get() + pen_contact::FRAME_SPACING);
             self.frames
                 .push(pen_contact::PointerFrame::new(frame, self.screen));
             self.outcome

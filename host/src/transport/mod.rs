@@ -239,9 +239,6 @@ pub async fn start_sender(
             _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
                 input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
-            _ = pen_spacing.wait(), if pen_spacing.armed() => {
-                input_relay.keep_pen_alive(*shared.capture_geometry.lock());
-            }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
                 let destination = *shared.target_addr.lock();
                 for datagram in fault.drain_due(Instant::now()) {
@@ -506,6 +503,12 @@ pub async fn start_sender(
                     target = %target_addr,
                     "Frame sent"
                 );
+            }
+            // Last, so a pen backlog goes out between NACK answers, input
+            // and video frames, never ahead of them: each flush sends one
+            // bounded chunk and arms this again at once.
+            _ = pen_spacing.wait(), if pen_spacing.armed() => {
+                input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
         }
     }

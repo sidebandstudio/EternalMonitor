@@ -155,8 +155,11 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   that end a stroke, so normal drawing is never held back. A held frame
   waits in the native queue, which does not coalesce or overflow while it is
   only waiting for its spacing, and a deadline thread wakes the transport
-  when it may go, so the transport never blocks. A frame Windows refuses
-  still starts a new contact at that sample, after its own spacing.
+  when it may go, so the transport never blocks. Each pass sends at most six
+  frames or about 1 ms of them, then hands the transport back, so NACK
+  answers, input and video go out between chunks of a backlog. A frame
+  Windows refuses still starts a new contact at that sample, once, even if
+  the new contact waits for its spacing or for Windows to be ready.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
   reject calls spaced less than its 0.1 ms timestamp resolution. If a frame
   is still refused after that, Windows' input queue is stuck: later frames

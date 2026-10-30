@@ -593,21 +593,23 @@ mod tests {
     }
 
     /// A clock on which frames are never close enough to be held back for
-    /// their spacing: each reading is `FRAME_SPACING` after the last.
+    /// their spacing: each frame takes `FRAME_SPACING`.
     #[derive(Debug)]
-    struct Unhurried(std::cell::Cell<Instant>);
+    struct Unhurried(Instant);
 
     impl Default for Unhurried {
         fn default() -> Self {
-            Self(std::cell::Cell::new(Instant::now()))
+            Self(Instant::now())
         }
     }
 
     impl Unhurried {
         fn now(&self) -> Instant {
-            let now = self.0.get() + super::super::pen_contact::FRAME_SPACING;
-            self.0.set(now);
-            now
+            self.0
+        }
+
+        fn frame(&mut self) {
+            self.0 += super::super::pen_contact::FRAME_SPACING;
         }
     }
 
@@ -693,6 +695,7 @@ mod tests {
             _: Option<CaptureGeometry>,
         ) -> Outcome {
             assert!(!self.destroyed.contains(&handle), "used a destroyed device");
+            self.clock.frame();
             self.frames.push((handle, frame.phase));
             self.answers.pop_front().unwrap_or(self.answer)
         }
@@ -1529,6 +1532,7 @@ mod tests {
             _: VirtualScreen,
             _: Option<CaptureGeometry>,
         ) -> Outcome {
+            self.clock.frame();
             let roll = if self.ready { 19 } else { self.rng.below(20) };
             match roll {
                 _ if self.stuck && !self.ready => {
@@ -1817,10 +1821,14 @@ mod tests {
                     lost |= !device.available();
                 }
             }
-            // Everything works again; the next tick delivers what waits.
+            // Everything works again; the next tick delivers what waits, in
+            // as many passes as the transport's deadline asks for.
             device.slot.api.ready = true;
             device.slot.api.now = now;
             flush_one(&mut device, now);
+            while device.spaced_until().is_some() {
+                flush_one(&mut device, now);
+            }
             note_drops(
                 &mut device,
                 false,

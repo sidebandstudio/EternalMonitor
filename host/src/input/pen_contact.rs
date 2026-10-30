@@ -11,7 +11,8 @@
 //! cancels every injected contact. ERROR_NOT_READY applies nothing; the same
 //! frame is retried, unless its sample goes stale first: then the next one is
 //! planned from the state Windows last accepted. A frame that would come too
-//! soon after the last waits the same way, for its spacing.
+//! soon after the last waits the same way, for its spacing, and so does one
+//! past the budget of a single flush.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -171,18 +172,44 @@ pub(super) const FRAME_SPACING: Duration = Duration::from_micros(250);
 /// the first twelve of a burst.
 pub(super) const FRAME_BURST: u32 = 6;
 
+/// The most frames one `flush` sends before it yields. Injection runs on the
+/// transport loop, so a backlog goes out in chunks with NACK answers, input
+/// and video pacing in between.
+const PASS_FRAMES: u32 = FRAME_BURST;
+
+/// The most time one `flush` spends sending frames before it yields, should
+/// Windows take long enough per frame that the spacing never holds one back.
+/// A pass stops before a frame that would take it past this at its average
+/// cost so far; the first frame of a pass always goes.
+const PASS_TIME: Duration = Duration::from_millis(1);
+
 /// Keeps frames `FRAME_SPACING` apart on average, allowing `FRAME_BURST` at
 /// once: a frame may go once the frames before it have had their spacing,
-/// less the burst. Waiting never blocks; `PenContact` holds the frame back.
+/// less the burst. Also ends each `flush` pass after `PASS_FRAMES` or
+/// `PASS_TIME`. Waiting never blocks; `PenContact` holds the frame back.
 #[derive(Debug, Default)]
 struct FrameSpacing {
     /// When the next frame would go if every frame were spaced.
     next: Option<Instant>,
+    /// When this pass started and the frames it has sent.
+    pass: Option<(Instant, u32)>,
 }
 
 impl FrameSpacing {
-    /// When the next frame may go, if not yet at `now`.
+    /// A `flush` pass starts at `now`.
+    fn start_pass(&mut self, now: Instant) {
+        self.pass = Some((now, 0));
+    }
+
+    /// When the next frame may go, if not yet at `now`: `now` itself once
+    /// the pass has used its budget, so the next pass follows at once.
     fn wait(&self, now: Instant) -> Option<Instant> {
+        if let Some((started, frames @ 1..)) = self.pass {
+            let used = now.saturating_duration_since(started);
+            if frames >= PASS_FRAMES || used + used / frames > PASS_TIME {
+                return Some(now);
+            }
+        }
         let at = self.next?.checked_sub(FRAME_SPACING * (FRAME_BURST - 1))?;
         (at > now).then_some(at)
     }
@@ -190,6 +217,9 @@ impl FrameSpacing {
     /// A frame reached Windows at `now`.
     fn sent(&mut self, now: Instant) {
         self.next = Some(self.next.map_or(now, |next| next.max(now)) + FRAME_SPACING);
+        if let Some((_, frames)) = &mut self.pass {
+            *frames += 1;
+        }
     }
 }
 
@@ -279,7 +309,8 @@ pub struct PenContact {
     /// When the frame held back to keep frames `FRAME_SPACING` apart may go.
     spaced_until: Option<Instant>,
     /// The first waiting sample was rejected and started again before its
-    /// frame was held back, so a second rejection gives it up.
+    /// frame was held back or Windows was not ready for it, so a second
+    /// rejection gives it up.
     resumed: bool,
     /// Samples dropped by design, with why, so tests can tell them from
     /// samples lost by mistake.
@@ -293,8 +324,9 @@ enum Brought {
     /// Windows was not ready: it waits, to be planned again from where it
     /// stopped.
     Waiting,
-    /// Its next frame would come too soon after the last: it waits for
-    /// `PenContact::spaced_until` and is planned again from where it stopped.
+    /// Its next frame would come too soon after the last, or past this
+    /// pass's budget: it waits for `PenContact::spaced_until` and is planned
+    /// again from where it stopped.
     Spaced,
     /// It cannot be delivered natively: the device is gone, or Windows
     /// rejected a frame for it that a fresh start did not fix.
@@ -322,7 +354,7 @@ impl PenContact {
     }
 
     /// When to `flush` again for a frame held back to keep frames
-    /// `FRAME_SPACING` apart.
+    /// `FRAME_SPACING` apart, or at once after a pass that used its budget.
     pub fn spaced_until(&self) -> Option<Instant> {
         self.spaced_until.filter(|_| !self.queue.is_empty())
     }
@@ -353,14 +385,20 @@ impl PenContact {
             self.abandoned.push((mapped(sample, output), now));
             return;
         }
+        // Behind frames held back, the sample waits for `spaced_until`'s
+        // flush, so one transport pass never sends more than one budget.
+        let held = self.spaced_until().is_some();
         self.enqueue(sample, now);
-        self.flush(output, now, target);
+        if !held {
+            self.flush(output, now, target);
+        }
     }
 
-    /// Deliver waiting samples in order until Windows is not ready, or the
-    /// next frame must wait for its spacing. Call on every refresh tick so
-    /// an end of contact is not left waiting for the next Pencil sample, and
-    /// at `spaced_until`.
+    /// Deliver waiting samples in order until Windows is not ready, the next
+    /// frame must wait for its spacing, or this pass has sent `PASS_FRAMES`
+    /// or taken `PASS_TIME`. Call on every refresh tick so an end of contact
+    /// is not left waiting for the next Pencil sample, and at
+    /// `spaced_until`.
     ///
     /// Native input is stuck once Windows has accepted nothing for
     /// `INPUT_STALE` while ink waits, or `STUCK_TRIAL` longer while it holds
@@ -378,6 +416,7 @@ impl PenContact {
     ) {
         self.expire(now);
         self.spaced_until = None;
+        self.spacing.start_pass(target.now());
         loop {
             while let Some(sample) = self.pending() {
                 match self.bring(mapped(sample, output), target) {
@@ -541,8 +580,8 @@ impl PenContact {
         };
         // A rejection cancels the contact; resume a move or hover from this
         // same, freshly mapped sample once, even after waiting for its
-        // spacing. A frame still rejected after that, or a rejected down or
-        // up, gives the sample up.
+        // spacing or for Windows to be ready. A frame still rejected after
+        // that, or a rejected down or up, gives the sample up.
         let mut restarted = std::mem::take(&mut self.resumed);
         loop {
             let mut rejected = false;
@@ -561,7 +600,10 @@ impl PenContact {
                 };
                 match outcome {
                     Outcome::Injected => {}
-                    Outcome::NotReady => return Brought::Waiting,
+                    Outcome::NotReady => {
+                        self.resumed = restarted;
+                        return Brought::Waiting;
+                    }
                     Outcome::Rejected => {
                         rejected = true;
                         break;
@@ -1410,6 +1452,9 @@ mod tests {
             }
             flaky.ready = true;
             contact.flush(Some(output), Instant::now(), &mut flaky);
+            while contact.spaced_until().is_some() {
+                contact.flush(Some(output), Instant::now(), &mut flaky);
+            }
             let accepted = std::mem::take(&mut flaky.accepted);
             assert!(windows.illegal.is_empty(), "{:?}", windows.illegal);
             // Every contact Windows accepted ended exactly once, by an up, a
@@ -1798,6 +1843,93 @@ mod tests {
         let abandoned = contact.take_abandoned();
         assert_eq!(abandoned.len(), 64 - 9);
         assert_eq!((abandoned[0].0.phase, abandoned[0].0.x), (Move, 9));
+    }
+
+    #[test]
+    fn a_restart_windows_was_not_ready_for_and_then_refused_gives_the_sample_up() {
+        let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+        for sample in backlog() {
+            deliver(&mut contact, &mut windows, sample);
+        }
+        while windows.sent_at.len() < 9 {
+            windows.clock = contact.spaced_until().expect("held back");
+            contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        }
+        // The 10th frame is refused; the restart waits for its spacing.
+        windows.refuse = 1;
+        windows.clock = contact.spaced_until().expect("held back");
+        contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        let until = contact.spaced_until().expect("restart held back");
+        assert!(until > windows.clock);
+        // Windows is not ready for the restart, then refuses it.
+        windows.clock = until;
+        windows.not_ready = 1;
+        contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        windows.clock += FRAME_SPACING;
+        windows.refuse = 1;
+        contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        // Started again once, not twice: the rest of the stroke goes to the
+        // mouse.
+        assert_eq!(
+            windows.take()[8..],
+            [
+                F(Move, 8, 10, Injected),
+                F(Move, 9, 10, Rejected),
+                F(Down, 9, 10, NotReady),
+                F(Down, 9, 10, Rejected),
+            ]
+        );
+        let abandoned = contact.take_abandoned();
+        assert_eq!(abandoned.len(), 64 - 9);
+        assert_eq!((abandoned[0].0.phase, abandoned[0].0.x), (Move, 9));
+    }
+
+    #[test]
+    fn a_backlog_goes_out_in_passes_short_enough_for_the_transport() {
+        // A backlog piles up behind frames held back for their spacing, and
+        // then Windows takes longer per frame, up to 300 µs: from 250 µs on
+        // the spacing never holds a frame back. Each pass, a sample's
+        // delivery or a flush, is one turn of the transport loop.
+        let every_sample: Vec<_> = backlog()
+            .iter()
+            .map(|sample| F(sample.phase, sample.x, sample.y, Injected))
+            .collect();
+        for call in [20, 100, 300].map(Duration::from_micros) {
+            let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+            let mut passes = Vec::new();
+            let mut yielded = 0;
+            let mut pass = |contact: &mut PenContact, windows: &mut FakeWindows, sample| {
+                let (sent, started) = (windows.sent_at.len(), windows.clock);
+                match sample {
+                    Some(sample) => deliver(contact, windows, sample),
+                    None => contact.flush(Some(OUTPUT), Instant::now(), windows),
+                }
+                passes.push((windows.sent_at.len() - sent, windows.clock - started));
+                // A pass that used its budget asks for the next at once.
+                yielded += usize::from(contact.spaced_until() == Some(windows.clock));
+            };
+            for sample in backlog() {
+                pass(&mut contact, &mut windows, Some(sample));
+            }
+            windows.call = call;
+            while let Some(until) = contact.spaced_until() {
+                windows.clock = windows.clock.max(until);
+                pass(&mut contact, &mut windows, None);
+            }
+            for &(frames, took) in &passes {
+                assert!(
+                    frames <= PASS_FRAMES as usize,
+                    "{frames} frames at {call:?}"
+                );
+                assert!(took <= PASS_TIME, "{took:?} at {call:?}");
+            }
+            if call >= FRAME_SPACING {
+                assert!(yielded > 0, "at {call:?}");
+            }
+            assert_eq!(windows.take(), every_sample, "at {call:?}");
+            assert!(contact.take_dropped().is_empty());
+            assert!(contact.take_abandoned().is_empty());
+        }
     }
 
     #[test]
