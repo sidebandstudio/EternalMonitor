@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "الإصدار {version}، بُني في {date} من {commit}",
   "download.beta.versionBuilt": "الإصدار {version}، بُني في {date}",
   "download.beta.versionFrom": "الإصدار {version} من {commit}",
-  "download.beta.version": "الإصدار {version}"
+  "download.beta.version": "الإصدار {version}",
+  "download.channel.hint": "إذا واجهت مشاكل، جرّب النسخة التجريبية. تصلها الإصلاحات أسرع بكثير.",
+  "download.beta.stable": "تنزيل النسخة المستقرة لـ Windows",
+  "download.ipad.version": "v{version}، الإصدار {build}"
 }

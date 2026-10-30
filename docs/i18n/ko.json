@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "버전 {version}, {commit}에서 {date}에 빌드",
   "download.beta.versionBuilt": "버전 {version}, {date}에 빌드",
   "download.beta.versionFrom": "버전 {version}, {commit}에서 빌드",
-  "download.beta.version": "버전 {version}"
+  "download.beta.version": "버전 {version}",
+  "download.channel.hint": "문제가 있나요? 베타를 써 보세요. 수정 사항이 훨씬 빨리 반영돼요.",
+  "download.beta.stable": "Windows용 안정 버전 다운로드",
+  "download.ipad.version": "v{version}, 빌드 {build}"
 }

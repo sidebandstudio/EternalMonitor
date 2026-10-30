@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "वर्शन {version}, {date} को {commit} से बना",
   "download.beta.versionBuilt": "वर्शन {version}, {date} को बना",
   "download.beta.versionFrom": "वर्शन {version}, {commit} से",
-  "download.beta.version": "वर्शन {version}"
+  "download.beta.version": "वर्शन {version}",
+  "download.channel.hint": "समस्या आ रही है? बीटा आज़माएँ। फ़िक्स वहाँ कहीं जल्दी आते हैं।",
+  "download.beta.stable": "Windows के लिए स्थिर वर्शन डाउनलोड करें",
+  "download.ipad.version": "v{version}, बिल्ड {build}"
 }

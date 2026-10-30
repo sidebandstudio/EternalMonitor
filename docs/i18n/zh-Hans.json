@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "版本 {version}，于 {date} 从 {commit} 构建",
   "download.beta.versionBuilt": "版本 {version}，于 {date} 构建",
   "download.beta.versionFrom": "版本 {version}，来自 {commit}",
-  "download.beta.version": "版本 {version}"
+  "download.beta.version": "版本 {version}",
+  "download.channel.hint": "遇到问题？试试测试版，修复会更快推送。",
+  "download.beta.stable": "下载 Windows 稳定版",
+  "download.ipad.version": "v{version}，构建 {build}"
 }

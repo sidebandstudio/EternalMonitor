@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "Версия {version}, сборка от {date} из {commit}",
   "download.beta.versionBuilt": "Версия {version}, сборка от {date}",
   "download.beta.versionFrom": "Версия {version} из {commit}",
-  "download.beta.version": "Версия {version}"
+  "download.beta.version": "Версия {version}",
+  "download.channel.hint": "Возникли проблемы? Попробуйте Бета. Исправления там выходят гораздо быстрее.",
+  "download.beta.stable": "Скачать стабильную версию для Windows",
+  "download.ipad.version": "v{version}, сборка {build}"
 }

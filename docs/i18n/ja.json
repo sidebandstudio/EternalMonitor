@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "バージョン {version}、{commit} から {date} にビルド",
   "download.beta.versionBuilt": "バージョン {version}、{date} にビルド",
   "download.beta.versionFrom": "バージョン {version}、{commit} から",
-  "download.beta.version": "バージョン {version}"
+  "download.beta.version": "バージョン {version}",
+  "download.channel.hint": "問題がある場合はベータをお試しください。修正がずっと早く届きます。",
+  "download.beta.stable": "Windows 版安定版をダウンロード",
+  "download.ipad.version": "v{version}、ビルド {build}"
 }

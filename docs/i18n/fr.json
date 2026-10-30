@@ -177,5 +177,8 @@
   "download.beta.versionBuiltFrom": "Version {version}, compilée le {date} à partir de {commit}",
   "download.beta.versionBuilt": "Version {version}, compilée le {date}",
   "download.beta.versionFrom": "Version {version} à partir de {commit}",
-  "download.beta.version": "Version {version}"
+  "download.beta.version": "Version {version}",
+  "download.channel.hint": "Un souci ? Essayez la Bêta. Les correctifs y arrivent bien plus vite.",
+  "download.beta.stable": "Télécharger Stable pour Windows",
+  "download.ipad.version": "v{version}, build {build}"
 }
