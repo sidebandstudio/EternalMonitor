@@ -849,6 +849,21 @@ small { font-size: 0.875rem; }
 .dl-actions { margin-top: 22px; }
 .dl-meta { margin-top: 10px; font-size: 0.875rem; color: var(--faint); }
 .dl-meta a { color: var(--muted); }
+/* Stable or Beta: links shaped like the home page's .sw switches. */
+.channel-switch { margin-top: 28px; }
+.channel-switch a {
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+}
+.channel-switch a:hover { color: var(--text); }
+.channel-switch a[aria-current] { background: var(--text); color: var(--bg); }
+.no-js .channel-switch { display: none; }
+.channel-note { margin-top: 14px; color: var(--muted); }
+.dl-all { margin-top: 20px; }
 .sha {
   margin-top: 18px;
   padding: 12px 14px;

@@ -365,4 +365,96 @@
       })
       .catch(function () { /* The HTML already carries the current release. */ });
   }
+
+  /* --- Download page: Stable or Beta channel ------------------------------------
+     ?channel=beta (or the older ?channel=nightly) shows the Beta build, which
+     .github/workflows/nightly.yml publishes each night under the moving "beta"
+     release. Its link never changes; GitHub is asked only for the version,
+     date, commit and SHA-256, kept for half an hour. */
+  var channelLinks = document.querySelectorAll('[data-channel]');
+  var stableCard = document.getElementById('windows');
+  var betaCard = document.getElementById('windows-beta');
+  if (channelLinks.length && stableCard && betaCard) {
+    var BETA_KEY = 'gh-beta-v1', BETA_TTL = 1800000;
+    var betaLoaded = false;
+    var betaBuild = document.getElementById('beta-build');
+
+    var showBeta = function (release) {
+      var body = release.body || '';
+      var asset = (release.assets || []).filter(function (a) { return a.name === 'EternalMonitor-Setup-beta.exe'; })[0];
+      var version = (body.match(/\b(\d+\.\d+\.\d+-beta\.(\d{4})(\d{2})(\d{2})\.\d+)\b/) || []);
+      var commit = (body.match(/\/commit\/([0-9a-f]{40})\b/) || [])[1];
+      var when = asset && asset.updated_at ? new Date(asset.updated_at)
+        : version[1] ? new Date(Date.UTC(+version[2], +version[3] - 1, +version[4])) : null;
+      if (betaBuild && version[1]) {
+        betaBuild.textContent = 'Version ' + version[1];
+        if (when && isFinite(when)) {
+          betaBuild.appendChild(document.createTextNode(', built ' +
+            when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })));
+        }
+        if (commit) {
+          var link = document.createElement('a');
+          link.href = 'https://github.com/' + REPO + '/commit/' + commit;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.textContent = commit.slice(0, 7);
+          betaBuild.appendChild(document.createTextNode(' from '));
+          betaBuild.appendChild(link);
+        }
+      }
+      var meta = document.getElementById('beta-meta');
+      if (meta && asset && typeof asset.size === 'number') {
+        meta.textContent = asset.name + ' · ' + (asset.size / 1048576).toFixed(1) + ' MB';
+      }
+      var sha = ((asset && asset.digest || '').match(/^sha256:([0-9a-f]{64})$/) ||
+                 body.match(/SHA-256[\s\S]*?\b([0-9a-f]{64})\b/) || [])[1];
+      var shaBox = document.getElementById('beta-sha'), shaEl = document.getElementById('beta-sha256-value');
+      if (sha && shaBox && shaEl) { shaEl.textContent = sha; shaBox.hidden = false; }
+    };
+
+    var loadBeta = function () {
+      if (betaLoaded) return;
+      betaLoaded = true;
+      var hit = null;
+      try { hit = JSON.parse(localStorage.getItem(BETA_KEY) || 'null'); } catch (e) {}
+      var age = hit && typeof hit.at === 'number' ? Date.now() - hit.at : -1;
+      if (hit && hit.release && age >= 0 && age <= BETA_TTL) { showBeta(hit.release); return; }
+      fetch('https://api.github.com/repos/' + REPO + '/releases/tags/beta', {
+        headers: { Accept: 'application/vnd.github+json' }
+      })
+        .then(function (r) {
+          if (r.status === 404 && betaBuild) betaBuild.textContent = 'The first Beta build is on its way. Use Stable until then.';
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        })
+        .then(function (release) {
+          var kept = { body: release.body, assets: (release.assets || []).map(function (a) {
+            return { name: a.name, size: a.size, updated_at: a.updated_at, digest: a.digest };
+          }) };
+          showBeta(kept);
+          try { localStorage.setItem(BETA_KEY, JSON.stringify({ release: kept, at: Date.now() })); } catch (e) {}
+        })
+        .catch(function () { /* The card still links the newest Beta build. */ });
+    };
+
+    var showChannel = function (channel) {
+      var beta = channel === 'beta';
+      stableCard.hidden = beta;
+      betaCard.hidden = !beta;
+      channelLinks.forEach(function (a) {
+        if (a.getAttribute('data-channel') === channel) a.setAttribute('aria-current', 'page');
+        else a.removeAttribute('aria-current');
+      });
+      if (beta) loadBeta();
+    };
+    var asked = new URLSearchParams(window.location.search).get('channel');
+    showChannel(asked === 'beta' || asked === 'nightly' ? 'beta' : 'stable');
+    channelLinks.forEach(function (a) {
+      a.addEventListener('click', function (e) {
+        e.preventDefault();
+        history.replaceState(null, '', a.getAttribute('href'));
+        showChannel(a.getAttribute('data-channel'));
+      });
+    });
+  }
 })();
