@@ -5,7 +5,8 @@
 //! [`SharedControl`]: the real worker then turns it on and off, synthetic
 //! capture switches onto it the way DXGI capture switches onto the real one,
 //! a failure is saved in a folder the test chooses, and the fake, not
-//! Windows, says whether the user's desktop is there. Release builds
+//! Windows, says whether the user's desktop is there and which graphics
+//! card the main screen is on. Release builds
 //! compile none of this, and nothing here reads the environment, so only a
 //! test that calls [`FakeDisplay::install`] gets it.
 //!
@@ -20,8 +21,10 @@ use parking_lot::{Condvar, Mutex};
 
 use super::memory::{Fingerprint, Memory, FILE_NAME};
 use super::{Command, Driver};
+use crate::capture::recovery::{CaptureBlock, CaptureUnavailable};
 use crate::capture::OutputInfo;
 use crate::control::{CaptureTarget, SharedControl};
+use crate::gpu_preference::{Adapter, GpuFacts};
 
 /// A display that attaches a set time after it is turned on, or never. Its
 /// clock is the real one, plus whatever the test moved it on with
@@ -29,8 +32,13 @@ use crate::control::{CaptureTarget, SharedControl};
 #[derive(Clone)]
 pub struct FakeDisplay(Arc<Inner>);
 
+/// The card EternalMonitor runs on, and lists every screen under, as DXGI
+/// does on a hybrid PC.
+pub const APP_GPU: &str = "Fake GPU";
+
 struct Inner {
-    attach_after: Option<Duration>,
+    /// See [`FakeDisplay::set_attach_after`].
+    attach_after: Mutex<Option<Duration>>,
     attach_timeout: Duration,
     created: Instant,
     ahead: Mutex<Duration>,
@@ -41,6 +49,8 @@ struct Inner {
     /// What it answers for Windows' input desktop: see
     /// [`FakeDisplay::set_desktop_away`].
     desktop_away: Arc<AtomicBool>,
+    /// See [`FakeDisplay::move_screen`].
+    screen_card: Mutex<Option<String>>,
 }
 
 impl FakeDisplay {
@@ -49,7 +59,7 @@ impl FakeDisplay {
     /// manifest's or `ETERNAL_VDD_TIMEOUT_SECS`'s.
     pub fn new(attach_after: Option<Duration>, attach_timeout: Duration) -> Self {
         Self(Arc::new(Inner {
-            attach_after,
+            attach_after: Mutex::new(attach_after),
             attach_timeout,
             created: Instant::now(),
             ahead: Mutex::new(Duration::ZERO),
@@ -57,6 +67,7 @@ impl FakeDisplay {
             on_since: Mutex::new(None),
             toggles: Mutex::new(Vec::new()),
             desktop_away: Arc::new(AtomicBool::new(false)),
+            screen_card: Mutex::new(None),
         }))
     }
 
@@ -99,6 +110,22 @@ impl FakeDisplay {
         self.0.desktop_away.store(away, Ordering::Relaxed);
     }
 
+    /// Whether the display attaches `after` its next Enable, or never, as
+    /// when Windows starts showing it as a copy of the main screen.
+    pub fn set_attach_after(&self, after: Option<Duration>) {
+        *self.0.attach_after.lock() = after;
+    }
+
+    /// Have Windows move the main screen to `card` (Some), as a laptop with
+    /// two graphics cards may while the app runs, or keep it on
+    /// [`APP_GPU`] (None, at first). On another card, mirroring it fails as
+    /// DXGI does then (`UnsupportedOnThisGpu`), and the display
+    /// configuration says the screen is wired to `card`; the second screen
+    /// still works.
+    pub fn move_screen(&self, card: Option<&str>) {
+        *self.0.screen_card.lock() = card.map(str::to_string);
+    }
+
     /// Each time it was turned on (true) or off, on its clock, since it was
     /// made.
     pub fn toggles(&self) -> Vec<(Duration, bool)> {
@@ -112,7 +139,7 @@ impl Driver for FakeDisplay {
             .0
             .on_since
             .lock()
-            .zip(self.0.attach_after)
+            .zip(*self.0.attach_after.lock())
             .is_some_and(|(on, after)| self.now() >= on + after);
         let output = |name: &str, primary: bool| OutputInfo {
             adapter_index: 0,
@@ -123,7 +150,7 @@ impl Driver for FakeDisplay {
             left: if primary { 0 } else { 1920 },
             top: 0,
             is_primary: primary,
-            adapter_name: "Fake GPU".to_string(),
+            adapter_name: APP_GPU.to_string(),
         };
         let mut outputs = vec![output("primary", true)];
         if attached {
@@ -186,6 +213,40 @@ pub(super) fn send(shared: &SharedControl, display: FakeDisplay, command: Comman
                 .expect("start the fake display's worker"),
         );
     }
+}
+
+/// What synthetic capture's mirror finds with a fake display installed: on
+/// [`APP_GPU`] it works; after [`FakeDisplay::move_screen`] Windows refuses
+/// it, as DXGI capture reports it.
+pub(crate) fn mirror(shared: &SharedControl) -> Result<(), CaptureUnavailable> {
+    let Some(display) = installed(shared) else {
+        return Ok(());
+    };
+    let Some(card) = display.0.screen_card.lock().clone() else {
+        crate::capture::note_mirror_works(shared, APP_GPU);
+        return Ok(());
+    };
+    let (app, other) = ((0, 1), (0, 2));
+    let facts = GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: app,
+                name: APP_GPU.to_string(),
+            },
+            Adapter {
+                id: other,
+                name: card,
+            },
+        ],
+        power_saving: Some(other),
+        high_performance: Some(app),
+        screens: vec![("primary".to_string(), other)],
+    };
+    crate::capture::note_gpu_refused(shared, "primary", Some(facts), true);
+    Err(CaptureUnavailable {
+        block: CaptureBlock::UnsupportedOnThisGpu,
+        detail: "the fake main screen is on another graphics card".to_string(),
+    })
 }
 
 /// The installed fake display's outputs, beside the primary one.

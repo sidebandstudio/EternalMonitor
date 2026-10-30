@@ -19,7 +19,10 @@
 //! otherwise the stream goes back to the mirror. A start that failed is
 //! remembered, across app runs too ([`memory`]): later connections stay on
 //! the mirror until the wait after it ends, the user clicks Try again,
-//! restarts the stream, or changes the mode.
+//! restarts the stream, or changes the mode. Not while the mirror itself is
+//! blocked ([`note_mirror_blocked`]): then the mirror shows nothing, so a
+//! failure is not saved and the next connection tries the second screen
+//! again.
 
 #[cfg(debug_assertions)]
 pub mod fake;
@@ -157,6 +160,8 @@ pub(crate) struct State {
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
     memory: Memory,
+    /// Windows refused the mirror's last capture: see [`note_mirror_blocked`].
+    mirror_blocked: bool,
     /// Whether the user's desktop is away, as an end-to-end test's fake
     /// display says in place of Windows: see [`desktop_away`].
     #[cfg(debug_assertions)]
@@ -183,6 +188,7 @@ impl State {
                 last_toggle: self.last_toggle,
                 attaching: self.attaching,
                 memory: std::mem::take(&mut self.memory),
+                mirror_blocked: self.mirror_blocked,
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
@@ -194,8 +200,22 @@ impl State {
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
-                let hold = self.memory.hold(now);
-                if let Some(hold) = hold.or_else(|| self.memory.hold_for_rule(now)) {
+                let hold = if self.mirror_blocked {
+                    if let Some(hold) = self.memory.hold(now) {
+                        tracing::info!(
+                            reason = hold.reason,
+                            failures = hold.failures,
+                            "The second screen failed on this PC before, but Windows won't let \
+                             EternalMonitor mirror the screen either — trying the second screen"
+                        );
+                    }
+                    None
+                } else {
+                    self.memory
+                        .hold(now)
+                        .or_else(|| self.memory.hold_for_rule(now))
+                };
+                if let Some(hold) = hold {
                     *status = VddStatus::Failed;
                     self.failure = Some(hold.reason);
                     log_hold(hold);
@@ -248,6 +268,7 @@ impl State {
             attaching: self.attaching,
             failure: Some(reason),
             memory: std::mem::take(&mut self.memory),
+            mirror_blocked: self.mirror_blocked,
             #[cfg(debug_assertions)]
             fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
@@ -262,6 +283,14 @@ impl State {
     /// something that passes may explain it: then only this app run keeps
     /// mirroring, as before.
     fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool) {
+        if self.mirror_blocked {
+            tracing::info!(
+                reason,
+                "The second screen failed while Windows won't let EternalMonitor mirror the \
+                 screen — not remembering it, so the next connection tries the second screen again"
+            );
+            return;
+        }
         if interrupted || self.desktop_away() {
             tracing::info!(
                 reason,
@@ -386,6 +415,17 @@ pub fn load_memory(shared: &SharedControl) {
 pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
+    // The mirror would show nothing: the second screen is the only picture.
+    if *status == VddStatus::Failed && state.mirror_blocked {
+        tracing::info!(
+            reason = state.failure.unwrap_or("attach_timeout"),
+            "Client connected, and the second screen failed before, but Windows won't let \
+             EternalMonitor mirror the screen — trying the second screen again"
+        );
+        *status = VddStatus::WaitingForClient;
+        state.failure = None;
+        return;
+    }
     if *status == VddStatus::Failed && state.memory.saved() {
         match state.memory.hold(now) {
             Some(hold) => log_hold(hold),
@@ -414,7 +454,35 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
 /// Whether the host tries the failed second screen again by itself later.
 pub(crate) fn retries_later(shared: &SharedControl) -> bool {
     let status = *shared.vdd_status.lock();
-    status == VddStatus::Failed && shared.second_screen.lock().memory.saved()
+    let state = shared.second_screen.lock();
+    status == VddStatus::Failed && (state.memory.saved() || state.mirror_blocked)
+}
+
+/// Whether Windows refused the mirror's last capture because EternalMonitor
+/// runs on another graphics card than the screen (DXGI_ERROR_UNSUPPORTED on
+/// a hybrid PC), or, `false`, duplicated it. While it refuses, the mirror
+/// shows nothing: a second screen that fails is not saved, and neither a
+/// saved failure nor one from this app run keeps the next connection on the
+/// mirror. On a PC where the mirror works this is never set.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_mirror_blocked(shared: &SharedControl, blocked: bool) {
+    let mut state = shared.second_screen.lock();
+    if std::mem::replace(&mut state.mirror_blocked, blocked) == blocked {
+        return;
+    }
+    if blocked {
+        tracing::info!(
+            "Windows won't let EternalMonitor mirror the screen from this graphics card — a \
+             second screen that fails is tried again at the next connection"
+        );
+    } else {
+        tracing::info!("EternalMonitor can mirror the screen again");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mirror_blocked(shared: &SharedControl) -> bool {
+    shared.second_screen.lock().mirror_blocked
 }
 
 /// Why connections mirror instead of extending, after a failed start. The

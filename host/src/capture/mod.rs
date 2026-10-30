@@ -587,6 +587,72 @@ fn vdd_attach_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS))
 }
 
+/// Windows won't duplicate `screen` from the card this process runs on (a
+/// hybrid PC running EternalMonitor on its other card). Works out which card
+/// the screen is wired to, from `facts` as just read (`None` when Windows
+/// couldn't say), for the Stream page notice: again on every refusal until
+/// Windows could say, and again after the cards or the screens' wiring
+/// change, but logged only when the answer is new. `mirror`: the screen is
+/// the one Mirror captures, so the mirror shows nothing while this lasts.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_gpu_refused(
+    shared: &SharedControl,
+    screen: &str,
+    facts: Option<crate::gpu_preference::GpuFacts>,
+    mirror: bool,
+) {
+    if mirror {
+        second_screen::note_mirror_blocked(shared, true);
+    }
+    let (checked, moved) = shared.screen_watch.lock().refused(screen, facts.clone());
+    let facts = facts.unwrap_or_default();
+    let app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str());
+    if let Some(moved) = moved {
+        info!(
+            from_gpu = %moved.from,
+            to_gpu = %moved.to,
+            app_gpu,
+            "The screen EternalMonitor mirrors moved to another graphics card"
+        );
+    }
+    let Some(diagnosis) = checked else {
+        return;
+    };
+    let card = |preference| {
+        facts
+            .card_for(preference)
+            .map_or("unknown", |a| a.name.as_str())
+    };
+    info!(
+        screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
+        app_gpu,
+        switch = ?diagnosis.as_ref().and_then(|d| d.preference),
+        cards = facts.adapters.len(),
+        power_saving_gpu = card(crate::gpu_preference::Preference::PowerSaving),
+        high_performance_gpu = card(crate::gpu_preference::Preference::HighPerformance),
+        "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
+    );
+    *shared.gpu_diagnosis.lock() = diagnosis;
+}
+
+/// Windows duplicates the screen Mirror captures from `app_gpu`, the card
+/// this process captures on. After a refusal (see [`note_gpu_refused`]) the
+/// screen moved back to that card: say so once, and drop the diagnosis, so
+/// the next refusal names the card the screen is on then.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_mirror_works(shared: &SharedControl, app_gpu: &str) {
+    second_screen::note_mirror_blocked(shared, false);
+    let Some(moved) = shared.screen_watch.lock().works(app_gpu) else {
+        return;
+    };
+    info!(
+        from_gpu = %moved.from,
+        to_gpu = %moved.to,
+        "The screen EternalMonitor mirrors moved back to the graphics card EternalMonitor runs on"
+    );
+    *shared.gpu_diagnosis.lock() = None;
+}
+
 /// Is an iPad currently registered as a receiver? The virtual display is brought up only while
 /// a client is connected, so an idle PC never shows a phantom second monitor.
 #[cfg(windows)]
@@ -1077,6 +1143,66 @@ mod tests {
     use super::*;
     use crate::control::CaptureTarget;
     use std::cell::Cell;
+
+    /// The hybrid laptop of the 0.3.4 beta report: the app on NVIDIA, the
+    /// screen moved by Windows to the AMD iGPU.
+    fn screen_on_amd() -> crate::gpu_preference::GpuFacts {
+        use crate::gpu_preference::{Adapter, GpuFacts};
+        let (nvidia, amd) = ((0, 0x14c81), (0, 0x12d2d));
+        GpuFacts {
+            adapters: vec![
+                Adapter {
+                    id: nvidia,
+                    name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+                },
+                Adapter {
+                    id: amd,
+                    name: "AMD Radeon 780M Graphics".into(),
+                },
+            ],
+            power_saving: Some(amd),
+            high_performance: Some(nvidia),
+            screens: vec![(r"\\.\DISPLAY1".into(), amd)],
+        }
+    }
+
+    /// The mirror's refusals block it and name the card for the notice; a
+    /// capture that works again unblocks it and drops the diagnosis, and
+    /// the next refusal names the card again.
+    #[test]
+    fn a_refused_mirror_blocks_it_and_names_the_card_until_it_works_again() {
+        use crate::gpu_preference::Preference;
+        let shared = SharedControl::new(9876, 15_000_000);
+        note_mirror_works(&shared, "NVIDIA GeForce RTX 5060 Laptop GPU");
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", Some(screen_on_amd()), true);
+        assert!(second_screen::mirror_blocked(&shared));
+        let diagnosis = shared.gpu_diagnosis.lock().clone().unwrap();
+        assert_eq!(diagnosis.screen_gpu, "AMD Radeon 780M Graphics");
+        assert_eq!(diagnosis.preference, Some(Preference::PowerSaving));
+        note_mirror_works(&shared, "NVIDIA GeForce RTX 5060 Laptop GPU");
+        assert!(!second_screen::mirror_blocked(&shared));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None, "the notice has no card");
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", Some(screen_on_amd()), true);
+        assert_eq!(
+            shared.gpu_diagnosis.lock().as_ref().unwrap().screen_gpu,
+            "AMD Radeon 780M Graphics"
+        );
+    }
+
+    /// Every PC where Mirror works: its captures never block anything or
+    /// set a notice. Nor does a refusal of the virtual second screen.
+    #[test]
+    fn a_working_mirror_or_a_refused_second_screen_never_blocks_the_mirror() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        for _ in 0..3 {
+            note_mirror_works(&shared, "NVIDIA GeForce RTX 5080");
+        }
+        assert!(!second_screen::mirror_blocked(&shared));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None);
+        note_gpu_refused(&shared, r"\\.\DISPLAY9", None, false);
+        assert!(!second_screen::mirror_blocked(&shared));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None);
+    }
 
     #[test]
     fn slow_virtual_attach_keeps_watchdog_alive_without_hiding_a_stall() {

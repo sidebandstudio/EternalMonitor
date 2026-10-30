@@ -1302,6 +1302,100 @@ mod tests {
         remove_folder(&path);
     }
 
+    /// The 0.3.4 beta field case: a laptop whose screen Windows moved to the
+    /// card EternalMonitor doesn't run on, so the mirror shows nothing, and
+    /// then a start that didn't attach (Windows showed the second screen as
+    /// a copy). 0.3.4-beta.1 saved it for an hour: eight connections got no
+    /// picture. Now nothing is saved, and the next connection tries the
+    /// second screen again.
+    #[test]
+    fn a_failure_while_the_mirror_is_blocked_is_tried_again_at_the_next_connection() {
+        use super::super::note_mirror_blocked;
+        let path = temp_file("mirror-blocked");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_mirror_blocked(&shared, true);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches::new(start);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert!(!exists(&path), "nothing saved for later connections");
+        assert!(retries_later(&shared), "the notice says it tries again");
+        // The next connection, a minute later.
+        let later = driver.now() + Duration::from_secs(60);
+        reconnect(&shared, later);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert_eq!(next_step(&shared, later), Step::Attach);
+        let driver = NeverAttaches::new(later);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(driver.enables.get(), 1);
+        assert!(!exists(&path));
+        // Nor is anything held at the next app run.
+        let (memory, _) = app_run(&path, Duration::from_secs(300));
+        assert!(!memory.saved());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A failure saved while the mirror worked (as by 0.3.4-beta.1), and a
+    /// picture-less second screen from this app run, keep the iPad on the
+    /// mirror only while the mirror works.
+    #[test]
+    fn no_failure_keeps_a_blocked_mirror_on_screen() {
+        use super::super::{note_capture_error, note_mirror_blocked};
+        let path = temp_file("saved-then-blocked");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start).unwrap();
+        let (memory, start) = app_run(&path, Duration::from_secs(600));
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        note_connected(&shared, start);
+        assert_eq!(next_step(&shared, start), Step::Nothing, "held, as before");
+        // The mirror's capture is refused.
+        note_mirror_blocked(&shared, true);
+        let now = start + Duration::from_secs(60);
+        reconnect(&shared, now);
+        assert_eq!(next_step(&shared, now), Step::Attach, "the saved hold");
+        assert_eq!(saved(&path)["failure"]["failures"], 1, "kept for later");
+        // It attaches but shows no picture: back to the (blocked) mirror for
+        // this connection only.
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, now), Step::Switch);
+        start_proving(&shared, 1, now);
+        note_capture_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, now),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["failures"], 1, "not counted");
+        let next = now + Duration::from_secs(60);
+        reconnect(&shared, next);
+        assert_eq!(next_step(&shared, next), Step::Attach, "this app run's");
+        remove_folder(&path);
+    }
+
+    /// Once the mirror works again (the screen back on the app's card),
+    /// failures are remembered as on every PC where it works.
+    #[test]
+    fn a_mirror_that_works_again_remembers_failures_as_before() {
+        use super::super::note_mirror_blocked;
+        let path = temp_file("mirror-unblocked");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_mirror_blocked(&shared, true);
+        note_mirror_blocked(&shared, false);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches::new(start);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        let later = driver.now() + Duration::from_secs(60);
+        reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Nothing, "the mirror");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        remove_folder(&path);
+    }
+
     /// Review round 1: a PC that works, waking to the lock screen (or a UAC
     /// prompt) during the picture check, mirrored for an hour at the next
     /// app run. A failure Windows' desktop explains is only for this run.

@@ -239,6 +239,65 @@ impl GpuCheck {
     }
 }
 
+/// The screen EternalMonitor mirrors moved from one card to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub from: String,
+    pub to: String,
+}
+
+/// Which card the screen EternalMonitor mirrors is on, as its captures show
+/// it: the card the app runs on while Windows duplicates the screen, the
+/// card it is wired to after a refusal. A laptop that moves its screen
+/// between its cards while the app runs (a display mux, or Windows on its
+/// own) changes it.
+#[derive(Debug, Default)]
+pub struct ScreenWatch {
+    check: GpuCheck,
+    card: Option<String>,
+}
+
+impl ScreenWatch {
+    pub const fn new() -> Self {
+        Self {
+            check: GpuCheck::new(),
+            card: None,
+        }
+    }
+
+    /// Windows duplicates the screen from `app_gpu`, the card the app runs
+    /// on, so the screen is on that card. Returns the move when it was on
+    /// another one. An earlier refusal's diagnosis no longer holds: the
+    /// next refusal is checked afresh, even with the same facts.
+    pub fn works(&mut self, app_gpu: &str) -> Option<Moved> {
+        self.check = GpuCheck::new();
+        self.moved_to(app_gpu)
+    }
+
+    /// [`GpuCheck::check`] after a refused duplication, and the move when
+    /// the card the screen is wired to is new.
+    pub fn refused(
+        &mut self,
+        screen: &str,
+        facts: Option<GpuFacts>,
+    ) -> (Option<Option<Diagnosis>>, Option<Moved>) {
+        let checked = self.check.check(screen, facts);
+        let moved = match &checked {
+            Some(Some(diagnosis)) => self.moved_to(&diagnosis.screen_gpu),
+            _ => None,
+        };
+        (checked, moved)
+    }
+
+    fn moved_to(&mut self, card: &str) -> Option<Moved> {
+        let from = self.card.replace(card.to_string())?;
+        (from != card).then(|| Moved {
+            from,
+            to: card.to_string(),
+        })
+    }
+}
+
 /// A display configuration read that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigRead {
@@ -1438,6 +1497,64 @@ mod tests {
             Some(None)
         );
         assert_eq!(check.check(r"\\.\DISPLAY9", Some(virtual_screen)), None);
+    }
+
+    /// The 0.3.4 beta field case: the screen of a laptop with an AMD iGPU
+    /// and an NVIDIA card, the app on NVIDIA, moved to the iGPU and back.
+    /// Each move is reported once, with both cards, and after the way back
+    /// the same refusal names the iGPU again.
+    #[test]
+    fn a_screen_moving_between_cards_is_reported_once_each_way() {
+        const NVIDIA: &str = "NVIDIA GeForce RTX 5060 Laptop GPU";
+        const AMD: &str = "AMD Radeon 780M Graphics";
+        let mut watch = ScreenWatch::new();
+        // On the app's card: Windows duplicates it at every capture start.
+        for _ in 0..3 {
+            assert_eq!(watch.works(NVIDIA), None);
+        }
+        // Windows moved it to the iGPU.
+        let (checked, moved) = watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia()));
+        assert_eq!(checked.unwrap().unwrap().screen_gpu, AMD);
+        let to_amd = Moved {
+            from: NVIDIA.into(),
+            to: AMD.into(),
+        };
+        assert_eq!(moved, Some(to_amd));
+        // The retries every few seconds say nothing new.
+        assert_eq!(
+            watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia())),
+            (None, None)
+        );
+        // Back on the app's card.
+        let to_nvidia = Moved {
+            from: AMD.into(),
+            to: NVIDIA.into(),
+        };
+        assert_eq!(watch.works(NVIDIA), Some(to_nvidia));
+        assert_eq!(watch.works(NVIDIA), None);
+        // And over again, with the same facts: diagnosed again, so the
+        // notice can name the iGPU.
+        let (checked, moved) = watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia()));
+        assert_eq!(checked.unwrap().unwrap().screen_gpu, AMD);
+        assert_eq!(moved.unwrap().to, AMD);
+    }
+
+    /// A PC whose screen stays on the app's card, as on every PC where Mirror
+    /// works: nothing is ever reported, and a refusal Windows can't explain
+    /// (no facts, or the virtual screen) moves nothing.
+    #[test]
+    fn a_screen_on_the_apps_card_is_never_reported_as_moved() {
+        let mut watch = ScreenWatch::new();
+        assert_eq!(watch.works("NVIDIA GeForce RTX 5080"), None);
+        assert_eq!(watch.works("NVIDIA GeForce RTX 5080"), None);
+        assert_eq!(watch.refused(r"\\.\DISPLAY1", None), (None, None));
+        let mut virtual_screen = laptop_on_nvidia();
+        virtual_screen.screens = vec![(r"\\.\DISPLAY9".into(), IDD)];
+        assert_eq!(
+            watch.refused(r"\\.\DISPLAY9", Some(virtual_screen)),
+            (Some(None), None)
+        );
+        assert_eq!(watch.works("NVIDIA GeForce RTX 5080"), None);
     }
 
     #[test]
