@@ -21,6 +21,9 @@ pub enum CaptureBlock {
     /// The display mode changed or a full-screen app took exclusive control
     /// of the display, and duplication has not come back yet.
     DisplayChanging,
+    /// No display is on: a laptop's lid is closed or its screen is off.
+    /// Capture resumes by itself when a display comes on.
+    NoDisplay,
     /// Windows refuses to duplicate this display from the GPU EternalMonitor
     /// runs on. Seen on hybrid laptops when the app runs on the discrete GPU
     /// while the screen is wired to the integrated one.
@@ -41,9 +44,10 @@ impl CaptureBlock {
         match code as u32 {
             0x8007_0005 => Some(Self::SecureDesktop), // E_ACCESSDENIED
             0x887A_0026 => Some(Self::DisplayChanging), // DXGI_ERROR_ACCESS_LOST
-            // DXGI_ERROR_NOT_FOUND: no display output, while a laptop's lid
-            // is closed or its screen is off. It ended capture like a crash,
-            // so the restart brake stopped it until the user clicked Start.
+            // DXGI_ERROR_NOT_FOUND: an adapter or output is missing, while
+            // the layout changes or a laptop's lid is closed. It ended
+            // capture like a crash, so the restart brake stopped it until
+            // the user clicked Start. [`Self::opening`] tells a closed lid.
             0x887A_0002 => Some(Self::DisplayChanging),
             0x887A_0004 => Some(Self::UnsupportedOnThisGpu), // DXGI_ERROR_UNSUPPORTED
             0x887A_0022 => Some(Self::TooManyCaptureApps),   // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
@@ -51,6 +55,30 @@ impl CaptureBlock {
             _ => None,
         }
     }
+
+    /// [`Self::from_hresult`] for a failure to open the output to capture.
+    /// DXGI_ERROR_NOT_FOUND means no display is on only when enumeration
+    /// found an adapter but no output at all; anywhere else the layout is
+    /// changing.
+    pub fn opening(step: OpenStep, code: i32) -> Option<Self> {
+        match (step, code as u32) {
+            (OpenStep::OnlyOutput, 0x887A_0002) => Some(Self::NoDisplay),
+            _ => Self::from_hresult(code),
+        }
+    }
+}
+
+/// The call that opens the output to capture, for [`CaptureBlock::opening`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenStep {
+    /// `EnumAdapters1`: no adapter is listed, as during a driver update.
+    Adapter,
+    /// `EnumOutputs` for an output enumeration listed: it went away since,
+    /// as when a display is unplugged or Win+P switches displays.
+    ListedOutput,
+    /// `EnumOutputs(0)` after enumeration listed no output at all: a
+    /// laptop's lid is closed or every display is off.
+    OnlyOutput,
 }
 
 /// Errors a GPU reset, a display change or a shortage of memory raises while
@@ -641,6 +669,45 @@ mod tests {
         assert!(now.duration_since(start) > LOSS_GIVE_UP);
     }
 
+    /// Review r1 of #141: "No display is on" told a desktop PC to open the
+    /// laptop lid while a display was unplugged or a driver updated. Only
+    /// an enumeration that found no output at all is a display that's off.
+    #[test]
+    fn only_no_listed_output_at_all_says_no_display_is_on() {
+        let not_found = 0x887A_0002_u32 as i32;
+        assert_eq!(
+            CaptureBlock::opening(OpenStep::OnlyOutput, not_found),
+            Some(CaptureBlock::NoDisplay)
+        );
+        // A listed output gone by the time it opens: unplugged, Win+P.
+        assert_eq!(
+            CaptureBlock::opening(OpenStep::ListedOutput, not_found),
+            Some(CaptureBlock::DisplayChanging)
+        );
+        // No adapter listed, as during a driver update.
+        assert_eq!(
+            CaptureBlock::opening(OpenStep::Adapter, not_found),
+            Some(CaptureBlock::DisplayChanging)
+        );
+        assert_eq!(
+            CaptureBlock::from_hresult(not_found),
+            Some(CaptureBlock::DisplayChanging)
+        );
+        // Other codes map as anywhere else.
+        let access_denied = 0x8007_0005_u32 as i32;
+        for step in [
+            OpenStep::Adapter,
+            OpenStep::ListedOutput,
+            OpenStep::OnlyOutput,
+        ] {
+            assert_eq!(
+                CaptureBlock::opening(step, access_denied),
+                Some(CaptureBlock::SecureDesktop)
+            );
+            assert_eq!(CaptureBlock::opening(step, 0x8007_000E_u32 as i32), None);
+        }
+    }
+
     /// Lid closed for two minutes: every attempt finds no display output
     /// (DXGI_ERROR_NOT_FOUND), then the lid opens.
     #[test]
@@ -665,8 +732,8 @@ mod tests {
 
         let not_found = 0x887A_0002_u32 as i32;
         assert_eq!(
-            CaptureBlock::from_hresult(not_found),
-            Some(CaptureBlock::DisplayChanging)
+            CaptureBlock::opening(OpenStep::OnlyOutput, not_found),
+            Some(CaptureBlock::NoDisplay)
         );
         // Not remembered against the second screen either.
         assert!(passing_code(not_found));
@@ -682,7 +749,7 @@ mod tests {
                 &shared,
                 |_| {
                     if *waited.borrow() < lid_closed_for {
-                        let block = CaptureBlock::from_hresult(not_found).unwrap();
+                        let block = CaptureBlock::opening(OpenStep::OnlyOutput, not_found).unwrap();
                         return Err(Box::new(CaptureUnavailable {
                             block,
                             detail: "EnumOutputs: 0x887a0002".into(),
@@ -692,10 +759,7 @@ mod tests {
                     Ok(())
                 },
                 |delay| {
-                    assert_eq!(
-                        *shared.capture_block.lock(),
-                        Some(CaptureBlock::DisplayChanging)
-                    );
+                    assert_eq!(*shared.capture_block.lock(), Some(CaptureBlock::NoDisplay));
                     waits.borrow_mut().push(delay);
                     *waited.borrow_mut() += delay;
                     true
@@ -774,6 +838,7 @@ mod tests {
         for block in [
             CaptureBlock::SecureDesktop,
             CaptureBlock::DisplayChanging,
+            CaptureBlock::NoDisplay,
             CaptureBlock::TooManyCaptureApps,
             CaptureBlock::SessionDisconnected,
         ] {
