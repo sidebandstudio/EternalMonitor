@@ -57,7 +57,14 @@ class InstallScript(unittest.TestCase):
         self.assertIn(f"$repo = '{nightly.REPO}'", self.script)
         self.assertIn(f"/releases/tags/{nightly.MOVING_TAG}\"", self.script)
         self.assertIn(f"$name = '{nightly.ASSET}'", self.script)
-        self.assertIn(f"/releases/download/{nightly.MOVING_TAG}/$name\"", self.script)
+        # The bytes downloaded are the asset whose digest was read: nightly.py renames
+        # and deletes the served asset, so the moving download link may change between
+        # two requests, but an asset id does not.
+        self.assertNotIn(f"/releases/download/{nightly.MOVING_TAG}/", self.script)
+        self.assertIn("GitHub \"$api/releases/assets/$($asset.id)\" 'application/octet-stream' $path", self.script)
+        # One more look if the asset vanished mid-publish, never more.
+        self.assertIn("if ($look -ge 2) { throw", self.script)
+        self.assertIn("GitHub is limiting requests from this network. Try again in an hour.", self.script)
         # GitHub's asset digest first, else the SHA-256 that nightly.notes() writes.
         self.assertIn("'^sha256:([0-9a-f]{64})$'", self.script)
         notes = nightly.notes("0.3.5-beta.20261030.1", "main", "a" * 40, "0.3.4", "B" * 64)
@@ -66,16 +73,25 @@ class InstallScript(unittest.TestCase):
 
     def test_it_checks_the_hash_before_starting_anything(self):
         s = self.script
-        check = s.index("Get-FileHash -LiteralPath $path -Algorithm SHA256")
+        # A new folder every run, never a fixed name in %TEMP%.
+        self.assertIn("[guid]::NewGuid()", s)
+        self.assertNotIn("Join-Path $env:TEMP", s)
+        # The hash is read through a handle that denies writes and deletes...
+        lock = s.index("[IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)")
+        check = s.index("$hasher.ComputeHash($file)")
         refuse = s.index("if ($got -ne $sha256)")
-        delete = s.index("Remove-Item -LiteralPath $path", refuse)
         dry = s.index("if ($dryRun)")
-        start = s.index("Start-Process -FilePath $path")
-        self.assertLess(check, refuse)
-        self.assertLess(refuse, delete)
-        self.assertLess(delete, dry)
-        self.assertLess(dry, start)
+        start = s.index("$installer = Start-Process -FilePath $path -PassThru")
+        wait = s.index("$installer.WaitForExit()")
+        # ...that stays open until the installer closes, then the folder goes.
+        release = s.index("if ($file) { $file.Dispose() }")
+        clean = s.index("Remove-Item -LiteralPath $dir -Recurse -Force")
+        self.assertLess(s.index("} finally {"), release)
+        self.assertEqual(sorted([lock, check, refuse, dry, start, wait, release, clean]),
+                         [lock, check, refuse, dry, start, wait, release, clean])
+        self.assertNotIn("Get-FileHash", s)
         self.assertEqual(s.count("Start-Process"), 1)
+        self.assertEqual(s.count("$file.Dispose()"), 1)
         self.assertIn("'^[0-9a-f]{64}$'", s)
         self.assertIn("$env:EM_INSTALL_DRY_RUN", s)
         self.assertIn("[Net.SecurityProtocolType]::Tls12", s)
@@ -84,7 +100,9 @@ class InstallScript(unittest.TestCase):
         for name in ("install.ps1", "install-beta.ps1"):
             text = (DOCS / name).read_text()
             # iex runs in the visitor's session: exit would close their window.
-            self.assertIsNone(re.search(r"^\s*exit\b", text, re.M | re.I), name)
+            self.assertIsNone(re.search(r"\bexit\b", text, re.I), name)
+            # Nothing reaches outside its own scope.
+            self.assertIsNone(re.search(r"\$(global|script):|-Scope\b", text, re.I), name)
             # Everything runs in a script block, so nothing is left in their session.
             code = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
             self.assertEqual((code[0], code[-1]), ("& {", "}"), name)
