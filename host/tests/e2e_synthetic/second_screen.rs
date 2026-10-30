@@ -544,3 +544,112 @@ fn a_late_attach_moves_the_stream_as_a_new_epoch_on_the_same_tunnel() {
     std::env::remove_var("ETERNAL_USB_DIRECT");
     let _ = std::fs::remove_dir_all(&memory);
 }
+
+/// The 0.3.4 beta field case, on a laptop with two graphics cards. The
+/// second screen works; then Windows moves the main screen to the card
+/// EternalMonitor doesn't run on, so the mirror shows nothing
+/// (`UnsupportedOnThisGpu`), and the next start doesn't attach (Windows
+/// showed the second screen as a copy of the main one). 0.3.4-beta.1 saved
+/// that for an hour and mirrored the blocked screen: no picture at all.
+/// Now nothing is saved, the Stream page's notice names the card the screen
+/// moved to, and once the display attaches again (the user chose Extend)
+/// the next connection gets its picture from the second screen.
+#[test]
+fn a_screen_moved_to_the_other_card_never_traps_the_ipad_on_a_blocked_mirror() {
+    use eternal_host::capture::second_screen::fake::APP_GPU;
+    use eternal_host::gpu_preference::Preference;
+
+    let _env = test_env();
+    synthetic_env();
+    let memory = memory_dir("moved-screen");
+    let display = FakeDisplay::new(Some(Duration::ZERO), Duration::from_secs(10));
+    let host = Host::start(&display, &memory, SystemTime::now());
+    // The fake clock skips the waits between display changes and the
+    // attach wait; none of it saves a failure at the moved clock.
+    let skip_waits = || {
+        if host.status() == VddStatus::Attaching {
+            display.advance(Duration::from_secs(1));
+        }
+    };
+
+    // The second screen works, with the screen on the app's card.
+    let mut receiver = host.connect(0x5707_2001);
+    let pictures = watch(&mut receiver, Duration::from_secs(40), |pictures| {
+        skip_waits();
+        after_first_epoch(pictures) >= 10
+    });
+    assert_eq!(epochs(&pictures).len(), 2, "mirror, then the second screen");
+    assert_eq!(host.status(), VddStatus::Active);
+    assert_eq!(*host.shared.gpu_diagnosis.lock(), None);
+
+    // Windows moves the main screen to the other card, and the next start
+    // won't attach. The iPad leaves; after the grace period the display is
+    // turned off and capture mirrors, which Windows now refuses.
+    display.move_screen(Some("Fake iGPU"));
+    display.set_attach_after(None);
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while host.shared.gpu_diagnosis.lock().is_none() {
+        assert!(Instant::now() < deadline, "the mirror is never refused");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let diagnosis = host.shared.gpu_diagnosis.lock().clone().unwrap();
+    assert_eq!(diagnosis.screen_gpu, "Fake iGPU", "the notice's card");
+    assert_eq!(diagnosis.app_gpu, APP_GPU);
+    assert_eq!(diagnosis.preference, Some(Preference::PowerSaving));
+
+    // The next iPad: nothing to mirror, and the start times out. It gets
+    // the "no picture" path, not a loop.
+    let mut receiver = host.connect(0x5707_2002);
+    let pictures = watch(&mut receiver, Duration::from_secs(40), |pictures| {
+        assert!(pictures.is_empty(), "the mirror is blocked");
+        skip_waits();
+        host.status() == VddStatus::Failed
+    });
+    assert!(pictures.is_empty());
+    receiver.send(&ControlMessage::Bye(ByeReason::Error));
+    let summary_2 = summary(0x5707_2002);
+    assert!(summary_2.contains(" outcome=no_picture "), "{summary_2}");
+    assert!(
+        summary_2.contains(" fallback=attach_timeout "),
+        "{summary_2}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(saved_failure(&memory), None, "no hour-long wait is saved");
+
+    // The display attaches again. The next connection tries the second
+    // screen at once, and its picture comes from it.
+    display.set_attach_after(Some(Duration::ZERO));
+    let enables = display.toggles().iter().filter(|(_, on)| *on).count();
+    let hello = Instant::now();
+    let mut receiver = host.connect(0x5707_2003);
+    let pictures = watch(&mut receiver, Duration::from_secs(40), |pictures| {
+        skip_waits();
+        pictures.len() >= 10
+    });
+    let first_ms = pictures[0].1.duration_since(hello).as_millis();
+    assert_eq!(host.status(), VddStatus::Active);
+    assert_eq!(
+        display.toggles().iter().filter(|(_, on)| *on).count(),
+        enables + 1,
+        "tried again: {:?}",
+        display.toggles()
+    );
+    assert_eq!(saved_failure(&memory), None);
+    assert_eq!(
+        host.shared
+            .gpu_diagnosis
+            .lock()
+            .as_ref()
+            .unwrap()
+            .screen_gpu,
+        "Fake iGPU",
+        "the mirror is still blocked: the notice stays"
+    );
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    let summary_3 = summary(0x5707_2003);
+    assert!(summary_3.contains(" outcome=streamed "), "{summary_3}");
+    eprintln!("SECOND_SCREEN_MOVED_SCREEN first_picture_ms={first_ms}");
+    drop(host);
+    let _ = std::fs::remove_dir_all(&memory);
+}
