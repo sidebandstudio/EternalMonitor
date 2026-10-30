@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <script>document.documentElement.className = 'js';</script>
+  <script>if (/Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1 && sessionStorage.getItem('mac-notice') !== 'off') document.documentElement.classList.add('mac');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EternalMonitor: your iPad as a second screen for your Windows PC</title>
   <meta name="description" content="Mirror your Windows PC or add the iPad as a real second screen, over USB or Wi-Fi. Apple Pencil, touch and keyboard go back to the PC. Free and open source.">
@@ -66,6 +67,13 @@
       </div>
     </nav>
   </header>
+
+  <aside class="mac-notice" aria-label="Note for Mac visitors">
+    <div class="container mac-notice-inner">
+      <p><strong>On a Mac?</strong>Mac support is <a href="index.html#coming">coming soon</a>, for iPad and iPhone Duo. Until then, EternalMonitor streams from Windows PCs, and Apple's <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> works with an iPad.</p>
+      <button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button>
+    </div>
+  </aside>
 
   <main id="main">
 

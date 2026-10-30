@@ -39,32 +39,16 @@
     updateNav();
   }
 
-  /* --- Mac visitors: one line, dismissable ------------------------------ */
-  // iPadOS reports 'MacIntel' too, so require a non-touch device.
-  var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
-  if (isMac && nav && sessionStorage.getItem('mac-notice') !== 'off') {
-    var notice = document.createElement('aside');
-    notice.className = 'mac-notice';
-    notice.setAttribute('aria-label', 'Note for Mac visitors');
-    notice.innerHTML =
-      '<div class="container mac-notice-inner">' +
-      '<p><strong>On a Mac?</strong>Mac support is <a href="index.html#coming">coming soon</a>, for iPad and iPhone Duo. Until then, EternalMonitor streams from Windows PCs, and Apple\'s ' +
-      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> works with an iPad.</p>' +
-      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button></div>';
-    notice.querySelector('.mac-notice-close').addEventListener('click', function () {
+  /* --- Mac visitors: one line under the header, dismissable ------------ */
+  // Each page's head script adds html.mac before the first paint, so the line
+  // never moves the page. iPadOS reports 'MacIntel' too, so it requires a
+  // non-touch device.
+  var macClose = document.querySelector('.mac-notice-close');
+  if (macClose) {
+    macClose.addEventListener('click', function () {
       sessionStorage.setItem('mac-notice', 'off');
-      notice.remove();
+      document.documentElement.classList.remove('mac');
     });
-    // On the home page it stays out of the way while the hero's picture is on
-    // screen, so it never covers the picture or its switches.
-    var hero = document.querySelector('.stage');
-    if (hero && 'IntersectionObserver' in window) {
-      notice.hidden = true;
-      new IntersectionObserver(function (entries) {
-        notice.hidden = entries[0].isIntersecting;
-      }).observe(hero);
-    }
-    document.body.appendChild(notice);
   }
 
   /* --- Hero: second screen or mirror, USB or Wi-Fi ---------------------

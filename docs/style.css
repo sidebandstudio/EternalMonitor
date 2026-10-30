@@ -433,7 +433,7 @@ small { font-size: 0.875rem; }
    its choices are both in view when the page opens. */
 @media (min-width: 721px) and (min-height: 600px) {
   .hero { --hero-top: clamp(28px, 4.5svh, 64px); padding-top: var(--hero-top); }
-  .hero > .container { display: flex; flex-direction: column; max-height: calc(100svh - var(--nav-h) - var(--hero-top) - 20px); }
+  .hero > .container { display: flex; flex-direction: column; max-height: calc(100svh - var(--nav-h) - var(--note-h, 0px) - var(--hero-top) - 20px); }
   .hero-text { flex: none; width: 100%; }
   .stage { display: flex; flex-direction: column; min-height: 0; margin-top: clamp(24px, 3.4svh, 52px); }
   .rig-fit { flex: 0 1 auto; min-height: 0; container-type: size; }
@@ -1403,33 +1403,26 @@ fieldset { border: 0; min-width: 0; }
 
 /* --- Mac notice ------------------------------------------------------------------- */
 
-.mac-notice {
-  position: fixed;
-  left: 16px;
-  bottom: 16px;
-  z-index: 90;
-  max-width: 440px;
-  padding: 12px 14px;
-  border-radius: var(--r-md);
-  background: var(--raised);
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.9);
-  font-size: 0.9rem;
-  color: var(--muted);
-}
-.mac-notice-inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; width: auto; }
-@media (max-width: 560px) { .mac-notice { left: 12px; right: 12px; bottom: 12px; max-width: none; } }
+/* Mac visitors: a band under the header, in the page's flow, so it never covers
+   anything. It shows while the head script's html.mac is set; --note-h is its
+   height, which the hero leaves room for. */
+.mac-notice { display: none; background: var(--surface); color: var(--muted); font-size: 0.9rem; }
+html.mac { --note-h: 48px; }
+html.mac .mac-notice { display: block; }
+@media (max-width: 1239px) { html.mac { --note-h: 64px; } }
+.mac-notice-inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: var(--note-h); padding-block: 8px; }
 .mac-notice strong { color: var(--text); font-weight: 500; margin-right: 6px; }
 .mac-notice a { color: var(--text); text-decoration: underline; text-underline-offset: 0.18em; }
 .mac-notice-close {
   flex: none;
-  width: 30px; height: 30px;
+  width: 32px; height: 32px;
+  margin-right: -6px;
   border-radius: 8px;
-  border: 1px solid var(--border);
+  border: 0;
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 1.1rem;
+  font-size: 1.25rem;
   cursor: pointer;
 }
 .mac-notice-close:hover { color: var(--text); background: var(--raised); }
