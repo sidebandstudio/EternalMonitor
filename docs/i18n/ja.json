@@ -135,7 +135,7 @@
   "index.films.title": "動作を動画で見る。",
   "index.film.secondScreen.label": "動画：Windows アプリでポインターがセカンドスクリーンを選びます。モニターの前の iPad はミラーリングをやめてセカンドスクリーンになり、夜の絵画の資料がモニターから iPad にドラッグされ、そのまま表示されます。",
   "index.film.secondScreen.title": "デスクトップを拡張",
-  "index.films.explore": "詳しく見る <0>→</0>",
+  "index.films.explore": "詳しく見る <0/>",
   "index.film.secondScreen.more": "セカンドスクリーンを詳しく見る",
   "index.film.pair.label": "動画：Windows アプリでポインターが QR コードをクリックし、スキャンして接続するダイアログが開きます。iPad で指が QRコードをスキャンをタップし、カメラが PC の画面のコードを読み取ると、iPad に PC が表示され始めます。Windows アプリには iPad Pro に Wi-Fi で配信中と表示されます。",
   "index.film.pair.title": "QR コードでペアリング",

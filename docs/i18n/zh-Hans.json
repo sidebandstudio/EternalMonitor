@@ -135,7 +135,7 @@
   "index.films.title": "看看它如何工作。",
   "index.film.secondScreen.label": "视频：在 Windows 应用中，指针选择第二屏幕。显示器前的 iPad 停止镜像，变成第二屏幕。一张夜景画参考资料从显示器拖到 iPad 上并保留在那里。",
   "index.film.secondScreen.title": "扩展桌面",
-  "index.films.explore": "了解更多 <0>→</0>",
+  "index.films.explore": "了解更多 <0/>",
   "index.film.secondScreen.more": "了解第二屏幕",
   "index.film.pair.label": "视频：在 Windows 应用中，指针点击二维码，打开扫描连接对话框。在 iPad 上，手指轻点扫描二维码，相机找到电脑屏幕上的二维码，iPad 开始显示电脑画面。Windows 应用显示正在通过 Wi-Fi 向 iPad Pro 串流。",
   "index.film.pair.title": "用二维码配对",

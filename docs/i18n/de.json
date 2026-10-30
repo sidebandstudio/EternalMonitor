@@ -135,7 +135,7 @@
   "index.films.title": "Sieh es in Aktion.",
   "index.film.secondScreen.label": "Video: In der Windows-App wählt der Mauszeiger Zweiter Bildschirm. Das iPad vor dem Monitor spiegelt nicht mehr, sondern wird zum zweiten Bildschirm. Eine Referenzvorlage mit Nachtgemälden wird vom Monitor auf das iPad gezogen und bleibt dort.",
   "index.film.secondScreen.title": "Desktop erweitern",
-  "index.films.explore": "Entdecken <0>→</0>",
+  "index.films.explore": "Entdecken <0/>",
   "index.film.secondScreen.more": "Den zweiten Bildschirm entdecken",
   "index.film.pair.label": "Video: In der Windows-App klickt der Mauszeiger auf QR-Code und der Dialog zum Verbinden per Scan öffnet sich. Auf dem iPad tippt ein Finger auf QR-Code scannen. Die Kamera erkennt den Code auf dem PC-Bildschirm und das iPad zeigt den PC. Die Windows-App meldet, dass sie über Wi-Fi auf das iPad Pro streamt.",
   "index.film.pair.title": "Per QR-Code koppeln",

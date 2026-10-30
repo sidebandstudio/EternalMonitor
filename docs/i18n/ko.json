@@ -135,7 +135,7 @@
   "index.films.title": "작동 모습을 보세요.",
   "index.film.secondScreen.label": "영상: Windows 앱에서 포인터가 두 번째 화면을 선택합니다. 모니터 앞의 iPad가 미러링을 멈추고 두 번째 화면이 됩니다. 밤 풍경 그림의 참고 자료를 모니터에서 iPad로 끌어 놓으면 그대로 표시됩니다.",
   "index.film.secondScreen.title": "데스크톱 확장",
-  "index.films.explore": "자세히 보기 <0>→</0>",
+  "index.films.explore": "자세히 보기 <0/>",
   "index.film.secondScreen.more": "두 번째 화면 알아보기",
   "index.film.pair.label": "영상: Windows 앱에서 포인터가 QR 코드를 클릭하면 스캔하여 연결 대화 상자가 열립니다. iPad에서 손가락으로 QR 코드 스캔을 탭하고 카메라가 PC 화면의 코드를 찾으면 iPad에 PC 화면이 표시됩니다. Windows 앱에는 iPad Pro로 Wi-Fi 스트리밍 중이라고 표시됩니다.",
   "index.film.pair.title": "QR 코드로 페어링",

@@ -135,7 +135,7 @@
   "index.films.title": "इसे काम करते देखें।",
   "index.film.secondScreen.label": "वीडियो: Windows ऐप में पॉइंटर दूसरी स्क्रीन चुनता है। मॉनिटर के सामने रखा iPad मिरर करना बंद करके दूसरी स्क्रीन बन जाता है। रात के चित्रों की रेफ़रेंस शीट मॉनिटर से खींचकर iPad पर रखी जाती है।",
   "index.film.secondScreen.title": "अपना डेस्कटॉप बढ़ाएँ",
-  "index.films.explore": "जानें <0>→</0>",
+  "index.films.explore": "जानें <0/>",
   "index.film.secondScreen.more": "दूसरी स्क्रीन के बारे में जानें",
   "index.film.pair.label": "वीडियो: Windows ऐप में पॉइंटर QR कोड पर क्लिक करता है और कनेक्ट करने के लिए स्कैन करें डायलॉग खुलता है। iPad पर एक उंगली QR कोड स्कैन करें पर टैप करती है, कैमरा PC की स्क्रीन पर कोड ढूँढता है और iPad पर PC दिखने लगता है। Windows ऐप बताता है कि iPad Pro पर Wi-Fi से स्ट्रीम हो रहा है।",
   "index.film.pair.title": "QR कोड से पेयर करें",

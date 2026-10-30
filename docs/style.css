@@ -588,10 +588,14 @@ small { font-size: 0.875rem; }
   transition: color 0.15s ease-out;
 }
 .demo-more span { display: inline-block; transition: transform 0.2s var(--ease-out); }
+/* The arrow is drawn here, not in the copy, so it points the reading way. */
+.demo-arrow::before { content: "\2192"; }
+[dir="rtl"] .demo-arrow::before { content: "\2190"; }
 /* The whole card is the link's target. */
 .demo-more::after { content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
 .demo:hover .demo-more, .demo-more:focus-visible { color: var(--text); }
 .demo:hover .demo-more span { transform: translateX(3px); }
+[dir="rtl"] .demo:hover .demo-more span { transform: translateX(-3px); }
 .demo-more:focus-visible { outline: none; }
 .demo:has(.demo-more:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
 .demo:hover .demo-media { transform: scale(1.015); }

@@ -135,7 +135,7 @@
   "index.films.title": "Veja como funciona.",
   "index.film.secondScreen.label": "Vídeo: no app para Windows, o ponteiro seleciona Segunda tela. O iPad diante do monitor deixa de espelhar a tela e vira uma segunda tela. Uma folha de referência com pinturas noturnas é arrastada do monitor para o iPad, onde permanece.",
   "index.film.secondScreen.title": "Estenda sua área de trabalho",
-  "index.films.explore": "Explorar <0>→</0>",
+  "index.films.explore": "Explorar <0/>",
   "index.film.secondScreen.more": "Explorar a segunda tela",
   "index.film.pair.label": "Vídeo: no app para Windows, o ponteiro clica em Código QR e a janela Escanear para conectar abre. No iPad, um dedo toca em Escanear código QR, a câmera encontra o código na tela do PC e o iPad começa a mostrar o PC enquanto o app para Windows informa que está transmitindo para o iPad Pro por Wi-Fi.",
   "index.film.pair.title": "Pareie com um código QR",

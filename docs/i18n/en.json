@@ -34,7 +34,7 @@
   "index.films.title": "Watch it work.",
   "index.film.secondScreen.label": "Film: in the Windows app, the pointer picks Second screen. The iPad in front of the monitor stops mirroring and becomes a second display, and a reference sheet of night paintings is dragged off the monitor onto it, where it stays.",
   "index.film.secondScreen.title": "Extend your desktop",
-  "index.films.explore": "Explore <0>→</0>",
+  "index.films.explore": "Explore <0/>",
   "index.film.secondScreen.more": "Explore the second screen",
   "index.film.pair.label": "Film: in the Windows app, the pointer clicks QR code and the Scan to connect dialog opens. On the iPad, a finger taps Scan QR code, the camera finds the code on the PC's screen, and the iPad starts showing the PC while the Windows app says it is streaming to the iPad Pro over Wi-Fi.",
   "index.film.pair.title": "Pair with a QR code",

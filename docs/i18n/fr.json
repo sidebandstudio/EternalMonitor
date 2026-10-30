@@ -135,7 +135,7 @@
   "index.films.title": "Voyez comment ça marche.",
   "index.film.secondScreen.label": "Vidéo : dans l'app Windows, le pointeur sélectionne Second écran. L'iPad devant le moniteur cesse de recopier son écran et devient un second écran. Une feuille de référence montrant des peintures nocturnes est glissée du moniteur vers l'iPad, où elle reste.",
   "index.film.secondScreen.title": "Étendez votre bureau",
-  "index.films.explore": "Explorer <0>→</0>",
+  "index.films.explore": "Explorer <0/>",
   "index.film.secondScreen.more": "Découvrir le second écran",
   "index.film.pair.label": "Vidéo : dans l'app Windows, le pointeur clique sur Code QR et la boîte de dialogue Scanner pour connecter s'ouvre. Sur l'iPad, un doigt touche Scanner le code QR, la caméra repère le code sur l'écran du PC et l'iPad commence à afficher le PC tandis que l'app Windows indique qu'elle diffuse vers l'iPad Pro en Wi-Fi.",
   "index.film.pair.title": "Jumelez avec un code QR",
