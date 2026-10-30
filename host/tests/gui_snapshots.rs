@@ -609,6 +609,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     waiting_for_the_port_can_be_stopped(&shared, &mut results);
     code_pairing_pause_says_why_and_resumes(&shared, &mut results);
     listen_on_is_chosen_and_reset(&shared, &dir, &mut results);
+    pairing_off_is_warned(&shared, &dir, &mut results);
     a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
@@ -665,6 +666,34 @@ fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut
     assert_ne!(shared.pairing.lock().code(), paused_code);
     assert!(window.query_by_label("Resume code pairing").is_none());
     window.get_by_label("New code");
+}
+
+/// Turning pairing off in Settings says what that allows, until it is on
+/// again.
+fn pairing_off_is_warned(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let warning = "Pairing is off, so any iPad on your network can connect, and use this PC's mouse and keyboard, without a code. Turn it on unless every device on this network is yours.";
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let switch = || kittest::by().role(Role::CheckBox).label("Require pairing");
+    window.get(switch()).scroll_to_me();
+    window.run_steps(4);
+    assert!(window.query_by_label(warning).is_none());
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(!shared.pairing.lock().required);
+    assert!(!settings_file(dir).require_pairing);
+    window.get_by_label(warning).scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-pairing-off");
+    results.extend_harness(&mut window);
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(shared.pairing.lock().required);
+    assert!(window.query_by_label(warning).is_none());
 }
 
 /// Listen on offers each network with its address, and Tailscale. A choice

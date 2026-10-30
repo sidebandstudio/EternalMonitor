@@ -739,7 +739,11 @@ impl AnalyzerApp {
     }
 
     fn set_require_pairing(&mut self, required: bool) {
-        self.control.shared.pairing.lock().required = required;
+        {
+            let mut pairing = self.control.shared.pairing.lock();
+            pairing.required = required;
+            pairing.warn_if_off();
+        }
         self.persist_settings();
     }
 

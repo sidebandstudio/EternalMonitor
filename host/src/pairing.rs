@@ -105,6 +105,13 @@ impl Pairing {
         }
     }
 
+    /// Said at startup and whenever pairing is turned off.
+    pub fn warn_if_off(&self) {
+        if !self.required {
+            warn!("Pairing is off: any iPad on the network can connect without a code");
+        }
+    }
+
     pub fn log_code(&self) {
         info!(pairing_code = %format_args!("{:06}", self.code), "Pairing code ready");
     }
