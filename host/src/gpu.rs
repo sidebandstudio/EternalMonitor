@@ -175,6 +175,7 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
                 .take_while(|&c| c != 0)
                 .collect::<Vec<_>>(),
         );
+        crate::telemetry::note_hardware(&name);
         let vendor = GpuVendor::from_vendor_id(desc.VendorId);
         let vram_mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
         let driver_version = match unsafe {
@@ -258,6 +259,7 @@ pub fn adapter_names() -> Vec<String> {
         )
         .trim()
         .to_string();
+        crate::telemetry::note_hardware(&name);
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
         }

@@ -356,6 +356,7 @@ final class ConnectionManager: ObservableObject {
         case .udp(let host, let targetPort):
             normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedHost.isEmpty, targetPort != 0 else { return }
+            SupportDiagnostics.noteTypedAddress(normalizedHost)
             port = targetPort
             receiver = makeUDPLink(port)
             lastTarget = (normalizedHost, port)
