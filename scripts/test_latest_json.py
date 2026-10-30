@@ -66,6 +66,8 @@ class LatestJsonTest(unittest.TestCase):
         self.releases = {f"v{v}": release(v) for v in SHA}
         self.downloads = []
         self.asc = None
+        # The tree at the published 0.3.3, whatever the repository's version.
+        self.bump_tree("0.3.3")
         self.git("init", "-q")
         # History: 0.3.2 everywhere, then Windows 0.3.3 and iPad 0.3.3 build 364.
         self.publish_state(manifest("0.3.2", "0.3.2", 316))

@@ -46,9 +46,12 @@ class CheckVersionsTest(unittest.TestCase):
         """What the release procedure changes: versions, the page and latest.json."""
         major, minor, patch = map(int, self.version.split("."))
         new = f"{major}.{minor}.{patch + 1}"
+        # The tree runs ahead of the published release until it is published.
+        published = json.loads((self.tmp / "docs/latest.json").read_text())["windows"]["version"]
         for name in FILES[1:6]:
             path = self.tmp / name
-            path.write_text(path.read_text().replace(self.version, new))
+            old = published if name.startswith("docs/") else self.version
+            path.write_text(path.read_text().replace(old, new))
         return new
 
     def test_current_tree_passes(self):
