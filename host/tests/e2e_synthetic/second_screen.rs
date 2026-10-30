@@ -94,6 +94,7 @@ impl Drop for Host {
             assert!(stopped || std::thread::panicking(), "host shutdown");
         }
         second_screen::shut_down(&self.shared);
+        second_screen::finish_saving(&self.shared);
     }
 }
 

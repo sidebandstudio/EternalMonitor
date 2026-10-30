@@ -991,6 +991,9 @@ impl eframe::App for AnalyzerApp {
         // encoder.
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Holds no lock: a second screen record writer that could not start
+        // is started here, once its wait is over.
+        crate::capture::second_screen::retry_saving(&self.control.shared);
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());

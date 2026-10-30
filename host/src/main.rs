@@ -283,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_sample = std::time::Instant::now();
         while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(250));
+            eternal_host::capture::second_screen::retry_saving(&gui_control.shared);
             if log_e2e && last_sample.elapsed() >= std::time::Duration::from_secs(1) {
                 last_sample = std::time::Instant::now();
                 let sample = stats::PIPELINE_STATS.lock();
@@ -348,6 +349,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
+
+    // The window is gone and the display is off, so a slow disk keeps no one
+    // waiting on screen: give the second screen record up to 30 s to land.
+    eternal_host::capture::second_screen::finish_saving(&gui_control.shared);
 
     eternal_host::startup::simulate_slow_exit();
     info!("EternalMonitor shutting down");
