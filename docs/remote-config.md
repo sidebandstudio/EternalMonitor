@@ -10,9 +10,9 @@ config never blocks or degrades a PC or iPad that works.** It may only
 - start Second screen sessions in the mirror on narrowly named hardware
   where the second screen is known not to start, which the user can always
   override with Try again,
-- choose how the PC's window draws (DX12, Vulkan or WARP) on a named
-  graphics vendor and driver range, from the next launch, below the user's
-  own choice and the PC's memory of renderers that crashed.
+- choose how the PC's window draws (DX12 or Vulkan, on its own graphics
+  card) on a named graphics vendor and driver range, from the next launch,
+  below the user's own choice and the PC's memory of renderers that crashed.
 
 It has no kill switch, no minimum version, no forced update or downgrade,
 and nothing that turns a feature off for everyone. Every field is optional.
@@ -145,7 +145,12 @@ Vulkan, so draw with DX12 there:
   PC compares the bounds with the driver version DXGI reports for the card,
   which is how its renderer crash memory keys drivers. A card whose driver
   version isn't known only matches a rule without a range.
-- `backend` is `dx12`, `vulkan` or `warp` (Windows' software renderer).
+- `backend` is `dx12` or `vulkan`, on the card the window would draw on.
+  Never `warp`: Windows' software renderer would draw a working PC slowly,
+  and a slow window still starts, so the PC's crash memory would never set
+  it aside. A `warp` rule is ignored, and `check-versions.sh` refuses it.
+  WARP stays the PC's own last fallback and a Troubleshooting choice.
+- Driver versions use ASCII digits `0`–`9` only, as the PC reads them.
 - A rule with a key or value the app doesn't know is ignored, so a newer
   constraint can't widen it on an older app. More than 8 rules, or
   `renderer_rules` that isn't a list: none apply. As with
@@ -164,27 +169,32 @@ What decides the window's backend, highest first:
 1. the `WGPU_BACKEND` environment variable;
 2. Settings > Troubleshooting > Window drawing, when it isn't Automatic.
    A chosen backend that already failed to start the window is set aside,
-   as before, and the automatic choice below draws;
+   as before, and the built-in choice draws, without any rule: the user
+   chose not to leave the window to the PC;
 3. the PC's renderer crash memory: a rule never draws with a backend that
    failed on that card and driver before, even one the PC would retry
    after some clean launches;
 4. a matching remote rule;
 5. the built-in choice.
 
-A rule can only choose among the backends the PC lists for that card, or
-WARP. It is ignored when its backend isn't listed (for example after the PC
-narrowed itself to DX12), when the backend lacks the features the window
-needs (Intel's old Vulkan drivers, issue #59), or on a PC with two cards of
-the same model. Each launch logs one line when a rule names the card:
-`renderer_rule applied=intel:31.0.101.2111->dx12`, or `renderer_rule
-ignored reason=env|choice|set_aside|unavailable|incapable|twin_gpus
+A rule can only choose among the backends the PC lists for that card. It is
+ignored when its backend isn't listed (for example after the PC narrowed
+itself to DX12), when the backend lacks the features the window needs
+(Intel's old Vulkan drivers, issue #59), on a PC with two cards of the same
+model, or when the PC can't remember a crash under it: its start marker
+couldn't be saved, or its renderer history can't be (`no_marker`). Each
+launch logs one line when a rule names the card: `renderer_rule
+applied=intel:31.0.101.2111->dx12`, or `renderer_rule ignored
+reason=env|choice|set_aside|unavailable|incapable|twin_gpus|no_marker
 rule=…`. Nothing else about the card is logged.
 
 **A bad rule costs at most one failed start per driver version.** The
-launch it steers leaves the same start marker as any other, so if the
+launch it steers leaves the same start marker as any other, and a rule only
+draws once that marker is saved and the renderer history saves too. If the
 window never appears, the next launch records that backend as failed on
 that card and driver, ignores the rule (`reason=set_aside`) and draws as
-before. The record stays until that backend draws on that driver, the user
+before. A launch that can't save the history keeps the marker, so a later
+one counts the crash. The record stays until that backend draws on that driver, the user
 resets crash avoidance in Troubleshooting, or the driver changes. A new
 driver the rule still names gets one try of its own.
 

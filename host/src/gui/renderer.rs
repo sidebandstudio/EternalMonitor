@@ -36,11 +36,13 @@
 //! out of the setting.
 //!
 //! The update manifest's `renderer_rules` (`docs/remote-config.md`) can name
-//! a backend for the GPU [`pick`] chose, by vendor and driver, from the next
-//! launch. WGPU_BACKEND and the Window drawing choice win over a rule, and a
-//! rule never draws with a backend that failed on that GPU and driver before,
-//! even one due for a retry. A rule that crashes the window leaves the same
-//! marker as any launch, so it costs at most one crash per driver.
+//! DX12 or Vulkan for the GPU [`pick`] chose, by vendor and driver, from the
+//! next launch. WGPU_BACKEND and any Window drawing choice but Automatic win
+//! over a rule, also a choice that failed, and a rule never draws with a
+//! backend that failed on that GPU and driver before, even one due for a
+//! retry. A rule draws only when this launch's marker is saved and the
+//! history can be, so a crash under it is remembered: it costs at most one
+//! crash per driver.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -322,7 +324,7 @@ fn choose_backends(
     if cfg!(windows) {
         if forced.is_none() {
             (plan, chosen_failed) = chosen_plan(history, &gpus, choice);
-            start(Marker {
+            let _ = start(Marker {
                 gpu: gpus.clone(),
                 backend: plan.stage().to_string(),
                 thread: current_thread(),
@@ -346,16 +348,17 @@ fn choose_backends(
         narrowed = plan != Plan::Full && Plan::chosen(choice) != Some(plan),
         "Window renderer instance"
     );
-    (plan, overruled(forced.is_some(), choice, chosen_failed))
+    (plan, overruled(forced.is_some(), choice))
 }
 
 /// Why a remote rule can't choose the backend: `WGPU_BACKEND` is set, or the
-/// Window drawing choice draws. A choice that failed before was set aside,
-/// so the automatic choice draws, and a rule is part of it.
-fn overruled(from_env: bool, choice: WindowDrawing, chosen_failed: bool) -> Option<&'static str> {
+/// user chose how the window draws. A choice that failed before is set aside
+/// and the automatic choice draws, but without the rule: the user chose not
+/// to leave it to the PC.
+fn overruled(from_env: bool, choice: WindowDrawing) -> Option<&'static str> {
     if from_env {
         Some("env")
-    } else if choice != WindowDrawing::Automatic && !chosen_failed {
+    } else if choice != WindowDrawing::Automatic {
         Some("choice")
     } else {
         None
@@ -408,16 +411,21 @@ fn current_thread() -> Option<u32> {
     None
 }
 
-/// Leave this launch's marker until the window is confirmed working.
-fn start(marker: Marker) {
-    if let Some(directory) = STATE_DIR.get() {
-        if let Ok(json) = serde_json::to_vec(&marker) {
-            let _ = fs::write(marker_path(directory, ProcessId::current()), json);
-        }
-    }
+/// Leave this launch's marker until the window is confirmed working. False
+/// when it could not be saved.
+fn start(marker: Marker) -> bool {
+    let saved = STATE_DIR
+        .get()
+        .is_some_and(|directory| save_marker(directory, ProcessId::current(), &marker));
     if let Ok(mut started) = STARTED.lock() {
         *started = Some(marker);
     }
+    saved
+}
+
+fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
+    serde_json::to_vec(marker)
+        .is_ok_and(|json| fs::write(marker_path(directory, owner), json).is_ok())
 }
 
 /// Called at the start of each UI pass; clears this launch's marker once the
@@ -544,25 +552,26 @@ fn select(
     let (candidates, gpus) = describe(&usable, history);
     let picked = pick(&candidates)
         .ok_or_else(|| "No graphics adapter can draw the EternalMonitor window".to_string())?;
-    let ruled = apply_rule(&candidates, &gpus, picked, rules, overruled);
-    let index = match ruled {
-        Some((_, Ok(index))) => index,
-        _ => picked,
+    let marker = |index: usize| Marker {
+        gpu: gpus[index].clone(),
+        backend: candidates[index].backend.to_str().to_string(),
+        thread: current_thread(),
     };
+    let (index, ruled) = guard_rule(
+        apply_rule(&candidates, &gpus, picked, rules, overruled),
+        picked,
+        STATE_DIR.get().map(PathBuf::as_path),
+        |index| start(marker(index)),
+    );
     if let Some((rule, outcome)) = ruled {
         info!("{}", rule_line(rule, outcome, &gpus[picked]));
     }
     let adapter = usable[index].clone();
     let info = adapter.get_info();
-    let marker = Marker {
-        gpu: gpus[index].clone(),
-        backend: info.backend.to_str().to_string(),
-        thread: current_thread(),
-    };
     info!(
         backend = %info.backend,
         adapter = %info.name,
-        gpu = %marker.gpu,
+        gpu = %gpus[index],
         compliant = candidates[index].compliant,
         reason = if index == picked {
             selection_reason(&candidates, index)
@@ -581,7 +590,6 @@ fn select(
         other => other.to_str(),
     };
     update_status(|status| status.backend = Some(drawing.to_string()));
-    start(marker);
     crate::startup::simulate_renderer_failure()?;
     Ok(adapter)
 }
@@ -668,11 +676,15 @@ fn twins(candidates: &[Candidate], gpu: &Candidate) -> bool {
     })
 }
 
+/// A rule that named the window's GPU, and the candidate it draws with or why
+/// it can't.
+type Ruled<'a> = Option<(&'a RendererRule, Result<usize, &'static str>)>;
+
 /// The first remote rule that names the GPU [`pick`] chose (`picked`), by
 /// vendor and driver, and the candidate it draws with, or why it can't. A
-/// rule only chooses among the listed candidates: the backend on that GPU, or
-/// WARP. It never takes one the crash memory holds a failure of, one that
-/// lacks WebGPU features (which crashes, issue #59), or one of two identical
+/// rule only chooses among the listed candidates: the backend on that GPU.
+/// It never takes one the crash memory holds a failure of, one that lacks
+/// WebGPU features (which crashes, issue #59), or one of two identical
 /// cards, which backends list in their own order.
 fn apply_rule<'a>(
     candidates: &[Candidate],
@@ -680,7 +692,7 @@ fn apply_rule<'a>(
     picked: usize,
     rules: &'a [RendererRule],
     overruled: Option<&'static str>,
-) -> Option<(&'a RendererRule, Result<usize, &'static str>)> {
+) -> Ruled<'a> {
     let gpu = &candidates[picked];
     let driver = gpus[picked].split_once(' ').map_or("", |(_, d)| d.trim());
     let rule = rules.iter().find(|r| r.matches(gpu.vendor, driver))?;
@@ -693,11 +705,10 @@ fn apply_rule<'a>(
             c.backend == Backend::Dx12 && c.device_type != DeviceType::Cpu && model(c)
         }
         RendererBackend::Vulkan => c.backend == Backend::Vulkan && model(c),
-        RendererBackend::Warp => c.backend == Backend::Dx12 && c.device_type == DeviceType::Cpu,
     };
     let target = if drawn_with(gpu) {
         Some(picked)
-    } else if rule.backend != RendererBackend::Warp && twins(candidates, gpu) {
+    } else if twins(candidates, gpu) {
         return Some((rule, Err("twin_gpus")));
     } else {
         candidates.iter().position(drawn_with)
@@ -709,6 +720,35 @@ fn apply_rule<'a>(
         Some(i) => Ok(i),
     };
     Some((rule, outcome))
+}
+
+/// A rule draws only when a crash under it will be remembered: this launch's
+/// marker naming its candidate is saved (`start`), and the next launch can
+/// save the history in `directory` it counts the crash in. Otherwise
+/// `picked` draws and the rule is ignored (`no_marker`), so a PC that can't
+/// remember crashes never crashes under a rule on every launch. Returns the
+/// candidate drawn with, whose marker is started.
+fn guard_rule<'a>(
+    ruled: Ruled<'a>,
+    picked: usize,
+    directory: Option<&Path>,
+    mut start: impl FnMut(usize) -> bool,
+) -> (usize, Ruled<'a>) {
+    match ruled {
+        Some((rule, Ok(index))) => {
+            if start(index) && directory.is_some_and(history_saves) {
+                return (index, ruled);
+            }
+            if index != picked {
+                start(picked);
+            }
+            (picked, Some((rule, Err("no_marker"))))
+        }
+        _ => {
+            start(picked);
+            (picked, ruled)
+        }
+    }
 }
 
 /// The launch's one line about a rule that named the window's GPU (`gpu`, a
@@ -949,15 +989,7 @@ fn update_history(
     directory: &Path,
     change: impl FnOnce(&mut Vec<Failure>),
 ) -> Option<Vec<Failure>> {
-    let _lock = match crate::startup::lock::try_lock(&directory.join(HISTORY_LOCK)) {
-        Ok(lock) => lock,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::WouldBlock {
-                warn!(%error, "Could not lock the renderer history");
-            }
-            return None;
-        }
-    };
+    let _lock = lock_history(directory)?;
     let mut history = read_history(directory);
     let before = history.clone();
     change(&mut history);
@@ -967,72 +999,105 @@ fn update_history(
     Some(history)
 }
 
-fn write_history(directory: &Path, history: &[Failure]) {
+/// `None` without waiting when another instance holds the history.
+fn lock_history(directory: &Path) -> Option<crate::startup::lock::Locked> {
+    match crate::startup::lock::try_lock(&directory.join(HISTORY_LOCK)) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                warn!(%error, "Could not lock the renderer history");
+            }
+            None
+        }
+    }
+}
+
+/// False when it could not be saved.
+fn write_history(directory: &Path, history: &[Failure]) -> bool {
     let path = directory.join(HISTORY_FILE);
     let temp = directory.join(format!("history.{}.tmp", ProcessId::current()));
     let saved = serde_json::to_vec(history)
         .map_err(std::io::Error::other)
         .and_then(|json| fs::write(&temp, json))
         .and_then(|()| fs::rename(&temp, &path));
-    if let Err(error) = saved {
+    if let Err(error) = &saved {
         warn!(%error, "Could not save the renderer history");
     }
+    saved.is_ok()
+}
+
+/// Whether the history saves now, as the next launch must save it to count a
+/// crash of this one. Saves it unchanged; false while another instance holds
+/// it.
+fn history_saves(directory: &Path) -> bool {
+    lock_history(directory).is_some_and(|_lock| write_history(directory, &read_history(directory)))
 }
 
 /// Count markers left by exited launches as failures, with what the failure
-/// reporter saw end them, and remove them. A launch it did not describe, as
-/// 0.3.3's, counts as [`UNKNOWN`]. Markers of running instances, including
-/// this one, are theirs to clear. When another instance is updating the
-/// history, it sweeps them; use the history as saved.
+/// reporter saw end them, and remove them once the history is saved. Until
+/// it saves, they stay, and a later launch counts them. A launch the reporter
+/// did not describe, as 0.3.3's, counts as [`UNKNOWN`]. Markers of running
+/// instances, including this one, are theirs to clear. When another instance
+/// is updating the history, it sweeps them; use the history as saved.
 fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
-    update_history(directory, |history| {
-        for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let (owner, is_marker) = match (name.strip_suffix(".start"), name.strip_suffix(".fault")) {
-                (Some(owner), _) => (owner, true),
-                (_, Some(owner)) => (owner, false),
-                _ => continue,
-            };
-            let Some(owner) = ProcessId::from_name(owner) else {
-                continue;
-            };
-            if owner == current || owner.is_running() {
-                continue;
-            }
-            // A note whose marker went with a working window.
-            if !is_marker {
-                if !marker_path(directory, owner).exists() {
-                    let _ = fs::remove_file(entry.path());
-                }
-                continue;
-            }
-            let fault = fs::read_to_string(fault_path(directory, owner))
-                .ok()
-                .map(|text| text.trim().to_string())
-                .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| UNKNOWN.to_string());
-            if let Some(marker) = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
-            {
-                record_failure(history, &marker, &fault);
-                let until_driver_changes = knows_driver(&marker.gpu)
-                    && history
-                        .iter()
-                        .any(|f| f.gpu == marker.gpu && f.backend == marker.backend && f.in_driver());
-                warn!(
-                    gpu = %marker.gpu,
-                    backend = %marker.backend,
-                    fault = %fault,
-                    retry = if until_driver_changes { "after a driver update" } else { "after clean launches" },
-                    "A previous launch closed before its window appeared; avoiding that renderer"
-                );
-            }
-            let _ = fs::remove_file(entry.path());
-            let _ = fs::remove_file(fault_path(directory, owner));
+    let Some(_lock) = lock_history(directory) else {
+        return read_history(directory);
+    };
+    let mut history = read_history(directory);
+    let before = history.clone();
+    let mut swept = Vec::new();
+    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (owner, is_marker) = match (name.strip_suffix(".start"), name.strip_suffix(".fault")) {
+            (Some(owner), _) => (owner, true),
+            (_, Some(owner)) => (owner, false),
+            _ => continue,
+        };
+        let Some(owner) = ProcessId::from_name(owner) else {
+            continue;
+        };
+        if owner == current || owner.is_running() {
+            continue;
         }
-    })
-    .unwrap_or_else(|| read_history(directory))
+        // A note whose marker went with a working window.
+        if !is_marker {
+            if !marker_path(directory, owner).exists() {
+                let _ = fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        let fault = fs::read_to_string(fault_path(directory, owner))
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| UNKNOWN.to_string());
+        if let Some(marker) = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
+        {
+            record_failure(&mut history, &marker, &fault);
+            let until_driver_changes = knows_driver(&marker.gpu)
+                && history
+                    .iter()
+                    .any(|f| f.gpu == marker.gpu && f.backend == marker.backend && f.in_driver());
+            warn!(
+                gpu = %marker.gpu,
+                backend = %marker.backend,
+                fault = %fault,
+                retry = if until_driver_changes { "after a driver update" } else { "after clean launches" },
+                "A previous launch closed before its window appeared; avoiding that renderer"
+            );
+        }
+        swept.push(owner);
+    }
+    if history != before && !write_history(directory, &history) {
+        return history;
+    }
+    for owner in swept {
+        let _ = fs::remove_file(marker_path(directory, owner));
+        let _ = fs::remove_file(fault_path(directory, owner));
+    }
+    history
 }
 
 #[cfg(test)]
@@ -2062,10 +2127,10 @@ mod tests {
         // The first rule naming the GPU decides.
         let two = rules(serde_json::json!([
             { "vendor": "amd", "backend": "dx12" },
-            { "vendor": "nvidia", "backend": "warp" },
+            { "vendor": "nvidia", "backend": "vulkan" },
             { "vendor": "nvidia", "backend": "dx12" },
         ]));
-        assert_eq!(drawn(&candidates, &gpus, &two, None), (4, Some(Ok(4))));
+        assert_eq!(drawn(&candidates, &gpus, &two, None), (0, Some(Ok(0))));
         // Naming the backend pick chose anyway applies and changes nothing.
         let vulkan = rules(serde_json::json!([{ "vendor": "nvidia", "backend": "vulkan" }]));
         assert_eq!(drawn(&candidates, &gpus, &vulkan, None), (0, Some(Ok(0))));
@@ -2130,13 +2195,11 @@ mod tests {
             drawn(&uhd_620(), &uhd, &intel_vulkan, None),
             (1, Some(Err("incapable")))
         );
-        // A capable UHD's Vulkan is allowed, and WARP always is.
+        // A capable UHD's Vulkan is allowed.
         assert_eq!(
             drawn(&uhd_capable(), &uhd, &intel_vulkan, None),
             (0, Some(Ok(0)))
         );
-        let intel_warp = rules(serde_json::json!([{ "vendor": "intel", "backend": "warp" }]));
-        assert_eq!(drawn(&uhd_620(), &uhd, &intel_warp, None), (2, Some(Ok(2))));
         // Two cards of one model: which DX12 adapter is which isn't known.
         let arc = |backend| Candidate {
             device: 0x56a0,
@@ -2167,7 +2230,7 @@ mod tests {
         let (candidates, gpus) = mainpc(&[]);
         assert_eq!(drawn(&candidates, &gpus, &[], None).0, 0);
         // 4. A rule beats it: DX12.
-        let automatic = overruled(false, WindowDrawing::Automatic, false);
+        let automatic = overruled(false, WindowDrawing::Automatic);
         assert_eq!(automatic, None);
         assert_eq!(
             drawn(&candidates, &gpus, &rule, automatic),
@@ -2191,7 +2254,7 @@ mod tests {
             chosen_plan(&history, &gpus_now, WindowDrawing::Vulkan),
             (Plan::Vulkan, false)
         );
-        let chosen = overruled(false, WindowDrawing::Vulkan, false);
+        let chosen = overruled(false, WindowDrawing::Vulkan);
         assert_eq!(chosen, Some("choice"));
         let (all, gpus) = mainpc(&history);
         let vulkan: Vec<Candidate> = all
@@ -2210,17 +2273,23 @@ mod tests {
             chosen_plan(&history, &gpus_now, WindowDrawing::Dx12),
             (Plan::Dx12, false)
         );
-        assert_eq!(overruled(false, WindowDrawing::Dx12, false), Some("choice"));
-        // A choice that itself crashed was set aside (#117): the automatic
-        // choice draws, and the rule is part of it.
+        assert_eq!(overruled(false, WindowDrawing::Dx12), Some("choice"));
+        // A choice that itself crashed is set aside (#117) and the automatic
+        // choice draws, still without the rule.
         assert_eq!(
             chosen_plan(&history, &gpus_now, WindowDrawing::Vulkan),
             (Plan::Full, true)
         );
-        let fallback = overruled(false, WindowDrawing::Vulkan, true);
-        assert_eq!(fallback, None);
         let (candidates, gpus) = mainpc(&history);
-        assert_eq!(drawn(&candidates, &gpus, &rule, fallback), (2, Some(Ok(2))));
+        assert_eq!(
+            drawn(
+                &candidates,
+                &gpus,
+                &rule,
+                overruled(false, WindowDrawing::Vulkan)
+            ),
+            (2, Some(Err("choice")))
+        );
 
         // 1. WGPU_BACKEND beats everything: the instance lists its backends
         // and neither the choice nor a rule applies.
@@ -2229,8 +2298,7 @@ mod tests {
             WindowDrawing::Dx12,
             WindowDrawing::Vulkan,
         ] {
-            assert_eq!(overruled(true, choice, false), Some("env"));
-            assert_eq!(overruled(true, choice, true), Some("env"));
+            assert_eq!(overruled(true, choice), Some("env"));
         }
         let vulkan_env = Backends::from_comma_list("vulkan");
         assert_eq!(
@@ -2242,6 +2310,142 @@ mod tests {
             drawn(&candidates, &gpus, &rule, Some("env")),
             (0, Some(Err("env")))
         );
+    }
+
+    /// The user chose how the window draws, so no rule decides, even after
+    /// that choice crashed and the automatic choice took over (#117).
+    #[test]
+    fn a_saved_choice_that_crashed_still_blocks_a_rule() {
+        let gpus_now = format!("1002:150e {AMD_DRIVER}, 10de:2d59 {NV_DRIVER}");
+        let rule = rules(serde_json::json!([{ "vendor": "nvidia", "backend": "dx12" }]));
+        let mut history = Vec::new();
+        record_failure(
+            &mut history,
+            &marker("1414:008c 10.0.26100.1", "dx12"),
+            UNKNOWN,
+        );
+        assert_eq!(
+            chosen_plan(&history, &gpus_now, WindowDrawing::Warp),
+            (Plan::Full, true)
+        );
+        let (candidates, gpus) = mainpc(&history);
+        assert_eq!(
+            drawn(
+                &candidates,
+                &gpus,
+                &rule,
+                overruled(false, WindowDrawing::Warp)
+            ),
+            (0, Some(Err("choice")))
+        );
+        for choice in [
+            WindowDrawing::Dx12,
+            WindowDrawing::Vulkan,
+            WindowDrawing::Warp,
+        ] {
+            assert_eq!(overruled(false, choice), Some("choice"), "{choice:?}");
+        }
+    }
+
+    /// A rule draws only when this launch's marker is saved and the history
+    /// can be, so a crash under it is counted at the next launch.
+    #[test]
+    fn a_rule_draws_only_when_its_crash_would_be_remembered() {
+        let (candidates, gpus) = mainpc(&[]);
+        let rule = rules(serde_json::json!([{ "vendor": "nvidia", "backend": "dx12" }]));
+        let picked = pick(&candidates).unwrap();
+        let owner = ProcessId::current();
+        let marker_of = |index: usize| marker(&gpus[index], candidates[index].backend.to_str());
+        let guarded = |directory: Option<&Path>| {
+            let (index, ruled) = guard_rule(
+                apply_rule(&candidates, &gpus, picked, &rule, None),
+                picked,
+                directory,
+                |index| directory.is_some_and(|d| save_marker(d, owner, &marker_of(index))),
+            );
+            (index, ruled.map(|(_, outcome)| outcome))
+        };
+        let started = |directory: &Path| -> Option<Marker> {
+            serde_json::from_slice(&fs::read(marker_path(directory, owner)).ok()?).ok()
+        };
+
+        // Both saved: the rule draws, and its marker names DX12.
+        let directory = temp_dir("renderer-rule-guard");
+        assert_eq!(guarded(Some(&directory)), (2, Some(Ok(2))));
+        assert_eq!(started(&directory), Some(marker_of(2)));
+
+        // No app data folder, or one where nothing can be saved: pick() draws.
+        assert_eq!(guarded(None), (0, Some(Err("no_marker"))));
+        let not_a_folder = directory.join("not-a-folder");
+        fs::write(&not_a_folder, b"").unwrap();
+        assert_eq!(guarded(Some(&not_a_folder)), (0, Some(Err("no_marker"))));
+
+        // The marker saves but the history can't: pick() draws, and the
+        // marker names its backend.
+        let unsaved = temp_dir("renderer-rule-unsaved");
+        let blocker = unsaved.join(format!("history.{}.tmp", ProcessId::current()));
+        fs::create_dir(&blocker).unwrap();
+        assert_eq!(guarded(Some(&unsaved)), (0, Some(Err("no_marker"))));
+        assert_eq!(started(&unsaved), Some(marker_of(0)));
+        fs::remove_dir(&blocker).unwrap();
+        // Nor while another instance holds the history.
+        let busy = crate::startup::lock::try_lock(&unsaved.join(HISTORY_LOCK)).unwrap();
+        assert_eq!(guarded(Some(&unsaved)), (0, Some(Err("no_marker"))));
+        drop(busy);
+        assert_eq!(guarded(Some(&unsaved)), (2, Some(Ok(2))));
+
+        // Without a rule, pick()'s marker is saved as before.
+        let (index, ruled) = guard_rule(
+            apply_rule(&candidates, &gpus, picked, &[], None),
+            picked,
+            Some(&directory),
+            |index| save_marker(&directory, owner, &marker_of(index)),
+        );
+        assert_eq!((index, ruled), (0, None));
+        assert_eq!(started(&directory), Some(marker_of(0)));
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(unsaved).unwrap();
+    }
+
+    /// A crash is never forgotten because the history couldn't be saved: the
+    /// marker stays and the next launch that can save counts it, once.
+    #[test]
+    fn a_history_that_cannot_be_saved_keeps_the_marker() {
+        let directory = temp_dir("renderer-sweep-unsaved");
+        let gpu = format!("10de:2d59 {NV_DRIVER}");
+        let dead = exited_process();
+        let crashed = Marker {
+            thread: Some(WINDOW),
+            ..marker(&gpu, "dx12")
+        };
+        fs::write(
+            marker_path(&directory, dead),
+            serde_json::to_vec(&crashed).unwrap(),
+        )
+        .unwrap();
+        write_fault(&directory, dead, "nvwgf2umx.dll", Some(WINDOW));
+        let blocker = directory.join(format!("history.{}.tmp", ProcessId::current()));
+        fs::create_dir(&blocker).unwrap();
+
+        // This launch avoids the backend, but nothing is saved, so the
+        // marker and its note stay.
+        let unsaved = sweep(&directory, ProcessId::current());
+        assert!(avoided(&unsaved, &gpu, "dx12"));
+        assert!(read_history(&directory).is_empty());
+        assert!(marker_path(&directory, dead).exists());
+        assert!(fault_path(&directory, dead).exists());
+
+        // The next launch saves it, counted once, and then removes them.
+        fs::remove_dir(&blocker).unwrap();
+        let saved = sweep(&directory, ProcessId::current());
+        assert_eq!(saved, unsaved);
+        assert_eq!(saved[0].failures, 1);
+        assert_eq!(saved[0].fault.as_deref(), Some("nvwgf2umx.dll"));
+        assert_eq!(read_history(&directory), saved);
+        assert!(!marker_path(&directory, dead).exists());
+        assert!(!fault_path(&directory, dead).exists());
+        assert_eq!(sweep(&directory, ProcessId::current()), saved);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// The worst a bad rule can do: one launch that never shows its window,
@@ -2320,6 +2524,8 @@ mod tests {
             serde_json::json!({ "schema": 1, "renderer_rules": { "vendor": "nvidia", "backend": "dx12" } }),
             serde_json::json!({ "schema": 1, "renderer_rules": [{ "vendor": "nvidia", "backend": "dx11" }] }),
             serde_json::json!({ "schema": 1, "renderer_rules": [{ "vendor": "nvidia", "backend": "dx12", "beta": true }] }),
+            // WARP would move this PC off its RTX card for good.
+            serde_json::json!({ "schema": 1, "renderer_rules": [{ "vendor": "nvidia", "backend": "warp" }] }),
             serde_json::json!({ "schema": 1, "renderer_rules": vec![serde_json::json!({ "vendor": "nvidia", "backend": "dx12" }); 9] }),
         ] {
             let parsed = crate::remote_config::parse_config(Some(&config)).unwrap();

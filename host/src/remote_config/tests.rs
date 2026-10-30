@@ -512,10 +512,10 @@ fn renderer_rules_parse_and_match_by_vendor_and_driver() {
     assert!(from.matches(NVIDIA, "33.0.15.1"));
     assert!(!from.matches(NVIDIA, "32.0.15.5999"));
     let until = renderer_rule(json!({
-        "vendor": "amd", "driver": { "max": "31.0.21001.45099" }, "backend": "warp"
+        "vendor": "amd", "driver": { "max": "31.0.21001.45099" }, "backend": "vulkan"
     }))
     .unwrap();
-    assert_eq!(until.backend, RendererBackend::Warp);
+    assert_eq!(until.backend, RendererBackend::Vulkan);
     assert!(until.matches(AMD, "31.0.21001.45099"));
     assert!(until.matches(AMD, "25.0.0.0"));
     assert!(!until.matches(AMD, "31.0.21001.45100"));
@@ -550,6 +550,9 @@ fn a_renderer_rule_with_anything_unknown_is_ignored() {
         with(&|v| {
             v.as_object_mut().unwrap().remove("vendor");
         }),
+        // WARP, the software renderer, would move a working PC off its card
+        // for good: a slow window still counts as working.
+        with(&|v| v["backend"] = json!("warp")),
         // Backends wgpu has but the window doesn't use, or other spellings.
         with(&|v| v["backend"] = json!("gl")),
         with(&|v| v["backend"] = json!("metal")),
@@ -571,6 +574,9 @@ fn a_renderer_rule_with_anything_unknown_is_ignored() {
         with(&|v| v["driver"]["min"] = json!("")),
         with(&|v| v["driver"]["min"] = json!(31)),
         with(&|v| v["driver"]["max"] = json!("31.0.101.99999999999")),
+        // Digits other than ASCII 0-9 (Arabic-Indic, fullwidth).
+        with(&|v| v["driver"]["min"] = json!("٣١.٠.١٠١.٠")),
+        with(&|v| v["driver"]["max"] = json!("31.0.101.６５５３５")),
         with(&|v| v["driver"]["exact"] = json!("31.0.101.2111")),
         // A constraint this app doesn't know would be dropped, widening the
         // rule: the whole rule goes instead.
@@ -598,6 +604,7 @@ fn too_many_renderer_rules_apply_none() {
     // A bad rule among good ones drops only itself, as second_screen_rules.
     let mixed = config(json!([
         { "vendor": "intel", "backend": "gl" },
+        { "vendor": "nvidia", "backend": "warp" },
         one,
         "garbage",
         { "vendor": "amd", "backend": "vulkan", "driver": { "max": "31.0.21001.45099" } }
@@ -640,4 +647,25 @@ fn saved_renderer_rules_apply_until_the_config_does_not() {
     );
     assert!(read(&path, START + MAX_AGE + 1).renderer_rules().is_empty());
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// The table `scripts/test_check_versions.py` runs through the publishing
+/// check: each rule the check accepts the PC applies, and the reverse.
+#[test]
+fn renderer_rules_parse_as_the_publishing_check_validates_them() {
+    let table: Value = serde_json::from_str(include_str!(
+        "../../../proto/testdata/renderer_rules_parity.json"
+    ))
+    .unwrap();
+    let cases = table["cases"].as_array().unwrap();
+    assert!(cases.len() > 30);
+    for case in cases {
+        let valid = case["valid"].as_bool().unwrap();
+        assert_eq!(
+            renderer_rule(case["rule"].clone()).is_some(),
+            valid,
+            "{}",
+            case["rule"]
+        );
+    }
 }

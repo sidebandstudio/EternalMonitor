@@ -404,12 +404,14 @@ pub struct RendererRule {
     pub backend: RendererBackend,
 }
 
+/// A backend of the card itself. WARP, the software renderer, is never a
+/// rule's: it would draw a working PC slowly, and a slow window still counts
+/// as working, so crash memory would never set it aside. Only the PC's own
+/// fallback and Troubleshooting choose it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RendererBackend {
     Dx12,
     Vulkan,
-    /// Microsoft's software renderer, on DX12.
-    Warp,
 }
 
 impl RendererBackend {
@@ -417,7 +419,6 @@ impl RendererBackend {
         match self {
             Self::Dx12 => "dx12",
             Self::Vulkan => "vulkan",
-            Self::Warp => "warp",
         }
     }
 }
@@ -436,13 +437,9 @@ impl RendererRule {
             .into_iter()
             .find(|(name, _)| *name == vendor)?;
         let backend = rule.get("backend")?.as_str()?;
-        let backend = [
-            RendererBackend::Dx12,
-            RendererBackend::Vulkan,
-            RendererBackend::Warp,
-        ]
-        .into_iter()
-        .find(|b| b.name() == backend)?;
+        let backend = [RendererBackend::Dx12, RendererBackend::Vulkan]
+            .into_iter()
+            .find(|b| b.name() == backend)?;
         let (min, max) = match rule.get("driver") {
             None => (None, None),
             Some(driver) => {
