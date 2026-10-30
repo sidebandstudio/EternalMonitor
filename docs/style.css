@@ -965,9 +965,10 @@ html.js.channel-beta .beta-hint.reveal { opacity: 0; visibility: hidden; transit
 .soon-body .soon-link {
   display: inline-flex;
   align-items: center;
-  height: 32px;
+  min-height: 32px;
   margin-top: 14px;
-  padding: 0 14px;
+  padding: 6px 14px;
+  line-height: 1.4;
   border-radius: 999px;
   background: var(--raised);
   color: var(--faint);
