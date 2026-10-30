@@ -59,7 +59,9 @@ def check_config(where, config, values):
 
 
 def version_numbers(text):
-    if not isinstance(text, str) or not re.fullmatch(r"\d+(\.\d+){0,3}", text):
+    # ASCII digits only, as the apps read them: \d also matches other scripts'
+    # digits, which int() reads but the PC would refuse.
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9]+(\.[0-9]+){0,3}", text):
         return None
     parts = [int(p) for p in text.split(".")]
     return None if any(p > 0xFFFFFFFF for p in parts) else parts
@@ -115,7 +117,8 @@ def check_renderer_rules(rules):
     if not isinstance(rules, list) or len(rules) > 8:
         raise ValueError("windows.config.renderer_rules must be a list of at most 8 rules")
     vendors = {"amd", "intel", "nvidia"}
-    backends = {"dx12", "vulkan", "warp"}
+    # Never WARP: only the PC's own fallback and Troubleshooting choose it.
+    backends = {"dx12", "vulkan"}
     for index, rule in enumerate(rules):
         where = f"windows.config.renderer_rules[{index}]"
         if not isinstance(rule, dict):
