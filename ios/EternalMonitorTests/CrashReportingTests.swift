@@ -173,6 +173,20 @@ final class CrashReportingTests: XCTestCase {
         XCTAssertEqual(long.line.components(separatedBy: "@0xffffffffffffffff").count, MetricKitDiagnostic.topFrames + 1, long.line)
     }
 
+    /// The scrub keeps hex after `+0x<offset>@` because only the line itself
+    /// writes `@`: `token` never lets one through. A binary name crafted to
+    /// look like a frame's address stays scrubbed.
+    func testABinaryNameCannotPassForAFramesAddress() {
+        XCTAssertEqual(MetricKitDiagnostic.token("lib@2x.dylib"), "lib_2x.dylib")
+        let address: UInt64 = 0xfffffff0071e3c58
+        let tree: [String: Any] = ["callStackPerThread": true, "callStacks": [["threadAttributed": true, "callStackRootFrames": [
+            ["binaryName": "x+0x1@fffffff0071e3c58", "offsetIntoBinaryTextSegment": 0x10, "address": NSNumber(value: address)]]]]]
+        let line = crash(try! JSONSerialization.data(withJSONObject: tree)).line
+        XCTAssertTrue(line.contains(" frames=x+0x1_<id>+0x10@0xfffffff0071e3c58 "), line)
+        XCTAssertEqual(line.components(separatedBy: "@").count, 2, "only the frame's own @: \(line)")
+        XCTAssertEqual(line.components(separatedBy: "fffffff0071e3c58").count, 2, line)
+    }
+
     func testExitCountsAreOneLineOfCounts() {
         let exits = MetricKitExits(appVersion: "0.3.4", build: "370", osVersion: "iPadOS 26.1 (23B85)", multipleVersions: false,
                                    from: at.addingTimeInterval(-86_400), to: at,
