@@ -30,8 +30,8 @@ import json,pathlib,shutil,sys
 out,shots=map(pathlib.Path,sys.argv[1:3]); errors=[]
 if sys.argv[3]!='0': errors.append('Streaming UI tests failed; see ui-run.log')
 summary=json.loads((out/'tests.json').read_text()) if (out/'tests.json').exists() else {}
-if summary.get('passedTests',0)!=7 or summary.get('failedTests',0)!=0:
-    errors.append('Expected seven passing streaming UI tests')
+if summary.get('passedTests',0)!=8 or summary.get('failedTests',0)!=0:
+    errors.append('Expected eight passing streaming UI tests')
 retained=out/'screenshots'/shots.name
 if shots.exists(): shutil.copytree(shots,retained)
 images=sorted(retained.glob('*.png'))
