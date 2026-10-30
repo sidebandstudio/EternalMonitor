@@ -60,6 +60,28 @@ final class SupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(SupportDiagnostics.redactForUpload(summary, category: "summary"), summary)
     }
 
+    /// Values, common words and this iPad's hardware names are never PC names, and a PC name in a
+    /// field's value stays: replacing either would corrupt the line.
+    func testValuesAndHardwareNamesAreNeverReplaced() {
+        SupportDiagnostics.noteHardware("iPad16,5")
+        for name in ["true", "5060", "v1.2.3", "auto", "none", "Server", "iPad16", "iPad16,5"] {
+            SupportDiagnostics.notePCName(name)
+        }
+        // Seen before the hardware name: let go once it is known.
+        SupportDiagnostics.notePCName("iPad13")
+        SupportDiagnostics.noteHardware("iPad13,4")
+        SupportDiagnostics.notePCName("Quinn")
+        for line in [
+            "app=0.3.4 build=5060 hardware=iPad16,5 simulator=false model=iPad running=true version=v1.2.3",
+            "Waiting for the server: auto, none, true; hardware=iPad13,4",
+            "reason=Quinn decoder=hevc",
+        ] {
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(line, category: "device"), line)
+        }
+        XCTAssertEqual(SupportDiagnostics.redactForUpload("Paired with Quinn at 192.0.2.7 reason=none", category: "ctrl"),
+                       "Paired with %COMPUTERNAME% at 192.0.2.7 reason=none")
+    }
+
     func testAnAcceptedPCNameLeavesUploadedLines() async throws {
         let queue = DispatchQueue(label: "pc-name-test")
         let (stream, continuation) = AsyncStream<Data>.makeStream()

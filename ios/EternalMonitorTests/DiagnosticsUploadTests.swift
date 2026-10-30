@@ -61,6 +61,34 @@ final class DiagnosticsUploadTests: XCTestCase {
         ])
     }
 
+    /// Each line is redacted as it is queued: a name the registry later lets go stays out of it.
+    func testEveryTypedAddressLeavesItsLinesAfterManyOthers() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
+        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
+        defer { upload.shutdown() }
+        let addresses = (0..<40).map { "studio-\($0)-annex.local" } + ["jane-office.local"]
+        for address in addresses {
+            SupportDiagnostics.noteTypedAddress(address)
+            let bare = address.replacingOccurrences(of: ".local", with: "")
+            upload.record(level: "info", category: "connection", message: "Starting connection attempt=1 transport=WiFi to \(address):9876 drawing=false", timestamp: Date())
+            upload.record(level: "warning", category: "connection", message: "Cannot resolve \(bare): nodename nor servname provided", timestamp: Date())
+        }
+        _ = await upload.status()
+        let messages = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+            .flatMap { try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: $0)).events }
+            .sorted { $0.sequence < $1.sequence }.map(\.message)
+        XCTAssertEqual(messages.count, 82)
+        XCTAssertEqual(Set(messages), [
+            "Starting connection attempt=1 transport=WiFi to %COMPUTERNAME%:9876 drawing=false",
+            "Cannot resolve %COMPUTERNAME%: nodename nor servname provided",
+        ])
+    }
+
     func testWrongAcknowledgementKeepsOutboxUntilMatchingRetry() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let suite = UUID().uuidString

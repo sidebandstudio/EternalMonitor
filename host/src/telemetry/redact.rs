@@ -12,11 +12,13 @@
 //!   `%USERNAME%` and `%COMPUTERNAME%`. A PC name ends at any character
 //!   outside `A-Z`, `a-z`, `0-9` and `-`, so `USB_DESKTOP-DEMO_Audio` loses
 //!   it and `DESKTOP-OTHER` keeps it.
-//! - Names owners give their devices, which this run saw: each audio output
-//!   the host opens (`Headphones (Maria's AirPods)`) becomes its kind
-//!   (`<headphones>`, else `<audio-device>`) anywhere in a line, and each
-//!   iPad's name becomes `<device-name>` unless it is Apple's own `iPad` or
-//!   `iPhone`. In the lines that log one, `device=` loses its value the same
+//! - Names owners give their devices, which this run saw, after the user and
+//!   PC names: each audio output the host opens (`Headphones (Maria's
+//!   AirPods)`) becomes its kind (`<headphones>`, else `<audio-device>`) in
+//!   a line's free text, `device=` and `error=`, and each iPad's name becomes
+//!   `<device-name>` unless it is Apple's own `iPad` or `iPhone`. A value
+//!   (`true`, `5060`), a common word or part of a graphics card's name is
+//!   never one. In the lines that log one, `device=` loses its value the same
 //!   way even if the name was never seen. The value ends at the field the log
 //!   site writes after it, so a name with `owner=` inside goes whole.
 //! - What stays: the line's time and level; field names (`name=`); the
@@ -216,7 +218,16 @@ const DEVICE_NAMES: [(&str, Device, Option<&str>); 5] = [
 
 /// Device names kept for uploads. Each makes every line's scan a little
 /// longer, and an iPad picks its own.
-const MAX_DEVICES: usize = 32;
+const MAX_DEVICES: usize = 64;
+
+/// Values the log writes, never a device name.
+const VALUE_WORDS: &[&str] = &[
+    "true", "false", "yes", "off", "none", "auto", "unknown", "null",
+];
+
+/// Fields whose value is text a device name may be in. A name in another
+/// field's value stays: it is a value or hardware (`running=true`).
+const NAME_FIELDS: [&str; 2] = ["device", "error"];
 
 #[derive(Clone, Copy)]
 enum Device {
@@ -281,8 +292,22 @@ pub(super) struct Names {
     folders: Vec<Vec<char>>,
     /// The user and PC names that may be replaced, longest first.
     words: Vec<Word>,
-    /// Device names this run saw, and their labels, longest first.
-    devices: Vec<(Vec<char>, &'static str)>,
+    /// Device names this run saw, least recently seen first.
+    devices: Vec<Seen>,
+    /// This PC's graphics cards, in lowercase.
+    hardware: Vec<String>,
+}
+
+/// A device name in each form a line may hold it, as written first, and
+/// its label.
+struct Seen {
+    forms: Vec<Vec<char>>,
+    label: &'static str,
+}
+
+/// Whether `a` is `b` in any case.
+fn same(a: &[char], b: &[char]) -> bool {
+    a.len() == b.len() && name_at(a, 0, b).is_some()
 }
 
 impl Names {
@@ -327,24 +352,18 @@ impl Names {
             folders,
             words,
             devices: Vec::new(),
+            hardware: Vec::new(),
         }
     }
 
-    /// From now on, `name` becomes `label` anywhere in a line. A `?`-logged
-    /// field writes it escaped and quoted, so that form goes too.
-    fn note_device(&mut self, name: &str, label: &'static str) {
+    /// From now on, `name` becomes `label` in a line's free text and
+    /// [`NAME_FIELDS`]. A `?`-logged field writes it escaped and quoted, and
+    /// the user's or PC's name inside it goes first, so those forms go too.
+    /// A line is redacted as it is queued, so letting the least recently
+    /// seen name go never uncovers one.
+    pub(super) fn note_device(&mut self, name: &str, label: &'static str) {
         let name = name.trim();
-        let labels = AUDIO_KINDS
-            .iter()
-            .map(|(_, kind)| *kind)
-            .chain([AUDIO_DEVICE, DEVICE_NAME]);
-        let generic = GENERIC_CLIENT_NAMES
-            .iter()
-            .chain(COMMON_WORDS)
-            .copied()
-            .chain(labels.map(|label| label.trim_matches(['<', '>'])))
-            .any(|word| word.eq_ignore_ascii_case(name));
-        if generic || name.chars().count() < MIN_NAME_CHARS {
+        if !self.may_be_chosen(name) {
             return;
         }
         let debug = format!("{name:?}");
@@ -352,18 +371,66 @@ impl Names {
             .strip_prefix('"')
             .and_then(|debug| debug.strip_suffix('"'))
             .unwrap_or(name);
-        for form in [name, escaped] {
+        let redacted = people(name, self);
+        let mut forms: Vec<Vec<char>> = Vec::new();
+        for form in [name, escaped, &redacted] {
             let form: Vec<char> = form.chars().collect();
-            let known = self
-                .devices
-                .iter()
-                .any(|(seen, _)| seen.len() == form.len() && name_at(seen, 0, &form).is_some());
-            if !known && self.devices.len() < MAX_DEVICES {
-                self.devices.push((form, label));
+            // A name that is only the user's or PC's name has gone already.
+            let mut rest = form.clone();
+            for (start, end) in placeholders(&form).into_iter().rev() {
+                rest.drain(start..end);
+            }
+            if rest.iter().any(|c| c.is_alphanumeric())
+                && !forms.iter().any(|seen| same(seen, &form))
+            {
+                forms.push(form);
             }
         }
         self.devices
-            .sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+            .retain(|seen| !seen.forms.first().is_some_and(|seen| same(seen, &forms[0])));
+        self.devices.push(Seen { forms, label });
+        if self.devices.len() > MAX_DEVICES {
+            self.devices.remove(0);
+        }
+    }
+
+    /// Whether its owner may have chosen `name`: not too short, generic, a
+    /// common word, a value (`true`, `5060`, `v1.2`) or inside the name of a
+    /// graphics card.
+    fn may_be_chosen(&self, name: &str) -> bool {
+        let labels = AUDIO_KINDS
+            .iter()
+            .map(|(_, kind)| *kind)
+            .chain([AUDIO_DEVICE, DEVICE_NAME]);
+        let generic = GENERIC_CLIENT_NAMES
+            .iter()
+            .chain(COMMON_WORDS)
+            .chain(VALUE_WORDS)
+            .copied()
+            .chain(labels.map(|label| label.trim_matches(['<', '>'])))
+            .any(|word| word.eq_ignore_ascii_case(name));
+        let lower = name.to_lowercase();
+        let version = lower.strip_prefix('v').unwrap_or(&lower);
+        let value = version.chars().any(|c| c.is_ascii_digit())
+            && version
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_punctuation());
+        let hardware = self.hardware.iter().any(|card| card.contains(&lower));
+        !generic && !value && !hardware && name.chars().count() >= MIN_NAME_CHARS
+    }
+
+    /// `description` names a graphics card: no device name inside it is
+    /// replaced, even one seen before.
+    fn note_hardware(&mut self, description: &str) {
+        let description = description.trim().to_lowercase();
+        if description.is_empty() || self.hardware.contains(&description) {
+            return;
+        }
+        self.devices.retain(|seen| {
+            let name: String = seen.forms.first().into_iter().flatten().collect();
+            !description.contains(&name.to_lowercase())
+        });
+        self.hardware.push(description);
     }
 
     /// This PC's names, from its environment.
@@ -414,7 +481,15 @@ pub(crate) fn note_client_device(name: &str) {
     NAMES.write().note_device(name, DEVICE_NAME);
 }
 
+/// No device name inside `description`, a graphics card's, is replaced.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn note_hardware(description: &str) {
+    NAMES.write().note_hardware(description);
+}
+
 /// `line` without the names in `names`. A log line's time and level stay.
+/// The user's and the PC's names go first, then device names in what is
+/// left, so a device name never cuts a profile path short.
 pub(super) fn redact(line: &str, names: &Names) -> String {
     let (head, message) = match crate::log_repeat::split_stamp(line) {
         Some((_, rest)) => {
@@ -424,9 +499,28 @@ pub(super) fn redact(line: &str, names: &Names) -> String {
         }
         None => ("", line),
     };
-    let chars: Vec<char> = message.chars().collect();
-    let fields = Fields::of(&chars);
-    let mut edits = devices(&chars, names, &fields);
+    let mut message = people(message, names);
+    // A device label ends a path segment a name ran on in, so the user's and
+    // PC's names can read differently after it: both go again until nothing
+    // changes, and redacting twice changes nothing.
+    for _ in 0..PASSES {
+        let next = device_names(&message, names);
+        if next == message {
+            break;
+        }
+        message = people(&next, names);
+    }
+    format!("{head}{message}")
+}
+
+/// Device-name passes after the first redaction of the user's and PC's
+/// names, at most. No fuzzed line has needed more than two.
+const PASSES: usize = 4;
+
+/// `text` without the device names in `names`.
+fn device_names(text: &str, names: &Names) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut edits = devices(&chars, names, &Fields::of(&chars));
     // The line's `device=` value takes in any device name it overlaps.
     if let Some(mut line) = device(&chars) {
         edits.retain(|edit| {
@@ -440,29 +534,34 @@ pub(super) fn redact(line: &str, names: &Names) -> String {
         edits.push(line);
         edits.sort_by_key(|edit| edit.start);
     }
-    // A profile inside a device name goes with it; one that runs into a
-    // device name ends there.
-    let found: Vec<Edit> = profiles(&chars, names)
+    apply(&chars, edits)
+}
+
+/// `text` without the user's and the PC's names.
+fn people(text: &str, names: &Names) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut edits = profiles(&chars, names);
+    let fields = Fields::of(&chars);
+    // A device label stays whole, so the next pass reads the same.
+    let mut taken: Vec<Edit> = placeholders(&chars)
         .into_iter()
-        .filter_map(|mut found| {
-            for edit in &edits {
-                if edit.start <= found.start && found.start < edit.end {
-                    return None;
-                }
-                if found.start < edit.start && edit.start < found.end {
-                    found.end = edit.start;
-                }
-            }
-            Some(found)
+        .map(|(start, end)| Edit {
+            start,
+            end,
+            token: "",
         })
+        .chain(edits.iter().copied())
         .collect();
+    taken.sort_by_key(|edit| edit.start);
+    let found = words(&chars, names, &taken, &fields);
     edits.extend(found);
     edits.sort_by_key(|edit| edit.start);
-    let found = words(&chars, names, &edits, &fields);
-    edits.extend(found);
-    edits.sort_by_key(|edit| edit.start);
-    let mut out = String::with_capacity(line.len());
-    out.push_str(head);
+    apply(&chars, edits)
+}
+
+/// `chars` with `edits`, which are in order.
+fn apply(chars: &[char], edits: Vec<Edit>) -> String {
+    let mut out = String::with_capacity(chars.len());
     let mut copied = 0;
     for edit in edits {
         if edit.start < copied || edit.end < edit.start {
@@ -476,7 +575,34 @@ pub(super) fn redact(line: &str, names: &Names) -> String {
     out
 }
 
+/// Where this redaction's names are in `chars` (`%USERNAME%`,
+/// `<headphones>`).
+fn placeholders(chars: &[char]) -> Vec<(usize, usize)> {
+    let labels = AUDIO_KINDS.iter().map(|(_, kind)| *kind);
+    let tokens: Vec<Vec<char>> = [
+        USERPROFILE,
+        USERNAME,
+        COMPUTERNAME,
+        AUDIO_DEVICE,
+        DEVICE_NAME,
+    ]
+    .into_iter()
+    .chain(labels)
+    .map(|token| token.chars().collect())
+    .collect();
+    let mut found = Vec::new();
+    for i in 0..chars.len() {
+        for token in &tokens {
+            if chars.get(i..i + token.len()) == Some(&token[..]) {
+                found.push((i, i + token.len()));
+            }
+        }
+    }
+    found
+}
+
 /// `chars[start..end]` becomes `token`.
+#[derive(Clone, Copy)]
 struct Edit {
     start: usize,
     end: usize,
@@ -734,10 +860,12 @@ fn profile(chars: &[char], start: usize, mut from: usize, names: &Names) -> Opti
     }
 }
 
-/// Field names, and the values a name inside stays in.
+/// Field names, the values a user or PC name inside stays in, and those a
+/// device name inside stays in.
 struct Fields {
     names: Vec<(usize, usize)>,
     kept: Vec<(usize, usize)>,
+    values: Vec<(usize, usize)>,
 }
 
 impl Fields {
@@ -767,6 +895,7 @@ impl Fields {
         if let Some((after, None)) = description {
             kept.push((after, chars.len()));
         }
+        let mut values = kept.clone();
         for (index, &(start, equals)) in fields.iter().enumerate() {
             let key: String = chars
                 .get(start..equals)
@@ -779,8 +908,15 @@ impl Fields {
             {
                 kept.push((equals + 1, end));
             }
+            if !NAME_FIELDS.contains(&key.as_str()) {
+                values.push((equals + 1, end));
+            }
         }
-        Self { names, kept }
+        Self {
+            names,
+            kept,
+            values,
+        }
     }
 }
 
@@ -825,22 +961,39 @@ fn device(chars: &[char]) -> Option<Edit> {
     (start < end).then_some(Edit { start, end, token })
 }
 
-/// The device names this run saw, wherever they are in `chars`, in order.
-/// A name stays only as a field name or part of a longer word.
+/// The device names this run saw in `chars`, longest first, in order. A
+/// name stays in another field's value or a hardware description, as a
+/// field name or part of a longer word, and where it would cut into a
+/// name replaced before.
 fn devices(chars: &[char], names: &Names, fields: &Fields) -> Vec<Edit> {
+    let placeholders = placeholders(chars);
+    let forms = names
+        .devices
+        .iter()
+        .flat_map(|seen| seen.forms.iter().map(|form| (form, seen.label)));
     let mut edits = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let found = names.devices.iter().find_map(|(name, label)| {
+        let found = forms.clone().filter_map(|(name, label)| {
             let end = name_at(chars, i, name).filter(|&end| end > i)?;
             let joined = |inside: Option<&char>, outside: Option<char>| {
                 inside.is_some_and(|&c| continues_name(c)) && outside.is_some_and(continues_name)
             };
             let word =
                 joined(name.first(), before(chars, i)) || joined(name.last(), at(chars, end));
-            let field = fields.names.iter().any(|&(s, e)| s <= i && end <= e);
-            (!word && !field).then_some((end, *label))
+            // A field name goes only with its `=`, so the next pass reads
+            // the same fields.
+            let field = fields
+                .names
+                .iter()
+                .any(|&(s, e)| s < end && i < e && !(i <= s && e < end));
+            let value = fields.values.iter().any(|&(s, e)| s <= i && i < e);
+            let cuts = placeholders
+                .iter()
+                .any(|&(s, e)| s < end && i < e && !(i <= s && e <= end));
+            (!word && !field && !value && !cuts).then_some((end, label))
         });
+        let found = found.max_by_key(|&(end, _)| end);
         match found {
             Some((end, token)) => {
                 edits.push(Edit {
@@ -1227,7 +1380,7 @@ mod tests {
         names.note_device(name, audio_kind(name));
         let unrelated = [
             format!("Default PC audio endpoint changed from {name}"),
-            logged(|| tracing::warn!(endpoint = name, "Could not open the PC audio output")),
+            logged(|| tracing::warn!(error = name, "Could not open the PC audio output")),
         ];
         for line in unrelated {
             let uploaded = redact(&line, &names);
@@ -1265,8 +1418,8 @@ mod tests {
                     r#"error="Maria's iPad Pro went away" code=5"#,
                     r#"error="<device-name> went away" code=5"#,
                 ),
-                // In a kept diagnostic value too.
-                ("reason=Kim's iPad", "reason=<device-name>'s iPad"),
+                // Another field's value is a value: it stays.
+                ("reason=Kim's iPad", "reason=Kim's iPad"),
                 // The line's own rule and a seen name together.
                 (
                     r#"Client session established peer=192.0.2.7:50000 session_id=5 device=Maria's iPad Pro screen="2732x2048""#,
@@ -1280,6 +1433,110 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    /// The user's and PC's names go first: a device name never cuts a
+    /// profile path short, and one holding the user's name still goes.
+    #[test]
+    fn a_device_name_never_cuts_a_profile_short() {
+        let mut names = maria();
+        names.note_device("Maria", DEVICE_NAME);
+        names.note_device("Maria Lopez's iPad", DEVICE_NAME);
+        assert_cases(
+            &names,
+            &[
+                (
+                    r"path=C:\Users\Maria Lopez\AppData\Roaming\EternalMonitor\x.log",
+                    r"path=%USERPROFILE%\AppData\Roaming\EternalMonitor\x.log",
+                ),
+                (
+                    r"Could not open C:\Users\Maria Lopez\Music for Maria",
+                    // The user's name, first.
+                    r"Could not open %USERPROFILE%\Music for %USERNAME%",
+                ),
+                (
+                    "Pairing approved for Maria Lopez's iPad",
+                    "Pairing approved for <device-name>",
+                ),
+                ("Logged on as maria", "Logged on as %USERNAME%"),
+            ],
+        );
+        let mut names = Names::new(Some(r"C:\Users\Maria Lopez"), Some("mlopez"), None);
+        names.note_device("Maria", DEVICE_NAME);
+        assert_cases(
+            &names,
+            &[(
+                r#"Could not open "C:\Users\Maria Lopez\Music" for Maria"#,
+                r#"Could not open "%USERPROFILE%\Music" for <device-name>"#,
+            )],
+        );
+    }
+
+    /// A name that is a value, or part of a graphics card's name, is never
+    /// a device name, and a seen name stays in another field's value. A
+    /// real name in free text still goes.
+    #[test]
+    fn values_and_hardware_names_are_never_device_names() {
+        let mut names = Names::new(None, None, None);
+        names.note_device("RTX 5060", DEVICE_NAME);
+        names.note_hardware("NVIDIA GeForce RTX 5060");
+        for name in [
+            "true",
+            "FALSE",
+            "5060",
+            "v1.2.3",
+            "32.0.15.6607",
+            "auto",
+            "None",
+            "GeForce RTX",
+        ] {
+            names.note_device(name, DEVICE_NAME);
+        }
+        names.note_device("Zoe's AirPods", audio_kind("Zoe's AirPods"));
+        names.note_device("Quinn", DEVICE_NAME);
+        assert_eq!(names.devices.len(), 2);
+        for line in [
+            format!("{STAMP}  INFO GPU: NVIDIA GeForce RTX 5060 running=true"),
+            format!(
+                "{STAMP}  INFO Capture started adapter=NVIDIA GeForce RTX 5060 running=true \
+                 version=1.2.3 driver=32.0.15.6607 mode=auto rollout=none"
+            ),
+            format!("{STAMP}  INFO Session end reason=Quinn left owner=Zoe's AirPods"),
+        ] {
+            assert_eq!(redact(&line, &names), line);
+        }
+        assert_cases(
+            &names,
+            &[
+                (
+                    "Default PC audio endpoint changed to Zoe's AirPods running=true",
+                    "Default PC audio endpoint changed to <audio-device> running=true",
+                ),
+                (
+                    "Client liveness expired device=Quinn",
+                    "Client liveness expired device=<device-name>",
+                ),
+                (
+                    r#"error="Quinn went away" code=5"#,
+                    r#"error="<device-name> went away" code=5"#,
+                ),
+            ],
+        );
+    }
+
+    /// Past its cap, the registry lets the least recently seen name go.
+    #[test]
+    fn the_least_recently_seen_device_name_goes_first() {
+        let mut names = Names::new(None, None, None);
+        for i in 0..MAX_DEVICES {
+            names.note_device(&format!("Kim's iPad {i}"), DEVICE_NAME);
+        }
+        names.note_device("kim's ipad 0", DEVICE_NAME);
+        names.note_device("Zoe's iPad", DEVICE_NAME);
+        assert_eq!(names.devices.len(), MAX_DEVICES);
+        assert_eq!(redact("Kim's iPad 0 left", &names), "<device-name> left");
+        assert_eq!(redact("Kim's iPad 1 left", &names), "Kim's iPad 1 left");
+        assert_eq!(redact("Zoe's iPad left", &names), "<device-name> left");
     }
 
     #[test]
@@ -1684,7 +1941,12 @@ mod tests {
                 "WASAPI loopback active",
                 "Client liveness expired",
                 " device=",
+                " error=",
                 " rate=",
+                "running=true",
+                "<device-name>",
+                "<headphones>",
+                "NVIDIA GeForce RTX 5060",
                 " [repeated ",
                 "]",
                 "'",
@@ -1732,7 +1994,7 @@ mod tests {
     /// empty folder names: no panic, and redacting twice changes nothing.
     #[test]
     fn redaction_never_panics_and_is_idempotent() {
-        let sets: [(Option<&str>, Option<&str>, Option<&str>); 7] = [
+        let sets: [(Option<&str>, Option<&str>, Option<&str>); 8] = [
             (
                 Some(r"C:\Users\Maria Lopez"),
                 Some("maria"),
@@ -1752,12 +2014,26 @@ mod tests {
             (Some(r"C:\Users\İrem"), Some("İrem"), Some("日本-PC")),
             (Some(r"C:\Users\K"), Some("K"), Some("Ω")),
             (Some(r"\\"), Some(""), None),
+            (
+                Some(r"C:\Users\headphones"),
+                Some("headphones"),
+                Some("device"),
+            ),
         ];
         let mut lines = Lines(0x9E37_79B9_7F4A_7C15);
         for (profile, user, pc) in sets {
             let mut names = Names::new(profile, user, pc);
-            names.note_device("Headphones (Maria's AirPods)", "<headphones>");
-            names.note_device("Kim's iPad", DEVICE_NAME);
+            names.note_hardware("NVIDIA GeForce RTX 5060");
+            for name in [
+                "Headphones (Maria's AirPods)",
+                "Kim's iPad",
+                "Maria",
+                "true",
+                "RTX 5060",
+            ] {
+                names.note_device(name, audio_kind(name));
+            }
+            names.note_device("Maria Lopez's iPad", DEVICE_NAME);
             let pieces: Vec<&str> = [
                 profile,
                 user,
@@ -1766,6 +2042,7 @@ mod tests {
                 Some("Kim"),
                 Some("Headphones (Maria's AirPods)"),
                 Some("Kim's iPad"),
+                Some("Maria Lopez's iPad"),
             ]
             .into_iter()
             .flatten()

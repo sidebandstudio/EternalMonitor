@@ -145,21 +145,50 @@ final class SupportDiagnostics: @unchecked Sendable {
         (#"^(Connected to ).*( session_id=\d+ host_caps=)"#, "$1%COMPUTERNAME%$2"),
     ].map { (try! NSRegularExpression(pattern: $0.0, options: .dotMatchesLineSeparators), $0.1) }
 
-    /// PC names seen this run, longest first: each HELLO_ACK's and each typed Address that isn't an
-    /// IP address. Uploads replace them anywhere, except inside a longer word or as a field name.
-    private static let pcNames = OSAllocatedUnfairLock(initialState: [(name: String, pattern: NSRegularExpression)]())
+    /// PC names seen this run, least recently seen first: each HELLO_ACK's and each typed Address that
+    /// isn't an IP address. Uploads replace them in free text, except inside a longer word, as a field
+    /// name or in a field's value. A line is redacted as it is queued, so letting the oldest name go
+    /// never uncovers one. `hardware` is this iPad's model and hardware names, never a PC's.
+    private static let pcNames = OSAllocatedUnfairLock(
+        initialState: (names: [(name: String, pattern: NSRegularExpression)](), hardware: [String]()))
+    static let maxPCNames = 64
 
-    /// Call it before logging `name`. Names shorter than 3 characters stay, as on Windows.
+    /// Words and values the log uses for other things, as on Windows: replacing them would corrupt it.
+    private static let commonWords: Set<String> = [
+        "user", "users", "admin", "administrator", "owner", "guest", "default", "public", "home", "pc",
+        "desktop", "laptop", "notebook", "computer", "workstation", "server", "display", "monitor", "screen",
+        "intel", "nvidia", "amd", "radeon", "geforce", "microsoft", "windows", "apple", "qualcomm", "realtek",
+        "true", "false", "yes", "off", "none", "auto", "unknown", "null",
+    ]
+    /// A field's value (`reason=x`) and a name this redaction wrote.
+    private static let keptPattern = try! NSRegularExpression(pattern: #"(?<=[\p{L}\p{N}_]=)\S+|%[A-Z]+%"#)
+
+    /// Call it before logging `name`. Names shorter than 3 characters, common words, numbers and
+    /// versions (`5060`, `v1.2.3`) and names inside this iPad's hardware names stay, as on Windows.
     static func notePCName(_ name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard name.count >= 3 else { return }
+        let lower = name.lowercased()
+        let version = lower.hasPrefix("v") ? lower.dropFirst() : Substring(lower)
+        let value = version.contains(where: \.isNumber) && version.allSatisfy { $0.isASCII && ($0.isNumber || $0.isPunctuation) }
+        guard name.count >= 3, !value, !commonWords.contains(lower) else { return }
         let pattern = try! NSRegularExpression(
-            pattern: #"(?<![\p{L}\p{N}_-])"# + NSRegularExpression.escapedPattern(for: name) + #"(?![\p{L}\p{N}_=-])"#,
+            pattern: #"(?<![\p{L}\p{N}_%-])"# + NSRegularExpression.escapedPattern(for: name) + #"(?![\p{L}\p{N}_=%-])"#,
             options: .caseInsensitive)
-        pcNames.withLock { names in
-            guard names.count < 32, !names.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else { return }
-            names.append((name, pattern))
-            names.sort { $0.name.count > $1.name.count }
+        pcNames.withLock { state in
+            guard !state.hardware.contains(where: { $0.range(of: name, options: .caseInsensitive) != nil }) else { return }
+            state.names.removeAll { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            state.names.append((name, pattern))
+            if state.names.count > maxPCNames { state.names.removeFirst(state.names.count - maxPCNames) }
+        }
+    }
+
+    /// This iPad's model or hardware name (`iPad`, `iPad16,5`): a PC name equal to or inside one stays.
+    static func noteHardware(_ text: String) {
+        guard !text.isEmpty else { return }
+        pcNames.withLock { state in
+            guard !state.hardware.contains(text) else { return }
+            state.hardware.append(text)
+            state.names.removeAll { text.range(of: $0.name, options: .caseInsensitive) != nil }
         }
     }
 
@@ -179,9 +208,15 @@ final class SupportDiagnostics: @unchecked Sendable {
             text = pattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
                 withTemplate: template)
         }
-        for (_, pattern) in pcNames.withLock({ $0 }) {
-            text = pattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
-                withTemplate: "%COMPUTERNAME%")
+        for (_, pattern) in pcNames.withLock({ $0.names }).sorted(by: { $0.name.count > $1.name.count }) {
+            let whole = NSRange(text.startIndex..., in: text)
+            let kept = keptPattern.matches(in: text, range: whole).map(\.range)
+            let result = NSMutableString(string: text)
+            for match in pattern.matches(in: text, range: whole).reversed()
+            where !kept.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) {
+                result.replaceCharacters(in: match.range, with: "%COMPUTERNAME%")
+            }
+            text = result as String
         }
         return text
     }
@@ -201,6 +236,8 @@ final class SupportDiagnostics: @unchecked Sendable {
         #else
         let simulator = false
         #endif
+        Self.noteHardware(UIDevice.current.model)
+        Self.noteHardware(machine)
         record("info", "device", "app=\(info["CFBundleShortVersionString"] ?? "unknown") build=\(info["CFBundleVersion"] ?? "unknown") hardware=\(machine) simulator=\(simulator) model=\(UIDevice.current.model) OS=\(process.operatingSystemVersionString) CPUs=\(process.processorCount) RAM_bytes=\(process.physicalMemory)")
         record("info", "display", "native_pixels=\(screen.nativeBounds) points=\(screen.bounds) scale=\(screen.scale) native_scale=\(screen.nativeScale) max_fps=\(screen.maximumFramesPerSecond)")
         record("info", "device", "hardware_decode_h264=\(VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)) hardware_decode_hevc=\(VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)) thermal=\(process.thermalState.rawValue) low_power=\(process.isLowPowerModeEnabled)")
