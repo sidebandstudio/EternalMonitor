@@ -208,6 +208,125 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
     }
 
+    /// A starved PC sent nothing for 350 ms while frames 352 and 353 were
+    /// both incomplete, then both repairs. Nothing complete waited behind
+    /// them, so dropping 352 gained nothing but an extra keyframe.
+    func testTwoIncompleteFramesWaitOutASilentPCWithoutAKeyframe() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        now = 16_667
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        for at in stride(from: UInt64(16_667), to: 366_667, by: 1_000) { assembler.tick(at: at) }
+        XCTAssertTrue(completed.isEmpty)
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        now = 366_667
+        add(seq: 352, index: 0, count: 2, byte: 1, retransmit: true)
+        add(seq: 353, index: 0, count: 2, byte: 3, retransmit: true)
+        XCTAssertEqual(completed, [Data([1, 2]), Data([3, 4])])
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+    }
+
+    /// With a complete frame waiting behind them, the incomplete frames keep
+    /// the stall allowance: each is dropped 100 ms past its deadline.
+    func testACompleteFrameBehindIncompleteOnesIsNotHeldBack() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        now = 16_667
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        now = 33_334
+        add(seq: 354, index: 0, count: 1, byte: 5)
+        assembler.tick(at: 124_999)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 125_000)
+        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        assembler.tick(at: 141_666)
+        XCTAssertTrue(completed.isEmpty)
+        assembler.tick(at: 141_667)
+        XCTAssertEqual(completed, [Data([5])])
+        XCTAssertEqual(keyframes, 2)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 2)
+    }
+
+    /// A dead stream still recovers. The first hold deadline a second past
+    /// the gap (1.1 s with the hold's retry cadence) retires both frames with
+    /// one keyframe request, and the keyframe is shown.
+    func testADeadStreamGivesUpOnceWithOneKeyframeRequest() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        now = 16_667
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        for at in stride(from: UInt64(16_667), to: 1_100_000, by: 1_000) { assembler.tick(at: at) }
+        XCTAssertEqual(keyframes, 0)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        for at in stride(from: UInt64(1_100_000), to: 3_000_000, by: 1_000) { assembler.tick(at: at) }
+        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 2)
+        let nacksBefore = nacks.count
+        now = 3_000_000
+        add(seq: 353, index: 0, count: 2, byte: 3, retransmit: true)
+        XCTAssertTrue(completed.isEmpty, "a late repair for a retired frame is ignored")
+        add(seq: 354, index: 0, count: 1, byte: 5, keyframe: true)
+        XCTAssertEqual(completed, [Data([5])])
+        XCTAssertEqual(keyframes, 1)
+        XCTAssertEqual(nacks.count, nacksBefore, "and no longer asked for")
+    }
+
+    /// A frame held for a second is retired, but a keyframe arriving behind
+    /// it needs no earlier frame. It used to be retired too, and its last
+    /// fragment was then ignored.
+    func testTheHoldBackstopKeepsAKeyframeThatIsStillArriving() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        for at in stride(from: UInt64(1_000), to: 1_090_000, by: 1_000) { assembler.tick(at: at) }
+        now = 1_090_000
+        add(seq: 353, index: 0, count: 2, byte: 3, keyframe: true)
+        assembler.tick(at: 1_100_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+        now = 1_105_000
+        add(seq: 353, index: 1, count: 2, byte: 4, keyframe: true)
+        XCTAssertEqual(completed, [Data([3, 4])])
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    /// A held frame with a complete frame behind it waits one repair window
+    /// from the first newer frame's first fragment, partial or not. It used
+    /// to wait from the complete frame's, 10 ms longer here.
+    func testAHeldFrameWaitsOneWindowFromTheFirstNewerFrame() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        assembler.tick(at: 125_000)
+        assembler.tick(at: 150_000)
+        now = 160_000
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        now = 170_000
+        add(seq: 354, index: 0, count: 1, byte: 5)
+        assembler.tick(at: 184_999)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        XCTAssertEqual(keyframes, 0)
+        assembler.tick(at: 185_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
+    /// A frame held with newer frames already behind it goes as soon as a
+    /// complete frame arrives: without them it would not have been held.
+    func testACompleteFrameEndsAHoldThatNewerFramesOverran() {
+        enableRepair()
+        add(seq: 352, index: 1, count: 2, byte: 2)
+        now = 16_667
+        add(seq: 353, index: 1, count: 2, byte: 4)
+        assembler.tick(at: 125_000)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 0)
+        now = 130_000
+        add(seq: 354, index: 0, count: 1, byte: 5)
+        XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1)
+        XCTAssertEqual(keyframes, 1)
+    }
+
     /// A complete keyframe needs no earlier frame. Received at 320 ms behind a
     /// held frame, it used to wait out that frame's repair window until 345 ms.
     func testCompleteKeyframeIsShownAtOnceAndRetiresAHeldFrame() {
