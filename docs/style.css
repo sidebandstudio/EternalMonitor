@@ -353,7 +353,7 @@ small { font-size: 0.875rem; }
 .stage { margin: clamp(32px, 3.5vw, 52px) calc(50% - min(620px, 50vw - 24px)) 0; }
 .rig-fit, .rig { aspect-ratio: 2709 / 980; }
 .rig { position: relative; }
-.rig > img, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
+.rig-devices, .rig-cable, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
 .rig-devices { inset: 0; width: 100%; height: 100%; }
 .rig-laptop { left: 5.906%; top: 5.612%; width: 39.793%; height: 60.51%; }
 .rig-ipad { left: 64.747%; top: 8.469%; width: 32.927%; height: 62.857%; }
@@ -389,6 +389,16 @@ small { font-size: 0.875rem; }
 @media (prefers-reduced-motion: reduce) {
   .rig .scr, .rig .scr.on, .rig-ipad > .scr, .rig-ipad > .scr.on { transition: none; }
   .rig-cable, .rig-air { transition-duration: 0.01s; }
+}
+/* Phones get their own picture (assets/hero/devices-narrow, a 2240 x 1200
+   canvas): the iPad stands in front of the laptop's right side, larger, and
+   its cable runs back behind the dock. */
+@media (max-width: 720px) {
+  .rig-fit, .rig { aspect-ratio: 2240 / 1200; }
+  .rig-laptop { left: 7.054%; top: 4.583%; width: 48.125%; height: 49.417%; }
+  .rig-ipad { left: 41.696%; top: 18.167%; width: 54.375%; height: 70%; }
+  .rig-cable { left: 17.679%; top: 50.5%; width: 30.848%; }
+  .rig-air { left: 62%; top: 3.5%; width: 5.4%; }
 }
 
 /* The two choices under the picture: what the iPad is, and how it is joined. */
@@ -430,10 +440,20 @@ small { font-size: 0.875rem; }
   .rig { width: min(100cqw, 100cqh * 2709 / 980); margin-inline: auto; }
   .rig-controls { flex: none; margin-top: clamp(14px, 2.4svh, 32px); }
 }
+/* Phones: each choice on one compact row, its name beside it. */
 @media (max-width: 720px) {
   .stage { margin-inline: calc(50% - 50vw + 10px); }
-  .rig-controls { flex-direction: column; align-items: center; gap: 12px; padding-inline: 16px; }
-  .rig-controls fieldset { flex-direction: column; gap: 8px; }
+  .rig-controls { flex-direction: column; align-items: stretch; gap: 8px; width: min(100%, 360px); margin-inline: auto; margin-top: 18px; }
+  .rig-controls fieldset { justify-content: space-between; gap: 10px; }
+  .rig-controls legend { font-size: 0.9375rem; }
+  .rig-controls .sw { padding: 2px; gap: 2px; }
+  .rig-controls .sw label { min-height: 34px; padding: 0 12px; gap: 6px; }
+  .rig-controls label svg { width: 15px; height: 15px; }
+}
+/* Too narrow for the names: they are still read out, and the pills centre. */
+@media (max-width: 360px) {
+  .rig-controls fieldset { justify-content: center; }
+  .rig-controls legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 }
 
 /* --- Switch -------------------------------------------------------------------
