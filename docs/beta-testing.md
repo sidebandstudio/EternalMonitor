@@ -22,7 +22,8 @@ back to Stable by running the Stable installer over it.
 - **Where it comes from:** `.github/workflows/nightly.yml` runs on main at
   07:41 UTC. It builds the newest `release/*-candidate` branch with commits main
   lacks, else main; the `NIGHTLY_BRANCH` repository variable overrides that.
-  It skips a night when that branch has not moved since the last Beta build.
+  It skips a night when that branch has not moved since the last Beta build
+  that finished publishing, so a night that stopped partway is redone.
   The build is the same as `release.yml`'s: same pins, diagnostics, secret scan
   and, once configured, signing.
 - **Version:** `<next>-beta.<YYYYMMDD>.<run>`, for example
@@ -43,7 +44,7 @@ back to Stable by running the Stable installer over it.
   build's version, date and commit) or the link above. Once the fix ships,
   they get the release through the app as usual. iPad betas still come
   through TestFlight, below.
-- **Run it by hand:** Actions, Nightly, Run workflow. On main it publishes;
+- **Run it by hand:** Actions, Beta builds, Run workflow. On main it publishes;
   tick **dry_run**, or pick another branch, to build and scan without
   publishing.
 

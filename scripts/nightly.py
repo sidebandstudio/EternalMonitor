@@ -11,6 +11,9 @@
       checkout in the current directory. The runner builds it; nothing is committed.
   nightly.py notes --version V --branch B --sha SHA --stable X.Y.Z --sha256 HASH
       Print the release notes.
+  nightly.py publish --tag TAG --sha SHA --title T --notes-file F INSTALLER
+      Publish the dated release, then point the fixed beta link at it (publish()).
+      Uses gh with GH_TOKEN; the downloads are checked anonymously.
   nightly.py expired [--keep 7] < releases.json
       Print the beta-* tags to delete, oldest last, from `gh release list
       --json tagName,isPrerelease,createdAt`.
@@ -22,14 +25,26 @@ is offered the next stable release as usual (host/src/updates.rs).
 """
 import argparse
 import datetime
+import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
 
 REPO = "sidebandstudio/EternalMonitor"
 ASSET = "EternalMonitor-Setup-beta.exe"
 MOVING_TAG = "beta"
+# The moving release's asset while it is replaced: the new build goes up as
+# NEXT, the old one steps aside as OLD, then NEXT takes ASSET's name.
+NEXT = "EternalMonitor-Setup-beta.next.exe"
+OLD = "EternalMonitor-Setup-beta.old.exe"
+MARKER = re.compile(r"<!-- beta-commit: ([0-9a-f]{40}) -->")
 CANDIDATE = re.compile(r"release/(\d+)\.(\d+)\.(\d+)-candidate")
 DATED_TAG = re.compile(r"beta-\d{8}-[0-9a-f]{7,40}")
 CORE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
@@ -135,6 +150,170 @@ def expired(releases, keep=7):
     return [r["tagName"] for r in dated[keep:]]
 
 
+def download_url(tag, name=ASSET, repo=REPO):
+    return f"https://github.com/{repo}/releases/download/{tag}/{name}"
+
+
+def marker(sha):
+    """The beta release body's last line once a build has finished publishing."""
+    return f"<!-- beta-commit: {sha} -->"
+
+
+def published_commit(body):
+    match = MARKER.search(body or "")
+    return match[1] if match else ""
+
+
+class PublishError(Exception):
+    pass
+
+
+class GitHub:
+    """The calls publish() makes: gh with GH_TOKEN for writes, plain HTTPS without
+    credentials for the checks, so they see what a visitor sees."""
+
+    def __init__(self, repo=None, run=subprocess.run):
+        self.repo, self.run = repo or os.environ.get("GH_REPO", REPO), run
+
+    def gh(self, *args):
+        return self.run(["gh", *args], check=True, capture_output=True, text=True).stdout
+
+    def release(self, tag):
+        """The release's API object, or None when there is none."""
+        result = self.run(["gh", "api", f"repos/{self.repo}/releases/tags/{tag}"],
+                          capture_output=True, text=True)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        if "HTTP 404" in result.stderr:
+            return None
+        raise PublishError(f"reading release {tag}: {result.stderr.strip()}")
+
+    def create(self, tag, sha, title, notes, path=None):
+        self.gh("release", "create", tag, *([path] if path else []), "--repo", self.repo, "--target", sha,
+                "--title", title, "--notes", notes, "--prerelease", "--latest=false")
+
+    def edit(self, tag, title, notes):
+        self.gh("release", "edit", tag, "--repo", self.repo,
+                "--title", title, "--notes", notes, "--prerelease", "--latest=false")
+
+    def upload(self, tag, path, name):
+        """path as asset name, replacing an asset of that name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            named = os.path.join(tmp, name)
+            shutil.copyfile(path, named)
+            self.gh("release", "upload", tag, named, "--repo", self.repo, "--clobber")
+
+    def rename(self, asset_id, name):
+        self.gh("api", "-X", "PATCH", f"repos/{self.repo}/releases/assets/{asset_id}", "-f", f"name={name}")
+
+    def delete(self, asset_id):
+        self.gh("api", "-X", "DELETE", f"repos/{self.repo}/releases/assets/{asset_id}")
+
+    def move_tag(self, tag, sha):
+        self.gh("api", "-X", "PATCH", f"repos/{self.repo}/git/refs/tags/{tag}", "-f", f"sha={sha}", "-F", "force=true")
+
+    def head(self, url):
+        """(status, Content-Length) of an anonymous HEAD, following redirects."""
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=60) as response:
+                return response.status, int(response.headers.get("Content-Length", -1))
+        except urllib.error.HTTPError as error:
+            return error.code, -1
+
+    def sha256(self, url):
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(url, timeout=300) as response:
+            for chunk in iter(lambda: response.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+
+def assets(release, name):
+    return [a for a in (release or {}).get("assets", []) if a["name"] == name]
+
+
+def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
+    """url serves size bytes (with sha256, those exact bytes) to an anonymous visitor.
+    A new or renamed asset can take a few seconds to show, so it retries."""
+    for attempt in range(tries):
+        try:
+            status, length = github.head(url)
+            seen = f"HTTP {status}, {length} bytes"
+            if status == 200 and length == size:
+                if sha256 is None:
+                    return
+                got = github.sha256(url)
+                if got == sha256:
+                    return
+                seen = f"SHA-256 {got}"
+        except OSError as error:
+            seen = str(error)
+        if attempt + 1 < tries:
+            sleep(wait)
+    raise PublishError(f"{url}: {seen}; expected {size} bytes" + (f", SHA-256 {sha256}" if sha256 else ""))
+
+
+def publish(github, tag, sha, title, notes, path, sleep=time.sleep):
+    """Publish the dated release, then point the fixed beta link at it.
+
+    Every step is checked. The beta release body gets marker(sha) last, and plan()
+    only skips a commit that carries it, so the next run finishes a run that
+    stopped partway: it reuses a dated release that exists, puts back an old asset
+    a stopped run left renamed away, and replaces a leftover NEXT. The fixed link
+    is missing only between the two renames, one API call (about a second); when
+    the second rename or the check after it fails, the old asset gets its name
+    back before the run fails."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    # 1. The dated release, checked from outside before anything links to it.
+    if github.release(tag) is None:
+        github.create(tag, sha, title, notes, path)
+    else:
+        github.edit(tag, title, notes)
+        github.upload(tag, path, ASSET)
+    verify(github, download_url(tag, repo=github.repo), size, sleep=sleep)
+
+    # 2. The moving beta release: NEXT goes up beside the working asset, then
+    # the two swap names.
+    beta = github.release(MOVING_TAG)
+    if beta is None:
+        github.create(MOVING_TAG, sha, title, notes)
+        beta = github.release(MOVING_TAG)
+    if not assets(beta, ASSET) and assets(beta, OLD):
+        github.rename(assets(beta, OLD)[0]["id"], ASSET)
+    github.upload(MOVING_TAG, path, NEXT)
+    beta = github.release(MOVING_TAG)
+    uploaded = assets(beta, NEXT)
+    if not uploaded or uploaded[0]["size"] != size:
+        raise PublishError(f"{NEXT} did not upload whole: {uploaded}")
+    new = uploaded[0]["id"]
+    old = next((a["id"] for a in assets(beta, ASSET)), None)
+    for stale in assets(beta, OLD):
+        github.delete(stale["id"])
+    if old:
+        github.rename(old, OLD)
+    renamed = False
+    try:
+        github.rename(new, ASSET)
+        renamed = True
+        verify(github, download_url(MOVING_TAG, repo=github.repo), size, sha256, sleep=sleep)
+    except Exception:
+        # Put the working build back under the fixed name before giving up.
+        if old:
+            if renamed:
+                github.rename(new, NEXT)
+            github.rename(old, ASSET)
+        raise
+    if old:
+        github.delete(old)
+
+    # 3. The tag, then the marker that says this commit is done.
+    github.move_tag(MOVING_TAG, sha)
+    github.edit(MOVING_TAG, title, f"{notes.rstrip()}\n\n{marker(sha)}\n")
+
+
 def git(*args):
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
 
@@ -153,10 +332,8 @@ def plan(override, run, date):
     stable = json.loads(git("show", "origin/main:docs/latest.json"))["windows"]["version"]
     host = package_version(git("show", f"{sha}:host/Cargo.toml"))
     version = nightly_version(next_version(host, stable), date, run)
-    # The moving tag marks the commit the newest published build came from.
-    last = ""
-    for line in git("ls-remote", "--tags", "origin", f"refs/tags/{MOVING_TAG}", f"refs/tags/{MOVING_TAG}^{{}}").splitlines():
-        last = line.split()[0]  # the peeled line, when present, comes last
+    # Not the tag: a build that stopped partway is published again.
+    last = published_commit((GitHub().release(MOVING_TAG) or {}).get("body"))
     return {
         "branch": branch,
         "sha": sha,
@@ -182,6 +359,10 @@ def main(argv=None):
     n = sub.add_parser("notes")
     for name in ("version", "branch", "sha", "stable", "sha256"):
         n.add_argument(f"--{name}", required=True)
+    u = sub.add_parser("publish")
+    for name in ("tag", "sha", "title", "notes-file"):
+        u.add_argument(f"--{name}", required=True)
+    u.add_argument("installer")
     e = sub.add_parser("expired")
     e.add_argument("--keep", type=int, default=7)
     args = parser.parse_args(argv)
@@ -201,6 +382,11 @@ def main(argv=None):
         print(f"eternal-host version {args.version}")
     elif args.command == "notes":
         sys.stdout.write(notes(args.version, args.branch, args.sha, args.stable, args.sha256))
+    elif args.command == "publish":
+        with open(args.notes_file, encoding="utf-8") as f:
+            text = f.read()
+        publish(GitHub(), args.tag, args.sha, args.title, text, args.installer)
+        print(f"Published {args.tag} and {download_url(MOVING_TAG)}")
     else:
         for tag in expired(json.load(sys.stdin), args.keep):
             print(tag)

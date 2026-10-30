@@ -1,0 +1,252 @@
+name: Beta installer
+
+# The Windows installer build of nightly.yml, as release.yml builds it. The
+# scheduled and manual runs call it with the repository's secrets; a pull
+# request runs its own code here, so it calls it with none and no OIDC token,
+# and every secret below is empty (scripts/test_workflow_secrets.py).
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      revision:
+        type: string
+        required: true
+    outputs:
+      sha256:
+        value: ${{ jobs.build.outputs.sha256 }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same pins as release.yml; scripts/test_nightly.py fails when they differ.
+  VDD_RELEASE_TAG: "25.5.2"
+  VDD_ASSET: "Virtual.Display.Driver-v25.05.03-setup-x64.exe"
+  VDD_SHA256: "ca10b85babecfb636c85b3f04d2306968d4f940dd3dd35767f866207bfba846e"
+  SIGNING_CLIENT_VERSION: "1.0.146"
+  SIGNING_CLIENT_SHA256: "7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70"
+  SDK_BUILD_TOOLS_VERSION: "10.0.28000.2957"
+  SDK_BUILD_TOOLS_SHA256: "b7163fc6f636172726d0985963e4f7f11c41afe1c7fdfe78f8051877360ed696"
+
+jobs:
+  build:
+    name: Build and scan
+    runs-on: windows-2022
+    timeout-minutes: 60
+    # As in release.yml: the release environment holds the Artifact Signing
+    # settings (docs/windows-signing.md) and only runs on main use it.
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
+      ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
+      # The stamped version leaves the checkout modified; name the commit itself.
+      ETERNAL_BUILD_REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      # scripts/nightly.py from this workflow's own commit; the source branch
+      # may not have it.
+      - uses: actions/checkout@v4
+        with:
+          path: .nightly-tools
+          sparse-checkout: scripts/nightly.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Cache FFmpeg 7.1.1 shared SDK
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\ffmpeg
+          key: ffmpeg-7.1.1-full_build-shared
+
+      - name: Download FFmpeg 7.1.1 shared SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.7z"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z
+          7z x ffmpeg.7z -oC:\ffmpeg-extract | Out-Null
+          Move-Item C:\ffmpeg-extract\ffmpeg-7.1.1-full_build-shared C:\ffmpeg
+
+      - name: Configure FFmpeg environment
+        shell: pwsh
+        run: |
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # Before the stamp, so the cache key follows the branch's own Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Stamp the beta version
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: python .nightly-tools\scripts\nightly.py stamp $env:VERSION
+
+      - name: Download the bundled virtual display driver
+        shell: pwsh
+        run: |
+          $dest = "installer\vendor\vdd"
+          $url = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$env:VDD_RELEASE_TAG/$env:VDD_ASSET"
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $dest $env:VDD_ASSET)
+          # Its MIT license text, redistributed alongside the binary.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/$env:VDD_RELEASE_TAG/LICENSE" `
+              -OutFile (Join-Path $dest "LICENSE-VirtualDisplayDriver.txt")
+
+      - name: Verify the driver against the pinned SHA-256
+        shell: pwsh
+        run: |
+          $path = "installer\vendor\vdd\$env:VDD_ASSET"
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Downloaded: $hash"
+          Write-Host "Pinned:     $env:VDD_SHA256"
+          if ($hash -ne $env:VDD_SHA256) {
+              throw "Driver asset hash mismatch — upstream bytes changed; re-vet the driver before updating the pin."
+          }
+          $sig = Get-AuthenticodeSignature $path
+          Write-Host "Authenticode status (informational): $($sig.Status)"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      # Signing turns on once the release environment has the Artifact Signing
+      # variables, exactly as in release.yml. Never for a pull request.
+      - name: Install the Artifact Signing client
+        if: github.event_name != 'pull_request' && vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        env:
+          SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "artifact-signing"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          function Get-PinnedPackage($id, $version, $sha256) {
+              $name = $id.ToLower()
+              $zip = Join-Path $root "$name.zip"
+              Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/$name/$version/$name.$version.nupkg" -OutFile $zip
+              $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+              if ($hash -ne $sha256) {
+                  throw "$id $version hash mismatch ($hash); re-vet the package before updating the pin."
+              }
+              $dest = Join-Path $root $name
+              Expand-Archive $zip $dest
+              $dest
+          }
+          $client = Get-PinnedPackage "Microsoft.ArtifactSigning.Client" $env:SIGNING_CLIENT_VERSION $env:SIGNING_CLIENT_SHA256
+          $tools = Get-PinnedPackage "Microsoft.Windows.SDK.BuildTools" $env:SDK_BUILD_TOOLS_VERSION $env:SDK_BUILD_TOOLS_SHA256
+          $signtool = @(Get-ChildItem "$tools\bin\*\x64\signtool.exe")
+          if ($signtool.Count -ne 1) { throw "Expected one x64 signtool.exe in the build tools package." }
+          $dlib = Join-Path $client "bin\x64\Azure.CodeSigning.Dlib.dll"
+          if (!(Test-Path $dlib)) { throw "Azure.CodeSigning.Dlib.dll is missing from the client package." }
+
+          $metadata = Join-Path $root "metadata.json"
+          @{
+              Endpoint = $env:SIGNING_ENDPOINT
+              CodeSigningAccountName = $env:SIGNING_ACCOUNT
+              CertificateProfileName = $env:SIGNING_PROFILE
+              CorrelationId = "$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+              ExcludeCredentials = @(
+                  "EnvironmentCredential", "WorkloadIdentityCredential", "ManagedIdentityCredential",
+                  "SharedTokenCacheCredential", "VisualStudioCredential", "VisualStudioCodeCredential",
+                  "AzurePowerShellCredential", "AzureDeveloperCliCredential", "InteractiveBrowserCredential")
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8NoBOM
+
+          $command = '$q{0}$q sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $q{1}$q /dmdf $q{2}$q $f' -f $signtool[0].FullName, $dlib, $metadata
+          "INSTALLER_SIGN_COMMAND=$command" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build the host and updater
+        shell: pwsh
+        run: |
+          # A pull request's check build has none; it uploads no diagnostics.
+          if ($env:GITHUB_EVENT_NAME -ne "pull_request" -and (!$env:ETERNAL_DIAGNOSTICS_ENDPOINT -or !$env:ETERNAL_DIAGNOSTICS_INGEST_KEY)) {
+              throw "Release diagnostics endpoint and ingest credential must be configured."
+          }
+          cargo build --release --locked -p eternal-host -p eternal-updater
+
+      - name: Sign in to Azure for Artifact Signing
+        if: github.event_name != 'pull_request' && vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          if (!$env:INSTALLER_SIGN_COMMAND) {
+              Write-Host "::warning::Artifact Signing is not configured, so this installer is unsigned. See docs/windows-signing.md."
+              # A source branch from before signing has no -SignCommand.
+              .\scripts\build-installer.ps1
+          } else {
+              .\scripts\build-installer.ps1 -SignCommand "$env:INSTALLER_SIGN_COMMAND"
+          }
+
+      - name: Check the Authenticode signatures
+        if: github.event_name != 'pull_request' && vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        run: |
+          $files = @(
+              "build\out\EternalMonitor-Setup.exe",
+              "build\installer-staging\EternalMonitor-host.exe",
+              "build\installer-staging\EternalMonitor-updater.exe")
+          foreach ($file in $files) {
+              $sig = Get-AuthenticodeSignature $file
+              Write-Host "${file}: $($sig.Status), signed by $($sig.SignerCertificate.Subject)"
+              if ($sig.Status -ne "Valid" -or !$sig.TimeStamperCertificate) {
+                  throw "$file is not validly signed and timestamped."
+              }
+          }
+
+      - name: Check the update helper's imports
+        shell: pwsh
+        run: |
+          $env:EM_UPDATER_EXE = (Resolve-Path "target\release\eternal-updater.exe").Path
+          cargo test -p eternal-updater --test imports --locked
+
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "build\out\EternalMonitor-Setup.exe" -Algorithm SHA256).Hash.ToLower()
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA256: $hash"
+
+      # Artifacts are public and not masked like the job log, and the publish
+      # job releases this artifact, so nothing leaves the job unscanned. The
+      # scanner comes from the source branch, as it does in release.yml.
+      - name: Check the installer artifact for secret values
+        id: artifact-scan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Optional: empty until Artifact Signing is set up (docs/windows-signing.md).
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: >-
+          python scripts/artifact_secrets.py scan
+          --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,GITHUB_TOKEN
+          --optional AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID
+          build/out/EternalMonitor-Setup.exe
+
+      - name: Upload the installer artifact
+        if: steps.artifact-scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-Setup-beta
+          path: build\out\EternalMonitor-Setup.exe
