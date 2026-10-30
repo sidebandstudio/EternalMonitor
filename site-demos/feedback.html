@@ -13,6 +13,9 @@
     #win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
     #win .win-view { width: 2080px; height: 1440px; }
     #win video { width: 2080px; height: 1440px; }
+    /* The loop's dissolve: to the night behind the window, not to black. */
+    #fade { position: absolute; inset: -4%; transform: scale(1.06); opacity: 0;
+      background: linear-gradient(rgba(6, 7, 10, 0.18), rgba(6, 7, 10, 0.18)), url('art/hills.webp') 40% 60% / cover; }
   </style>
 </head>
 <body>
@@ -29,27 +32,35 @@
         <video id="app" src="footage/host-feedback.mp4" data-start="0" data-duration="8" muted playsinline></video>
       </div>
     </div>
+    <div id="fade"></div>
   </div>
 
   <script>
     const tl = gsap.timeline({ paused: true });
     const AT = { x: 552, y: 445 };
     // Settings with the sidebar's Send feedback; the whole feedback panel;
-    // close on the message as it is typed.
+    // close on the message as it is typed; the send button and the note the
+    // app shows once the email app has the message.
     const PAGE = pose(440, 345, 1.15, AT);
     const PANEL = pose(520, 359, 1.48, AT);
     const NOTE = pose(520, 330, 1.75, AT);
+    const SENT = pose(520, 470, 1.62, AT);
 
     tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -14, duration: 4, ease: 'sine.inOut' }, 0);
     tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
 
     // In the footage the pointer opens the panel at 1.5 s, picks Something I
-    // like at 2.7 s, types from 3.7 s to 5 s and closes the panel at 7.0 s.
+    // like at 2.6 s, types from 3.6 s to 5 s and clicks Open in my email app
+    // at 5.75 s, when the app says the email app should open.
     tl.set('#win', PAGE, 0);
     tl.to('#win', { ...PANEL, duration: 0.8, ease: 'power3.inOut' }, 1.55);
-    tl.to('#win', { ...NOTE, duration: 0.8, ease: 'power2.inOut' }, 3.2);
-    tl.to('#win', { ...PANEL, duration: 0.7, ease: 'power2.inOut' }, 5.2);
-    tl.to('#win', { ...PAGE, duration: 0.8, ease: 'power3.inOut' }, 7.05);
+    tl.to('#win', { ...NOTE, duration: 0.8, ease: 'power2.inOut' }, 3.1);
+    tl.to('#win', { ...SENT, duration: 0.9, ease: 'power2.inOut' }, 5.0);
+    // The loop: the panel's window steps back into the night and the
+    // Settings page comes forward again.
+    tl.to('#win', { scale: SENT.scale * 0.96, x: SENT.x + 12, y: SENT.y + 18, duration: 0.5, ease: 'power2.in' }, 7.5);
+    tl.to('#fade', { opacity: 1, duration: 0.42, ease: 'power1.in' }, 7.58);
+    tl.fromTo('#fade', { opacity: 1 }, { opacity: 0, duration: 0.4, ease: 'power1.out', immediateRender: true }, 0);
 
     window.__timelines['feedback'] = tl;
   </script>
