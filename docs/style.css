@@ -435,7 +435,9 @@ small { font-size: 0.875rem; }
   gap: 14px 36px;
   margin-top: clamp(20px, 2.5vw, 32px);
 }
-.rig-controls fieldset { display: flex; align-items: center; gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
+/* Each option stays whole; when a language's names do not fit beside the
+   legend, the pill wraps under it as one piece. */
+.rig-controls fieldset { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
 /* Floated, the legend is an ordinary flex item, so it lines up with its pill. */
 .rig-controls legend { float: left; padding: 0; font-size: 0.9375rem; color: var(--muted); }
 .rig-controls .sw { padding: 3px; }
@@ -446,6 +448,8 @@ small { font-size: 0.875rem; }
   gap: 7px;
   min-height: 38px;
   padding: 0 15px;
+  white-space: nowrap;
+  word-break: keep-all;
   transition: background-color 0.2s ease, color 0.2s ease;
 }
 .rig-controls label svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
@@ -470,15 +474,16 @@ small { font-size: 0.875rem; }
 @media (max-width: 720px) {
   .stage { margin-inline: calc(50% - 50vw + 10px); }
   .rig-controls { flex-direction: column; align-items: stretch; gap: 8px; width: min(100% - 20px, 360px); margin-inline: auto; margin-top: 18px; }
-  .rig-controls fieldset { justify-content: space-between; gap: 10px; }
+  .rig-controls fieldset { justify-content: space-between; gap: 8px 10px; }
   .rig-controls legend { font-size: 0.9375rem; }
-  .rig-controls .sw { padding: 2px; gap: 2px; }
+  .rig-controls .sw { padding: 2px; gap: 2px; margin-inline-start: auto; }
   .rig-controls .sw label { min-height: 34px; padding: 0 12px; gap: 6px; }
   .rig-controls label svg { width: 15px; height: 15px; }
 }
 /* Too narrow for the names: they are still read out, and the pills centre. */
 @media (max-width: 360px) {
   .rig-controls fieldset { justify-content: center; }
+  .rig-controls .sw { margin-inline: auto; }
   .rig-controls legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 }
 
