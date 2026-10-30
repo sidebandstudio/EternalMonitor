@@ -34,15 +34,17 @@ final class CrashReportingTests: XCTestCase {
         XCTAssertEqual(crash().line,
             "MetricKit crash app=0.3.4 build=370 os=ipados:26.1 os_build=23B85 at=2026-10-26T07:33:20Z"
             + " exception_type=1(EXC_BAD_ACCESS) exception_code=2 signal=11(SIGSEGV) objc_exception=- thread=attributed"
-            + " frames=libsystem_kernel.dylib+0x1a2b00,EternalMonitor+0x1a2b10,EternalMonitor+0x1a2b20,EternalMonitor+0x1a2b30,"
-            + "EternalMonitor+0x1a2b40,EternalMonitor+0x1a2b50,EternalMonitor+0x1a2b60,EternalMonitor+0x1a2b70"
+            + " frames=libsystem_kernel.dylib+0x1a2b00@0x100007fc0,EternalMonitor+0x1a2b10@0x100007fc1,EternalMonitor+0x1a2b20@0x100007fc2,"
+            + "EternalMonitor+0x1a2b30@0x100007fc3,EternalMonitor+0x1a2b40@0x100007fc4,EternalMonitor+0x1a2b50@0x100007fc5,"
+            + "EternalMonitor+0x1a2b60@0x100007fc6,EternalMonitor+0x1a2b70@0x100007fc7"
             + " termination=namespace:SIGNAL code:11")
         var objc = crash(perThreadTree(frames: 2), reason: nil)
         objc.exceptionType = 10
         objc.signal = 6
         objc.objcException = "NSRangeException"
         XCTAssertTrue(objc.line.hasSuffix("exception_type=10(EXC_CRASH) exception_code=2 signal=6(SIGABRT)"
-            + " objc_exception=NSRangeException thread=attributed frames=libsystem_kernel.dylib+0x1a2b00,EternalMonitor+0x1a2b10"
+            + " objc_exception=NSRangeException thread=attributed"
+            + " frames=libsystem_kernel.dylib+0x1a2b00@0x100007fc0,EternalMonitor+0x1a2b10@0x100007fc1"
             + " termination=-"), objc.line)
         // Values MetricKit left out, and a tree it couldn't give.
         let bare = MetricKitDiagnostic(kind: .crash, appVersion: "", build: "", osVersion: "", at: at)
@@ -56,9 +58,11 @@ final class CrashReportingTests: XCTestCase {
         let hang = MetricKitDiagnostic(kind: .hang, appVersion: "0.3.4", build: "370", osVersion: "iPhone OS 18.6 (22G86)", at: at,
                                        seconds: 2.5, frames: top.frames, attributed: top.attributed)
         XCTAssertEqual(hang.line, "MetricKit hang app=0.3.4 build=370 os=ipados:18.6 os_build=22G86 at=2026-10-26T07:33:20Z"
-            + " duration_ms=2500 thread=attributed frames=libsystem_kernel.dylib+0x1a2b00,EternalMonitor+0x1a2b10,EternalMonitor+0x1a2b20")
+            + " duration_ms=2500 thread=attributed frames=libsystem_kernel.dylib+0x1a2b00@0x100007fc0,EternalMonitor+0x1a2b10@0x100007fc1,"
+            + "EternalMonitor+0x1a2b20@0x100007fc2")
         // A CPU report aggregates samples from the outermost caller: the
-        // heaviest path ends in the innermost frame, which is shown first.
+        // heaviest path ends in the innermost frame, which is shown first. A
+        // frame without an address shows 0.
         let tree: [String: Any] = ["callStackPerThread": false, "callStacks": [["callStackRootFrames": [
             ["binaryName": "dyld", "offsetIntoBinaryTextSegment": 0x10, "sampleCount": 3],
             ["binaryName": "dyld", "offsetIntoBinaryTextSegment": 0x20, "sampleCount": 90, "subFrames": [
@@ -69,7 +73,7 @@ final class CrashReportingTests: XCTestCase {
         let cpu = MetricKitDiagnostic(kind: .cpuException, appVersion: "0.3.4", build: "370", osVersion: "iPadOS 26.1 (23B85)", at: at,
                                       seconds: 81, sampledSeconds: 180, frames: samples.frames, attributed: samples.attributed)
         XCTAssertEqual(cpu.line, "MetricKit cpu_exception app=0.3.4 build=370 os=ipados:26.1 os_build=23B85 at=2026-10-26T07:33:20Z"
-            + " cpu_ms=81000 sampled_ms=180000 thread=first frames=VideoToolbox+0x50,EternalMonitor+0x40,dyld+0x20")
+            + " cpu_ms=81000 sampled_ms=180000 thread=first frames=VideoToolbox+0x50@0x0,EternalMonitor+0x40@0x0,dyld+0x20@0x0")
     }
 
     func testTheLineStaysWithinTheCapWithoutPathsOrSecondLines() {
@@ -83,7 +87,7 @@ final class CrashReportingTests: XCTestCase {
         XCTAssertTrue(line.hasSuffix(" termination=namespace:DYLD code:1"), line)
         let frames = line.components(separatedBy: " frames=")[1].components(separatedBy: " ")[0].split(separator: ",")
         XCTAssertEqual(frames.count, MetricKitDiagnostic.topFrames)
-        XCTAssertEqual(frames[1], Substring(String(repeating: "__x", count: 21) + "_+0x1a2b10"), "names are ASCII tokens of 64 at most")
+        XCTAssertEqual(frames[1], Substring(String(repeating: "__x", count: 21) + "_+0x1a2b10@0x100007fc1"), "names are ASCII tokens of 64 at most")
         // The support log and the upload cut at 8 KiB anyway; the line is far inside.
         XCTAssertEqual(SupportDiagnostics.redact(line), line)
     }
@@ -133,10 +137,40 @@ final class CrashReportingTests: XCTestCase {
                                 ("libswiftCore.dylib", "libswiftCore.dylib"), ("AGXMetalG13X", "AGXMetalG13X"),
                                 ("ScreenTimeSettingsUIExtension", "ScreenTimeSettingsUIExtension")] {
             let line = crash(perThreadTree(frames: 2, binary: binary)).line
-            XCTAssertTrue(line.contains(",\(shown)+0x1a2b10 "), line)
+            XCTAssertTrue(line.contains(",\(shown)+0x1a2b10@0x100007fc1 "), line)
         }
         XCTAssertEqual(MetricKitDiagnostic.scrub("exception_code=-9223372036854775808 frames=dyld+0x1a2b00"),
                        "exception_code=-9223372036854775808 frames=dyld+0x1a2b00", "decimal numbers and offsets stay")
+    }
+
+    /// A 64-bit code says why the app was killed, so the scrub keeps it in
+    /// the termination field, and only there.
+    func testALongTerminationCodeIsKept() {
+        let code = "0xc00000000000ab12"
+        let line = crash(perThreadTree(frames: 2, binary: code), reason: "Namespace GUARD, Code \(code) GUARD_TYPE_MACH_PORT").line
+        XCTAssertTrue(line.hasSuffix(" termination=namespace:GUARD code:\(code)"), line)
+        XCTAssertTrue(line.contains(",<id>+0x1a2b10@0x100007fc1 "), "the same hex in a binary name: \(line)")
+        XCTAssertEqual(line.components(separatedBy: "c00000000000ab12").count, 2, line)
+        XCTAssertEqual(MetricKitDiagnostic.scrub("code:\(code) x code:\(code)"), "code:<id> x code:<id>", "outside the termination field")
+        XCTAssertTrue(crash(reason: "Namespace JETSAM, Code 0x8badf00dc00010ff").line.hasSuffix(" termination=namespace:JETSAM code:0x8badf00dc00010ff"))
+    }
+
+    /// An early payload's offset can be the binary's load address, so each
+    /// frame shows its address too. The scrub keeps an address of 16 hex
+    /// digits, and still takes the same digits out of a binary name.
+    func testEachFrameShowsItsAddress() {
+        let address: UInt64 = 0xfffffff0071e3c58
+        let tree: [String: Any] = ["callStackPerThread": true, "callStacks": [["threadAttributed": true, "callStackRootFrames": [
+            ["binaryName": "EternalMonitor", "offsetIntoBinaryTextSegment": 0x104a2c000, "address": 0x104a3d2b4, "subFrames": [
+                ["binaryName": "fffffff0071e3c58", "offsetIntoBinaryTextSegment": 0x10, "address": NSNumber(value: address)]]]]]]]
+        let line = crash(try! JSONSerialization.data(withJSONObject: tree)).line
+        XCTAssertTrue(line.contains(" frames=EternalMonitor+0x104a2c000@0x104a3d2b4,<id>+0x10@0xfffffff0071e3c58 "), line)
+        // Eight frames of the longest names and addresses stay inside the cap.
+        let top = MetricKitDiagnostic.Frame(binary: String(repeating: "x", count: 64), offset: .max, address: .max)
+        var long = crash()
+        long.frames = Array(repeating: top, count: MetricKitDiagnostic.topFrames)
+        XCTAssertLessThan(long.line.utf8.count, 2048, long.line)
+        XCTAssertEqual(long.line.components(separatedBy: "@0xffffffffffffffff").count, MetricKitDiagnostic.topFrames + 1, long.line)
     }
 
     func testExitCountsAreOneLineOfCounts() {
