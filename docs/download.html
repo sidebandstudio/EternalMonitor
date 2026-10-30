@@ -53,6 +53,10 @@
           <span>GitHub</span>
           <span class="count" data-stars></span>
         </a>
+        <a href="https://discord.gg/Xc7NykBZ6z" class="nav-link" target="_blank" rel="noopener" aria-label="Sideband Studio on Discord">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>
+          <span>Discord</span>
+        </a>
         <a href="#feedback" class="btn btn-secondary btn-sm">Feedback</a>
       </div>
     </nav>
@@ -73,7 +77,7 @@
     <section class="container dl-grid reveal" aria-label="Downloads">
       <article class="card dl-card" id="windows">
         <div class="card-head">
-          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+          <span class="platform" aria-hidden="true"><img src="assets/platform-windows.webp" srcset="assets/platform-windows@2x.webp 2x" alt="" width="56" height="56"></span>
           <h2>Windows</h2>
           <span class="badge badge-accent" id="release-version" data-win-version>v0.3.3</span>
         </div>
@@ -89,6 +93,11 @@
           </a>
           <p class="dl-meta"><span id="release-meta">EternalMonitor-Setup.exe · 60.0 MB</span> · <a id="release-notes-link" href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3" target="_blank" rel="noopener">Release notes</a> · <a href="known-issues.html">Known issues</a></p>
         </div>
+        <div class="term">
+          <p class="term-what">Or paste this into PowerShell. It downloads the installer and starts it only if the SHA-256 matches.</p>
+          <p class="term-cmd"><code><span class="term-ps" aria-hidden="true">PS&gt; </span><span id="install-cmd">irm https://eternalmonitor.dev/<wbr>install.ps1 | iex</span></code></p>
+          <button type="button" class="term-copy" data-copy="install-cmd">Copy</button>
+        </div>
         <div class="sha">
           <div class="sha-label"><span>SHA-256</span><button type="button" class="btn btn-secondary btn-sm" data-copy="sha256-value">Copy</button></div>
           <code id="sha256-value">3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b</code>
@@ -101,7 +110,7 @@
 
       <article class="card dl-card" id="windows-beta">
         <div class="card-head">
-          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><path d="M13.6 6.4a3.4 3.4 0 1 0 2.6 5.2 2.7 2.7 0 1 1-2.6-5.2z" fill="currentColor" stroke="none"/></svg></span>
+          <span class="platform" aria-hidden="true"><img src="assets/platform-windows-night.webp" srcset="assets/platform-windows-night@2x.webp 2x" alt="" width="56" height="56"></span>
           <h2>Windows</h2>
           <span class="badge badge-accent">Beta</span>
         </div>
@@ -119,6 +128,11 @@
           <p class="dl-meta"><span id="beta-meta">EternalMonitor-Setup-beta.exe</span> · <a href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/beta" target="_blank" rel="noopener">Release notes</a> · <a href="known-issues.html">Known issues</a></p>
           <p class="dl-meta" id="beta-build">A new build comes out each night with the fixes that landed that day.</p>
         </div>
+        <div class="term">
+          <p class="term-what">Or paste this into PowerShell. It downloads the newest Beta and starts it only if the SHA-256 matches.</p>
+          <p class="term-cmd"><code><span class="term-ps" aria-hidden="true">PS&gt; </span><span id="beta-install-cmd">irm https://eternalmonitor.dev/<wbr>install-beta.ps1 | iex</span></code></p>
+          <button type="button" class="term-copy" data-copy="beta-install-cmd">Copy</button>
+        </div>
         <div class="sha" id="beta-sha" hidden>
           <div class="sha-label"><span>SHA-256</span><button type="button" class="btn btn-secondary btn-sm" data-copy="beta-sha256-value">Copy</button></div>
           <code id="beta-sha256-value"></code>
@@ -135,7 +149,7 @@
 
       <article class="card dl-card" id="ipad">
         <div class="card-head">
-          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
+          <span class="platform" aria-hidden="true"><img src="assets/platform-ipad.webp" srcset="assets/platform-ipad@2x.webp 2x" alt="" width="56" height="56"><img class="platform-night" src="assets/platform-ipad-night.webp" srcset="assets/platform-ipad-night@2x.webp 2x" alt="" width="56" height="56"></span>
           <h2>iPad</h2>
           <span class="badge badge-accent">TestFlight beta</span>
         </div>
@@ -155,6 +169,44 @@
       </article>
     </section>
     <p class="container caption dl-all">Every build, Stable and Beta, is on the <a href="https://github.com/sidebandstudio/EternalMonitor/releases" target="_blank" rel="noopener">GitHub releases page</a>.</p>
+
+    <section class="pedigree reveal" aria-labelledby="pedigree-title">
+      <div class="container">
+        <p class="pedigree-title" id="pedigree-title">Built by engineers from</p>
+        <ul class="pedigree-logos">
+          <li><img class="logo-aws" src="assets/logos/aws.svg" alt="AWS" width="189" height="126" decoding="async" loading="lazy"></li>
+          <li><img class="logo-amazon" src="assets/logos/amazon.svg" alt="Amazon" width="399" height="134" decoding="async" loading="lazy"></li>
+          <li><img class="logo-sonos" src="assets/logos/sonos.svg" alt="Sonos" width="514" height="100" decoding="async" loading="lazy"></li>
+          <li><img class="logo-mit-lincoln-laboratory" src="assets/logos/mit-lincoln-laboratory.svg" alt="MIT Lincoln Laboratory" width="2025" height="204" decoding="async" loading="lazy"></li>
+          <li><img class="logo-summit-partners" src="assets/logos/summit-partners.svg" alt="Summit Partners" width="232" height="44" decoding="async" loading="lazy"></li>
+          <li><img class="logo-philips" src="assets/logos/philips.svg" alt="Philips" width="500" height="92" decoding="async" loading="lazy"></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="container soon reveal" aria-labelledby="soon-title">
+      <h2 id="soon-title">Coming to Mac and iPhone Duo</h2>
+      <div class="soon-grid">
+        <article class="soon-card" id="mac">
+          <span class="platform" aria-hidden="true"><img src="assets/platform-mac.webp" srcset="assets/platform-mac@2x.webp 2x" alt="" width="56" height="56"><img class="platform-night" src="assets/platform-mac-night.webp" srcset="assets/platform-mac-night@2x.webp 2x" alt="" width="56" height="56"></span>
+          <div class="soon-body">
+            <h3>Mac</h3>
+            <p>Use your iPad or iPhone Duo as a second screen for your Mac.</p>
+          </div>
+        </article>
+        <article class="soon-card" id="iphone-duo">
+          <span class="platform" aria-hidden="true"><img src="assets/platform-iphone-duo.webp" srcset="assets/platform-iphone-duo@2x.webp 2x" alt="" width="56" height="56"><img class="platform-night" src="assets/platform-iphone-duo-night.webp" srcset="assets/platform-iphone-duo-night@2x.webp 2x" alt="" width="56" height="56"></span>
+          <div class="soon-body">
+            <h3>iPhone Duo</h3>
+            <p>Use your iPhone Duo as a second screen. It's a separate app, EternalMonitor Duo, with its own TestFlight beta.</p>
+            <!-- The Duo's public TestFlight link goes here. Until it exists, keep this
+                 plain text; then replace it with
+                 <a href="https://testflight.apple.com/join/…" class="soon-link" target="_blank" rel="noopener">Join the Duo TestFlight beta</a> -->
+            <p class="soon-link" id="duo-testflight">TestFlight link soon</p>
+          </div>
+        </article>
+      </div>
+    </section>
 
     <section class="section" id="feedback" aria-labelledby="feedback-title">
       <div class="container">
@@ -275,6 +327,7 @@ xcodegen generate
         <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
         <a href="privacy.html">Privacy</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/Xc7NykBZ6z" target="_blank" rel="noopener">Discord</a>
         <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
       </nav>
     </div>

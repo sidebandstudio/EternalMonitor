@@ -843,6 +843,13 @@ small { font-size: 0.875rem; }
 
 .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .dl-card { display: flex; flex-direction: column; }
+.dl-card .card-head { gap: 16px; }
+/* The app icon's tile with the platform drawn in it. The iPad card is shared by
+   both channels, so its night tile fades in over the day one like .brand-night. */
+.platform { position: relative; flex: none; width: 56px; height: 56px; }
+.platform img { width: 100%; height: 100%; }
+/* Pills in the text face, like the rest of the card. */
+.dl-card .badge { font-family: var(--font); font-size: 0.8125rem; letter-spacing: 0; }
 .dl-card .btn { margin-top: 0; }
 .dl-actions { margin-top: 22px; }
 .dl-meta { margin-top: 10px; font-size: 0.875rem; color: var(--faint); }
@@ -862,6 +869,32 @@ small { font-size: 0.875rem; }
 .no-js .channel-switch { display: none; }
 .channel-note { margin-top: 14px; color: var(--muted); }
 .dl-all { margin-top: 20px; }
+/* Mac and iPhone Duo, not out yet: quieter than the download cards, with no
+   button. Their tiles turn to night on Beta like the iPad card's. */
+.soon { margin-top: clamp(64px, 8vw, 104px); }
+.soon h2 { font-size: clamp(1.5rem, 1.2rem + 0.8vw, 1.875rem); letter-spacing: -0.03em; line-height: 1.1; }
+.soon-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+.soon-card { display: flex; align-items: flex-start; gap: 18px; padding: 24px; border-radius: var(--r-lg); background: var(--surface); }
+.soon-card .platform { width: 48px; height: 48px; }
+.soon-body p { margin-top: 6px; color: var(--muted); }
+.soon-body .soon-link {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  margin-top: 14px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--faint);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+a.soon-link { color: var(--text); text-decoration: none; }
+a.soon-link:hover { background: var(--border); }
+@media (max-width: 760px) {
+  .soon-grid { grid-template-columns: 1fr; }
+  .soon-card { padding: 20px; gap: 16px; }
+}
 
 /* --- Download page: the Beta channel at night ---------------------------------
    html.channel-beta (set before first paint from ?channel=beta, then by the
@@ -915,13 +948,13 @@ html:not(.channel-beta) #windows-beta,
 }
 
 .brand-mark { position: relative; display: inline-flex; }
-.brand-night { position: absolute; inset: 0; display: none; opacity: 0; }
-.night-ready .brand-night { display: block; }
-.channel-beta .brand-night { opacity: 1; }
+.brand-night, .platform-night { position: absolute; inset: 0; display: none; opacity: 0; }
+.night-ready .brand-night, .night-ready .platform-night { display: block; }
+.channel-beta .brand-night, .channel-beta .platform-night { opacity: 1; }
 
 /* The cards and buttons the two channels share take on a moonlit tint. */
-.night-ready .dl-card { position: relative; }
-.night-ready .dl-card::before {
+.night-ready .dl-card, .night-ready .soon-card { position: relative; }
+.night-ready .dl-card::before, .night-ready .soon-card::before {
   content: "";
   position: absolute;
   inset: -1px;
@@ -931,7 +964,7 @@ html:not(.channel-beta) #windows-beta,
   pointer-events: none;
   opacity: 0;
 }
-.channel-beta .dl-card::before { opacity: 1; }
+.channel-beta .dl-card::before, .channel-beta .soon-card::before { opacity: 1; }
 .night-ready .dl-card .btn-primary { position: relative; isolation: isolate; }
 .night-ready .dl-card .btn-primary::before {
   content: "";
@@ -946,13 +979,17 @@ html:not(.channel-beta) #windows-beta,
 .channel-beta .dl-card .btn-primary:hover::before { background: #d9deff; }
 .channel-beta .channel-switch { border-color: rgba(165, 176, 255, 0.3); }
 .channel-beta .channel-switch a[aria-current] { background: #e4e8ff; color: #0b0f2e; }
-#windows-beta .badge-accent { background: rgba(195, 203, 255, 0.12); color: #c3cbff; border-color: rgba(195, 203, 255, 0.28); }
+.channel-beta .dl-card .badge-accent { background: rgba(195, 203, 255, 0.12); color: #c3cbff; border-color: rgba(195, 203, 255, 0.28); }
+.channel-beta .dl-card .specs li::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c3cbff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.2l2.8 2.8 6.2-6.3'/%3E%3C/svg%3E");
+}
+.channel-beta .dl-card a:not(.btn):hover { text-decoration-color: #c3cbff; }
 #windows-beta .channel-note { color: #c9cff5; }
-#windows-beta .card-head .icon { color: #c3cbff; }
+.channel-beta .soon-link { background: rgba(195, 203, 255, 0.1); color: #c3cbff; }
 
 @media (prefers-reduced-motion: no-preference) {
   /* About T3's pace: a quick start and a long settle, both ways. */
-  .night-sky, .brand-night, .dl-card::before, .dl-card .btn-primary::before {
+  .night-sky, .brand-night, .platform-night, .dl-card::before, .soon-card::before, .dl-card .btn-primary::before {
     transition: opacity 0.9s var(--ease-out);
   }
   .moon { transition: opacity 1.1s var(--ease-out) 0.15s, transform 1.4s var(--ease-out) 0.15s; }
@@ -964,7 +1001,7 @@ html:not(.channel-beta) #windows-beta,
 }
 @media (prefers-reduced-motion: reduce) {
   /* An instant switch, not the site-wide 0.01 ms transition. */
-  .night-sky, .moon, .brand-night, .dl-card::before, .dl-card .btn-primary::before { transition: none !important; }
+  .night-sky, .moon, .brand-night, .platform-night, .dl-card::before, .soon-card::before, .dl-card .btn-primary::before { transition: none !important; }
 }
 /* script.js sets html.sky-paused while the tab is hidden or the sky is
    scrolled out of view, so the sky's animations wait for someone to see them. */
@@ -987,6 +1024,51 @@ html:not(.channel-beta) #windows-beta,
   .night-sky { height: 520px; }
   .moon { top: 74px; right: 5%; width: 68px; height: 68px; }
   .shooting-star { top: 96px; left: 48%; width: 96px; }
+  .platform { width: 48px; height: 48px; }
+}
+/* The PowerShell one-liner, set on Windows PowerShell's own console blue. */
+.term {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "what copy" "cmd cmd";
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 22px;
+}
+.term-what { grid-area: what; font-size: 0.9375rem; color: var(--muted); }
+.term-copy { grid-area: copy; }
+.term-cmd {
+  grid-area: cmd;
+  padding: 14px 18px;
+  border-radius: var(--r-md);
+  background: #012456;
+  color: #eeedf0;
+  font-family: var(--mono); /* taste-skill-ignore: the line is literal PowerShell code */
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.term-cmd code { font: inherit; color: #ffffff; }
+.term-cmd .term-ps { color: #9fb4d8; }
+.term-copy {
+  flex: none;
+  height: 34px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: #012456;
+  color: #ffffff;
+  font: 600 0.875rem/1 var(--font);
+  cursor: pointer;
+  transition: background-color 0.15s ease-out, transform 0.1s ease-out;
+}
+.term-copy:hover { background: #0b3a7e; }
+.term-copy:active { transform: scale(0.96); }
+.term-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.channel-beta .term-copy:focus-visible { outline-color: #c3cbff; }
+@media (max-width: 760px) {
+  .term { grid-template-columns: 1fr; grid-template-areas: "what" "cmd" "copy"; }
+  .term-copy { height: 44px; }
 }
 .sha {
   margin-top: 18px;
@@ -1379,3 +1461,152 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .policy .post-list { margin-top: 16px; }
 .policy .post-update { margin-top: 20px; }
 .policy .post-update dl { margin-top: 0; }
+
+/* --- Discord link and the "Built by engineers from" strip ------------------------
+   Kept in one block at the end of the file. The Discord link reuses .nav-link. The
+   header gained a link, so it now compacts earlier: below 900px GitHub and Discord
+   drop their words (screen readers still hear them), below 800px the text links
+   go, and on phones the right-hand group tightens so the brand keeps its name. */
+
+.nav-link { white-space: nowrap; }
+.nav-link svg { flex: none; }
+@media (max-width: 900px) {
+  .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
+  .nav-link[href^="https://discord.gg/"] > span {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
+}
+@media (max-width: 800px) {
+  .nav .hide-sm { display: none !important; }
+}
+@media (max-width: 480px) {
+  .nav-links { gap: 2px; }
+  .nav-link, .nav-link[href^="https://discord.gg/"] { padding-inline: 6px; }
+  .nav .btn-sm { padding-inline: 12px; }
+  .nav .count-star { display: none; }
+}
+/* At 380px and below the star count goes too, so the brand keeps its full name. */
+@media (max-width: 380px) {
+  .nav-link .count { display: none; }
+}
+
+/* Below 360px the brand shows its mark only; the link keeps its name for
+   screen readers. Neither side of the bar may shrink, so nothing overlaps. */
+.brand-mark, .brand > img, .nav-links { flex: none; }
+@media (max-width: 360px) {
+  .brand > span:last-child {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* "Built by engineers from": the companies Sideband Studio's engineers have
+   worked at. The logos are the companies' own files; one filter turns each into
+   flat white, slightly muted, so they read the same on the plain page and in the
+   Beta night sky. Each logo has its own height, set by eye so the six carry
+   equal weight: a tall emblem sits lower than a thin, wide wordmark, and the
+   long MIT Lincoln Laboratory lockup gets the widest place on every layout. */
+.pedigree { --s: 1; padding-top: clamp(64px, 8vw, 112px); }
+.pedigree.center .pedigree-title { text-align: center; }
+.pedigree-title {
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 0.95rem + 0.45vw, 1.3125rem);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.pedigree-logos {
+  list-style: none;
+  margin-top: clamp(28px, 3vw, 40px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.pedigree-logos li { display: flex; justify-content: center; }
+.pedigree-logos img {
+  display: block;
+  width: auto;
+  height: calc(var(--h) * var(--s));
+  filter: brightness(0) invert(1);
+  opacity: 0.86;
+}
+.logo-aws { --h: 46px; }
+.logo-amazon { --h: 38px; }
+.logo-sonos { --h: 24px; }
+.logo-mit-lincoln-laboratory { --h: 34px; }
+.logo-summit-partners { --h: 34px; }
+.logo-philips { --h: 21px; }
+/* The download page puts it under the cards, closer than a section break. */
+.dl-all + .pedigree { padding-top: clamp(48px, 6vw, 80px); }
+
+/* Below 1160px the row no longer fits: two rows, AWS, Amazon and Sonos, then
+   MIT Lincoln Laboratory, Summit Partners and Philips. Each row runs from margin
+   to margin. The ::before is the line break (flex has none), its height the gap. */
+@media (max-width: 1160px) {
+  .pedigree { --s: 0.9; }
+  .pedigree-logos { flex-wrap: wrap; gap: 0 24px; }
+  .pedigree-logos::before { content: ""; order: 1; flex: 0 0 100%; height: 40px; }
+  .pedigree-logos li:nth-child(n+4) { order: 2; }
+}
+/* Phones and small tablets: three rows, MIT Lincoln Laboratory alone in the
+   middle at full width. */
+@media (max-width: 720px) {
+  .pedigree { --s: 0.8; }
+  .pedigree-logos { gap: 0 16px; }
+  .pedigree-logos::before, .pedigree-logos::after { content: ""; flex: 0 0 100%; height: 32px; }
+  .pedigree-logos::after { order: 3; }
+  .pedigree-logos li:nth-child(n+5) { order: 4; }
+  .pedigree-logos li:nth-child(4) { flex: 0 0 100%; justify-content: flex-start; }
+  .pedigree.center .pedigree-logos li:nth-child(4) { justify-content: center; }
+  .pedigree-logos .logo-mit-lincoln-laboratory { width: min(100%, 340px); height: auto; }
+}
+@media (max-width: 360px) {
+  .pedigree { --s: 0.72; }
+}
+
+/* The logos come in one after another, once, after the strip itself starts to rise. */
+html.js .pedigree.reveal li {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.6s var(--ease-out), transform 0.7s var(--ease-out);
+}
+html.js .pedigree.reveal.visible li { opacity: 1; transform: none; }
+.pedigree li:nth-child(2) { transition-delay: 70ms; }
+.pedigree li:nth-child(3) { transition-delay: 140ms; }
+.pedigree li:nth-child(4) { transition-delay: 210ms; }
+.pedigree li:nth-child(5) { transition-delay: 280ms; }
+.pedigree li:nth-child(6) { transition-delay: 350ms; }
+@media (prefers-reduced-motion: reduce) {
+  html.js .pedigree.reveal li { opacity: 1; transform: none; transition: none; }
+}
+
+/* --- Download page on narrow phones ---------------------------------------------- */
+/* Single-column tracks may shrink below their content, and long button labels,
+   badges and addresses wrap instead of pushing the cards past the screen. */
+@media (max-width: 760px) {
+  .dl-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 860px) {
+  .feedback { grid-template-columns: minmax(0, 1fr); }
+}
+.dl-card, .feedback > * { min-width: 0; }
+.dl-card .card-head { flex-wrap: wrap; row-gap: 10px; }
+.dl-card .card-head h2 { min-width: 0; }
+.dl-card .btn, .feedback .btn { max-width: 100%; white-space: normal; text-align: center; }
+.dl-card .btn-lg, .feedback .btn-lg { height: auto; min-height: 50px; padding-block: 12px; line-height: 1.25; }
+.feedback a, .dl-meta a { overflow-wrap: anywhere; }
+@media (max-width: 380px) {
+  .dl-card, .feedback { padding: 22px 20px; }
+  /* The pill sits under the title, beside the tile, rather than alone on a row. */
+  .dl-card .card-head { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 14px; }
+  .dl-card .card-head .platform { grid-row: span 2; }
+  .dl-card .card-head .badge { justify-self: start; }
+  /* Room for the whole host on one line before the path. */
+  .term-cmd { padding: 12px 14px; font-size: 0.75rem; }
+}
