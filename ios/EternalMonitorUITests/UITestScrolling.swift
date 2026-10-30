@@ -43,8 +43,9 @@ extension XCUIApplication {
         while Date() < deadline {
             let landed = Self.frame(of: item).flatMap { !$0.isEmpty && window.contains($0) ? $0 : nil }
             if let landed, landed == last {
+                // Frames are in screen points; the app's .zero is at window's origin.
                 coordinate(withNormalizedOffset: .zero)
-                    .withOffset(CGVector(dx: landed.midX, dy: landed.midY)).tap()
+                    .withOffset(CGVector(dx: landed.midX - window.minX, dy: landed.midY - window.minY)).tap()
                 return true
             }
             last = landed
