@@ -253,19 +253,61 @@ def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
     raise PublishError(f"{url}: {seen}; expected {size} bytes" + (f", SHA-256 {sha256}" if sha256 else ""))
 
 
+def reconcile(github, size=None, sha256=None, new=None, old=None, sleep=time.sleep):
+    """Make the fixed link serve a whole build again, from the beta release's assets
+    as GitHub lists them now, whatever a failed call did or did not do before it
+    reported the failure. new and old are the ids of this run's upload and of the
+    asset the link served before it. The start of a run knows neither and takes
+    the asset named OLD as the old build.
+
+    The link keeps the build it serves unless that is the new build and fails its
+    check. Otherwise the new build takes the name if it checks out (size and
+    SHA-256 of an anonymous download), else the old one; then the link is checked."""
+    beta = github.release(MOVING_TAG)
+    if beta is None:
+        return
+    found = {a["id"]: a for a in beta.get("assets", [])}
+    served = next(iter(assets(beta, ASSET)), None)
+    if old is None:
+        old = next((a["id"] for a in assets(beta, OLD)), None)
+
+    def whole(asset):
+        try:
+            verify(github, download_url(MOVING_TAG, asset["name"], github.repo), size, sha256, sleep=sleep)
+            return True
+        except PublishError:
+            return False
+
+    if served and (served["id"] != new or whole(served)):
+        return
+    if new in found and found[new] is not served and whole(found[new]):
+        pick = found[new]
+    elif old in found:
+        pick = found[old]
+    else:
+        return  # no build to put back: the first one never went up whole
+    if served:
+        github.delete(served["id"])  # the new build, which failed its check
+    github.rename(pick["id"], ASSET)
+    verify(github, download_url(MOVING_TAG, repo=github.repo), pick["size"],
+           sha256 if pick["id"] == new else None, sleep=sleep)
+
+
 def publish(github, tag, sha, title, notes, path, sleep=time.sleep):
     """Publish the dated release, then point the fixed beta link at it.
 
     Every step is checked. The beta release body gets marker(sha) last, and plan()
     only skips a commit that carries it, so the next run finishes a run that
-    stopped partway: it reuses a dated release that exists, puts back an old asset
-    a stopped run left renamed away, and replaces a leftover NEXT. The fixed link
-    is missing only between the two renames, one API call (about a second); when
-    the second rename or the check after it fails, the old asset gets its name
-    back before the run fails."""
+    stopped partway: it reuses a dated release that exists and replaces a
+    leftover NEXT. The fixed link is missing only between the two renames, one
+    API call (about a second). Any failure in the swap, including a call GitHub
+    carried out before the request failed, ends in reconcile(), which puts a whole
+    build back under the fixed name from the assets GitHub actually has; every run
+    starts with reconcile() too, for a run that stopped inside it."""
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
+    reconcile(github, sleep=sleep)
 
     # 1. The dated release, checked from outside before anything links to it.
     if github.release(tag) is None:
@@ -277,37 +319,28 @@ def publish(github, tag, sha, title, notes, path, sleep=time.sleep):
 
     # 2. The moving beta release: NEXT goes up beside the working asset, then
     # the two swap names.
-    beta = github.release(MOVING_TAG)
-    if beta is None:
-        github.create(MOVING_TAG, sha, title, notes)
-        beta = github.release(MOVING_TAG)
-    if not assets(beta, ASSET) and assets(beta, OLD):
-        github.rename(assets(beta, OLD)[0]["id"], ASSET)
-    github.upload(MOVING_TAG, path, NEXT)
-    beta = github.release(MOVING_TAG)
-    uploaded = assets(beta, NEXT)
-    if not uploaded or uploaded[0]["size"] != size:
-        raise PublishError(f"{NEXT} did not upload whole: {uploaded}")
-    new = uploaded[0]["id"]
-    old = next((a["id"] for a in assets(beta, ASSET)), None)
-    for stale in assets(beta, OLD):
-        github.delete(stale["id"])
-    if old:
-        github.rename(old, OLD)
-    renamed = False
+    new = old = None
     try:
-        github.rename(new, ASSET)
-        renamed = True
-        verify(github, download_url(MOVING_TAG, repo=github.repo), size, sha256, sleep=sleep)
-    except Exception:
-        # Put the working build back under the fixed name before giving up.
+        if github.release(MOVING_TAG) is None:
+            github.create(MOVING_TAG, sha, title, notes)
+        github.upload(MOVING_TAG, path, NEXT)
+        beta = github.release(MOVING_TAG)
+        uploaded = assets(beta, NEXT)
+        if not uploaded or uploaded[0]["size"] != size:
+            raise PublishError(f"{NEXT} did not upload whole: {uploaded}")
+        new = uploaded[0]["id"]
+        old = next((a["id"] for a in assets(beta, ASSET)), None)
+        for stale in assets(beta, OLD):
+            github.delete(stale["id"])
         if old:
-            if renamed:
-                github.rename(new, NEXT)
-            github.rename(old, ASSET)
+            github.rename(old, OLD)
+        github.rename(new, ASSET)
+        verify(github, download_url(MOVING_TAG, repo=github.repo), size, sha256, sleep=sleep)
+        if old:
+            github.delete(old)
+    except Exception:
+        reconcile(github, size, sha256, new, old, sleep=sleep)
         raise
-    if old:
-        github.delete(old)
 
     # 3. The tag, then the marker that says this commit is done.
     github.move_tag(MOVING_TAG, sha)

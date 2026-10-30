@@ -187,14 +187,16 @@ class RetentionTest(unittest.TestCase):
 class FakeGitHub:
     """GitHub's releases in memory, with the methods of nightly.GitHub. Assets are
     served by name, as releases/download serves them. Calls whose index (counted
-    from 0 in each run) is in fail raise instead of acting."""
+    from 0 in each run) is in fail raise instead of acting; writes whose index is
+    in after act, then raise, as when GitHub applies a change but the request
+    reports a connection failure."""
 
     repo = nightly.REPO
 
     def __init__(self):
         self.releases, self.tags = {}, {}
         self.ids = itertools.count(1)
-        self.fail, self.calls = set(), []
+        self.fail, self.after, self.calls = set(), set(), []
         self.corrupt = False  # the fixed link serves the wrong bytes
         self.served = []      # after each write, whether the fixed link serves a file
 
@@ -203,11 +205,14 @@ class FakeGitHub:
         self.calls.append((name, *args))
         if index in self.fail:
             raise subprocess.CalledProcessError(1, ["gh", name])
+        return index
 
-    def wrote(self):
+    def wrote(self, index):
         beta = self.releases.get(nightly.MOVING_TAG)
         if beta is not None:
             self.served.append(any(a["name"] == nightly.ASSET for a in beta["assets"]))
+        if index in self.after:
+            raise subprocess.CalledProcessError(1, ["gh", self.calls[index][0]], stderr="connection reset")
 
     def find(self, asset_id):
         for release in self.releases.values():
@@ -229,42 +234,42 @@ class FakeGitHub:
             "assets": [{k: a[k] for k in ("id", "name", "size")} for a in release["assets"]]}
 
     def create(self, tag, sha, title, notes, path=None):
-        self.call("create", tag)
+        index = self.call("create", tag)
         assert tag not in self.releases
         self.tags.setdefault(tag, sha)
         self.releases[tag] = {"title": title, "body": notes, "assets": []}
-        self.wrote()
         if path:
             self.add(self.releases[tag], path, os.path.basename(path))
+        self.wrote(index)
 
     def edit(self, tag, title, notes):
-        self.call("edit", tag)
+        index = self.call("edit", tag)
         self.releases[tag].update(title=title, body=notes)
-        self.wrote()
+        self.wrote(index)
 
     def upload(self, tag, path, name):
-        self.call("upload", tag, name)
+        index = self.call("upload", tag, name)
         self.add(self.releases[tag], path, name)
-        self.wrote()
+        self.wrote(index)
 
     def rename(self, asset_id, name):
-        self.call("rename", name)
+        index = self.call("rename", name)
         release, asset = self.find(asset_id)
         if any(a["name"] == name for a in release["assets"]):
             raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="HTTP 422 already_exists")
         asset["name"] = name
-        self.wrote()
+        self.wrote(index)
 
     def delete(self, asset_id):
-        self.call("delete", asset_id)
+        index = self.call("delete", asset_id)
         release, asset = self.find(asset_id)
         release["assets"].remove(asset)
-        self.wrote()
+        self.wrote(index)
 
     def move_tag(self, tag, sha):
-        self.call("move_tag", tag, sha)
+        index = self.call("move_tag", tag, sha)
         self.tags[tag] = sha
-        self.wrote()
+        self.wrote(index)
 
     def served_asset(self, url):
         prefix = f"https://github.com/{self.repo}/releases/download/"
@@ -285,6 +290,7 @@ class FakeGitHub:
 
 
 OLD_SHA, NEW_SHA = "1" * 40, "2" * 40
+WRITES = ("create", "edit", "upload", "rename", "delete", "move_tag")
 
 
 class PublishTest(unittest.TestCase):
@@ -300,8 +306,8 @@ class PublishTest(unittest.TestCase):
         path.write_bytes(data)
         return str(path)
 
-    def publish(self, github, sha, data, fail=()):
-        github.fail, github.calls = set(fail), []
+    def publish(self, github, sha, data, fail=(), after=()):
+        github.fail, github.after, github.calls = set(fail), set(after), []
         date = "20261030" if sha == OLD_SHA else "20261031"
         version = f"0.3.4-beta.{date}.1"
         nightly.publish(github, nightly.nightly_tag(date, sha), sha, nightly.title(version),
@@ -360,52 +366,119 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(github.calls[swap - 1], ("rename", nightly.OLD))
         self.assertEqual(github.calls[swap + 1:swap + 3], [("head", fixed), ("sha256", fixed)])
 
-    def test_a_failure_at_any_step_is_finished_by_the_next_run(self):
+    def link(self, github):
+        """The bytes the fixed link serves, or None."""
+        asset = github.served_asset(nightly.download_url(nightly.MOVING_TAG))
+        return asset and asset["data"]
+
+    def fault(self, github, sha, data, before, fault):
+        """Publish with fault ({mode: call indices}) and check the fixed link
+        serves a whole build (one of before) once publish fails, or at the latest
+        once the next run's reconcile() has run; then the next run finishes.
+        Returns "on failure" or "after reconcile"."""
+        with self.assertRaises((subprocess.CalledProcessError, nightly.PublishError)):
+            self.publish(github, sha, data, **fault)
+        when = "on failure"
+        if self.link(github) not in before:
+            github.fail, github.after, github.calls = set(), set(), []
+            nightly.reconcile(github, sleep=lambda _: None)
+            when = "after reconcile"
+        self.assertIn(self.link(github), before, github.calls)
+        beta = github.releases.get(nightly.MOVING_TAG, {"body": ""})
+        if nightly.published_commit(beta["body"]) != sha:
+            # Not marked done, so the next run's plan builds this commit again.
+            self.publish(github, sha, data)
+        self.assert_done(github, sha, data)
+        return when
+
+    def published_with_stale(self):
+        """published(), with an OLD a stopped run left behind."""
+        github = self.published()
+        github.add(github.releases[nightly.MOVING_TAG], self.installer(b"older build"), nightly.OLD)
+        return github
+
+    def matrix(self, mode, first=False, stale=False):
+        """{(index, call): when the link serves a build} for one fault at each call
+        of a clean run: in fail mode at every call, in after mode at every write."""
+        repository = FakeGitHub if first else self.published_with_stale if stale else self.published
+        if first:
+            sha, data, before = OLD_SHA, b"old build", (None, b"old build")
+        else:
+            sha, data, before = NEW_SHA, b"new build", (b"old build", b"new build")
+        github = repository()
+        self.publish(github, sha, data)
+        steps = [(i, c) for i, c in enumerate(github.calls) if mode == "fail" or c[0] in WRITES]
+        result = {}
+        for index, call in steps:
+            with self.subTest(mode=mode, step=index, call=call):
+                github = repository()
+                result[index, call] = self.fault(github, sha, data, before, {mode: {index}})
+                if not first:  # before the first build the link has nothing to keep
+                    self.assert_link_kept(github)
+        return result
+
+    def test_a_failure_at_any_step_leaves_the_link_working(self):
+        for mode in ("fail", "after"):
+            for stale in (False, True):
+                result = self.matrix(mode, stale=stale)
+                self.assertEqual(set(result.values()), {"on failure"}, result)
+                # The stale OLD's delete is a step too, beside the old build's.
+                self.assertEqual([call[0] for _, call in result].count("delete"), 2 if stale else 1)
+
+    def test_a_change_applied_then_reported_failed_is_recovered(self):
+        # Sol's case: the old build is renamed away, then the request fails.
         github = self.published()
         self.publish(github, NEW_SHA, b"new build")
-        steps = list(github.calls)
-        for index, step in enumerate(steps):
-            with self.subTest(step=index, call=step):
+        step = github.calls.index(("rename", nightly.OLD))
+        github = self.published()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.publish(github, NEW_SHA, b"new build", after={step})
+        # The new build checked out, so it took the fixed name.
+        self.assertEqual(self.link(github), b"new build")
+        self.assertEqual(sorted(a["name"] for a in github.releases[nightly.MOVING_TAG]["assets"]),
+                         [nightly.ASSET, nightly.OLD])
+        self.assertEqual(nightly.published_commit(github.releases[nightly.MOVING_TAG]["body"]), OLD_SHA)
+
+    def test_a_failed_recovery_is_put_right_by_the_next_runs_reconcile(self):
+        # A second fault in reconcile()'s own calls, after each first one.
+        github = self.published()
+        self.publish(github, NEW_SHA, b"new build")
+        firsts = [i for i, c in enumerate(github.calls) if c[0] in WRITES]
+        seen = set()
+        for first in firsts:
+            for mode in ("fail", "after"):
                 github = self.published()
                 with self.assertRaises(subprocess.CalledProcessError):
-                    self.publish(github, NEW_SHA, b"new build", fail={index})
-                # Not marked done, so the next run's plan builds this commit again,
-                # and the link still serves a build in the meantime.
-                beta = github.releases[nightly.MOVING_TAG]
-                self.assertEqual(nightly.published_commit(beta["body"]), OLD_SHA)
-                self.assertIn(nightly.ASSET, [a["name"] for a in beta["assets"]])
-                self.publish(github, NEW_SHA, b"new build")
-                self.assert_done(github, NEW_SHA, b"new build")
-                self.assert_link_kept(github)
+                    self.publish(github, NEW_SHA, b"new build", after={first})
+                recovery = [i for i, c in enumerate(github.calls) if i > first and c[0] in WRITES
+                            and c[0] not in ("move_tag", "edit")]
+                for second in recovery:
+                    with self.subTest(first=first, second=second, mode=mode):
+                        github = self.published()
+                        fault = {"after": {first, second}} if mode == "after" else {"after": {first}, "fail": {second}}
+                        seen.add(self.fault(github, NEW_SHA, b"new build", (b"old build", b"new build"), fault))
+        self.assertEqual(seen, {"on failure", "after reconcile"})
 
     def test_the_first_build_recovers_too(self):
-        github = FakeGitHub()
-        self.publish(github, OLD_SHA, b"old build")
-        for index in range(len(github.calls)):
-            with self.subTest(step=index, call=github.calls[index] if index < len(github.calls) else None):
-                fresh = FakeGitHub()
-                with self.assertRaises(subprocess.CalledProcessError):
-                    self.publish(fresh, OLD_SHA, b"old build", fail={index})
-                self.assertEqual(nightly.published_commit(
-                    fresh.releases.get(nightly.MOVING_TAG, {}).get("body")), "")
-                self.publish(fresh, OLD_SHA, b"old build")
-                self.assert_done(fresh, OLD_SHA, b"old build")
+        for mode in ("fail", "after"):
+            self.matrix(mode, first=True)
 
     def test_a_failed_rollback_is_put_right_first_on_the_next_run(self):
         github = self.published()
         self.publish(github, NEW_SHA, b"new build")
         swap = github.calls.index(("rename", nightly.ASSET))
         github = self.published()
-        # The second rename fails, and so does the rename that would undo the first.
+        # The second rename fails, and so does every call after it, reconcile()'s too.
         with self.assertRaises(subprocess.CalledProcessError):
-            self.publish(github, NEW_SHA, b"new build", fail={swap, swap + 1})
+            self.publish(github, NEW_SHA, b"new build", fail=range(swap, swap + 100))
         names = sorted(a["name"] for a in github.releases[nightly.MOVING_TAG]["assets"])
         self.assertEqual(names, [nightly.NEXT, nightly.OLD])
         self.publish(github, NEW_SHA, b"new build")
         writes = [c for c in github.calls if c[0] not in ("release", "head", "sha256")]
-        self.assertEqual(writes[:3], [("edit", "beta-20261031-2222222"),
-                                      ("upload", "beta-20261031-2222222", nightly.ASSET),
-                                      ("rename", nightly.ASSET)])
+        # The old build gets its name back before anything else.
+        self.assertEqual(writes[:3], [("rename", nightly.ASSET),
+                                      ("edit", "beta-20261031-2222222"),
+                                      ("upload", "beta-20261031-2222222", nightly.ASSET)])
         self.assert_done(github, NEW_SHA, b"new build")
 
     def test_wrong_bytes_at_the_fixed_link_put_the_old_build_back(self):
@@ -418,8 +491,10 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(served[0]["data"], b"old build")
         self.assertEqual(github.tags[nightly.MOVING_TAG], OLD_SHA)
         self.assertEqual(nightly.published_commit(beta["body"]), OLD_SHA)
-        # It retried before giving up.
-        self.assertEqual(len([c for c in github.calls if c[0] == "sha256"]), 6)
+        # It retried before giving up, and reconcile() checked again before putting
+        # the old build back.
+        self.assertEqual(len([c for c in github.calls if c[0] == "sha256"]), 12)
+        self.assertEqual(sorted(a["name"] for a in beta["assets"]), [nightly.ASSET])
         github.corrupt = False
         self.publish(github, NEW_SHA, b"new build")
         self.assert_done(github, NEW_SHA, b"new build")
