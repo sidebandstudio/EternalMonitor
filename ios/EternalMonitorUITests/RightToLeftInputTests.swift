@@ -1,9 +1,42 @@
 import XCTest
 
-/// In Arabic the app's own controls mirror, but the PC picture and touch
-/// input do not: a tap on the left of the iPad clicks the left of the PC.
+/// In Arabic the app's own controls mirror, but the PC picture, touch
+/// input and the keyboard bar do not: a tap on the left of the iPad clicks
+/// the left of the PC.
 final class RightToLeftInputTests: UITestCase {
+    /// Arabic chosen in the app on an English iPad. Switching back to
+    /// English in Settings relabels the keyboard bar already built.
     func testArabicMirrorsControlsButNotInput() throws {
+        let app = try checkArabic(["-appLanguage", "ar"], shot: "arabic-stream")
+        let done = app.buttons["keyboard.done"]
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: done)
+        waitForExpectations(timeout: 5)
+        app.tapHUDControl("display.settings", until: app.buttons["settings.done"], reveal: .threeFingersTogether)
+        let picker = app.buttons["settings.language"]
+        XCTAssertTrue(app.swipeUp(toReveal: picker))
+        picker.tap()
+        app.buttons["English"].tap()
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5), app.debugDescription)
+        app.buttons["settings.done"].tap()
+        app.tapHUDControl("display.keyboard", until: done, reveal: .threeFingersTogether)
+        XCTAssertEqual(done.label, "Done")
+        let control = app.buttons["keyboard.key.224"]
+        control.tap()
+        XCTAssertEqual(control.value as? String, "On")
+        control.tap()
+        done.tap()
+    }
+
+    /// An iPad set to Arabic, the app following it. UIKit then runs right
+    /// to left as well, outside the SwiftUI screens.
+    func testSystemArabicMirrorsControlsButNotInput() throws {
+        try checkArabic(["-AppleLanguages", "(ar)", "-appLanguage", ""],
+                        shot: "system-arabic-stream")
+    }
+
+    /// Leaves the app running, connected, with the keyboard bar closed.
+    @discardableResult
+    private func checkArabic(_ language: [String], shot name: String) throws -> XCUIApplication {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         let environment = ProcessInfo.processInfo.environment
@@ -13,10 +46,9 @@ final class RightToLeftInputTests: UITestCase {
         let height = Double(environment["EM_INPUT_HEIGHT"] ?? "360") ?? 360
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-pictureFit", "fit", "-appLanguage", "ar"]
+                               "-playPCaudio", "NO", "-pictureFit", "fit"] + language
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         launchCleanly(app)
-        defer { app.terminate() }
 
         // The controls are Arabic and mirrored: Disconnect, last in the bar,
         // sits at its left end.
@@ -26,7 +58,7 @@ final class RightToLeftInputTests: UITestCase {
         XCTAssertEqual(disconnect.label, "قطع الاتصال")
         XCTAssertLessThan(disconnect.frame.midX, keyboard.frame.midX, "the controls did not mirror")
         let shot = XCTAttachment(screenshot: app.screenshot())
-        shot.name = "arabic-stream"
+        shot.name = name
         shot.lifetime = .keepAlways
         add(shot)
         // Taps go to the picture once the controls hide.
@@ -61,5 +93,27 @@ final class RightToLeftInputTests: UITestCase {
         waitForExpectations(timeout: 15)
         XCTAssertEqual(Double(moves[0]) / 65535, 0.2, accuracy: 0.05, "first tap: \(moves)")
         XCTAssertEqual(Double(moves[moves.count - 1]) / 65535, 0.8, accuracy: 0.05, "second tap: \(moves)")
+
+        // The keyboard bar keeps a PC keyboard's order, Done at its right
+        // end, with Done and the toggles' values in Arabic.
+        let done = app.buttons["keyboard.done"]
+        app.tapHUDControl("display.keyboard", until: done, reveal: .threeFingersTogether)
+        let arrows = [0x50, 0x52, 0x51, 0x4f].map { app.buttons["keyboard.key.\($0)"].frame.midX }
+        XCTAssertTrue(zip(arrows, arrows.dropFirst()).allSatisfy { $0 < $1 },
+                      "the arrow keys are not ← ↑ ↓ → from the left: \(arrows)")
+        XCTAssertLessThan(app.buttons["keyboard.key.41"].frame.midX, arrows[0], "Esc is not left of the arrows")
+        XCTAssertGreaterThan(done.frame.midX, app.buttons["keyboard.key.76"].frame.maxX, "Done is not at the right end")
+        XCTAssertEqual(done.label, "تم")
+        let control = app.buttons["keyboard.key.224"]
+        control.tap()
+        XCTAssertEqual(control.value as? String, "قيد التشغيل")
+        control.tap()
+        XCTAssertEqual(control.value as? String, "متوقف")
+        let bar = XCTAttachment(screenshot: app.screenshot())
+        bar.name = "\(name)-keyboard"
+        bar.lifetime = .keepAlways
+        add(bar)
+        done.tap()
+        return app
     }
 }
