@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1104, height=1040">
+  <title>Apple Pencil, with pressure and tilt</title>
+  <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="pencil.css">
+  <script src="vendor/gsap.min.js"></script>
+  <script src="vendor/perfect-freehand.js"></script>
+</head>
+<body>
+  <div id="root" data-composition-id="pencil" data-start="0" data-width="1104" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+    <div id="cam">
+      <div class="ipad" id="tab">
+        <div class="ipad-screen">
+          <video id="sheet" src="footage/ipad-pencil.mp4" data-start="0" data-duration="8" muted playsinline></video>
+          <canvas id="ink" width="2420" height="1668"></canvas>
+        </div>
+      </div>
+    </div>
+    <div id="shadow"><div id="pencil"><img src="art/stylus.webp" alt=""></div></div>
+    <div id="dip"></div>
+  </div>
+  <script src="pencil.js"></script>
+</body>
+</html>

@@ -24,6 +24,10 @@
   };
   var REPO = 'sidebandstudio/EternalMonitor';
   var FEEDBACK_TO = 'hello@sideband.studio';
+  // Text this script writes, in the page's language (docs/i18n.js), else the
+  // English given here. Each is redrawn when the visitor changes language.
+  var t = function (key, english) { return window.emI18n ? window.emI18n.t(key, english) : english; };
+  var onLanguage = function (redraw) { document.addEventListener('em:language', redraw); };
 
   /* --- Nav: hairline once the page scrolls ------------------------------ */
   var nav = document.querySelector('.nav');
@@ -39,23 +43,59 @@
     updateNav();
   }
 
-  /* --- Mac visitors: one line, dismissable ------------------------------ */
-  // iPadOS reports 'MacIntel' too, so require a non-touch device.
-  var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
-  if (isMac && nav && sessionStorage.getItem('mac-notice') !== 'off') {
-    var notice = document.createElement('aside');
-    notice.className = 'mac-notice';
-    notice.setAttribute('aria-label', 'Note for Mac visitors');
-    notice.innerHTML =
-      '<div class="container mac-notice-inner">' +
-      '<p><strong>On a Mac?</strong>EternalMonitor streams from Windows PCs. macOS already has ' +
-      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> for this.</p>' +
-      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button></div>';
-    notice.querySelector('.mac-notice-close').addEventListener('click', function () {
+  /* --- Mac visitors: one line under the header, dismissable ------------ */
+  // Each page's head script adds html.mac before the first paint, so the line
+  // never moves the page. iPadOS reports 'MacIntel' too, so it requires a
+  // non-touch device.
+  var macClose = document.querySelector('.mac-notice-close');
+  if (macClose) {
+    macClose.addEventListener('click', function () {
       sessionStorage.setItem('mac-notice', 'off');
-      notice.remove();
+      document.documentElement.classList.remove('mac');
     });
-    document.body.appendChild(notice);
+  }
+
+  /* --- Hero: second screen or mirror, USB or Wi-Fi ---------------------
+     The radios set the stage's data-mode and data-link; each screen picture
+     names the state it belongs to in data-for and shows while all of its
+     words match. The other states' pictures load once the page has. */
+  var stage = document.querySelector('.stage[data-mode]');
+  if (stage) {
+    var later = stage.querySelectorAll('img[data-src]');
+    var fetched = false;
+    var fetchStates = function () {
+      if (fetched) return;
+      fetched = true;
+      later.forEach(function (img) {
+        img.srcset = img.getAttribute('data-srcset');
+        img.src = img.getAttribute('data-src');
+      });
+    };
+    if (document.readyState === 'complete') setTimeout(fetchStates, 300);
+    else window.addEventListener('load', function () { setTimeout(fetchStates, 300); });
+    var showState = function () {
+      var state = [stage.getAttribute('data-mode'), stage.getAttribute('data-link')];
+      var has = function (words) {
+        return words.split(' ').every(function (w) { return state.indexOf(w) >= 0; });
+      };
+      stage.querySelectorAll('.scr[data-for]').forEach(function (img) {
+        img.classList.toggle('on', has(img.getAttribute('data-for')));
+      });
+      stage.querySelectorAll('[data-say]').forEach(function (line) {
+        line.hidden = !has(line.getAttribute('data-say'));
+      });
+    };
+    stage.addEventListener('change', function (e) {
+      fetchStates();
+      if (e.target.name === 'hero-mode') stage.setAttribute('data-mode', e.target.value);
+      if (e.target.name === 'hero-link') stage.setAttribute('data-link', e.target.value);
+      showState();
+    });
+    // A restored page can come back with other radios checked.
+    stage.querySelectorAll('input:checked').forEach(function (input) {
+      stage.setAttribute(input.name === 'hero-mode' ? 'data-mode' : 'data-link', input.value);
+    });
+    showState();
   }
 
   /* --- Scroll reveal ----------------------------------------------------- */
@@ -74,26 +114,6 @@
     reveals.forEach(function (el) { el.classList.add('visible'); });
   }
 
-  /* --- Feature switches play once -------------------------------------------
-     Without JS the switches rest on Second screen and Fill. With JS (and
-     motion allowed) each starts on the other option and flips the first
-     time it scrolls into view, so the change is seen; clicks work as before. */
-  if (!reducedMotion && 'IntersectionObserver' in window) {
-    [['mode-mirror', 'mode-second'], ['pic-fit', 'pic-fill']].forEach(function (pair) {
-      var from = document.getElementById(pair[0]), to = document.getElementById(pair[1]);
-      if (!from || !to) return;
-      var touched = false;
-      from.checked = true;
-      [from, to].forEach(function (el) { el.addEventListener('change', function () { touched = true; }); });
-      var io = new IntersectionObserver(function (entries) {
-        if (!entries[0].isIntersecting) return;
-        io.disconnect();
-        setTimeout(function () { if (!touched) to.checked = true; }, 700);
-      }, { threshold: 0.35 });
-      io.observe(from.closest('.switch-demo'));
-    });
-  }
-
   /* --- Connection clip -------------------------------------------------------
      The short clip in How it works plays silently while it is in view,
      unless the visitor prefers reduced motion; the Play button covers both. */
@@ -107,7 +127,7 @@
     var setPlayLabel = function () {
       if (!playBtn) return;
       var playing = !clip.paused && !clip.ended;
-      playBtn.querySelector('.label').textContent = playing ? 'Pause' : 'Play';
+      playBtn.querySelector('.label').textContent = playing ? t('clip.pause', 'Pause') : t('clip.play', 'Play');
       playBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
       // SVG elements have no `hidden` property, so toggle the attribute.
       playBtn.querySelector('.ico-play').toggleAttribute('hidden', playing);
@@ -120,6 +140,7 @@
     clip.addEventListener('play', setPlayLabel);
     clip.addEventListener('pause', setPlayLabel);
     setPlayLabel();
+    onLanguage(setPlayLabel);
 
     if ('IntersectionObserver' in window) {
       new IntersectionObserver(function (entries) {
@@ -133,6 +154,58 @@
         if (clip.paused) { wantsPlay = true; tryPlay(); } else { wantsPlay = false; clip.pause(); }
       });
     }
+  }
+
+  /* --- Feature films ---------------------------------------------------------
+     Each film in Watch it work plays while it is mostly on screen and pauses
+     when it leaves or the tab is hidden. Every film has its own Pause button,
+     and a film the visitor paused stays paused until they play it again. With
+     reduced motion the posters stay until a film's Play button is pressed. */
+  var films = Array.prototype.slice.call(document.querySelectorAll('.demo-film'));
+  if (films.length && 'IntersectionObserver' in window) {
+    var inView = new Set();
+    var held = new Set();
+    var ICONS = '<svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="3.5" y="2.5" width="3" height="11" rx="1"/><rect x="9.5" y="2.5" width="3" height="11" rx="1"/></svg>' +
+      '<svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.5 2.9v10.2a.8.8 0 0 0 1.2.7l8.3-5.1a.8.8 0 0 0 0-1.4L5.7 2.2a.8.8 0 0 0-1.2.7z"/></svg>';
+    var playFilm = function (film) {
+      if (held.has(film) || document.hidden) return;
+      var p = film.play();
+      if (p && p.catch) p.catch(function () {});
+    };
+    films.forEach(function (film) {
+      if (reducedMotion) held.add(film);
+      var card = film.closest('.demo');
+      var title = card && card.querySelector('h3');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'demo-toggle';
+      btn.innerHTML = ICONS;
+      var show = function () {
+        var playing = !held.has(film);
+        // The heading follows the language, so its text is read each time.
+        var name = title ? title.textContent.trim() : '';
+        btn.setAttribute('aria-label', (playing ? t('film.pause', 'Pause film: {name}') : t('film.play', 'Play film: {name}')).replace('{name}', name));
+        btn.classList.toggle('is-paused', !playing);
+      };
+      btn.addEventListener('click', function () {
+        if (held.has(film)) { held.delete(film); if (inView.has(film)) playFilm(film); }
+        else { held.add(film); film.pause(); }
+        show();
+      });
+      show();
+      onLanguage(show);
+      card.appendChild(btn);
+    });
+    var filmWatcher = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) { inView.add(entry.target); playFilm(entry.target); }
+        else { inView.delete(entry.target); entry.target.pause(); }
+      });
+    }, { threshold: 0.4 });
+    films.forEach(function (film) { filmWatcher.observe(film); });
+    document.addEventListener('visibilitychange', function () {
+      inView.forEach(function (film) { if (document.hidden) film.pause(); else playFilm(film); });
+    });
   }
 
   /* --- GitHub stars -------------------------------------------------------------
@@ -157,7 +230,9 @@
       svg.appendChild(path);
       return svg;
     };
+    var shownStars = null;
     var showStars = function (text) {
+      shownStars = text;
       // Screen readers hear "GitHub, 180 stars", not a bare number.
       starEls.forEach(function (el) {
         el.textContent = '';
@@ -165,10 +240,11 @@
         el.appendChild(document.createTextNode(text));
         var unit = document.createElement('span');
         unit.className = 'visually-hidden';
-        unit.textContent = text === '1' ? ' star' : ' stars';
+        unit.textContent = ' ' + (text === '1' ? t('stars.one', 'star') : t('stars.other', 'stars'));
         el.appendChild(unit);
       });
     };
+    onLanguage(function () { if (shownStars) showStars(shownStars); });
     var keepStars = function (text) {
       showStars(text);
       try { localStorage.setItem(STARS_KEY, JSON.stringify({ text: text, at: Date.now() })); } catch (e) {}
@@ -234,13 +310,34 @@
     document.body.removeChild(ta);
   };
   document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    var reset = null;
+    var shown = null;
+    // While "Copied" shows, the button's own label nodes wait in __i18nHold,
+    // where docs/i18n.js takes them as the English if it translates the button.
+    var release = function () {
+      clearTimeout(reset);
+      reset = null;
+      var held = btn.__i18nHold || [];
+      btn.__i18nHold = null;
+      // "Copied" still showing means nothing relabelled the button (the timer,
+      // English chosen again, or a language that fell back): its label goes back.
+      if (shown && shown.parentNode === btn) {
+        btn.textContent = '';
+        held.forEach(function (n) { btn.appendChild(n); });
+      }
+      shown = null;
+    };
+    onLanguage(release);
     btn.addEventListener('click', function () {
       var target = document.getElementById(btn.getAttribute('data-copy'));
       if (!target) return;
-      var original = btn.textContent;
       copyText(target.textContent.trim(), function () {
-        btn.textContent = 'Copied';
-        setTimeout(function () { btn.textContent = original; }, 1800);
+        if (!reset) btn.__i18nHold = Array.prototype.slice.call(btn.childNodes);
+        clearTimeout(reset);
+        shown = document.createTextNode(t('common.copied', 'Copied'));
+        btn.textContent = '';
+        btn.appendChild(shown);
+        reset = setTimeout(release, 1800);
       });
     });
   });
@@ -264,16 +361,17 @@
       var msg = document.getElementById('fb-message');
       if (msg) {
         msg.placeholder = kind() === 'Bug'
-          ? 'What you expected, what happened instead, and any message word for word.'
+          ? t('download.form.placeholder.bug', 'What you expected, what happened instead, and any message word for word.')
           : kind() === 'Idea'
-            ? 'What would make EternalMonitor more useful for you?'
-            : 'Anything at all. How you use it, what you study, what you draw.';
+            ? t('download.form.placeholder.idea', 'What would make EternalMonitor more useful for you?')
+            : t('download.form.placeholder.hello', 'Anything at all. How you use it, what you study, what you draw.');
       }
     };
     Array.prototype.forEach.call(form.querySelectorAll('input[name="kind"]'), function (r) {
       r.addEventListener('change', syncKind);
     });
     syncKind();
+    onLanguage(syncKind);
 
     var compose = function () {
       var lines = [value('fb-message'), ''];
@@ -312,7 +410,20 @@
     var shaEl = document.getElementById('sha256-value');
     var tfLink = document.getElementById('testflight-link');
     var notesLink = document.getElementById('release-notes-link');
+    var betaStableBtn = document.getElementById('beta-stable-btn');
     var htmlTag = versionEls.length ? versionEls[0].textContent.trim() : '';
+    // The iPad build line, from the page's own text until latest.json answers,
+    // in the visitor's language.
+    var ipadShown = ipadEls.length && ipadEls[0].textContent.trim().match(/^v(\d+\.\d+\.\d+), build (\d+)$/);
+    ipadShown = ipadShown ? { version: ipadShown[1], build: ipadShown[2] } : null;
+    var drawIpad = function () {
+      if (!ipadShown) return;
+      var text = t('download.ipad.version', 'v{version}, build {build}')
+        .replace('{version}', ipadShown.version).replace('{build}', ipadShown.build);
+      ipadEls.forEach(function (el) { el.textContent = text; });
+    };
+    drawIpad();
+    onLanguage(drawIpad);
 
     var formatBytes = function (n) {
       if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
@@ -328,12 +439,14 @@
         var installer = 'https://github.com/' + REPO + '/releases/download/' + tag + '/EternalMonitor-Setup.exe';
         if (win.installer !== installer) throw new Error('unexpected installer');
         downloadBtn.href = installer;
+        if (betaStableBtn) betaStableBtn.href = installer;
         versionEls.forEach(function (el) { el.textContent = tag; });
         if (shaEl && /^[0-9a-f]{64}$/.test(win.sha256)) shaEl.textContent = win.sha256;
         if (notesLink) notesLink.href = 'https://github.com/' + REPO + '/releases/tag/' + tag;
         var ipad = latest.ipad || {};
         if (ipad.version && ipad.build) {
-          ipadEls.forEach(function (el) { el.textContent = 'v' + ipad.version + ', build ' + ipad.build; });
+          ipadShown = { version: String(ipad.version), build: String(ipad.build) };
+          drawIpad();
         }
         if (tfLink && /^https:\/\/testflight\.apple\.com\/join\/[A-Za-z0-9]+$/.test(ipad.testflight || '')) {
           tfLink.href = ipad.testflight;
@@ -377,6 +490,24 @@
     var BETA_KEY = 'gh-beta-v1', BETA_TTL = 1800000;
     var betaLoaded = false;
     var betaBuild = document.getElementById('beta-build');
+    // What the build line shows: null (the page's text), 'missing' (no Beta
+    // release yet) or the release. Redrawn when the language changes.
+    // GitHub's 404 is the only proof there is no Beta yet: the card then offers
+    // Stable instead of links that would 404 too. Any other failure (403 when
+    // rate-limited, offline) leaves the card as it is.
+    var betaShown = null;
+    var drawBuild = function () {
+      if (!betaBuild) return;
+      if (betaShown === 'missing') {
+        betaBuild.textContent = t('download.beta.missing', 'The first Beta build is on its way. Use Stable until then.');
+      } else if (betaShown) {
+        betaShown();
+      } else {
+        betaBuild.textContent = t('download.beta.build', 'A new build comes out each night with the fixes that landed that day.');
+      }
+    };
+    drawBuild();
+    onLanguage(drawBuild);
 
     var showBeta = function (release) {
       var body = release.body || '';
@@ -386,20 +517,30 @@
       var when = asset && asset.updated_at ? new Date(asset.updated_at)
         : version[1] ? new Date(Date.UTC(+version[2], +version[3] - 1, +version[4])) : null;
       if (betaBuild && version[1]) {
-        betaBuild.textContent = 'Version ' + version[1];
-        if (when && isFinite(when)) {
-          betaBuild.appendChild(document.createTextNode(', built ' +
-            when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })));
-        }
+        var link = null;
         if (commit) {
-          var link = document.createElement('a');
+          link = document.createElement('a');
           link.href = 'https://github.com/' + REPO + '/commit/' + commit;
           link.target = '_blank';
           link.rel = 'noopener';
           link.textContent = commit.slice(0, 7);
-          betaBuild.appendChild(document.createTextNode(' from '));
-          betaBuild.appendChild(link);
         }
+        betaShown = function () {
+          var dated = when && isFinite(when);
+          var line = dated && link ? t('download.beta.versionBuiltFrom', 'Version {version}, built {date} from {commit}')
+            : dated ? t('download.beta.versionBuilt', 'Version {version}, built {date}')
+            : link ? t('download.beta.versionFrom', 'Version {version} from {commit}')
+            : t('download.beta.version', 'Version {version}');
+          line = line.replace('{version}', version[1]);
+          if (dated) {
+            line = line.replace('{date}', when.toLocaleDateString(document.documentElement.lang || 'en-US',
+              { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }));
+          }
+          var around = line.split('{commit}');
+          betaBuild.textContent = around[0];
+          if (link) betaBuild.append(link, around[1] || '');
+        };
+        drawBuild();
       }
       var meta = document.getElementById('beta-meta');
       if (meta && asset && typeof asset.size === 'number') {
@@ -409,6 +550,16 @@
                  body.match(/SHA-256[\s\S]*?\b([0-9a-f]{64})\b/) || [])[1];
       var shaBox = document.getElementById('beta-sha'), shaEl = document.getElementById('beta-sha256-value');
       if (sha && shaBox && shaEl) { shaEl.textContent = sha; shaBox.hidden = false; }
+    };
+
+    var showMissing = function () {
+      root.classList.add('beta-missing');
+      ['beta-download-btn', 'beta-files', 'beta-term', 'beta-back'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.hidden = true;
+      });
+      var stable = document.getElementById('beta-stable-btn');
+      if (stable) stable.hidden = false;
     };
 
     var loadBeta = function () {
@@ -422,7 +573,7 @@
         headers: { Accept: 'application/vnd.github+json' }
       })
         .then(function (r) {
-          if (r.status === 404 && betaBuild) betaBuild.textContent = 'The first Beta build is on its way. Use Stable until then.';
+          if (r.status === 404) { betaShown = 'missing'; showMissing(); drawBuild(); }
           if (!r.ok) throw new Error(r.status);
           return r.json();
         })

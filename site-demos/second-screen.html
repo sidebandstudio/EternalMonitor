@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1480, height=1040">
+  <title>Extend your desktop</title>
+  <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="second-screen.css">
+  <script src="vendor/gsap.min.js"></script>
+</head>
+<body>
+  <div id="root" data-composition-id="second-screen" data-start="0" data-width="1480" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <div id="world">
+      <div id="neck"></div><div id="foot"></div>
+      <div id="mon">
+        <div class="screen">
+          <div class="desk" id="deskA">
+            <img class="wall" src="art/wallpaper.webp" alt="">
+            <div class="win appwin">
+              <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+              <div class="win-view"><video id="appA" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+            </div>
+            <div class="doc" id="docA"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+            <div class="ptr" id="ptrA"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+          </div>
+          <div class="dark" id="monDark"></div>
+        </div>
+      </div>
+
+      <div id="pad">
+        <div class="screen">
+          <!-- Mirror my screen: the monitor's desktop again, whole, with bars. -->
+          <div class="layer" id="mirror">
+            <div class="desk" id="deskM">
+              <img class="wall" src="art/wallpaper.webp" alt="">
+              <div class="win appwin">
+                <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                <div class="win-view"><video id="appM" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+              </div>
+              <div class="doc" id="docM"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+            </div>
+          </div>
+          <!-- Second screen: the iPad's own display, right of the monitor. -->
+          <div class="layer" id="extend">
+            <div class="desk2" id="deskB">
+              <img class="wall" src="art/wallpaper.webp" alt="">
+              <div class="doc" id="docB"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+              <div class="ptr" id="ptrB"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+            </div>
+          </div>
+          <div class="dark" id="padDark"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chip" id="chip"><span class="dot"></span><span class="say"><span id="say-mirror">Mirror my screen</span><span id="say-second">Second screen</span></span></div>
+  </div>
+  <script src="second-screen.js"></script>
+</body>
+</html>
