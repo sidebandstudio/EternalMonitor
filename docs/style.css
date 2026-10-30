@@ -718,6 +718,17 @@ small { font-size: 0.875rem; }
   gap: 12px;
   margin-bottom: 14px;
 }
+.card-head .icon {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.card-head .icon svg { width: 20px; height: 20px; }
 .card-head h3 { flex: 1; font-size: 1.25rem; }
 .card > p { color: var(--muted); }
 .card .btn { margin-top: 20px; }
