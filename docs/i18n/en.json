@@ -118,6 +118,7 @@
   "download.beta.badge": "Beta",
   "download.beta.note": "Beta: the newest fixes, built every night. For testing; you can go back to Stable anytime.",
   "download.beta.download": "Download Beta for Windows",
+  "download.beta.stable": "Download Stable for Windows",
   "download.term.beta": "Or paste this into PowerShell. It downloads the newest Beta and starts it only if the SHA-256 matches.",
   "download.beta.backLabel": "Going back to Stable",
   "download.beta.back1": "To go back, choose <0>Stable</0> above and run its installer over this one.",

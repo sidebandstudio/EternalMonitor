@@ -914,6 +914,8 @@ small { font-size: 0.875rem; }
 .channel-row { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 4px; margin-top: 28px; }
 .channel-row .channel-switch { margin-top: 0; }
 .no-js .beta-hint { display: none; }
+/* Once this visit has found no Beta release, Stable stops pointing at it. */
+.beta-missing .beta-hint { display: none; }
 .beta-hint { display: flex; align-items: center; gap: 2px; min-width: 0; color: var(--accent); }
 .beta-hint p {
   max-width: 13em;

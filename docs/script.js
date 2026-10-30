@@ -410,6 +410,7 @@
     var shaEl = document.getElementById('sha256-value');
     var tfLink = document.getElementById('testflight-link');
     var notesLink = document.getElementById('release-notes-link');
+    var betaStableBtn = document.getElementById('beta-stable-btn');
     var htmlTag = versionEls.length ? versionEls[0].textContent.trim() : '';
     // The iPad build line, from the page's own text until latest.json answers,
     // in the visitor's language.
@@ -438,6 +439,7 @@
         var installer = 'https://github.com/' + REPO + '/releases/download/' + tag + '/EternalMonitor-Setup.exe';
         if (win.installer !== installer) throw new Error('unexpected installer');
         downloadBtn.href = installer;
+        if (betaStableBtn) betaStableBtn.href = installer;
         versionEls.forEach(function (el) { el.textContent = tag; });
         if (shaEl && /^[0-9a-f]{64}$/.test(win.sha256)) shaEl.textContent = win.sha256;
         if (notesLink) notesLink.href = 'https://github.com/' + REPO + '/releases/tag/' + tag;
@@ -490,6 +492,9 @@
     var betaBuild = document.getElementById('beta-build');
     // What the build line shows: null (the page's text), 'missing' (no Beta
     // release yet) or the release. Redrawn when the language changes.
+    // GitHub's 404 is the only proof there is no Beta yet: the card then offers
+    // Stable instead of links that would 404 too. Any other failure (403 when
+    // rate-limited, offline) leaves the card as it is.
     var betaShown = null;
     var drawBuild = function () {
       if (!betaBuild) return;
@@ -547,6 +552,16 @@
       if (sha && shaBox && shaEl) { shaEl.textContent = sha; shaBox.hidden = false; }
     };
 
+    var showMissing = function () {
+      root.classList.add('beta-missing');
+      ['beta-download-btn', 'beta-files', 'beta-term', 'beta-back'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.hidden = true;
+      });
+      var stable = document.getElementById('beta-stable-btn');
+      if (stable) stable.hidden = false;
+    };
+
     var loadBeta = function () {
       if (betaLoaded) return;
       betaLoaded = true;
@@ -558,7 +573,7 @@
         headers: { Accept: 'application/vnd.github+json' }
       })
         .then(function (r) {
-          if (r.status === 404) { betaShown = 'missing'; drawBuild(); }
+          if (r.status === 404) { betaShown = 'missing'; showMissing(); drawBuild(); }
           if (!r.ok) throw new Error(r.status);
           return r.json();
         })
