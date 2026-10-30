@@ -17,6 +17,7 @@ pub mod handoff;
 pub mod input;
 pub mod log_repeat;
 pub mod logging;
+pub mod network;
 pub mod pairing;
 pub mod pipeline;
 pub mod relaunch;
