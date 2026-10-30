@@ -33,7 +33,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::pen_contact::{pointer_flag, NotReadyRetry, Outcome, PointerFrame, PointerKind};
+use super::pen_contact::{
+    pointer_flag, NotReadyRetry, Outcome, PointerFrame, PointerKind, RefusalLog,
+};
 use super::pen_device::PenApi;
 use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
@@ -52,8 +54,9 @@ const _: () = {
 /// The Win32 calls behind the native pen device.
 #[derive(Debug, Default)]
 pub(crate) struct Win32Pen {
-    /// Error codes already logged, so a repeated refusal logs once.
-    warned: Vec<windows::core::HRESULT>,
+    /// Refusals by error code, so a repeated one logs at its 1st, 10th,
+    /// 100th... time.
+    warned: RefusalLog<windows::core::HRESULT>,
     retry: NotReadyRetry,
 }
 
@@ -78,6 +81,10 @@ impl PenApi for Win32Pen {
 
     fn screen(&self) -> VirtualScreen {
         virtual_screen()
+    }
+
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
     }
 
     fn inject(
@@ -142,7 +149,7 @@ impl Default for PenDevice {
     }
 }
 
-/// Where a frame was aimed, for the once-per-error warning.
+/// Where a frame was aimed, for the first warning of each error.
 #[derive(Clone, Copy)]
 struct FrameContext {
     screen: VirtualScreen,
@@ -154,7 +161,7 @@ fn inject_frame(
     frame: PenSample,
     from: PointerKind,
     context: FrameContext,
-    warned: &mut Vec<windows::core::HRESULT>,
+    warned: &mut RefusalLog<windows::core::HRESULT>,
     retry: &mut NotReadyRetry,
 ) -> Outcome {
     let screen = context.screen;
@@ -192,8 +199,8 @@ fn inject_frame(
         }
         Err(error) => error,
     };
-    if !warned.contains(&error.code()) {
-        warned.push(error.code());
+    let count = warned.note(error.code());
+    if count == Some(1) {
         // E_ACCESSDENIED: the secure desktop or an elevated window has focus;
         // SendInput is blocked there too, so there is no useful fallback.
         // Other codes point at the frame, its starting state or the geometry.
@@ -222,6 +229,14 @@ fn inject_frame(
             output_height = output.height,
             dpi_awareness = dpi_awareness(),
             "Windows rejected native pen input"
+        );
+    } else if let Some(count) = count {
+        // Later refusals say how often, without the frame.
+        warn!(
+            %error,
+            hresult = format_args!("{:#010x}", error.code().0),
+            count,
+            "Windows keeps rejecting native pen input"
         );
     }
     if error.code() == not_ready {

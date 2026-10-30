@@ -91,6 +91,11 @@ const QUIT_JOIN: Duration = Duration::from_secs(5);
 /// limit is 30 s.
 const QUIT_ENABLE_WAIT: Duration = Duration::from_secs(35);
 
+/// How long quitting waits for the second screen record to be written,
+/// once the window is gone. A spinning disk shared with a build stalled for
+/// more than 30 s at times.
+const QUIT_SAVE_WAIT: Duration = Duration::from_secs(30);
+
 /// What the transport does next for the second screen.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -905,6 +910,38 @@ pub fn shut_down(shared: &SharedControl) {
     }
 }
 
+/// Quitting, once the window is gone and the display is off: wait up to
+/// [`QUIT_SAVE_WAIT`] for the second screen record to be written. A writer
+/// that could not start is tried once more; if it still can't, the record
+/// is left unwritten rather than written here, where a stalled disk would
+/// keep the process alive.
+pub fn finish_saving(shared: &SharedControl) {
+    finish_saving_within(shared, QUIT_SAVE_WAIT);
+}
+
+/// Whether everything asked for was written.
+fn finish_saving_within(shared: &SharedControl, wait: Duration) -> bool {
+    let Some(saver) = shared.second_screen.lock().memory.saver() else {
+        return true;
+    };
+    let pending = saver.pending();
+    let started = Instant::now();
+    let written = saver.flush(wait);
+    let waited_ms = started.elapsed().as_millis() as u64;
+    match written {
+        Err(reason) => warn!(
+            waited_ms,
+            reason = %reason,
+            "Abandoned a pending save of the second screen record — quitting without it"
+        ),
+        Ok(()) if pending => {
+            tracing::info!(waited_ms, "Wrote the second screen record before quitting")
+        }
+        Ok(()) => {}
+    }
+    written.is_ok()
+}
+
 #[cfg(any(windows, test, debug_assertions))]
 fn quitting(shared: &SharedControl) -> bool {
     shared.vdd_worker.queue.lock().quitting
@@ -920,6 +957,7 @@ pub(crate) fn run(
     wait: bool,
 ) {
     loop {
+        let start_saving = start_saving(shared, driver.now());
         let command = {
             let mut queue = shared.vdd_worker.queue.lock();
             loop {
@@ -927,13 +965,28 @@ pub(crate) fn run(
                     return;
                 }
                 if let Some(command) = queue.commands.pop_front() {
-                    break command;
+                    break Some(command);
                 }
                 if !wait {
                     return;
                 }
-                shared.vdd_worker.wake.wait(&mut queue);
+                match start_saving {
+                    Some(at) => {
+                        if shared
+                            .vdd_worker
+                            .wake
+                            .wait_until(&mut queue, at)
+                            .timed_out()
+                        {
+                            break None;
+                        }
+                    }
+                    None => shared.vdd_worker.wake.wait(&mut queue),
+                }
             }
+        };
+        let Some(command) = command else {
+            continue;
         };
         match command {
             Command::Attach => attach(shared, driver, attach_timeout),
@@ -943,6 +996,38 @@ pub(crate) fn run(
                 release(shared, driver);
             }
         }
+    }
+}
+
+/// Start the second screen record's writer if its thread could not start,
+/// here where no lock is held. When to try again, if it still can't.
+#[cfg(any(windows, test, debug_assertions))]
+fn start_saving(shared: &SharedControl, now: Instant) -> Option<Instant> {
+    let saver = shared.second_screen.lock().memory.saver()?;
+    saver.retry_start(now)
+}
+
+/// The window's update loop, and the headless loop, call this at every
+/// pass: start the second screen record's writer if its thread could not
+/// start, once the wait after the last try is over. Those loops always run,
+/// unlike the second screen worker, and hold no lock here. The second
+/// screen's lock is only tried, so a transport holding it never holds up
+/// the window; the next pass tries again.
+pub fn retry_saving(shared: &SharedControl) {
+    #[cfg(any(windows, test, debug_assertions))]
+    retry_saving_at(shared, Instant::now());
+    #[cfg(not(any(windows, test, debug_assertions)))]
+    let _ = shared;
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+fn retry_saving_at(shared: &SharedControl, now: Instant) {
+    let saver = shared
+        .second_screen
+        .try_lock()
+        .and_then(|state| state.memory.saver());
+    if let Some(saver) = saver {
+        saver.retry_start(now);
     }
 }
 
