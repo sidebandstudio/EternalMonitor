@@ -1488,8 +1488,9 @@ html.js .reveal.visible { opacity: 1; transform: none; }
   .nav .btn-sm { padding-inline: 12px; }
   .nav .count-star { display: none; }
 }
-/* At 380px and below the star count goes too, so the brand keeps its full name. */
-@media (max-width: 380px) {
+/* At 420px and below the star count goes too, so the brand keeps its full name
+   beside the language switcher. */
+@media (max-width: 420px) {
   .nav-link .count { display: none; }
 }
 
@@ -1700,14 +1701,10 @@ html:lang(ko) { word-break: keep-all; }
 [dir="rtl"] .specs li::before { left: auto; right: 0; }
 [dir="rtl"] .field select { padding-right: 13px; padding-left: 36px; background-position: left 12px center; }
 [dir="rtl"] .source-body ul { padding-left: 0; padding-right: 1.2em; }
-[dir="rtl"] .mac-notice { left: auto; right: 16px; }
 [dir="rtl"] .mac-notice strong { margin-right: 0; margin-left: 6px; }
 [dir="rtl"] :is(#feedback-send, .ways li) svg { transform: scaleX(-1); }
 @media (max-width: 760px) {
   [dir="rtl"] .fact + .fact { border-right: 0; }
-}
-@media (max-width: 560px) {
-  [dir="rtl"] .mac-notice { left: 12px; }
 }
 @media (max-width: 480px) {
   [dir="rtl"] .nav .btn { margin-right: 0; }
@@ -1732,7 +1729,8 @@ html:lang(ko) { word-break: keep-all; }
   .lang-button::after { display: none; }
 }
 /* Narrow desktops: the switcher keeps only its globe, and away from English
-   the page links (also in the footer) give way to the toggle. */
+   the page links (also in the footer) give way to the toggle; with the
+   Discord link in the bar, translated links need that room up to 1180px. */
 @media (max-width: 960px) {
   .lang-button .lang-name {
     position: absolute;
@@ -1741,7 +1739,7 @@ html:lang(ko) { word-break: keep-all; }
     white-space: nowrap;
   }
 }
-@media (max-width: 900px) {
+@media (max-width: 1180px) {
   .not-english .nav-links > .hide-sm { display: none; }
 }
 @media (max-width: 340px) {
