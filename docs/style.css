@@ -1495,3 +1495,69 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 @media (max-width: 380px) {
   .nav-link .count { display: none; }
 }
+
+/* "Built by engineers from": the companies Sideband Studio's engineers have
+   worked at. The logos are the companies' own files; one filter turns each into
+   flat white and the opacity mutes it, so they read the same on the plain page
+   and in the Beta night sky. Each logo has its own height, set by eye so the six
+   carry equal weight: a tall emblem sits lower than a thin, wide wordmark. */
+.pedigree { --s: 1; padding-top: clamp(56px, 7vw, 96px); }
+.pedigree.center .pedigree-title { text-align: center; }
+.pedigree-title { color: var(--faint); font-size: 0.9375rem; }
+.pedigree-logos {
+  list-style: none;
+  margin-top: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.pedigree.center .pedigree-logos { max-width: 1000px; margin-inline: auto; }
+.pedigree-logos li { display: flex; justify-content: center; }
+.pedigree-logos img {
+  display: block;
+  width: auto;
+  height: calc(var(--h) * var(--s));
+  filter: brightness(0) invert(1);
+  opacity: 0.56;
+}
+.logo-aws { --h: 32px; }
+.logo-amazon { --h: 27px; }
+.logo-mit-lincoln-laboratory { --h: 18px; }
+.logo-sonos { --h: 16px; }
+.logo-summit-partners { --h: 22px; }
+.logo-philips { --h: 16px; }
+/* The download page puts it under the cards, closer than a section break. */
+.dl-all + .pedigree { padding-top: clamp(48px, 6vw, 72px); }
+
+/* Tablets: two rows of three. Phones: three rows of two. Equal columns, the
+   logos centred in them on the home page and on the left edge on the download page. */
+@media (max-width: 860px) {
+  .pedigree { --s: 0.86; }
+  .pedigree-logos {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 32px 24px;
+  }
+  .pedigree-logos li { justify-content: flex-start; }
+  .pedigree.center .pedigree-logos li { justify-content: center; }
+}
+@media (max-width: 560px) {
+  .pedigree-logos { grid-template-columns: repeat(2, 1fr); gap: 28px 20px; }
+}
+
+/* The logos come in one after another, once, after the strip itself starts to rise. */
+html.js .pedigree.reveal li {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.6s var(--ease-out), transform 0.7s var(--ease-out);
+}
+html.js .pedigree.reveal.visible li { opacity: 1; transform: none; }
+.pedigree li:nth-child(2) { transition-delay: 70ms; }
+.pedigree li:nth-child(3) { transition-delay: 140ms; }
+.pedigree li:nth-child(4) { transition-delay: 210ms; }
+.pedigree li:nth-child(5) { transition-delay: 280ms; }
+.pedigree li:nth-child(6) { transition-delay: 350ms; }
+@media (prefers-reduced-motion: reduce) {
+  html.js .pedigree.reveal li { opacity: 1; transform: none; transition: none; }
+}
