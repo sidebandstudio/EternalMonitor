@@ -385,8 +385,9 @@ impl PenContact {
             self.abandoned.push((mapped(sample, output), now));
             return;
         }
-        // Behind frames held back, the sample waits for `spaced_until`'s
-        // flush, so one transport pass never sends more than one budget.
+        // Behind frames held back, the sample waits for the flush at the
+        // top of the next transport pass, so one pass never sends more than
+        // one budget.
         let held = self.spaced_until().is_some();
         self.enqueue(sample, now);
         if !held {
@@ -1929,6 +1930,94 @@ mod tests {
             assert_eq!(windows.take(), every_sample, "at {call:?}");
             assert!(contact.take_dropped().is_empty());
             assert!(contact.take_abandoned().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_backlog_drains_while_the_transport_always_has_video_to_send() {
+        // The transport loop as `start_sender` runs it, a pass at a time,
+        // with a video frame always ready. A pass first sends one chunk of a
+        // held backlog if it is due, then serves the first ready branch of
+        // its biased select: the 50 ms pen tick (not while a backlog is
+        // held), a Pencil sample, or video, which takes 1 ms. The pen's
+        // wake-up comes last and never wins. A stall delivers 64 samples at
+        // once, then the Pencil goes on at 240 Hz for two seconds. Windows
+        // takes 20 µs a frame, so the spacing holds the stall's samples back.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Branch {
+            Tick,
+            Sample,
+            Video,
+        }
+        const VIDEO: Duration = Duration::from_millis(1);
+        const TICK: Duration = Duration::from_millis(50);
+        // The stall's samples are all drawn within this, and every sample
+        // arriving after it within a video frame and a chunk, 2 ms.
+        const CAUGHT_UP: Duration = Duration::from_millis(50);
+        let every = Duration::from_secs(1) / 240;
+        let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+        let start = windows.clock;
+        let arrivals: Vec<_> = (0..64 + 480)
+            .map(|x: u32| {
+                let sample = pen(if x == 0 { Down } else { Move }, x as i32, 10);
+                (sample, start + every * x.saturating_sub(63))
+            })
+            .collect();
+        let (mut next, mut tick) = (0, start + TICK);
+        // Each pass: the backlog frames sent at its top, the branch
+        // served, the frames that branch sent while a backlog was held.
+        let mut passes = Vec::new();
+        while next < arrivals.len() || contact.waiting() > 0 {
+            assert!(windows.clock < start + Duration::from_secs(10));
+            let sent = windows.sent_at.len();
+            if contact.spaced_until().is_some_and(|at| at <= windows.clock) {
+                contact.flush(Some(OUTPUT), windows.clock, &mut windows);
+            }
+            let chunk = windows.sent_at.len() - sent;
+            let (now, held) = (windows.clock, contact.spaced_until().is_some());
+            let sent = windows.sent_at.len();
+            let branch = if now >= tick && !held {
+                tick = now + TICK;
+                contact.flush(Some(OUTPUT), now, &mut windows);
+                Branch::Tick
+            } else if arrivals.get(next).is_some_and(|&(_, at)| at <= now) {
+                contact.deliver(arrivals[next].0, Some(OUTPUT), now, &mut windows);
+                next += 1;
+                Branch::Sample
+            } else {
+                windows.clock += VIDEO;
+                Branch::Video
+            };
+            let after = if held {
+                windows.sent_at.len() - sent
+            } else {
+                0
+            };
+            passes.push((chunk, branch, after));
+        }
+        assert_eq!(contact.take_dropped().len(), 0, "samples went stale");
+        let every_sample: Vec<_> = arrivals
+            .iter()
+            .map(|(sample, _)| F(sample.phase, sample.x, sample.y, Injected))
+            .collect();
+        assert_eq!(windows.take(), every_sample);
+        assert!(contact.take_abandoned().is_empty());
+        for (&(_, arrived), &sent) in arrivals.iter().zip(&windows.sent_at) {
+            let lag = sent - arrived;
+            let bound = if arrived < start + CAUGHT_UP {
+                CAUGHT_UP
+            } else {
+                VIDEO + PASS_TIME
+            };
+            assert!(lag <= bound, "{lag:?}");
+        }
+        // A chunk a pass, with a sample or a video frame and no other
+        // pen frame between it and the next.
+        let chunks = passes.iter().filter(|&&(chunk, ..)| chunk > 0).count();
+        assert!(chunks > 64 / PASS_FRAMES as usize);
+        for &(chunk, branch, after) in &passes {
+            assert!(chunk <= PASS_FRAMES as usize);
+            assert_eq!(after, 0, "{branch:?}");
         }
     }
 

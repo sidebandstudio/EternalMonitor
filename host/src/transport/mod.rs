@@ -230,13 +230,24 @@ pub async fn start_sender(
     let mut pen_spacing = Deadline::new("pen-spacing")?;
 
     loop {
+        // A pen backlog sends one bounded chunk at the top of every pass,
+        // whatever the select below keeps ready, so the loop serves one
+        // branch between chunks and the backlog never waits behind them.
+        if input_relay
+            .pen_spaced_until()
+            .is_some_and(|at| at <= Instant::now())
+        {
+            input_relay.keep_pen_alive(*shared.capture_geometry.lock());
+        }
         pen_spacing.arm(input_relay.pen_spaced_until());
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
+            // Not while a backlog is held: its chunk went at the top of
+            // this pass, and a second one would leave nothing between them.
+            _ = pen_tick.tick(), if input_relay.pen_tick_needed() && input_relay.pen_spaced_until().is_none() => {
                 input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
@@ -504,12 +515,10 @@ pub async fn start_sender(
                     "Frame sent"
                 );
             }
-            // Last, so a pen backlog goes out between NACK answers, input
-            // and video frames, never ahead of them: each flush sends one
-            // bounded chunk and arms this again at once.
-            _ = pen_spacing.wait(), if pen_spacing.armed() => {
-                input_relay.keep_pen_alive(*shared.capture_geometry.lock());
-            }
+            // Only wakes an otherwise idle loop for the next chunk, which
+            // goes at the top of the pass. Last, because any branch ready
+            // before it starts that pass anyway.
+            _ = pen_spacing.wait(), if pen_spacing.armed() => {}
         }
     }
 
