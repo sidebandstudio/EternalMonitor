@@ -363,8 +363,8 @@ fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: f32) {
 
 /// On/off switch. `label` is its accessible name in English. In a row
 /// whose title is translated it is named by that title as a screen reader
-/// reads it, and has the title's English as its AutomationId, so a switch
-/// reads in the same language as its row.
+/// reads it, so a switch reads in the same language as its row. Its
+/// AutomationId is its row's title in English, or `label` outside a row.
 pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::click());
     if response.clicked() {
@@ -374,13 +374,13 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let value = *on;
     let enabled = ui.is_enabled();
     response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, value, label));
-    if let Some(names) = row_title(ui) {
-        let name = if i18n::active() == i18n::Lang::En {
-            label
-        } else {
-            &names.name
-        };
-        set_automation(&response, &names.id, name);
+    let title = row_title(ui);
+    match title.as_deref().and_then(i18n::automation) {
+        Some(names) if i18n::active() != i18n::Lang::En => {
+            set_automation(&response, &names.id, &names.name)
+        }
+        Some(names) => set_automation(&response, &names.id, label),
+        None => set_automation(&response, title.as_deref().unwrap_or(label), label),
     }
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_with_time(response.id, value, 0.12);
@@ -701,11 +701,9 @@ fn row_title_id() -> egui::Id {
     egui::Id::new("setting row title")
 }
 
-/// How UI Automation reads the title of the row whose control is drawing,
-/// when the title is translated.
-fn row_title(ui: &Ui) -> Option<i18n::Automation> {
-    let title = ui.data(|d| d.get_temp::<String>(row_title_id()))?;
-    i18n::automation(&title)
+/// The title of the row whose control is drawing, as shown.
+fn row_title(ui: &Ui) -> Option<String> {
+    ui.data(|d| d.get_temp::<String>(row_title_id()))
 }
 
 /// Label on the left, value on the right, one line.
@@ -1094,7 +1092,7 @@ pub fn combo_rich(
 /// after `show_ui`, which describes the combo box.
 pub fn name_combo(ui: &Ui, response: &Response, shown: &str) {
     let value = i18n::automation(shown).map_or_else(|| shown.to_string(), |names| names.name);
-    let title = row_title(ui);
+    let title = row_title(ui).as_deref().and_then(i18n::automation);
     response.ctx.accesskit_node_builder(response.id, |node| {
         node.set_value(value);
         if let Some(title) = title {

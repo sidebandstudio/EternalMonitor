@@ -108,6 +108,7 @@ fn languages_settings_and_setup() {
     upgrades_never_open_setup(&dir, &shared);
     a_fresh_install_opens_setup_and_a_language_applies_at_once(&dir, &shared);
     every_translation_keeps_an_english_id(&shared);
+    every_switch_has_an_english_id(&shared);
     typed_text_stays_as_typed(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
@@ -580,6 +581,118 @@ fn every_translation_keeps_an_english_id(shared: &SharedControl) {
             };
             click(&mut h, Role::Button, next);
         }
+    }
+}
+
+/// Every switch: its AutomationId, its name in English, and whether its
+/// row's title is translated. "Start with Windows" shows in Settings on
+/// Windows only, and in setup everywhere.
+const SWITCHES: [(&str, &str, bool); 12] = [
+    ("Pairing", "Require pairing", true),
+    ("PC audio", "Stream PC audio", true),
+    (
+        "Include app and PC details",
+        "Include app and PC details",
+        false,
+    ),
+    (
+        "Match the iPad's resolution",
+        "Match the second screen to the iPad's resolution",
+        true,
+    ),
+    ("Stream PC audio", "Stream PC audio", true),
+    ("Require pairing", "Require pairing", true),
+    (
+        "Check for updates automatically",
+        "Automatic update checks",
+        true,
+    ),
+    (
+        "Automatically share diagnostics",
+        "Automatically share diagnostics",
+        false,
+    ),
+    (
+        "Sharper video format (HEVC)",
+        "Prefer HEVC (H.265) when the iPad supports it",
+        false,
+    ),
+    (
+        "Smaller network packets",
+        "Use smaller network packets",
+        false,
+    ),
+    ("Start with Windows", "Start on Windows startup", true),
+    ("Play PC audio", "Play PC audio", true),
+];
+
+/// In English, German and Arabic every switch on Stream, in Send feedback,
+/// in Settings with Troubleshooting open and in setup has its English id.
+/// A switch keeps its English name in English and in a row never
+/// translated; otherwise it is named by its row's title, as written.
+fn every_switch_has_an_english_id(shared: &SharedControl) {
+    use eternal_host::i18n::{logical, tr};
+
+    for code in ["en", "de", "ar"] {
+        save_language(Some(code));
+        let mut seen = std::collections::BTreeSet::new();
+        let mut check = |h: &Harness<'_, AnalyzerApp>, place: &str| {
+            for node in h.query_all(By::new().role(Role::CheckBox)) {
+                let node = node.accesskit_node();
+                let name = name_of(&node);
+                let id = node.author_id();
+                let Some(&(id, english, translated)) =
+                    SWITCHES.iter().find(|(known, _, _)| Some(*known) == id)
+                else {
+                    panic!("{code} {place}: switch {name:?} has no English id ({id:?})");
+                };
+                let expected = if code == "en" || !translated {
+                    english
+                } else {
+                    logical(tr(id)).unwrap_or(tr(id))
+                };
+                assert_eq!(
+                    name.as_deref(),
+                    Some(expected),
+                    "{code} {place}: the {id:?} switch's name"
+                );
+                seen.insert(id);
+            }
+        };
+
+        let mut h = harness(shared, egui::vec2(1040.0, 2400.0));
+        h.run_steps(4);
+        check(&h, "Stream");
+        click(&mut h, Role::Button, "Send feedback");
+        check(&h, "Send feedback");
+
+        let mut h = harness(shared, egui::vec2(1040.0, 2400.0));
+        click(&mut h, Role::Button, "Settings");
+        h.get(id("Show options")).scroll_to_me();
+        h.run_steps(4);
+        click(&mut h, Role::Button, "Show options");
+        check(&h, "Settings");
+        h.get(id("Run setup again")).scroll_to_me();
+        h.run_steps(4);
+        click(&mut h, Role::Button, "Run setup again");
+        for (index, _) in STEPS.iter().enumerate() {
+            check(&h, &format!("setup step {}", index + 1));
+            let next = if index + 1 == STEPS.len() {
+                "Done"
+            } else {
+                "Next"
+            };
+            click(&mut h, Role::Button, next);
+        }
+        let missing: Vec<_> = SWITCHES
+            .iter()
+            .map(|(id, _, _)| *id)
+            .filter(|id| !seen.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{code}: switches not found: {missing:?}"
+        );
     }
 }
 
