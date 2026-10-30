@@ -9,10 +9,11 @@
   <script src="film.js"></script>
   <style>
     .bg { background-image: url('art/valley.webp'); background-position: 50% 55%; }
-    /* The Windows app draws every frame of footage/host-performance.mp4 itself. */
-    #win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
-    #win .win-view { width: 2080px; height: 2000px; }
-    #win video { width: 2080px; height: 2000px; }
+    /* Three PCs, each drawn by the Windows app itself on its own GPU:
+       footage/host-performance-{nvidia,amd,intel}.mp4, 3.2 s each. */
+    .win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
+    .win .win-view { width: 2080px; height: 2000px; }
+    .win video { width: 2080px; height: 2000px; }
     #chip { left: 40px; top: 36px; gap: 22px; padding: 0 28px 0 22px; }
     #chip .gpu { color: #71717a; }
   </style>
@@ -22,46 +23,22 @@
     <div class="bg" id="bg"></div>
     <div class="bg-dim"></div>
 
-    <div class="win" id="win">
-      <div class="win-bar">
-        <span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span>
-        <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-      </div>
-      <div class="win-view">
-        <video id="app" src="footage/host-performance.mp4" data-start="0" data-duration="8" muted playsinline></video>
-      </div>
-    </div>
+    <!-- Each PC's window is on screen for its session and the slides either
+         side; the loop's slide needs the Intel tail at the start and the
+         NVIDIA lead-in at the end. -->
+    <div class="win" id="win-i0"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-i0" src="footage/host-performance-intel.mp4" data-start="0" data-media-start="2.9667" data-duration="0.2333" muted playsinline></video></div></div>
+    <div class="win" id="win-n"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-n" src="footage/host-performance-nvidia.mp4" data-start="0" data-media-start="0.3" data-duration="2.9" muted playsinline></video></div></div>
+    <div class="win" id="win-a"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-a" src="footage/host-performance-amd.mp4" data-start="2.3667" data-duration="3.2" muted playsinline></video></div></div>
+    <div class="win" id="win-i"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-i" src="footage/host-performance-intel.mp4" data-start="5.0333" data-duration="2.9667" muted playsinline></video></div></div>
+    <div class="win" id="win-n2"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-n2" src="footage/host-performance-nvidia.mp4" data-start="7.7" data-duration="0.3" muted playsinline></video></div></div>
 
     <div class="chip" id="chip"><span class="dot"></span><span class="gpu" id="g0">NVIDIA</span><span class="gpu" id="g1">AMD</span><span class="gpu" id="g2">Intel</span></div>
   </div>
-
-  <script>
-    const tl = gsap.timeline({ paused: true });
-    const AT = { x: 740, y: 470 };
-    // The whole window; the live encode-time chart over the Encoder card;
-    // closer, with the GPU and encoder names readable.
-    const WHOLE = pose(520, 500, 0.84, AT);
-    const CHART = pose(632, 520, 1.5, AT);
-    const ENCODER = pose(632, 650, 1.85, AT);
-
-    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
-    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
-
-    tl.set('#win', WHOLE, 0);
-    tl.to('#win', { ...CHART, duration: 1.3, ease: 'power2.inOut' }, 0.3);
-    tl.to('#win', { ...ENCODER, duration: 0.9, ease: 'power2.inOut' }, 2.0);
-    tl.to('#win', { ...CHART, duration: 0.9, ease: 'power2.inOut' }, 5.9);
-    tl.to('#win', { ...WHOLE, duration: 1.0, ease: 'power2.inOut' }, 6.95);
-
-    // The footage changes GPU at 2.67 s and 5.33 s, and back to NVIDIA as it loops.
-    const light = (id, at) => tl.to(id, { color: '#f4f4f5', duration: 0.25, ease: 'power2.out' }, at);
-    const dim = (id, at) => tl.to(id, { color: '#71717a', duration: 0.25, ease: 'power2.out' }, at);
-    tl.set('#g0', { color: '#f4f4f5' }, 0);
-    dim('#g0', 2.67); light('#g1', 2.67);
-    dim('#g1', 5.33); light('#g2', 5.33);
-    dim('#g2', 7.75); light('#g0', 7.75);
-
-    window.__timelines['performance'] = tl;
-  </script>
+  <script src="performance.js"></script>
 </body>
 </html>

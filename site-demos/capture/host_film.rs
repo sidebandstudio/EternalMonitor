@@ -3,7 +3,8 @@
 // capture-host.sh appends this file to a scratch copy of host/tests/gui_snapshots.rs
 // (it reuses that file's fixture, harness and iPad helpers) and runs it there, so
 // nothing in host/ changes. Each film is 240 frames at 30 fps, drawn by the app
-// itself through egui_kittest at 2x. The pointer path is written next to the
+// itself through egui_kittest at 2x (the performance sessions are 96 frames
+// each, so the film can slide between them). The pointer path is written next to the
 // frames as pointer.json, so the film can draw a cursor exactly where the app
 // saw the pointer.
 
@@ -68,7 +69,11 @@ impl Film {
     }
 
     fn finish(self) {
-        assert_eq!(self.frame, 240, "{} has {} frames", self.dir.display(), self.frame);
+        self.finish_at(240);
+    }
+
+    fn finish_at(self, frames: usize) {
+        assert_eq!(self.frame, frames, "{} has {} frames", self.dir.display(), self.frame);
         std::fs::write(self.dir.join("pointer.json"), format!("[{}]\n", self.log.join(","))).unwrap();
     }
 }
@@ -106,16 +111,65 @@ fn note(film: &Film, name: &str, rect: egui::Rect) {
     std::fs::write(path, text).unwrap();
 }
 
-/// A periodic encode-time trace: one wave every 30 samples and a keyframe
-/// spike every 60, so 480 samples later it is back where it started.
-fn encode_sample(i: usize) -> f64 {
-    let wave = 1.1 + 0.32 * ((i as f64) * std::f64::consts::TAU / 30.0).sin();
-    let spike = match i % 60 {
-        0 => 1.7,
-        1 => 0.5,
-        _ => 0.0,
-    };
-    wave + spike
+/// A small seeded generator, so every capture draws the same trace.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Roughly normal, mean 0 and spread 1.
+    fn normal(&mut self) -> f64 {
+        (0..4).map(|_| self.next()).sum::<f64>() - 2.0
+    }
+}
+
+/// An encode-time trace in milliseconds as a GPU encoder draws it: a level
+/// that wanders a little, frame-to-frame jitter, and a keyframe or a busy
+/// scene now and then, at no fixed interval.
+fn encode_trace(seed: u64, base: f64, len: usize) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut wander = 0.0;
+    let mut jitter = 0.0;
+    let mut next_spike = 20 + (rng.next() * 60.0) as usize;
+    let mut tail = 0.0;
+    (0..len)
+        .map(|i| {
+            wander = 0.985 * wander + 0.015 * rng.normal() * base * 0.9;
+            jitter = 0.55 * jitter + 0.45 * rng.normal() * base * 0.07;
+            let mut v = base + wander + jitter;
+            if i == next_spike {
+                // A keyframe costs one to two and a half times the usual frame.
+                let size = if rng.next() < 0.2 { 2.2 + rng.next() * 0.5 } else { 0.9 + rng.next() * 0.7 };
+                v += base * size;
+                tail = base * size * (0.15 + rng.next() * 0.2);
+                next_spike = i + 35 + (rng.next() * 110.0) as usize;
+            } else if tail > 0.01 {
+                v += tail;
+                tail *= 0.35;
+            }
+            v.max(base * 0.55)
+        })
+        .collect()
+}
+
+/// One streaming session on one PC, for the Performance film.
+struct Session {
+    film: &'static str,
+    gpu: &'static str,
+    codec: &'static str,
+    seed: u64,
+    encode_ms: f64,
+    uptime_s: u64,
+    frames: u64,
+    bytes: u64,
+    packets: u64,
+    retransmits: u64,
+    frame_bytes: usize,
 }
 
 /// The iPad that scanned the QR code joins over Wi-Fi, so the app says so.
@@ -187,27 +241,29 @@ fn home_page_films() {
     let wants = |name: &str| only.is_empty() || only.split(',').any(|n| n == name);
     let size = egui::vec2(1040.0, 720.0);
 
-    // Pair: the QR code, an iPad arrives, the dialog closes on its own or by Done.
+    // Pair: the QR code opens at 1.2 s; the iPad that scans it joins at 4.9 s
+    // and Done closes the dialog at 5.6 s. The iPad leaves as the film loops.
     if wants("pair") {
         let (_dir, shared) = fixture();
         let mut h = film_harness(&shared, size);
         let mut f = Film::new(&root, "pair", egui::pos2(760.0, 600.0));
         let qr = centre(&h, Some(Role::Button), "QR code");
-        f.hold(&mut h, 14);
-        f.glide(&mut h, qr, 30);
-        f.hold(&mut h, 4);
+        f.hold(&mut h, 6);
+        f.glide(&mut h, qr, 26);
+        f.hold(&mut h, 3);
         f.click(&mut h);
         PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
-        f.hold(&mut h, 20);
+        f.hold(&mut h, 16);
         note(&f, "dialog", h.get_by_label("Scan to connect").rect());
-        f.glide(&mut h, egui::pos2(880.0, 610.0), 26);
-        f.hold(&mut h, 50);
+        f.glide(&mut h, egui::pos2(880.0, 610.0), 24);
+        let used = f.frame;
+        f.hold(&mut h, 147 - used);
         connect_wifi(&shared);
-        f.hold(&mut h, 14);
+        f.hold(&mut h, 4);
         if let Some(done) = h.query_by_label("Done") {
             let done = done.rect().center();
-            f.glide(&mut h, done, 22);
-            f.hold(&mut h, 3);
+            f.glide(&mut h, done, 12);
+            f.hold(&mut h, 2);
             f.click(&mut h);
         }
         let used = f.frame;
@@ -218,79 +274,81 @@ fn home_page_films() {
         f.finish();
     }
 
-    // Second screen: Mirror my screen, then Second screen, then back. 16 + 30 + 4 + 2 + 10
-    // + 24 frames bring the pointer to the title bar at 2.87 s; it leaves at 5.2 s.
+    // Second screen: from Mirror my screen to Second screen, which it keeps.
+    // The click lands at 1.5 s; the pointer then leaves the window on the right
+    // at 2.2 s, where the film's own pointer carries a document to the iPad.
     if wants("second-screen") {
         let (_dir, shared) = fixture();
         connect_named(&shared, "iPad Pro", 10, 20);
         let mut h = film_harness(&shared, size);
         let mut f = Film::new(&root, "second-screen", egui::pos2(760.0, 420.0));
         let second = centre(&h, None, "Second screen");
-        let mirror = centre(&h, None, "Mirror my screen");
         note(&f, "choice", h.get_by_label("Use the iPad as").rect());
-        f.hold(&mut h, 16);
-        f.glide(&mut h, second, 30);
+        f.hold(&mut h, 12);
+        f.glide(&mut h, second, 28);
         f.hold(&mut h, 4);
         f.click(&mut h);
         f.hold(&mut h, 10);
         *shared.vdd_status.lock() = VddStatus::Active;
-        // Up and out to the title bar, which the film draws: it carries the
-        // window across to the iPad and back while the app holds still.
-        f.glide(&mut h, egui::pos2(560.0, -14.0), 24);
-        f.hold(&mut h, 70);
-        f.glide(&mut h, mirror, 30);
-        f.hold(&mut h, 4);
-        f.click(&mut h);
-        *shared.vdd_status.lock() = VddStatus::Inactive;
+        f.glide(&mut h, egui::pos2(1080.0, 300.0), 22);
         let used = f.frame;
-        f.hold(&mut h, 212 - used);
-        f.glide(&mut h, egui::pos2(760.0, 420.0), 28);
+        f.hold(&mut h, 240 - used);
         f.finish();
     }
 
-    // Performance: a live encode-time chart while the GPU behind it changes.
-    if wants("performance") {
+    // Performance: three PCs, each with its own GPU and its own session. The
+    // film slides from one to the next, so each is 96 frames: 3.2 s, enough to
+    // overlap the slides on either side.
+    let sessions = [
+        Session { film: "performance-nvidia", gpu: "NVIDIA GeForce RTX 4070", codec: "h264_nvenc", seed: 0x9e37_79b9_7f4a_7c15, encode_ms: 1.05, uptime_s: 1_513, frames: 90_780, bytes: 2_838_000_000, packets: 2_053_350, retransmits: 212, frame_bytes: 31_200 },
+        Session { film: "performance-amd", gpu: "AMD Radeon RX 7800 XT", codec: "hevc_amf", seed: 0x2545_f491_4f6c_dd1d, encode_ms: 2.3, uptime_s: 4_327, frames: 259_560, bytes: 8_112_000_000, packets: 5_871_204, retransmits: 1_046, frame_bytes: 29_400 },
+        Session { film: "performance-intel", gpu: "Intel Arc A750", codec: "h264_qsv", seed: 0x6a09_e667_f3bc_c908, encode_ms: 1.6, uptime_s: 468, frames: 28_032, bytes: 877_000_000, packets: 634_880, retransmits: 37, frame_bytes: 32_600 },
+    ];
+    for session in &sessions {
+        if !wants("performance") && !wants(session.film) {
+            continue;
+        }
+        const LEN: usize = 96;
         let (_dir, shared) = fixture();
         connect_named(&shared, "iPad Pro", 10, 20);
-        let gpus = [
-            ("NVIDIA GeForce RTX 4070", "h264_nvenc"),
-            ("AMD Radeon RX 7800 XT", "hevc_amf"),
-            ("Intel Arc A750", "h264_qsv"),
-        ];
-        let feed = |frame: usize| {
+        // 300 samples on screen, two encoded frames for every film frame.
+        let trace = encode_trace(session.seed, session.encode_ms, 300 + 2 * LEN);
+        let mut size = Rng(session.seed ^ 0xff);
+        let feed = |frame: usize, size: &mut Rng| {
             let mut stats = PIPELINE_STATS.lock();
-            let (gpu, codec) = gpus[frame / 80];
-            stats.gpu_name = gpu.into();
-            stats.codec_name = codec.into();
-            stats.encode_time_history = (0..300).map(|i| encode_sample(i + frame * 2)).collect();
-            stats.encode_time_us = (encode_sample(frame * 2 + 299) * 1000.0) as u128;
-            // Twenty-five minutes into a session at 60 fps and 15 Mbps. Frames
-            // are drawn slower than real time, so uptime is set, not measured.
+            stats.gpu_name = session.gpu.into();
+            stats.codec_name = session.codec.into();
+            stats.encode_time_history = trace[frame * 2..frame * 2 + 300].iter().copied().collect();
+            stats.encode_time_us = (trace[frame * 2 + 299] * 1000.0) as u128;
+            // At 60 fps and 15 Mbps. Frames are drawn slower than real time,
+            // so uptime is set, not measured.
             let n = frame as u64;
-            stats.start_time =
-                Some(std::time::Instant::now() - std::time::Duration::from_millis(1_512_000 + n * 1000 / 30));
-            stats.capture_frame_count = 90_720 + n * 2;
-            stats.encode_frame_count = 90_718 + n * 2;
-            stats.nal_bytes_last = 30_600 + (n as usize * 7_919) % 2_400;
-            stats.transport_bytes_sent = 2_835_000_000 + n * 62_500;
-            stats.transport_packets_sent = 2_052_000 + n * 45;
-            stats.transport_fragments_sent = 2_052_000 + n * 45;
-            stats.transport_retransmits = 212;
+            stats.start_time = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(session.uptime_s * 1000 + n * 1000 / 30),
+            );
+            stats.capture_frame_count = session.frames + n * 2;
+            stats.encode_frame_count = session.frames - 2 + n * 2;
+            stats.nal_bytes_last = (session.frame_bytes as f64 * (0.9 + 0.2 * size.next())) as usize;
+            stats.transport_bytes_sent = session.bytes + n * 62_500;
+            stats.transport_packets_sent = session.packets + n * 45;
+            stats.transport_fragments_sent = session.packets + n * 45;
+            stats.transport_retransmits = session.retransmits;
         };
-        feed(0);
+        feed(0, &mut size);
         let mut h = film_harness(&shared, egui::vec2(1040.0, 1000.0));
         nav(&mut h, "Performance");
-        let mut f = Film::new(&root, "performance", egui::pos2(-50.0, -50.0));
+        let mut f = Film::new(&root, session.film, egui::pos2(-50.0, -50.0));
         note(&f, "gpu", h.get_by_label("GPU").rect());
         note(&f, "chart", h.get_by_label("Encode time").rect());
-        for frame in 0..240 {
-            feed(frame);
+        for frame in 0..LEN {
+            feed(frame, &mut size);
             f.shoot(&mut h, false);
         }
-        f.finish();
+        f.finish_at(LEN);
     }
 
-    // Feedback: open the panel from the sidebar, write a line, close it.
+    // Feedback: open the panel from the sidebar, write a line, send it to the email app.
     if wants("feedback") {
         let (_dir, shared) = fixture();
         connect_named(&shared, "iPad Pro", 10, 20);
@@ -327,16 +385,15 @@ fn home_page_films() {
                 f.shoot(&mut h, false);
             }
         }
+        // Open in my email app at 5.8 s; the app's own note says what happens.
         let send = centre(&h, Some(Role::Button), "Open in my email app");
         f.glide(&mut h, send, 18);
-        f.hold(&mut h, 20);
-        let close = centre(&h, Some(Role::Button), "Close");
-        f.glide(&mut h, close, 16);
-        f.hold(&mut h, 3);
+        f.hold(&mut h, 4);
         f.click(&mut h);
+        f.glide(&mut h, send + egui::vec2(40.0, 70.0), 14);
         let used = f.frame;
-        assert!(used <= 214, "feedback runs long: {used}");
-        f.glide(&mut h, egui::pos2(520.0, 520.0), 240 - used);
+        assert!(used <= 200, "feedback runs long: {used}");
+        f.hold(&mut h, 240 - used);
         f.finish();
     }
 }
