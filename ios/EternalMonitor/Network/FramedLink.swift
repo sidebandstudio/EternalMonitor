@@ -57,6 +57,9 @@ final class FramedLink: MediaLink {
     /// The connection's state, on the link's queue. A failure is logged once,
     /// by `fail`.
     func handle(_ state: NWConnection.State) {
+        #if DEBUG
+        dispatchPrecondition(condition: .onQueue(queue))
+        #endif
         switch state {
         case .ready: receiveNext()
         case .failed(let error):

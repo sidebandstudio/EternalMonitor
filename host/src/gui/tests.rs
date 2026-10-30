@@ -327,6 +327,12 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         "{body}"
     );
     assert!(body.contains("Restart"), "{body}");
+    // Kepler cards (GTX 600/700) stop at driver 470 and can't install 570.
+    assert!(body.contains("if your graphics card supports it"), "{body}");
+    assert!(
+        body.contains("Older cards keep using the processor"),
+        "{body}"
+    );
     for jargon in ["NVENC", "API", "libx264", "encoder", "http"] {
         assert!(!body.contains(jargon), "{body}");
     }
@@ -344,6 +350,7 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     let blocks = [
         CaptureBlock::SecureDesktop,
         CaptureBlock::DisplayChanging,
+        CaptureBlock::NoDisplay,
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
@@ -377,6 +384,17 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
         capture_block_notice(Some(CaptureBlock::DriverNotResponding), true).unwrap();
     assert_eq!(stuck, "The graphics driver isn't responding");
     assert!(body.contains("restart the PC"), "{body}");
+    // A closed lid is not a display change.
+    let (_, off, body) = capture_block_notice(Some(CaptureBlock::NoDisplay), true).unwrap();
+    assert_eq!(off, "No display is on");
+    assert!(
+        body.contains("laptop lid") && body.contains("Second screen"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("resolution") && !body.contains("game"),
+        "{body}"
+    );
 }
 
 #[test]
