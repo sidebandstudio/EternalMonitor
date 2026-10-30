@@ -1758,7 +1758,7 @@ html:lang(ko) { word-break: keep-all; }
 
 /* Right to left. Screenshots, the logo, code, versions and checksums keep
    their left-to-right order. */
-[dir="rtl"] :is(.brand, .stage, .modes, .pair, .pc-window, .tablet, .dialog-shot, pre, code) { direction: ltr; }
+[dir="rtl"] :is(.brand, .stage, .tablet, pre, code) { direction: ltr; }
 [dir="rtl"] :is(#release-meta, [data-win-version], [data-ipad-version]) { direction: ltr; unicode-bidi: isolate; }
 [dir="rtl"] .sha code { text-align: left; }
 [dir="rtl"] .skip-link { left: auto; right: 16px; }
@@ -1831,4 +1831,4 @@ html:lang(ko) { word-break: keep-all; }
 }
 /* Geist Mono has no Arabic, Devanagari or CJK: translated labels set in it
    (badges, the link chip, Copy) use the text font there. */
-html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) :is(.badge:not([data-win-version]), .stage-chip, .sha .btn) { font-family: var(--font); }
+html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) :is(.badge:not([data-win-version]), .sha .btn) { font-family: var(--font); }
