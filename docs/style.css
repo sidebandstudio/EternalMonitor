@@ -468,6 +468,7 @@ small { font-size: 0.875rem; }
 }
 .demo {
   position: relative;
+  display: grid;
   overflow: hidden;
   border-radius: 24px;
   background: var(--surface);
@@ -488,10 +489,12 @@ small { font-size: 0.875rem; }
   object-fit: cover;
 }
 .demo-film { background: transparent; }
-/* A neutral scrim keeps the label readable over the film. */
+/* A neutral scrim keeps the label readable over the film. The label is a
+   grid item at the card's foot rather than positioned, so the link's target
+   below fills the card and not just this strip. */
 .demo-foot {
-  position: absolute;
-  inset: auto 0 0 0;
+  z-index: 1;
+  align-self: end;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
@@ -557,7 +560,7 @@ small { font-size: 0.875rem; }
   .demo { display: flex; flex-direction: column; }
   .demo-w2, .demo-w3, .demo-w4 { grid-column: auto; aspect-ratio: auto; }
   .demo-media { position: relative; inset: auto; aspect-ratio: 728 / 1040; overflow: hidden; }
-  .demo-foot { position: static; min-height: 82px; align-items: center; padding: 14px 18px 16px; background: none; }
+  .demo-foot { align-self: stretch; min-height: 82px; align-items: center; padding: 14px 18px 16px; background: none; }
   .demo-toggle { top: 12px; right: 12px; width: 44px; height: 44px; }
 }
 
