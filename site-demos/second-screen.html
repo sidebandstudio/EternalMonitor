@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1480, height=1040">
+  <title>Extend your desktop</title>
+  <link rel="stylesheet" href="shared.css">
+  <script src="vendor/gsap.min.js"></script>
+  <style>
+    .bg { background-image: url('art/dunes.webp'); background-position: 50% 70%; }
+    #world { position: absolute; left: 0; top: 0; width: 1480px; height: 1040px; transform-origin: 0 0; }
+
+    /* Two displays of one Windows desktop, each 1920 x 1080: the monitor, and
+       the iPad beside it, which shows its display whole with bars (Fit). */
+    #mon {
+      position: absolute; left: 104px; top: 134px; width: 812px; height: 471px;
+      border-radius: 18px; background: #0c0c0e;
+      border: 2px solid rgba(255, 255, 255, 0.14);
+      box-shadow: 0 60px 120px -50px rgba(0, 0, 0, 0.95);
+    }
+    #mon .screen { left: 14px; top: 14px; width: 780px; height: 439px; border-radius: 6px; }
+    #neck { position: absolute; left: 470px; top: 605px; width: 80px; height: 96px; background: #141416; }
+    #foot { position: absolute; left: 380px; top: 699px; width: 260px; height: 16px; border-radius: 8px 8px 4px 4px; background: #18181b; border-top: 2px solid rgba(255, 255, 255, 0.1); }
+    #pad {
+      position: absolute; left: 942px; top: 212px; width: 436px; height: 314px;
+      border-radius: 30px; background: #1c1c1f;
+      border: 2px solid rgba(255, 255, 255, 0.2);
+      box-shadow: inset 0 0 0 2px rgba(0, 0, 0, 0.6), 0 60px 120px -50px rgba(0, 0, 0, 0.95);
+    }
+    #pad .screen { left: 16px; top: 16px; width: 400px; height: 278px; border-radius: 14px; }
+    .screen { position: absolute; overflow: hidden; background: #000; }
+
+    /* A desktop is 1920 x 1080 desktop pixels, scaled to its screen. */
+    .desk { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; overflow: hidden; transform-origin: 0 0; }
+    .desk > img { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; max-width: none; }
+    #mon .desk { transform: scale(0.40625); }
+    #pad .layer { position: absolute; left: 0; top: 26px; width: 400px; height: 225px; }
+    #pad .desk { transform: scale(0.208333); }
+
+    /* The app window: footage pixels, two per desktop pixel. Its title bar
+       hides the top of the footage, where the app's pointer waits. */
+    .appwin { position: absolute; left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
+    .appwin .win-view { width: 2080px; height: 1420px; }
+    .appwin video { position: absolute; left: 0; top: -20px; width: 2080px; height: 1440px; }
+
+    /* The pointer while it carries the window, in desktop pixels. Its tip is
+       the element's top-left corner. */
+    .ptr { position: absolute; left: 0; top: 0; width: 34px; height: 50px; opacity: 0; transform-origin: 0 0; }
+    .ptr svg { width: 100%; height: 100%; overflow: visible; }
+    #blink { position: absolute; inset: 0; background: #000; opacity: 0; }
+    #chip { left: 40px; top: 36px; width: 330px; justify-content: flex-start; }
+    #chip .say { position: relative; display: inline-block; width: 262px; height: 30px; }
+    #chip .say span { position: absolute; left: 0; top: 0; line-height: 30px; }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="second-screen" data-start="0" data-width="1480" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <div id="world">
+      <div id="neck"></div><div id="foot"></div>
+      <div id="mon">
+        <div class="screen">
+          <div class="desk">
+            <img src="art/wallpaper.webp" alt="">
+            <div class="win appwin" id="winA">
+              <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+              <div class="win-view"><video id="appA" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+            </div>
+            <div class="ptr" id="ptrA"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="pad">
+        <div class="screen">
+          <!-- Mirror my screen: the monitor's desktop again. -->
+          <div class="layer" id="mirror">
+            <div class="desk">
+              <img src="art/wallpaper.webp" alt="">
+              <div class="win appwin" id="winM">
+                <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                <div class="win-view"><video id="appM" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+              </div>
+            </div>
+          </div>
+          <!-- Second screen: the desktop's second display, right of the monitor. -->
+          <div class="layer" id="extend">
+            <div class="desk">
+              <img src="art/wallpaper.webp" alt="">
+              <div class="win appwin" id="winB">
+                <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                <div class="win-view"><video id="appB" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+              </div>
+              <div class="ptr" id="ptrB"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+            </div>
+          </div>
+          <div id="blink"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chip" id="chip"><span class="dot"></span><span class="say"><span id="say-mirror">Mirror my screen</span><span id="say-second">Second screen</span></span></div>
+  </div>
+
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const M = 0.40625;                       // monitor: frame pixels per desktop pixel
+    const SCREEN = { x: 120, y: 150 };       // the monitor's screen, in frame pixels
+    const WIN = { x: 640, y: 150 };          // the window's top-left on the desktop
+    const ACROSS = 1720;                     // to the middle of the iPad's display
+    // The app's point (px, py) in frame pixels, before the camera moves.
+    const world = (px, py) => ({ x: SCREEN.x + M * (WIN.x + px), y: SCREEN.y + M * (WIN.y + 30 + py) });
+    const AT = { x: 740, y: 440 };
+    const cam = (p, s) => ({ x: AT.x - s * p.x, y: AT.y - s * p.y, scale: s });
+    const WIDE = cam({ x: 740, y: 400 }, 1);
+    const CLOSE = cam(world(520, 165), 3.4);
+    const NEAR = cam(world(470, 200), 1.9);
+
+    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+
+    // Windows on the desktop: the monitor's copy, the mirror's copy, and the
+    // second display's copy, which starts one display to the left (off it).
+    tl.set(['#winA', '#winM'], { x: WIN.x, y: WIN.y, scale: 0.5 }, 0);
+    tl.set('#winB', { x: WIN.x - 1920, y: WIN.y, scale: 0.5 }, 0);
+    tl.set('#extend', { opacity: 0 }, 0);
+    tl.set('#say-second', { opacity: 0 }, 0);
+
+    // In the footage the pointer clicks Second screen at 1.73 s, leaves for the
+    // title bar at 2.67 s, comes back at 5.25 s and clicks Mirror my screen at 6.33 s.
+    tl.set('#world', WIDE, 0);
+    tl.to('#world', { ...CLOSE, duration: 0.95, ease: 'power2.inOut' }, 0.4);
+    tl.to('#world', { ...WIDE, duration: 1.0, ease: 'power2.inOut' }, 1.85);
+    tl.to('#world', { ...NEAR, duration: 0.9, ease: 'power2.inOut' }, 5.35);
+    tl.to('#world', { ...WIDE, duration: 1.0, ease: 'power2.inOut' }, 6.6);
+
+    // The stream restarts on each switch: the iPad goes dark, then shows the other picture.
+    const restart = (at, show, hide) => {
+      tl.to('#blink', { opacity: 1, duration: 0.18, ease: 'power1.in' }, at);
+      tl.set(hide, { opacity: 0 }, at + 0.3);
+      tl.set(show, { opacity: 1 }, at + 0.3);
+      tl.to('#blink', { opacity: 0, duration: 0.3, ease: 'power1.out' }, at + 0.45);
+    };
+    restart(1.95, '#extend', '#mirror');
+    restart(6.45, '#mirror', '#extend');
+
+    const say = (at, show, hide, width) => {
+      tl.to(hide, { opacity: 0, y: -8, duration: 0.2, ease: 'power2.in' }, at);
+      tl.fromTo(show, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.3, ease: 'power3.out', immediateRender: false }, at + 0.15);
+      tl.to('#chip', { width, duration: 0.35, ease: 'power3.inOut' }, at + 0.05);
+    };
+    tl.set('#chip', { width: 300 }, 0);
+    say(1.8, '#say-second', '#say-mirror', 270);
+    say(6.4, '#say-mirror', '#say-second', 300);
+
+    // The pointer takes over on the title bar, carries the window onto the
+    // iPad and back, and lets go where the app's own pointer comes back in.
+    const GRIP = { x: WIN.x + 560, y: WIN.y + 16 };
+    tl.set('#ptrA', { x: GRIP.x, y: GRIP.y }, 0);
+    tl.set('#ptrB', { x: GRIP.x - 1920, y: GRIP.y }, 0);
+    tl.to(['#ptrA', '#ptrB'], { opacity: 1, duration: 0.12 }, 2.72);
+    tl.to(['#ptrA', '#ptrB'], { scale: 0.86, duration: 0.08, ease: 'power2.in' }, 2.98);
+    const carry = (dx, at, duration) => {
+      tl.to(['#winA', '#winB', '#ptrA', '#ptrB'], { x: `+=${dx}`, duration, ease: 'power2.inOut' }, at);
+    };
+    carry(ACROSS, 3.08, 1.05);
+    carry(-ACROSS, 4.42, 0.8);
+    tl.to(['#ptrA', '#ptrB'], { scale: 1, duration: 0.08, ease: 'power2.out' }, 5.24);
+    tl.to(['#ptrA', '#ptrB'], { opacity: 0, duration: 0.06 }, 5.26);
+
+    window.__timelines['second-screen'] = tl;
+  </script>
+</body>
+</html>

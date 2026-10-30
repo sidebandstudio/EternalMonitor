@@ -48,8 +48,8 @@
     notice.setAttribute('aria-label', 'Note for Mac visitors');
     notice.innerHTML =
       '<div class="container mac-notice-inner">' +
-      '<p><strong>On a Mac?</strong>EternalMonitor streams from Windows PCs. macOS already has ' +
-      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> for this.</p>' +
+      '<p><strong>On a Mac?</strong>Mac support is <a href="index.html#coming">coming soon</a>, for iPad and iPhone Duo. Until then, EternalMonitor streams from Windows PCs, and Apple\'s ' +
+      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> works with an iPad.</p>' +
       '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button></div>';
     notice.querySelector('.mac-notice-close').addEventListener('click', function () {
       sessionStorage.setItem('mac-notice', 'off');

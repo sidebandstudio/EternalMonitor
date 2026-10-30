@@ -115,9 +115,20 @@
           <h2 id="features-title">Watch it work.</h2>
         </div>
         <div class="bento reveal">
-          <article class="demo demo-sm" aria-labelledby="d-pair">
-            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
-                   poster="assets/demos/pair.webp" aria-label="Film: in the Windows app, the pointer clicks QR code, the Scan to connect dialog opens, and an iPad connects.">
+          <article class="demo demo-w4" aria-labelledby="d-second-screen">
+            <video class="demo-film" muted loop playsinline preload="none" width="1480" height="1040"
+                   poster="assets/demos/second-screen.webp" aria-label="Film: in the Windows app, the pointer picks Second screen. The iPad beside the monitor turns into a second screen, and the app window is dragged across onto it and back.">
+              <source src="assets/demos/second-screen.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/second-screen.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-second-screen">Extend your desktop</h3>
+              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#step-5-use-the-ipad-as-a-second-screen-optional" aria-label="Explore the second screen" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-w2" aria-labelledby="d-pair">
+            <video class="demo-film" muted loop playsinline preload="none" width="728" height="1040"
+                   poster="assets/demos/pair.webp" aria-label="Film: in the Windows app, the pointer clicks QR code, the Scan to connect dialog opens, an iPad Pro connects over Wi-Fi and the app shows it streaming.">
               <source src="assets/demos/pair.webm" type='video/webm; codecs="vp9"'>
               <source src="assets/demos/pair.mp4" type="video/mp4">
             </video>
@@ -126,20 +137,9 @@
               <a class="demo-more" href="#how" aria-label="Explore pairing">Explore <span aria-hidden="true">&rarr;</span></a>
             </div>
           </article>
-          <article class="demo demo-sm" aria-labelledby="d-pencil">
-            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
-                   poster="assets/demos/pencil.webp" aria-label="Film: an Apple Pencil taps Drawing mode on in the iPad app's settings, then off again.">
-              <source src="assets/demos/pencil.webm" type='video/webm; codecs="vp9"'>
-              <source src="assets/demos/pencil.mp4" type="video/mp4">
-            </video>
-            <div class="demo-foot">
-              <h3 id="d-pencil">Apple Pencil drawing</h3>
-              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" aria-label="Explore Apple Pencil drawing" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
-            </div>
-          </article>
-          <article class="demo demo-sm" aria-labelledby="d-fit">
-            <video class="demo-film" muted loop playsinline preload="none" width="720" height="880"
-                   poster="assets/demos/fit.webp" aria-label="Film: on the iPad, the picture switches between Fit, with black bars, and Fill, edge to edge.">
+          <article class="demo demo-w2" aria-labelledby="d-fit">
+            <video class="demo-film" muted loop playsinline preload="none" width="728" height="1040"
+                   poster="assets/demos/fit.webp" aria-label="Film: the iPad app shows a PC picture with bars above and below, a finger taps the picture button and it fills the screen, then fits again.">
               <source src="assets/demos/fit.webm" type='video/webm; codecs="vp9"'>
               <source src="assets/demos/fit.mp4" type="video/mp4">
             </video>
@@ -148,26 +148,37 @@
               <a class="demo-more" href="updates.html#v0-3-2" aria-label="Explore Fit and Fill">Explore <span aria-hidden="true">&rarr;</span></a>
             </div>
           </article>
-          <article class="demo demo-wide" aria-labelledby="d-second-screen">
-            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="880"
-                   poster="assets/demos/second-screen.webp" aria-label="Film: in the Windows app, the pointer switches Use the iPad as from Mirror my screen to Second screen and back.">
-              <source src="assets/demos/second-screen.webm" type='video/webm; codecs="vp9"'>
-              <source src="assets/demos/second-screen.mp4" type="video/mp4">
-            </video>
-            <div class="demo-foot">
-              <h3 id="d-second-screen">Mirror, or a second screen</h3>
-              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#step-5-use-the-ipad-as-a-second-screen-optional" aria-label="Explore second screen setup" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
-            </div>
-          </article>
-          <article class="demo demo-wide" aria-labelledby="d-performance">
-            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="880"
-                   poster="assets/demos/performance.webp" aria-label="Film: the Windows app's Performance page, its encode-time chart moving live while the GPU changes from NVIDIA to AMD to Intel.">
+          <article class="demo demo-w4" aria-labelledby="d-performance">
+            <video class="demo-film" muted loop playsinline preload="none" width="1480" height="1040"
+                   poster="assets/demos/performance.webp" aria-label="Film: the Windows app's Performance page, its encode-time chart running live while the encoder moves from an NVIDIA to an AMD to an Intel graphics card.">
               <source src="assets/demos/performance.webm" type='video/webm; codecs="vp9"'>
               <source src="assets/demos/performance.mp4" type="video/mp4">
             </video>
             <div class="demo-foot">
               <h3 id="d-performance">Your graphics card does the work</h3>
-              <a class="demo-more" href="download.html" aria-label="Explore system requirements">Explore <span aria-hidden="true">&rarr;</span></a>
+              <a class="demo-more" href="updates.html#v0-3-1" aria-label="Explore graphics support">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-w3" aria-labelledby="d-pencil">
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="1040"
+                   poster="assets/demos/pencil.webp" aria-label="Film: an Apple Pencil switches Drawing mode on and off in the iPad app's settings, where the Pencil row says Ready to draw.">
+              <source src="assets/demos/pencil.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/pencil.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-pencil">Apple Pencil, with pressure and tilt</h3>
+              <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" aria-label="Explore Apple Pencil drawing" target="_blank" rel="noopener">Explore <span aria-hidden="true">&rarr;</span></a>
+            </div>
+          </article>
+          <article class="demo demo-w3" aria-labelledby="d-feedback">
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="1040"
+                   poster="assets/demos/feedback.webp" aria-label="Film: in the Windows app, Send feedback opens a panel, Something I like is picked and a short note is typed before the panel closes.">
+              <source src="assets/demos/feedback.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/feedback.mp4" type="video/mp4">
+            </video>
+            <div class="demo-foot">
+              <h3 id="d-feedback">Send feedback from the app</h3>
+              <a class="demo-more" href="updates.html" aria-label="Explore what changed">Explore <span aria-hidden="true">&rarr;</span></a>
             </div>
           </article>
         </div>
@@ -261,6 +272,27 @@
             <a href="download.html#ipad" class="btn btn-secondary">Join the TestFlight beta</a>
           </article>
         </div>
+        <div class="coming reveal" id="coming">
+          <h3 id="coming-title">Coming to Mac and iPhone Duo</h3>
+          <div class="coming-grid">
+            <article class="coming-card">
+              <img class="coming-tile" src="assets/platform-mac.webp" srcset="assets/platform-mac@2x.webp 2x" alt="" width="48" height="48">
+              <div>
+                <h4>Mac</h4>
+                <p>Use your iPad or iPhone Duo as a second screen for your Mac.</p>
+              </div>
+            </article>
+            <article class="coming-card">
+              <img class="coming-tile" src="assets/platform-iphone-duo.webp" srcset="assets/platform-iphone-duo@2x.webp 2x" alt="" width="48" height="48">
+              <div>
+                <h4>iPhone Duo</h4>
+                <p>Use your iPhone Duo as a second screen. It's a separate app, EternalMonitor Duo, with its own TestFlight beta.</p>
+                <!-- Plain text until the Duo's public TestFlight link exists. -->
+                <p class="coming-note">TestFlight link soon</p>
+              </div>
+            </article>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -276,7 +308,7 @@
           </details>
           <details>
             <summary>Does it work with a Mac?</summary>
-            <div><p>No, the PC app is for Windows. Macs have Apple's <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>.</p></div>
+            <div><p>Not yet. Mac support is <a href="#coming">coming soon</a>, for iPad and iPhone Duo; Apple's Sidecar doesn't work with an iPhone Duo. Until then, use <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> with an iPad.</p></div>
           </details>
           <details>
             <summary>USB or Wi-Fi?</summary>

@@ -218,7 +218,8 @@ fn home_page_films() {
         f.finish();
     }
 
-    // Second screen: Mirror my screen, then Second screen, then back.
+    // Second screen: Mirror my screen, then Second screen, then back. 16 + 30 + 4 + 2 + 10
+    // + 24 frames bring the pointer to the title bar at 2.87 s; it leaves at 5.2 s.
     if wants("second-screen") {
         let (_dir, shared) = fixture();
         connect_named(&shared, "iPad Pro", 10, 20);
@@ -233,8 +234,10 @@ fn home_page_films() {
         f.click(&mut h);
         f.hold(&mut h, 10);
         *shared.vdd_status.lock() = VddStatus::Active;
-        f.glide(&mut h, egui::pos2(720.0, 300.0), 26);
-        f.hold(&mut h, 62);
+        // Up and out to the title bar, which the film draws: it carries the
+        // window across to the iPad and back while the app holds still.
+        f.glide(&mut h, egui::pos2(560.0, -14.0), 24);
+        f.hold(&mut h, 70);
         f.glide(&mut h, mirror, 30);
         f.hold(&mut h, 4);
         f.click(&mut h);
