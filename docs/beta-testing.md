@@ -13,6 +13,41 @@ steps. To bundle the driver, drop the signed setup into `installer/vendor/vdd/` 
 that folder's `README.txt`); without it the build still works but produces an app-only
 installer and the extended-display option won't appear.
 
+## The Beta channel (Windows)
+
+Beta is the newest Windows build with every fix that has landed, built every
+night, without waiting for a release. It is for testing, and anyone can go
+back to Stable by running the Stable installer over it.
+
+- **Where it comes from:** `.github/workflows/nightly.yml` runs on main at
+  07:41 UTC. It builds the newest `release/*-candidate` branch with commits main
+  lacks, else main; the `NIGHTLY_BRANCH` repository variable overrides that.
+  It skips a night when that branch has not moved since the last Beta build
+  that finished publishing, so a night that stopped partway is redone.
+  The build is the same as `release.yml`'s: same pins, diagnostics, secret scan
+  and, once configured, signing.
+- **Version:** `<next>-beta.<YYYYMMDD>.<run>`, for example
+  `0.3.4-beta.20261030.12`, shown in Settings and in diagnostics. `<next>` is
+  the host's version when it is ahead of the stable release in
+  `docs/latest.json`, else that release's next patch. It sorts below `0.3.4`,
+  so Beta users get the next Stable release from the normal update prompt, and
+  Stable users are never offered a Beta build.
+- **On GitHub:** each build is a pre-release tagged `beta-<YYYYMMDD>-<sha>`,
+  titled like "EternalMonitor 0.3.4 beta (Oct 30, 2026)". The newest 7 are
+  kept. The pre-release `beta` always holds the newest, so this link never
+  changes:
+  https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe
+  Nothing here starts with `v`, so no build triggers the release or
+  TestFlight workflows, and none becomes GitHub's latest release.
+- **For support:** to give a customer a fix before its release, send
+  https://eternalmonitor.dev/download.html?channel=beta (the page shows the
+  build's version, date and commit) or the link above. Once the fix ships,
+  they get the release through the app as usual. iPad betas still come
+  through TestFlight, below.
+- **Run it by hand:** Actions, Beta builds, Run workflow. On main it publishes;
+  tick **dry_run**, or pick another branch, to build and scan without
+  publishing.
+
 ## Getting a tester onto the iPad app (TestFlight)
 
 A tester needs no Xcode and no developer account. They need the TestFlight
