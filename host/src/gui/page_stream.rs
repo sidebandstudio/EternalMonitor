@@ -21,7 +21,7 @@ impl AnalyzerApp {
         snap: &StatsSnapshot,
         client: &ClientSnapshot,
     ) {
-        self.notices(ui, snap);
+        self.notices(ui, snap, client);
         self.ipad_update_notice(ui, client);
         self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
@@ -53,12 +53,13 @@ impl AnalyzerApp {
     }
 
     /// Update, restart and fault notices, most urgent first.
-    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
             snap.apple_devices_installed,
+            client.on_usb(),
         ) {
             widgets::banner(ui, WARNING, Icon::Plug, title, body, 170.0, |ui| {
                 apple_devices_action(ui, snap.apple_devices_installed);
@@ -77,11 +78,7 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
-                if customized {
-                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
-                } else {
-                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
-                },
+                &software_fallback_body(customized, snap.nvidia_driver_outdated),
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
@@ -757,6 +754,22 @@ enum HeaderAction {
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
+
+/// What the CPU fallback notice says: undo custom settings first, say the
+/// NVIDIA driver is too old when that is what the graphics card refused, or
+/// suggest a driver update.
+pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
+    if customized {
+        "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
+    } else if nvidia_driver_outdated {
+        format!(
+            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, then click Restart.",
+            crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else {
+        "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
+    }
+}
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
@@ -1219,13 +1232,15 @@ fn apple_devices_action(ui: &mut Ui, installed: bool) {
 }
 
 /// The Stream page notice for an iPad on the cable that Windows cannot reach
-/// because Apple Devices is not running or not installed.
+/// because Apple Devices is not running or not installed. A session streaming
+/// over USB proves the cable works, so it silences the notice.
 pub(super) fn usb_cable_notice(
     reachable: bool,
     cabled: usize,
     installed: bool,
+    streaming_over_usb: bool,
 ) -> Option<(&'static str, &'static str)> {
-    if reachable || cabled == 0 {
+    if reachable || cabled == 0 || streaming_over_usb {
         return None;
     }
     Some(if installed {

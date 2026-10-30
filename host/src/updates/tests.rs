@@ -1127,6 +1127,23 @@ fn try_again_waits_for_the_launch_check_of_a_saved_release() {
 }
 
 #[test]
+fn a_worker_that_cannot_start_does_not_hold_the_saved_release() {
+    let now = 100_000;
+    let mut s = state(Saved {
+        latest: Some(release("0.3.2")),
+        checked_at: Some(now - RECHECK_OFFER),
+        ..Saved::default()
+    });
+    assert!(s.launch_check(now));
+    assert!(s.rechecking());
+    let s = Mutex::new(s);
+    start_worker(&s, || Err(std::io::Error::other("no threads left")));
+    let s = s.lock();
+    assert!(!s.rechecking());
+    assert_eq!(s.notice(now), Some(Notice::Available("0.3.2".into())));
+}
+
+#[test]
 fn update_now_while_streaming_can_be_forced_or_cancelled() {
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(release("0.3.2")));
@@ -1773,18 +1790,20 @@ fn the_failure_message_check_is_validated_and_bounded() {
         lookup.saved_offer().describe(),
         "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
     );
+    // Not before the deadline, and at it rather than at a later limit (the
+    // failure message's 3 s FAILURE_CHECK, ureq's 10 s connect timeout) or
+    // after a second wait as long as the first. 300 ms is left for a loaded
+    // runner to schedule the return, where 150 ms was tight.
+    let wait = Duration::from_secs(1);
     let started = Instant::now();
-    let deadline = started + Duration::from_millis(300);
+    let deadline = started + wait;
     let offer = lookup.finish_from(stuck.clone(), deadline);
     let took = started.elapsed();
     assert_eq!(
         offer.describe(),
         "Update offer on the failure message: offered version=0.3.9 source=saved fetch=failed"
     );
-    assert!(
-        took >= Duration::from_millis(300) && took < Duration::from_millis(450),
-        "{took:?}"
-    );
+    assert!(took >= wait && took < wait * 13 / 10, "{took:?}");
     // A deadline already past makes no request.
     assert!(fetch_by(stuck, Instant::now()).is_err());
     drop(silent);

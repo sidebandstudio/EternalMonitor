@@ -1,5 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -101,16 +102,23 @@ fn usb_row_says_to_open_or_install_apple_devices() {
 
 #[test]
 fn cable_notice_appears_only_for_a_plugged_in_ipad_without_the_service() {
-    assert_eq!(usb_cable_notice(true, 1, true), None);
-    assert_eq!(usb_cable_notice(false, 0, false), None);
+    assert_eq!(usb_cable_notice(true, 1, true, false), None);
+    assert_eq!(usb_cable_notice(false, 0, false, false), None);
 
-    let (title, body) = usb_cable_notice(false, 1, true).unwrap();
+    let (title, body) = usb_cable_notice(false, 1, true, false).unwrap();
     assert!(title.contains("Apple Devices is not running"), "{title}");
     assert!(body.contains("leave it running"), "{body}");
 
-    let (title, body) = usb_cable_notice(false, 2, false).unwrap();
+    let (title, body) = usb_cable_notice(false, 2, false, false).unwrap();
     assert!(title.contains("Apple Devices is not installed"), "{title}");
     assert!(body.contains("Microsoft Store"), "{body}");
+}
+
+#[test]
+fn cable_notice_stays_hidden_while_an_ipad_streams_over_usb() {
+    // A missed service poll during a USB session is not a broken cable.
+    assert_eq!(usb_cable_notice(false, 1, true, true), None);
+    assert_eq!(usb_cable_notice(false, 1, false, true), None);
 }
 
 #[test]
@@ -304,11 +312,30 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
     assert_eq!(CAPTURE_AUTO_LABEL, "Mirror my screen");
     assert_eq!(CAPTURE_VIRTUAL_LABEL, "Second screen");
     for (_, body) in [
-        usb_cable_notice(false, 1, true).unwrap(),
-        usb_cable_notice(false, 1, false).unwrap(),
+        usb_cable_notice(false, 1, true, false).unwrap(),
+        usb_cable_notice(false, 1, false, false).unwrap(),
     ] {
         assert!(body.contains("Wi-Fi") && !body.contains("WiFi"), "{body}");
     }
+}
+
+#[test]
+fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
+    let body = software_fallback_body(false, true);
+    assert!(
+        body.contains("NVIDIA driver to version 570 or newer"),
+        "{body}"
+    );
+    assert!(body.contains("Restart"), "{body}");
+    for jargon in ["NVENC", "API", "libx264", "encoder", "http"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // Custom settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(true, true),
+        software_fallback_body(true, false)
+    );
+    assert!(!software_fallback_body(false, false).contains("570"));
 }
 
 #[test]

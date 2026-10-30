@@ -22,11 +22,14 @@ final class FramedLink: MediaLink {
     private var bufferedPackets: [Data] = []
     private var pendingSends: [Data] = []
     private var sending = false
+    private let record: (_ level: String, _ category: String, _ message: String) -> Void
 
     var controlQueue: DispatchQueue { queue }
 
-    init(connection: NWConnection) {
+    init(connection: NWConnection,
+         record: @escaping (String, String, String) -> Void = { SupportDiagnostics.shared.record($0, $1, $2) }) {
         self.connection = connection
+        self.record = record
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -45,15 +48,20 @@ final class FramedLink: MediaLink {
             queue.asyncAfter(deadline: .now() + .seconds(2), execute: deadline)
             connection.stateUpdateHandler = { [weak self, weak connection] state in
                 guard let self, let connection, self.connection === connection else { return }
-                switch state {
-                case .ready: self.receiveNext()
-                case .failed(let error):
-                    SupportDiagnostics.shared.record("error", "usb", "NWConnection failed: \(error)")
-                    self.fail(LinkError(.connectionFailed, "USB connection failed: \(error.localizedDescription)", underlying: error))
-                default: break
-                }
+                self.handle(state)
             }
             connection.start(queue: queue)
+        }
+    }
+
+    /// The connection's state, on the link's queue. A failure is logged once,
+    /// by `fail`.
+    func handle(_ state: NWConnection.State) {
+        switch state {
+        case .ready: receiveNext()
+        case .failed(let error):
+            fail(LinkError(.connectionFailed, "USB connection failed: \(error.localizedDescription)", underlying: error))
+        default: break
         }
     }
 
@@ -96,7 +104,6 @@ final class FramedLink: MediaLink {
             guard let self, let connection, self.connection === connection else { return }
             self.sending = false
             if let error {
-                SupportDiagnostics.shared.record("error", "usb", "NWConnection send: \(error)")
                 self.fail(LinkError(.send, "USB send failed: \(error.localizedDescription)", underlying: error))
             }
             else { self.sendNext() }
@@ -166,7 +173,7 @@ final class FramedLink: MediaLink {
         guard connection != nil else { return }
         // The connection that took this link logs the failure with its state;
         // a link still waiting for its preamble logs it here.
-        if let onError { onError(error) } else { SupportDiagnostics.shared.record("error", "usb", error.message) }
+        if let onError { onError(error) } else { record("error", "usb", error.message) }
         finish()
     }
 

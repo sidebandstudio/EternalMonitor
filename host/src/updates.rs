@@ -1751,12 +1751,11 @@ impl Updater {
             session,
             wake,
         };
-        if let Err(error) = std::thread::Builder::new()
-            .name("updates".into())
-            .spawn(move || worker.run(rx))
-        {
-            tracing::warn!(%error, "Could not start the update worker");
-        }
+        start_worker(&state, || {
+            std::thread::Builder::new()
+                .name("updates".into())
+                .spawn(move || worker.run(rx))
+        });
         let in_place = std::env::current_exe()
             .is_ok_and(|exe| installs_in_place(&exe, install_dir().as_deref()));
         Self {
@@ -1871,6 +1870,18 @@ impl Updater {
         let ready = self.with(|state| state.take_ready(streaming));
         self.send(ready.map(|(path, release)| Command::Install(path, release)));
         self.with(|state| std::mem::take(&mut state.close))
+    }
+}
+
+/// Without a worker the launch check never answers, so the saved release is
+/// offered as it is offline instead of waiting for that check for good.
+fn start_worker(
+    state: &Mutex<State>,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) {
+    if let Err(error) = spawn() {
+        tracing::warn!(%error, "Could not start the update worker");
+        state.lock().recheck = false;
     }
 }
 
