@@ -439,6 +439,22 @@
     // html.channel-beta shows the Beta card and the night sky (style.css). The
     // inline script in <head> sets it before first paint for ?channel=beta.
     var root = document.documentElement, switchTimer = 0;
+
+    // The sky's animations pause while nobody can see them (.sky-paused).
+    var sky = document.querySelector('.night-sky');
+    if (sky) {
+      var skyInView = true;
+      var pauseSky = function () { root.classList.toggle('sky-paused', document.hidden || !skyInView); };
+      document.addEventListener('visibilitychange', pauseSky);
+      if ('IntersectionObserver' in window) {
+        new IntersectionObserver(function (entries) {
+          skyInView = entries[entries.length - 1].isIntersecting;
+          pauseSky();
+        }).observe(sky);
+      }
+      pauseSky();
+    }
+
     var showChannel = function (channel) {
       var beta = channel === 'beta';
       if (beta && !root.classList.contains('night-ready')) {
