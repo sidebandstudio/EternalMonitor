@@ -128,10 +128,9 @@ class WorkflowSecretsTest(unittest.TestCase):
         installer = (WORKFLOWS / "beta-installer.yml").read_text()
         self.assertIn("workflow_call:", installer)
         self.assertNotIn("pull_request:", installer)
-        # The installer's build job asks for an OIDC token for signing. A called
-        # workflow gets at most its caller's permissions, so the trusted caller
-        # grants id-token and the pull request caller grants only contents: read.
-        self.assertEqual(permissions(jobs(installer)["build"]), {"contents": "read", "id-token": "write"})
+        # The installer sets no permissions, so it runs with its caller's grant:
+        # an OIDC token for signing from the trusted caller, none for a pull request.
+        self.assertNotRegex(installer, r"(?m)^ *permissions:")
         self.assertEqual(permissions(callers["build"]), {"contents": "read", "id-token": "write"})
         self.assertEqual(permissions(callers["check"]), {"contents": "read"})
         self.assertNotIn("secrets:", callers["check"])

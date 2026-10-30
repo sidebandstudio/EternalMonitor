@@ -3,9 +3,11 @@ name: Beta installer
 # The Windows installer build of nightly.yml, as release.yml builds it. The
 # scheduled and manual runs call it with the repository's secrets; a pull
 # request runs its own code here, so it calls it with none and no OIDC token,
-# and every secret below is empty (scripts/test_workflow_secrets.py). The build
-# job asks for id-token: write, but a called workflow never gets more than its
-# caller grants, so only the trusted caller's run can sign.
+# and every secret below is empty (scripts/test_workflow_secrets.py). There is
+# no permissions: here, so the build runs with exactly what its caller grants:
+# id-token: write for signing from the trusted caller, contents: read alone from
+# the pull request one. (A called job that asks for more than its caller grants
+# fails the whole run at startup.)
 on:
   workflow_call:
     inputs:
@@ -21,8 +23,6 @@ on:
     outputs:
       sha256:
         value: ${{ jobs.build.outputs.sha256 }}
-
-permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,11 +43,6 @@ jobs:
     # As in release.yml: the release environment holds the Artifact Signing
     # settings (docs/windows-signing.md) and only runs on main use it.
     environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
-    permissions:
-      contents: read
-      # Lets azure/login exchange the run's OIDC token for Artifact Signing
-      # access; capped at what the caller grants.
-      id-token: write
     outputs:
       sha256: ${{ steps.hash.outputs.sha256 }}
     env:
