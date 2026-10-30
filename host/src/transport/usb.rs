@@ -101,10 +101,7 @@ impl UsbHub {
     /// that are already open, so the first heartbeat can reach them.
     fn subscribe(&self, force_idr: &Arc<AtomicBool>) -> Subscription {
         let (tx, rx) = mpsc::channel(256);
-        let key: SourceKey = (
-            std::env::var("ETERNAL_USB_DIRECT").ok(),
-            Arc::as_ptr(force_idr) as usize,
-        );
+        let key: SourceKey = (direct_endpoint(), Arc::as_ptr(force_idr) as usize);
         let mut state = self.state.lock();
         if state
             .supervisor
@@ -433,8 +430,32 @@ async fn device_worker(source: Source, events: mpsc::Sender<UsbEvent>, force_idr
     }
 }
 
+/// Which builds obey `ETERNAL_USB_DIRECT`: debug builds and builds with
+/// the `usb-direct` feature. A function of the two flags, so a debug test
+/// can check the release combination too.
+const fn direct_allowed(debug_assertions: bool, usb_direct: bool) -> bool {
+    debug_assertions || usb_direct
+}
+
+/// Decided at compile time; a release build drops the read below.
+const DIRECT_ALLOWED: bool = direct_allowed(cfg!(debug_assertions), cfg!(feature = "usb-direct"));
+
+/// `ETERNAL_USB_DIRECT`: a test's TCP endpoint in place of the USB tunnels,
+/// where this build allows one.
+fn direct_endpoint() -> Option<String> {
+    direct_value(DIRECT_ALLOWED, || std::env::var("ETERNAL_USB_DIRECT").ok())
+}
+
+fn direct_value(allowed: bool, requested: impl FnOnce() -> Option<String>) -> Option<String> {
+    if allowed {
+        requested()
+    } else {
+        None
+    }
+}
+
 async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
-    if let Ok(address) = std::env::var("ETERNAL_USB_DIRECT") {
+    if let Some(address) = direct_endpoint() {
         {
             let mut stats = PIPELINE_STATS.lock();
             stats.usb_service_reachable = true;
@@ -493,5 +514,40 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
             }
             _ = workers.join_next(), if !workers.is_empty() => {},
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_debug_and_usb_direct_builds_read_the_direct_endpoint() {
+        // A release build: no debug assertions, no feature.
+        assert!(!direct_allowed(false, false));
+        assert!(direct_allowed(true, false));
+        assert!(direct_allowed(false, true));
+        assert!(direct_allowed(true, true));
+        assert_eq!(
+            DIRECT_ALLOWED,
+            cfg!(debug_assertions) || cfg!(feature = "usb-direct")
+        );
+        // Not allowed: the variable is not even read.
+        let requested = || -> Option<String> { panic!("read in a build that ignores it") };
+        assert_eq!(direct_value(false, requested), None);
+        assert_eq!(
+            direct_value(true, || Some("127.0.0.1:0".into())).as_deref(),
+            Some("127.0.0.1:0")
+        );
+        assert_eq!(direct_value(true, || None), None);
+    }
+
+    /// `cargo test --release` runs this; other builds may use the endpoint.
+    #[cfg(not(any(debug_assertions, feature = "usb-direct")))]
+    #[test]
+    fn release_builds_ignore_the_direct_endpoint() {
+        std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:9");
+        assert_eq!(direct_endpoint(), None);
+        std::env::remove_var("ETERNAL_USB_DIRECT");
     }
 }
