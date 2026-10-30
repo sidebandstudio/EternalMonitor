@@ -4,28 +4,10 @@ import XCTest
 /// input and the keyboard bar do not: a tap on the left of the iPad clicks
 /// the left of the PC.
 final class RightToLeftInputTests: UITestCase {
-    /// Arabic chosen in the app on an English iPad. Switching back to
-    /// English in Settings relabels the keyboard bar already built.
+    /// Arabic chosen in the app on an English iPad. A switch made while the
+    /// keyboard bar exists is covered by KeyboardBarLanguageTests.
     func testArabicMirrorsControlsButNotInput() throws {
-        let app = try checkArabic(["-appLanguage", "ar"], shot: "arabic-stream")
-        let done = app.buttons["keyboard.done"]
-        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: done)
-        waitForExpectations(timeout: 5)
-        app.tapHUDControl("display.settings", until: app.buttons["settings.done"], reveal: .threeFingersTogether)
-        let picker = app.buttons["settings.language"]
-        XCTAssertTrue(app.swipeUp(toReveal: picker))
-        picker.tap()
-        // The menu slides in from the mirrored side; tap once it has landed.
-        XCTAssertTrue(app.chooseMenuItem("English"), app.debugDescription)
-        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5), app.debugDescription)
-        app.buttons["settings.done"].tap()
-        app.tapHUDControl("display.keyboard", until: done, reveal: .threeFingersTogether)
-        XCTAssertEqual(done.label, "Done")
-        let control = app.buttons["keyboard.key.224"]
-        control.tap()
-        XCTAssertEqual(control.value as? String, "On")
-        control.tap()
-        done.tap()
+        try checkArabic(["-appLanguage", "ar"], shot: "arabic-stream")
     }
 
     /// An iPad set to Arabic, the app following it. UIKit then runs right
@@ -35,9 +17,7 @@ final class RightToLeftInputTests: UITestCase {
                         shot: "system-arabic-stream")
     }
 
-    /// Leaves the app running, connected, with the keyboard bar closed.
-    @discardableResult
-    private func checkArabic(_ language: [String], shot name: String) throws -> XCUIApplication {
+    private func checkArabic(_ language: [String], shot name: String) throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         let environment = ProcessInfo.processInfo.environment
@@ -115,6 +95,5 @@ final class RightToLeftInputTests: UITestCase {
         bar.lifetime = .keepAlways
         add(bar)
         done.tap()
-        return app
     }
 }

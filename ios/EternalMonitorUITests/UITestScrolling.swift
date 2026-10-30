@@ -34,7 +34,8 @@ extension XCUIApplication {
     /// A snapshot reports the frame without that check: the item is tapped
     /// at its centre once it lies inside the window and holds still for two
     /// polls. Tapped once only: a second tap on a closing menu would land on
-    /// the row under it.
+    /// the row under it. Over a live stream CI's polls never saw the item
+    /// hold still, so it is for screens with nothing streaming.
     func chooseMenuItem(_ label: String, timeout: TimeInterval = 10) -> Bool {
         let item = buttons[label]
         let window = frame

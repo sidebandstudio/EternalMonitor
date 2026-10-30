@@ -171,3 +171,48 @@ final class RightToLeftMappingTests: XCTestCase {
         XCTAssertEqual(right.x, 0.9, accuracy: 0.01)
     }
 }
+
+/// A language switch relabels a keyboard bar that is already built:
+/// TouchRelayView calls `updateLanguage()` when the language changes.
+@MainActor
+final class KeyboardBarLanguageTests: XCTestCase {
+    override func tearDown() {
+        LanguageStore.shared.choice = nil
+        super.tearDown()
+    }
+
+    private func button(_ identifier: String, in view: UIView) -> UIButton? {
+        if let button = view as? UIButton, button.accessibilityIdentifier == identifier { return button }
+        return view.subviews.lazy.compactMap { self.button(identifier, in: $0) }.first
+    }
+
+    func testSwitchRelabelsTheBuiltBar() throws {
+        LanguageStore.shared.choice = .en
+        let relay = RelayTouchUIView()
+        relay.keyboardSupported = true
+        // Without a sink `onEvents?(…)` skips the toggle it would send.
+        relay.onEvents = { _ in }
+        relay.updateLanguage()
+        let input = try XCTUnwrap(relay.subviews.lazy.compactMap { $0 as? RelayKeyboardInputView }.first)
+        let bar = try XCTUnwrap(input.inputAccessoryView)
+        let done = try XCTUnwrap(button("keyboard.done", in: bar))
+        let control = try XCTUnwrap(button("keyboard.key.224", in: bar))
+        let alt = try XCTUnwrap(button("keyboard.key.226", in: bar))
+        relay.toggleRemoteModifier(0xe0)
+        XCTAssertEqual(done.configuration?.title, "Done")
+        XCTAssertEqual(control.accessibilityValue, "On")
+        XCTAssertEqual(alt.accessibilityValue, "Off")
+
+        LanguageStore.shared.choice = .ar
+        relay.updateLanguage()
+        XCTAssertEqual(done.configuration?.title, "تم")
+        XCTAssertEqual(control.accessibilityValue, "قيد التشغيل")
+        XCTAssertEqual(alt.accessibilityValue, "متوقف")
+
+        LanguageStore.shared.choice = .en
+        relay.updateLanguage()
+        XCTAssertEqual(done.configuration?.title, "Done")
+        XCTAssertEqual(control.accessibilityValue, "On")
+        XCTAssertEqual(alt.accessibilityValue, "Off")
+    }
+}
