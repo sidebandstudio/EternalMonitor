@@ -13,18 +13,74 @@ final class SupportDiagnosticsTests: XCTestCase {
 
     func testUploadsLeaveOutThePCNameButTheReportKeepsIt() async throws {
         let line = "Session 5 established with MARIA-DESKTOP"
-        XCTAssertEqual(SupportDiagnostics.redactForUpload(line), "Session 5 established with %COMPUTERNAME%")
-        XCTAssertEqual(SupportDiagnostics.redactForUpload("Session 5 established with Maria's PC token=x"),
+        XCTAssertEqual(SupportDiagnostics.redactForUpload(line, category: "ctrl"), "Session 5 established with %COMPUTERNAME%")
+        XCTAssertEqual(SupportDiagnostics.redactForUpload("Session 5 established with Maria's PC token=x", category: "ctrl"),
                        "Session 5 established with %COMPUTERNAME%")
+        // ConnectionManager's line ends the name at its own last session_id=.
+        let connected = "Connected to Zoe session_id=1 owner=Zoe Chen session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()"
+        XCTAssertEqual(SupportDiagnostics.redactForUpload(connected, category: "ctrl"),
+                       "Connected to %COMPUTERNAME% session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()")
         for other in ["HELLO2 attempt 1/4 to 192.0.2.7:9876", "model=iPad hardware=iPad16,5"] {
-            XCTAssertEqual(SupportDiagnostics.redactForUpload(other), other)
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(other, category: "ctrl"), other)
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = SupportDiagnostics(directory: directory)
         store.record("info", "ctrl", line)
+        store.record("info", "ctrl", connected)
         let report = await store.report()
-        XCTAssertTrue(report.contains(line), report)
+        XCTAssertTrue(report.contains(line) && report.contains(connected), report)
+    }
+
+    func testASeenPCNameLeavesEveryUploadedLine() {
+        let name = #"Zoë's "Big" PC (2)"#
+        SupportDiagnostics.notePCName(name)
+        for (line, uploaded) in [
+            (#"Paired with zoë's "big" pc (2) at 192.0.2.7"#, "Paired with %COMPUTERNAME% at 192.0.2.7"),
+            (#"Connection lost (Zoë's "Big" PC (2) stopped answering)"#, "Connection lost (%COMPUTERNAME% stopped answering)"),
+        ] {
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(line, category: "ctrl"), uploaded)
+        }
+        // A typed name, with and without its domain; addresses stay.
+        for address in ["studio-quinn.local", "192.0.2.7", "fe80::1%en0", "[2001:db8::1]"] {
+            SupportDiagnostics.noteTypedAddress(address)
+        }
+        for (line, uploaded) in [
+            ("Starting connection transport=WiFi to studio-quinn.local:9876 drawing=false",
+             "Starting connection transport=WiFi to %COMPUTERNAME%:9876 drawing=false"),
+            ("Cannot resolve STUDIO-QUINN: nodename nor servname provided", "Cannot resolve %COMPUTERNAME%: nodename nor servname provided"),
+            // Another PC, a field name, and the addresses.
+            ("studio-quinn-2 studio-quinn=1 HELLO2 attempt 1/4 to 192.0.2.7:9876 fe80::1%en0 [2001:db8::1]",
+             "studio-quinn-2 studio-quinn=1 HELLO2 attempt 1/4 to 192.0.2.7:9876 fe80::1%en0 [2001:db8::1]"),
+        ] {
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(line, category: "connection"), uploaded)
+        }
+        // A session summary uploads as written (#111).
+        let summary = "session_summary v=1 role=ipad session_id=5 hw=studio-quinn"
+        XCTAssertEqual(SupportDiagnostics.redactForUpload(summary, category: "summary"), summary)
+    }
+
+    func testAnAcceptedPCNameLeavesUploadedLines() async throws {
+        let queue = DispatchQueue(label: "pc-name-test")
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        let channel = ControlChannel(queue: queue) { continuation.yield($0) }
+        defer { channel.stop(); continuation.finish() }
+        let identity = ControlChannel.ClientIdentity(deviceName: "Test iPad", screenPxW: 640, screenPxH: 360,
+            screenPtW: 640, screenPtH: 360, refreshHz: 60, authToken: Data(1...16))
+        channel.startHandshake(listenPort: 50000, identity: identity)
+        var messages = stream.makeAsyncIterator()
+        let sent = await messages.next()
+        guard case .hello2(let hello) = try XCTUnwrap(Wire.parseControl(XCTUnwrap(sent))).message else {
+            return XCTFail("missing handshake")
+        }
+        let ack = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
+            status: .ok, acceptedVersion: 2, clientNonce: hello.clientNonce, sessionId: 41,
+            heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
+            streamConfig: StreamConfig(), hostName: "RIVER-OFFICE", authToken: Data(17...32), hostCaps: 0)))
+        queue.sync { channel.handleControl(ack) }
+        XCTAssertEqual(channel.currentSessionId, 41)
+        XCTAssertEqual(SupportDiagnostics.redactForUpload("USB: connected to River-Office", category: "usb"),
+                       "USB: connected to %COMPUTERNAME%")
     }
 
     func testReportSurvivesRelaunchIncludesLatestErrorAndExportsAFile() async throws {

@@ -104,7 +104,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     func record(level: String, category: String, message: String, timestamp: Date) {
         guard configured, enabled else { return }
         guard capacity.wait(timeout: .now()) == .success else { lossLock.lock(); dropped += 1; lossLock.unlock(); return }
-        let message = SupportDiagnostics.redactForUpload(String(decoding: message.utf8.prefix(8192), as: UTF8.self))
+        let message = SupportDiagnostics.redactForUpload(String(decoding: message.utf8.prefix(8192), as: UTF8.self), category: category)
         queue.async {
             defer { self.capacity.signal() }
             guard self.enabled else { return }

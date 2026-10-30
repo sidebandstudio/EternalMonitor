@@ -660,10 +660,17 @@ mod tests {
             current_line: Vec::new(),
             repeats: Some(Default::default()),
         };
-        let line = "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
-                    device=Headphones (Maria's AirPods) rate=48000 channels=2";
-        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
-        assert_eq!(shared.lock().iter().collect::<Vec<_>>(), [line]);
+        let lines = [
+            "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+             device=Headphones (Maria's AirPods) rate=48000 channels=2",
+            "2026-10-30T09:12:00.223456Z  INFO PC audio session started (Opus, 48 kHz stereo, 20 ms) \
+             session_id=5 device=\"Headphones (Maria's AirPods)\" bitrate=96000",
+        ];
+        for line in lines {
+            writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+            assert!(!crate::telemetry::uploaded(line).contains("Maria"));
+        }
+        assert_eq!(shared.lock().iter().collect::<Vec<_>>(), lines);
     }
 
     #[test]

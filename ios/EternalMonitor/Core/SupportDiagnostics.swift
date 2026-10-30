@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import UIKit
 import VideoToolbox
 import os
@@ -137,14 +138,52 @@ final class SupportDiagnostics: @unchecked Sendable {
     }
 
     /// The PC's name, from its HELLO_ACK, often names its owner ("MARIA-DESKTOP"). Uploads leave it out
-    /// as the Windows app's do; this iPad's log and report keep it.
-    private static let pcNamePattern = try! NSRegularExpression(
-        pattern: #"^(Session \d+ established with ).*$"#, options: .dotMatchesLineSeparators)
+    /// as the Windows app's do; this iPad's log and report keep it. The lines that log it end it at
+    /// their own last field, so a name holding `session_id=` goes whole.
+    private static let pcNameLines = [
+        (#"^(Session \d+ established with ).*$"#, "$1%COMPUTERNAME%"),
+        (#"^(Connected to ).*( session_id=\d+ host_caps=)"#, "$1%COMPUTERNAME%$2"),
+    ].map { (try! NSRegularExpression(pattern: $0.0, options: .dotMatchesLineSeparators), $0.1) }
 
-    static func redactForUpload(_ text: String) -> String {
-        let text = redact(text)
-        return pcNamePattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
-            withTemplate: "$1%COMPUTERNAME%")
+    /// PC names seen this run, longest first: each HELLO_ACK's and each typed Address that isn't an
+    /// IP address. Uploads replace them anywhere, except inside a longer word or as a field name.
+    private static let pcNames = OSAllocatedUnfairLock(initialState: [(name: String, pattern: NSRegularExpression)]())
+
+    /// Call it before logging `name`. Names shorter than 3 characters stay, as on Windows.
+    static func notePCName(_ name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.count >= 3 else { return }
+        let pattern = try! NSRegularExpression(
+            pattern: #"(?<![\p{L}\p{N}_-])"# + NSRegularExpression.escapedPattern(for: name) + #"(?![\p{L}\p{N}_=-])"#,
+            options: .caseInsensitive)
+        pcNames.withLock { names in
+            guard names.count < 32, !names.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else { return }
+            names.append((name, pattern))
+            names.sort { $0.name.count > $1.name.count }
+        }
+    }
+
+    /// A typed Address names the PC unless it is an IP address.
+    static func noteTypedAddress(_ host: String) {
+        guard !host.contains(":"), IPv4Address(host) == nil else { return }
+        notePCName(host)
+        // The bare name of `maria-desktop.local`.
+        if let label = host.split(separator: ".").first, label.count < host.count { notePCName(String(label)) }
+    }
+
+    /// A session summary uploads as written: its tokens are the backend's contract (#111).
+    static func redactForUpload(_ text: String, category: String) -> String {
+        var text = redact(text)
+        guard category != "summary" else { return text }
+        for (pattern, template) in pcNameLines {
+            text = pattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
+                withTemplate: template)
+        }
+        for (_, pattern) in pcNames.withLock({ $0 }) {
+            text = pattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
+                withTemplate: "%COMPUTERNAME%")
+        }
+        return text
     }
 
     @MainActor

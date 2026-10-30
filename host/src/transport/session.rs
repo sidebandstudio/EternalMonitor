@@ -510,6 +510,7 @@ impl Session {
 
         actions.ended = self.end(EndReason::Superseded, now);
         let session_id = self.allocate_session_id();
+        crate::telemetry::note_client_device(&hello.device_name);
         info!(
             peer = %source,
             session_id,
@@ -962,6 +963,30 @@ mod tests {
         hello.device_id = device_id;
         hello.feature_caps = FEATURE_SUPPORTS_NACK;
         ControlMessage::Hello2(hello)
+    }
+
+    /// Uploads leave the iPad's name out of every line, once its HELLO is
+    /// accepted (`telemetry::note_client_device`).
+    #[test]
+    fn an_accepted_ipad_name_leaves_uploads() {
+        let ControlMessage::Hello2(mut named) = hello(1, 50000) else {
+            unreachable!()
+        };
+        named.device_name = "Zoë's iPad mini".to_string();
+        let mut session = Session::new(100);
+        let wifi = addr([10, 0, 0, 5], 50000);
+        session.handle_control(
+            wifi,
+            0,
+            ControlMessage::Hello2(named),
+            &TestConfig,
+            Instant::now(),
+        );
+        assert!(session.session_id().is_some());
+        assert_eq!(
+            crate::telemetry::uploaded("Stream for Zoë's iPad mini ended"),
+            "Stream for <device-name> ended"
+        );
     }
 
     #[test]

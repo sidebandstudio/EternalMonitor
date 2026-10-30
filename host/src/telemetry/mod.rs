@@ -14,6 +14,9 @@ use std::{
 mod periodic;
 mod redact;
 use periodic::Periodic;
+#[cfg(windows)]
+pub(crate) use redact::note_audio_device;
+pub(crate) use redact::note_client_device;
 
 const MAX_FILES: usize = 512;
 /// The longest line or message that uploads. Redaction slows down faster
@@ -561,8 +564,13 @@ pub(crate) fn session_summary(line: &str) -> Option<&str> {
         .strip_prefix("INFO ")
         .filter(|message| message.starts_with("session_summary v="))
 }
+/// What uploads say for `line`.
+#[cfg(test)]
+pub(crate) fn uploaded(line: &str) -> String {
+    event(line, level(line)).message
+}
 fn event(line: &str, level: &str) -> Event {
-    event_with(line, level, &redact::NAMES)
+    event_with(line, level, &redact::NAMES.read())
 }
 /// A session summary uploads as written. Other lines leave out the user's
 /// and the PC's names (see [`redact`]).
@@ -1642,13 +1650,14 @@ mod tests {
             summary.to_string(),
         ] {
             let uploaded = event(&line, level(&line));
-            // The iPad's name is left out (see `redact`).
+            // The iPad's name, the rest of its line, is left out (see `redact`).
+            let message = match line.split_once(" device=") {
+                Some((head, _)) => format!("{head} device=<device-name>"),
+                None => line.clone(),
+            };
             assert_eq!(
                 (uploaded.category.as_str(), uploaded.message),
-                (
-                    "host",
-                    line.replacen("\"x session_summary", "<device-name>", 1)
-                )
+                ("host", message)
             );
         }
     }

@@ -42,11 +42,23 @@ final class DiagnosticsUploadTests: XCTestCase {
         let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
         let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
         defer { upload.shutdown() }
-        upload.record(level: "info", category: "ctrl", message: "Session 5 established with MARIA-DESKTOP", timestamp: Date())
+        SupportDiagnostics.notePCName("ASH-DESKTOP")
+        for message in [
+            "Session 5 established with ASH-DESKTOP",
+            "Connected to ASH-DESKTOP session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()",
+            "Connection closed by ash-desktop before a picture",
+        ] {
+            upload.record(level: "info", category: "ctrl", message: message, timestamp: Date())
+        }
         _ = await upload.status()
-        let file = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first!
-        let batch = try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: file))
-        XCTAssertEqual(batch.events.map(\.message), ["Session 5 established with %COMPUTERNAME%"])
+        let events = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+            .flatMap { try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: $0)).events }
+        XCTAssertEqual(events.sorted { $0.sequence < $1.sequence }.map(\.message), [
+            "Session 5 established with %COMPUTERNAME%",
+            "Connected to %COMPUTERNAME% session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()",
+            "Connection closed by %COMPUTERNAME% before a picture",
+        ])
     }
 
     func testWrongAcknowledgementKeepsOutboxUntilMatchingRetry() async throws {
