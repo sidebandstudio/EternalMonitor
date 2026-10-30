@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- The EternalMonitor icon at night: the same three bars, lit by the moon. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#0b0f2e"/>
+      <stop offset="0.62" stop-color="#1c2163"/>
+      <stop offset="1" stop-color="#3a2a78"/>
+    </linearGradient>
+    <radialGradient id="haze" cx="0.82" cy="0.18" r="0.5">
+      <stop offset="0" stop-color="#c9d1ff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#c9d1ff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-80%" width="160%" height="260%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#sky)"/>
+  <rect width="256" height="256" rx="56" fill="url(#haze)"/>
+  <path d="M206 30a20 20 0 1 0 20 27 16 16 0 1 1-20-27z" fill="#eef1ff"/>
+  <g fill="#dfe4ff">
+    <circle cx="40" cy="40" r="2.6"/>
+    <circle cx="150" cy="28" r="2"/>
+    <circle cx="210" cy="120" r="2.2"/>
+    <circle cx="34" cy="206" r="2"/>
+    <circle cx="220" cy="214" r="2.6"/>
+  </g>
+  <g fill="#c4ccff" filter="url(#glow)">
+    <rect x="72" y="64" width="112" height="24" rx="2"/>
+    <rect x="72" y="116" width="98" height="24" rx="2"/>
+    <rect x="72" y="168" width="112" height="24" rx="2"/>
+  </g>
+</svg>

@@ -372,9 +372,8 @@
      release. Its link never changes; GitHub is asked only for the version,
      date, commit and SHA-256, kept for half an hour. */
   var channelLinks = document.querySelectorAll('[data-channel]');
-  var stableCard = document.getElementById('windows');
   var betaCard = document.getElementById('windows-beta');
-  if (channelLinks.length && stableCard && betaCard) {
+  if (channelLinks.length && betaCard) {
     var BETA_KEY = 'gh-beta-v1', BETA_TTL = 1800000;
     var betaLoaded = false;
     var betaBuild = document.getElementById('beta-build');
@@ -437,10 +436,17 @@
         .catch(function () { /* The card still links the newest Beta build. */ });
     };
 
+    // html.channel-beta shows the Beta card and the night sky (style.css). The
+    // inline script in <head> sets it before first paint for ?channel=beta.
+    var root = document.documentElement, switchTimer = 0;
     var showChannel = function (channel) {
       var beta = channel === 'beta';
-      stableCard.hidden = beta;
-      betaCard.hidden = !beta;
+      if (beta && !root.classList.contains('night-ready')) {
+        // Render the night layers at their day state first, so they fade in.
+        root.classList.add('night-ready');
+        void root.offsetWidth;
+      }
+      root.classList.toggle('channel-beta', beta);
       channelLinks.forEach(function (a) {
         if (a.getAttribute('data-channel') === channel) a.setAttribute('aria-current', 'page');
         else a.removeAttribute('aria-current');
@@ -452,8 +458,14 @@
     channelLinks.forEach(function (a) {
       a.addEventListener('click', function (e) {
         e.preventDefault();
+        var channel = a.getAttribute('data-channel');
+        if ((channel === 'beta') === root.classList.contains('channel-beta')) return;
         history.replaceState(null, '', a.getAttribute('href'));
-        showChannel(a.getAttribute('data-channel'));
+        // Lets the newly shown card ease in; the sky has its own transition.
+        root.classList.add('channel-switching');
+        clearTimeout(switchTimer);
+        switchTimer = setTimeout(function () { root.classList.remove('channel-switching'); }, 600);
+        showChannel(channel);
       });
     });
   }

@@ -864,6 +864,128 @@ small { font-size: 0.875rem; }
 .no-js .channel-switch { display: none; }
 .channel-note { margin-top: 14px; color: var(--muted); }
 .dl-all { margin-top: 20px; }
+
+/* --- Download page: the Beta channel at night ---------------------------------
+   html.channel-beta (set before first paint from ?channel=beta, then by the
+   switch) shows the Beta card and fades in a night sky. Every change animates
+   opacity or transform only, and only when motion is allowed. The night layers
+   are not rendered at all until html.night-ready (the first visit to Beta), so
+   Stable renders exactly as it did without them. */
+html:not(.channel-beta) #windows-beta,
+.channel-beta #windows { display: none; }
+
+.night-sky {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: -1;
+  height: 660px;
+  overflow: hidden;
+  display: none;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse 34% 26% at 6% 74%, rgba(70, 92, 230, 0.26), transparent 70%),
+    radial-gradient(ellipse 30% 24% at 96% 66%, rgba(146, 84, 222, 0.22), transparent 70%),
+    linear-gradient(180deg, #0a0d27 0%, #121848 38%, rgba(18, 24, 72, 0.55) 70%, rgba(10, 10, 11, 0) 100%);
+}
+.night-ready .night-sky { display: block; }
+.channel-beta .night-sky { opacity: 1; }
+/* A fixed field centred on the page, so the heading column always falls in the
+   part download.html leaves without stars. */
+.stars { position: absolute; top: 0; left: 50%; width: 2560px; max-width: none; height: 660px; margin-left: -1280px; }
+.moon {
+  position: absolute;
+  top: 92px;
+  right: 9%;
+  width: 104px;
+  height: 104px;
+  opacity: 0;
+  transform: translate3d(0, 36px, 0) rotate(-14deg);
+}
+.channel-beta .moon { opacity: 1; transform: none; }
+.shooting-star {
+  position: absolute;
+  top: 120px;
+  left: 62%;
+  width: 150px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #f4f5ff, rgba(244, 245, 255, 0));
+  opacity: 0;
+}
+
+.brand-mark { position: relative; display: inline-flex; }
+.brand-night { position: absolute; inset: 0; display: none; opacity: 0; }
+.night-ready .brand-night { display: block; }
+.channel-beta .brand-night { opacity: 1; }
+
+/* The cards and buttons the two channels share take on a moonlit tint. */
+.night-ready .dl-card { position: relative; }
+.night-ready .dl-card::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(165, 176, 255, 0.3);
+  background: linear-gradient(180deg, rgba(92, 104, 235, 0.09), rgba(92, 104, 235, 0) 55%);
+  pointer-events: none;
+  opacity: 0;
+}
+.channel-beta .dl-card::before { opacity: 1; }
+.night-ready .dl-card .btn-primary { position: relative; isolation: isolate; }
+.night-ready .dl-card .btn-primary::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: -1;
+  border-radius: inherit;
+  background: #c3cbff;
+  opacity: 0;
+}
+.channel-beta .dl-card .btn-primary::before { opacity: 1; }
+.channel-beta .dl-card .btn-primary:hover::before { background: #d9deff; }
+.channel-beta .channel-switch { border-color: rgba(165, 176, 255, 0.3); }
+.channel-beta .channel-switch a[aria-current] { background: #e4e8ff; color: #0b0f2e; }
+#windows-beta .badge-accent { background: rgba(195, 203, 255, 0.12); color: #c3cbff; border-color: rgba(195, 203, 255, 0.28); }
+#windows-beta .channel-note { color: #c9cff5; }
+#windows-beta .card-head .icon { color: #c3cbff; }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* About T3's pace: a quick start and a long settle, both ways. */
+  .night-sky, .brand-night, .dl-card::before, .dl-card .btn-primary::before {
+    transition: opacity 0.9s var(--ease-out);
+  }
+  .moon { transition: opacity 1.1s var(--ease-out) 0.15s, transform 1.4s var(--ease-out) 0.15s; }
+  .channel-beta .stars-b { animation: twinkle 4.2s ease-in-out infinite; }
+  .channel-beta .stars-c { animation: twinkle 6.6s ease-in-out -2.4s infinite; }
+  .channel-beta .shooting-star { animation: shoot 1.3s cubic-bezier(0.3, 0.1, 0.2, 1) 1.1s both; }
+  .channel-switching .dl-card:not(#ipad) { animation: card-in 0.5s var(--ease-out) both; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* An instant switch, not the site-wide 0.01 ms transition. */
+  .night-sky, .moon, .brand-night, .dl-card::before, .dl-card .btn-primary::before { transition: none !important; }
+}
+@keyframes twinkle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes shoot {
+  0% { opacity: 0; transform: translate3d(0, 0, 0) rotate(-24deg); }
+  12%, 60% { opacity: 1; }
+  100% { opacity: 0; transform: translate3d(-440px, 196px, 0) rotate(-24deg); }
+}
+@keyframes card-in {
+  from { opacity: 0; transform: translate3d(0, 10px, 0); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 760px) {
+  .night-sky { height: 520px; }
+  .moon { top: 74px; right: 5%; width: 68px; height: 68px; }
+  .shooting-star { top: 96px; left: 48%; width: 96px; }
+}
 .sha {
   margin-top: 18px;
   padding: 12px 14px;
