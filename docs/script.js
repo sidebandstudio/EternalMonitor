@@ -74,26 +74,6 @@
     reveals.forEach(function (el) { el.classList.add('visible'); });
   }
 
-  /* --- Feature switches play once -------------------------------------------
-     Without JS the switches rest on Second screen and Fill. With JS (and
-     motion allowed) each starts on the other option and flips the first
-     time it scrolls into view, so the change is seen; clicks work as before. */
-  if (!reducedMotion && 'IntersectionObserver' in window) {
-    [['mode-mirror', 'mode-second'], ['pic-fit', 'pic-fill']].forEach(function (pair) {
-      var from = document.getElementById(pair[0]), to = document.getElementById(pair[1]);
-      if (!from || !to) return;
-      var touched = false;
-      from.checked = true;
-      [from, to].forEach(function (el) { el.addEventListener('change', function () { touched = true; }); });
-      var io = new IntersectionObserver(function (entries) {
-        if (!entries[0].isIntersecting) return;
-        io.disconnect();
-        setTimeout(function () { if (!touched) to.checked = true; }, 700);
-      }, { threshold: 0.35 });
-      io.observe(from.closest('.switch-demo'));
-    });
-  }
-
   /* --- Connection clip -------------------------------------------------------
      The short clip in How it works plays silently while it is in view,
      unless the visitor prefers reduced motion; the Play button covers both. */
