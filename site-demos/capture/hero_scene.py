@@ -236,7 +236,7 @@ for c in (col_ipad, col_cable, col_env):
     scene.collection.children.link(c)
 
 alu = material("alu", (0.55, 0.55, 0.57), metallic=1.0, roughness=0.36, aniso=0.2)
-alu_dock = material("alu-dock", (0.6, 0.6, 0.62), metallic=1.0, roughness=0.55)
+alu_dock = material("alu-dock", (0.17, 0.17, 0.18), metallic=1.0, roughness=0.42, aniso=0.2)
 glass = material("glass", (0.004, 0.004, 0.005), roughness=0.04, coat=1.0)
 camera_dot = material("camera-dot", (0.015, 0.018, 0.03), roughness=0.1, coat=1.0)
 screen = holdout("screen")
@@ -258,7 +258,8 @@ dot.location = (IPAD_W / 2 - 1.1, 0, IPAD_H - bz / 2 - 1.1)
 for obj in (body, glass_face, display, dot):
     obj.matrix_world = ipad_frame @ obj.matrix_basis
 
-# The dock: a low aluminium bar the iPad's bottom edge rests in.
+# The dock: a low graphite aluminium bar, the laptop's finish, that the iPad's
+# bottom edge rests in.
 dock_w, dock_d, dock_h = 150.0, 44.0, 16.0
 dock = box("dock", (dock_w, dock_d, dock_h), alu_dock, col_ipad, bevel=2.4)
 dock.location = (IPAD_LEFT + IPAD_W / 2, 8.0, dock_h / 2)

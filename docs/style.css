@@ -367,7 +367,8 @@ small { font-size: 0.875rem; }
 .rig-ipad .extend.on { transform: none; }
 .rig-cable { left: 48.911%; top: 52.857%; width: 16.131%; height: auto; transition: opacity 0.5s ease; }
 .stage[data-link="wifi"] .rig-cable { opacity: 0; }
-/* Over Wi-Fi: the cable is gone and a calm signal sits between the devices. */
+/* Over Wi-Fi: the cable is gone and a calm signal sits between the devices.
+   It ripples outward twice as it arrives, then rests, all within five seconds. */
 .rig-air {
   left: 53.6%; top: 46%; width: 3.4%; height: auto;
   fill: none; stroke: var(--text); stroke-width: 3.2; stroke-linecap: round;
@@ -376,11 +377,11 @@ small { font-size: 0.875rem; }
 .rig-air circle { fill: var(--text); stroke: none; }
 .stage[data-link="wifi"] .rig-air { opacity: 1; transform: none; }
 @media (prefers-reduced-motion: no-preference) {
-  .stage[data-link="wifi"] .rig-air path { animation: air 2.4s ease-in-out infinite; }
+  .stage[data-link="wifi"] .rig-air path { animation: air 2s ease-in-out 2; }
   .stage[data-link="wifi"] .rig-air .a2 { animation-delay: 0.25s; }
   .stage[data-link="wifi"] .rig-air .a3 { animation-delay: 0.5s; }
 }
-@keyframes air { 0%, 100% { opacity: 0.35; } 30% { opacity: 1; } 60% { opacity: 0.35; } }
+@keyframes air { 0%, 100% { opacity: 1; } 35% { opacity: 0.3; } }
 @media (prefers-reduced-motion: reduce) {
   .rig .scr, .rig-cable, .rig-air { transition-duration: 0.01s; }
 }
