@@ -24,8 +24,8 @@
       ],
       "renderer_rules": [
         {
-          "vendor": "intel",
-          "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+          "vendor": "nvidia",
+          "driver": { "min": "32.0.15.8000", "max": "32.0.15.8099" },
           "backend": "dx12"
         }
       ]

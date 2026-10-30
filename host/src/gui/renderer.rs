@@ -1027,10 +1027,20 @@ fn write_history(directory: &Path, history: &[Failure]) -> bool {
 }
 
 /// Whether the history saves now, as the next launch must save it to count a
-/// crash of this one. Saves it unchanged; false while another instance holds
-/// it.
+/// crash of this one: it reads, or is not there yet, and the file
+/// [`write_history`] writes first saves next to it. The history itself is left
+/// untouched, so one that can't be read now, or is in a newer version's
+/// format, is not replaced. False while another instance holds it.
 fn history_saves(directory: &Path) -> bool {
-    lock_history(directory).is_some_and(|_lock| write_history(directory, &read_history(directory)))
+    let Some(_lock) = lock_history(directory) else {
+        return false;
+    };
+    let reads = match fs::read(directory.join(HISTORY_FILE)) {
+        Ok(bytes) => serde_json::from_slice::<Vec<Failure>>(&bytes).is_ok(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let probe = directory.join(format!("history.{}.tmp", ProcessId::current()));
+    reads && fs::write(&probe, b"").is_ok() && fs::remove_file(&probe).is_ok()
 }
 
 /// Count markers left by exited launches as failures, with what the failure
@@ -2373,6 +2383,11 @@ mod tests {
         let directory = temp_dir("renderer-rule-guard");
         assert_eq!(guarded(Some(&directory)), (2, Some(Ok(2))));
         assert_eq!(started(&directory), Some(marker_of(2)));
+        // Checked with a probe file, which is removed; no history is written.
+        assert!(!directory.join(HISTORY_FILE).exists());
+        assert!(!directory
+            .join(format!("history.{}.tmp", ProcessId::current()))
+            .exists());
 
         // No app data folder, or one where nothing can be saved: pick() draws.
         assert_eq!(guarded(None), (0, Some(Err("no_marker"))));
@@ -2405,6 +2420,42 @@ mod tests {
         assert_eq!(started(&directory), Some(marker_of(0)));
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(unsaved).unwrap();
+    }
+
+    /// A history this launch can't read, as one in a newer version's format or
+    /// one it can't open now, is left as it is, and a rule is ignored.
+    #[test]
+    fn a_rule_leaves_a_history_it_cannot_read_untouched() {
+        let (candidates, gpus) = mainpc(&[]);
+        let rule = rules(serde_json::json!([{ "vendor": "nvidia", "backend": "dx12" }]));
+        let picked = pick(&candidates).unwrap();
+        let owner = ProcessId::current();
+        let guarded = |directory: &Path| {
+            let (index, ruled) = guard_rule(
+                apply_rule(&candidates, &gpus, picked, &rule, None),
+                picked,
+                Some(directory),
+                |index| {
+                    let backend = candidates[index].backend.to_str();
+                    save_marker(directory, owner, &marker(&gpus[index], backend))
+                },
+            );
+            (index, ruled.map(|(_, outcome)| outcome))
+        };
+
+        let directory = temp_dir("renderer-rule-unparsed");
+        let newer = br#"{"version":2,"failures":[{"gpu":"10de:2d59"}]}"#;
+        fs::write(directory.join(HISTORY_FILE), newer).unwrap();
+        assert_eq!(guarded(&directory), (0, Some(Err("no_marker"))));
+        assert_eq!(fs::read(directory.join(HISTORY_FILE)).unwrap(), newer);
+
+        // A read that fails (here a folder in its place) is not a missing file.
+        let unread = temp_dir("renderer-rule-unread");
+        fs::create_dir(unread.join(HISTORY_FILE)).unwrap();
+        assert_eq!(guarded(&unread), (0, Some(Err("no_marker"))));
+        assert!(unread.join(HISTORY_FILE).is_dir());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(unread).unwrap();
     }
 
     /// A crash is never forgotten because the history couldn't be saved: the

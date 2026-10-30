@@ -638,7 +638,7 @@ fn saved_renderer_rules_apply_until_the_config_does_not() {
     let applied = read(&path, START + DAY);
     let rules = applied.renderer_rules();
     assert_eq!(rules.len(), 1);
-    assert!(rules[0].matches(INTEL, "31.0.101.2111"));
+    assert!(rules[0].matches(NVIDIA, "32.0.15.8034"));
     assert_eq!(rules[0].backend, RendererBackend::Dx12);
     // The launch line is unchanged; the renderer logs its own.
     assert_eq!(

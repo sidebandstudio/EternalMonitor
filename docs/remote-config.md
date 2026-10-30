@@ -125,18 +125,27 @@ even if the state file can't be cleared yet.
 ### Window renderer rules
 
 A driver that crashes the PC's window at start can be steered to another
-backend without a release. Example: Intel driver 31.0.101.x crashes in
-Vulkan, so draw with DX12 there:
+backend without a release. Example: if NVIDIA drivers 32.0.15.8000 to
+32.0.15.8099 crashed the window in Vulkan, draw with DX12 there:
 
 ```json
 "renderer_rules": [
   {
-    "vendor": "intel",
-    "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+    "vendor": "nvidia",
+    "driver": { "min": "32.0.15.8000", "max": "32.0.15.8099" },
     "backend": "dx12"
   }
 ]
 ```
+
+A rule only has an effect when it names the backend the PC would not choose
+on its own. On its own, the PC draws on an AMD or NVIDIA card with Vulkan,
+and on an Intel card with DX12. It falls back to the other one where that
+backend isn't listed, lacks the window's features or failed before, and an
+Intel card with an identical second card uses Vulkan. So a useful rule is
+`amd` or `nvidia` → `dx12`, or `intel` → `vulkan`. `intel` → `dx12` and
+`amd` or `nvidia` → `vulkan` only restate the default: the PC already draws
+that way wherever the rule could.
 
 - `vendor` is `amd`, `intel` or `nvidia`.
 - `driver` is optional: a Windows driver version range with inclusive
@@ -184,7 +193,7 @@ itself to DX12), when the backend lacks the features the window needs
 model, or when the PC can't remember a crash under it: its start marker
 couldn't be saved, or its renderer history can't be (`no_marker`). Each
 launch logs one line when a rule names the card: `renderer_rule
-applied=intel:31.0.101.2111->dx12`, or `renderer_rule ignored
+applied=nvidia:32.0.15.8034->dx12`, or `renderer_rule ignored
 reason=env|choice|set_aside|unavailable|incapable|twin_gpus|no_marker
 rule=…`. Nothing else about the card is logged.
 
@@ -197,6 +206,16 @@ before. A launch that can't save the history keeps the marker, so a later
 one counts the crash. The record stays until that backend draws on that driver, the user
 resets crash avoidance in Troubleshooting, or the driver changes. A new
 driver the rule still names gets one try of its own.
+
+**A crash after the window started isn't remembered.** The start marker
+goes once the window has drawn for 3 seconds and 10 frames. A backend that
+crashes after that is not counted as a failed start, so a rule whose backend
+crashes later in a session keeps applying, and could crash the app on every
+launch. Write rules only for drivers that crash the window as it starts,
+and remove a rule from `latest.json` when field diagnostics show crashes
+later in sessions under it. Until the PC checks the manifest again, the user
+gets out by choosing another backend in Settings > Troubleshooting > Window
+drawing, which no rule overrides.
 
 The PC saves the manifest's values in `remote-config.json` after each check
 and applies them at the next launch for up to 14 days; with automatic
