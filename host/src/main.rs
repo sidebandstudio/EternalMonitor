@@ -281,6 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_sample = std::time::Instant::now();
         while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(250));
+            eternal_host::capture::second_screen::retry_saving(&gui_control.shared);
             if log_e2e && last_sample.elapsed() >= std::time::Duration::from_secs(1) {
                 last_sample = std::time::Instant::now();
                 let sample = stats::PIPELINE_STATS.lock();

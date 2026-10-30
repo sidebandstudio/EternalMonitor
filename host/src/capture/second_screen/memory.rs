@@ -583,7 +583,8 @@ enum Writer {
     Stopped,
     Running,
     /// Its thread could not start, `tries` times in a row, the last at `at`.
-    /// The files wait for [`Saver::retry_start`], or quitting writes them.
+    /// The files wait for [`Saver::retry_start`], or for quitting to start
+    /// it once more.
     Failed {
         tries: u32,
         at: Instant,
@@ -656,7 +657,7 @@ impl Saver {
                     tries: tries.saturating_add(1),
                     at: now,
                 };
-                // A quit waiting for the writer writes the files itself.
+                // A quit waiting for the writer gives up.
                 self.idle.notify_all();
             }
         }
@@ -705,6 +706,7 @@ impl Saver {
         saving.writer = Writer::Stopped;
     }
 
+    #[cfg_attr(not(any(windows, test, debug_assertions)), allow(dead_code))]
     fn write_one(&self, saving: &mut MutexGuard<'_, Saving>, job: Job) {
         saving.busy = true;
         let result = MutexGuard::unlocked(saving, || job.run());
@@ -719,23 +721,31 @@ impl Saver {
         saving.busy || !saving.jobs.is_empty()
     }
 
-    /// Wait up to `timeout` for every file asked for to be written. Whether
-    /// they were. Without a writer, they are written here, however long that
-    /// takes: the caller, quitting, holds no lock.
-    pub(crate) fn flush(&self, timeout: Duration) -> bool {
+    /// Wait up to `timeout` for every file asked for to be written. A writer
+    /// that could not start is started once more: the caller, quitting,
+    /// holds no lock. Never written here, as a write may take any time. Why
+    /// a file wasn't written: `timeout`, or `no_writer` if it still can't
+    /// start.
+    pub(crate) fn flush(self: &Arc<Self>, timeout: Duration) -> Result<(), &'static str> {
         let deadline = Instant::now() + timeout;
+        if !self.pending() {
+            return Ok(());
+        }
+        #[cfg(any(windows, test, debug_assertions))]
+        self.start(Instant::now());
         let mut saving = self.saving.lock();
         loop {
-            if !matches!(saving.writer, Writer::Running) {
-                while let Some(job) = saving.jobs.pop_front() {
-                    self.write_one(&mut saving, job);
-                }
-            }
             if !saving.busy && saving.jobs.is_empty() {
-                return true;
+                return Ok(());
+            }
+            if !matches!(saving.writer, Writer::Running) {
+                return Err("no_writer");
             }
             if self.idle.wait_until(&mut saving, deadline).timed_out() {
-                return !saving.busy && saving.jobs.is_empty();
+                return match !saving.busy && saving.jobs.is_empty() {
+                    true => Ok(()),
+                    false => Err("timeout"),
+                };
             }
         }
     }
@@ -967,7 +977,7 @@ mod tests {
                 .collect()
         };
         for saver in savers {
-            assert!(saver.flush(DISK_WAIT), "written");
+            assert_eq!(saver.flush(DISK_WAIT), Ok(()), "written");
         }
     }
 
@@ -2708,12 +2718,14 @@ mod tests {
         remove_folder(&path);
     }
 
-    /// Without a writer, quitting writes the files itself: it holds no lock.
+    /// The writer could not start when the memory loaded, and the second
+    /// screen's worker never ran to try again. Quitting, which holds no
+    /// lock, starts it once more, and waits for the file.
     #[test]
-    fn quitting_writes_the_record_when_the_writer_never_started() {
+    fn quitting_starts_a_writer_that_could_not_start() {
         use super::super::finish_saving_within;
-        let path = temp_file("quit-no-writer");
-        let (memory, start) = counted_run(&path, u32::MAX);
+        let path = temp_file("quit-late-writer");
+        let (memory, start) = counted_run(&path, 1);
         let shared = second_screen_with(memory);
         let hold = shared
             .second_screen
@@ -2722,8 +2734,82 @@ mod tests {
             .note_failure("no_frames", start);
         assert!(hold.is_some());
         assert!(!Path::exists(&path));
-        assert!(finish_saving_within(&shared, Duration::ZERO));
+        assert!(finish_saving_within(&shared, DISK_WAIT));
+        assert_eq!(starts(), 2);
         assert_eq!(read(&path).unwrap().unwrap().1, "no_frames");
+        remove_folder(&path);
+    }
+
+    /// No writer, and it still can't start at quit, on a disk that doesn't
+    /// answer: quitting never writes the file itself, which could keep a
+    /// windowless process alive for good. It returns within its wait and
+    /// logs the save it abandoned.
+    #[test]
+    fn quitting_without_a_writer_abandons_the_save() {
+        use super::super::finish_saving_within;
+        let path = temp_file("quit-no-writer");
+        let (memory, start) = counted_run(&path, u32::MAX);
+        let shared = second_screen_with(memory);
+        slow_disk(&shared);
+        let gate = gate(&path);
+        let hold = shared
+            .second_screen
+            .lock()
+            .memory
+            .note_failure("no_frames", start);
+        assert!(hold.is_some());
+        let wait = secs(2);
+        let (log, (written, waited)) = std::thread::scope(|scope| {
+            // A write here would wait for the disk until then.
+            scope.spawn(|| {
+                std::thread::sleep(wait + secs(3));
+                gate.open();
+            });
+            let quitting = Instant::now();
+            logs(|| (finish_saving_within(&shared, wait), quitting.elapsed()))
+        });
+        assert!(!written);
+        assert!(waited < wait, "{waited:?}");
+        assert_eq!(gate.writes(), 0, "nothing written at quit");
+        assert_eq!(starts(), 2, "started once more at quit");
+        assert!(
+            log.contains("Abandoned a pending save of the second screen record")
+                && log.contains("reason=no_writer"),
+            "{log}"
+        );
+        assert!(!Path::exists(&path));
+        drop(shared);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// In mirror mode the second screen's worker never runs. The writer
+    /// could not start, and moving to the mirror forgets a loaded failure:
+    /// its clear waits. The window's update loop, which holds no lock,
+    /// starts the writer after the first wait, and the file is cleared.
+    #[test]
+    fn the_window_starts_a_writer_that_could_not_start() {
+        use super::super::retry_saving_at;
+        let path = temp_file("window-retry");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start).unwrap();
+        written(&path);
+        drop(memory);
+        let (memory, start) = counted_run(&path, 1);
+        assert!(memory.saved(), "the failure loaded");
+        let shared = second_screen_with(memory);
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, start), Step::Nothing);
+        assert!(!shared.second_screen.lock().memory.saved());
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+        assert!(shared.vdd_worker.thread.lock().is_none(), "no worker");
+        assert!(Path::exists(&path), "the clear waits");
+        retry_saving_at(&shared, start + Duration::from_millis(900));
+        assert_eq!(starts(), 1, "the first wait is a second");
+        retry_saving_at(&shared, start + secs(1));
+        assert_eq!(starts(), 2);
+        assert!(!exists(&path), "cleared");
+        retry_saving_at(&shared, start + secs(120));
+        assert_eq!(starts(), 2, "running: never started again");
         remove_folder(&path);
     }
 
@@ -2787,7 +2873,8 @@ mod tests {
         assert!(!written);
         assert!(waited >= wait && waited < secs(5), "{waited:?}");
         assert!(
-            log.contains("The second screen record is still being written — quitting without it"),
+            log.contains("Abandoned a pending save of the second screen record")
+                && log.contains("reason=timeout"),
             "{log}"
         );
         drop(opens);

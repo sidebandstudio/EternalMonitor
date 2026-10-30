@@ -911,8 +911,10 @@ pub fn shut_down(shared: &SharedControl) {
 }
 
 /// Quitting, once the window is gone and the display is off: wait up to
-/// [`QUIT_SAVE_WAIT`] for the second screen record to be written, or write
-/// it here if its writer never started.
+/// [`QUIT_SAVE_WAIT`] for the second screen record to be written. A writer
+/// that could not start is tried once more; if it still can't, the record
+/// is left unwritten rather than written here, where a stalled disk would
+/// keep the process alive.
 pub fn finish_saving(shared: &SharedControl) {
     finish_saving_within(shared, QUIT_SAVE_WAIT);
 }
@@ -926,15 +928,18 @@ fn finish_saving_within(shared: &SharedControl, wait: Duration) -> bool {
     let started = Instant::now();
     let written = saver.flush(wait);
     let waited_ms = started.elapsed().as_millis() as u64;
-    if !written {
-        warn!(
+    match written {
+        Err(reason) => warn!(
             waited_ms,
-            "The second screen record is still being written — quitting without it"
-        );
-    } else if pending {
-        tracing::info!(waited_ms, "Wrote the second screen record before quitting");
+            reason = %reason,
+            "Abandoned a pending save of the second screen record — quitting without it"
+        ),
+        Ok(()) if pending => {
+            tracing::info!(waited_ms, "Wrote the second screen record before quitting")
+        }
+        Ok(()) => {}
     }
-    written
+    written.is_ok()
 }
 
 #[cfg(any(windows, test, debug_assertions))]
@@ -1000,6 +1005,30 @@ pub(crate) fn run(
 fn start_saving(shared: &SharedControl, now: Instant) -> Option<Instant> {
     let saver = shared.second_screen.lock().memory.saver()?;
     saver.retry_start(now)
+}
+
+/// The window's update loop, and the headless loop, call this at every
+/// pass: start the second screen record's writer if its thread could not
+/// start, once the wait after the last try is over. Those loops always run,
+/// unlike the second screen worker, and hold no lock here. The second
+/// screen's lock is only tried, so a transport holding it never holds up
+/// the window; the next pass tries again.
+pub fn retry_saving(shared: &SharedControl) {
+    #[cfg(any(windows, test, debug_assertions))]
+    retry_saving_at(shared, Instant::now());
+    #[cfg(not(any(windows, test, debug_assertions)))]
+    let _ = shared;
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+fn retry_saving_at(shared: &SharedControl, now: Instant) {
+    let saver = shared
+        .second_screen
+        .try_lock()
+        .and_then(|state| state.memory.saver());
+    if let Some(saver) = saver {
+        saver.retry_start(now);
+    }
 }
 
 /// What turning the display on needs from Windows, so tests can supply a
