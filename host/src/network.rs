@@ -598,6 +598,8 @@ mod tests {
         assert_eq!(listen_ip(&ListenOn::Tailscale, &[tailscale]), None);
     }
 
+    /// Test adapters exist in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_chosen_network_that_is_not_connected_listens_on_this_pc_only() {
         set_test_adapters(Some(vec![
