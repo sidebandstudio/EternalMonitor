@@ -582,7 +582,9 @@ impl AnalyzerApp {
             if let Some(home) = home_address(&self.address_hint, &snap.listen_addr) {
                 widgets::paragraph(
                     ui,
-                    muted(format!("If your iPad is on this PC's Wi-Fi, enter {home}.")),
+                    muted(format!(
+                        "If that doesn't connect and your iPad is on the same network as this PC, use {home} as the PC address."
+                    )),
                 );
             }
         } else {
@@ -1111,12 +1113,15 @@ pub(super) fn screen_mode_text(
     what + restart
 }
 
-/// The home network's address with the shown port, when the shown address
-/// is a VPN's or virtual switch's and the home network's is known.
-fn home_address(hints: &crate::network::HintCache, listen_addr: &str) -> Option<String> {
-    let (ip, port) = listen_addr.rsplit_once(':')?;
-    let home = hints.get(ip.parse().ok()?)?;
-    Some(format!("{home}:{port}"))
+/// The home network's address, without the port (the iPad has its own Port
+/// field), when the shown address is a VPN's or virtual switch's and the
+/// home network's is known.
+fn home_address(
+    hints: &crate::network::HintCache,
+    listen_addr: &str,
+) -> Option<std::net::Ipv4Addr> {
+    let (ip, _port) = listen_addr.rsplit_once(':')?;
+    hints.get(ip.parse().ok()?)
 }
 
 /// Overline label, a large monospaced value and trailing controls.

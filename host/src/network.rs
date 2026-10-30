@@ -11,6 +11,8 @@
 //! an adapter's name: uploads carry it, and adapter names can name the user
 //! or the PC.
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(any(windows, test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -240,21 +242,26 @@ impl HintCache {
             (hint, start)
         };
         if start {
-            let (list, state) = (self.list, self.state.clone());
-            let spawned = std::thread::Builder::new()
+            let (list, listing) = (self.list, Listing(self.state.clone()));
+            // A thread that can't start drops the closure, and with it the guard.
+            let _ = std::thread::Builder::new()
                 .name("address-hint".into())
                 .spawn(move || {
                     let hint = list().and_then(|adapters| home_hint(&adapters, shown));
-                    *state.lock() = HintState {
-                        checked: Some((shown, Instant::now(), hint)),
-                        listing: false,
-                    };
+                    listing.0.lock().checked = Some((shown, Instant::now(), hint));
                 });
-            if spawned.is_err() {
-                self.state.lock().listing = false;
-            }
         }
         hint
+    }
+}
+
+/// Ends a listing when dropped, so a worker that panics loses only that
+/// refresh and the next ask lists again.
+struct Listing(Arc<Mutex<HintState>>);
+
+impl Drop for Listing {
+    fn drop(&mut self) {
+        self.0.lock().listing = false;
     }
 }
 
@@ -330,23 +337,40 @@ pub fn adapters() -> Option<Vec<Adapter>> {
 /// Calls `list` with a buffer of `size` bytes, growing it to the size the
 /// call asks for at most three times: adapters that keep appearing must not
 /// keep the caller listing. u64 elements keep the structures aligned.
+/// The first failure in a row is a warning, the rest debug lines: the
+/// Stream page asks every 30 s.
 #[cfg(any(windows, test))]
-fn fill(mut list: impl FnMut(&mut [u64], &mut u32) -> u32) -> Option<Vec<u64>> {
+fn fill(
+    warned: &AtomicBool,
+    mut list: impl FnMut(&mut [u64], &mut u32) -> u32,
+) -> Option<Vec<u64>> {
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
     const GROWS: usize = 3;
     let mut size: u32 = 16 * 1024;
+    let mut code = None;
     for _ in 0..=GROWS {
         let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
         match list(&mut buffer, &mut size) {
-            0 => return Some(buffer),
+            0 => {
+                warned.store(false, Ordering::Relaxed);
+                return Some(buffer);
+            }
             ERROR_BUFFER_OVERFLOW => {}
-            code => {
-                tracing::warn!(code, "Could not list the network adapters");
-                return None;
+            failed => {
+                code = Some(failed);
+                break;
             }
         }
     }
-    tracing::warn!("Could not list the network adapters: the list kept growing");
+    let reason = match code {
+        Some(code) => format!("error {code}"),
+        None => "the list kept growing".to_string(),
+    };
+    if warned.swap(true, Ordering::Relaxed) {
+        tracing::debug!(%reason, "Could not list the network adapters");
+    } else {
+        tracing::warn!(%reason, "Could not list the network adapters");
+    }
     None
 }
 
@@ -365,7 +389,8 @@ pub fn adapters() -> Option<Vec<Adapter>> {
         | GAA_FLAG_SKIP_ANYCAST
         | GAA_FLAG_SKIP_MULTICAST
         | GAA_FLAG_SKIP_DNS_SERVER;
-    let buffer = fill(|buffer, size| unsafe {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let buffer = fill(&WARNED, |buffer, size| unsafe {
         GetAdaptersAddresses(
             AF_INET.0 as u32,
             flags,
@@ -416,7 +441,7 @@ pub fn adapters() -> Option<Vec<Adapter>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     fn adapter(kind: Kind, gateway: bool, ip: [u8; 4]) -> Adapter {
         Adapter {
@@ -712,8 +737,9 @@ mod tests {
     /// list, so no hint.
     #[test]
     fn listing_gives_up_after_three_bigger_buffers() {
+        let warned = AtomicBool::new(false);
         let mut calls = 0;
-        let listed = fill(|buffer, size| {
+        let listed = fill(&warned, |buffer, size| {
             calls += 1;
             assert!(buffer.len() * 8 >= *size as usize);
             *size += 4096;
@@ -723,7 +749,7 @@ mod tests {
         assert_eq!(calls, 4);
 
         let mut calls = 0;
-        let listed = fill(|_, size| {
+        let listed = fill(&warned, |_, size| {
             calls += 1;
             if calls < 4 {
                 *size = 64 * 1024;
@@ -733,7 +759,53 @@ mod tests {
             }
         });
         assert_eq!(listed.map(|buffer| buffer.len()), Some(64 * 1024 / 8));
-        assert_eq!(fill(|_, _| 232), None);
+        assert_eq!(fill(&warned, |_, _| 232), None);
+    }
+
+    #[derive(Clone, Default)]
+    struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.lock().push(*event.metadata().level());
+        }
+    }
+
+    /// Windows keeps failing while the Stream page asks every 30 s: one
+    /// warning, then debug lines, until a listing works again.
+    #[test]
+    fn repeated_failures_warn_once() {
+        use tracing::Level;
+        use tracing_subscriber::prelude::*;
+        let warned = AtomicBool::new(false);
+        let levels = Levels::default();
+        let subscriber = tracing_subscriber::registry().with(levels.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                assert_eq!(fill(&warned, |_, _| 232), None);
+            }
+            let growing = fill(&warned, |_, size| {
+                *size += 4096;
+                111
+            });
+            assert_eq!(growing, None);
+            assert!(fill(&warned, |_, _| 0).is_some());
+            assert_eq!(fill(&warned, |_, _| 232), None);
+        });
+        assert_eq!(
+            *levels.0.lock(),
+            [
+                Level::WARN,
+                Level::DEBUG,
+                Level::DEBUG,
+                Level::DEBUG,
+                Level::WARN
+            ]
+        );
     }
 
     fn wait_for(cache: &HintCache, shown: Ipv4Addr) -> Option<Ipv4Addr> {
@@ -759,8 +831,8 @@ mod tests {
     static GATED_THREAD: Mutex<Option<String>> = Mutex::new(None);
 
     fn gated() -> Option<Vec<Adapter>> {
-        GATED_CALLS.fetch_add(1, Ordering::SeqCst);
         *GATED_THREAD.lock() = std::thread::current().name().map(str::to_string);
+        GATED_CALLS.fetch_add(1, Ordering::SeqCst);
         let _open = GATE.lock();
         tailscale_and_wifi()
     }
@@ -818,6 +890,25 @@ mod tests {
         }
         assert_eq!(cache.get(wifi), None);
         assert_eq!(COUNTED_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    static PANICKY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn panics_once() -> Option<Vec<Adapter>> {
+        if PANICKY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("listing failed");
+        }
+        tailscale_and_wifi()
+    }
+
+    /// A listing that panics loses only that refresh: the next ask lists
+    /// again and gets the hint.
+    #[test]
+    fn a_panicking_listing_does_not_block_the_next() {
+        let cache = HintCache::with(panics_once, HINT_TTL);
+        let shown = ip([100, 80, 1, 2]);
+        assert_eq!(wait_for(&cache, shown), Some(ip([192, 168, 1, 20])));
+        assert_eq!(PANICKY_CALLS.load(Ordering::SeqCst), 2);
     }
 
     fn unlisted() -> Option<Vec<Adapter>> {

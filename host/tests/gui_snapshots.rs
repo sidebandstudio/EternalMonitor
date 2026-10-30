@@ -613,11 +613,12 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
 }
 
 /// Tailscale owns the default route. The Address row, its Copy and the QR
-/// code keep the address they always had; one line adds the Wi-Fi's.
+/// code keep the address they always had; one line adds the Wi-Fi's IP,
+/// without the port, for the iPad's PC address field.
 fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
     use eternal_host::network::{set_test_adapters, Adapter, Kind};
     let vpn = "100.80.1.2:9876";
-    let hint = "If your iPad is on this PC's Wi-Fi, enter 192.168.1.20:9876.";
+    let hint = "If that doesn't connect and your iPad is on the same network as this PC, use 192.168.1.20 as the PC address.";
     PIPELINE_STATS.lock().listen_addr = vpn.into();
     let adapter = |kind, ip: [u8; 4]| Adapter {
         kind,
@@ -637,6 +638,8 @@ fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
         std::thread::sleep(Duration::from_millis(10));
         window.run_steps(1);
     }
+    // The iPad has a Port field of its own: the hint gives the IP alone.
+    assert!(window.query_by_label_contains("192.168.1.20:").is_none());
     window.get_by_label(vpn);
     window.get_by_label("Copy address").click();
     window.step();
@@ -662,7 +665,10 @@ fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
     // Shown on the Wi-Fi itself: nothing more.
     PIPELINE_STATS.lock().listen_addr = "192.168.1.20:9876".into();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while window.query_by_label_contains("If your iPad").is_some() {
+    while window
+        .query_by_label_contains("as the PC address")
+        .is_some()
+    {
         assert!(Instant::now() < deadline, "the hint stayed");
         std::thread::sleep(Duration::from_millis(10));
         window.run_steps(1);
