@@ -67,9 +67,9 @@ enum Feedback {
     }
 
     /// Said first in Mail whenever the Diagnostics report is attached, since
-    /// the report can name the PC and iPad.
+    /// the report can hold the PC's address.
     static let attachmentNotice = "We attached a diagnostics report to help us look into it. "
-        + "It can include your PC's and iPad's names and local network addresses. "
+        + "It can include your PC's local network address. "
         + "Remove it before sending if you'd rather not share it."
 
     /// Room to write, then the details in short lines. With the Diagnostics

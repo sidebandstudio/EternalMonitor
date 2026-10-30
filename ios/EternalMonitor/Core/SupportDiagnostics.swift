@@ -101,7 +101,7 @@ final class SupportDiagnostics: @unchecked Sendable {
         return await withCheckedContinuation { continuation in
             queue.async {
                 self.lossLock.lock(); let dropped = self.dropped; self.lossLock.unlock()
-                var report = "EternalMonitor iPad support report, schema 1\nSupport ID: \(self.upload.installationID)\nLaunch: \(self.launchID)\nAutomatic upload: \(uploadStatus)\nOutput queue dropped events: \(dropped)\nStorage error: \(self.storageError ?? "none")\nLogs may contain PC/device names and local network addresses.\n\n--- Startup evidence ---\n\(self.startup.joined())"
+                var report = "EternalMonitor iPad support report, schema 1\nSupport ID: \(self.upload.installationID)\nLaunch: \(self.launchID)\nAutomatic upload: \(uploadStatus)\nOutput queue dropped events: \(dropped)\nStorage error: \(self.storageError ?? "none")\nLogs may contain local network addresses.\n\n--- Startup evidence ---\n\(self.startup.joined())"
                 for suffix in [".2", ".1", ""] {
                     if let text = try? String(contentsOf: self.url(suffix), encoding: .utf8) {
                         report += "\n--- Log\(suffix) ---\n\(text)"
