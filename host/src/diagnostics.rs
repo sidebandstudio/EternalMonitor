@@ -42,6 +42,27 @@ pub fn install_ffmpeg_logging() {
     INSTALL.call_once(|| unsafe { eternal_install_ffmpeg_logger(ffmpeg_message) });
 }
 
+thread_local! {
+    /// Set while this thread opens an encoder that is one of several to try.
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `open`, an encoder open with another encoder to try if it fails,
+/// with FFmpeg's ERROR lines from this thread logged as warnings. On a PC
+/// without that graphics card or driver they are expected, and the next
+/// encoder takes over; the caller logs one error if none opens. Every other
+/// FFmpeg line keeps its level.
+pub fn while_probing<T>(open: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROBING.with(|probing| probing.set(self.0));
+        }
+    }
+    let _restore = Restore(PROBING.with(|probing| probing.replace(true)));
+    open()
+}
+
 unsafe extern "C" fn ffmpeg_message(level: i32, message: *const libc::c_char) {
     // Never unwind through a C callback, including a third-party tracing subscriber.
     let _ = std::panic::catch_unwind(|| {
@@ -53,7 +74,8 @@ unsafe extern "C" fn ffmpeg_message(level: i32, message: *const libc::c_char) {
         if message.is_empty() {
             return;
         }
-        if level <= ffmpeg_next::ffi::AV_LOG_ERROR {
+        // `ffmpeg_level` keeps FFmpeg's own level either way.
+        if level <= ffmpeg_next::ffi::AV_LOG_ERROR && !PROBING.with(std::cell::Cell::get) {
             tracing::error!(target: "ffmpeg", ffmpeg_level = level, "{message}");
         } else {
             tracing::warn!(target: "ffmpeg", ffmpeg_level = level, "{message}");

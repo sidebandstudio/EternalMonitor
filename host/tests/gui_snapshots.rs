@@ -1538,6 +1538,10 @@ fn review_screens() {
     PIPELINE_STATS.lock().using_software_fallback = true;
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
     save(&mut h, "problems-display-task-and-encoder");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problem-nvidia-driver-outdated");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = false;
     *shared.vdd_status.lock() = VddStatus::Failed;
     PIPELINE_STATS.lock().using_software_fallback = false;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);

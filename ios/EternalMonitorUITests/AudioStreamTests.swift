@@ -19,8 +19,7 @@ final class AudioStreamTests: UITestCase {
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio muted or unavailable")
         let disconnect = app.buttons["display.disconnect"]
-        revealControls(app, showing: disconnect)
-        XCTAssertTrue(appears(disconnect, within: 5))
+        waitForControl(app, disconnect, "The controls never showed Disconnect")
         capture("audio-muted-hud", app: app)
         openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
@@ -36,8 +35,8 @@ final class AudioStreamTests: UITestCase {
         capture("audio-playing-hud", app: app)
         // The test pins Fit; scrolling Settings must not have chosen Fill.
         let picture = app.buttons["display.pictureFit"]
-        revealControls(app, showing: picture)
-        XCTAssertTrue(appears(picture, where: "label == %@", "Fill the screen", within: 5), picture.debugDescription)
+        waitForControl(app, picture, matching: NSPredicate(format: "label == %@", "Fill the screen"),
+                       picture.debugDescription)
         app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
         app.terminate()
     }
@@ -63,13 +62,25 @@ final class AudioStreamTests: UITestCase {
     }
 
     private func waitForHUD(_ app: XCUIApplication, containing text: String) {
-        let hud = app.buttons["display.hud"]
+        waitForControl(app, app.buttons["display.hud"],
+                       matching: NSPredicate(format: "exists == true AND label CONTAINS %@", text),
+                       "HUD never showed \"\(text)\"")
+    }
+
+    // The controls can also fade between a check that finds them and the
+    // check that follows, with nothing to bring them back. Reveal them again
+    // before each try.
+    private func waitForControl(_ app: XCUIApplication, _ element: XCUIElement,
+                                matching predicate: NSPredicate = NSPredicate(format: "exists == true"),
+                                _ failure: @autoclosure () -> String,
+                                file: StaticString = #filePath, line: UInt = #line) {
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
-            revealControls(app, showing: hud)
-            if appears(hud, where: "exists == true AND label CONTAINS %@", text, within: 2) { return }
+            revealControls(app, showing: element)
+            let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+            if XCTWaiter().wait(for: [expectation], timeout: 2) == .completed { return }
         }
-        XCTFail("HUD never showed \"\(text)\"")
+        XCTFail(failure(), file: file, line: line)
     }
 
     // A single press can be lost on a busy runner. Re-read the value before

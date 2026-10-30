@@ -71,6 +71,7 @@ struct StatsSnapshot {
     bitrate_bps: u32,
     codec_name: String,
     using_software_fallback: bool,
+    nvidia_driver_outdated: bool,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -108,6 +109,7 @@ impl StatsSnapshot {
             bitrate_bps: s.bitrate_bps,
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
+            nvidia_driver_outdated: s.nvidia_driver_outdated,
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -154,11 +156,14 @@ impl ClientSnapshot {
         }
     }
 
-    fn link_name(&self) -> &'static str {
-        if self
-            .peer
+    /// Whether an iPad is streaming over the USB cable right now.
+    fn on_usb(&self) -> bool {
+        self.peer
             .is_some_and(|p| matches!(p.link, LinkId::Usb { .. }))
-        {
+    }
+
+    fn link_name(&self) -> &'static str {
+        if self.on_usb() {
             "USB"
         } else {
             "Wi-Fi"
