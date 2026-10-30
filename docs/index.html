@@ -4,8 +4,9 @@
   <meta charset="UTF-8">
   <script>document.documentElement.className = 'js';</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EternalMonitor: your iPad as a second screen for your Windows PC</title>
-  <meta name="description" content="Mirror your Windows PC or add the iPad as a real second screen, over USB or Wi-Fi. Apple Pencil, touch and keyboard go back to the PC. Free and open source.">
+  <script src="i18n.js" data-translated></script>
+  <title data-i18n="index.title">EternalMonitor: your iPad as a second screen for your Windows PC</title>
+  <meta name="description" content="Mirror your Windows PC or add the iPad as a real second screen, over USB or Wi-Fi. Apple Pencil, touch and keyboard go back to the PC. Free and open source." data-i18n-content="index.description">
   <link rel="canonical" href="https://eternalmonitor.dev/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="EternalMonitor">
@@ -41,24 +42,33 @@
   </script>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
+  <a class="skip-link" href="#main" data-i18n="common.skip">Skip to content</a>
 
   <header class="nav">
-    <nav class="container nav-inner" aria-label="Main">
-      <a href="./" class="brand" aria-label="EternalMonitor home">
+    <nav class="container nav-inner" aria-label="Main" data-i18n-aria-label="nav.main">
+      <a href="./" class="brand" aria-label="EternalMonitor home" data-i18n-aria-label="nav.home">
         <img src="assets/icon.png" alt="" width="26" height="26">
         <span>EternalMonitor</span>
       </a>
       <div class="nav-links">
-        <a href="#how" class="nav-link hide-sm">How it works</a>
-        <a href="updates.html" class="nav-link hide-sm">Updates</a>
-        <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
+        <a href="#how" class="nav-link hide-sm" data-i18n="nav.how">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm" data-i18n="nav.updates">Updates</a>
+        <a href="known-issues.html" class="nav-link hide-sm" data-i18n="nav.knownIssues">Known issues</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           <span>GitHub</span>
           <span class="count" data-stars></span>
         </a>
-        <a href="download.html" class="btn btn-primary btn-sm">Download</a>
+        <div class="lang" data-lang>
+          <button type="button" class="nav-link lang-button" aria-expanded="false" aria-controls="lang-menu">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.7 1.8 2.5 3.9 2.5 6.4S9.7 12.6 8 14.4M8 1.6C6.3 3.4 5.5 5.5 5.5 8s.8 4.6 2.5 6.4"/></svg>
+            <span class="visually-hidden" data-i18n="lang.label">Language</span>
+            <span class="lang-name" data-lang-name>English</span>
+          </button>
+          <ul class="lang-menu" id="lang-menu" hidden></ul>
+        </div>
+        <a href="?lang=en" class="nav-link lang-english" lang="en" hreflang="en" data-lang-english hidden>English</a>
+        <a href="download.html" class="btn btn-primary btn-sm"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg><span data-i18n="nav.download">Download</span></a>
       </div>
     </nav>
   </header>
@@ -68,40 +78,40 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="container">
         <div class="hero-text">
-          <h1 id="hero-title">Your Windows PC, on your iPad.</h1>
-          <p class="lead">Mirror it, extend it, draw on it with Apple Pencil.</p>
+          <h1 id="hero-title" data-i18n="index.hero.title">Your Windows PC, on your iPad.</h1>
+          <p class="lead" data-i18n="index.hero.lead">Mirror it, extend it, draw on it with Apple Pencil.</p>
           <div class="hero-actions">
-            <a href="download.html" class="btn btn-primary btn-lg">
+            <a href="download.html" class="btn btn-primary btn-lg" data-i18n="common.downloadWindows">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg>
               Download for Windows
             </a>
-            <a href="download.html#ipad" class="btn btn-secondary btn-lg">Get the iPad app</a>
+            <a href="download.html#ipad" class="btn btn-secondary btn-lg" data-i18n="index.hero.getIpad">Get the iPad app</a>
           </div>
           <p class="hero-meta">
-            <span>Free and open source</span>
-            <span>Windows 10 and 11</span>
-            <span>iPadOS 17 or later</span>
+            <span data-i18n="index.hero.free">Free and open source</span>
+            <span data-i18n="index.hero.windows">Windows 10 and 11</span>
+            <span data-i18n="common.req.ipados">iPadOS 17 or later</span>
           </p>
         </div>
 
-        <figure class="stage" aria-label="The Windows app streaming over USB or Wi-Fi to the iPad, which shows the PC's picture">
+        <figure class="stage" aria-label="The Windows app streaming over USB or Wi-Fi to the iPad, which shows the PC's picture" data-i18n-aria-label="index.stage.label">
           <div class="stage-pc">
             <div class="pc-window">
               <div class="pc-titlebar" aria-hidden="true">
                 <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
                 <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
               </div>
-              <img src="assets/hero-pc.webp" srcset="assets/hero-pc.webp 1040w, assets/hero-pc@2x.webp 2080w" sizes="(max-width: 720px) 92vw, 600px" width="2080" height="1233" fetchpriority="high" decoding="async" alt="The Windows app streaming to an iPad over USB, mirroring the screen at 60 fps, with the connected iPad's details, Send feedback and a GitHub star card in the sidebar.">
+              <img src="assets/hero-pc.webp" srcset="assets/hero-pc.webp 1040w, assets/hero-pc@2x.webp 2080w" sizes="(max-width: 720px) 92vw, 600px" width="2080" height="1233" fetchpriority="high" decoding="async" data-i18n-alt="index.stage.pcAlt" alt="The Windows app streaming to an iPad over USB, mirroring the screen at 60 fps, with the connected iPad's details, Send feedback and a GitHub star card in the sidebar.">
             </div>
           </div>
           <div class="stage-link" aria-hidden="true">
             <span class="stage-line"></span>
-            <span class="stage-chip">USB or Wi-Fi</span>
+            <span class="stage-chip" data-i18n="index.stage.link">USB or Wi-Fi</span>
           </div>
           <div class="stage-ipad">
             <div class="tablet">
               <div class="screen">
-                <img src="assets/hero-ipad.webp" srcset="assets/hero-ipad.webp 1009w, assets/hero-ipad@2x.webp 2018w" sizes="(max-width: 720px) 70vw, 460px" width="2018" height="1300" decoding="async" alt="The iPad showing the PC's picture full screen.">
+                <img src="assets/hero-ipad.webp" srcset="assets/hero-ipad.webp 1009w, assets/hero-ipad@2x.webp 2018w" sizes="(max-width: 720px) 70vw, 460px" width="2018" height="1300" decoding="async" alt="The iPad showing the PC's picture full screen." data-i18n-alt="index.stage.ipadAlt">
               </div>
             </div>
           </div>
@@ -111,18 +121,18 @@
 
     <section class="section" id="features" aria-labelledby="features-title">
       <div class="container">
-        <h2 id="features-title" class="visually-hidden">Features</h2>
+        <h2 id="features-title" class="visually-hidden" data-i18n="index.features.title">Features</h2>
 
         <article class="show reveal" aria-labelledby="f-screen">
           <div class="show-head">
-            <h3 id="f-screen">Mirror my screen, or a real second screen.</h3>
+            <h3 id="f-screen" data-i18n="index.mode.title">Mirror my screen, or a real second screen.</h3>
           </div>
           <div class="switch-demo">
             <input type="radio" name="mode" id="mode-mirror" class="sw-input">
             <input type="radio" name="mode" id="mode-second" class="sw-input" checked>
-            <div class="sw" role="group" aria-label="Use the iPad as">
-              <label for="mode-mirror">Mirror my screen</label>
-              <label for="mode-second">Second screen</label>
+            <div class="sw" role="group" aria-label="Use the iPad as" data-i18n-aria-label="app.useIpadAs">
+              <label for="mode-mirror" data-i18n="app.mirror">Mirror my screen</label>
+              <label for="mode-second" data-i18n="app.second">Second screen</label>
             </div>
             <div class="modes">
               <div class="pc-window modes-pc">
@@ -131,8 +141,8 @@
                   <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
                 </div>
                 <div class="swap">
-                  <img class="swap-a" src="assets/mode-mirror.webp" srcset="assets/mode-mirror.webp 1040w, assets/mode-mirror@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Mirror my screen: the iPad shows the same picture as your main screen.">
-                  <img class="swap-b" src="assets/mode-second.webp" srcset="assets/mode-second.webp 1040w, assets/mode-second@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Second screen: the iPad becomes an extra screen next to your main one.">
+                  <img class="swap-a" src="assets/mode-mirror.webp" srcset="assets/mode-mirror.webp 1040w, assets/mode-mirror@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" data-i18n-alt="index.mode.mirrorAlt" alt="The Windows app with Use the iPad as set to Mirror my screen: the iPad shows the same picture as your main screen.">
+                  <img class="swap-b" src="assets/mode-second.webp" srcset="assets/mode-second.webp 1040w, assets/mode-second@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" data-i18n-alt="index.mode.secondAlt" alt="The Windows app with Use the iPad as set to Second screen: the iPad becomes an extra screen next to your main one.">
                 </div>
               </div>
               <div class="displays" aria-hidden="true">
@@ -145,19 +155,19 @@
 
         <article class="show reveal" aria-labelledby="f-fill">
           <div class="show-head">
-            <h3 id="f-fill">Fit the picture, or fill the iPad.</h3>
+            <h3 id="f-fill" data-i18n="index.picture.title">Fit the picture, or fill the iPad.</h3>
           </div>
           <div class="switch-demo">
             <input type="radio" name="picture" id="pic-fit" class="sw-input">
             <input type="radio" name="picture" id="pic-fill" class="sw-input" checked>
-            <div class="sw" role="group" aria-label="Picture">
-              <label for="pic-fit">Fit</label>
-              <label for="pic-fill">Fill</label>
+            <div class="sw" role="group" aria-label="Picture" data-i18n-aria-label="app.picture">
+              <label for="pic-fit" data-i18n="app.fit">Fit</label>
+              <label for="pic-fill" data-i18n="app.fill">Fill</label>
             </div>
             <div class="tablet fill-tablet">
               <div class="screen swap">
-                <img class="swap-a" src="assets/ipad-fit.webp" srcset="assets/ipad-fit.webp 1180w, assets/ipad-fit@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fit: the whole PC picture, with black bars where the shapes differ.">
-                <img class="swap-b" src="assets/ipad-fill.webp" srcset="assets/ipad-fill.webp 1180w, assets/ipad-fill@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fill: the PC picture covers the whole iPad screen.">
+                <img class="swap-a" src="assets/ipad-fit.webp" srcset="assets/ipad-fit.webp 1180w, assets/ipad-fit@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" data-i18n-alt="index.picture.fitAlt" alt="The iPad app with Picture set to Fit: the whole PC picture, with black bars where the shapes differ.">
+                <img class="swap-b" src="assets/ipad-fill.webp" srcset="assets/ipad-fill.webp 1180w, assets/ipad-fill@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" data-i18n-alt="index.picture.fillAlt" alt="The iPad app with Picture set to Fill: the PC picture covers the whole iPad screen.">
               </div>
             </div>
           </div>
@@ -165,28 +175,28 @@
 
         <article class="show show-split reveal" aria-labelledby="f-pencil">
           <div class="show-head">
-            <h3 id="f-pencil">Apple Pencil, like a real pen.</h3>
-            <p>Pressure and tilt, tuned with care, because we care about drawing.</p>
+            <h3 id="f-pencil" data-i18n="index.pencil.title">Apple Pencil, like a real pen.</h3>
+            <p data-i18n="index.pencil.text">Pressure and tilt, tuned with care, because we care about drawing.</p>
           </div>
           <div class="tablet">
             <div class="screen">
-              <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
+              <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" data-i18n-alt="index.pencil.alt" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
             </div>
           </div>
         </article>
 
         <article class="show show-split flip reveal" aria-labelledby="f-link">
           <div class="show-head">
-            <h3 id="f-link">USB or Wi-Fi. Pair once.</h3>
-            <p>Or scan the QR code and skip the code.</p>
+            <h3 id="f-link" data-i18n="index.pair.title">USB or Wi-Fi. Pair once.</h3>
+            <p data-i18n="index.pair.text">Or scan the QR code and skip the code.</p>
           </div>
             <div class="pair">
               <div class="dialog-shot">
-                <img src="assets/host-qr.webp" srcset="assets/host-qr.webp 374w, assets/host-qr@2x.webp 748w" sizes="(max-width: 860px) 50vw, 280px" width="748" height="1050" loading="lazy" decoding="async" alt="The Windows app's Scan to connect dialog, with a QR code and the PC's address under it.">
+                <img src="assets/host-qr.webp" srcset="assets/host-qr.webp 374w, assets/host-qr@2x.webp 748w" sizes="(max-width: 860px) 50vw, 280px" width="748" height="1050" loading="lazy" decoding="async" data-i18n-alt="index.pair.qrAlt" alt="The Windows app's Scan to connect dialog, with a QR code and the PC's address under it.">
               </div>
               <div class="tablet portrait">
                 <div class="screen">
-                  <img src="assets/ipad-pairing.webp" srcset="assets/ipad-pairing.webp 834w, assets/ipad-pairing@2x.webp 1668w" sizes="(max-width: 860px) 38vw, 210px" width="1668" height="2420" loading="lazy" decoding="async" alt="The iPad app's Pair with your PC sheet, with a six-digit code field, a Pair iPad button and the number keyboard.">
+                  <img src="assets/ipad-pairing.webp" srcset="assets/ipad-pairing.webp 834w, assets/ipad-pairing@2x.webp 1668w" sizes="(max-width: 860px) 38vw, 210px" width="1668" height="2420" loading="lazy" decoding="async" data-i18n-alt="index.pair.ipadAlt" alt="The iPad app's Pair with your PC sheet, with a six-digit code field, a Pair iPad button and the number keyboard.">
                 </div>
               </div>
             </div>
@@ -194,42 +204,42 @@
 
         <div class="tiles reveal">
           <article class="tile">
-            <h3>Your graphics card does the work.</h3>
-            <p>NVIDIA, AMD or Intel, in H.264 or HEVC.</p>
+            <h3 data-i18n="index.gpu.title">Your graphics card does the work.</h3>
+            <p data-i18n="index.gpu.text">NVIDIA, AMD or Intel, in H.264 or HEVC.</p>
             <div class="pc-window">
               <div class="pc-titlebar" aria-hidden="true">
                   <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
                   <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
                 </div>
-              <img src="assets/host-performance.webp" srcset="assets/host-performance.webp 1040w, assets/host-performance@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1095" loading="lazy" decoding="async" alt="The Windows app's Performance page: capture, encode and send rates, bandwidth, and a chart of encode time per frame.">
+              <img src="assets/host-performance.webp" srcset="assets/host-performance.webp 1040w, assets/host-performance@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1095" loading="lazy" decoding="async" data-i18n-alt="index.gpu.alt" alt="The Windows app's Performance page: capture, encode and send rates, bandwidth, and a chart of encode time per frame.">
             </div>
           </article>
           <article class="tile">
-            <h3>Send feedback from either app.</h3>
-            <p>One-click updates on the PC. The iPad updates through TestFlight.</p>
+            <h3 data-i18n="index.feedback.title">Send feedback from either app.</h3>
+            <p data-i18n="index.feedback.text">One-click updates on the PC. The iPad updates through TestFlight.</p>
             <div class="tile-shot">
-              <img src="assets/ipad-feedback.webp" srcset="assets/ipad-feedback.webp 580w, assets/ipad-feedback@2x.webp 1160w" sizes="(max-width: 860px) 92vw, 520px" width="1160" height="1114" loading="lazy" decoding="async" alt="The iPad app's settings: Send feedback, Check for updates automatically, and About with the version, source code, Star EternalMonitor on GitHub and Contact.">
+              <img src="assets/ipad-feedback.webp" srcset="assets/ipad-feedback.webp 580w, assets/ipad-feedback@2x.webp 1160w" sizes="(max-width: 860px) 92vw, 520px" width="1160" height="1114" loading="lazy" decoding="async" data-i18n-alt="index.feedback.alt" alt="The iPad app's settings: Send feedback, Check for updates automatically, and About with the version, source code, Star EternalMonitor on GitHub and Contact.">
             </div>
           </article>
         </div>
       </div>
     </section>
 
-    <section class="section numbers" aria-label="In numbers">
+    <section class="section numbers" aria-label="In numbers" data-i18n-aria-label="index.numbers.label">
       <div class="container">
         <dl class="facts reveal">
-          <div class="fact"><dt>Up to</dt><dd class="n">120<small>fps*</small></dd></div>
-          <div class="fact"><dt>Adaptive bitrate</dt><dd class="n">4–50<small>Mbps</small></dd></div>
-          <div class="fact"><dt>Open source</dt><dd class="n">Free<small>MIT</small></dd></div>
+          <div class="fact"><dt data-i18n="index.numbers.upTo">Up to</dt><dd class="n">120<small>fps*</small></dd></div>
+          <div class="fact"><dt data-i18n="index.numbers.bitrate">Adaptive bitrate</dt><dd class="n">4–50<small>Mbps</small></dd></div>
+          <div class="fact"><dt data-i18n="index.numbers.openSource">Open source</dt><dd class="n" data-i18n="index.numbers.free">Free<small>MIT</small></dd></div>
         </dl>
-        <p class="footnote">*On iPads with ProMotion. The lower of the PC's and the iPad's frame rate wins.</p>
+        <p class="footnote" data-i18n="index.numbers.footnote">*On iPads with ProMotion. The lower of the PC's and the iPad's frame rate wins.</p>
       </div>
     </section>
 
     <section class="section" id="how" aria-labelledby="how-title">
       <div class="container">
         <div class="section-head reveal">
-          <h2 id="how-title">Three steps.</h2>
+          <h2 id="how-title" data-i18n="index.how.title">Three steps.</h2>
         </div>
         <div class="how reveal">
           <figure class="clip">
@@ -240,7 +250,7 @@
                       >
                   <source src="assets/connect-clip.mp4" type="video/mp4">
                   <source src="assets/connect-clip.webm" type="video/webm">
-                  <a href="assets/connect-clip.mp4">Download the clip (MP4)</a>
+                  <a href="assets/connect-clip.mp4" data-i18n="index.how.clipLink">Download the clip (MP4)</a>
                 </video>
               </div>
             </div>
@@ -254,16 +264,16 @@
           </figure>
           <ol class="steps">
             <li class="step">
-              <h3>Install on your PC</h3>
-              <p>From the <a href="download.html">download page</a>.</p>
+              <h3 data-i18n="index.how.step1">Install on your PC</h3>
+              <p data-i18n="index.how.step1Text">From the <a href="download.html">download page</a>.</p>
             </li>
             <li class="step">
-              <h3>Open the iPad app</h3>
-              <p>Tap your PC, scan its QR code, or plug in a cable.</p>
+              <h3 data-i18n="index.how.step2">Open the iPad app</h3>
+              <p data-i18n="index.how.step2Text">Tap your PC, scan its QR code, or plug in a cable.</p>
             </li>
             <li class="step">
-              <h3>Pair once</h3>
-              <p>Type the six-digit code the first time on Wi-Fi. The QR code skips it.</p>
+              <h3 data-i18n="index.how.step3">Pair once</h3>
+              <p data-i18n="index.how.step3Text">Type the six-digit code the first time on Wi-Fi. The QR code skips it.</p>
             </li>
           </ol>
         </div>
@@ -273,7 +283,7 @@
     <section class="section" id="get" aria-labelledby="get-title">
       <div class="container">
         <div class="section-head reveal">
-          <h2 id="get-title">Two apps, both free.</h2>
+          <h2 id="get-title" data-i18n="index.get.title">Two apps, both free.</h2>
         </div>
         <div class="get reveal">
           <article class="card">
@@ -281,25 +291,25 @@
               <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
               <h3>Windows</h3>
             </div>
-            <p>It isn\'t code-signed yet, so Windows asks before it runs.</p>
+            <p data-i18n="index.get.windowsText">It isn't code-signed yet, so Windows asks before it runs.</p>
             <ul class="specs">
-              <li>Windows 10 (1809 or later) or 11, 64-bit</li>
-              <li>NVIDIA, AMD or Intel graphics</li>
-              <li>For USB: Apple's free <strong>Apple Devices</strong> app (Windows 10 22H2 or 11)</li>
+              <li data-i18n="common.req.windows">Windows 10 (1809 or later) or 11, 64-bit</li>
+              <li data-i18n="common.req.gpu">NVIDIA, AMD or Intel graphics</li>
+              <li data-i18n="index.get.usb">For USB: Apple's free <strong>Apple Devices</strong> app (Windows 10 22H2 or 11)</li>
             </ul>
-            <a href="download.html" class="btn btn-primary">Download for Windows</a>
+            <a href="download.html" class="btn btn-primary" data-i18n="common.downloadWindows">Download for Windows</a>
           </article>
           <article class="card">
             <div class="card-head">
               <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="2" width="16" height="20" rx="3"/><path d="M11 18.5h2"/></svg></span>
               <h3>iPad</h3>
             </div>
-            <p>A public TestFlight beta, open to everyone.</p>
+            <p data-i18n="index.get.ipadText">A public TestFlight beta, open to everyone.</p>
             <ul class="specs">
-              <li>iPadOS 17 or later</li>
-              <li>Apple Pencil for pressure and tilt</li>
+              <li data-i18n="common.req.ipados">iPadOS 17 or later</li>
+              <li data-i18n="index.get.pencil">Apple Pencil for pressure and tilt</li>
             </ul>
-            <a href="download.html#ipad" class="btn btn-secondary">Join the TestFlight beta</a>
+            <a href="download.html#ipad" class="btn btn-secondary" data-i18n="common.joinBeta">Join the TestFlight beta</a>
           </article>
         </div>
       </div>
@@ -308,36 +318,36 @@
     <section class="section" id="faq" aria-labelledby="faq-title">
       <div class="narrow">
         <div class="section-head reveal">
-          <h2 id="faq-title">Before you install</h2>
+          <h2 id="faq-title" data-i18n="index.faq.title">Before you install</h2>
         </div>
         <div class="faq reveal">
           <details>
-            <summary>Is it really free?</summary>
-            <div><p>Yes. Free, open source under MIT, with no account.</p></div>
+            <summary data-i18n="index.faq.free.q">Is it really free?</summary>
+            <div><p data-i18n="index.faq.free.a">Yes. Free, open source under MIT, with no account.</p></div>
           </details>
           <details>
-            <summary>Does it work with a Mac?</summary>
-            <div><p>No, the PC app is for Windows. Macs have Apple\'s <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>.</p></div>
+            <summary data-i18n="index.faq.mac.q">Does it work with a Mac?</summary>
+            <div><p data-i18n="index.faq.mac.a">No, the PC app is for Windows. Macs have Apple's <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>.</p></div>
           </details>
           <details>
-            <summary>USB or Wi-Fi?</summary>
-            <div><p>Wi-Fi to start. A cable gives a steadier picture and charges the iPad; it needs Apple's free Apple Devices app open on the PC (Windows 10 22H2 or 11).</p></div>
+            <summary data-i18n="index.faq.usb.q">USB or Wi-Fi?</summary>
+            <div><p data-i18n="index.faq.usb.a">Wi-Fi to start. A cable gives a steadier picture and charges the iPad; it needs Apple's free Apple Devices app open on the PC (Windows 10 22H2 or 11).</p></div>
           </details>
           <details>
-            <summary>Is the stream encrypted?</summary>
-            <div><p>Not yet. Pairing keeps other devices out, so use a network you trust. Over a cable, the stream stays on the cable.</p></div>
+            <summary data-i18n="index.faq.encrypted.q">Is the stream encrypted?</summary>
+            <div><p data-i18n="index.faq.encrypted.a">Not yet. Pairing keeps other devices out, so use a network you trust. Over a cable, the stream stays on the cable.</p></div>
           </details>
           <details>
-            <summary>Which iPads and Pencils?</summary>
-            <div><p>An iPad with iPadOS 17 or later. Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.</p></div>
+            <summary data-i18n="index.faq.ipads.q">Which iPads and Pencils?</summary>
+            <div><p data-i18n="index.faq.ipads.a">An iPad with iPadOS 17 or later. Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.</p></div>
           </details>
           <details>
-            <summary>Does it send anything to you?</summary>
-            <div><p>Yes, diagnostics while the apps run: device details, errors and stream stats, including PC and iPad names, audio device names and network addresses. Never your screen, audio or pairing codes. Kept up to 30 days, sometimes less, and up to 7 more days in backups. Turn it off in Settings. <a href="privacy.html">Details</a>.</p></div>
+            <summary data-i18n="index.faq.data.q">Does it send anything to you?</summary>
+            <div><p data-i18n="index.faq.data.a">Yes, diagnostics while the apps run: device details, errors and stream stats, including PC and iPad names, audio device names and network addresses. Never your screen, audio or pairing codes. Kept up to 30 days, sometimes less, and up to 7 more days in backups. Turn it off in Settings. <a href="privacy.html">Details</a>.</p></div>
           </details>
           <details>
-            <summary>Something isn't working</summary>
-            <div><p>See <a href="known-issues.html">known issues</a> and the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">setup guide</a>, or <a href="download.html#feedback">tell us</a>.</p></div>
+            <summary data-i18n="index.faq.broken.q">Something isn't working</summary>
+            <div><p data-i18n="index.faq.broken.a">See <a href="known-issues.html">known issues</a> and the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">setup guide</a>, or <a href="download.html#feedback">tell us</a>.</p></div>
           </details>
         </div>
       </div>
@@ -346,11 +356,11 @@
     <section class="section" id="studio" aria-labelledby="studio-title">
       <div class="container">
         <div class="studio reveal">
-          <h2 id="studio-title">Made by a small studio.</h2>
-          <p><a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a> builds EternalMonitor for students and anyone with a spare iPad. We read every message, and your feedback shapes what we fix next :)</p>
+          <h2 id="studio-title" data-i18n="index.studio.title">Made by a small studio.</h2>
+          <p data-i18n="index.studio.text"><a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a> builds EternalMonitor for students and anyone with a spare iPad. We read every message, and your feedback shapes what we fix next :)</p>
           <div class="studio-actions">
-            <a href="download.html#feedback" class="btn btn-primary">Send feedback</a>
-            <a href="https://github.com/sidebandstudio/EternalMonitor" class="btn btn-secondary" target="_blank" rel="noopener">
+            <a href="download.html#feedback" class="btn btn-primary" data-i18n="common.sendFeedback">Send feedback</a>
+            <a href="https://github.com/sidebandstudio/EternalMonitor" class="btn btn-secondary" target="_blank" rel="noopener" data-i18n="index.studio.star">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>
               Star on GitHub <span class="count" data-stars></span>
             </a>
@@ -363,13 +373,13 @@
 
   <footer class="footer">
     <div class="container footer-inner">
-      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
-      <nav class="footer-links" aria-label="Footer">
-        <a href="download.html">Download</a>
-        <a href="known-issues.html">Known issues</a>
-        <a href="updates.html">Updates</a>
-        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
-        <a href="privacy.html">Privacy</a>
+      <p class="footer-copy" data-i18n="footer.copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer" data-i18n-aria-label="footer.label">
+        <a href="download.html" data-i18n="nav.download">Download</a>
+        <a href="known-issues.html" data-i18n="nav.knownIssues">Known issues</a>
+        <a href="updates.html" data-i18n="nav.updates">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener" data-i18n="footer.setup">Setup guide</a>
+        <a href="privacy.html" data-i18n="footer.privacy">Privacy</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
         <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
       </nav>
