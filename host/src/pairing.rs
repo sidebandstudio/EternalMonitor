@@ -131,10 +131,12 @@ impl Pairing {
             .filter(|left| !left.is_zero())
     }
 
-    /// Resumes code pairing from the PC, with a full budget and a new code.
+    /// Resumes code pairing from the PC, with a full budget, no address
+    /// limits and a new code.
     pub fn resume_code_pairing(&mut self) -> Result<(), getrandom::Error> {
         self.rotate_code()?;
         self.budget = CodeBudget::default();
+        self.limiter = RateLimiter::default();
         info!("Code pairing resumed from the PC");
         Ok(())
     }
@@ -463,6 +465,24 @@ mod tests {
         assert!(pairing
             .authorize(wifi(500), &hello(500, [0; 16], code), now)
             .is_ok());
+    }
+
+    #[test]
+    fn resuming_from_the_pc_lifts_address_limits_so_the_new_code_pairs_at_once() {
+        let mut pairing = Pairing::new(true, [7; 16]).unwrap();
+        let now = Instant::now();
+        let user = wifi(1);
+        for n in 0..5 {
+            let _ = pairing.authorize(user, &hello(n, [0; 16], wrong_code(&pairing)), now);
+        }
+        for n in 5..10 {
+            let _ = pairing.authorize(wifi(n), &hello(n, [0; 16], wrong_code(&pairing)), now);
+        }
+        assert!(pairing.code_pairing_paused(now).is_some());
+        pairing.resume_code_pairing().unwrap();
+        let code = pairing.code();
+        let grant = pairing.authorize(user, &hello(100, [0; 16], code), now);
+        assert!(grant.is_ok_and(|grant| grant.used_code && grant.new_pairing));
     }
 
     #[test]
