@@ -910,7 +910,7 @@ small { font-size: 0.875rem; }
 /* On Stable, a handwritten note beside the switch with an arrow to Beta. The
    arrow's ink is a filled outline (the pen's width varies); a mask along its
    centre line draws it in once, then the two strokes of the head. Beta hides
-   it. On phones the note sits under the switch and the arrow points up. */
+   it. On phones the arrow points up at Beta and the note runs under it. */
 .channel-row { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 4px; margin-top: 28px; }
 .channel-row .channel-switch { margin-top: 0; }
 .no-js .beta-hint { display: none; }
@@ -946,11 +946,14 @@ html.js.channel-beta .beta-hint.reveal { opacity: 0; visibility: hidden; transit
 }
 @media (max-width: 560px) {
   .channel-row { row-gap: 2px; }
-  /* The arrow starts 52px back, under Beta, whatever the labels' widths. */
-  .beta-hint { grid-column: 2; grid-row: 2; align-items: flex-start; margin-inline-start: -52px; }
+  /* The hint spans the row's columns: the arrow starts 52px back from the
+     second, under Beta, whatever the labels' widths, and the note takes the
+     full width beneath it. */
+  .beta-hint { grid-column: 1 / -1; grid-row: 2; display: grid; grid-template-columns: subgrid; gap: 0 4px; }
+  .beta-arrow { grid-column: 2; margin-inline-start: -52px; }
   .beta-arrow-wide { display: none; }
   .beta-arrow-narrow { display: block; }
-  .beta-hint p { margin-top: 26px; font-size: 1.3125rem; }
+  .beta-hint p { grid-column: 1 / -1; max-width: none; font-size: 1.3125rem; }
   html.js.channel-beta .beta-hint.reveal { display: none; }
 }
 .dl-all { margin-top: 20px; }
