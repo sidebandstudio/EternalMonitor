@@ -20,9 +20,10 @@
 //! remembered, across app runs too ([`memory`]): later connections stay on
 //! the mirror until the wait after it ends, the user clicks Try again,
 //! restarts the stream, or changes the mode. Not while the mirror itself is
-//! blocked ([`note_mirror_blocked`]): then the mirror shows nothing, so a
+//! blocked ([`mirror_blocked_now`]): then the mirror shows nothing, so a
 //! failure is not saved and the next connection tries the second screen
-//! again.
+//! again, no sooner than [`BLOCKED_EXTEND_RETRY`] after Windows kept the
+//! desktop off it.
 
 #[cfg(debug_assertions)]
 pub mod fake;
@@ -37,6 +38,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
+use crate::gpu_preference::{AdapterId, GpuFacts};
 use memory::{Hold, Memory};
 
 #[cfg(any(windows, test, debug_assertions))]
@@ -86,6 +88,14 @@ const STOPPED_WAIT: Duration = Duration::from_secs(6);
 /// two are never added.
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// While the mirror is blocked, how long after a start Windows kept the
+/// desktop off (it showed the second screen as a copy) the next one waits.
+/// Every connection would otherwise turn the display on and off again
+/// while Windows' choice stays the same; the notices say to choose Extend
+/// or switch graphics cards, and Try again starts at once.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) const BLOCKED_EXTEND_RETRY: Duration = Duration::from_secs(120);
 
 /// How long quitting waits for the worker to exit after the last Enable.
 const QUIT_JOIN: Duration = Duration::from_secs(5);
@@ -160,8 +170,19 @@ pub(crate) struct State {
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
     memory: Memory,
-    /// Windows refused the mirror's last capture: see [`note_mirror_blocked`].
-    mirror_blocked: bool,
+    /// Windows refused the mirror's screen from the card EternalMonitor
+    /// captures on, which the display configuration then wired to another
+    /// card: see [`note_mirror_refused`].
+    mirror_refused: Option<MirrorRefusal>,
+    /// A failure not saved because the mirror was blocked: the next
+    /// connection tries the second screen again, no sooner than
+    /// `blocked_retry_at` when that is set.
+    retry_blocked: bool,
+    blocked_retry_at: Option<Instant>,
+    /// The display configuration as an end-to-end test's fake display, or a
+    /// unit test, says it in place of Windows: see [`facts_now`].
+    #[cfg(debug_assertions)]
+    fake_facts: Option<std::sync::Arc<Mutex<Option<GpuFacts>>>>,
     /// Whether the user's desktop is away, as an end-to-end test's fake
     /// display says in place of Windows: see [`desktop_away`].
     #[cfg(debug_assertions)]
@@ -169,12 +190,15 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// `blocked`: [`mirror_blocked_now`], read for this decision when
+    /// [`State::decides_on_mirror`] says it needs it.
     pub(crate) fn step(
         &mut self,
         selected: bool,
         status: &mut VddStatus,
         connected: bool,
         now: Instant,
+        blocked: bool,
     ) -> Step {
         self.memory.retry_clear(now);
         if !selected {
@@ -188,19 +212,21 @@ impl State {
                 last_toggle: self.last_toggle,
                 attaching: self.attaching,
                 memory: std::mem::take(&mut self.memory),
-                mirror_blocked: self.mirror_blocked,
+                mirror_refused: self.mirror_refused.take(),
+                #[cfg(debug_assertions)]
+                fake_facts: self.fake_facts.take(),
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
             };
             return Step::Nothing;
         }
-        if let Some(reason) = self.fail_unproven(status, now) {
+        if let Some(reason) = self.fail_unproven(status, now, blocked) {
             return Step::Fallback(reason);
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
-                let hold = if self.mirror_blocked {
+                let hold = if blocked {
                     if let Some(hold) = self.memory.hold(now) {
                         tracing::info!(
                             reason = hold.reason,
@@ -248,47 +274,80 @@ impl State {
         }
     }
 
-    /// End a second screen that failed to prove itself: a capture error, or
-    /// no image within [`PROVE_TIMEOUT`] of the switch. Returns why.
-    fn fail_unproven(&mut self, status: &mut VddStatus, now: Instant) -> Option<&'static str> {
+    /// Whether this tick decides something that depends on the mirror
+    /// being blocked: whether a saved failure or a manifest rule holds a
+    /// connection on the mirror, or whether a failed proof is saved.
+    fn decides_on_mirror(
+        &self,
+        selected: bool,
+        status: VddStatus,
+        connected: bool,
+        now: Instant,
+    ) -> bool {
+        selected
+            && (self.unproven(now).is_some()
+                || (status == VddStatus::WaitingForClient && connected))
+    }
+
+    /// Why the second screen failed its proof by `now`, if it did: a
+    /// capture error, or no image within [`PROVE_TIMEOUT`] of the switch.
+    fn unproven(&self, now: Instant) -> Option<&'static str> {
         let proving = self.proving?;
-        let reason = if proving.capture_failed {
-            "duplication_failed"
+        if proving.capture_failed {
+            Some("duplication_failed")
         } else if now.duration_since(proving.since) >= PROVE_TIMEOUT {
-            if proving.persistent {
+            Some(if proving.persistent {
                 "duplication_failed"
             } else {
                 "no_frames"
-            }
+            })
         } else {
-            return None;
-        };
+            None
+        }
+    }
+
+    /// End a second screen that failed to prove itself ([`State::unproven`]).
+    /// Returns why. `blocked`: see [`State::remember`].
+    fn fail_unproven(
+        &mut self,
+        status: &mut VddStatus,
+        now: Instant,
+        blocked: bool,
+    ) -> Option<&'static str> {
+        let reason = self.unproven(now)?;
+        let proving = self.proving?;
         *self = State {
             last_toggle: self.last_toggle,
             attaching: self.attaching,
             failure: Some(reason),
             memory: std::mem::take(&mut self.memory),
-            mirror_blocked: self.mirror_blocked,
+            mirror_refused: self.mirror_refused.take(),
+            #[cfg(debug_assertions)]
+            fake_facts: self.fake_facts.take(),
             #[cfg(debug_assertions)]
             fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
         };
         *status = VddStatus::Failed;
         let passing = proving.interrupted || proving.call_pending || proving.losses > LOSS_LIMIT;
-        self.remember(reason, now, passing);
+        self.remember(reason, now, passing, blocked);
         Some(reason)
     }
 
     /// Save the failure for later connections and app runs, unless
     /// something that passes may explain it: then only this app run keeps
-    /// mirroring, as before.
-    fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool) {
-        if self.mirror_blocked {
+    /// mirroring, as before. Nor while the mirror is `blocked`, as
+    /// [`mirror_blocked_now`] read it for this failure: then the next
+    /// connection tries the second screen again.
+    fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool, blocked: bool) {
+        self.clear_blocked_retry();
+        if blocked {
             tracing::info!(
                 reason,
                 "The second screen failed while Windows won't let EternalMonitor mirror the \
                  screen — not remembering it, so the next connection tries the second screen again"
             );
+            self.retry_blocked = true;
             return;
         }
         if interrupted || self.desktop_away() {
@@ -328,6 +387,11 @@ impl State {
         !self.release_requested
     }
 
+    fn clear_blocked_retry(&mut self) {
+        self.retry_blocked = false;
+        self.blocked_retry_at = None;
+    }
+
     #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn note_toggle(&mut self, now: Instant) {
         self.last_toggle = Some(now);
@@ -347,11 +411,14 @@ impl State {
 pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
     let selected = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
     let connected = shared.client_connected();
+    let blocked = mirror_blocked_now(shared, |status, state| {
+        state.decides_on_mirror(selected, status, connected, now)
+    });
     let mut status = shared.vdd_status.lock();
     shared
         .second_screen
         .lock()
-        .step(selected, &mut status, connected, now)
+        .step(selected, &mut status, connected, now, blocked)
 }
 
 /// A new capture generation ends a second screen that already failed to
@@ -360,8 +427,12 @@ pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
 /// Returns why it failed.
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn take_unproven(shared: &SharedControl, now: Instant) -> Option<&'static str> {
+    let blocked = mirror_blocked_now(shared, |_, state| state.unproven(now).is_some());
     let mut status = shared.vdd_status.lock();
-    shared.second_screen.lock().fail_unproven(&mut status, now)
+    shared
+        .second_screen
+        .lock()
+        .fail_unproven(&mut status, now, blocked)
 }
 
 /// Whether the second screen is still proving itself. Nothing is sent from
@@ -413,19 +484,35 @@ pub fn load_memory(shared: &SharedControl) {
 /// why the iPad gets the mirror, or tries again once the wait after a saved
 /// failure is over.
 pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
+    let blocked = mirror_blocked_now(shared, |status, _| status == VddStatus::Failed);
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
     // The mirror would show nothing: the second screen is the only picture.
-    if *status == VddStatus::Failed && state.mirror_blocked {
+    if *status == VddStatus::Failed && blocked {
+        let reason = state.failure.unwrap_or("attach_timeout");
+        if let Some(at) = state.blocked_retry_at.filter(|at| now < *at) {
+            tracing::info!(
+                reason,
+                retry_in_s = at.duration_since(now).as_secs(),
+                "Client connected, and Windows kept the desktop off the second screen, but \
+                 won't let EternalMonitor mirror the screen either — trying the second screen \
+                 again later, or when the user clicks Try again"
+            );
+            return;
+        }
         tracing::info!(
-            reason = state.failure.unwrap_or("attach_timeout"),
+            reason,
             "Client connected, and the second screen failed before, but Windows won't let \
              EternalMonitor mirror the screen — trying the second screen again"
         );
         *status = VddStatus::WaitingForClient;
         state.failure = None;
+        state.clear_blocked_retry();
         return;
     }
+    // The mirror works again: a failure while it didn't keeps this app run
+    // on the mirror, as one Windows' desktop excused does.
+    state.clear_blocked_retry();
     if *status == VddStatus::Failed && state.memory.saved() {
         match state.memory.hold(now) {
             Some(hold) => log_hold(hold),
@@ -455,34 +542,106 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
 pub(crate) fn retries_later(shared: &SharedControl) -> bool {
     let status = *shared.vdd_status.lock();
     let state = shared.second_screen.lock();
-    status == VddStatus::Failed && (state.memory.saved() || state.mirror_blocked)
+    status == VddStatus::Failed && (state.memory.saved() || state.retry_blocked)
 }
 
-/// Whether Windows refused the mirror's last capture because EternalMonitor
-/// runs on another graphics card than the screen (DXGI_ERROR_UNSUPPORTED on
-/// a hybrid PC), or, `false`, duplicated it. While it refuses, the mirror
-/// shows nothing: a second screen that fails is not saved, and neither a
-/// saved failure nor one from this app run keeps the next connection on the
-/// mirror. On a PC where the mirror works this is never set.
+/// Windows refused to duplicate the mirror's `screen` from `card`, the card
+/// EternalMonitor captures on, and the display configuration then wired the
+/// screen to another card: evidence that the mirror may be blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MirrorRefusal {
+    pub screen: String,
+    pub card: AdapterId,
+}
+
+/// A refusal of the mirror with that evidence (`Some`), or a mirror capture
+/// that works (`None`). A refusal without it (Windows couldn't say which
+/// card the screen is on, or it is on the app's own) records nothing:
+/// DXGI_ERROR_UNSUPPORTED also comes and goes while the desktop changes
+/// mode. On a PC where the mirror works this is never set.
 #[cfg(any(windows, test, debug_assertions))]
-pub(crate) fn note_mirror_blocked(shared: &SharedControl, blocked: bool) {
+pub(crate) fn note_mirror_refused(shared: &SharedControl, refusal: Option<MirrorRefusal>) {
     let mut state = shared.second_screen.lock();
-    if std::mem::replace(&mut state.mirror_blocked, blocked) == blocked {
-        return;
+    if refusal.is_none() {
+        state.clear_blocked_retry();
     }
-    if blocked {
-        tracing::info!(
-            "Windows won't let EternalMonitor mirror the screen from this graphics card — a \
-             second screen that fails is tried again at the next connection"
-        );
-    } else {
-        tracing::info!("EternalMonitor can mirror the screen again");
+    let was = std::mem::replace(&mut state.mirror_refused, refusal);
+    match (&was, &state.mirror_refused) {
+        (None, Some(_)) => tracing::info!(
+            "Windows won't let EternalMonitor mirror the screen from this graphics card — while \
+             the screen stays on the other card, a second screen that fails is tried again at \
+             the next connection"
+        ),
+        (Some(_), None) => tracing::info!("EternalMonitor can mirror the screen again"),
+        _ => {}
     }
 }
 
 #[cfg(test)]
-pub(crate) fn mirror_blocked(shared: &SharedControl) -> bool {
-    shared.second_screen.lock().mirror_blocked
+pub(crate) fn mirror_refused(shared: &SharedControl) -> bool {
+    shared.second_screen.lock().mirror_refused.is_some()
+}
+
+/// Whether the mirror is blocked now: Windows refused the mirror's screen
+/// from the card EternalMonitor captures on ([`note_mirror_refused`]), and
+/// the display configuration, read now, still wires that screen to another
+/// card. Never from the last capture alone: Windows may have moved the
+/// screen back since, while the second screen ran. Reads nothing unless
+/// such a refusal is recorded and `deciding` says the caller decides
+/// something now; takes the locks only to ask, and reads with none held.
+fn mirror_blocked_now(
+    shared: &SharedControl,
+    deciding: impl FnOnce(VddStatus, &State) -> bool,
+) -> bool {
+    let refusal = {
+        let status = shared.vdd_status.lock();
+        let state = shared.second_screen.lock();
+        match &state.mirror_refused {
+            Some(refusal) if deciding(*status, &state) => refusal.clone(),
+            _ => return false,
+        }
+    };
+    let blocked =
+        facts_now(shared).is_some_and(|facts| facts.wired_elsewhere(&refusal.screen, refusal.card));
+    if !blocked {
+        tracing::info!(
+            "Windows refused the mirror before, but doesn't list its screen on another \
+             graphics card now — deciding as on any PC where the mirror works"
+        );
+    }
+    blocked
+}
+
+/// The graphics cards and screens as Windows reports them now, or as the
+/// fake display of a test says. Unit tests never read the PC's own.
+fn facts_now(shared: &SharedControl) -> Option<GpuFacts> {
+    #[cfg(debug_assertions)]
+    {
+        let fake = shared.second_screen.lock().fake_facts.clone();
+        if let Some(facts) = fake {
+            return facts.lock().clone();
+        }
+    }
+    let _ = shared;
+    if cfg!(test) {
+        return None;
+    }
+    crate::gpu_preference::facts()
+}
+
+/// Have [`mirror_blocked_now`] read `facts` from now on.
+#[cfg(test)]
+pub(crate) fn set_facts(shared: &SharedControl, facts: Option<GpuFacts>) {
+    use_fake_facts(shared, std::sync::Arc::new(Mutex::new(facts)));
+}
+
+/// Have [`mirror_blocked_now`] read `facts` in place of Windows.
+#[cfg(debug_assertions)]
+pub(crate) fn use_fake_facts(
+    shared: &SharedControl,
+    facts: std::sync::Arc<Mutex<Option<GpuFacts>>>,
+) {
+    shared.second_screen.lock().fake_facts = Some(facts);
 }
 
 /// Why connections mirror instead of extending, after a failed start. The
@@ -511,6 +670,7 @@ pub(crate) fn retry(shared: &SharedControl) {
     if stale || matches!(*status, VddStatus::Failed | VddStatus::TaskFailed) {
         *status = VddStatus::WaitingForClient;
         state.failure = None;
+        state.clear_blocked_retry();
     }
 }
 
@@ -1290,11 +1450,23 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             // Enable succeeded but nothing attached: turn it back off so no
             // half-enabled device lingers as a phantom monitor.
             disable(shared, driver);
+            let blocked = mirror_blocked_now(shared, |_, _| true);
+            let copied = *shared.vdd_problem.lock() == Some(VddProblem::NotExtended);
+            let now = driver.now();
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
             let mut state = shared.second_screen.lock();
             state.failure = Some("attach_timeout");
-            state.remember("attach_timeout", driver.now(), false);
+            state.remember("attach_timeout", now, false, blocked);
+            if blocked && copied {
+                info!(
+                    retry_in_s = BLOCKED_EXTEND_RETRY.as_secs(),
+                    "Windows kept the desktop off the second screen while it won't let \
+                     EternalMonitor mirror the screen either — the next connection tries the \
+                     second screen again after the wait"
+                );
+                state.blocked_retry_at = Some(now + BLOCKED_EXTEND_RETRY);
+            }
         }
     }
 }

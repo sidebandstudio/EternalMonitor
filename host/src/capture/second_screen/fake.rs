@@ -24,7 +24,7 @@ use super::{Command, Driver};
 use crate::capture::recovery::{CaptureBlock, CaptureUnavailable};
 use crate::capture::OutputInfo;
 use crate::control::{CaptureTarget, SharedControl};
-use crate::gpu_preference::{Adapter, GpuFacts};
+use crate::gpu_preference::{Adapter, AdapterId, GpuFacts};
 
 /// A display that attaches a set time after it is turned on, or never. Its
 /// clock is the real one, plus whatever the test moved it on with
@@ -35,6 +35,10 @@ pub struct FakeDisplay(Arc<Inner>);
 /// The card EternalMonitor runs on, and lists every screen under, as DXGI
 /// does on a hybrid PC.
 pub const APP_GPU: &str = "Fake GPU";
+
+/// The LUIDs of [`APP_GPU`] and of the PC's other card.
+const APP_CARD: AdapterId = (0, 1);
+const OTHER_CARD: AdapterId = (0, 2);
 
 struct Inner {
     /// See [`FakeDisplay::set_attach_after`].
@@ -49,8 +53,8 @@ struct Inner {
     /// What it answers for Windows' input desktop: see
     /// [`FakeDisplay::set_desktop_away`].
     desktop_away: Arc<AtomicBool>,
-    /// See [`FakeDisplay::move_screen`].
-    screen_card: Mutex<Option<String>>,
+    /// The display configuration: see [`FakeDisplay::move_screen`].
+    facts: Arc<Mutex<Option<GpuFacts>>>,
 }
 
 impl FakeDisplay {
@@ -67,7 +71,7 @@ impl FakeDisplay {
             on_since: Mutex::new(None),
             toggles: Mutex::new(Vec::new()),
             desktop_away: Arc::new(AtomicBool::new(false)),
-            screen_card: Mutex::new(None),
+            facts: Arc::new(Mutex::new(Some(screen_on(None)))),
         }))
     }
 
@@ -91,6 +95,7 @@ impl FakeDisplay {
         state.memory = loaded;
         state.fake_desktop_away = Some(self.0.desktop_away.clone());
         drop(state);
+        super::use_fake_facts(shared, self.0.facts.clone());
         *shared.vdd_worker.fake.lock() = Some(self.clone());
     }
 
@@ -116,14 +121,14 @@ impl FakeDisplay {
         *self.0.attach_after.lock() = after;
     }
 
-    /// Have Windows move the main screen to `card` (Some), as a laptop with
-    /// two graphics cards may while the app runs, or keep it on
-    /// [`APP_GPU`] (None, at first). On another card, mirroring it fails as
-    /// DXGI does then (`UnsupportedOnThisGpu`), and the display
-    /// configuration says the screen is wired to `card`; the second screen
-    /// still works.
+    /// Have Windows move the main screen to the PC's other card, named
+    /// `card` (Some), as a laptop with two graphics cards may while the app
+    /// runs, or back to [`APP_GPU`] (None, at first). On the other card,
+    /// mirroring it fails as DXGI does then (`UnsupportedOnThisGpu`), and
+    /// the display configuration says the screen is wired to it; the second
+    /// screen still works.
     pub fn move_screen(&self, card: Option<&str>) {
-        *self.0.screen_card.lock() = card.map(str::to_string);
+        *self.0.facts.lock() = Some(screen_on(card));
     }
 
     /// Each time it was turned on (true) or off, on its clock, since it was
@@ -215,6 +220,29 @@ pub(super) fn send(shared: &SharedControl, display: FakeDisplay, command: Comman
     }
 }
 
+/// The PC's two cards, the main screen on the other one, named `card`, or
+/// on [`APP_GPU`].
+fn screen_on(card: Option<&str>) -> GpuFacts {
+    GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: APP_CARD,
+                name: APP_GPU.to_string(),
+            },
+            Adapter {
+                id: OTHER_CARD,
+                name: card.unwrap_or("Fake iGPU").to_string(),
+            },
+        ],
+        power_saving: Some(OTHER_CARD),
+        high_performance: Some(APP_CARD),
+        screens: vec![(
+            "primary".to_string(),
+            if card.is_some() { OTHER_CARD } else { APP_CARD },
+        )],
+    }
+}
+
 /// What synthetic capture's mirror finds with a fake display installed: on
 /// [`APP_GPU`] it works; after [`FakeDisplay::move_screen`] Windows refuses
 /// it, as DXGI capture reports it.
@@ -222,27 +250,19 @@ pub(crate) fn mirror(shared: &SharedControl) -> Result<(), CaptureUnavailable> {
     let Some(display) = installed(shared) else {
         return Ok(());
     };
-    let Some(card) = display.0.screen_card.lock().clone() else {
-        crate::capture::note_mirror_works(shared, APP_GPU);
+    let facts = display.0.facts.lock().clone();
+    if !facts
+        .as_ref()
+        .is_some_and(|facts| facts.wired_elsewhere("primary", APP_CARD))
+    {
+        let app = Adapter {
+            id: APP_CARD,
+            name: APP_GPU.to_string(),
+        };
+        crate::capture::note_mirror_works(shared, Some(&app));
         return Ok(());
-    };
-    let (app, other) = ((0, 1), (0, 2));
-    let facts = GpuFacts {
-        adapters: vec![
-            Adapter {
-                id: app,
-                name: APP_GPU.to_string(),
-            },
-            Adapter {
-                id: other,
-                name: card,
-            },
-        ],
-        power_saving: Some(other),
-        high_performance: Some(app),
-        screens: vec![("primary".to_string(), other)],
-    };
-    crate::capture::note_gpu_refused(shared, "primary", Some(facts), true);
+    }
+    crate::capture::note_gpu_refused(shared, "primary", facts, Some(APP_CARD));
     Err(CaptureUnavailable {
         block: CaptureBlock::UnsupportedOnThisGpu,
         detail: "the fake main screen is on another graphics card".to_string(),
@@ -291,7 +311,7 @@ mod tests {
             shared
                 .second_screen
                 .lock()
-                .remember("attach_timeout", Instant::now(), false);
+                .remember("attach_timeout", Instant::now(), false, false);
             // The file may be written a moment after `remember` returns.
             let file = dir.join(FILE_NAME);
             if away {

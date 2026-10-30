@@ -35,8 +35,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -210,6 +210,14 @@ pub fn run_capture_loop(
     };
 
     info!(adapter = %adapter_name, "Capture using adapter");
+    // The mirror's card, by LUID, for the graphics card checks.
+    let mirror_card = unsafe { adapter.GetDesc1() }
+        .ok()
+        .filter(|_| !second_screen)
+        .map(|desc| crate::gpu_preference::Adapter {
+            id: adapter_id(desc),
+            name: adapter_name.clone(),
+        });
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.set_gpu_name(adapter_name.clone());
@@ -235,7 +243,7 @@ pub fn run_capture_loop(
         duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
             .inspect_err(|error| {
                 if error.code() == DXGI_ERROR_UNSUPPORTED {
-                    check_gpu(&output1, &shared, !second_screen);
+                    check_gpu(&output1, &shared, mirror_card.as_ref().map(|card| card.id));
                 }
             })
             .map_err(blocked_or_error)?
@@ -243,7 +251,7 @@ pub fn run_capture_loop(
     info!("Desktop duplication active");
     note_gpu_outcome(&shared, Outcome::Worked);
     if !second_screen {
-        super::note_mirror_works(&shared, &adapter_name);
+        super::note_mirror_works(&shared, mirror_card.as_ref());
     }
 
     // --- Query desktop dimensions from duplication ---
@@ -831,14 +839,24 @@ fn resend_last_frame(
 }
 
 /// Windows won't duplicate `output` from the card this process runs on: see
-/// [`super::note_gpu_refused`]. `mirror`: `output` is the mirror's screen.
-fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl, mirror: bool) {
+/// [`super::note_gpu_refused`]. `mirror_card`: `output` is the mirror's
+/// screen, captured from the card with this LUID.
+fn check_gpu(
+    output: &IDXGIOutput1,
+    shared: &SharedControl,
+    mirror_card: Option<crate::gpu_preference::AdapterId>,
+) {
     note_gpu_outcome(shared, Outcome::StillUnsupported);
     let Ok(desc) = (unsafe { output.GetDesc() }) else {
         return;
     };
     let screen = utf16_to_string(&desc.DeviceName);
-    super::note_gpu_refused(shared, &screen, crate::gpu_preference::facts(), mirror);
+    super::note_gpu_refused(shared, &screen, crate::gpu_preference::facts(), mirror_card);
+}
+
+/// An adapter's LUID, as the graphics card checks compare it.
+fn adapter_id(desc: DXGI_ADAPTER_DESC1) -> crate::gpu_preference::AdapterId {
+    (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which

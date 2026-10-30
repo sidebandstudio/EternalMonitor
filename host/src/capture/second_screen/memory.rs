@@ -892,13 +892,15 @@ fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::super::{
         attach, next_step, note_attached, note_connected, note_image, remembered_failure,
-        retries_later, start_proving, Driver, Step, PROVE_TIMEOUT,
+        retries_later, set_facts, start_proving, Driver, Failure, Step, BLOCKED_EXTEND_RETRY,
+        PROVE_TIMEOUT,
     };
     use super::*;
-    use crate::capture::tests::connect_viewer;
+    use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
     use crate::capture::OutputInfo;
     use crate::control::{CaptureTarget, SharedControl, VddStatus};
     use crate::transport::link::LinkId;
+    use crate::vdd_device::VddProblem;
     use std::cell::Cell;
 
     /// 2027-01-15, an arbitrary wall clock for the first app run.
@@ -1302,6 +1304,41 @@ mod tests {
         remove_folder(&path);
     }
 
+    /// [`NeverAttaches`], as when Windows shows the second screen as a copy
+    /// of the main one: its device is ready, and the desktop kept off it.
+    struct Copied<'a> {
+        display: NeverAttaches,
+        shared: &'a SharedControl,
+    }
+
+    impl Driver for Copied<'_> {
+        fn outputs(&self) -> Vec<OutputInfo> {
+            self.display.outputs()
+        }
+
+        fn prepare(&self, outputs: &[OutputInfo]) {
+            self.display.prepare(outputs);
+        }
+
+        fn set_enabled(&self, enabled: bool) -> bool {
+            self.display.set_enabled(enabled)
+        }
+
+        fn report(&self, failure: Failure) {
+            if failure == Failure::AttachTimeout {
+                *self.shared.vdd_problem.lock() = Some(VddProblem::NotExtended);
+            }
+        }
+
+        fn now(&self) -> Instant {
+            self.display.now()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.display.sleep(duration);
+        }
+    }
+
     /// The 0.3.4 beta field case: a laptop whose screen Windows moved to the
     /// card EternalMonitor doesn't run on, so the mirror shows nothing, and
     /// then a start that didn't attach (Windows showed the second screen as
@@ -1310,11 +1347,10 @@ mod tests {
     /// second screen again.
     #[test]
     fn a_failure_while_the_mirror_is_blocked_is_tried_again_at_the_next_connection() {
-        use super::super::note_mirror_blocked;
         let path = temp_file("mirror-blocked");
         let (memory, start) = app_run(&path, Duration::ZERO);
         let shared = second_screen_with(memory);
-        note_mirror_blocked(&shared, true);
+        refuse_moved_mirror(&shared);
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Attach);
         let driver = NeverAttaches::new(start);
@@ -1342,7 +1378,7 @@ mod tests {
     /// mirror only while the mirror works.
     #[test]
     fn no_failure_keeps_a_blocked_mirror_on_screen() {
-        use super::super::{note_capture_error, note_mirror_blocked};
+        use super::super::note_capture_error;
         let path = temp_file("saved-then-blocked");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("attach_timeout", start).unwrap();
@@ -1352,7 +1388,7 @@ mod tests {
         note_connected(&shared, start);
         assert_eq!(next_step(&shared, start), Step::Nothing, "held, as before");
         // The mirror's capture is refused.
-        note_mirror_blocked(&shared, true);
+        refuse_moved_mirror(&shared);
         let now = start + Duration::from_secs(60);
         reconnect(&shared, now);
         assert_eq!(next_step(&shared, now), Step::Attach, "the saved hold");
@@ -1378,12 +1414,12 @@ mod tests {
     /// failures are remembered as on every PC where it works.
     #[test]
     fn a_mirror_that_works_again_remembers_failures_as_before() {
-        use super::super::note_mirror_blocked;
         let path = temp_file("mirror-unblocked");
         let (memory, start) = app_run(&path, Duration::ZERO);
         let shared = second_screen_with(memory);
-        note_mirror_blocked(&shared, true);
-        note_mirror_blocked(&shared, false);
+        refuse_moved_mirror(&shared);
+        set_facts(&shared, Some(hybrid_laptop(false)));
+        crate::capture::note_mirror_works(&shared, Some(&hybrid_laptop(false).adapters[0]));
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Attach);
         let driver = NeverAttaches::new(start);
@@ -1393,6 +1429,183 @@ mod tests {
         reconnect(&shared, later);
         assert_eq!(next_step(&shared, later), Step::Nothing, "the mirror");
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        remove_folder(&path);
+    }
+
+    /// Review round 1: on a PC where the mirror works, Windows may refuse it
+    /// for a moment while the desktop changes mode. Unless the display
+    /// configuration wires its screen to another card than the one capture
+    /// runs on, a failure is saved and held, and a manifest rule holds,
+    /// exactly as before: not without facts, nor with the screen on that
+    /// card.
+    #[test]
+    fn a_refusal_without_a_card_mismatch_keeps_failures_and_rules_as_before() {
+        use crate::capture::note_gpu_refused;
+        for facts in [None, Some(hybrid_laptop(false))] {
+            let refuse = |shared: &SharedControl| {
+                set_facts(shared, facts.clone());
+                note_gpu_refused(shared, r"\\.\DISPLAY1", facts.clone(), Some(NVIDIA));
+            };
+            let path = temp_file("refused-same-card");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            refuse(&shared);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Attach);
+            let driver = NeverAttaches::new(start);
+            attach(&shared, &driver, ATTACH_TIMEOUT);
+            assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+            let later = driver.now() + Duration::from_secs(60);
+            reconnect(&shared, later);
+            assert_eq!(next_step(&shared, later), Step::Nothing, "{facts:?}");
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+            remove_folder(&path);
+            // The next app run, the failure saved: held at once.
+            let path = temp_file("refused-same-card-saved");
+            let (mut memory, start) = app_run(&path, Duration::ZERO);
+            memory.note_failure("attach_timeout", start).unwrap();
+            let (memory, start) = app_run(&path, Duration::from_secs(600));
+            let shared = second_screen_with(memory);
+            refuse(&shared);
+            connect_viewer(&shared);
+            note_connected(&shared, start);
+            assert_eq!(next_step(&shared, start), Step::Nothing, "{facts:?}");
+            remove_folder(&path);
+            // A manifest rule naming this PC.
+            let path = temp_file("refused-same-card-rule");
+            let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+            let shared = second_screen_with(memory);
+            refuse(&shared);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Nothing, "{facts:?}");
+            assert_eq!(remembered_failure(&shared), Some(HARDWARE_RULE));
+            remove_folder(&path);
+        }
+    }
+
+    /// Review round 1: the mirror was refused with its screen on the other
+    /// card, and the second screen ran. Windows moved the screen back
+    /// meanwhile, so the mirror works again, though nothing captured it to
+    /// say so. A failure of the second screen then is saved, and the next
+    /// connection mirrors, as on any PC where the mirror works.
+    #[test]
+    fn a_screen_moved_back_during_the_second_screen_saves_its_failure() {
+        use super::super::note_capture_error;
+        let path = temp_file("moved-back");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        refuse_moved_mirror(&shared);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        note_attached(&shared, "virtual".to_string());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 1, start);
+        set_facts(&shared, Some(hybrid_laptop(false)));
+        note_capture_error(&shared, 1);
+        assert_eq!(
+            next_step(&shared, start),
+            Step::Fallback("duplication_failed")
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
+        assert_eq!(saved(&path)["failure"]["failures"], 1);
+        let later = start + Duration::from_secs(60);
+        reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Nothing, "the mirror");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        remove_folder(&path);
+        // And a start that times out once the screen is back is saved too.
+        let path = temp_file("moved-back-attach");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        refuse_moved_mirror(&shared);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        set_facts(&shared, Some(hybrid_laptop(false)));
+        attach(&shared, &NeverAttaches::new(start), ATTACH_TIMEOUT);
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        remove_folder(&path);
+    }
+
+    /// Review round 1: while the mirror is blocked and Windows keeps showing
+    /// the second screen as a copy of the main one, every connection turned
+    /// the display on and off again. Now the next start waits
+    /// [`BLOCKED_EXTEND_RETRY`], the "choose Extend" and graphics card
+    /// notices stay, and Try again starts at once.
+    #[test]
+    fn while_the_mirror_is_blocked_a_copied_second_screen_is_tried_every_2_minutes() {
+        let path = temp_file("blocked-copied");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        refuse_moved_mirror(&shared);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let copied = Copied {
+            display: NeverAttaches::new(start),
+            shared: &shared,
+        };
+        attach(&shared, &copied, ATTACH_TIMEOUT);
+        let failed_at = copied.now();
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert!(!exists(&path), "nothing saved");
+        assert!(retries_later(&shared));
+        let notices = |shared: &SharedControl| {
+            assert_eq!(
+                *shared.vdd_problem.lock(),
+                Some(VddProblem::NotExtended),
+                "choose Extend"
+            );
+            assert_eq!(
+                shared.gpu_diagnosis.lock().as_ref().unwrap().screen_gpu,
+                "AMD Radeon 780M Graphics",
+                "switch graphics cards"
+            );
+        };
+        notices(&shared);
+        // Connections within the wait mirror, with no new start.
+        for after in [10, 60, 119] {
+            let now = failed_at + Duration::from_secs(after);
+            reconnect(&shared, now);
+            assert_eq!(next_step(&shared, now), Step::Nothing, "{after} s");
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+            assert!(retries_later(&shared));
+            notices(&shared);
+        }
+        assert_eq!(copied.display.enables.get(), 1);
+        // After it, the next connection tries again.
+        let now = failed_at + BLOCKED_EXTEND_RETRY;
+        reconnect(&shared, now);
+        assert_eq!(next_step(&shared, now), Step::Attach);
+        let copied = Copied {
+            display: NeverAttaches::new(now),
+            shared: &shared,
+        };
+        attach(&shared, &copied, ATTACH_TIMEOUT);
+        assert_eq!(copied.display.enables.get(), 1);
+        let now = copied.now() + Duration::from_secs(5);
+        reconnect(&shared, now);
+        assert_eq!(next_step(&shared, now), Step::Nothing, "the wait again");
+        // Try again starts at once.
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, now), Step::Attach);
+        assert!(!exists(&path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // With the mirror working, such a failure is saved and held as
+        // before, well past the wait.
+        let path = temp_file("copied-mirror-works");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let copied = Copied {
+            display: NeverAttaches::new(start),
+            shared: &shared,
+        };
+        attach(&shared, &copied, ATTACH_TIMEOUT);
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        let later = copied.now() + BLOCKED_EXTEND_RETRY * 2;
+        reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Nothing, "held an hour");
         remove_folder(&path);
     }
 
