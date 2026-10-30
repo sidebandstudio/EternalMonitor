@@ -118,11 +118,9 @@ impl UsbHub {
             }
             state.links.clear();
             let (event_tx, event_rx) = mpsc::channel(256);
-            let supervisor = self.runtime.spawn(supervise(
-                event_tx,
-                Arc::clone(force_idr),
-                Arc::clone(&self.state),
-            ));
+            let supervisor = self
+                .runtime
+                .spawn(supervise(event_tx, Arc::clone(force_idr)));
             self.runtime
                 .spawn(run_hub(event_rx, Arc::clone(&self.state)));
             state.supervisor = Some((key, supervisor.abort_handle()));
@@ -435,19 +433,7 @@ async fn device_worker(source: Source, events: mpsc::Sender<UsbEvent>, force_idr
     }
 }
 
-/// Whether to log that Apple Devices is missing for an iPad on the cable:
-/// once per change, and never while a USB tunnel is open. An open tunnel
-/// proves the cable works, so a missed service poll during a session is not
-/// worth a warning, as the Stream page notice already knows.
-fn warn_apple_devices(cabled: AppleUsbState, logged: AppleUsbState, tunnel_open: bool) -> bool {
-    !tunnel_open && cabled != logged && cabled.cabled_devices > 0
-}
-
-async fn supervise(
-    events: mpsc::Sender<UsbEvent>,
-    force_idr: Arc<AtomicBool>,
-    hub: Arc<Mutex<HubState>>,
-) {
+async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     if let Ok(address) = std::env::var("ETERNAL_USB_DIRECT") {
         {
             let mut stats = PIPELINE_STATS.lock();
@@ -479,19 +465,14 @@ async fn supervise(
                 } else {
                     tokio::task::spawn_blocking(apple_usb::probe).await.unwrap_or_default()
                 };
-                let tunnel_open = !hub.lock().links.is_empty();
-                if warn_apple_devices(cabled, unreachable, tunnel_open) {
+                if cabled != unreachable && cabled.cabled_devices > 0 {
                     if cabled.apple_devices_installed {
                         warn!("An iPad is plugged in over USB, but Apple Devices is not running. Open Apple Devices to stream over the cable");
                     } else {
                         warn!("An iPad is plugged in over USB, but Apple Devices is not installed. Get it from the Microsoft Store to stream over the cable");
                     }
                 }
-                // Kept through a session, so a service that is still gone
-                // when the session ends is logged then.
-                if !tunnel_open {
-                    unreachable = cabled;
-                }
+                unreachable = cabled;
                 {
                     let mut stats = PIPELINE_STATS.lock();
                     stats.usb_service_reachable = available;
@@ -512,30 +493,5 @@ async fn supervise(
             }
             _ = workers.join_next(), if !workers.is_empty() => {},
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn apple_devices_is_logged_missing_only_without_a_usb_session() {
-        let fine = AppleUsbState::default();
-        let not_running = AppleUsbState {
-            cabled_devices: 1,
-            apple_devices_installed: true,
-        };
-        assert!(warn_apple_devices(not_running, fine, false));
-        // Once per change.
-        assert!(!warn_apple_devices(not_running, not_running, false));
-        assert!(!warn_apple_devices(fine, not_running, false));
-        // A missed poll while the iPad streams over the cable says nothing.
-        assert!(!warn_apple_devices(not_running, fine, true));
-        let not_installed = AppleUsbState {
-            apple_devices_installed: false,
-            ..not_running
-        };
-        assert!(!warn_apple_devices(not_installed, fine, true));
     }
 }
