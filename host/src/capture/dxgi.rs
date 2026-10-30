@@ -13,7 +13,7 @@ use windows::core::Interface;
 
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
-    LossStep, LOSS_GIVE_UP,
+    LossStep, OpenStep, LOSS_GIVE_UP,
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
@@ -147,8 +147,8 @@ pub fn run_capture_loop(
     if !outputs.is_empty() && NO_OUTPUTS.swap(false, Ordering::Relaxed) {
         info!(outputs = outputs.len(), "A display output is back");
     }
-    // A missing output (DXGI_ERROR_NOT_FOUND) is a display change the stage
-    // waits out, not a failure.
+    // A missing adapter or output (DXGI_ERROR_NOT_FOUND) is a display change
+    // the stage waits out, not a failure.
     let (adapter, output, adapter_name, capture_label) = match resolve_target(&outputs, &target) {
         Some(idx) => {
             let chosen = &outputs[idx];
@@ -160,15 +160,15 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for the chosen output's adapter — falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
+                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
                 Ok(desc) => utf16_to_string(&desc.Description),
                 Err(_) => chosen.adapter_name.clone(),
             };
-            let output: IDXGIOutput =
-                unsafe { adapter.EnumOutputs(chosen.output_index) }.map_err(blocked_or_error)?;
+            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(chosen.output_index) }
+                .map_err(opening(OpenStep::ListedOutput))?;
             let label = format!(
                 "{} ({}x{})",
                 chosen.device_name, chosen.width, chosen.height
@@ -196,7 +196,7 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
+                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
@@ -204,7 +204,7 @@ pub fn run_capture_loop(
                 Err(_) => String::new(),
             };
             let output: IDXGIOutput =
-                unsafe { adapter.EnumOutputs(0) }.map_err(blocked_or_error)?;
+                unsafe { adapter.EnumOutputs(0) }.map_err(opening(OpenStep::OnlyOutput))?;
             (adapter, output, adapter_name, "primary (auto)".to_string())
         }
     };
@@ -844,7 +844,21 @@ fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl, mirror: bool) {
 /// Windows states that block duplication become [`CaptureUnavailable`], which
 /// the stage retries; anything else fails the stage as before.
 fn blocked_or_error(error: windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    match CaptureBlock::from_hresult(error.code().0) {
+    unavailable_or_error(CaptureBlock::from_hresult(error.code().0), error)
+}
+
+/// [`blocked_or_error`] for the call at `step` that opens the output.
+fn opening(
+    step: OpenStep,
+) -> impl FnOnce(windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    move |error| unavailable_or_error(CaptureBlock::opening(step, error.code().0), error)
+}
+
+fn unavailable_or_error(
+    block: Option<CaptureBlock>,
+    error: windows::core::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match block {
         Some(block) => Box::new(CaptureUnavailable {
             block,
             detail: error.to_string(),

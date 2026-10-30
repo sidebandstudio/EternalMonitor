@@ -668,6 +668,9 @@ fn outputs(shared: &SharedControl) -> Vec<OutputInfo> {
     if let Some(outputs) = second_screen::fake::outputs(shared) {
         return outputs;
     }
+    // Only the debug-build fake reads it.
+    #[cfg(not(debug_assertions))]
+    let _ = shared;
     enumerate_outputs()
 }
 
