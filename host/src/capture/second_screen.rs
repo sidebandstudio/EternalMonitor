@@ -89,6 +89,9 @@ const QUIT_JOIN: Duration = Duration::from_secs(5);
 /// limit is 30 s.
 const QUIT_ENABLE_WAIT: Duration = Duration::from_secs(35);
 
+/// How long quitting waits for the saved failure to be written.
+const QUIT_SAVE_WAIT: Duration = Duration::from_secs(5);
+
 /// What the transport does next for the second screen.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -843,8 +846,16 @@ fn spawn_worker(shared: &SharedControl) -> std::io::Result<()> {
 
 /// Quitting: once this returns no Enable runs or will start, so the caller's
 /// Disable is the last change. Waits for an Enable in flight, then for the
-/// worker to exit, both bounded.
+/// worker to exit, then for the saved failure to be written, all bounded.
 pub fn shut_down(shared: &SharedControl) {
+    stop_worker(shared);
+    let saver = shared.second_screen.lock().memory.saver();
+    if saver.is_some_and(|saver| !saver.flush(QUIT_SAVE_WAIT)) {
+        warn!("The second screen record is still being written — quitting without it");
+    }
+}
+
+fn stop_worker(shared: &SharedControl) {
     let worker = &shared.vdd_worker;
     worker.queue.lock().quitting = true;
     worker.wake.notify_all();

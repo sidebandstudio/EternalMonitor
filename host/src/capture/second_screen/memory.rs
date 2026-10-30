@@ -18,10 +18,17 @@
 //! with Try again, and the same waits. A PC where the second screen showed a
 //! picture, or where Try again was clicked, is exempt from every rule for
 //! good: a rule never moves a PC that works into the mirror.
+//!
+//! The files are written by a [`Saver`] thread, never by the caller: the
+//! caller holds the locks the transport takes at every pass, and a write on
+//! a slow disk took 3 s, long enough for the iPad to give up.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -208,6 +215,7 @@ struct Store {
     wall: u64,
     since: Instant,
     io: Io,
+    saver: Arc<Saver>,
 }
 
 /// The file operations, so tests can make them fail.
@@ -240,14 +248,6 @@ pub(crate) struct Memory {
     /// failure, instead of trying again at each connection. The saved
     /// failure and its count stay for the next app run.
     excused: bool,
-    /// A forgotten failure is still in the file, and when clearing it was
-    /// last tried: removing, replacing and overwriting it all failed. This app
-    /// run treats it as cleared and tries again at the next success or Try
-    /// again, or a minute later; the next app run may hold until the wait
-    /// ends or the user clicks Try again.
-    uncleared: Option<Instant>,
-    /// Clearing failed and was logged once in this app run.
-    clear_failure_logged: bool,
     rule: Option<Rule>,
 }
 
@@ -280,6 +280,9 @@ impl Memory {
                 failed_at: record.failed_at,
             }),
         };
+        let saver = Arc::new(Saver::default());
+        #[cfg(test)]
+        SAVERS.lock().push((path.clone(), Arc::downgrade(&saver)));
         let memory = Self {
             store: Some(Store {
                 path,
@@ -287,11 +290,10 @@ impl Memory {
                 wall,
                 since: now,
                 io: Io::FILES,
+                saver,
             }),
             failed,
             excused: false,
-            uncleared: None,
-            clear_failure_logged: false,
             rule: None,
         };
         if let Some(failed) = memory.failed {
@@ -367,22 +369,9 @@ impl Memory {
             format: FORMAT,
             cards: store.fingerprint.cards(),
         };
-        let written = serde_json::to_vec_pretty(&saved)
-            .map_err(std::io::Error::other)
-            .and_then(|data| {
-                rule.path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-                (store.io.replace)(&rule.path, &data)
-            });
-        match written {
-            Ok(()) => tracing::info!(
-                "The second screen worked or was tried on this PC — no update manifest rule \
-                 applies here"
-            ),
-            Err(error) => warn!(
-                %error,
-                "Could not save that the second screen worked on this PC — an update manifest \
-                 rule may apply again at the next app run"
-            ),
+        match serde_json::to_vec_pretty(&saved) {
+            Ok(data) => store.save(rule.path.clone(), Save::Worked(data), Instant::now()),
+            Err(error) => warn!(%error, "{}", OVERRIDE_NOT_SAVED),
         }
     }
 
@@ -430,14 +419,14 @@ impl Memory {
         let failed_at = self.wall(now)?;
         let store = self.store.as_ref()?;
         let failures = self.failed.map_or(0, |f| f.failures).saturating_add(1);
-        match store.write(Some(Record {
+        match encode(Some(Record {
             fingerprint: store.fingerprint.clone(),
             reason: reason.to_string(),
             failures,
             failed_at,
         })) {
-            Ok(()) => self.uncleared = None,
-            Err(error) => warn!(%error, "Could not save the second screen record"),
+            Ok(data) => store.save(store.path.clone(), Save::Failure(data), now),
+            Err(error) => warn!(%error, "{}", FAILURE_NOT_SAVED),
         }
         self.excused = false;
         self.failed = Some(Failed {
@@ -452,7 +441,7 @@ impl Memory {
     /// be removed (another program holds it) is replaced by one that says
     /// there is no failure, or overwritten in place with that, so the next
     /// app run doesn't hold either. When none works, see
-    /// [`Memory::uncleared`]. `now` paces those retries; `success` (a picture
+    /// [`Saving::uncleared`]. `now` paces those retries; `success` (a picture
     /// or Try again) retries at once.
     pub(crate) fn forget(&mut self, now: Instant, success: bool) -> bool {
         if success {
@@ -460,7 +449,7 @@ impl Memory {
         }
         let forgot = self.failed.take().is_some();
         self.excused = false;
-        if forgot || (success && self.uncleared.is_some()) {
+        if forgot || (success && self.uncleared().is_some()) {
             self.clear(now);
         } else {
             self.retry_clear(now);
@@ -473,7 +462,7 @@ impl Memory {
     /// whatever the mode and however the second screen is doing.
     pub(crate) fn retry_clear(&mut self, now: Instant) {
         if self
-            .uncleared
+            .uncleared()
             .is_some_and(|tried| now.saturating_duration_since(tried) >= CLEAR_RETRY)
         {
             self.clear(now);
@@ -481,12 +470,161 @@ impl Memory {
     }
 
     fn clear(&mut self, now: Instant) {
-        let Some(store) = &self.store else {
-            return;
+        if let Some(store) = &self.store {
+            store.save(store.path.clone(), Save::Clear, now);
+        }
+    }
+
+    /// See [`Saving::uncleared`].
+    fn uncleared(&self) -> Option<Instant> {
+        self.store.as_ref()?.saver.saving.lock().uncleared
+    }
+
+    /// What writes the files, to wait for at quit.
+    pub(crate) fn saver(&self) -> Option<Arc<Saver>> {
+        Some(Arc::clone(&self.store.as_ref()?.saver))
+    }
+}
+
+impl Store {
+    fn save(&self, path: PathBuf, save: Save, now: Instant) {
+        self.saver.queue(Job {
+            path,
+            save,
+            io: self.io,
+            now,
+        });
+    }
+}
+
+/// Writes the files on its own thread, one at a time and in the order they
+/// were asked for, so the threads that decide what they hold never wait for
+/// the disk. A file's next state replaces one still waiting to be written:
+/// an earlier state never lands after a later one.
+#[derive(Debug, Default)]
+pub(crate) struct Saver {
+    saving: Mutex<Saving>,
+    idle: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Saving {
+    jobs: VecDeque<Job>,
+    /// The thread runs, or is about to.
+    writing: bool,
+    /// The forgotten failure may still be in the file: since this time, a
+    /// clear is waiting, or removing, replacing and overwriting it all
+    /// failed. This app run treats it as cleared and tries again at the next
+    /// success or Try again, or a minute later; the next app run may hold
+    /// until the wait ends or the user clicks Try again.
+    uncleared: Option<Instant>,
+    /// Clearing failed and was logged once in this app run.
+    clear_failure_logged: bool,
+}
+
+#[derive(Debug)]
+struct Job {
+    path: PathBuf,
+    save: Save,
+    io: Io,
+    /// When the caller asked for it, on the caller's clock.
+    now: Instant,
+}
+
+#[derive(Debug)]
+enum Save {
+    /// The failure's record, encoded.
+    Failure(Vec<u8>),
+    /// No failure: see [`clear`].
+    Clear,
+    /// The [`Override`] of the manifest rules, encoded.
+    Worked(Vec<u8>),
+}
+
+const FAILURE_NOT_SAVED: &str = "Could not save the second screen record";
+
+const OVERRIDE_NOT_SAVED: &str = "Could not save that the second screen worked on this PC — an \
+                                  update manifest rule may apply again at the next app run";
+
+impl Saver {
+    fn queue(self: &Arc<Self>, job: Job) {
+        let start = {
+            let mut saving = self.saving.lock();
+            match job.save {
+                Save::Failure(_) => saving.uncleared = None,
+                Save::Clear => saving.uncleared = Some(job.now),
+                Save::Worked(_) => {}
+            }
+            saving.jobs.retain(|waiting| waiting.path != job.path);
+            saving.jobs.push_back(job);
+            !std::mem::replace(&mut saving.writing, true)
         };
-        match store.clear() {
-            Ok(()) => self.uncleared = None,
-            Err(error) => {
+        if !start {
+            return;
+        }
+        let saver = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("second-screen-save".into())
+            .spawn(move || saver.drain());
+        // Never written here, under the caller's locks: the next save tries
+        // again.
+        if let Err(error) = spawned {
+            self.saving.lock().writing = false;
+            warn!(%error, "Could not start saving the second screen record — trying again later");
+        }
+    }
+
+    fn drain(&self) {
+        let mut saving = self.saving.lock();
+        while let Some(job) = saving.jobs.pop_front() {
+            let result = MutexGuard::unlocked(&mut saving, || job.run());
+            saving.finish(&job, result);
+        }
+        saving.writing = false;
+        self.idle.notify_all();
+    }
+
+    /// Wait up to `timeout` for every file asked for to be written. Whether
+    /// they were.
+    pub(crate) fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut saving = self.saving.lock();
+        while saving.writing {
+            if self.idle.wait_until(&mut saving, deadline).timed_out() {
+                break;
+            }
+        }
+        !saving.writing && saving.jobs.is_empty()
+    }
+}
+
+impl Job {
+    /// Replace the file at once, as the settings file is: a crash leaves the
+    /// old content or the new one.
+    fn run(&self) -> std::io::Result<()> {
+        match &self.save {
+            Save::Failure(data) | Save::Worked(data) => {
+                self.path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+                (self.io.replace)(&self.path, data)
+            }
+            Save::Clear => clear(&self.path, self.io),
+        }
+    }
+}
+
+impl Saving {
+    fn finish(&mut self, job: &Job, result: std::io::Result<()>) {
+        // A later state of the file is waiting; it decides.
+        let superseded = self.jobs.iter().any(|later| later.path == job.path);
+        match (&job.save, result) {
+            (Save::Failure(_), Ok(())) => {}
+            (Save::Failure(_), Err(error)) => warn!(%error, "{}", FAILURE_NOT_SAVED),
+            (Save::Clear, Ok(())) => {
+                if !superseded {
+                    self.uncleared = None;
+                }
+            }
+            (Save::Clear, Err(error)) => {
                 if !std::mem::replace(&mut self.clear_failure_logged, true) {
                     warn!(
                         %error,
@@ -495,32 +633,31 @@ impl Memory {
                          clicked"
                     );
                 }
-                self.uncleared = Some(now);
             }
+            (Save::Worked(_), Ok(())) => tracing::info!(
+                "The second screen worked or was tried on this PC — no update manifest rule \
+                 applies here"
+            ),
+            (Save::Worked(_), Err(error)) => warn!(%error, "{}", OVERRIDE_NOT_SAVED),
         }
     }
 }
 
-impl Store {
-    /// Replace the file at once, as the settings file is: a crash leaves the
-    /// old record or the new one.
-    fn write(&self, failure: Option<Record>) -> std::io::Result<()> {
-        self.path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-        (self.io.replace)(&self.path, &encode(failure)?)
-    }
+/// Every saver, for tests to wait for the files of theirs.
+#[cfg(test)]
+static SAVERS: Mutex<Vec<(PathBuf, std::sync::Weak<Saver>)>> = Mutex::new(Vec::new());
 
-    /// Leave no failure in the file: remove it; else replace it with one that
-    /// says there is none; else, when a handle another program holds allows
-    /// writing but not deleting, overwrite it in place. Torn by a crash, that
-    /// reads as unusable, which also means no failure. The last error.
-    fn clear(&self) -> std::io::Result<()> {
-        match (self.io.remove)(&self.path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
-            _ => return Ok(()),
-        }
-        let empty = encode(None)?;
-        (self.io.replace)(&self.path, &empty).or_else(|_| (self.io.overwrite)(&self.path, &empty))
+/// Leave no failure in the file: remove it; else replace it with one that
+/// says there is none; else, when a handle another program holds allows
+/// writing but not deleting, overwrite it in place. Torn by a crash, that
+/// reads as unusable, which also means no failure. The last error.
+fn clear(path: &Path, io: Io) -> std::io::Result<()> {
+    match (io.remove)(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
+        _ => return Ok(()),
     }
+    let empty = encode(None)?;
+    (io.replace)(path, &empty).or_else(|_| (io.overwrite)(path, &empty))
 }
 
 fn encode(failure: Option<Record>) -> std::io::Result<Vec<u8>> {
@@ -630,8 +767,10 @@ mod tests {
         }
     }
 
-    /// An app run that starts `after` the first one, on the same PC.
+    /// An app run that starts `after` the first one, on the same PC, once
+    /// the earlier ones' files are written.
     fn app_run(path: &Path, after: Duration) -> (Memory, Instant) {
+        written(path);
         let start = Instant::now();
         let memory = Memory::load(path.to_path_buf(), laptop(), T0 + after.as_secs(), start);
         (memory, start)
@@ -658,8 +797,48 @@ mod tests {
         note_connected(shared, now);
     }
 
+    /// Wait for the files of every memory saving in `path`'s folder.
+    fn written(path: &Path) {
+        let savers: Vec<_> = {
+            let mut savers = SAVERS.lock();
+            savers.retain(|(_, saver)| saver.strong_count() > 0);
+            savers
+                .iter()
+                .filter(|(saved, _)| saved.parent() == path.parent())
+                .filter_map(|(_, saver)| saver.upgrade())
+                .collect()
+        };
+        for saver in savers {
+            assert!(saver.flush(Duration::from_secs(10)), "written");
+        }
+    }
+
+    /// The test's folder, once nothing writes to it.
+    fn remove_folder(path: &Path) {
+        written(path);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn exists(path: &Path) -> bool {
+        written(path);
+        Path::exists(path)
+    }
+
     fn saved(path: &Path) -> serde_json::Value {
+        written(path);
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// [`Saving::uncleared`], once `memory`'s files are written.
+    fn uncleared(memory: &Memory) -> Option<Instant> {
+        written(&memory.store.as_ref().unwrap().path);
+        memory.uncleared()
+    }
+
+    fn clear_failure_logged(memory: &Memory) -> bool {
+        let store = memory.store.as_ref().unwrap();
+        written(&store.path);
+        store.saver.saving.lock().clear_failure_logged
     }
 
     /// A display that never attaches, on a paused clock.
@@ -768,7 +947,7 @@ mod tests {
         assert_eq!(saved(&path)["failure"]["failures"], 2);
         let hold = shared.second_screen.lock().memory.hold(driver.now());
         assert_eq!(hold.map(|h| h.retry_in), Some(hours(6)));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     #[test]
@@ -800,12 +979,12 @@ mod tests {
         assert_eq!(next_step(&shared, start), Step::Switch);
         start_proving(&shared, 1, start);
         note_image(&shared, 1);
-        assert!(!path.exists(), "a success forgets the failure");
+        assert!(!exists(&path), "a success forgets the failure");
         assert!(!shared.second_screen.lock().memory.saved());
         let (memory, start) = app_run(&path, hours(3));
         assert_eq!(memory.hold(start), None);
         assert!(!memory.saved());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     #[test]
@@ -830,7 +1009,7 @@ mod tests {
         let (memory, start) = app_run(&path, elapsed - hours(169));
         assert_eq!(memory.hold(start), None);
         assert!(memory.saved());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     #[test]
@@ -859,8 +1038,8 @@ mod tests {
             let memory = Memory::load(path.clone(), updated, T0 + 60, at);
             assert_eq!(memory.hold(at), None, "{name}");
             assert!(!memory.saved());
-            assert!(!path.exists(), "{name}");
-            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            assert!(!exists(&path), "{name}");
+            remove_folder(&path);
         }
     }
 
@@ -886,11 +1065,11 @@ mod tests {
                 *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
                 *shared.vdd_status.lock() = VddStatus::WaitingForClient;
             }
-            assert!(!path.exists(), "{how}");
+            assert!(!exists(&path), "{how}");
             assert_eq!(next_step(&shared, start), Step::Attach, "{how}");
             let (memory, start) = app_run(&path, Duration::from_secs(120));
             assert_eq!(memory.hold(start), None, "{how}");
-            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            remove_folder(&path);
         }
     }
 
@@ -942,7 +1121,7 @@ mod tests {
             memory.note_failure("no_frames", start).unwrap();
             let (reloaded, at) = app_run(&path, Duration::from_secs(1));
             assert_eq!(reloaded.hold(at).map(|h| h.reason), Some("no_frames"));
-            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            remove_folder(&path);
         }
         // Bytes that are not text, and a record that matches, for contrast.
         let path = temp_file("binary");
@@ -952,7 +1131,7 @@ mod tests {
         std::fs::write(&path, record(1, "attach_timeout", 3)).unwrap();
         let (memory, start) = app_run(&path, Duration::ZERO);
         assert_eq!(memory.hold(start).map(|h| h.failures), Some(3));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Review round 1: a PC that works, waking to the lock screen (or a UAC
@@ -986,7 +1165,7 @@ mod tests {
                 Step::Fallback(reason)
             );
             assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
-            assert!(!path.exists(), "{reason}: nothing saved");
+            assert!(!exists(&path), "{reason}: nothing saved");
             assert!(!retries_later(&shared));
             // This app run keeps mirroring until Try again, as in 0.3.3.
             let later = start + hours(2);
@@ -1038,9 +1217,9 @@ mod tests {
         // still forgets it.
         assert_eq!(saved(&path)["failure"]["failures"], 1);
         shared.retry_second_screen();
-        assert!(!path.exists());
+        assert!(!exists(&path));
         assert_eq!(next_step(&shared, start + hours(3)), Step::Attach);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// The second screen shown up to the switch, then proving itself.
@@ -1076,7 +1255,7 @@ mod tests {
         note_image(&shared, 1);
         assert!(!super::super::proving(&shared));
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
-        assert!(!path.exists());
+        assert!(!exists(&path));
     }
 
     /// Review round 2: a lost desktop followed by an error that doesn't pass
@@ -1093,7 +1272,7 @@ mod tests {
             Step::Fallback("duplication_failed")
         );
         assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Round 5: a retry that failed with an error that doesn't pass kept the
@@ -1118,7 +1297,7 @@ mod tests {
             Step::Fallback("no_frames")
         );
         assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
 
         // Lost, UNSUPPORTED, then another capturing app until the window
         // ends: this app run only.
@@ -1131,7 +1310,7 @@ mod tests {
             next_step(&shared, start + PROVE_TIMEOUT),
             Step::Fallback("no_frames")
         );
-        assert!(!path.exists());
+        assert!(!exists(&path));
         assert!(!retries_later(&shared));
     }
 
@@ -1154,7 +1333,7 @@ mod tests {
         );
         note_image(&shared, 1);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
-        assert!(!path.exists());
+        assert!(!exists(&path));
 
         // Four losses, and the desktop never comes back.
         let path = temp_file("four-then-nothing");
@@ -1170,7 +1349,7 @@ mod tests {
             Step::Fallback("no_frames")
         );
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
-        assert!(!path.exists(), "this app run only");
+        assert!(!exists(&path), "this app run only");
         assert!(!retries_later(&shared));
 
         // A display that keeps dropping out ends the proof early, still for
@@ -1185,7 +1364,7 @@ mod tests {
             next_step(&shared, start + secs(9)),
             Step::Fallback("duplication_failed")
         );
-        assert!(!path.exists());
+        assert!(!exists(&path));
     }
 
     /// PR #110, review 4: D3D creation took 2.5 s, then DuplicateOutput
@@ -1211,7 +1390,7 @@ mod tests {
         note_interruption(&shared, 1);
         note_capture_error(&shared, 1);
         assert_eq!(next_step(&shared, start + secs(6)), Step::Nothing);
-        assert!(!path.exists(), "a failure during a driver call was saved");
+        assert!(!exists(&path), "a failure during a driver call was saved");
         assert!(!retries_later(&shared));
 
         // Unchanged otherwise: a call of another generation does not cover
@@ -1225,7 +1404,7 @@ mod tests {
             Step::Fallback("no_frames")
         );
         assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// PR #110 on 945873d's rule: the last duplication retry decides. A
@@ -1249,7 +1428,7 @@ mod tests {
             next_step(&shared, start + PROVE_TIMEOUT),
             Step::Fallback("no_frames")
         );
-        assert!(!path.exists(), "a failure whose last try stalled was saved");
+        assert!(!exists(&path), "a failure whose last try stalled was saved");
 
         let path = temp_file("stall-then-unsupported");
         let (shared, start) = proving_second_screen(&path);
@@ -1262,7 +1441,7 @@ mod tests {
             Step::Fallback("duplication_failed")
         );
         assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// PR #110, review 5: a restart during a time-limited call. The new
@@ -1285,7 +1464,7 @@ mod tests {
         );
         assert_eq!(saved(&path)["failure"]["reason"], "duplication_failed");
         drop(old_call);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
 
         // The old guard ending does not clear the new generation's call.
         let path = temp_file("old-guard-new-call");
@@ -1299,7 +1478,7 @@ mod tests {
             Step::Fallback("no_frames")
         );
         assert!(
-            !path.exists(),
+            !exists(&path),
             "a failure during generation 2's call was saved"
         );
     }
@@ -1317,7 +1496,7 @@ mod tests {
         assert_eq!(next_step(&shared, deadline - secs(1)), Step::Nothing);
         assert_eq!(next_step(&shared, deadline), Step::Fallback("no_frames"));
         assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Review round 3: a loss behind the lock screen counted toward the
@@ -1341,7 +1520,7 @@ mod tests {
         note_image(&shared, 1);
         assert!(!super::super::proving(&shared));
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
-        assert!(!path.exists(), "nothing saved");
+        assert!(!exists(&path), "nothing saved");
     }
 
     /// Review round 2: idle time said "the display may be off", but an iPad
@@ -1365,7 +1544,7 @@ mod tests {
             Step::Fallback("no_frames")
         );
         assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     fn locked(_: &Path) -> std::io::Result<()> {
@@ -1392,25 +1571,29 @@ mod tests {
         let path = temp_file("locked");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("attach_timeout", start).unwrap();
+        written(&path);
         memory.store.as_mut().unwrap().io = Io {
             remove: counted,
             replace: locked_write,
             overwrite: locked_write,
         };
         assert!(memory.forget(start, false));
-        assert!(!memory.saved() && memory.uncleared.is_some());
-        assert!(memory.clear_failure_logged);
+        assert!(!memory.saved() && uncleared(&memory).is_some());
+        assert!(clear_failure_logged(&memory));
         assert_eq!(memory.hold(start), None, "this app run acts as cleared");
         // Mirror mode's ticks for the next minute don't touch the file.
         for tick in 1..1200 {
             assert!(!memory.forget(start + Duration::from_millis(50 * tick), false));
         }
+        written(&path);
         assert_eq!(REMOVES.load(Ordering::Relaxed), 1);
         assert!(!memory.forget(start + CLEAR_RETRY, false));
+        written(&path);
         assert_eq!(REMOVES.load(Ordering::Relaxed), 2, "once a minute");
         assert!(!memory.forget(start + CLEAR_RETRY, true));
+        written(&path);
         assert_eq!(REMOVES.load(Ordering::Relaxed), 3, "and at each success");
-        assert!(memory.uncleared.is_some());
+        assert!(uncleared(&memory).is_some());
         // The residual: an app run starting now would still hold.
         let (next, at) = app_run(&path, secs(60));
         assert!(next.hold(at).is_some());
@@ -1421,11 +1604,11 @@ mod tests {
             overwrite: locked_write,
         };
         assert!(!memory.forget(start + CLEAR_RETRY, true));
-        assert!(memory.uncleared.is_none());
+        assert!(uncleared(&memory).is_none());
         assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
         let (next, at) = app_run(&path, secs(60));
         assert!(!next.saved() && next.hold(at).is_none());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Round 4: the paced retry ran only while Second screen was not
@@ -1436,6 +1619,7 @@ mod tests {
         let path = temp_file("uncleared-session");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("attach_timeout", start).unwrap();
+        written(&path);
         memory.store.as_mut().unwrap().io = Io {
             remove: locked,
             replace: locked_write,
@@ -1452,7 +1636,7 @@ mod tests {
         start_proving(&shared, 1, later);
         note_image(&shared, 1);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
-        assert!(shared.second_screen.lock().memory.uncleared.is_some());
+        assert!(uncleared(&shared.second_screen.lock().memory).is_some());
         // The other program lets go; the transport's ticks clear it while
         // the second screen streams.
         shared
@@ -1463,12 +1647,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .io = Io::FILES;
-        let tried = shared.second_screen.lock().memory.uncleared.unwrap();
+        let tried = uncleared(&shared.second_screen.lock().memory).unwrap();
         assert_eq!(next_step(&shared, tried + secs(30)), Step::Nothing);
-        assert!(path.exists(), "paced: not yet");
+        assert!(exists(&path), "paced: not yet");
         assert_eq!(next_step(&shared, tried + CLEAR_RETRY), Step::Nothing);
-        assert!(!path.exists());
-        assert!(shared.second_screen.lock().memory.uncleared.is_none());
+        assert!(!exists(&path));
+        assert!(uncleared(&shared.second_screen.lock().memory).is_none());
         let (next, at) = app_run(&path, hours(3));
         assert!(!next.saved() && next.hold(at).is_none());
     }
@@ -1480,13 +1664,14 @@ mod tests {
         let path = temp_file("in-place");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("no_frames", start).unwrap();
+        written(&path);
         memory.store.as_mut().unwrap().io = Io {
             remove: locked,
             replace: locked_write,
             overwrite: Io::FILES.overwrite,
         };
         assert!(memory.forget(start, true));
-        assert!(memory.uncleared.is_none() && !memory.clear_failure_logged);
+        assert!(uncleared(&memory).is_none() && !clear_failure_logged(&memory));
         assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
         let (next, at) = app_run(&path, secs(60));
         assert!(!next.saved() && next.hold(at).is_none());
@@ -1494,7 +1679,7 @@ mod tests {
         std::fs::write(&path, &std::fs::read(&path).unwrap()[..10]).unwrap();
         let (next, at) = app_run(&path, secs(120));
         assert!(!next.saved() && next.hold(at).is_none());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Review round 1: a success whose file could not be removed left the
@@ -1504,13 +1689,14 @@ mod tests {
         let path = temp_file("cleared");
         let (mut memory, start) = app_run(&path, Duration::ZERO);
         memory.note_failure("no_frames", start).unwrap();
-        assert!(memory.store.as_ref().unwrap().write(None).is_ok());
+        written(&path);
+        replace_file(&path, &encode(None).unwrap()).unwrap();
         let (memory, start) = app_run(&path, Duration::from_secs(60));
         assert_eq!(memory.hold(start), None);
         assert!(!memory.saved());
-        assert!(path.exists(), "a cleared file is not unreadable");
+        assert!(exists(&path), "a cleared file is not unreadable");
         assert_eq!(saved(&path)["failure"], serde_json::Value::Null);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Review round 1: a corrupt time near the end of the clock overflowed.
@@ -1538,7 +1724,7 @@ mod tests {
             assert_eq!(hold, None, "the count saturates, the wait can't end");
             assert_eq!(saved(&path)["failure"]["failures"], u32::MAX);
         }
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// The example manifest's config: its first rule names [`laptop`].
@@ -1612,8 +1798,8 @@ mod tests {
 
         shared.retry_second_screen();
         assert_eq!(next_step(&shared, start), Step::Attach, "Try again works");
-        assert!(!path.exists());
-        assert!(rule_file(&path).exists());
+        assert!(!exists(&path));
+        assert!(exists(&rule_file(&path)));
         // Later app runs try it, after a driver update too.
         let (memory, start) = ruled_run(&path, Duration::from_secs(120), true);
         let shared = second_screen_with(memory);
@@ -1630,7 +1816,7 @@ mod tests {
         // A failure now is a real one, remembered as usual.
         attach(&shared, &NeverAttaches::new(at), ATTACH_TIMEOUT);
         assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// The rule's failure waits like any other, and a picture after the
@@ -1650,11 +1836,11 @@ mod tests {
         start_proving(&shared, 1, later);
         note_image(&shared, 1);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
-        assert!(!path.exists() && rule_file(&path).exists());
+        assert!(!exists(&path) && exists(&rule_file(&path)));
         let (memory, start) = ruled_run(&path, hours(2), true);
         assert_eq!(memory.hold(start), None);
         assert!(!memory.saved());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Mirror mode never sees the rule. Switching to another mode and back
@@ -1670,7 +1856,7 @@ mod tests {
             assert_eq!(next_step(&shared, start + secs(tick)), Step::Nothing);
         }
         assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
-        assert!(!path.exists(), "nothing saved in Mirror mode");
+        assert!(!exists(&path), "nothing saved in Mirror mode");
         assert_eq!(remembered_failure(&shared), None);
         // Second screen is still offered; choosing it applies the rule.
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
@@ -1679,11 +1865,11 @@ mod tests {
         // Another mode forgets it; back in Second screen it is tried.
         *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
         assert_eq!(next_step(&shared, start), Step::Nothing);
-        assert!(!path.exists());
+        assert!(!exists(&path));
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         *shared.vdd_status.lock() = VddStatus::WaitingForClient;
         assert_eq!(next_step(&shared, start), Step::Attach);
-        assert!(!rule_file(&path).exists(), "no override without a try");
+        assert!(!exists(&rule_file(&path)), "no override without a try");
     }
 
     /// A PC the manifest doesn't name is tried as before, and a failure
@@ -1701,13 +1887,13 @@ mod tests {
         assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule");
         let (memory, start) = ruled_run(&path, Duration::from_secs(60), false);
         assert_eq!(memory.hold(start), None);
-        assert!(!memory.saved() && !path.exists());
+        assert!(!memory.saved() && !exists(&path));
         // A real failure stays when the manifest has no rule.
         let (mut memory, start) = ruled_run(&path, Duration::ZERO, false);
         memory.note_failure("no_frames", start).unwrap();
         let (memory, start) = ruled_run(&path, Duration::from_secs(60), false);
         assert_eq!(memory.hold(start).map(|h| h.reason), Some("no_frames"));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Review round 2: a PC streaming Second screen fine was moved to the
@@ -1724,21 +1910,21 @@ mod tests {
         assert_eq!(next_step(&shared, start), Step::Switch);
         start_proving(&shared, 1, start);
         note_image(&shared, 1);
-        assert!(rule_file(&path).exists(), "recorded without a rule");
+        assert!(exists(&rule_file(&path)), "recorded without a rule");
         // A rule naming this PC arrives with the next check.
         let (memory, start) = ruled_run(&path, hours(24), true);
         let shared = second_screen_with(memory);
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Attach);
         assert_eq!(remembered_failure(&shared), None);
-        assert!(!path.exists());
+        assert!(!exists(&path));
         // Without manifest rules at all (unit tests, off Windows) nothing is
         // recorded.
         let other = temp_file("rule-none");
         let (mut memory, start) = app_run(&other, Duration::ZERO);
         memory.forget(start, true);
-        assert!(!rule_file(&other).exists());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!exists(&rule_file(&other)));
+        remove_folder(&path);
     }
 
     /// #108 round 5 with a rule: the rule's failure, tried after its wait,
@@ -1774,12 +1960,12 @@ mod tests {
         assert_eq!(saved(&path)["failure"]["failures"], 1);
         shared.retry_second_screen();
         assert_eq!(next_step(&shared, start + hours(2)), Step::Attach);
-        assert!(!path.exists() && rule_file(&path).exists());
+        assert!(!exists(&path) && exists(&rule_file(&path)));
         let (memory, start) = ruled_run(&path, hours(3), true);
         let shared = second_screen_with(memory);
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Attach);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     fn locked_state(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -1802,6 +1988,7 @@ mod tests {
         let shared = second_screen_with(memory);
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Nothing);
+        written(&path);
         shared
             .second_screen
             .lock()
@@ -1815,7 +2002,7 @@ mod tests {
             overwrite: locked_write,
         };
         shared.retry_second_screen();
-        assert!(rule_file(&path).exists());
+        assert!(exists(&rule_file(&path)));
         assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule", "kept");
 
         // Restarted ten minutes later, with the file still locked.
@@ -1828,15 +2015,15 @@ mod tests {
         };
         memory.set_rule(true, rule_file(&path));
         assert_eq!(memory.hold(start), None);
-        assert!(!memory.saved() && memory.uncleared.is_some());
+        assert!(!memory.saved() && uncleared(&memory).is_some());
         let shared = second_screen_with(memory);
         connect_viewer(&shared);
         assert_eq!(next_step(&shared, start), Step::Attach);
         // Unlocked, the next app run clears it from the file.
         let (memory, start) = ruled_run(&path, Duration::from_secs(700), true);
         assert_eq!(memory.hold(start), None);
-        assert!(!memory.saved() && !path.exists());
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!memory.saved() && !exists(&path));
+        remove_folder(&path);
     }
 
     /// An override that can't be read is no override; one that can't be
@@ -1870,7 +2057,7 @@ mod tests {
             memory.hold_for_rule(start).is_some(),
             "the next one holds again"
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        remove_folder(&path);
     }
 
     /// Unit tests and builds off Windows have no store: nothing is held,
@@ -1882,5 +2069,335 @@ mod tests {
         assert_eq!(memory.note_failure("attach_timeout", now), None);
         assert_eq!(memory.hold(now), None);
         assert!(!memory.saved() && !memory.forget(now, true));
+    }
+
+    /// Disks as slow as a test wants, one per test folder: each write there
+    /// waits until the test opens its gate.
+    #[derive(Default)]
+    struct Gate {
+        /// Writes that reached the gate, and whether it is open.
+        state: Mutex<(u32, bool)>,
+        changed: Condvar,
+    }
+
+    static GATES: Mutex<Vec<(PathBuf, Arc<Gate>)>> = Mutex::new(Vec::new());
+
+    fn gate(path: &Path) -> Arc<Gate> {
+        let dir = path.parent().unwrap();
+        let mut gates = GATES.lock();
+        if let Some((_, gate)) = gates.iter().find(|(gated, _)| gated == dir) {
+            return Arc::clone(gate);
+        }
+        let gate = Arc::new(Gate::default());
+        gates.push((dir.to_path_buf(), Arc::clone(&gate)));
+        gate
+    }
+
+    impl Gate {
+        fn pass(&self) {
+            let mut state = self.state.lock();
+            state.0 += 1;
+            self.changed.notify_all();
+            while !state.1 {
+                self.changed.wait(&mut state);
+            }
+        }
+
+        /// Wait for a write to reach the gate. Whether one did.
+        fn reached(&self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut state = self.state.lock();
+            while state.0 == 0 {
+                if self.changed.wait_until(&mut state, deadline).timed_out() {
+                    return state.0 > 0;
+                }
+            }
+            true
+        }
+
+        fn writes(&self) -> u32 {
+            self.state.lock().0
+        }
+
+        fn open(&self) {
+            self.state.lock().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Opens the gate however the test ends, so a thread stuck at it ends.
+    struct Opens(Arc<Gate>);
+
+    impl Drop for Opens {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    fn slow_remove(path: &Path) -> std::io::Result<()> {
+        gate(path).pass();
+        remove_file(path)
+    }
+
+    fn slow_replace(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        gate(path).pass();
+        replace_file(path, data)
+    }
+
+    fn slow_overwrite(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        gate(path).pass();
+        overwrite_file(path, data)
+    }
+
+    const SLOW: Io = Io {
+        remove: slow_remove,
+        replace: slow_replace,
+        overwrite: slow_overwrite,
+    };
+
+    fn slow_disk(shared: &SharedControl) {
+        shared
+            .second_screen
+            .lock()
+            .memory
+            .store
+            .as_mut()
+            .unwrap()
+            .io = SLOW;
+    }
+
+    /// While the save `act` asks for waits on a disk that doesn't answer,
+    /// `act` returns, the transport's locks are free at once, and `meanwhile`
+    /// runs. Then the disk answers.
+    fn never_waits_for_the_disk(
+        site: &str,
+        path: &Path,
+        shared: &SharedControl,
+        act: impl FnOnce() + Send,
+        meanwhile: impl FnOnce(),
+    ) {
+        let gate = gate(path);
+        std::thread::scope(|scope| {
+            // Inside the scope, so a failed assertion opens it before the
+            // scope joins the thread stuck at it.
+            let _opens = Opens(Arc::clone(&gate));
+            let acting = scope.spawn(act);
+            assert!(gate.reached(), "{site}: nothing saved");
+            let asked = Instant::now();
+            let status = shared.vdd_status.try_lock_for(Duration::from_secs(1));
+            let state = shared.second_screen.try_lock_for(Duration::from_secs(1));
+            let waited = asked.elapsed();
+            assert!(
+                status.is_some() && state.is_some(),
+                "{site}: the transport's locks are held while the file is written"
+            );
+            drop((state, status));
+            assert!(
+                waited < Duration::from_millis(250),
+                "{site}: {waited:?} for the locks"
+            );
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !acting.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(acting.is_finished(), "{site}: waits for the file");
+            meanwhile();
+        });
+        written(path);
+    }
+
+    /// Found on a PC whose app data sits on a spinning disk: saving the
+    /// attach timeout took 3.1 s under the locks the transport takes at
+    /// every pass, so nothing went out and the iPad dropped the mirror the
+    /// fallback was there to keep. The fallback now mirrors while the disk
+    /// is still busy.
+    #[test]
+    fn a_slow_disk_never_holds_up_the_attach_timeout_fallback() {
+        let path = temp_file("slow-attach");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        slow_disk(&shared);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        never_waits_for_the_disk(
+            "attach timeout",
+            &path,
+            &shared,
+            || attach(&shared, &NeverAttaches::new(start), ATTACH_TIMEOUT),
+            || {
+                assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+                assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
+                assert!(retries_later(&shared));
+                assert!(shared.client_connected(), "the iPad stays");
+                let later = start + Duration::from_secs(60);
+                assert_eq!(next_step(&shared, later), Step::Nothing, "the mirror");
+                reconnect(&shared, later);
+                assert_eq!(next_step(&shared, later), Step::Nothing);
+            },
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "attach_timeout");
+        remove_folder(&path);
+    }
+
+    /// A second screen without a picture fails at the transport's pass, or
+    /// when the next capture generation starts.
+    #[test]
+    fn a_slow_disk_never_holds_up_a_failed_proof() {
+        use super::super::take_unproven;
+        for site in ["transport pass", "next capture generation"] {
+            let path = temp_file("slow-proof");
+            let (shared, start) = proving_second_screen(&path);
+            slow_disk(&shared);
+            let end = start + PROVE_TIMEOUT;
+            never_waits_for_the_disk(
+                site,
+                &path,
+                &shared,
+                || match site {
+                    "transport pass" => {
+                        assert_eq!(next_step(&shared, end), Step::Fallback("no_frames"))
+                    }
+                    _ => assert_eq!(take_unproven(&shared, end), Some("no_frames")),
+                },
+                || assert_eq!(remembered_failure(&shared), Some("no_frames")),
+            );
+            assert_eq!(saved(&path)["failure"]["reason"], "no_frames", "{site}");
+            remove_folder(&path);
+        }
+    }
+
+    /// A manifest rule's failure is saved at the transport's pass.
+    #[test]
+    fn a_slow_disk_never_holds_up_a_manifest_rule() {
+        let path = temp_file("slow-rule");
+        let (memory, start) = ruled_run(&path, Duration::ZERO, true);
+        let shared = second_screen_with(memory);
+        slow_disk(&shared);
+        connect_viewer(&shared);
+        never_waits_for_the_disk(
+            "manifest rule",
+            &path,
+            &shared,
+            || assert_eq!(next_step(&shared, start), Step::Nothing),
+            || assert_eq!(remembered_failure(&shared), Some("hardware_rule")),
+        );
+        assert_eq!(saved(&path)["failure"]["reason"], "hardware_rule");
+        remove_folder(&path);
+    }
+
+    /// Forgetting a saved failure: a picture (capture's thread), Try again
+    /// (the window), another mode and the paced retry of a clear that failed
+    /// (the transport's pass).
+    #[test]
+    fn a_slow_disk_never_holds_up_forgetting_a_failure() {
+        for site in ["picture", "try again", "another mode", "paced retry"] {
+            let path = temp_file("slow-forget");
+            let (mut memory, start) = app_run(&path, Duration::ZERO);
+            memory.note_failure("no_frames", start).unwrap();
+            written(&path);
+            let (mut memory, start) = ruled_run(&path, hours(2), false);
+            if site == "paced retry" {
+                memory.store.as_mut().unwrap().io = Io {
+                    remove: locked,
+                    replace: locked_write,
+                    overwrite: locked_write,
+                };
+                assert!(memory.forget(start, false));
+                assert!(uncleared(&memory).is_some());
+            }
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            if site == "picture" {
+                assert_eq!(next_step(&shared, start), Step::Attach);
+                note_attached(&shared, "virtual".to_string());
+                assert_eq!(next_step(&shared, start), Step::Switch);
+                start_proving(&shared, 1, start);
+            }
+            slow_disk(&shared);
+            never_waits_for_the_disk(
+                site,
+                &path,
+                &shared,
+                || match site {
+                    "picture" => note_image(&shared, 1),
+                    "try again" => shared.retry_second_screen(),
+                    "another mode" => {
+                        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+                        assert_eq!(next_step(&shared, start), Step::Nothing);
+                    }
+                    _ => assert_eq!(next_step(&shared, start + CLEAR_RETRY), Step::Attach),
+                },
+                || assert!(!shared.second_screen.lock().memory.saved(), "{site}"),
+            );
+            assert!(!exists(&path), "{site}");
+            remove_folder(&path);
+        }
+    }
+
+    /// Saves made while the disk is still busy with an earlier one: the
+    /// file ends with the last state, and one replaced before it was
+    /// written is never written.
+    #[test]
+    fn the_file_ends_with_the_last_state_saved() {
+        let path = temp_file("order");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.store.as_mut().unwrap().io = SLOW;
+        let disk = gate(&path);
+        let opens = Opens(Arc::clone(&disk));
+        memory.note_failure("attach_timeout", start).unwrap();
+        assert!(disk.reached());
+        assert!(memory.forget(start + secs(1), false));
+        memory.note_failure("no_frames", start + secs(2)).unwrap();
+        drop(opens);
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
+        assert_eq!(disk.writes(), 2, "the clear between them is never written");
+        let (next, at) = app_run(&path, secs(60));
+        assert_eq!(next.hold(at).map(|h| h.reason), Some("no_frames"));
+        remove_folder(&path);
+
+        // A failure, then a picture: no failure is left.
+        let path = temp_file("order-clear");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.store.as_mut().unwrap().io = SLOW;
+        let disk = gate(&path);
+        let opens = Opens(Arc::clone(&disk));
+        memory.note_failure("attach_timeout", start).unwrap();
+        assert!(disk.reached());
+        assert!(memory.forget(start + secs(1), true));
+        drop(opens);
+        assert!(!exists(&path));
+        assert!(uncleared(&memory).is_none());
+        let (next, at) = app_run(&path, secs(60));
+        assert!(!next.saved() && next.hold(at).is_none());
+    }
+
+    /// The last failure is on the disk when the app has quit, if the disk
+    /// answers within the quit's wait.
+    #[test]
+    fn quitting_waits_for_the_last_save() {
+        let path = temp_file("quit");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        slow_disk(&shared);
+        let gate = gate(&path);
+        let _opens = Opens(Arc::clone(&gate));
+        let hold = shared
+            .second_screen
+            .lock()
+            .memory
+            .note_failure("no_frames", start);
+        assert!(hold.is_some());
+        assert!(gate.reached());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                gate.open();
+            });
+            super::super::shut_down(&shared);
+            let data = std::fs::read(&path).expect("saved before the quit ended");
+            let file: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(file["failure"]["reason"], "no_frames");
+        });
+        remove_folder(&path);
     }
 }
