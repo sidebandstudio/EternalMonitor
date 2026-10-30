@@ -254,17 +254,29 @@
   };
   document.querySelectorAll('[data-copy]').forEach(function (btn) {
     var reset = null;
-    var label = '';
+    // While "Copied" shows, the button's own label nodes wait in __i18nHold,
+    // where docs/i18n.js takes them as the English if the language changes.
+    var release = function () {
+      clearTimeout(reset);
+      reset = null;
+      var held = btn.__i18nHold || [];
+      btn.__i18nHold = null;
+      return held;
+    };
     // A language change relabels the button itself; the old label must not come back.
-    onLanguage(function () { clearTimeout(reset); reset = null; });
+    onLanguage(release);
     btn.addEventListener('click', function () {
       var target = document.getElementById(btn.getAttribute('data-copy'));
       if (!target) return;
-      if (!reset) label = btn.textContent;
       copyText(target.textContent.trim(), function () {
+        if (!reset) btn.__i18nHold = Array.prototype.slice.call(btn.childNodes);
         clearTimeout(reset);
         btn.textContent = t('common.copied', 'Copied');
-        reset = setTimeout(function () { reset = null; btn.textContent = label; }, 1800);
+        reset = setTimeout(function () {
+          var held = release();
+          btn.textContent = '';
+          held.forEach(function (n) { btn.appendChild(n); });
+        }, 1800);
       });
     });
   });

@@ -92,7 +92,9 @@
     // The element's own children are captured once and moved, never cloned,
     // so other scripts keep their references (the iPad build, star counts).
     var en = kept(el);
-    if (!en.nodes) en.nodes = Array.prototype.slice.call(el.childNodes);
+    // __i18nHold: a label another script has swapped out for a moment
+    // (Copy showing "Copied"); that, not the moment's text, is the English.
+    if (!en.nodes) en.nodes = el.__i18nHold || Array.prototype.slice.call(el.childNodes);
     var kids = el.__i18nKids || (el.__i18nKids = Array.prototype.filter.call(el.children, function (c) { return !isIcon(c); }));
     Array.prototype.slice.call(el.childNodes).forEach(function (n) {
       if (n.nodeType === 3 || kids.indexOf(n) >= 0) el.removeChild(n);

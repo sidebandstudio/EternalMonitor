@@ -33,6 +33,10 @@
       if (boot.translated) { root.lang = boot.lang; root.dir = boot.lang === 'ar' ? 'rtl' : 'ltr'; }
       // Too slow or no strings: English (docs/i18n.js does it once it runs).
       var english = function () {
+        // Once only: a download that fails after the timeout must not undo a
+        // language the visitor has chosen since.
+        if (boot.done) return;
+        boot.done = true;
         clearTimeout(boot.timer);
         if (boot.fail) return boot.fail();
         boot.lang = 'en';
@@ -198,11 +202,11 @@
             <div class="field-row">
               <div class="field">
                 <label for="fb-ipad" data-i18n="download.form.ipad">iPad and iPadOS <span class="opt">optional</span></label>
-                <input id="fb-ipad" name="ipad" type="text" placeholder="iPad Air 11-inch (M2), iPadOS 26.2" autocomplete="off">
+                <input id="fb-ipad" name="ipad" type="text" dir="auto" placeholder="iPad Air 11-inch (M2), iPadOS 26.2" autocomplete="off">
               </div>
               <div class="field">
                 <label for="fb-pc" data-i18n="download.form.pc">Windows and graphics card <span class="opt">optional</span></label>
-                <input id="fb-pc" name="pc" type="text" placeholder="Windows 11 24H2, GeForce RTX 4070" autocomplete="off">
+                <input id="fb-pc" name="pc" type="text" dir="auto" placeholder="Windows 11 24H2, GeForce RTX 4070" autocomplete="off">
               </div>
             </div>
             <div class="field">

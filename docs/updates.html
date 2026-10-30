@@ -33,6 +33,10 @@
       if (boot.translated) { root.lang = boot.lang; root.dir = boot.lang === 'ar' ? 'rtl' : 'ltr'; }
       // Too slow or no strings: English (docs/i18n.js does it once it runs).
       var english = function () {
+        // Once only: a download that fails after the timeout must not undo a
+        // language the visitor has chosen since.
+        if (boot.done) return;
+        boot.done = true;
         clearTimeout(boot.timer);
         if (boot.fail) return boot.fail();
         boot.lang = 'en';
