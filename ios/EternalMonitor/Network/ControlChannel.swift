@@ -250,6 +250,7 @@ final class ControlChannel {
 
         sessionId = ack.sessionId
         hostCaps = ack.hostCaps
+        SupportDiagnostics.notePCName(ack.hostName)
         onDiagnostic?("Session \(ack.sessionId) established with \(ack.hostName)")
         lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }
         startReportTimer(intervalMs: max(ack.reportIntervalMs, 100))
