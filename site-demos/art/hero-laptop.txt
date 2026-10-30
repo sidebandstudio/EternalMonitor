@@ -1,0 +1,11 @@
+hero-laptop.webp: generated with the codex-image skill (Codex image_gen), --aspect wide --transparent --key-color '#ff00ff', take 1 of 2, stored losslessly. The blue display is keyed out by capture/hero_compose.py.
+
+Use case: product-mockup
+Asset type: device shell cutout for a website hero; the screen will be replaced with a real screenshot afterwards
+Primary request: one premium thin aluminium laptop with MacBook-Pro-like proportions (16:10 display), seen straight from the front, camera slightly above the keyboard (about 15 degrees elevation), lid open about 110 degrees, centred, the display plane facing the camera squarely with no left-right rotation; the keyboard deck, black keys, large trackpad and the hinge are visible below the display in gentle foreshortening; thin uniform black bezels; rounded display corners
+Style/medium: photorealistic studio product render, like a premium hardware maker's launch page; long telephoto lens (about 200mm) so the view is nearly orthographic and every vertical and horizontal edge is perfectly straight and parallel to the frame
+Lighting/mood: soft large key light from upper left, cool subtle rim light tracing the right and top edges so the silhouette reads against a near-black page, calm and premium
+Color palette: space-grey anodised aluminium with fine bead-blasted texture, deep black glass bezel
+Composition/framing: the whole laptop fills about 90% of the frame width, centred, fully inside the frame with a small margin, nothing cropped
+Constraints: the entire display area inside the bezel is ONE solid uniform pure blue #0000FF with no reflection, no gradient, no glare, no content; no logo anywhere, no Apple logo, no notch, no camera cutout in the display, no text, no stickers, no watermark; no table, no floor, no shadow on the background
+Avoid: perspective distortion, tilted or keystoned display, three-quarter angle, garbled keys with letters, any branding

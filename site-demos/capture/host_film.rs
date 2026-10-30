@@ -349,6 +349,38 @@ fn home_page_films() {
         f.finish_at(LEN);
     }
 
+    // Hero: the stills the home page's laptop shows, in each mode over USB
+    // and over Wi-Fi. The pointer rests outside the window. Only drawn when
+    // asked for by name (capture-hero.sh), so the films' run skips them.
+    for (name, wifi, second) in [
+        ("hero-mirror-usb", false, false),
+        ("hero-second-usb", false, true),
+        ("hero-mirror-wifi", true, false),
+        ("hero-second-wifi", true, true),
+    ] {
+        if !only.split(',').any(|n| n == "hero" || n == name) {
+            continue;
+        }
+        let (_dir, shared) = fixture();
+        if wifi {
+            connect_wifi(&shared);
+        } else {
+            connect_named(&shared, "iPad Pro", 10, 20);
+        }
+        PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+        let mut h = film_harness(&shared, size);
+        let mut f = Film::new(&root, name, egui::pos2(-50.0, -50.0));
+        if second {
+            f.pointer = centre(&h, None, "Second screen");
+            f.click(&mut h);
+            *shared.vdd_status.lock() = VddStatus::Active;
+            f.pointer = egui::pos2(-50.0, -50.0);
+        }
+        let used = f.frame;
+        f.hold(&mut h, 30 - used);
+        f.finish_at(30);
+    }
+
     // Feedback: open the panel from the sidebar, write a line, send it to the email app.
     if wants("feedback") {
         let (_dir, shared) = fixture();

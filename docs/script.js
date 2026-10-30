@@ -58,6 +58,49 @@
     document.body.appendChild(notice);
   }
 
+  /* --- Hero: second screen or mirror, USB or Wi-Fi ---------------------
+     The radios set the stage's data-mode and data-link; each screen picture
+     names the state it belongs to in data-for and shows while all of its
+     words match. The other states' pictures load once the page has. */
+  var stage = document.querySelector('.stage[data-mode]');
+  if (stage) {
+    var later = stage.querySelectorAll('img[data-src]');
+    var fetched = false;
+    var fetchStates = function () {
+      if (fetched) return;
+      fetched = true;
+      later.forEach(function (img) {
+        img.srcset = img.getAttribute('data-srcset');
+        img.src = img.getAttribute('data-src');
+      });
+    };
+    if (document.readyState === 'complete') setTimeout(fetchStates, 300);
+    else window.addEventListener('load', function () { setTimeout(fetchStates, 300); });
+    var showState = function () {
+      var state = [stage.getAttribute('data-mode'), stage.getAttribute('data-link')];
+      var has = function (words) {
+        return words.split(' ').every(function (w) { return state.indexOf(w) >= 0; });
+      };
+      stage.querySelectorAll('.scr[data-for]').forEach(function (img) {
+        img.classList.toggle('on', has(img.getAttribute('data-for')));
+      });
+      stage.querySelectorAll('[data-say]').forEach(function (line) {
+        line.hidden = !has(line.getAttribute('data-say'));
+      });
+    };
+    stage.addEventListener('change', function (e) {
+      fetchStates();
+      if (e.target.name === 'hero-mode') stage.setAttribute('data-mode', e.target.value);
+      if (e.target.name === 'hero-link') stage.setAttribute('data-link', e.target.value);
+      showState();
+    });
+    // A restored page can come back with other radios checked.
+    stage.querySelectorAll('input:checked').forEach(function (input) {
+      stage.setAttribute(input.name === 'hero-mode' ? 'data-mode' : 'data-link', input.value);
+    });
+    showState();
+  }
+
   /* --- Scroll reveal ----------------------------------------------------- */
   var reveals = document.querySelectorAll('.reveal');
   if (reveals.length && 'IntersectionObserver' in window && !reducedMotion) {

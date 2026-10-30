@@ -88,26 +88,41 @@
           </p>
         </div>
 
-        <figure class="stage" aria-label="The Windows app streaming over USB or Wi-Fi to the iPad, which shows the PC's picture">
-          <div class="stage-pc">
-            <div class="pc-window">
-              <div class="pc-titlebar" aria-hidden="true">
-                <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
-                <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-              </div>
-              <img src="assets/hero-pc.webp" srcset="assets/hero-pc.webp 1040w, assets/hero-pc@2x.webp 2080w" sizes="(max-width: 720px) 92vw, 600px" width="2080" height="1233" fetchpriority="high" decoding="async" alt="The Windows app streaming to an iPad over USB, mirroring the screen at 60 fps, with the connected iPad's details, Send feedback and a GitHub star card in the sidebar.">
+        <figure class="stage" data-mode="second" data-link="usb" aria-labelledby="stage-caption">
+          <div class="rig">
+            <div class="rig-laptop" aria-hidden="true">
+              <img class="scr on" data-for="second usb" src="assets/hero/laptop-second-usb.webp" srcset="assets/hero/laptop-second-usb.webp 534w, assets/hero/laptop-second-usb@2x.webp 1067w" sizes="(max-width: 1320px) 40vw, 520px" width="1067" height="564" fetchpriority="high" alt="">
+              <img class="scr" data-for="mirror usb" data-src="assets/hero/laptop-mirror-usb.webp" data-srcset="assets/hero/laptop-mirror-usb.webp 534w, assets/hero/laptop-mirror-usb@2x.webp 1067w" sizes="(max-width: 1320px) 40vw, 520px" width="1067" height="564" alt="">
+              <img class="scr" data-for="second wifi" data-src="assets/hero/laptop-second-wifi.webp" data-srcset="assets/hero/laptop-second-wifi.webp 534w, assets/hero/laptop-second-wifi@2x.webp 1067w" sizes="(max-width: 1320px) 40vw, 520px" width="1067" height="564" alt="">
+              <img class="scr" data-for="mirror wifi" data-src="assets/hero/laptop-mirror-wifi.webp" data-srcset="assets/hero/laptop-mirror-wifi.webp 534w, assets/hero/laptop-mirror-wifi@2x.webp 1067w" sizes="(max-width: 1320px) 40vw, 520px" width="1067" height="564" alt="">
             </div>
-          </div>
-          <div class="stage-link" aria-hidden="true">
-            <span class="stage-line"></span>
-            <span class="stage-chip">USB or Wi-Fi</span>
-          </div>
-          <div class="stage-ipad">
-            <div class="tablet">
-              <div class="screen">
-                <img src="assets/hero-ipad.webp" srcset="assets/hero-ipad.webp 1009w, assets/hero-ipad@2x.webp 2018w" sizes="(max-width: 720px) 70vw, 460px" width="2018" height="1300" decoding="async" alt="The iPad mirroring the PC's desktop: the EternalMonitor window and a sheet of night paintings over a painted lake.">
-              </div>
+            <div class="rig-ipad" aria-hidden="true">
+              <img class="scr extend on" data-for="second" src="assets/hero/ipad-second.webp" srcset="assets/hero/ipad-second.webp 436w, assets/hero/ipad-second@2x.webp 872w" sizes="(max-width: 1320px) 33vw, 430px" width="872" height="600" decoding="async" alt="">
+              <span class="mirror">
+                <img class="scr" data-for="mirror usb" data-src="assets/hero/laptop-mirror-usb.webp" data-srcset="assets/hero/laptop-mirror-usb.webp 534w, assets/hero/laptop-mirror-usb@2x.webp 1067w" sizes="(max-width: 1320px) 33vw, 430px" width="1067" height="564" alt="">
+                <img class="scr" data-for="mirror wifi" data-src="assets/hero/laptop-mirror-wifi.webp" data-srcset="assets/hero/laptop-mirror-wifi.webp 534w, assets/hero/laptop-mirror-wifi@2x.webp 1067w" sizes="(max-width: 1320px) 33vw, 430px" width="1067" height="564" alt="">
+              </span>
             </div>
+            <img class="rig-devices" src="assets/hero/devices.webp" srcset="assets/hero/devices.webp 1355w, assets/hero/devices@2x.webp 2709w" sizes="(max-width: 1320px) 96vw, 1240px" width="2709" height="980" decoding="async" alt="">
+            <img class="rig-cable" src="assets/hero/cable.webp" srcset="assets/hero/cable.webp 228w, assets/hero/cable@2x.webp 456w" sizes="(max-width: 1320px) 16vw, 210px" width="456" height="404" decoding="async" alt="">
+            <svg class="rig-air" viewBox="0 0 48 40" aria-hidden="true"><path class="a3" d="M3 14.5a30 30 0 0 1 42 0"/><path class="a2" d="M10 21.5a20 20 0 0 1 28 0"/><path class="a1" d="M17 28.5a10 10 0 0 1 14 0"/><circle cx="24" cy="35" r="2.6"/></svg>
+          </div>
+          <figcaption class="visually-hidden" id="stage-caption" aria-live="polite">A laptop running Windows and the EternalMonitor app, with an iPad beside it on a dock. <span data-say="second">The iPad is a second screen: the laptop keeps the app, and a reference sheet sits on the iPad.</span><span data-say="mirror" hidden>The iPad mirrors the laptop: both show the app and the reference sheet.</span> <span data-say="usb">A USB-C cable joins them.</span><span data-say="wifi" hidden>They are joined over Wi-Fi, with no cable.</span></figcaption>
+          <div class="rig-controls">
+            <fieldset>
+              <legend>Use the iPad as</legend>
+              <span class="sw">
+                <input type="radio" name="hero-mode" id="hero-second" value="second" checked><label for="hero-second">Second screen</label>
+                <input type="radio" name="hero-mode" id="hero-mirror" value="mirror"><label for="hero-mirror">Mirror</label>
+              </span>
+            </fieldset>
+            <fieldset>
+              <legend>Connected over</legend>
+              <span class="sw">
+                <input type="radio" name="hero-link" id="hero-usb" value="usb" checked><label for="hero-usb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 18V3.6M9.6 6.2 12 3.2l2.4 3M12 15.2l-4.6-2.6V10M12 13.4l4.6-2.6V8.2"/><circle cx="7.4" cy="8.7" r="1.4"/><rect x="15.4" y="5.4" width="2.4" height="2.4" rx="0.3" class="fill"/><circle cx="12" cy="19.6" r="1.9" class="fill"/></svg>USB</label>
+                <input type="radio" name="hero-link" id="hero-wifi" value="wifi"><label for="hero-wifi"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.6 9.4a13.4 13.4 0 0 1 18.8 0M5.8 12.7a8.8 8.8 0 0 1 12.4 0M9 16a4.2 4.2 0 0 1 6 0"/><circle cx="12" cy="19.3" r="1.5" class="fill"/></svg>Wi-Fi</label>
+              </span>
+            </fieldset>
           </div>
         </figure>
       </div>

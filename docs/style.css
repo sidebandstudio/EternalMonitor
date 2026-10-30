@@ -341,71 +341,82 @@ small { font-size: 0.875rem; }
 }
 
 /* --- Hero stage --------------------------------------------------------------
-   The Windows window, a USB or Wi-Fi link, and the iPad showing the PC. The
-   iPad slides in once and the link draws across; with reduced motion (or no
-   animation support) everything simply sits in place. */
+   A laptop and an iPad on its dock, joined by a USB-C cable: one render of the
+   two devices with their displays cut out (assets/hero/devices), the screens
+   beneath it and the cable above it, all placed in percent of the render's
+   2709 x 980 canvas (site-demos/capture/hero_compose.py prints the numbers).
+   script.js switches the screens with the two radio groups; without it the
+   picture stays in its first state and the radios are hidden. */
 
-.stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(150px, 0.3fr) minmax(0, 1fr);
-  align-items: center;
-  margin-top: clamp(36px, 4.5vw, 64px);
+/* Up to 1240px wide, a little past the text column, with the page's margins. */
+.stage { margin: clamp(36px, 4.5vw, 64px) calc(50% - min(620px, 50vw - 24px)) 0; }
+.rig { position: relative; aspect-ratio: 2709 / 980; }
+.rig > img, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
+.rig-devices { inset: 0; width: 100%; height: 100%; }
+.rig-laptop { left: 5.5%; top: 4.592%; width: 39.424%; height: 57.755%; }
+.rig-ipad { left: 66.002%; top: 24.694%; width: 32.226%; height: 61.224%; }
+.rig-laptop, .rig-ipad { overflow: hidden; background: #000; }
+.rig .scr { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 0.5s ease, transform 0.6s var(--ease-out); }
+.rig .scr.on { opacity: 1; }
+/* Mirroring, the iPad shows the laptop's 16:9 picture whole, with bars. */
+.rig-ipad .mirror { position: absolute; left: 0; right: 0; top: 50%; aspect-ratio: 16 / 9; transform: translateY(-50%); }
+.rig-ipad .mirror .scr { transform: scale(1.04); }
+.rig-ipad .mirror .scr.on { transform: none; }
+/* As a second screen, the iPad's desktop arrives from the laptop's side. */
+.rig-ipad .extend { transform: translateX(-8%); }
+.rig-ipad .extend.on { transform: none; }
+.rig-cable { left: 48.21%; top: 52.857%; width: 16.833%; height: auto; transition: opacity 0.5s ease; }
+.stage[data-link="wifi"] .rig-cable { opacity: 0; }
+/* Over Wi-Fi: the cable is gone and a calm signal sits between the devices. */
+.rig-air {
+  left: 53.6%; top: 46%; width: 3.4%; height: auto;
+  fill: none; stroke: var(--text); stroke-width: 3.2; stroke-linecap: round;
+  opacity: 0; transform: translateY(8%); transition: opacity 0.5s ease, transform 0.6s var(--ease-out);
 }
-.stage-link { position: relative; height: 44px; display: grid; place-items: center; }
-.stage-line {
-  position: absolute;
-  left: -8px;
-  right: -8px;
-  top: calc(50% - 1px);
-  height: 2px;
-  background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15));
-  transform-origin: left center;
-}
-.stage-chip {
-  position: relative;
-  padding: 5px 11px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-  background: var(--raised);
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-.stage-ipad { position: relative; }
-/* A signal runs along the link: a full-width layer moved by its own width,
-   carrying one dot, so only transform and opacity change. */
-.stage-line::after {
-  content: "";
-  position: absolute;
-  inset: -3px 0;
-  background: radial-gradient(circle at 4px 50%, #fff 0 2px, var(--accent) 3px, transparent 5px) no-repeat;
-  opacity: 0;
-}
+.rig-air circle { fill: var(--text); stroke: none; }
+.stage[data-link="wifi"] .rig-air { opacity: 1; transform: none; }
 @media (prefers-reduced-motion: no-preference) {
-  .stage-line::after { animation: stage-signal 2.6s ease-in-out 1.8s infinite; }
-  .stage-ipad { animation: stage-slide 1s var(--ease-out) 0.2s both; }
-  .stage-line { animation: stage-draw 0.6s ease-out 0.9s both; }
-  .stage-chip { animation: stage-fade 0.5s ease-out 1.3s both; }
+  .stage[data-link="wifi"] .rig-air path { animation: air 2.4s ease-in-out infinite; }
+  .stage[data-link="wifi"] .rig-air .a2 { animation-delay: 0.25s; }
+  .stage[data-link="wifi"] .rig-air .a3 { animation-delay: 0.5s; }
 }
-@keyframes stage-slide { from { opacity: 0; transform: translateX(18%); } to { opacity: 1; transform: none; } }
-@keyframes stage-draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-@keyframes stage-fade { from { opacity: 0; } to { opacity: 1; } }
-@keyframes stage-signal { 0% { transform: translateX(-4px); opacity: 0; } 15%, 80% { opacity: 1; } 100% { transform: translateX(calc(100% - 8px)); opacity: 0; } }
+@keyframes air { 0%, 100% { opacity: 0.35; } 30% { opacity: 1; } 60% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .rig .scr, .rig-cable, .rig-air { transition-duration: 0.01s; }
+}
+
+/* The two choices under the picture: what the iPad is, and how it is joined. */
+.rig-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 14px 36px;
+  margin-top: clamp(20px, 2.5vw, 32px);
+}
+.rig-controls fieldset { display: flex; align-items: center; gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.rig-controls legend { float: left; padding: 0; font-size: 0.9375rem; color: var(--muted); }
+.rig-controls .sw { padding: 3px; }
+.rig-controls input { position: absolute; opacity: 0; pointer-events: none; }
+.rig-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 15px;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+.rig-controls label svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.rig-controls label svg .fill { fill: currentColor; stroke: none; }
+.rig-controls input:checked + label { background: var(--text); color: var(--bg); }
+.rig-controls input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rig-controls label:active { transform: scale(0.97); }
+.no-js .rig-controls { display: none; }
 @media (max-width: 720px) {
-  .stage { grid-template-columns: 1fr; justify-items: center; }
-  .stage-pc { width: 100%; }
-  .stage-link { height: 52px; width: 100%; }
-  .stage-line { left: calc(50% - 1px); right: auto; top: 0; bottom: 0; width: 2px; height: auto; transform-origin: center top;
-    background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15)); }
-  .stage-ipad { width: 78%; }
-  .stage-line::after { display: none; }
-  @media (prefers-reduced-motion: no-preference) {
-    .stage-ipad { animation-name: stage-rise; }
-    .stage-line { animation-name: stage-draw-down; }
-  }
+  .stage { margin-inline: calc(50% - 50vw + 10px); }
+  .rig-controls { flex-direction: column; align-items: center; gap: 12px; padding-inline: 16px; }
+  .rig-controls fieldset { flex-direction: column; gap: 8px; }
+  .rig-controls legend { float: none; }
 }
-@keyframes stage-rise { from { opacity: 0; transform: translateY(12%); } to { opacity: 1; transform: none; } }
-@keyframes stage-draw-down { from { transform: scaleY(0); } to { transform: scaleY(1); } }
 
 /* --- Switch -------------------------------------------------------------------
    A pill of options, used by the download page's channel switch. */
@@ -565,30 +576,6 @@ small { font-size: 0.875rem; }
 }
 
 /* --- Device frames ---------------------------------------------------------- */
-
-.pc-window {
-  border-radius: 12px;
-  overflow: hidden;
-  background: #0e0e10;
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
-}
-.pc-titlebar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 32px;
-  padding: 0 10px 0 12px;
-  background: #0a0a0b;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.75rem;
-  color: var(--muted);
-}
-.pc-titlebar .t { display: inline-flex; align-items: center; gap: 8px; }
-.pc-titlebar .t img { width: 14px; height: 14px; border-radius: 4px; }
-.pc-titlebar .wc { display: inline-flex; gap: 14px; color: var(--faint); }
-.pc-titlebar .wc svg { width: 10px; height: 10px; }
-.pc-window img { width: 100%; }
 
 .tablet {
   position: relative;
@@ -1423,9 +1410,9 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 @media (max-width: 720px) {
   .caption, .fact .d, .hero-meta, .footer, .status-line, .chip span, .toc,
   .mac-notice, .field label, .field legend, .dl-meta, .nav-link { font-size: 0.9375rem; }
-  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label, .stage-chip, .post-meta,
+  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label, .post-meta,
   .sha .btn-sm, .toc h2 { font-size: 0.875rem; }
-  .nav-link .count, .btn .count, .pc-titlebar, .sha code { font-size: 0.8125rem; }
+  .nav-link .count, .btn .count, .sha code { font-size: 0.8125rem; }
   .fallback pre, .source-body pre { font-size: 0.875rem; }
   pre code { font-size: 1em; }
 }
