@@ -11,6 +11,22 @@ final class SupportDiagnosticsTests: XCTestCase {
         XCTAssertTrue(redacted.contains("status=-12909 session_id=123456"))
     }
 
+    func testUploadsLeaveOutThePCNameButTheReportKeepsIt() async throws {
+        let line = "Session 5 established with MARIA-DESKTOP"
+        XCTAssertEqual(SupportDiagnostics.redactForUpload(line), "Session 5 established with %COMPUTERNAME%")
+        XCTAssertEqual(SupportDiagnostics.redactForUpload("Session 5 established with Maria's PC token=x"),
+                       "Session 5 established with %COMPUTERNAME%")
+        for other in ["HELLO2 attempt 1/4 to 192.0.2.7:9876", "model=iPad hardware=iPad16,5"] {
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(other), other)
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = SupportDiagnostics(directory: directory)
+        store.record("info", "ctrl", line)
+        let report = await store.report()
+        XCTAssertTrue(report.contains(line), report)
+    }
+
     func testReportSurvivesRelaunchIncludesLatestErrorAndExportsAFile() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -1642,11 +1642,26 @@ mod tests {
             summary.to_string(),
         ] {
             let uploaded = event(&line, level(&line));
+            // The iPad's name is left out (see `redact`).
             assert_eq!(
                 (uploaded.category.as_str(), uploaded.message),
-                ("host", line)
+                (
+                    "host",
+                    line.replacen("\"x session_summary", "<device-name>", 1)
+                )
             );
         }
+    }
+    #[test]
+    fn uploads_name_a_device_by_its_kind() {
+        let line = "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+                    device=Headphones (Maria's AirPods) rate=48000 channels=2";
+        let uploaded = event(line, level(line));
+        assert_eq!(
+            uploaded.message,
+            "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+             device=<headphones> rate=48000 channels=2"
+        );
     }
     /// Lines a streaming host logs over `seconds`, at their real rates.
     fn streaming_lines(seconds: u32) -> Vec<String> {

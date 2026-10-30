@@ -34,6 +34,21 @@ final class DiagnosticsUploadTests: XCTestCase {
         XCTAssertFalse(upload.enabled)
     }
 
+    func testOutboxLeavesOutThePCName() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
+        let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
+        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
+        defer { upload.shutdown() }
+        upload.record(level: "info", category: "ctrl", message: "Session 5 established with MARIA-DESKTOP", timestamp: Date())
+        _ = await upload.status()
+        let file = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first!
+        let batch = try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: file))
+        XCTAssertEqual(batch.events.map(\.message), ["Session 5 established with %COMPUTERNAME%"])
+    }
+
     func testWrongAcknowledgementKeepsOutboxUntilMatchingRetry() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let suite = UUID().uuidString

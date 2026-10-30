@@ -1,6 +1,7 @@
 //! What uploads leave out: the Windows profile folder, which is a user name,
-//! the user name and the PC's name. Support identifies a PC by its
-//! installation id. The session log and "Copy logs" keep them all.
+//! the user name, the PC's name and the names owners give their devices.
+//! Support identifies a PC by its installation id. The session log and
+//! "Copy logs" keep them all.
 //!
 //! - A profile path under any root (`C:\`, `\\server\share\`, `\\?\`,
 //!   `\\?\UNC\`), with either separator or Debug-doubled backslashes: this
@@ -11,6 +12,10 @@
 //!   `%USERNAME%` and `%COMPUTERNAME%`. A PC name ends at any character
 //!   outside `A-Z`, `a-z`, `0-9` and `-`, so `USB_DESKTOP-DEMO_Audio` loses
 //!   it and `DESKTOP-OTHER` keeps it.
+//! - In the lines that log one, `device=` with a name its owner may have
+//!   chosen: the PC's audio output (`Headphones (Maria's AirPods)`) becomes
+//!   its kind (`<headphones>`, else `<audio-device>`), and the iPad's name
+//!   becomes `<device-name>` unless it is Apple's own `iPad` or `iPhone`.
 //! - What stays: the line's time and level; field names (`name=`); the
 //!   values of diagnostic fields and hardware descriptions, outside paths;
 //!   names that are common words (`Intel`, `display`, `DESKTOP`), except as
@@ -189,6 +194,52 @@ const DESCRIPTIONS: [(&str, Option<&str>); 4] = [
     ("Found GPU adapter", Some("name")),
 ];
 
+/// Messages whose `device=` is a name its owner may have chosen.
+const DEVICE_NAMES: [(&str, Device); 4] = [
+    ("WASAPI loopback active", Device::Audio),
+    ("Audio stream stats", Device::Audio),
+    ("Client session established", Device::Client),
+    ("Client liveness expired", Device::Client),
+];
+
+#[derive(Clone, Copy)]
+enum Device {
+    /// A Windows audio endpoint, `Description (device)`: `Speakers (Realtek(R)
+    /// Audio)`, `Headphones (Maria's AirPods)`.
+    Audio,
+    /// The name the iPad sends in its HELLO.
+    Client,
+}
+
+/// An audio endpoint's kind, by the words Windows and drivers put in its
+/// name: the description before ` (` first, then the whole name.
+const AUDIO_KINDS: [(&[&str], &str); 4] = [
+    (
+        &["headphone", "headset", "earphone", "earbud"],
+        "<headphones>",
+    ),
+    (&["speaker"], "<speakers>"),
+    (&["bluetooth", "hands-free"], "<bluetooth>"),
+    (
+        &[
+            "hdmi",
+            "displayport",
+            "display audio",
+            "nvidia high definition",
+            "amd high definition",
+        ],
+        "<hdmi>",
+    ),
+];
+const AUDIO_DEVICE: &str = "<audio-device>";
+
+/// iPadOS 16 and later send these unless the app may read the user's name.
+const GENERIC_CLIENT_NAMES: [&str; 2] = ["iPad", "iPhone"];
+const DEVICE_NAME: &str = "<device-name>";
+
+/// The log's repeat count (`crate::log_repeat`) follows a line's last field.
+const REPEATED: &str = " [repeated ";
+
 const USERPROFILE: &str = "%USERPROFILE%";
 const USERNAME: &str = "%USERNAME%";
 const COMPUTERNAME: &str = "%COMPUTERNAME%";
@@ -306,8 +357,15 @@ pub(super) fn redact(line: &str, names: &Names) -> String {
         None => ("", line),
     };
     let chars: Vec<char> = message.chars().collect();
-    let mut edits = profiles(&chars, names);
     let fields = Fields::of(&chars);
+    let mut edits: Vec<Edit> = device(&chars, &fields).into_iter().collect();
+    let device = edits.first().map(|edit| (edit.start, edit.end));
+    edits.extend(
+        profiles(&chars, names).into_iter().filter(|edit| {
+            device.is_none_or(|(start, end)| edit.end <= start || end <= edit.start)
+        }),
+    );
+    edits.sort_by_key(|edit| edit.start);
     let found = words(&chars, names, &edits, &fields);
     edits.extend(found);
     edits.sort_by_key(|edit| edit.start);
@@ -578,6 +636,8 @@ fn profile(chars: &[char], start: usize, mut from: usize, names: &Names) -> Opti
 struct Fields {
     names: Vec<(usize, usize)>,
     kept: Vec<(usize, usize)>,
+    /// The value of `device=`, without the space or repeat count after it.
+    device: Option<(usize, usize)>,
 }
 
 impl Fields {
@@ -604,6 +664,7 @@ impl Fields {
             Some((name_at(chars, leading, &label)?, *field))
         });
         let mut kept = Vec::new();
+        let mut device = None;
         if let Some((after, None)) = description {
             kept.push((after, chars.len()));
         }
@@ -619,9 +680,60 @@ impl Fields {
             {
                 kept.push((equals + 1, end));
             }
+            if key == "device" && device.is_none() {
+                let value = chars.get(equals + 1..end).unwrap_or_default();
+                let repeated: Vec<char> = REPEATED.chars().collect();
+                let length = (0..value.len())
+                    .find(|&i| name_at(value, i, &repeated).is_some())
+                    .unwrap_or(value.len());
+                let spaces = value
+                    .get(..length)
+                    .unwrap_or_default()
+                    .iter()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
+                device = Some((equals + 1, equals + 1 + length - spaces));
+            }
         }
-        Self { names, kept }
+        Self {
+            names,
+            kept,
+            device,
+        }
     }
+}
+
+/// The edit to the device name a message logs, if its owner may have chosen
+/// it.
+fn device(chars: &[char], fields: &Fields) -> Option<Edit> {
+    let leading = count(chars, 0, char::is_whitespace);
+    let (_, kind) = DEVICE_NAMES.iter().find(|(message, _)| {
+        let message: Vec<char> = message.chars().collect();
+        name_at(chars, leading, &message).is_some()
+    })?;
+    let (start, end) = fields.device?;
+    let name: String = chars.get(start..end)?.iter().collect();
+    let token = match kind {
+        Device::Audio => audio_kind(&name),
+        Device::Client if GENERIC_CLIENT_NAMES.contains(&name.as_str()) => return None,
+        Device::Client => DEVICE_NAME,
+    };
+    (start < end).then_some(Edit { start, end, token })
+}
+
+/// The label of the audio endpoint `name`.
+fn audio_kind(name: &str) -> &'static str {
+    let name = name.to_lowercase();
+    let description = name.split(" (").next().unwrap_or_default();
+    [description, name.as_str()]
+        .iter()
+        .find_map(|text| {
+            AUDIO_KINDS
+                .iter()
+                .find(|(words, _)| words.iter().any(|word| text.contains(word)))
+        })
+        .map_or(AUDIO_DEVICE, |(_, kind)| kind)
 }
 
 /// The user and PC names in `chars` outside `taken`, in order.
@@ -800,14 +912,88 @@ mod tests {
                 "Announce maria-desktop.local. on 192.0.2.1",
                 "Announce %COMPUTERNAME%.local. on 192.0.2.1",
             ),
-            (
-                "Client session established session_id=5 device=Maria's iPad",
-                "Client session established session_id=5 device=%USERNAME%'s iPad",
-            ),
             // Part of a longer word is another word.
             ("user=mariadb mariana", "user=mariadb mariana"),
         ] {
             assert_eq!(redact(text, &names), uploaded, "{text}");
+        }
+    }
+
+    #[test]
+    fn device_names_become_their_kind() {
+        // Not this PC's user: any owner's name goes.
+        let names = Names::new(None, None, None);
+        let wasapi = |device: &str| {
+            format!("{STAMP}  INFO WASAPI loopback active device={device} rate=48000 channels=2")
+        };
+        for (device, kind) in [
+            ("Headphones (Maria's AirPods)", "<headphones>"),
+            ("Headset (Maria's AirPods Hands-Free)", "<headphones>"),
+            ("Speakers (2- Maria's Bose Mini)", "<speakers>"),
+            ("Speakers (Realtek(R) Audio)", "<speakers>"),
+            ("Maria's Bluetooth Stereo", "<bluetooth>"),
+            ("DELL U2720Q (NVIDIA High Definition Audio)", "<hdmi>"),
+            ("Living Room TV (Intel(R) Display Audio)", "<hdmi>"),
+            ("Maria's Studio (Focusrite USB Audio)", "<audio-device>"),
+            ("Default PC output", "<audio-device>"),
+        ] {
+            assert_eq!(redact(&wasapi(device), &names), wasapi(kind), "{device}");
+        }
+        for (text, uploaded) in [
+            (
+                "Audio stream stats device=Headphones (Maria's AirPods) kbps=96.0 dropped=0",
+                "Audio stream stats device=<headphones> kbps=96.0 dropped=0",
+            ),
+            // A frozen stream's repeat count uploads as it is.
+            (
+                "Audio stream stats device=Headphones (Maria's AirPods) kbps=0.0 wire_stream=3 \
+                 [repeated 9 more times from 2026-10-29T17:46:01Z to 2026-10-29T17:46:10Z]",
+                "Audio stream stats device=<headphones> kbps=0.0 wire_stream=3 \
+                 [repeated 9 more times from 2026-10-29T17:46:01Z to 2026-10-29T17:46:10Z]",
+            ),
+            (
+                "Client session established peer=192.0.2.7:50000 session_id=5 \
+                 device=Maria's iPad Pro screen=2732x2048",
+                "Client session established peer=192.0.2.7:50000 session_id=5 \
+                 device=<device-name> screen=2732x2048",
+            ),
+            (
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 device=Maria's iPad [repeated 1 more times from 1 to 2]",
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 device=<device-name> [repeated 1 more times from 1 to 2]",
+            ),
+        ] {
+            assert_eq!(redact(text, &names), uploaded, "{text}");
+        }
+        // With this PC's names known, the rest of the line still loses them.
+        assert_eq!(
+            redact(
+                &format!("{STAMP}  INFO WASAPI loopback active device=Headphones (maria's AirPods) rate=48000 host=MARIA-DESKTOP"),
+                &maria()
+            ),
+            format!("{STAMP}  INFO WASAPI loopback active device=<headphones> rate=48000 host=%COMPUTERNAME%")
+        );
+    }
+
+    #[test]
+    fn hardware_and_display_devices_keep_their_names() {
+        let names = Names::new(None, None, None);
+        for line in [
+            format!("{STAMP}  INFO Client session established session_id=5 device=iPad screen=2732x2048"),
+            format!("{STAMP}  INFO Client session established session_id=5 device=iPhone"),
+            format!(
+                "{STAMP}  INFO Discovered display output device=\\\\.\\DISPLAY1 \
+                 adapter=NVIDIA GeForce RTX 5060 width=2560 height=1440 primary=true"
+            ),
+            format!("{STAMP}  INFO GPU: NVIDIA GeForce RTX 5060 (8188 MB)"),
+            format!("{STAMP}  WARN Virtual display could not be enabled device=problem_43"),
+            format!(
+                "{STAMP}  WARN Virtual display failure snapshot vdd_device=ok \
+                 outputs=[DELL U2720Q] device=unknown(display tasks missing)"
+            ),
+        ] {
+            assert_eq!(redact(&line, &names), line);
         }
     }
 

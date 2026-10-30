@@ -649,6 +649,23 @@ mod tests {
         assert!(lines[1].contains("access lost [repeated 19 more times"));
     }
 
+    /// Uploads leave device names out (`crate::telemetry`); the user's own
+    /// log and "Copy logs" keep them.
+    #[test]
+    fn the_session_log_keeps_device_names() {
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+            repeats: Some(Default::default()),
+        };
+        let line = "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+                    device=Headphones (Maria's AirPods) rate=48000 channels=2";
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        assert_eq!(shared.lock().iter().collect::<Vec<_>>(), [line]);
+    }
+
     #[test]
     fn session_summaries_are_never_collapsed() {
         let shared = Arc::new(Mutex::new(VecDeque::new()));

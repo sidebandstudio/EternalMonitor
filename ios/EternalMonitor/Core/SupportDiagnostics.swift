@@ -136,6 +136,17 @@ final class SupportDiagnostics: @unchecked Sendable {
             withTemplate: "$1$2[REDACTED]")
     }
 
+    /// The PC's name, from its HELLO_ACK, often names its owner ("MARIA-DESKTOP"). Uploads leave it out
+    /// as the Windows app's do; this iPad's log and report keep it.
+    private static let pcNamePattern = try! NSRegularExpression(
+        pattern: #"^(Session \d+ established with ).*$"#, options: .dotMatchesLineSeparators)
+
+    static func redactForUpload(_ text: String) -> String {
+        let text = redact(text)
+        return pcNamePattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
+            withTemplate: "$1%COMPUTERNAME%")
+    }
+
     @MainActor
     func recordDeviceSnapshot() {
         let process = ProcessInfo.processInfo
