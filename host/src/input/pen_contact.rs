@@ -10,7 +10,8 @@
 //! with an in-range UPDATE and ends with a bare UPDATE. A rejected frame
 //! cancels every injected contact. ERROR_NOT_READY applies nothing; the same
 //! frame is retried, unless its sample goes stale first: then the next one is
-//! planned from the state Windows last accepted.
+//! planned from the state Windows last accepted. A frame that would come too
+//! soon after the last waits the same way, for its spacing.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -153,6 +154,75 @@ impl NotReadyRetry {
     }
 }
 
+/// The least time between frames on the pen device beyond `FRAME_BURST`.
+/// Windows refuses a frame with E_INVALIDARG once a dozen or so come faster
+/// than about one every 100 µs. On the reference PC, 64 samples sent back to
+/// back lost about one frame in twenty from the 13th on, frames 50 µs apart
+/// about one in eighty, and frames 100 µs or more apart none. 250 µs is two
+/// and a half times the closest clean spacing, and more than two ticks of
+/// Windows' 0.1 ms input clock. Samples come that fast only as a backlog,
+/// after Wi-Fi or the PC stalled; it then drains at 4000 frames a second,
+/// about 16 times a Pencil's rate.
+pub(super) const FRAME_SPACING: Duration = Duration::from_micros(250);
+
+/// Frames that may go back to back. The iPad sends each batch of coalesced
+/// samples together: at most four at 60 Hz, and the move and up that end a
+/// stroke, so normal drawing is never held back. The soak never lost one of
+/// the first twelve of a burst.
+pub(super) const FRAME_BURST: u32 = 6;
+
+/// Keeps frames `FRAME_SPACING` apart on average, allowing `FRAME_BURST` at
+/// once: a frame may go once the frames before it have had their spacing,
+/// less the burst. Waiting never blocks; `PenContact` holds the frame back.
+#[derive(Debug, Default)]
+struct FrameSpacing {
+    /// When the next frame would go if every frame were spaced.
+    next: Option<Instant>,
+}
+
+impl FrameSpacing {
+    /// When the next frame may go, if not yet at `now`.
+    fn wait(&self, now: Instant) -> Option<Instant> {
+        let at = self.next?.checked_sub(FRAME_SPACING * (FRAME_BURST - 1))?;
+        (at > now).then_some(at)
+    }
+
+    /// A frame reached Windows at `now`.
+    fn sent(&mut self, now: Instant) {
+        self.next = Some(self.next.map_or(now, |next| next.max(now)) + FRAME_SPACING);
+    }
+}
+
+/// Counts refused frames by error code, so a repeated refusal is logged at
+/// its 1st, 10th, 100th, 1000th... occurrence rather than every time.
+#[derive(Debug)]
+pub struct RefusalLog<C> {
+    counts: Vec<(C, u64)>,
+}
+
+impl<C> Default for RefusalLog<C> {
+    fn default() -> Self {
+        Self { counts: Vec::new() }
+    }
+}
+
+impl<C: PartialEq> RefusalLog<C> {
+    /// Count a refusal with `code`; its count when it should be logged.
+    pub fn note(&mut self, code: C) -> Option<u64> {
+        let count = match self.counts.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, count)) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                self.counts.push((code, 1));
+                1
+            }
+        };
+        (count == 10u64.pow(count.ilog10())).then_some(count)
+    }
+}
+
 /// `sample` with its desktop pixels mapped from its wire position onto
 /// `output`, the capture rect current now.
 fn mapped(mut sample: PenSample, output: Option<CaptureGeometry>) -> PenSample {
@@ -170,6 +240,8 @@ pub trait PenTarget {
     /// Inject one frame and report its outcome, given the state the frame
     /// starts from.
     fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome;
+    /// The time now, for spacing frames.
+    fn now(&self) -> Instant;
     /// Destroy and recreate the synthetic pen device, which ends any pointer
     /// Windows holds for it.
     fn recreate(&mut self);
@@ -203,6 +275,12 @@ pub struct PenContact {
     /// The device is new because native input seemed stuck: unless it
     /// accepts a frame by then, Pencil input goes to the mouse.
     trial_until: Option<Instant>,
+    spacing: FrameSpacing,
+    /// When the frame held back to keep frames `FRAME_SPACING` apart may go.
+    spaced_until: Option<Instant>,
+    /// The first waiting sample was rejected and started again before its
+    /// frame was held back, so a second rejection gives it up.
+    resumed: bool,
     /// Samples dropped by design, with why, so tests can tell them from
     /// samples lost by mistake.
     #[cfg(test)]
@@ -215,6 +293,9 @@ enum Brought {
     /// Windows was not ready: it waits, to be planned again from where it
     /// stopped.
     Waiting,
+    /// Its next frame would come too soon after the last: it waits for
+    /// `PenContact::spaced_until` and is planned again from where it stopped.
+    Spaced,
     /// It cannot be delivered natively: the device is gone, or Windows
     /// rejected a frame for it that a fresh start did not fix.
     Abandoned,
@@ -240,6 +321,12 @@ impl PenContact {
         self.queue.front().map(|&(sample, _)| sample)
     }
 
+    /// When to `flush` again for a frame held back to keep frames
+    /// `FRAME_SPACING` apart.
+    pub fn spaced_until(&self) -> Option<Instant> {
+        self.spaced_until.filter(|_| !self.queue.is_empty())
+    }
+
     /// Bring Windows to the state `sample`, received `now`, asks for, after
     /// anything still waiting. `output` is the current capture rect.
     pub fn deliver(
@@ -250,7 +337,12 @@ impl PenContact {
         target: &mut impl PenTarget,
     ) {
         self.expire(now);
-        if self.queue.len() >= QUEUE_LIMIT && !self.coalesces(&sample) {
+        // Only samples waiting on a refusal count: a backlog waiting for
+        // its spacing is moving.
+        if self.refused_since.is_some()
+            && self.queue.len() >= QUEUE_LIMIT
+            && !self.coalesces(&sample)
+        {
             // Windows has refused the first waiting frame for a whole queue
             // of samples: native input is stuck. Recreating the device ends
             // any pointer it holds and the retry it is owed; every waiting
@@ -265,9 +357,10 @@ impl PenContact {
         self.flush(output, now, target);
     }
 
-    /// Deliver waiting samples in order until Windows is not ready. Call on
-    /// every refresh tick so an end of contact is not left waiting for the
-    /// next Pencil sample.
+    /// Deliver waiting samples in order until Windows is not ready, or the
+    /// next frame must wait for its spacing. Call on every refresh tick so
+    /// an end of contact is not left waiting for the next Pencil sample, and
+    /// at `spaced_until`.
     ///
     /// Native input is stuck once Windows has accepted nothing for
     /// `INPUT_STALE` while ink waits, or `STUCK_TRIAL` longer while it holds
@@ -284,6 +377,7 @@ impl PenContact {
         target: &mut impl PenTarget,
     ) {
         self.expire(now);
+        self.spaced_until = None;
         loop {
             while let Some(sample) = self.pending() {
                 match self.bring(mapped(sample, output), target) {
@@ -291,6 +385,7 @@ impl PenContact {
                         self.queue.pop_front();
                     }
                     Brought::Waiting => break,
+                    Brought::Spaced => return,
                     Brought::Abandoned => return self.abandon(output),
                 }
             }
@@ -335,6 +430,7 @@ impl PenContact {
     /// samples are planned from the state Windows last accepted, so a move
     /// whose down was dropped starts the contact itself.
     fn expire(&mut self, now: Instant) {
+        let waiting = self.queue.len();
         self.queue.retain(|&(sample, received)| {
             let stale = is_ink(&sample) && now.saturating_duration_since(received) >= INPUT_STALE;
             #[cfg(test)]
@@ -343,6 +439,8 @@ impl PenContact {
             }
             !stale
         });
+        // The oldest sample is the first to go stale.
+        self.resumed &= self.queue.len() == waiting;
     }
 
     #[cfg(test)]
@@ -351,6 +449,7 @@ impl PenContact {
     }
 
     fn abandon(&mut self, output: Option<CaptureGeometry>) {
+        self.resumed = false;
         let waiting = self
             .queue
             .drain(..)
@@ -366,16 +465,20 @@ impl PenContact {
     /// The session ended or was taken over: drop samples Windows never
     /// received, and end only the pointer it holds, where it holds it. If
     /// Windows is still refusing a frame, recreate the device rather than
-    /// send it a different one.
+    /// send it a different one. The end is not held back for its spacing:
+    /// if Windows refuses it, recreating the device ends the pointer anyway.
     pub fn reset(&mut self, target: &mut impl PenTarget) {
         if !self.queue.is_empty() {
             #[cfg(test)]
             self.dropped
                 .extend(self.queue.iter().map(|&(s, _)| (s, "reset")));
             self.queue.clear();
-            target.recreate();
-            self.state = PointerState::Out;
-            return;
+            self.resumed = false;
+            if self.refused_since.is_some() {
+                target.recreate();
+                self.state = PointerState::Out;
+                return;
+            }
         }
         let end = match self.state {
             PointerState::Out => return,
@@ -396,12 +499,14 @@ impl PenContact {
         }
     }
 
-    /// Whether `sample` replaces the last waiting one: only the latest
-    /// position matters, but the first sample is being retried, and Windows
-    /// must get that same frame again.
+    /// Whether `sample` replaces the last waiting one while Windows refuses
+    /// the first: only the latest position matters, but the first sample is
+    /// being retried, and Windows must get that same frame again. Samples
+    /// waiting only for their spacing all go.
     fn coalesces(&self, sample: &PenSample) -> bool {
         let update = |sample: &PenSample| matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
-        self.queue.len() > 1
+        self.refused_since.is_some()
+            && self.queue.len() > 1
             && self.queue.back().is_some_and(|(last, _)| update(last))
             && update(sample)
     }
@@ -435,14 +540,20 @@ impl PenContact {
             _ => sample,
         };
         // A rejection cancels the contact; resume a move or hover from this
-        // same, freshly mapped sample once. A frame still rejected after
-        // that, or a rejected down or up, gives the sample up.
-        let mut restarted = false;
+        // same, freshly mapped sample once, even after waiting for its
+        // spacing. A frame still rejected after that, or a rejected down or
+        // up, gives the sample up.
+        let mut restarted = std::mem::take(&mut self.resumed);
         loop {
             let mut rejected = false;
             for frame in self.plan(sample).into_iter().flatten() {
                 if !target.available() {
                     return Brought::Abandoned;
+                }
+                if let Some(until) = self.spacing.wait(target.now()) {
+                    self.spaced_until = Some(until);
+                    self.resumed = restarted;
+                    return Brought::Spaced;
                 }
                 let outcome = match frame.phase {
                     PenPhase::Cancel | PenPhase::Leave => self.end(frame, target),
@@ -485,6 +596,8 @@ impl PenContact {
 
     fn send(&mut self, frame: PenSample, target: &mut impl PenTarget) -> Outcome {
         let outcome = target.inject(frame, self.state.kind());
+        // Every call counts, refused or not: Windows received the frame.
+        self.spacing.sent(target.now());
         match outcome {
             Outcome::Injected => {
                 self.refused_since = None;
@@ -651,6 +764,16 @@ mod tests {
         retry: Option<PointerFrame>,
         frames: Vec<Seen>,
         illegal: Vec<(PenPhase, PointerKind)>,
+        /// The time now. Each frame takes `call`; by default that keeps
+        /// frames far enough apart that none is held back.
+        clock: Instant,
+        call: Duration,
+        /// When each frame reached Windows.
+        sent_at: Vec<Instant>,
+        /// Refuse frames as the reference PC did: the 13th in a row to come
+        /// less than 100 µs after the one before, and each after it.
+        rate_limited: bool,
+        fast: usize,
     }
 
     impl Default for FakeWindows {
@@ -664,6 +787,11 @@ mod tests {
                 retry: None,
                 frames: Vec::new(),
                 illegal: Vec::new(),
+                clock: Instant::now(),
+                call: FRAME_SPACING,
+                sent_at: Vec::new(),
+                rate_limited: false,
+                fast: 0,
             }
         }
     }
@@ -673,8 +801,19 @@ mod tests {
             self.screen
         }
 
+        fn now(&self) -> Instant {
+            self.clock
+        }
+
         fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
             assert_eq!(from, self.belief_of(from), "injector state diverged");
+            let fast = self
+                .sent_at
+                .last()
+                .is_some_and(|&last| self.clock - last < Duration::from_micros(100));
+            self.fast = if fast { self.fast + 1 } else { 0 };
+            self.sent_at.push(self.clock);
+            self.clock += self.call;
             let pointer = PointerFrame::new(frame, self.screen);
             if let Some(retry) = self.retry.take() {
                 assert_eq!(pointer, retry, "{frame:?} replaced a frame being retried");
@@ -692,8 +831,8 @@ mod tests {
             let (x, y) = pointer.location;
             let on_screen = (0..self.screen.width as i32).contains(&x)
                 && (0..self.screen.height as i32).contains(&y);
-            let outcome = if self.refuse > 0 {
-                self.refuse -= 1;
+            let outcome = if self.refuse > 0 || (self.rate_limited && self.fast >= 12) {
+                self.refuse = self.refuse.saturating_sub(1);
                 self.state = PointerKind::Out;
                 Outcome::Rejected
             } else if !on_screen {
@@ -1149,6 +1288,10 @@ mod tests {
             self.windows.screen
         }
 
+        fn now(&self) -> Instant {
+            self.windows.now()
+        }
+
         fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
             if !matches!(frame.phase, Cancel | Leave) {
                 let mapped =
@@ -1479,5 +1622,193 @@ mod tests {
             windows.not_ready = 1;
         });
         assert_eq!(not_ready, [F(Cancel, 10, 10, NotReady), Recreated]);
+        // Frames held back only for their spacing are not a refusal: the
+        // contact ends where Windows has it, without a new device.
+        let spaced = reset(&|contact, windows| {
+            windows.call = Duration::from_micros(20);
+            for x in 10..30 {
+                deliver(
+                    contact,
+                    windows,
+                    pen(if x == 10 { Down } else { Move }, x, 10),
+                );
+            }
+            assert!(contact.spaced_until().is_some());
+        });
+        assert_eq!(spaced, [F(Cancel, 15, 10, Injected)]);
+    }
+
+    /// Windows that takes `call` per frame and refuses frames as the
+    /// reference PC did.
+    fn measured_windows() -> FakeWindows {
+        FakeWindows {
+            call: Duration::from_micros(20),
+            rate_limited: true,
+            ..FakeWindows::default()
+        }
+    }
+
+    /// Flush whenever the contact asks to, as the transport's deadline does.
+    fn wait_for_spacing(contact: &mut PenContact, windows: &mut FakeWindows) {
+        while let Some(until) = contact.spaced_until() {
+            windows.clock = windows.clock.max(until);
+            contact.flush(Some(OUTPUT), Instant::now(), windows);
+        }
+    }
+
+    /// A 64-sample stroke, as it arrives after Wi-Fi or the PC stalled.
+    fn backlog() -> Vec<PenSample> {
+        (0..64)
+            .map(|x| pen(if x == 0 { Down } else { Move }, x, 10))
+            .collect()
+    }
+
+    #[test]
+    fn a_backlog_of_samples_is_spaced_so_windows_takes_every_one() {
+        // Sent back to back, unspaced, the soak's burst loses frames.
+        let mut windows = measured_windows();
+        for sample in backlog() {
+            windows.inject(sample, windows.state);
+        }
+        assert!(windows.take().contains(&F(Move, 12, 10, Rejected)));
+
+        let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+        for sample in backlog() {
+            deliver(&mut contact, &mut windows, sample);
+        }
+        wait_for_spacing(&mut contact, &mut windows);
+        let every_sample: Vec<_> = backlog()
+            .iter()
+            .map(|sample| F(sample.phase, sample.x, sample.y, Injected))
+            .collect();
+        assert_eq!(windows.take(), every_sample);
+        assert!(contact.take_dropped().is_empty());
+        assert!(contact.take_abandoned().is_empty());
+        // The first FRAME_BURST go at once; after that, frames go
+        // FRAME_SPACING apart. The first gap is short by the time the
+        // burst itself took.
+        let burst = FRAME_BURST as usize;
+        let gaps: Vec<_> = windows.sent_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps[..burst - 1].iter().all(|&gap| gap == windows.call));
+        assert_eq!(
+            gaps[burst - 1],
+            FRAME_SPACING - windows.call * (FRAME_BURST - 2)
+        );
+        assert!(gaps[burst..].iter().all(|&gap| gap >= FRAME_SPACING));
+        // Windows never gets more than FRAME_BURST ahead of the spacing,
+        // and the backlog drains as fast as that allows.
+        let start = windows.sent_at[0];
+        for (i, &at) in windows.sent_at.iter().enumerate() {
+            let spaced = (i as u32).saturating_sub(FRAME_BURST - 1);
+            assert!(at - start >= FRAME_SPACING * spaced, "frame {i}");
+        }
+        assert_eq!(
+            windows.sent_at[63] - start,
+            FRAME_SPACING * (64 - FRAME_BURST) + windows.call
+        );
+    }
+
+    #[test]
+    fn samples_at_pencil_rates_are_never_held_back() {
+        // 240 Hz one at a time, and the iPad's batches at 120 and 60 Hz,
+        // each stroke ending with its last batch, a move and an up.
+        for (interval_us, batch) in [(4_167, 1), (8_333, 2), (16_667, 4)] {
+            let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+            let mut samples = vec![pen(Down, 0, 10)];
+            samples.extend((1..=240).map(|x| pen(Move, x, 10)));
+            samples.push(pen(Up, 241, 10));
+            let mut arrival = windows.clock;
+            for batch in samples.chunks(batch) {
+                arrival += Duration::from_micros(interval_us);
+                windows.clock = arrival;
+                for &sample in batch {
+                    let sent = windows.sent_at.len();
+                    let at = windows.clock;
+                    deliver(&mut contact, &mut windows, sample);
+                    // Sent at once, at the time it arrived.
+                    assert!(
+                        contact.pending().is_none(),
+                        "{sample:?} at {interval_us} µs"
+                    );
+                    assert_eq!(windows.sent_at[sent], at);
+                }
+            }
+            assert_eq!(windows.frames.len(), samples.len() + 1);
+            assert!(windows
+                .take()
+                .iter()
+                .all(|seen| matches!(seen, F(_, _, _, Injected))));
+            assert!(windows.illegal.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_frame_refused_in_a_backlog_restarts_the_contact_at_that_sample() {
+        let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+        for sample in backlog() {
+            deliver(&mut contact, &mut windows, sample);
+        }
+        // Windows refuses the 10th frame for another reason.
+        while windows.sent_at.len() < 9 {
+            let until = contact.spaced_until().expect("held back");
+            windows.clock = until;
+            contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        }
+        windows.refuse = 1;
+        wait_for_spacing(&mut contact, &mut windows);
+        let seen = windows.take();
+        assert_eq!(
+            seen[8..12],
+            [
+                F(Move, 8, 10, Injected),
+                F(Move, 9, 10, Rejected),
+                F(Down, 9, 10, Injected),
+                F(Move, 10, 10, Injected),
+            ]
+        );
+        assert_eq!(seen.len(), 65);
+        // The new down waited for its spacing too.
+        assert!(windows.sent_at[10] - windows.sent_at[9] >= FRAME_SPACING);
+        assert_eq!(windows.illegal, []);
+        assert!(contact.take_abandoned().is_empty());
+    }
+
+    #[test]
+    fn a_restart_refused_after_waiting_for_its_spacing_gives_the_sample_up() {
+        let (mut contact, mut windows) = (PenContact::default(), measured_windows());
+        for sample in backlog() {
+            deliver(&mut contact, &mut windows, sample);
+        }
+        while windows.sent_at.len() < 9 {
+            windows.clock = contact.spaced_until().expect("held back");
+            contact.flush(Some(OUTPUT), Instant::now(), &mut windows);
+        }
+        windows.refuse = 2;
+        wait_for_spacing(&mut contact, &mut windows);
+        // Started again once, not until the sample goes stale: the rest of
+        // the stroke goes to the mouse.
+        assert_eq!(
+            windows.take()[8..],
+            [
+                F(Move, 8, 10, Injected),
+                F(Move, 9, 10, Rejected),
+                F(Down, 9, 10, Rejected),
+            ]
+        );
+        let abandoned = contact.take_abandoned();
+        assert_eq!(abandoned.len(), 64 - 9);
+        assert_eq!((abandoned[0].0.phase, abandoned[0].0.x), (Move, 9));
+    }
+
+    #[test]
+    fn refusals_are_logged_at_each_power_of_ten_with_their_count() {
+        const E_INVALIDARG: u32 = 0x8007_0057;
+        const ERROR_NOT_READY: u32 = 0x8007_0015;
+        let mut log = RefusalLog::default();
+        let logged: Vec<_> = (0..1000).filter_map(|_| log.note(E_INVALIDARG)).collect();
+        assert_eq!(logged, [1, 10, 100, 1000]);
+        // Each code counts on its own.
+        assert_eq!(log.note(ERROR_NOT_READY), Some(1));
+        assert_eq!(log.note(E_INVALIDARG), None);
     }
 }

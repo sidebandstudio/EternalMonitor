@@ -30,7 +30,7 @@ use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::{FramePacer, PacingClock};
+use pacer::{Deadline, FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -227,14 +227,19 @@ pub async fn start_sender(
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
     pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pen_spacing = Deadline::new("pen-spacing")?;
 
     loop {
+        pen_spacing.arm(input_relay.pen_spaced_until());
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
             _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
+                input_relay.keep_pen_alive(*shared.capture_geometry.lock());
+            }
+            _ = pen_spacing.wait(), if pen_spacing.armed() => {
                 input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {

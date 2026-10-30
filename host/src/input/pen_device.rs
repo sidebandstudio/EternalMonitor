@@ -25,6 +25,8 @@ pub trait PenApi {
     fn destroy(&mut self, handle: Self::Handle);
     /// The virtual screen that frame locations are measured on now.
     fn screen(&self) -> VirtualScreen;
+    /// The time now, for spacing frames.
+    fn now(&self) -> Instant;
     /// Inject one frame. `output` is the capture rect, for diagnostics.
     fn inject(
         &mut self,
@@ -187,6 +189,10 @@ impl<A: PenApi> PenTarget for Target<'_, A> {
         self.slot.handle.is_some()
     }
 
+    fn now(&self) -> Instant {
+        self.slot.api.now()
+    }
+
     fn recreate(&mut self) {
         self.slot.destroy();
         self.slot.create(self.now);
@@ -341,6 +347,13 @@ impl<A: PenApi> PenDevice<A> {
         };
         self.contact.flush(output, now, &mut target);
         self.hand_over(output, now);
+    }
+
+    /// When to `flush` again for a frame held back to keep frames
+    /// `FRAME_SPACING` apart.
+    #[cfg_attr(not(windows), allow(dead_code))] // Only the Windows relay asks.
+    pub fn spaced_until(&self) -> Option<Instant> {
+        self.contact.spaced_until().filter(|_| self.available())
     }
 
     /// Whether the refresh tick has work even without a device: mouse input
@@ -576,6 +589,26 @@ mod tests {
         /// A release a dropped device left owed, where Windows keeps it for
         /// the next device's Windows.
         owed: std::rc::Rc<std::cell::Cell<Option<(i32, i32)>>>,
+        clock: Unhurried,
+    }
+
+    /// A clock on which frames are never close enough to be held back for
+    /// their spacing: each reading is `FRAME_SPACING` after the last.
+    #[derive(Debug)]
+    struct Unhurried(std::cell::Cell<Instant>);
+
+    impl Default for Unhurried {
+        fn default() -> Self {
+            Self(std::cell::Cell::new(Instant::now()))
+        }
+    }
+
+    impl Unhurried {
+        fn now(&self) -> Instant {
+            let now = self.0.get() + super::super::pen_contact::FRAME_SPACING;
+            self.0.set(now);
+            now
+        }
     }
 
     impl FakeApi {
@@ -592,6 +625,7 @@ mod tests {
                 button: false,
                 screen: SCREEN,
                 owed: Default::default(),
+                clock: Unhurried::default(),
             }
         }
     }
@@ -644,6 +678,10 @@ mod tests {
 
         fn screen(&self) -> VirtualScreen {
             self.screen
+        }
+
+        fn now(&self) -> Instant {
+            self.clock.now()
         }
 
         fn inject(
@@ -1452,6 +1490,7 @@ mod tests {
         blocked: bool,
         /// The time of the call in progress.
         now: Instant,
+        clock: Unhurried,
         seen: Vec<Seen>,
         coverage: Coverage,
     }
@@ -1476,6 +1515,10 @@ mod tests {
 
         fn screen(&self) -> VirtualScreen {
             SCREEN
+        }
+
+        fn now(&self) -> Instant {
+            self.clock.now()
         }
 
         fn inject(
@@ -1587,6 +1630,7 @@ mod tests {
                 stuck: false,
                 blocked: false,
                 now: start,
+                clock: Unhurried::default(),
                 seen: Vec::new(),
                 coverage: Coverage::default(),
             });
