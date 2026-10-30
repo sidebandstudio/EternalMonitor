@@ -253,13 +253,18 @@
     document.body.removeChild(ta);
   };
   document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    var reset = null;
+    var label = '';
+    // A language change relabels the button itself; the old label must not come back.
+    onLanguage(function () { clearTimeout(reset); reset = null; });
     btn.addEventListener('click', function () {
       var target = document.getElementById(btn.getAttribute('data-copy'));
       if (!target) return;
-      var original = btn.textContent;
+      if (!reset) label = btn.textContent;
       copyText(target.textContent.trim(), function () {
+        clearTimeout(reset);
         btn.textContent = t('common.copied', 'Copied');
-        setTimeout(function () { btn.textContent = original; }, 1800);
+        reset = setTimeout(function () { reset = null; btn.textContent = label; }, 1800);
       });
     });
   });
