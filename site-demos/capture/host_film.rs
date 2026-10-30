@@ -251,8 +251,9 @@ fn home_page_films() {
         f.hold(&mut h, 6);
         f.glide(&mut h, qr, 26);
         f.hold(&mut h, 3);
-        f.click(&mut h);
+        // The dialog's address is a documentation one from its first frame.
         PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+        f.click(&mut h);
         f.hold(&mut h, 16);
         note(&f, "dialog", h.get_by_label("Scan to connect").rect());
         f.glide(&mut h, egui::pos2(880.0, 610.0), 24);

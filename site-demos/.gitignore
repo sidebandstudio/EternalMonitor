@@ -5,3 +5,6 @@ art/*.log
 snapshots/
 .hyperframes/
 footage/desktop.png
+footage/pair-dialog.png
+footage/desktop-pair.png
+footage/pair-live.png

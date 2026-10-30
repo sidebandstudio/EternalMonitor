@@ -13,6 +13,13 @@
     #win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
     #win .win-view { width: 2080px; height: 1440px; }
     #win video { width: 2080px; height: 1440px; }
+    #shade { position: absolute; inset: 0; background: rgba(6, 7, 10, 0.55); opacity: 0; }
+    /* The iPad app, recorded in the simulator: Scan QR code, its real scanner
+       (playing what the camera would see, capture/camera.html), then the
+       stream. footage/ipad-pair.mp4 is the screen at 1112 x 1614. */
+    #tab { left: 84px; top: 140px; width: 560px; height: 795px; border-radius: 44px; transform-origin: 50% 50%; }
+    #tab .ipad-screen { left: 20px; top: 20px; width: 520px; height: 755px; border-radius: 26px; }
+    #tab video { left: 0; top: 0; width: 520px; height: 755px; }
     #chip { left: 0; right: 0; top: 34px; margin: 0 auto; width: max-content; }
   </style>
 </head>
@@ -30,6 +37,14 @@
         <video id="app" src="footage/host-pair.mp4" data-start="0" data-duration="8" muted playsinline></video>
       </div>
     </div>
+    <div id="shade"></div>
+
+    <div class="ipad" id="tab">
+      <div class="ipad-screen">
+        <video id="pad" src="footage/ipad-pair.mp4" data-start="2.2" data-duration="5.7" muted playsinline></video>
+        <div class="touch" id="touch"></div>
+      </div>
+    </div>
 
     <div class="chip" id="chip"><span class="dot"></span>iPad Pro connected over Wi-Fi</div>
   </div>
@@ -41,21 +56,37 @@
     // Scan to connect dialog; the streaming header and the connected iPad.
     const WHOLE = pose(520, 345, 0.66, AT);
     const CARD = pose(450, 300, 1.45, AT);
-    const DIALOG = pose(520, 361, 1.3, { x: 364, y: 500 });
-    const LIVE = pose(700, 310, 1.04, AT);
+    const DIALOG = pose(520, 330, 1.3, { x: 364, y: 470 });
+    const LIVE = pose(640, 250, 1.0, { x: 364, y: 330 });
 
     tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -14, duration: 4, ease: 'sine.inOut' }, 0);
     tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
 
-    // In the footage the pointer clicks QR code at 1.6 s, the iPad connects at
-    // 4.9 s and Done is clicked at 6.2 s.
+    // In the PC's footage the pointer clicks QR code at 1.17 s, the iPad joins
+    // at 4.9 s, Done closes the dialog at 5.5 s and the iPad leaves at 7.8 s.
+    // In the iPad's footage (from 2.2 s) the scanner opens at 3.0 s, reads the
+    // code at 4.6 s and the stream is up at 4.75 s.
     tl.set('#win', WHOLE, 0);
-    tl.to('#win', { ...CARD, duration: 1.2, ease: 'power2.inOut' }, 0.2);
-    tl.to('#win', { ...DIALOG, duration: 0.8, ease: 'power3.inOut' }, 1.65);
-    tl.to('#win', { ...LIVE, duration: 0.9, ease: 'power3.inOut' }, 6.3);
+    tl.to('#win', { ...CARD, duration: 1.0, ease: 'power2.inOut' }, 0.15);
+    tl.to('#win', { ...DIALOG, duration: 0.75, ease: 'power3.inOut' }, 1.25);
+    tl.to('#win', { ...LIVE, duration: 0.9, ease: 'power3.inOut' }, 5.25);
     tl.to('#win', { ...WHOLE, duration: 0.7, ease: 'power2.inOut' }, 7.3);
 
-    tl.fromTo('#chip', { opacity: 0, y: -14 }, { opacity: 1, y: 0, duration: 0.45, ease: 'power3.out' }, 4.95);
+    // The iPad comes up in front of the PC, steps back to the corner once it
+    // is connected, and leaves as the film loops.
+    tl.fromTo('#tab', { y: 1000, rotation: 0, scale: 1 }, { y: 0, duration: 0.6, ease: 'power3.out', immediateRender: true }, 2.2);
+    tl.to('#shade', { opacity: 1, duration: 0.5, ease: 'power1.out' }, 2.25);
+    tl.to('#tab', { x: 200, y: 285, scale: 0.42, duration: 0.85, ease: 'power3.inOut' }, 5.3);
+    tl.to('#shade', { opacity: 0, duration: 0.6, ease: 'power1.inOut' }, 5.35);
+    tl.to('#tab', { y: 1100, duration: 0.55, ease: 'power2.in' }, 7.3);
+
+    // A finger on Scan QR code.
+    const SCAN = { x: 379 * 520 / 1112, y: 841 * 520 / 1112 };
+    tl.set('#touch', { left: SCAN.x, top: SCAN.y }, 0);
+    tl.fromTo('#touch', { scale: 0.6, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.14, ease: 'power2.out', immediateRender: false }, 2.82);
+    tl.to('#touch', { scale: 1.5, opacity: 0, duration: 0.4, ease: 'power2.out' }, 2.98);
+
+    tl.fromTo('#chip', { opacity: 0, y: -14 }, { opacity: 1, y: 0, duration: 0.45, ease: 'power3.out', immediateRender: true }, 4.95);
     tl.to('#chip', { opacity: 0, y: -14, duration: 0.4, ease: 'power2.in' }, 7.35);
 
     window.__timelines['pair'] = tl;
