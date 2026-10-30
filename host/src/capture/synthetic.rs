@@ -53,6 +53,12 @@ pub fn run_capture_loop(
     generation: u64,
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // End-to-end tests with a fake virtual display: mirror or capture the
+    // second screen as DXGI capture would, and prove it with the first frame.
+    #[cfg(debug_assertions)]
+    let Some(mut proving) = super::second_screen::fake::capture_second_screen(&shared, generation) else {
+        return Ok(());
+    };
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
     let frame_bytes = row_bytes * height as usize;
@@ -100,6 +106,10 @@ pub fn run_capture_loop(
             width,
             height,
         });
+        #[cfg(debug_assertions)]
+        if std::mem::take(&mut proving) {
+            super::second_screen::note_image(&shared, generation);
+        }
 
         next_deadline += frame_budget;
         let now = Instant::now();

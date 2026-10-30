@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 pub(super) const FILE_NAME: &str = "second-screen-state.json";
 
 /// The graphics cards of a PC where the second screen showed a picture, or
@@ -106,7 +106,7 @@ impl Fingerprint {
     }
 
     /// Which parts differ from `other`, for the log.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     fn changes(&self, other: &Self) -> Vec<&'static str> {
         [
             ("app", self.app != other.app),
@@ -218,7 +218,7 @@ struct Io {
     overwrite: fn(&Path, &[u8]) -> std::io::Result<()>,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 impl Io {
     const FILES: Io = Io {
         remove: remove_file,
@@ -255,7 +255,7 @@ impl Memory {
     /// Read the failure saved at `path`, if it is for `fingerprint`. `wall`
     /// is the time at `now` in seconds since 1970; later times count from
     /// `now` on the monotonic clock.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, debug_assertions))]
     pub(crate) fn load(path: PathBuf, fingerprint: Fingerprint, wall: u64, now: Instant) -> Self {
         let failed = match read(&path) {
             Ok(None) => None,
@@ -542,7 +542,7 @@ fn remembered(reason: &str) -> Option<&'static str> {
 
 /// The saved record and its reason. `Ok(None)` without a file or without a
 /// failure in it; an error for one that cannot be used.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
     let data = match std::fs::read(path) {
         Ok(data) => data,
@@ -563,20 +563,20 @@ fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
     Ok(Some((record, reason)))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn remove_file(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
 /// Through a temporary file and a rename.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path))
 }
 
 /// The existing file, truncated and written where it is.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, debug_assertions))]
 fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()

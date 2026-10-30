@@ -31,6 +31,11 @@ use eternal_wire::v2::control::{
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
 
+/// The fake virtual display exists in debug builds only.
+#[cfg(debug_assertions)]
+#[path = "e2e_synthetic/second_screen.rs"]
+mod second_screen;
+
 /// Tests share process-global env (ETERNAL_*); run them one at a time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -115,7 +120,11 @@ fn init_test_tracing() {
         || std::env::var("RUST_TEST_NOCAPTURE").is_ok_and(|value| value != "0");
     if nocapture {
         let (writer, guard) = eternal_host::logging::non_blocking_output(std::io::stdout());
-        let subscriber = subscriber.with_writer(writer).finish().with(SummaryCapture);
+        let subscriber = subscriber
+            .with_writer(writer)
+            .finish()
+            .with(SummaryCapture)
+            .with(eternal_host::diagnostics::FallbackWatch);
         if subscriber.try_init().is_ok() {
             let _ = LIVE_OUTPUT.set(guard);
         }
@@ -124,6 +133,7 @@ fn init_test_tracing() {
             .with_test_writer()
             .finish()
             .with(SummaryCapture)
+            .with(eternal_host::diagnostics::FallbackWatch)
             .try_init();
     }
     eternal_host::diagnostics::install_ffmpeg_logging();
@@ -199,7 +209,7 @@ const CATCH_UP_FRAMES: i64 = 6;
 #[test]
 fn usb_framed_stream_end_to_end() {
     use eternal_host::stats::PIPELINE_STATS;
-    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_host::transport::link::{read_datagram, write_datagram};
     use eternal_wire::v2::control::HOSTCAP_USB;
     use std::sync::atomic::Ordering;
 
@@ -241,10 +251,9 @@ fn usb_framed_stream_end_to_end() {
         runtime.block_on(async {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await.unwrap().unwrap();
+        let mut stream = accept_host_tunnel(&listener, Duration::from_secs(30)).await;
         stream.set_nodelay(true).unwrap();
         socket2::SockRef::from(&stream).set_recv_buffer_size(32 * 1024).unwrap();
-        read_preamble(&mut stream).await.unwrap();
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2, proto_max: 2, client_nonce: 1, listen_port: 0,
             decoder_caps: CAP_DECODE_H264, feature_caps: 0,
@@ -412,8 +421,9 @@ fn usb_framed_stream_end_to_end() {
         // gives up 10 s after the handshake, and over USB it was dialed again
         // into the same restart. Here the start fails at once (no driver
         // with synthetic capture), and the reconnect after it mirrors too.
-        // The epoch and generation checks prove there was no restart first;
-        // the 30 s deadlines are only backstops.
+        // The epoch and generation checks prove there was no restart first,
+        // and each mirror must decode within the iPad's 10 s. The 30 s
+        // deadlines after it are only backstops.
         use eternal_host::capture::second_screen;
         use eternal_host::control::{CaptureTarget, VddStatus};
         use eternal_host::supervisor::CURRENT_GENERATION;
@@ -427,7 +437,7 @@ fn usb_framed_stream_end_to_end() {
             let sent = Instant::now();
             write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
             let (frame_epoch, decoded) =
-                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(30)).await;
+                first_decoded_frame(&mut stream, &mut session, &mut msg_seq, None, sent + Duration::from_secs(10)).await;
             assert_eq!(frame_epoch, epoch, "the mirror comes from the running pipeline");
             assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation,
                 "attempt {attempt}: connecting must not restart the pipeline");
@@ -571,7 +581,7 @@ struct SlowUsbRun {
 /// it drops a partial frame, at most once per 500 ms.
 fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
     use eternal_host::stats::PIPELINE_STATS;
-    use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram};
+    use eternal_host::transport::link::{read_datagram, write_datagram};
 
     init_test_tracing();
     ffmpeg_next::init().unwrap();
@@ -609,15 +619,11 @@ fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let mut stream = accept_host_tunnel(&listener, Duration::from_secs(10)).await;
             stream.set_nodelay(true).unwrap();
             socket2::SockRef::from(&stream)
                 .set_recv_buffer_size(32 * 1024)
                 .unwrap();
-            read_preamble(&mut stream).await.unwrap();
             let hello = ControlMessage::Hello2(Hello2 {
                 proto_min: 2,
                 proto_max: 2,
@@ -783,8 +789,94 @@ fn slow_usb_link_measurement() {
     assert!(run.tunnel_open, "the tunnel must stay open");
 }
 
+/// Accepts the host's USB tunnel on `listener` within `within`, past its
+/// EMLINK preamble, as `read_preamble` reads it. Other programs dial a
+/// test's loopback listener too: a development tool that probes each new
+/// listening port with an HTTP GET and a TLS hello did, on a shared machine.
+/// Those are logged with their peer and first bytes, and dropped. Any other
+/// connection fails the test, so a bad first try of the host's own is not
+/// hidden by a good retry.
+async fn accept_host_tunnel(
+    listener: &tokio::net::TcpListener,
+    within: Duration,
+) -> tokio::net::TcpStream {
+    use eternal_host::transport::link::PREAMBLE;
+    use tokio::io::AsyncReadExt;
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let (mut stream, peer) = tokio::time::timeout_at(deadline, listener.accept())
+            .await
+            .expect("the host dials the tunnel")
+            .unwrap();
+        let mut first = Vec::with_capacity(PREAMBLE.len());
+        let read = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut chunk = [0u8; 8];
+            while first.len() < PREAMBLE.len() {
+                let n = stream
+                    .read(&mut chunk[..PREAMBLE.len() - first.len()])
+                    .await?;
+                if n == 0 {
+                    break;
+                }
+                first.extend_from_slice(&chunk[..n]);
+            }
+            std::io::Result::Ok(())
+        })
+        .await;
+        match classify_dial(&first) {
+            Dial::Host => return stream,
+            Dial::Probe => {
+                eprintln!("FOREIGN_USB_DIAL peer={peer} first_bytes={first:02x?} read={read:?}")
+            }
+            Dial::Unknown => panic!(
+                "a tunnel connection from {peer} began {first:02x?}, not the EMLINK preamble \
+                 or a known probe (read {read:?})"
+            ),
+        }
+    }
+}
+
+/// Who dialed a test's tunnel listener, by the first bytes it sent.
+#[derive(Debug, PartialEq)]
+enum Dial {
+    /// The host, with its EMLINK preamble.
+    Host,
+    /// The port probe: an HTTP GET, or a TLS record (a client hello).
+    Probe,
+    /// Anything else, such as a short or wrong preamble from the host.
+    Unknown,
+}
+
+fn classify_dial(first: &[u8]) -> Dial {
+    use eternal_host::transport::link::PREAMBLE;
+    if first == PREAMBLE {
+        Dial::Host
+    } else if first.starts_with(b"GET ") || first.starts_with(&[0x16, 0x03]) {
+        Dial::Probe
+    } else {
+        Dial::Unknown
+    }
+}
+
+#[test]
+fn only_the_preamble_and_known_probes_are_told_apart() {
+    assert_eq!(classify_dial(b"EMLINK\x01\x00"), Dial::Host);
+    assert_eq!(classify_dial(b"GET / HT"), Dial::Probe);
+    assert_eq!(
+        classify_dial(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01]),
+        Dial::Probe
+    );
+    assert_eq!(classify_dial(b"EMLINK\x02\x00"), Dial::Unknown);
+    assert_eq!(classify_dial(b"EMLI"), Dial::Unknown);
+    assert_eq!(classify_dial(b""), Dial::Unknown);
+    assert_eq!(classify_dial(&[0xde, 0xad, 0xbe, 0xef]), Dial::Unknown);
+}
+
+/// A port for the host's stream, which binds every address: a port that is
+/// free on loopback only may be taken on another, by a connected UDP socket
+/// such as a QUIC or NTP client's, and the host then waits for it.
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
+    UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
         .expect("ephemeral port")
