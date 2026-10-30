@@ -283,7 +283,7 @@ impl AnalyzerApp {
                     }
                 }
             });
-        widgets::automation_id_as(&combo.response, "Language", label(chosen).text());
+        widgets::name_combo(ui, &combo.response, label(chosen).text());
         if let Some(choice) = choice {
             self.set_language(&ui.ctx().clone(), choice);
         }

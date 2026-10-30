@@ -88,7 +88,8 @@ if ($View -eq 'QR' -and !($english -contains 'Scan to connect')) { throw 'QR mod
 $autostart = $null
 if ($TestAutostart) {
     if ($View -ne 'Settings') { throw 'Autostart must be tested from Settings' }
-    $checkbox = Find-HostElement 'Start on Windows startup' $null
+    # The switch's AutomationId is its row's English title; the row's label shares it.
+    $checkbox = Find-HostElement 'Start with Windows' ([System.Windows.Automation.ControlType]::CheckBox)
     $toggle = $null
     if (!$checkbox -or !$checkbox.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$toggle)) {
         throw 'Startup checkbox has no UI Automation toggle'

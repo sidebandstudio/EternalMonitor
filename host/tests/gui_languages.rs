@@ -128,7 +128,11 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
             settings.get(id(label));
         }
         settings.get(id("Language").role(Role::Label));
-        settings.get(id("Language").role(Role::ComboBox));
+        let lang = eternal_host::i18n::Lang::from_code(code).unwrap();
+        assert_combo(&settings, code, "Language", lang.native_name());
+        let mirror = eternal_host::i18n::tr("Mirror my screen");
+        let mirror = eternal_host::i18n::logical(mirror).unwrap_or(mirror);
+        assert_combo(&settings, code, "How the iPad shows your PC", mirror);
         snapshot(&mut settings, &shared, &format!("lang-{code}-settings"));
         results.extend_harness(&mut settings);
 
@@ -165,6 +169,25 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
         );
         results.extend_harness(&mut setup);
     }
+}
+
+/// A menu in a Settings row: named by the row's title as a screen reader
+/// reads it, English in English, with the title's English as its id, and
+/// the choice it shows, as written, as its value.
+fn assert_combo(h: &Harness<'_, AnalyzerApp>, code: &str, title: &'static str, choice: &str) {
+    let node = h.get(id(title).role(Role::ComboBox)).accesskit_node();
+    let shown = eternal_host::i18n::tr(title);
+    let written = eternal_host::i18n::logical(shown).unwrap_or(shown);
+    assert_eq!(
+        node.label().as_deref(),
+        Some(written),
+        "{code}: the {title:?} menu is named by its row's title"
+    );
+    assert_eq!(
+        node.value().as_deref(),
+        Some(choice),
+        "{code}: the {title:?} menu's value is its choice"
+    );
 }
 
 /// A settings folder with anything from an earlier run is an upgrade, which
@@ -466,15 +489,26 @@ fn every_translation_keeps_an_english_id(shared: &SharedControl) {
                     "{code} {place}: {name:?} has no English id ({id:?})"
                 );
             }
+            // A switch is named by its row's title, as the title reads, so
+            // it speaks the row's language.
+            let labels: Vec<String> = h
+                .query_all(By::new().role(Role::Label))
+                .filter_map(|node| name_of(&node.accesskit_node()))
+                .collect();
+            for node in h.query_all(By::new().role(Role::CheckBox)) {
+                let node = node.accesskit_node();
+                let name = name_of(&node).unwrap_or_default();
+                assert!(
+                    labels.contains(&name),
+                    "{code} {place}: switch {name:?} is not named by its row's title"
+                );
+            }
             // Whatever has a translated key as its id is named by the
-            // translation; a combo box by the choice it shows.
+            // translation; a combo box by its row's title.
             for (key, _, written) in &translations {
                 let has_id = By::new().predicate(|node| node.author_id() == Some(key));
                 for node in h.query_all(has_id) {
                     let node = node.accesskit_node();
-                    if node.role() == Role::ComboBox {
-                        continue;
-                    }
                     assert_eq!(
                         name_of(&node).as_deref(),
                         Some(written.as_str()),

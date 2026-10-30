@@ -361,7 +361,10 @@ fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: f32) {
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
-/// On/off switch. `label` is the accessible name (the row shows the title).
+/// On/off switch. `label` is its accessible name in English. In a row
+/// whose title is translated it is named by that title as a screen reader
+/// reads it, and has the title's English as its AutomationId, so a switch
+/// reads in the same language as its row.
 pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::click());
     if response.clicked() {
@@ -371,6 +374,14 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let value = *on;
     let enabled = ui.is_enabled();
     response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, value, label));
+    if let Some(names) = row_title(ui) {
+        let name = if i18n::active() == i18n::Lang::En {
+            label
+        } else {
+            &names.name
+        };
+        set_automation(&response, &names.id, name);
+    }
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_with_time(response.id, value, 0.12);
         let hovered = response.hovered();
@@ -673,13 +684,28 @@ fn row_with_leading(
             );
         }
         ui.add_space(gap);
+        // The control's [`toggle`] is named by the title.
+        ui.data_mut(|d| d.insert_temp(row_title_id(), title.to_string()));
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), height),
             Layout::right_to_left(Align::Center),
             control,
         );
+        ui.data_mut(|d| d.remove::<String>(row_title_id()));
     });
     ui.add_space(14.0);
+}
+
+/// Where a row keeps its title while its control draws.
+fn row_title_id() -> egui::Id {
+    egui::Id::new("setting row title")
+}
+
+/// How UI Automation reads the title of the row whose control is drawing,
+/// when the title is translated.
+fn row_title(ui: &Ui) -> Option<i18n::Automation> {
+    let title = ui.data(|d| d.get_temp::<String>(row_title_id()))?;
+    i18n::automation(&title)
 }
 
 /// Label on the left, value on the right, one line.
@@ -1062,8 +1088,23 @@ pub fn combo_rich(
         })
 }
 
-/// [`automation_id`] with a given id: a combo box's English title, which
-/// stays put whatever it shows, or a language's own name.
+/// Names a [`combo`] in a row by the row's title as a screen reader reads
+/// it, in English too, with the title's English as its AutomationId, and
+/// gives it the choice it shows, in reading order, as its value. Call it
+/// after `show_ui`, which describes the combo box.
+pub fn name_combo(ui: &Ui, response: &Response, shown: &str) {
+    let value = i18n::automation(shown).map_or_else(|| shown.to_string(), |names| names.name);
+    let title = row_title(ui);
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_value(value);
+        if let Some(title) = title {
+            node.set_author_id(title.id);
+            node.set_label(title.name);
+        }
+    });
+}
+
+/// [`automation_id`] with a given id: a language's own name.
 pub fn automation_id_as(response: &Response, id: &str, shown: &str) {
     let name = i18n::automation(shown).map_or_else(|| shown.to_string(), |names| names.name);
     set_automation(response, id, &name);

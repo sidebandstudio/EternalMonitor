@@ -774,11 +774,7 @@ impl AnalyzerApp {
                 }
             },
         );
-        widgets::automation_id_as(
-            &combo.response,
-            "How the iPad shows your PC",
-            &selected_text,
-        );
+        widgets::name_combo(ui, &combo.response, &selected_text);
         if choice != current {
             self.set_capture_display(choice);
         }
