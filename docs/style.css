@@ -443,7 +443,7 @@ small { font-size: 0.875rem; }
 /* Phones: each choice on one compact row, its name beside it. */
 @media (max-width: 720px) {
   .stage { margin-inline: calc(50% - 50vw + 10px); }
-  .rig-controls { flex-direction: column; align-items: stretch; gap: 8px; width: min(100%, 360px); margin-inline: auto; margin-top: 18px; }
+  .rig-controls { flex-direction: column; align-items: stretch; gap: 8px; width: min(100% - 20px, 360px); margin-inline: auto; margin-top: 18px; }
   .rig-controls fieldset { justify-content: space-between; gap: 10px; }
   .rig-controls legend { font-size: 0.9375rem; }
   .rig-controls .sw { padding: 2px; gap: 2px; }
