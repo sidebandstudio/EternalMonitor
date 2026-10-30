@@ -7,9 +7,10 @@
 //! picker never loads a system font.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{FontData, FontFamily};
+use parking_lot::Mutex;
 
 use crate::i18n::Lang;
 
@@ -72,14 +73,29 @@ pub fn fonts_dir() -> PathBuf {
 pub fn load(lang: Lang) -> Option<FontData> {
     let dir = fonts_dir();
     candidates(lang).iter().find_map(|(file, family)| {
-        let bytes = std::fs::read(dir.join(file)).ok()?;
-        let index = face_index(&bytes, family)?;
+        let bytes = read_once(&dir.join(file))?;
+        let index = face_index(bytes, family)?;
         Some(FontData {
-            font: Cow::Owned(bytes),
+            font: Cow::Borrowed(bytes),
             index,
             tweak: Default::default(),
         })
     })
+}
+
+/// A font file's bytes, read once and kept for the process. egui copies an
+/// owned font each time it builds its fonts, which doubled a 20 MB Chinese
+/// font; borrowed bytes are shared. Switching back to a language reuses its
+/// file.
+fn read_once(path: &Path) -> Option<&'static [u8]> {
+    static FILES: Mutex<Vec<(PathBuf, &'static [u8])>> = Mutex::new(Vec::new());
+    let mut files = FILES.lock();
+    if let Some((_, bytes)) = files.iter().find(|(p, _)| p == path) {
+        return Some(bytes);
+    }
+    let bytes: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+    files.push((path.to_path_buf(), bytes));
+    Some(bytes)
 }
 
 /// Which face in a font file (or collection) is `family`, by its family or
