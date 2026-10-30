@@ -309,9 +309,9 @@ pub async fn start_sender(
                                             eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
                                             _ => None,
                                         };
-                                        let mut actions = shared.session.lock().handle_control(
+                                        let mut actions = shared.session.lock().handle_datagram(
                                             src,
-                                            header.session_id,
+                                            &header,
                                             message,
                                             &config,
                                             Instant::now(),
@@ -689,7 +689,7 @@ async fn repair_while_pacing(
                 let Ok((len, peer)) = received else { break; };
                 if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
                     let count = nack.frag_count;
-                    let actions = shared.session.lock().handle_control(PeerId::udp(peer), header.session_id,
+                    let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
                         ControlMessage::Nack(nack), config, Instant::now());
                     if let Some((epoch, seq, missing)) = actions.retransmit {
                         send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
