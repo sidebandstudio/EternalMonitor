@@ -21,7 +21,7 @@ impl AnalyzerApp {
         snap: &StatsSnapshot,
         client: &ClientSnapshot,
     ) {
-        self.notices(ui, snap);
+        self.notices(ui, snap, client);
         self.ipad_update_notice(ui, client);
         self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
@@ -53,12 +53,13 @@ impl AnalyzerApp {
     }
 
     /// Update, restart and fault notices, most urgent first.
-    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
             snap.apple_devices_installed,
+            client.on_usb(),
         ) {
             widgets::banner(ui, WARNING, Icon::Plug, title, body, 170.0, |ui| {
                 apple_devices_action(ui, snap.apple_devices_installed);
@@ -1219,13 +1220,15 @@ fn apple_devices_action(ui: &mut Ui, installed: bool) {
 }
 
 /// The Stream page notice for an iPad on the cable that Windows cannot reach
-/// because Apple Devices is not running or not installed.
+/// because Apple Devices is not running or not installed. A session streaming
+/// over USB proves the cable works, so it silences the notice.
 pub(super) fn usb_cable_notice(
     reachable: bool,
     cabled: usize,
     installed: bool,
+    streaming_over_usb: bool,
 ) -> Option<(&'static str, &'static str)> {
-    if reachable || cabled == 0 {
+    if reachable || cabled == 0 || streaming_over_usb {
         return None;
     }
     Some(if installed {
