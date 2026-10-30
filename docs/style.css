@@ -457,7 +457,9 @@ small { font-size: 0.875rem; }
 
 /* --- Watch it work: short films of each feature ---------------------------------
    Six columns, three rows of two or three cards. Each film is a muted loop at
-   twice the card's size; script.js plays it only while it is on screen. */
+   twice the card's size; script.js plays it only while it is on screen. The
+   poster is a <picture> under the video, so on a phone only the phone
+   version's poster and film are fetched (index.html picks them by media). */
 
 .bento {
   display: grid;
@@ -476,14 +478,16 @@ small { font-size: 0.875rem; }
 .demo-w2 { grid-column: span 2; aspect-ratio: 728 / 1040; }
 .demo-w3 { grid-column: span 3; aspect-ratio: 1104 / 1040; }
 .demo-w4 { grid-column: span 4; aspect-ratio: 1480 / 1040; }
-.demo-film {
+.demo-media { position: absolute; inset: 0; transition: transform 0.6s var(--ease-out); }
+.demo-poster img, .demo-film {
   position: absolute;
   inset: 0;
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  background: var(--surface);
 }
+.demo-film { background: transparent; }
 /* A neutral scrim keeps the label readable over the film. */
 .demo-foot {
   position: absolute;
@@ -512,8 +516,7 @@ small { font-size: 0.875rem; }
 .demo:hover .demo-more span { transform: translateX(3px); }
 .demo-more:focus-visible { outline: none; }
 .demo:has(.demo-more:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
-.demo-film { transition: transform 0.6s var(--ease-out); }
-.demo:hover .demo-film { transform: scale(1.015); }
+.demo:hover .demo-media { transform: scale(1.015); }
 /* Pause and play, one per film (script.js adds it). It sits above the card's
    link target and shows the action it will take. */
 .demo-toggle {
@@ -547,10 +550,15 @@ small { font-size: 0.875rem; }
   .demo-w2, .demo-w3 { grid-column: span 1; }
   .demo-w4 { grid-column: span 2; }
 }
+/* Phones: every film is the same tall shape (the -m versions), and the label
+   sits in its own row under it, so it never covers the film. */
 @media (max-width: 600px) {
   .bento { grid-template-columns: 1fr; gap: 12px; }
-  .demo-w2, .demo-w3, .demo-w4 { grid-column: auto; }
-  .demo-foot { padding: 48px 18px 16px; }
+  .demo { display: flex; flex-direction: column; }
+  .demo-w2, .demo-w3, .demo-w4 { grid-column: auto; aspect-ratio: auto; }
+  .demo-media { position: relative; inset: auto; aspect-ratio: 728 / 1040; overflow: hidden; }
+  .demo-foot { position: static; min-height: 82px; align-items: center; padding: 14px 18px 16px; background: none; }
+  .demo-toggle { top: 12px; right: 12px; width: 44px; height: 44px; }
 }
 
 /* --- Device frames ---------------------------------------------------------- */

@@ -37,14 +37,18 @@
 
   <script>
     const tl = gsap.timeline({ paused: true });
-    const AT = { x: 552, y: 445 };
+    // The root's width picks the framing, so the phone version (render.sh
+    // makes it from this file at 728 wide) sits closer on the panel.
+    const root = document.getElementById('root');
+    const PHONE = +root.dataset.width < 900;
+    const AT = { x: +root.dataset.width / 2, y: 445 };
     // Settings with the sidebar's Send feedback; the whole feedback panel;
     // close on the message as it is typed; the send button and the note the
     // app shows once the email app has the message.
-    const PAGE = pose(440, 345, 1.15, AT);
-    const PANEL = pose(520, 359, 1.48, AT);
-    const NOTE = pose(520, 330, 1.75, AT);
-    const SENT = pose(520, 470, 1.62, AT);
+    const PAGE = pose(PHONE ? 470 : 440, 345, PHONE ? 1.0 : 1.15, AT);
+    const PANEL = pose(520, 359, PHONE ? 1.38 : 1.48, AT);
+    const NOTE = pose(520, 330, PHONE ? 1.5 : 1.75, AT);
+    const SENT = pose(520, 470, PHONE ? 1.42 : 1.62, AT);
 
     tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -14, duration: 4, ease: 'sine.inOut' }, 0);
     tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
@@ -62,7 +66,7 @@
     tl.to('#fade', { opacity: 1, duration: 0.42, ease: 'power1.in' }, 7.58);
     tl.fromTo('#fade', { opacity: 1 }, { opacity: 0, duration: 0.4, ease: 'power1.out', immediateRender: true }, 0);
 
-    window.__timelines['feedback'] = tl;
+    window.__timelines[root.dataset.compositionId] = tl;
   </script>
 </body>
 </html>
