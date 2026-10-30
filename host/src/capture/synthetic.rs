@@ -59,6 +59,10 @@ pub fn run_capture_loop(
     let Some(mut proving) = super::second_screen::fake::capture_second_screen(&shared, generation) else {
         return Ok(());
     };
+    #[cfg(debug_assertions)]
+    if !proving {
+        super::second_screen::fake::mirror(&shared)?;
+    }
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
     let frame_bytes = row_bytes * height as usize;

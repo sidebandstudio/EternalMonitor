@@ -95,6 +95,13 @@ impl GpuFacts {
         self.adapter(*id)
     }
 
+    /// Whether `screen` is wired to a hardware adapter other than `card`,
+    /// compared by LUID: two cards of one model share a name. False when
+    /// these facts can't say which card the screen is on.
+    pub fn wired_elsewhere(&self, screen: &str, card: AdapterId) -> bool {
+        self.wired_to(screen).is_some_and(|wired| wired.id != card)
+    }
+
     /// The card each preference selects, for the Troubleshooting choice.
     pub fn card_for(&self, preference: Preference) -> Option<&Adapter> {
         match preference {
@@ -236,6 +243,66 @@ impl GpuCheck {
         let diagnosis = diagnose(&key.1, screen);
         self.checked = Some(key);
         Some(diagnosis)
+    }
+}
+
+/// The screen EternalMonitor mirrors moved from one card to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub from: Adapter,
+    pub to: Adapter,
+}
+
+/// Which card the screen EternalMonitor mirrors is on, by LUID, as its
+/// captures show it: the card the app captures on while Windows duplicates
+/// the screen, the card it is wired to after a refusal. A laptop that moves
+/// its screen between its cards while the app runs (a display mux, or
+/// Windows on its own) changes it.
+#[derive(Debug, Default)]
+pub struct ScreenWatch {
+    check: GpuCheck,
+    card: Option<Adapter>,
+}
+
+impl ScreenWatch {
+    pub const fn new() -> Self {
+        Self {
+            check: GpuCheck::new(),
+            card: None,
+        }
+    }
+
+    /// Windows duplicates the screen from `app`, the card the app captures
+    /// on (`None` when DXGI didn't describe it), so the screen is on that
+    /// card. Returns the move when it was on another one. An earlier
+    /// refusal's diagnosis no longer holds: the next refusal is checked
+    /// afresh, even with the same facts.
+    pub fn works(&mut self, app: Option<&Adapter>) -> Option<Moved> {
+        self.check = GpuCheck::new();
+        self.moved_to(app?.clone())
+    }
+
+    /// [`GpuCheck::check`] after a refused duplication, and the move when
+    /// the card the screen is wired to is new.
+    pub fn refused(
+        &mut self,
+        screen: &str,
+        facts: Option<GpuFacts>,
+    ) -> (Option<Option<Diagnosis>>, Option<Moved>) {
+        let wired = facts
+            .as_ref()
+            .and_then(|facts| facts.wired_to(screen).cloned());
+        let checked = self.check.check(screen, facts);
+        let moved = match (&checked, wired) {
+            (Some(Some(_)), Some(wired)) => self.moved_to(wired),
+            _ => None,
+        };
+        (checked, moved)
+    }
+
+    fn moved_to(&mut self, card: Adapter) -> Option<Moved> {
+        let from = self.card.replace(card.clone())?;
+        (from.id != card.id).then_some(Moved { from, to: card })
     }
 }
 
@@ -1438,6 +1505,119 @@ mod tests {
             Some(None)
         );
         assert_eq!(check.check(r"\\.\DISPLAY9", Some(virtual_screen)), None);
+    }
+
+    /// The 0.3.4 beta field case: the screen of a laptop with an AMD iGPU
+    /// and an NVIDIA card, the app on NVIDIA, moved to the iGPU and back.
+    /// Each move is reported once, with both cards, and after the way back
+    /// the same refusal names the iGPU again.
+    #[test]
+    fn a_screen_moving_between_cards_is_reported_once_each_way() {
+        let nvidia = adapter(DGPU, "NVIDIA GeForce RTX 5060 Laptop GPU");
+        let amd = adapter(IGPU, "AMD Radeon 780M Graphics");
+        let mut watch = ScreenWatch::new();
+        // On the app's card: Windows duplicates it at every capture start.
+        for _ in 0..3 {
+            assert_eq!(watch.works(Some(&nvidia)), None);
+        }
+        // Windows moved it to the iGPU.
+        let (checked, moved) = watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia()));
+        assert_eq!(checked.unwrap().unwrap().screen_gpu, amd.name);
+        let to_amd = Moved {
+            from: nvidia.clone(),
+            to: amd.clone(),
+        };
+        assert_eq!(moved, Some(to_amd));
+        // The retries every few seconds say nothing new.
+        assert_eq!(
+            watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia())),
+            (None, None)
+        );
+        // Back on the app's card.
+        let to_nvidia = Moved {
+            from: amd.clone(),
+            to: nvidia.clone(),
+        };
+        assert_eq!(watch.works(Some(&nvidia)), Some(to_nvidia));
+        assert_eq!(watch.works(Some(&nvidia)), None);
+        // And over again, with the same facts: diagnosed again, so the
+        // notice can name the iGPU.
+        let (checked, moved) = watch.refused(r"\\.\DISPLAY1", Some(laptop_on_nvidia()));
+        assert_eq!(checked.unwrap().unwrap().screen_gpu, amd.name);
+        assert_eq!(moved.unwrap().to, amd);
+    }
+
+    /// Review round 1: a PC with two cards of one model. A move between
+    /// them changes no name, so the cards are told apart by LUID.
+    #[test]
+    fn a_move_between_two_cards_of_one_model_is_reported() {
+        const MODEL: &str = "AMD Radeon RX 7600";
+        let (app, other) = (adapter(DGPU, MODEL), adapter(IGPU, MODEL));
+        let facts = GpuFacts {
+            adapters: vec![app.clone(), other.clone()],
+            power_saving: None,
+            high_performance: None,
+            screens: vec![(r"\\.\DISPLAY1".into(), IGPU)],
+        };
+        let mut watch = ScreenWatch::new();
+        assert_eq!(watch.works(Some(&app)), None);
+        let (_, moved) = watch.refused(r"\\.\DISPLAY1", Some(facts));
+        assert_eq!(
+            moved,
+            Some(Moved {
+                from: app.clone(),
+                to: other.clone(),
+            })
+        );
+        assert_eq!(
+            watch.works(Some(&app)),
+            Some(Moved {
+                from: other,
+                to: app,
+            })
+        );
+    }
+
+    /// A PC whose screen stays on the app's card, as on every PC where Mirror
+    /// works: nothing is ever reported, and a refusal Windows can't explain
+    /// (no facts, or the virtual screen) moves nothing.
+    #[test]
+    fn a_screen_on_the_apps_card_is_never_reported_as_moved() {
+        let card = adapter(DGPU, "NVIDIA GeForce RTX 5080");
+        let mut watch = ScreenWatch::new();
+        assert_eq!(watch.works(Some(&card)), None);
+        assert_eq!(watch.works(Some(&card)), None);
+        assert_eq!(watch.works(None), None, "DXGI didn't describe the card");
+        assert_eq!(watch.refused(r"\\.\DISPLAY1", None), (None, None));
+        let mut virtual_screen = laptop_on_nvidia();
+        virtual_screen.screens = vec![(r"\\.\DISPLAY9".into(), IDD)];
+        assert_eq!(
+            watch.refused(r"\\.\DISPLAY9", Some(virtual_screen)),
+            (Some(None), None)
+        );
+        assert_eq!(watch.works(Some(&card)), None);
+    }
+
+    /// The evidence that blocks the mirror: the display configuration wires
+    /// the screen to another card than the one capture runs on, by LUID.
+    #[test]
+    fn a_screen_is_elsewhere_only_on_another_cards_luid() {
+        let facts = laptop_on_nvidia();
+        assert!(facts.wired_elsewhere(r"\\.\DISPLAY1", DGPU));
+        assert!(
+            !facts.wired_elsewhere(r"\\.\DISPLAY1", IGPU),
+            "the same card"
+        );
+        assert!(
+            !facts.wired_elsewhere(r"\\.\DISPLAY9", DGPU),
+            "an unknown screen"
+        );
+        let mut virtual_screen = facts;
+        virtual_screen.screens = vec![(r"\\.\DISPLAY1".into(), IDD)];
+        assert!(
+            !virtual_screen.wired_elsewhere(r"\\.\DISPLAY1", DGPU),
+            "no hardware card"
+        );
     }
 
     #[test]

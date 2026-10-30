@@ -35,8 +35,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -210,9 +210,17 @@ pub fn run_capture_loop(
     };
 
     info!(adapter = %adapter_name, "Capture using adapter");
+    // The mirror's card, by LUID, for the graphics card checks.
+    let mirror_card = unsafe { adapter.GetDesc1() }
+        .ok()
+        .filter(|_| !second_screen)
+        .map(|desc| crate::gpu_preference::Adapter {
+            id: adapter_id(desc),
+            name: adapter_name.clone(),
+        });
     {
         let mut stats = PIPELINE_STATS.lock();
-        stats.set_gpu_name(adapter_name);
+        stats.set_gpu_name(adapter_name.clone());
         stats.set_capture_display(capture_label);
     }
 
@@ -235,13 +243,16 @@ pub fn run_capture_loop(
         duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
             .inspect_err(|error| {
                 if error.code() == DXGI_ERROR_UNSUPPORTED {
-                    check_gpu(&output1, &shared);
+                    check_gpu(&output1, &shared, mirror_card.as_ref().map(|card| card.id));
                 }
             })
             .map_err(blocked_or_error)?
     });
     info!("Desktop duplication active");
     note_gpu_outcome(&shared, Outcome::Worked);
+    if !second_screen {
+        super::note_mirror_works(&shared, mirror_card.as_ref());
+    }
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
@@ -827,39 +838,25 @@ fn resend_last_frame(
     *last_send = now;
 }
 
-/// Windows won't duplicate `output` from the card this process runs on (a
-/// hybrid PC running EternalMonitor on its other card). Works out which card
-/// the screen is wired to, for the Stream page notice: again on every
-/// refusal until Windows could say, and again after the cards or the
-/// screens' wiring change, but logged only when the answer is new.
-fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl) {
-    static CHECK: parking_lot::Mutex<crate::gpu_preference::GpuCheck> =
-        parking_lot::Mutex::new(crate::gpu_preference::GpuCheck::new());
+/// Windows won't duplicate `output` from the card this process runs on: see
+/// [`super::note_gpu_refused`]. `mirror_card`: `output` is the mirror's
+/// screen, captured from the card with this LUID.
+fn check_gpu(
+    output: &IDXGIOutput1,
+    shared: &SharedControl,
+    mirror_card: Option<crate::gpu_preference::AdapterId>,
+) {
     note_gpu_outcome(shared, Outcome::StillUnsupported);
     let Ok(desc) = (unsafe { output.GetDesc() }) else {
         return;
     };
     let screen = utf16_to_string(&desc.DeviceName);
-    let facts = crate::gpu_preference::facts();
-    let Some(diagnosis) = CHECK.lock().check(&screen, facts.clone()) else {
-        return;
-    };
-    let facts = facts.unwrap_or_default();
-    let card = |preference| {
-        facts
-            .card_for(preference)
-            .map_or("unknown", |a| a.name.as_str())
-    };
-    info!(
-        screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
-        app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str()),
-        switch = ?diagnosis.as_ref().and_then(|d| d.preference),
-        cards = facts.adapters.len(),
-        power_saving_gpu = card(crate::gpu_preference::Preference::PowerSaving),
-        high_performance_gpu = card(crate::gpu_preference::Preference::HighPerformance),
-        "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
-    );
-    *shared.gpu_diagnosis.lock() = diagnosis;
+    super::note_gpu_refused(shared, &screen, crate::gpu_preference::facts(), mirror_card);
+}
+
+/// An adapter's LUID, as the graphics card checks compare it.
+fn adapter_id(desc: DXGI_ADAPTER_DESC1) -> crate::gpu_preference::AdapterId {
+    (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which
