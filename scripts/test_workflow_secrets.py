@@ -33,6 +33,14 @@ def condition(text, indent):
     return match[1].strip() if match else ""
 
 
+def permissions(job):
+    """A job's permissions: block as {scope: access}."""
+    block = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", job)
+    lines = block[1].splitlines() if block else []
+    return dict(re.match(r" *([a-z-]+): *(\S+)", line).groups() for line in lines
+                if not line.strip().startswith("#"))
+
+
 def runs_on_pull_requests(text):
     head = text.partition("\njobs:\n")[0]
     return bool(re.search(r"(?m)^  pull_request(_target)?:|^on:.*\bpull_request\b", head))
@@ -120,6 +128,13 @@ class WorkflowSecretsTest(unittest.TestCase):
         installer = (WORKFLOWS / "beta-installer.yml").read_text()
         self.assertIn("workflow_call:", installer)
         self.assertNotIn("pull_request:", installer)
+        # The installer's build job asks for an OIDC token for signing. A called
+        # workflow gets at most its caller's permissions, so the trusted caller
+        # grants id-token and the pull request caller grants only contents: read.
+        self.assertEqual(permissions(jobs(installer)["build"]), {"contents": "read", "id-token": "write"})
+        self.assertEqual(permissions(callers["build"]), {"contents": "read", "id-token": "write"})
+        self.assertEqual(permissions(callers["check"]), {"contents": "read"})
+        self.assertNotIn("secrets:", callers["check"])
         # It signs only outside pull requests, whatever the variables say.
         for step in steps(jobs(installer)["build"]):
             if "azure/login" in step or "INSTALLER_SIGN_COMMAND=" in step or "Get-AuthenticodeSignature $file" in step:
