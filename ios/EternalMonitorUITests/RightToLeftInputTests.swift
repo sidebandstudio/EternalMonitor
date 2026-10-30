@@ -16,10 +16,7 @@ final class RightToLeftInputTests: UITestCase {
         XCTAssertTrue(app.swipeUp(toReveal: picker))
         picker.tap()
         // The menu slides in from the mirrored side; tap once it has landed.
-        let english = app.buttons["English"]
-        expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: english)
-        waitForExpectations(timeout: 5)
-        english.tap()
+        XCTAssertTrue(app.chooseMenuItem("English"), app.debugDescription)
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5), app.debugDescription)
         app.buttons["settings.done"].tap()
         app.tapHUDControl("display.keyboard", until: done, reveal: .threeFingersTogether)

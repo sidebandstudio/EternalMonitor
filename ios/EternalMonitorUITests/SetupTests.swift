@@ -141,7 +141,7 @@ final class SetupTests: UITestCase {
         let picker = app.buttons["settings.language"]
         XCTAssertTrue(app.swipeUp(toReveal: picker))
         picker.tap()
-        app.buttons["日本語"].tap()
+        XCTAssertTrue(app.chooseMenuItem("日本語"), app.debugDescription)
         XCTAssertTrue(app.navigationBars["設定"].waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertEqual(app.buttons["settings.done"].label, "完了")
         capture("settings-ja", app)
@@ -154,7 +154,7 @@ final class SetupTests: UITestCase {
         XCTAssertTrue(picker.waitForExistence(timeout: 5) || app.swipeUp(toReveal: picker))
         XCTAssertTrue(app.swipeUp(toReveal: picker))
         picker.tap()
-        app.buttons["システムの言語"].tap()
+        XCTAssertTrue(app.chooseMenuItem("システムの言語"), app.debugDescription)
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5), app.debugDescription)
         let runSetup = app.buttons["settings.runSetup"]
         XCTAssertTrue(app.swipeUp(toReveal: runSetup))

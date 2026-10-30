@@ -27,6 +27,32 @@ extension XCUIApplication {
         return element.exists && Self.settled(element)
     }
 
+    /// Taps the button `label` in the menu just opened. Until the menu has
+    /// slid in (from the left in Arabic) its items exist with an infinite
+    /// frame, and reading `hittable` of one then fails the test at once
+    /// ("Activation point invalid"), so a predicate wait on it can't wait.
+    /// A snapshot reports the frame without that check: the item is tapped
+    /// at its centre once it lies inside the window and holds still for two
+    /// polls. Tapped once only: a second tap on a closing menu would land on
+    /// the row under it.
+    func chooseMenuItem(_ label: String, timeout: TimeInterval = 10) -> Bool {
+        let item = buttons[label]
+        let window = frame
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: CGRect?
+        while Date() < deadline {
+            let landed = Self.frame(of: item).flatMap { !$0.isEmpty && window.contains($0) ? $0 : nil }
+            if let landed, landed == last {
+                coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: landed.midX, dy: landed.midY)).tap()
+                return true
+            }
+            last = landed
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        return false
+    }
+
     /// Where `element` is, or `nil` while it is gone. A row can leave the
     /// list between two reads (in a review run the diagnostics row did, a
     /// second after the list stopped), and reading `frame` of an element
