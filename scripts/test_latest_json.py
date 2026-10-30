@@ -302,6 +302,8 @@ class LatestJsonTest(unittest.TestCase):
             ("--windows-config", {"schema": 1, "second_screen_rules": [broad]}),
             ("--windows-config", {"schema": 1, "second_screen_rules": [narrow] * 9}),
             ("--windows-config", {"schema": 1, "second_screen_rules": [{**narrow, "cpu": "arm64"}]}),
+            ("--windows-config", {"schema": 1, "renderer_rules": [{"vendor": "intel", "backend": "gl"}]}),
+            ("--windows-config", {"schema": 1, "renderer_rules": [{"vendor": "intel", "backend": "dx12"}] * 9}),
             ("--windows-config", {"schema": 1, "kill_switch": True}),
             ("--ipad-config", {"schema": 1, "first_frame_timeout_s": 8}),
             ("--ipad-config", {"schema": 1, "first_frame_timeout_s": 21}),

@@ -46,16 +46,6 @@ struct DiagnosticsView: View {
             .listRowBackground(Theme.surfaceRaised)
 
             Section {
-                Toggle("Automatically share diagnostics", isOn: $uploadEnabled)
-                    .accessibilityIdentifier("diagnostics.automaticUpload")
-                    .onChange(of: uploadEnabled) { _, enabled in DiagnosticsUpload.shared.setEnabled(enabled) }
-                Text(uploadStatus).font(.footnote)
-            } footer: {
-                Text("Device details, app errors and stream statistics are sent to EternalMonitor support while the app runs. Offline events retry automatically. Reports include the PC address you connect to. Screen content, audio and pairing credentials are excluded.")
-            }
-            .listRowBackground(Theme.surfaceRaised)
-
-            Section {
                 Text("Device and app versions, connection history, stream statistics and errors are saved automatically. Recent logs remain available after restarting the app.")
                 Button {
                     preparing = true
@@ -84,6 +74,19 @@ struct DiagnosticsView: View {
                 if let error { Text("Could not export diagnostics: \(error)") }
             } footer: {
                 Text("Reports include the PC address you connect to. Pairing codes and tokens are removed.")
+            }
+            .listRowBackground(Theme.surfaceRaised)
+
+            // Below the action rows: the status line grows from one line to
+            // several when it loads, and above them it moved Copy and Export
+            // down under a finger about to tap them.
+            Section {
+                Toggle("Automatically share diagnostics", isOn: $uploadEnabled)
+                    .accessibilityIdentifier("diagnostics.automaticUpload")
+                    .onChange(of: uploadEnabled) { _, enabled in DiagnosticsUpload.shared.setEnabled(enabled) }
+                Text(uploadStatus).font(.footnote)
+            } footer: {
+                Text("Device details, app errors and stream statistics are sent to EternalMonitor support while the app runs. Offline events retry automatically. Reports include the PC address you connect to. Screen content, audio and pairing credentials are excluded.")
             }
             .listRowBackground(Theme.surfaceRaised)
         }

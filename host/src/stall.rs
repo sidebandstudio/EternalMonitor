@@ -37,9 +37,12 @@ pub enum Call {
     /// the limit (see `vdd::run_task`).
     VddEnable,
     VddDisable,
+    /// Reading the graphics cards and the screens' wiring for the second
+    /// screen's decisions (`capture::second_screen::facts`).
+    GpuFacts,
 }
 
-const CALLS: usize = 5;
+const CALLS: usize = 6;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,7 @@ impl Call {
             Self::EncoderOpen => "encoder_open",
             Self::VddEnable => "vdd_enable",
             Self::VddDisable => "vdd_disable",
+            Self::GpuFacts => "gpu_facts",
         }
     }
 
@@ -91,6 +95,10 @@ impl Call {
             // an earlier run and 15 s for its own; 30 s is four times the
             // slowest and was the limit before.
             Self::VddEnable | Self::VddDisable => Limits::ms(10_000, 30_000),
+            // Not timed in the field. It creates a DXGI factory and lists the
+            // adapters, as device creation begins, then asks DXCore and reads
+            // the display configuration; it keeps device creation's limits.
+            Self::GpuFacts => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -772,6 +780,7 @@ mod tests {
             Call::EncoderOpen,
             Call::VddEnable,
             Call::VddDisable,
+            Call::GpuFacts,
         ]
         .map(Call::name)
         .into();
@@ -788,6 +797,7 @@ mod tests {
             Call::DuplicateOutput,
             Call::EncoderOpen,
             Call::VddEnable,
+            Call::GpuFacts,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");

@@ -472,3 +472,200 @@ fn a_config_without_values_logs_its_defaults() {
         "remote_config=applied rollout=none ss_rule=n/a attach_s=default"
     );
 }
+
+fn renderer_rule(value: Value) -> Option<RendererRule> {
+    RendererRule::parse(&value)
+}
+
+const NVIDIA: u32 = 0x10de;
+const AMD: u32 = 0x1002;
+const INTEL: u32 = 0x8086;
+
+#[test]
+fn renderer_rules_parse_and_match_by_vendor_and_driver() {
+    let rule = renderer_rule(json!({
+        "vendor": "intel",
+        "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+        "backend": "dx12"
+    }))
+    .unwrap();
+    assert_eq!(rule.backend, RendererBackend::Dx12);
+    assert_eq!(rule.vendor(), "intel");
+    assert!(rule.matches(INTEL, "31.0.101.2111"));
+    assert!(rule.matches(INTEL, "31.0.101.0"));
+    assert!(rule.matches(INTEL, "31.0.101.65535"));
+    assert!(!rule.matches(INTEL, "31.0.102.0"));
+    assert!(!rule.matches(INTEL, "32.0.101.6078"));
+    assert!(!rule.matches(INTEL, "30.0.101.1994"));
+    assert!(!rule.matches(NVIDIA, "31.0.101.2111"));
+    // wgpu's driver text, when DXGI didn't list the GPU, is no version.
+    assert!(!rule.matches(INTEL, "Intel Corporation Intel driver"));
+    assert!(!rule.matches(INTEL, "31.0.101"));
+    assert!(!rule.matches(INTEL, ""));
+
+    // One end only, or no range: every driver of the vendor.
+    let from = renderer_rule(json!({
+        "vendor": "nvidia", "driver": { "min": "32.0.15.6000" }, "backend": "vulkan"
+    }))
+    .unwrap();
+    assert!(from.matches(NVIDIA, "32.0.15.6000"));
+    assert!(from.matches(NVIDIA, "33.0.15.1"));
+    assert!(!from.matches(NVIDIA, "32.0.15.5999"));
+    let until = renderer_rule(json!({
+        "vendor": "amd", "driver": { "max": "31.0.21001.45099" }, "backend": "vulkan"
+    }))
+    .unwrap();
+    assert_eq!(until.backend, RendererBackend::Vulkan);
+    assert!(until.matches(AMD, "31.0.21001.45099"));
+    assert!(until.matches(AMD, "25.0.0.0"));
+    assert!(!until.matches(AMD, "31.0.21001.45100"));
+    let any = renderer_rule(json!({ "vendor": "amd", "backend": "dx12" })).unwrap();
+    assert!(any.matches(AMD, "32.0.21025.1024"));
+    assert!(any.matches(AMD, "AMD proprietary driver"));
+    assert!(!any.matches(INTEL, "32.0.21025.1024"));
+    assert!(!any.matches(0x1414, "10.0.26100.1"));
+}
+
+#[test]
+fn a_renderer_rule_with_anything_unknown_is_ignored() {
+    let good = json!({
+        "vendor": "intel",
+        "driver": { "min": "31.0.101.0", "max": "31.0.101.65535" },
+        "backend": "dx12"
+    });
+    assert!(renderer_rule(good.clone()).is_some());
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut value = good.clone();
+        change(&mut value);
+        value
+    };
+    let bad = [
+        // Vendors second_screen_rules knows but the renderer doesn't, other
+        // spellings, ids.
+        with(&|v| v["vendor"] = json!("qualcomm")),
+        with(&|v| v["vendor"] = json!("Intel")),
+        with(&|v| v["vendor"] = json!("8086")),
+        with(&|v| v["vendor"] = json!(32902)),
+        with(&|v| v["vendor"] = json!(["intel"])),
+        with(&|v| {
+            v.as_object_mut().unwrap().remove("vendor");
+        }),
+        // WARP, the software renderer, would move a working PC off its card
+        // for good: a slow window still counts as working.
+        with(&|v| v["backend"] = json!("warp")),
+        // Backends wgpu has but the window doesn't use, or other spellings.
+        with(&|v| v["backend"] = json!("gl")),
+        with(&|v| v["backend"] = json!("metal")),
+        with(&|v| v["backend"] = json!("DX12")),
+        with(&|v| v["backend"] = json!("auto")),
+        with(&|v| v["backend"] = json!(null)),
+        with(&|v| {
+            v.as_object_mut().unwrap().remove("backend");
+        }),
+        // Ranges: empty, null, reversed, not four numbers, unknown keys.
+        with(&|v| v["driver"] = json!({})),
+        with(&|v| v["driver"] = json!(null)),
+        with(&|v| v["driver"] = json!("31.0.101.x")),
+        with(&|v| v["driver"]["min"] = json!(null)),
+        with(&|v| v["driver"]["max"] = json!("31.0.100.0")),
+        with(&|v| v["driver"]["min"] = json!("31.0.101")),
+        with(&|v| v["driver"]["max"] = json!("31.0.101.65535.1")),
+        with(&|v| v["driver"]["min"] = json!("31.0.101.x")),
+        with(&|v| v["driver"]["min"] = json!("")),
+        with(&|v| v["driver"]["min"] = json!(31)),
+        with(&|v| v["driver"]["max"] = json!("31.0.101.99999999999")),
+        // Digits other than ASCII 0-9 (Arabic-Indic, fullwidth).
+        with(&|v| v["driver"]["min"] = json!("٣١.٠.١٠١.٠")),
+        with(&|v| v["driver"]["max"] = json!("31.0.101.６５５３５")),
+        with(&|v| v["driver"]["exact"] = json!("31.0.101.2111")),
+        // A constraint this app doesn't know would be dropped, widening the
+        // rule: the whole rule goes instead.
+        with(&|v| v["windows"] = json!({ "min": "26100.0", "max": "26100.9" })),
+        with(&|v| v["device"] = json!("9bc4")),
+        json!(null),
+        json!("intel dx12"),
+        json!([]),
+    ];
+    for bad in bad {
+        assert_eq!(renderer_rule(bad.clone()), None, "{bad}");
+    }
+}
+
+#[test]
+fn too_many_renderer_rules_apply_none() {
+    let one = json!({ "vendor": "intel", "backend": "dx12" });
+    let config = |rules: Value| {
+        parse_config(Some(&json!({ "schema": 1, "renderer_rules": rules })))
+            .unwrap()
+            .renderer_rules
+    };
+    assert_eq!(config(json!(vec![one.clone(); MAX_RULES])).len(), MAX_RULES);
+    assert!(config(json!(vec![one.clone(); MAX_RULES + 1])).is_empty());
+    // A bad rule among good ones drops only itself, as second_screen_rules.
+    let mixed = config(json!([
+        { "vendor": "intel", "backend": "gl" },
+        { "vendor": "nvidia", "backend": "warp" },
+        one,
+        "garbage",
+        { "vendor": "amd", "backend": "vulkan", "driver": { "max": "31.0.21001.45099" } }
+    ]));
+    assert_eq!(mixed.len(), 2);
+    assert_eq!(mixed[0].backend, RendererBackend::Dx12);
+    assert_eq!(mixed[1].backend, RendererBackend::Vulkan);
+    for not_a_list in [json!(one), json!("intel"), json!(null), json!(8)] {
+        assert!(config(not_a_list.clone()).is_empty(), "{not_a_list}");
+    }
+    // The other values stay when the rules are bad, and the reverse.
+    let both = parse_config(Some(&json!({
+        "schema": 1,
+        "attach_timeout_s": 45,
+        "renderer_rules": "garbage",
+        "second_screen_rules": [{ "gpus": ["intel"] }]
+    })))
+    .unwrap();
+    assert_eq!(both.attach_timeout_s, Some(45));
+    assert!(both.renderer_rules.is_empty() && both.rules.is_empty());
+    let rules_only = parse_config(Some(&json!({ "schema": 1, "renderer_rules": [one] }))).unwrap();
+    assert_eq!(rules_only.attach_timeout_s, None);
+    assert_eq!(rules_only.renderer_rules.len(), 1);
+}
+
+#[test]
+fn saved_renderer_rules_apply_until_the_config_does_not() {
+    let path = temp_file("renderer");
+    assert!(read(&path, START).renderer_rules().is_empty());
+    write(&path, EXAMPLE.as_bytes(), START).unwrap();
+    let applied = read(&path, START + DAY);
+    let rules = applied.renderer_rules();
+    assert_eq!(rules.len(), 1);
+    assert!(rules[0].matches(NVIDIA, "32.0.15.8034"));
+    assert_eq!(rules[0].backend, RendererBackend::Dx12);
+    // The launch line is unchanged; the renderer logs its own.
+    assert_eq!(
+        applied.summary(Some(true)),
+        "remote_config=applied rollout=7d ss_rule=match attach_s=45"
+    );
+    assert!(read(&path, START + MAX_AGE + 1).renderer_rules().is_empty());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// The table `scripts/test_check_versions.py` runs through the publishing
+/// check: each rule the check accepts the PC applies, and the reverse.
+#[test]
+fn renderer_rules_parse_as_the_publishing_check_validates_them() {
+    let table: Value = serde_json::from_str(include_str!(
+        "../../../proto/testdata/renderer_rules_parity.json"
+    ))
+    .unwrap();
+    let cases = table["cases"].as_array().unwrap();
+    assert!(cases.len() > 30);
+    for case in cases {
+        let valid = case["valid"].as_bool().unwrap();
+        assert_eq!(
+            renderer_rule(case["rule"].clone()).is_some(),
+            valid,
+            "{}",
+            case["rule"]
+        );
+    }
+}

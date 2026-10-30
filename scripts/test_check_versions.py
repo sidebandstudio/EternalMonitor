@@ -5,8 +5,12 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import manifest_fields  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FILES = [
@@ -261,6 +265,95 @@ class CheckVersionsTest(unittest.TestCase):
             result = self.rule_check(change)
             self.assertNotEqual(result.returncode, 0, f"case {index}: {result.stdout}")
             self.assertIn("FAIL", result.stdout + result.stderr, f"case {index}")
+
+    RENDERER = {
+        "vendor": "intel",
+        "driver": {"min": "31.0.101.0", "max": "31.0.101.65535"},
+        "backend": "dx12",
+    }
+
+    def renderer_check(self, rules):
+        result = self.with_fields("windows", lambda e: e.update(
+            config={"schema": 1, "renderer_rules": rules}))
+        self.tearDown()
+        self.setUp()
+        return result
+
+    def test_renderer_rules_pass(self):
+        def rule(**changes):
+            changed = {**copy.deepcopy(self.RENDERER), **changes}
+            return {key: value for key, value in changed.items() if value is not None}
+        for rules in [
+            [],
+            [self.RENDERER],
+            [rule(driver=None)],
+            [rule(driver={"min": "31.0.101.2111"})],
+            [rule(driver={"max": "31.0.101.2111"})],
+            [rule(driver={"min": "31.0.101.2111", "max": "31.0.101.2111"})],
+            [rule(vendor="nvidia", backend="vulkan"), rule(vendor="amd", backend="dx12")],
+            [self.RENDERER] * 8,
+        ]:
+            result = self.renderer_check(rules)
+            self.assertEqual(result.returncode, 0, f"{rules}: {result.stdout}{result.stderr}")
+
+    def test_bad_renderer_rules_are_refused(self):
+        def rule(**changes):
+            return {**copy.deepcopy(self.RENDERER), **changes}
+        def without(key):
+            changed = copy.deepcopy(self.RENDERER)
+            changed.pop(key)
+            return changed
+        cases = [
+            [self.RENDERER] * 9,
+            self.RENDERER,
+            "intel dx12",
+            ["intel"],
+            [rule(vendor="qualcomm")],
+            [rule(vendor="Intel")],
+            [rule(vendor=32902)],
+            [rule(vendor=["intel"])],
+            [rule(backend={"dx12": True})],
+            [without("vendor")],
+            # WARP would move a working PC off its card; only the PC chooses it.
+            [rule(backend="warp")],
+            [rule(backend="gl")],
+            [rule(backend="DX12")],
+            [rule(backend=None)],
+            [without("backend")],
+            [rule(driver={})],
+            [rule(driver=None)],
+            [rule(driver="31.0.101.x")],
+            [rule(driver={"min": None})],
+            [rule(driver={"min": "31.0.101"})],
+            [rule(driver={"max": "31.0.101.0.1"})],
+            [rule(driver={"min": "31.0.101.x"})],
+            [rule(driver={"min": 31})],
+            # The PC reads ASCII digits only; it would drop these rules.
+            [rule(driver={"min": "\u0663\u0661.\u0660.\u0661\u0660\u0661.\u0660"})],
+            [rule(driver={"max": "31.0.101.\uff16\uff15\uff15\uff13\uff15"})],
+            [rule(driver={"min": "31.0.101.9", "max": "31.0.101.1"})],
+            [rule(driver={"min": "31.0.101.0", "exact": "31.0.101.2111"})],
+            [rule(windows={"min": "26100.0", "max": "26100.9"})],
+            # A bad rule among good ones fails the publish.
+            [self.RENDERER, rule(backend="opengl")],
+        ]
+        for index, rules in enumerate(cases):
+            result = self.renderer_check(rules)
+            self.assertNotEqual(result.returncode, 0, f"case {index} {rules}: {result.stdout}")
+            self.assertIn("FAIL", result.stdout + result.stderr, f"case {index}")
+
+    def test_renderer_rules_validate_as_the_pc_parses_them(self):
+        # The table host/src/remote_config/tests.rs runs through the PC's
+        # parser: a rule passes here exactly when the PC applies it.
+        table = json.loads((ROOT / "proto/testdata/renderer_rules_parity.json").read_text())
+        self.assertGreater(len(table["cases"]), 30)
+        for case in table["cases"]:
+            try:
+                manifest_fields.check_renderer_rules([case["rule"]])
+                valid = True
+            except ValueError:
+                valid = False
+            self.assertEqual(valid, case["valid"], case["rule"])
 
     def test_bad_notes_and_unknown_keys_are_refused(self):
         for platform in ("windows", "ipad"):

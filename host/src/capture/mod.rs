@@ -587,6 +587,89 @@ fn vdd_attach_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS))
 }
 
+/// Windows won't duplicate `screen` from the card this process runs on (a
+/// hybrid PC running EternalMonitor on its other card). Works out which card
+/// the screen is wired to, from `facts` as just read (`None` when Windows
+/// couldn't say), for the Stream page notice: again on every refusal until
+/// Windows could say, and again after the cards or the screens' wiring
+/// change, but logged only when the answer is new. `mirror_card`: the
+/// screen is the one Mirror captures, from the card with this LUID.
+///
+/// The mirror counts as refused ([`second_screen::note_mirror_refused`])
+/// only when `facts` wire the screen to another card than `mirror_card`.
+/// Without that evidence (no facts, or the screen on the capture card)
+/// DXGI_ERROR_UNSUPPORTED may be a passing desktop mode change, and the
+/// second screen's failures are remembered as on any PC.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_gpu_refused(
+    shared: &SharedControl,
+    screen: &str,
+    facts: Option<crate::gpu_preference::GpuFacts>,
+    mirror_card: Option<crate::gpu_preference::AdapterId>,
+) {
+    if let Some(card) = mirror_card {
+        if facts
+            .as_ref()
+            .is_some_and(|facts| facts.wired_elsewhere(screen, card))
+        {
+            let screen = screen.to_string();
+            let refusal = second_screen::MirrorRefusal { screen, card };
+            second_screen::note_mirror_refused(shared, Some(refusal));
+        }
+    }
+    let (checked, moved) = shared.screen_watch.lock().refused(screen, facts.clone());
+    let facts = facts.unwrap_or_default();
+    let app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str());
+    if let Some(moved) = moved {
+        info!(
+            from_gpu = %moved.from.name,
+            to_gpu = %moved.to.name,
+            app_gpu,
+            "The screen EternalMonitor mirrors moved to another graphics card"
+        );
+    }
+    let Some(diagnosis) = checked else {
+        return;
+    };
+    let card = |preference| {
+        facts
+            .card_for(preference)
+            .map_or("unknown", |a| a.name.as_str())
+    };
+    info!(
+        screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
+        app_gpu,
+        switch = ?diagnosis.as_ref().and_then(|d| d.preference),
+        cards = facts.adapters.len(),
+        power_saving_gpu = card(crate::gpu_preference::Preference::PowerSaving),
+        high_performance_gpu = card(crate::gpu_preference::Preference::HighPerformance),
+        "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
+    );
+    *shared.gpu_diagnosis.lock() = diagnosis;
+}
+
+/// Windows duplicates the screen Mirror captures from `app`, the card this
+/// process captures on (`None` when DXGI didn't describe it). An earlier
+/// refusal's diagnosis no longer holds, whichever card it named: drop it,
+/// so the next refusal names the card the screen is on then. A move back
+/// from another card, told apart by LUID, is logged once.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_mirror_works(
+    shared: &SharedControl,
+    app: Option<&crate::gpu_preference::Adapter>,
+) {
+    second_screen::note_mirror_refused(shared, None);
+    *shared.gpu_diagnosis.lock() = None;
+    let Some(moved) = shared.screen_watch.lock().works(app) else {
+        return;
+    };
+    info!(
+        from_gpu = %moved.from.name,
+        to_gpu = %moved.to.name,
+        "The screen EternalMonitor mirrors moved back to the graphics card EternalMonitor runs on"
+    );
+}
+
 /// Is an iPad currently registered as a receiver? The virtual display is brought up only while
 /// a client is connected, so an idle PC never shows a phantom second monitor.
 #[cfg(windows)]
@@ -602,6 +685,9 @@ fn outputs(shared: &SharedControl) -> Vec<OutputInfo> {
     if let Some(outputs) = second_screen::fake::outputs(shared) {
         return outputs;
     }
+    // Only the debug-build fake reads it.
+    #[cfg(not(debug_assertions))]
+    let _ = shared;
     enumerate_outputs()
 }
 
@@ -1077,6 +1163,154 @@ mod tests {
     use super::*;
     use crate::control::CaptureTarget;
     use std::cell::Cell;
+
+    /// The LUIDs of the hybrid laptop of the 0.3.4 beta report.
+    pub(crate) const NVIDIA: crate::gpu_preference::AdapterId = (0, 0x14c81);
+    const AMD: crate::gpu_preference::AdapterId = (0, 0x12d2d);
+
+    /// That laptop: the app capturing on NVIDIA, the screen where Windows
+    /// put it, on the AMD iGPU (`moved`) or on NVIDIA.
+    pub(crate) fn hybrid_laptop(moved: bool) -> crate::gpu_preference::GpuFacts {
+        use crate::gpu_preference::{Adapter, GpuFacts};
+        GpuFacts {
+            adapters: vec![
+                Adapter {
+                    id: NVIDIA,
+                    name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+                },
+                Adapter {
+                    id: AMD,
+                    name: "AMD Radeon 780M Graphics".into(),
+                },
+            ],
+            power_saving: Some(AMD),
+            high_performance: Some(NVIDIA),
+            screens: vec![(r"\\.\DISPLAY1".into(), if moved { AMD } else { NVIDIA })],
+        }
+    }
+
+    fn screen_on_amd() -> crate::gpu_preference::GpuFacts {
+        hybrid_laptop(true)
+    }
+
+    fn nvidia() -> crate::gpu_preference::Adapter {
+        hybrid_laptop(false).adapters[0].clone()
+    }
+
+    /// The mirror refused on that laptop after Windows moved its screen to
+    /// the iGPU, with the display configuration read now saying so too.
+    pub(crate) fn refuse_moved_mirror(shared: &SharedControl) {
+        second_screen::set_facts(shared, Some(screen_on_amd()));
+        note_gpu_refused(shared, r"\\.\DISPLAY1", Some(screen_on_amd()), Some(NVIDIA));
+    }
+
+    /// The mirror's refusals with the screen on another card block it and
+    /// name the card for the notice; a capture that works again unblocks it
+    /// and drops the diagnosis, and the next refusal names the card again.
+    #[test]
+    fn a_refused_mirror_blocks_it_and_names_the_card_until_it_works_again() {
+        use crate::gpu_preference::Preference;
+        let shared = SharedControl::new(9876, 15_000_000);
+        note_mirror_works(&shared, Some(&nvidia()));
+        note_gpu_refused(
+            &shared,
+            r"\\.\DISPLAY1",
+            Some(screen_on_amd()),
+            Some(NVIDIA),
+        );
+        assert!(second_screen::mirror_refused(&shared));
+        let diagnosis = shared.gpu_diagnosis.lock().clone().unwrap();
+        assert_eq!(diagnosis.screen_gpu, "AMD Radeon 780M Graphics");
+        assert_eq!(diagnosis.preference, Some(Preference::PowerSaving));
+        note_mirror_works(&shared, Some(&nvidia()));
+        assert!(!second_screen::mirror_refused(&shared));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None, "the notice has no card");
+        note_gpu_refused(
+            &shared,
+            r"\\.\DISPLAY1",
+            Some(screen_on_amd()),
+            Some(NVIDIA),
+        );
+        assert_eq!(
+            shared.gpu_diagnosis.lock().as_ref().unwrap().screen_gpu,
+            "AMD Radeon 780M Graphics"
+        );
+    }
+
+    /// Every PC where Mirror works: its captures never block anything or
+    /// set a notice. Nor does a refusal of the virtual second screen.
+    #[test]
+    fn a_working_mirror_or_a_refused_second_screen_never_blocks_the_mirror() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        for _ in 0..3 {
+            note_mirror_works(&shared, Some(&nvidia()));
+        }
+        assert!(!second_screen::mirror_refused(&shared));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None);
+        note_gpu_refused(&shared, r"\\.\DISPLAY9", None, None);
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", Some(screen_on_amd()), None);
+        assert!(!second_screen::mirror_refused(&shared));
+    }
+
+    /// Review round 1: DXGI_ERROR_UNSUPPORTED also comes while the desktop
+    /// changes mode. A refusal of the mirror blocks nothing unless the
+    /// display configuration wires its screen to another card than the one
+    /// capture runs on: not without it, nor with the screen on that card.
+    #[test]
+    fn a_refused_mirror_without_a_card_mismatch_blocks_nothing() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", None, Some(NVIDIA));
+        assert!(!second_screen::mirror_refused(&shared), "no facts");
+        note_gpu_refused(
+            &shared,
+            r"\\.\DISPLAY1",
+            Some(hybrid_laptop(false)),
+            Some(NVIDIA),
+        );
+        assert!(!second_screen::mirror_refused(&shared), "the same card");
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", Some(screen_on_amd()), Some(AMD));
+        assert!(
+            !second_screen::mirror_refused(&shared),
+            "captured on its card"
+        );
+    }
+
+    /// Review round 1: two cards of one model. The screen moves back to the
+    /// app's card, which changes no name: a mirror that works drops the
+    /// notice's diagnosis all the same.
+    #[test]
+    fn a_working_mirror_drops_the_notice_with_two_cards_of_one_model() {
+        use crate::gpu_preference::{Adapter, GpuFacts};
+        const MODEL: &str = "AMD Radeon RX 7600";
+        let (app, other) = ((0, 0x100), (0, 0x200));
+        let facts = GpuFacts {
+            adapters: vec![
+                Adapter {
+                    id: app,
+                    name: MODEL.into(),
+                },
+                Adapter {
+                    id: other,
+                    name: MODEL.into(),
+                },
+            ],
+            power_saving: None,
+            high_performance: None,
+            screens: vec![(r"\\.\DISPLAY1".into(), other)],
+        };
+        let shared = SharedControl::new(9876, 15_000_000);
+        let card = facts.adapters[0].clone();
+        note_mirror_works(&shared, Some(&card));
+        note_gpu_refused(&shared, r"\\.\DISPLAY1", Some(facts), Some(app));
+        assert!(second_screen::mirror_refused(&shared));
+        assert_eq!(
+            shared.gpu_diagnosis.lock().as_ref().unwrap().screen_gpu,
+            MODEL
+        );
+        note_mirror_works(&shared, Some(&card));
+        assert_eq!(*shared.gpu_diagnosis.lock(), None, "the notice has no card");
+        assert!(!second_screen::mirror_refused(&shared));
+    }
 
     #[test]
     fn slow_virtual_attach_keeps_watchdog_alive_without_hiding_a_stall() {

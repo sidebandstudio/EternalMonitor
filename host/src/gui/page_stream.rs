@@ -771,7 +771,7 @@ pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: b
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
         format!(
-            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, then click Restart.",
+            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
             crate::encoder::NVENC_MIN_DRIVER
         )
     } else {
@@ -797,6 +797,7 @@ fn simulate_problem(
     match name.as_str() {
         "secure-desktop" => *block = Some(CaptureBlock::SecureDesktop),
         "display-changing" => *block = Some(CaptureBlock::DisplayChanging),
+        "no-display" => *block = Some(CaptureBlock::NoDisplay),
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
@@ -1058,6 +1059,11 @@ pub(super) fn capture_block_notice(
             Icon::Display,
             "Windows is changing the display",
             "This happens when the resolution changes or a full-screen game or app starts. The picture comes back by itself when it's done.",
+        ),
+        CaptureBlock::NoDisplay => (
+            Icon::Display,
+            "No display is on",
+            "Open the laptop lid or turn a display on, and the picture comes back by itself. To keep streaming with the lid closed, choose Second screen.",
         ),
         CaptureBlock::UnsupportedOnThisGpu => (
             Icon::Display,

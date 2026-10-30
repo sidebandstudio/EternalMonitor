@@ -13,7 +13,7 @@ use windows::core::Interface;
 
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
-    LossStep, LOSS_GIVE_UP,
+    LossStep, OpenStep, LOSS_GIVE_UP,
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
@@ -35,8 +35,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -147,8 +147,8 @@ pub fn run_capture_loop(
     if !outputs.is_empty() && NO_OUTPUTS.swap(false, Ordering::Relaxed) {
         info!(outputs = outputs.len(), "A display output is back");
     }
-    // A missing output (DXGI_ERROR_NOT_FOUND) is a display change the stage
-    // waits out, not a failure.
+    // A missing adapter or output (DXGI_ERROR_NOT_FOUND) is a display change
+    // the stage waits out, not a failure.
     let (adapter, output, adapter_name, capture_label) = match resolve_target(&outputs, &target) {
         Some(idx) => {
             let chosen = &outputs[idx];
@@ -160,15 +160,15 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for the chosen output's adapter — falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
+                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
                 Ok(desc) => utf16_to_string(&desc.Description),
                 Err(_) => chosen.adapter_name.clone(),
             };
-            let output: IDXGIOutput =
-                unsafe { adapter.EnumOutputs(chosen.output_index) }.map_err(blocked_or_error)?;
+            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(chosen.output_index) }
+                .map_err(opening(OpenStep::ListedOutput))?;
             let label = format!(
                 "{} ({}x{})",
                 chosen.device_name, chosen.width, chosen.height
@@ -196,7 +196,7 @@ pub fn run_capture_loop(
                         error = %error,
                         "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
                     );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(blocked_or_error)?
+                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
                 }
             };
             let adapter_name = match unsafe { adapter.GetDesc1() } {
@@ -204,15 +204,23 @@ pub fn run_capture_loop(
                 Err(_) => String::new(),
             };
             let output: IDXGIOutput =
-                unsafe { adapter.EnumOutputs(0) }.map_err(blocked_or_error)?;
+                unsafe { adapter.EnumOutputs(0) }.map_err(opening(OpenStep::OnlyOutput))?;
             (adapter, output, adapter_name, "primary (auto)".to_string())
         }
     };
 
     info!(adapter = %adapter_name, "Capture using adapter");
+    // The mirror's card, by LUID, for the graphics card checks.
+    let mirror_card = unsafe { adapter.GetDesc1() }
+        .ok()
+        .filter(|_| !second_screen)
+        .map(|desc| crate::gpu_preference::Adapter {
+            id: adapter_id(desc),
+            name: adapter_name.clone(),
+        });
     {
         let mut stats = PIPELINE_STATS.lock();
-        stats.set_gpu_name(adapter_name);
+        stats.set_gpu_name(adapter_name.clone());
         stats.set_capture_display(capture_label);
     }
 
@@ -235,13 +243,16 @@ pub fn run_capture_loop(
         duplicate_output(&output1, &device, super::hold_watchdog(&shared, generation))?
             .inspect_err(|error| {
                 if error.code() == DXGI_ERROR_UNSUPPORTED {
-                    check_gpu(&output1, &shared);
+                    check_gpu(&output1, &shared, mirror_card.as_ref().map(|card| card.id));
                 }
             })
             .map_err(blocked_or_error)?
     });
     info!("Desktop duplication active");
     note_gpu_outcome(&shared, Outcome::Worked);
+    if !second_screen {
+        super::note_mirror_works(&shared, mirror_card.as_ref());
+    }
 
     // --- Query desktop dimensions from duplication ---
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
@@ -827,45 +838,45 @@ fn resend_last_frame(
     *last_send = now;
 }
 
-/// Windows won't duplicate `output` from the card this process runs on (a
-/// hybrid PC running EternalMonitor on its other card). Works out which card
-/// the screen is wired to, for the Stream page notice: again on every
-/// refusal until Windows could say, and again after the cards or the
-/// screens' wiring change, but logged only when the answer is new.
-fn check_gpu(output: &IDXGIOutput1, shared: &SharedControl) {
-    static CHECK: parking_lot::Mutex<crate::gpu_preference::GpuCheck> =
-        parking_lot::Mutex::new(crate::gpu_preference::GpuCheck::new());
+/// Windows won't duplicate `output` from the card this process runs on: see
+/// [`super::note_gpu_refused`]. `mirror_card`: `output` is the mirror's
+/// screen, captured from the card with this LUID.
+fn check_gpu(
+    output: &IDXGIOutput1,
+    shared: &SharedControl,
+    mirror_card: Option<crate::gpu_preference::AdapterId>,
+) {
     note_gpu_outcome(shared, Outcome::StillUnsupported);
     let Ok(desc) = (unsafe { output.GetDesc() }) else {
         return;
     };
     let screen = utf16_to_string(&desc.DeviceName);
-    let facts = crate::gpu_preference::facts();
-    let Some(diagnosis) = CHECK.lock().check(&screen, facts.clone()) else {
-        return;
-    };
-    let facts = facts.unwrap_or_default();
-    let card = |preference| {
-        facts
-            .card_for(preference)
-            .map_or("unknown", |a| a.name.as_str())
-    };
-    info!(
-        screen_gpu = diagnosis.as_ref().map_or("unknown", |d| d.screen_gpu.as_str()),
-        app_gpu = facts.running_on().map_or("unknown", |a| a.name.as_str()),
-        switch = ?diagnosis.as_ref().and_then(|d| d.preference),
-        cards = facts.adapters.len(),
-        power_saving_gpu = card(crate::gpu_preference::Preference::PowerSaving),
-        high_performance_gpu = card(crate::gpu_preference::Preference::HighPerformance),
-        "Graphics card check: Windows won't share this screen from the card EternalMonitor runs on"
-    );
-    *shared.gpu_diagnosis.lock() = diagnosis;
+    super::note_gpu_refused(shared, &screen, crate::gpu_preference::facts(), mirror_card);
+}
+
+/// An adapter's LUID, as the graphics card checks compare it.
+fn adapter_id(desc: DXGI_ADAPTER_DESC1) -> crate::gpu_preference::AdapterId {
+    (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
 }
 
 /// Windows states that block duplication become [`CaptureUnavailable`], which
 /// the stage retries; anything else fails the stage as before.
 fn blocked_or_error(error: windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    match CaptureBlock::from_hresult(error.code().0) {
+    unavailable_or_error(CaptureBlock::from_hresult(error.code().0), error)
+}
+
+/// [`blocked_or_error`] for the call at `step` that opens the output.
+fn opening(
+    step: OpenStep,
+) -> impl FnOnce(windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    move |error| unavailable_or_error(CaptureBlock::opening(step, error.code().0), error)
+}
+
+fn unavailable_or_error(
+    block: Option<CaptureBlock>,
+    error: windows::core::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match block {
         Some(block) => Box::new(CaptureUnavailable {
             block,
             detail: error.to_string(),
