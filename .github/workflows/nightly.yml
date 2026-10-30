@@ -10,8 +10,9 @@ name: Nightly
 # docs/latest.json, /releases/latest and the apps' update checks never see
 # one. scripts/nightly.py has the version, branch and retention rules.
 #
-# Only a run on main publishes. A manual run with dry_run, or on any other
-# branch, builds and scans the installer and uploads it as a run artifact.
+# Only a run on main publishes. A manual run with dry_run, on any other
+# branch or for a pull request that changes this pipeline, builds and scans
+# the installer and uploads it as a run artifact.
 on:
   schedule:
     - cron: "41 7 * * *"
@@ -21,11 +22,15 @@ on:
         description: Build and scan, but publish nothing
         type: boolean
         default: false
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+      - scripts/nightly.py
 
 permissions: {}
 
 concurrency:
-  group: nightly
+  group: ${{ github.event_name == 'pull_request' && github.ref || 'nightly' }}
   cancel-in-progress: false
 
 env:
