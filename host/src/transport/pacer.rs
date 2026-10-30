@@ -45,6 +45,58 @@ impl PacingClock {
     }
 }
 
+/// Wakes the transport at a deadline from a dedicated thread, as
+/// `PacingClock` does, for pen frames held back to keep them
+/// `FRAME_SPACING` apart. The transport arms it at the top of each loop and
+/// selects on `wait`; arming the same deadline again sends nothing, and a
+/// superseded deadline only costs an extra flush.
+pub struct Deadline {
+    tx: std::sync::mpsc::Sender<Instant>,
+    due: std::sync::Arc<tokio::sync::Notify>,
+    armed: Option<Instant>,
+}
+
+impl Deadline {
+    pub fn new(name: &str) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Instant>();
+        let due = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = std::sync::Arc::clone(&due);
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let mut timer = crate::capture::timing::FrameTimer::new();
+                while let Ok(deadline) = rx.recv() {
+                    timer.wait_until(deadline);
+                    notify.notify_one();
+                }
+            })?;
+        Ok(Self {
+            tx,
+            due,
+            armed: None,
+        })
+    }
+
+    pub fn arm(&mut self, deadline: Option<Instant>) {
+        if deadline == self.armed {
+            return;
+        }
+        self.armed = deadline;
+        if let Some(deadline) = deadline {
+            let _ = self.tx.send(deadline);
+        }
+    }
+
+    pub fn armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    pub async fn wait(&mut self) {
+        self.due.notified().await;
+        self.armed = None;
+    }
+}
+
 /// Frames at or below this many fragments go out unpaced.
 pub const PACE_THRESHOLD_FRAGS: usize = 16;
 /// Datagrams per burst between gaps.
@@ -111,6 +163,21 @@ mod tests {
             .unwrap();
         drop(clock);
         ready.await.unwrap(); // dropping the clock never strands a pending wait
+    }
+
+    #[tokio::test]
+    async fn a_deadline_wakes_the_runtime_once_it_has_passed() {
+        let mut deadline = Deadline::new("test-deadline").unwrap();
+        let started = Instant::now();
+        let at = started + Duration::from_micros(250);
+        deadline.arm(Some(at));
+        // Arming it again does not queue a second wake.
+        deadline.arm(Some(at));
+        assert!(deadline.armed());
+        deadline.wait().await;
+        assert!(Instant::now() >= at);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!deadline.armed());
     }
 
     #[test]
