@@ -1,0 +1,54 @@
+/* Extend your desktop. The world is laid out in its own pixels; second-screen.js
+   moves the camera over it. The monitor shows a 1920 x 1080 desktop at 0.6,
+   the iPad (2420 x 1668 pixels at 0.27) is in front of its lower right corner. */
+.bg { background-image: url('art/dunes.webp'); background-position: 50% 70%; }
+#world { position: absolute; left: 0; top: 0; width: 1600px; height: 960px; transform-origin: 0 0; }
+#mon {
+  position: absolute; left: -18px; top: -18px; width: 1188px; height: 684px;
+  border-radius: 18px; background: #0c0c0e;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 60px 120px -50px rgba(0, 0, 0, 0.95);
+}
+#mon .screen { left: 16px; top: 16px; width: 1152px; height: 648px; border-radius: 6px; }
+#neck { position: absolute; left: 531px; top: 664px; width: 90px; height: 124px; background: #141416; }
+#foot { position: absolute; left: 416px; top: 784px; width: 320px; height: 18px; border-radius: 9px 9px 4px 4px; background: #18181b; border-top: 2px solid rgba(255, 255, 255, 0.1); }
+#pad {
+  position: absolute; left: 858px; top: 448px; width: 697px; height: 494px;
+  border-radius: 36px; background: #1c1c1f;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow: inset 0 0 0 2px rgba(0, 0, 0, 0.6), 0 50px 110px -30px rgba(0, 0, 0, 0.95), 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+#pad .screen { left: 20px; top: 20px; width: 653px; height: 450px; border-radius: 16px; }
+.screen { position: absolute; overflow: hidden; background: #000; }
+.dark { position: absolute; inset: 0; background: #000; opacity: 0; }
+
+/* A desktop is drawn in desktop pixels and scaled to its screen. */
+.desk, .desk2 { position: absolute; left: 0; top: 0; overflow: hidden; transform-origin: 0 0; }
+.desk { width: 1920px; height: 1080px; }
+.desk2 { width: 1440px; height: 993px; }
+.wall { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; max-width: none; }
+#deskA { transform: scale(0.6); }
+#mirror { position: absolute; left: 0; top: 41.4px; width: 653px; height: 367.5px; }
+#deskM { transform: scale(0.34031); }
+#extend { position: absolute; inset: 0; }
+#deskB { transform: scale(0.45375); }
+
+/* The app's window: footage pixels, two per desktop pixel. */
+.appwin { position: absolute; left: 60px; top: 110px; width: 2080px; transform-origin: 0 0; transform: scale(0.5); }
+.appwin .win-view { width: 2080px; height: 1420px; }
+.appwin video { position: absolute; left: 0; top: -20px; width: 2080px; height: 1440px; }
+
+/* The reference sheet (footage/doc.png, a page captured at 2x). */
+.doc { position: absolute; left: 0; top: 0; width: 760px; border-radius: 9px; overflow: hidden; background: #f2f0eb; border: 1px solid rgba(0, 0, 0, 0.35); box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.85); }
+.doc .bar { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 12px; background: #e6e4df; border-bottom: 1px solid rgba(0, 0, 0, 0.08); font-size: 11px; color: #4a4b50; }
+.doc .wc { display: inline-flex; gap: 16px; }
+.doc .wc svg { width: 9px; height: 9px; }
+.doc img { display: block; width: 760px; height: 780px; }
+
+/* The pointer, in desktop pixels; its tip is the element's top-left corner. */
+.ptr { position: absolute; left: 0; top: 0; width: 26px; height: 39px; opacity: 0; transform-origin: 0 0; }
+.ptr svg { width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.45)); }
+
+#chip { left: 40px; top: 36px; width: 330px; justify-content: flex-start; }
+#chip .say { position: relative; display: inline-block; width: 262px; height: 30px; }
+#chip .say span { position: absolute; left: 0; top: 0; line-height: 30px; }
