@@ -82,6 +82,25 @@ final class SupportDiagnosticsTests: XCTestCase {
                        "Paired with %COMPUTERNAME% at 192.0.2.7 reason=none")
     }
 
+    /// A name without a letter or digit, or holding placeholder syntax, is never a PC name, even with
+    /// another name already seen; redacting an uploaded line again changes nothing.
+    func testEmojiAndPlaceholderNamesAreNeverPCNames() {
+        SupportDiagnostics.notePCName("Ines-PC")
+        for name in ["🎮🎧🎵", "!!!", "%COMPUTERNAME% Chen", "<device-name> Chen", "Kim <3", "100% Kim"] {
+            SupportDiagnostics.notePCName(name)
+        }
+        SupportDiagnostics.noteTypedAddress("🎮🎧🎵")
+        for (line, uploaded) in [
+            ("Paired with 🎮🎧🎵 at 192.0.2.7", "Paired with 🎮🎧🎵 at 192.0.2.7"),
+            ("Ines-PC Chen and the lobby", "%COMPUTERNAME% Chen and the lobby"),
+            ("<device-name> Chen and 100% Kim <3", "<device-name> Chen and 100% Kim <3"),
+        ] {
+            let once = SupportDiagnostics.redactForUpload(line, category: "ctrl")
+            XCTAssertEqual(once, uploaded)
+            XCTAssertEqual(SupportDiagnostics.redactForUpload(once, category: "ctrl"), once)
+        }
+    }
+
     func testAnAcceptedPCNameLeavesUploadedLines() async throws {
         let queue = DispatchQueue(label: "pc-name-test")
         let (stream, continuation) = AsyncStream<Data>.makeStream()

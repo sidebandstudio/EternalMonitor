@@ -386,8 +386,11 @@ impl Names {
                 forms.push(form);
             }
         }
+        let Some(first) = forms.first() else {
+            return;
+        };
         self.devices
-            .retain(|seen| !seen.forms.first().is_some_and(|seen| same(seen, &forms[0])));
+            .retain(|seen| !seen.forms.first().is_some_and(|seen| same(seen, first)));
         self.devices.push(Seen { forms, label });
         if self.devices.len() > MAX_DEVICES {
             self.devices.remove(0);
@@ -395,9 +398,14 @@ impl Names {
     }
 
     /// Whether its owner may have chosen `name`: not too short, generic, a
-    /// common word, a value (`true`, `5060`, `v1.2`) or inside the name of a
-    /// graphics card.
+    /// common word, a value (`true`, `5060`, `v1.2`), inside the name of a
+    /// graphics card, without a letter or digit (`🎮🎧🎵`) or holding this
+    /// redaction's placeholder syntax (`<device-name> Chen`), which would
+    /// read differently once redacted.
     fn may_be_chosen(&self, name: &str) -> bool {
+        if !name.chars().any(char::is_alphanumeric) || name.contains(['<', '>', '%']) {
+            return false;
+        }
         let labels = AUDIO_KINDS
             .iter()
             .map(|(_, kind)| *kind)
@@ -1524,6 +1532,57 @@ mod tests {
         );
     }
 
+    /// A name without a letter or digit is never a device name, and
+    /// noting one with another name already seen panics nothing.
+    #[test]
+    fn a_name_without_letters_or_digits_is_never_a_device_name() {
+        let mut names = Names::new(None, None, None);
+        let headphones = "Headphones (Maria's AirPods)";
+        names.note_device(headphones, audio_kind(headphones));
+        for name in ["🎮🎧🎵", "!!!", "- - -", "\u{200B}\u{200B}\u{200B}"] {
+            names.note_device(name, DEVICE_NAME);
+        }
+        assert_eq!(names.devices.len(), 1);
+        assert_cases(
+            &names,
+            &[(
+                "Stream for 🎮🎧🎵 ended on Headphones (Maria's AirPods)",
+                "Stream for 🎮🎧🎵 ended on <headphones>",
+            )],
+        );
+    }
+
+    /// A name holding this redaction's placeholder syntax is never a device
+    /// name, so one pass is final and text after a name stays.
+    #[test]
+    fn names_with_placeholder_syntax_are_never_device_names() {
+        let mut names = Names::new(None, Some("maria"), None);
+        names.note_device("Zoe", DEVICE_NAME);
+        for name in [
+            "<device-name> Chen",
+            "<device-name> Chen and",
+            "<headphones>",
+            "%USERNAME%'s iPad",
+            "Kim <3",
+            "100% Kim",
+        ] {
+            names.note_device(name, DEVICE_NAME);
+        }
+        assert_eq!(names.devices.len(), 1);
+        for (line, expected) in [
+            ("Zoe Chen and the lobby", "<device-name> Chen and the lobby"),
+            (
+                "<device-name> Chen and the lobby",
+                "<device-name> Chen and the lobby",
+            ),
+            ("100% Kim joined maria", "100% Kim joined %USERNAME%"),
+        ] {
+            let once = redact(line, &names);
+            assert_eq!(once, expected);
+            assert_eq!(redact(&once, &names), once);
+        }
+    }
+
     /// Past its cap, the registry lets the least recently seen name go.
     #[test]
     fn the_least_recently_seen_device_name_goes_first() {
@@ -2030,6 +2089,10 @@ mod tests {
                 "Maria",
                 "true",
                 "RTX 5060",
+                "Zoe",
+                "🎮🎧🎵",
+                "<device-name> Chen",
+                "%USERNAME%'s iPad",
             ] {
                 names.note_device(name, audio_kind(name));
             }
@@ -2043,6 +2106,9 @@ mod tests {
                 Some("Headphones (Maria's AirPods)"),
                 Some("Kim's iPad"),
                 Some("Maria Lopez's iPad"),
+                Some("🎮🎧🎵"),
+                Some("<device-name> Chen"),
+                Some("Zoe Chen and"),
             ]
             .into_iter()
             .flatten()

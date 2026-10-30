@@ -164,13 +164,16 @@ final class SupportDiagnostics: @unchecked Sendable {
     private static let keptPattern = try! NSRegularExpression(pattern: #"(?<=[\p{L}\p{N}_]=)\S+|%[A-Z]+%"#)
 
     /// Call it before logging `name`. Names shorter than 3 characters, common words, numbers and
-    /// versions (`5060`, `v1.2.3`) and names inside this iPad's hardware names stay, as on Windows.
+    /// versions (`5060`, `v1.2.3`), names inside this iPad's hardware names, names without a letter or
+    /// digit (`🎮🎧🎵`) and names holding placeholder syntax (`%COMPUTERNAME% Chen`) stay, as on Windows.
     static func notePCName(_ name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = name.lowercased()
         let version = lower.hasPrefix("v") ? lower.dropFirst() : Substring(lower)
         let value = version.contains(where: \.isNumber) && version.allSatisfy { $0.isASCII && ($0.isNumber || $0.isPunctuation) }
-        guard name.count >= 3, !value, !commonWords.contains(lower) else { return }
+        guard name.count >= 3, !value, !commonWords.contains(lower),
+              name.contains(where: { $0.isLetter || $0.isNumber }),
+              !name.contains(where: { "<>%".contains($0) }) else { return }
         let pattern = try! NSRegularExpression(
             pattern: #"(?<![\p{L}\p{N}_%-])"# + NSRegularExpression.escapedPattern(for: name) + #"(?![\p{L}\p{N}_=%-])"#,
             options: .caseInsensitive)

@@ -989,6 +989,35 @@ mod tests {
         );
     }
 
+    /// An iPad named only with emoji, with an audio output already noted:
+    /// the session starts, the name stays out of the registry, and uploads
+    /// still leave out the output's name.
+    #[test]
+    fn an_emoji_only_ipad_name_panics_nothing() {
+        crate::telemetry::note_audio_device("Headphones (Ines's AirPods Max)");
+        let ControlMessage::Hello2(mut named) = hello(1, 50000) else {
+            unreachable!()
+        };
+        named.device_name = "🎮🎧🎵".to_string();
+        let mut session = Session::new(100);
+        session.handle_control(
+            addr([10, 0, 0, 5], 50000),
+            0,
+            ControlMessage::Hello2(named),
+            &TestConfig,
+            Instant::now(),
+        );
+        assert!(session.session_id().is_some());
+        assert_eq!(
+            crate::telemetry::uploaded("Stream for 🎮🎧🎵 ended"),
+            "Stream for 🎮🎧🎵 ended"
+        );
+        assert_eq!(
+            crate::telemetry::uploaded("Playing on Headphones (Ines's AirPods Max)"),
+            "Playing on <headphones>"
+        );
+    }
+
     #[test]
     fn same_device_takes_over_usb_and_ignores_late_wifi_messages() {
         let mut session = Session::new(100);

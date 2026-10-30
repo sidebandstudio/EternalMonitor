@@ -14,7 +14,7 @@ use std::{
 mod periodic;
 mod redact;
 use periodic::Periodic;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) use redact::note_audio_device;
 pub(crate) use redact::note_client_device;
 #[cfg(windows)]
