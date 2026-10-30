@@ -797,6 +797,10 @@ mod tests {
         note_connected(shared, now);
     }
 
+    /// How long a test waits for a real write: mainpc's spinning disk, which
+    /// every build there shares, stalls for 30 s at times.
+    const DISK_WAIT: Duration = Duration::from_secs(120);
+
     /// Wait for the files of every memory saving in `path`'s folder.
     fn written(path: &Path) {
         let savers: Vec<_> = {
@@ -809,7 +813,7 @@ mod tests {
                 .collect()
         };
         for saver in savers {
-            assert!(saver.flush(Duration::from_secs(10)), "written");
+            assert!(saver.flush(DISK_WAIT), "written");
         }
     }
 
@@ -2105,7 +2109,7 @@ mod tests {
 
         /// Wait for a write to reach the gate. Whether one did.
         fn reached(&self) -> bool {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + DISK_WAIT;
             let mut state = self.state.lock();
             while state.0 == 0 {
                 if self.changed.wait_until(&mut state, deadline).timed_out() {
@@ -2371,8 +2375,8 @@ mod tests {
         assert!(!next.saved() && next.hold(at).is_none());
     }
 
-    /// The last failure is on the disk when the app has quit, if the disk
-    /// answers within the quit's wait.
+    /// Quitting waits for the last failure to be written, for as long as the
+    /// quit's wait lasts.
     #[test]
     fn quitting_waits_for_the_last_save() {
         let path = temp_file("quit");
@@ -2388,16 +2392,20 @@ mod tests {
             .note_failure("no_frames", start);
         assert!(hold.is_some());
         assert!(gate.reached());
+        let stuck = Duration::from_millis(300);
+        let quitting = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(stuck);
                 gate.open();
             });
             super::super::shut_down(&shared);
-            let data = std::fs::read(&path).expect("saved before the quit ended");
-            let file: serde_json::Value = serde_json::from_slice(&data).unwrap();
-            assert_eq!(file["failure"]["reason"], "no_frames");
         });
+        // It returned no sooner than the stuck write could go on. A disk
+        // slower than the quit's own wait lets it return before the file
+        // lands, so the file is read after the writer is done.
+        assert!(quitting.elapsed() >= stuck, "{:?}", quitting.elapsed());
+        assert_eq!(saved(&path)["failure"]["reason"], "no_frames");
         remove_folder(&path);
     }
 }
