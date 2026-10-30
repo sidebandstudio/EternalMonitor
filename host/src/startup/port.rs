@@ -997,11 +997,17 @@ mod tests {
         looking_rx.recv().unwrap();
         let (read_tx, read_rx) = mpsc::channel();
         thread::spawn(move || read_tx.send(super::held()).unwrap());
-        let read = read_rx.recv_timeout(Duration::from_secs(1));
+        // The lookup is held until `release_tx` drops below, so any read
+        // that arrives came during it. The bound only ends a read that
+        // waits for the lookup; it is generous so a loaded runner can't
+        // break it.
+        let read = read_rx.recv_timeout(Duration::from_secs(30));
         drop(release_tx);
         assert!(!checker.join().unwrap());
         assert_eq!(
-            read.expect("read during the lookup").unwrap().by,
+            read.expect("the Stream page's read waited for the holder lookup")
+                .unwrap()
+                .by,
             HeldBy::Unknown
         );
         assert_eq!(super::held().unwrap().by, HeldBy::OtherCopy);
