@@ -89,6 +89,13 @@
           </a>
           <p class="dl-meta"><span id="release-meta">EternalMonitor-Setup.exe · 60.0 MB</span> · <a id="release-notes-link" href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3" target="_blank" rel="noopener">Release notes</a> · <a href="known-issues.html">Known issues</a></p>
         </div>
+        <div class="term">
+          <div class="term-head">
+            <p class="term-what">Or paste this into PowerShell. It downloads the installer and starts it only if the SHA-256 matches.</p>
+            <button type="button" class="term-copy" data-copy="install-cmd">Copy</button>
+          </div>
+          <p class="term-cmd"><span class="term-ps" aria-hidden="true">PS&gt;</span> <code id="install-cmd">irm https://eternalmonitor.dev/install.ps1 | iex</code></p>
+        </div>
         <div class="sha">
           <div class="sha-label"><span>SHA-256</span><button type="button" class="btn btn-secondary btn-sm" data-copy="sha256-value">Copy</button></div>
           <code id="sha256-value">3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b</code>
@@ -118,6 +125,13 @@
           </a>
           <p class="dl-meta"><span id="beta-meta">EternalMonitor-Setup-beta.exe</span> · <a href="https://github.com/sidebandstudio/EternalMonitor/releases/tag/beta" target="_blank" rel="noopener">Release notes</a> · <a href="known-issues.html">Known issues</a></p>
           <p class="dl-meta" id="beta-build">A new build comes out each night with the fixes that landed that day.</p>
+        </div>
+        <div class="term">
+          <div class="term-head">
+            <p class="term-what">Or paste this into PowerShell. It downloads the newest Beta and starts it only if the SHA-256 matches.</p>
+            <button type="button" class="term-copy" data-copy="beta-install-cmd">Copy</button>
+          </div>
+          <p class="term-cmd"><span class="term-ps" aria-hidden="true">PS&gt;</span> <code id="beta-install-cmd">irm https://eternalmonitor.dev/install-beta.ps1 | iex</code></p>
         </div>
         <div class="sha" id="beta-sha" hidden>
           <div class="sha-label"><span>SHA-256</span><button type="button" class="btn btn-secondary btn-sm" data-copy="beta-sha256-value">Copy</button></div>

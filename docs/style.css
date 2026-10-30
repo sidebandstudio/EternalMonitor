@@ -990,6 +990,39 @@ html:not(.channel-beta) #windows-beta,
   .shooting-star { top: 96px; left: 48%; width: 96px; }
   .platform { width: 48px; height: 48px; }
 }
+/* The PowerShell one-liner, set on Windows PowerShell's own console blue. */
+.term { margin-top: 22px; }
+.term-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.term-what { font-size: 0.9375rem; color: var(--muted); }
+.term-cmd {
+  margin-top: 10px;
+  padding: 14px 18px;
+  border-radius: var(--r-md);
+  background: #012456;
+  color: #eeedf0;
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.term-cmd code { font: inherit; color: #ffffff; }
+.term-ps { color: #9fb4d8; }
+.term-copy {
+  flex: none;
+  height: 34px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: #012456;
+  color: #ffffff;
+  font: 600 0.875rem/1 var(--font);
+  cursor: pointer;
+  transition: background-color 0.15s ease-out, transform 0.1s ease-out;
+}
+.term-copy:hover { background: #0b3a7e; }
+.term-copy:active { transform: scale(0.96); }
+.term-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.channel-beta .term-copy:focus-visible { outline-color: #c3cbff; }
 .sha {
   margin-top: 18px;
   padding: 12px 14px;
