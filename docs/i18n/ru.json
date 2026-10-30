@@ -45,7 +45,7 @@
   "index.gpu.alt": "Страница Производительность в приложении для Windows: скорость захвата, кодирования и отправки, пропускная способность и график времени кодирования кадра.",
   "index.feedback.title": "Отзыв — из любого приложения.",
   "index.feedback.text": "Обновления на ПК в один щелчок. iPad обновляется через TestFlight.",
-  "index.feedback.alt": "Настройки приложения для iPad: Send feedback, Check for updates automatically и О приложении с версией, исходным кодом, Поставить звезду EternalMonitor на GitHub и Контакты.",
+  "index.feedback.alt": "Настройки приложения для iPad: Send feedback, Проверять обновления автоматически и О приложении с версией, исходным кодом, Поставить звезду EternalMonitor на GitHub и Контакты.",
   "index.numbers.label": "В цифрах",
   "index.numbers.upTo": "До",
   "index.numbers.bitrate": "Адаптивный битрейт",

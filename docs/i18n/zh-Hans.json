@@ -45,7 +45,7 @@
   "index.gpu.alt": "Windows 应用的性能页面：采集、编码和发送速率、带宽，以及每帧编码时间的图表。",
   "index.feedback.title": "两个应用都能发送反馈。",
   "index.feedback.text": "电脑上一键更新。iPad 通过 TestFlight 更新。",
-  "index.feedback.alt": "iPad 应用的设置：Send feedback、Check for updates automatically，以及包含版本、源代码、在 GitHub 上为 EternalMonitor 加星和联系我们的“关于”。",
+  "index.feedback.alt": "iPad 应用的设置：Send feedback、自动检查更新，以及包含版本、源代码、在 GitHub 上为 EternalMonitor 加星和联系我们的“关于”。",
   "index.numbers.label": "数字一览",
   "index.numbers.upTo": "最高",
   "index.numbers.bitrate": "自适应码率",

@@ -45,7 +45,7 @@
   "index.gpu.alt": "A página Desempenho do app do Windows: taxas de captura, codificação e envio, largura de banda e um gráfico do tempo de codificação por quadro.",
   "index.feedback.title": "Envie feedback por qualquer um dos apps.",
   "index.feedback.text": "Atualizações com um clique no PC. O iPad se atualiza pelo TestFlight.",
-  "index.feedback.alt": "Os ajustes do app para iPad: Send feedback, Check for updates automatically e Sobre, com a versão, o código-fonte, Dar uma estrela no GitHub e Contato.",
+  "index.feedback.alt": "Os ajustes do app para iPad: Send feedback, Verificar atualizações automaticamente e Sobre, com a versão, o código-fonte, Dar uma estrela no GitHub e Contato.",
   "index.numbers.label": "Em números",
   "index.numbers.upTo": "Até",
   "index.numbers.bitrate": "Taxa de bits adaptável",

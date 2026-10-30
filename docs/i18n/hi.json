@@ -45,7 +45,7 @@
   "index.gpu.alt": "Windows ऐप का परफ़ॉर्मेंस पेज: कैप्चर, एन्कोड और भेजने की दरें, बैंडविड्थ, और हर फ़्रेम के एन्कोड समय का चार्ट।",
   "index.feedback.title": "किसी भी ऐप से फ़ीडबैक भेजें।",
   "index.feedback.text": "PC पर एक क्लिक में अपडेट। iPad TestFlight से अपडेट होता है।",
-  "index.feedback.alt": "iPad ऐप की सेटिंग्स: Send feedback, Check for updates automatically, और परिचय जिसमें वर्शन, सोर्स कोड, GitHub पर EternalMonitor को स्टार दें और संपर्क हैं।",
+  "index.feedback.alt": "iPad ऐप की सेटिंग्स: Send feedback, अपडेट अपने-आप जाँचें, और परिचय जिसमें वर्शन, सोर्स कोड, GitHub पर EternalMonitor को स्टार दें और संपर्क हैं।",
   "index.numbers.label": "आंकड़ों में",
   "index.numbers.upTo": "अधिकतम",
   "index.numbers.bitrate": "अडैप्टिव बिटरेट",

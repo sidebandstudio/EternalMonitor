@@ -2,22 +2,28 @@
 
    English is the HTML itself, which is what search engines and visitors
    without JavaScript get. Every other language is docs/i18n/<code>.json,
-   loaded only for the language in use. This file runs in <head>, before the
-   page shows: it picks the language (a ?lang= link, the saved choice, then
-   the browser's languages), starts loading its strings and keeps the page
-   hidden until they are in, so nothing flashes in the wrong language.
+   loaded only for the language in use.
 
-   Pages that load this with data-translated (index, download) are translated.
-   On the others the copy stays English and a line says so in the visitor's
-   language.
+   A small script inline in every page's <head> (the same on each; see
+   scripts/test_site_i18n.py) picks the language first: a ?lang= link, the
+   saved choice, then the browser's languages. For English it does nothing
+   else, so English visitors never wait on a download. For another language
+   it starts loading the strings and keeps the page hidden until they are in,
+   never longer than 3 s, so nothing flashes in the wrong language. It leaves
+   what it decided in window.emLang. This file loads async and does the rest.
+
+   Pages whose bootstrap has data-translated (index, download) are
+   translated. On the others the copy stays English and a line says so in the
+   visitor's language.
 
    In the HTML, data-i18n="key" replaces an element's text and
    data-i18n-<attribute>="key" an attribute (alt, aria-label, placeholder,
    content). In a string, <0>text</0> is the element's first child element
    (icons not counted) with new text, and <0/> keeps that child as it is, so
-   links, versions and code stay in the HTML. scripts/site_i18n.py checks
-   every language file against docs/i18n/en.json, and en.json against the
-   HTML. */
+   links, versions and code stay in the HTML. The page's English is kept the
+   first time an element is translated and put back from there, so English
+   never needs a download. scripts/site_i18n.py checks every language file
+   against docs/i18n/en.json, and en.json against the HTML. */
 (function () {
   'use strict';
 
@@ -30,48 +36,23 @@
   LANGS.forEach(function (l) { NAMES[l[0]] = l[1]; });
   var STORE = 'em-lang';
   var root = document.documentElement;
-  var me = document.currentScript;
-  var translated = !!(me && me.hasAttribute('data-translated'));
-
-  // One of ours for a language tag; null for Traditional Chinese, which has
-  // no translation and gets English rather than Simplified.
-  var match = function (tag) {
-    var parts = String(tag || '').toLowerCase().split(/[-_]/);
-    var lang = parts[0];
-    if (lang === 'zh') {
-      if (parts.indexOf('hans') > 0) return 'zh-Hans';
-      if (parts.indexOf('hant') > 0 || /^(tw|hk|mo)$/.test(parts[1] || '')) return null;
-      return 'zh-Hans';
-    }
-    if (lang === 'pt') return 'pt-BR';
-    return /^(en|es|ar|hi|ru|ja|fr|de|ko)$/.test(lang) ? lang : '';
-  };
-  var fromBrowser = function () {
-    var list = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
-    for (var i = 0; i < list.length; i++) {
-      var m = match(list[i]);
-      if (m === null) return 'en';
-      if (m) return m;
-    }
-    return 'en';
-  };
+  var boot = window.emLang || { lang: 'en' };
+  var translated = !!boot.translated;
   var save = function (lang) { try { localStorage.setItem(STORE, lang); } catch (e) {} };
-  var saved = function () { try { return match(localStorage.getItem(STORE)); } catch (e) { return ''; } };
 
-  var asked = match(new URLSearchParams(window.location.search).get('lang'));
-  if (asked) save(asked);
-  var current = 'en';
-  var wanted = asked || saved() || fromBrowser();
+  var current = 'en';  // the language the page shows
+  var latest = 0;      // the newest request; answers to older ones are dropped
   var cache = {};
-
-  var load = function (lang) {
-    if (!cache[lang]) {
-      cache[lang] = fetch('i18n/' + lang + '.json')
-        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
-      cache[lang].catch(function () { delete cache[lang]; });
-    }
-    return cache[lang];
+  var remember = function (lang, strings) {
+    cache[lang] = strings;
+    strings.catch(function () { delete cache[lang]; });
+    return strings;
   };
+  var load = function (lang) {
+    return cache[lang] || remember(lang, fetch('i18n/' + lang + '.json')
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }));
+  };
+  if (boot.strings) remember(boot.lang, boot.strings);
   var setRootLang = function (lang) {
     root.classList.toggle('not-english', lang !== 'en');
     var shown = translated ? lang : 'en';
@@ -79,14 +60,7 @@
     root.dir = shown === 'ar' ? 'rtl' : 'ltr';
   };
 
-  // Hidden (style.css) until the strings are in; never longer than 3 s.
-  var reveal = function () { root.classList.remove('i18n-wait'); };
-  if (wanted !== 'en') {
-    root.classList.add('i18n-wait');
-    setRootLang(wanted);
-    setTimeout(reveal, 3000);
-  }
-  var strings = wanted !== 'en' ? load(wanted) : null;
+  var reveal = function () { clearTimeout(boot.timer); root.classList.remove('i18n-wait'); };
   var domReady = new Promise(function (resolve) {
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', resolve);
     else resolve();
@@ -96,9 +70,29 @@
   var TOKEN = /<(\d+)>([^<]*)<\/\1>|<(\d+)\/>/g;
   var isIcon = function (el) { return /^(svg|img)$/i.test(el.tagName); };
 
+  // The page's English for each element translated so far, kept before the
+  // first change: its child nodes when its text is replaced, and attributes.
+  var touched = [];
+  var kept = function (el) {
+    if (!el.__i18nEn) { el.__i18nEn = {}; touched.push(el); }
+    return el.__i18nEn;
+  };
+  var restore = function () {
+    touched.forEach(function (el) {
+      var en = el.__i18nEn;
+      if (en.nodes) {
+        el.textContent = '';
+        en.nodes.forEach(function (n) { el.appendChild(n); });
+      }
+      for (var attr in en.attrs) el.setAttribute(attr, en.attrs[attr]);
+    });
+  };
+
   var fill = function (el, text) {
     // The element's own children are captured once and moved, never cloned,
     // so other scripts keep their references (the iPad build, star counts).
+    var en = kept(el);
+    if (!en.nodes) en.nodes = Array.prototype.slice.call(el.childNodes);
     var kids = el.__i18nKids || (el.__i18nKids = Array.prototype.filter.call(el.children, function (c) { return !isIcon(c); }));
     Array.prototype.slice.call(el.childNodes).forEach(function (n) {
       if (n.nodeType === 3 || kids.indexOf(n) >= 0) el.removeChild(n);
@@ -109,7 +103,11 @@
       if (m.index > at) frag.appendChild(document.createTextNode(text.slice(at, m.index)));
       var kid = kids[+(m[1] || m[3])];
       if (kid) {
-        if (m[1]) kid.textContent = m[2];
+        if (m[1]) {
+          var kidEn = kept(kid);
+          if (!kidEn.nodes) kidEn.nodes = Array.prototype.slice.call(kid.childNodes);
+          kid.textContent = m[2];
+        }
         frag.appendChild(kid);
       }
       at = TOKEN.lastIndex;
@@ -127,20 +125,35 @@
     ATTRS.forEach(function (attr) {
       Array.prototype.forEach.call(scope.querySelectorAll('[data-i18n-' + attr + ']'), function (el) {
         var text = dict[el.getAttribute('data-i18n-' + attr)];
-        if (typeof text === 'string') el.setAttribute(attr, text);
+        if (typeof text !== 'string') return;
+        var en = kept(el);
+        en.attrs = en.attrs || {};
+        if (!(attr in en.attrs)) en.attrs[attr] = el.getAttribute(attr);
+        el.setAttribute(attr, text);
       });
     });
   };
 
   var active = {};
   var apply = function (lang, dict) {
+    var scope = translated ? document : document.querySelector('[data-lang]');
+    if (scope) translate(scope, dict);
+    show(lang, dict);
+  };
+  // English from the page itself, with no download: also what a timeout or a
+  // failed download shows.
+  var showEnglish = function () {
+    restore();
+    show('en', {});
+  };
+  // Everything around the copy that follows the language: the root's lang and
+  // dir, the switcher, the English toggle and the English-only note.
+  var show = function (lang, dict) {
     active = dict;
     current = lang;
     setRootLang(lang);
-    if (translated) translate(document, dict);
     var box = document.querySelector('[data-lang]');
     if (box) {
-      if (!translated) translate(box, dict);
       if (!translated) box.lang = lang;
       var name = box.querySelector('[data-lang-name]');
       if (name) { name.textContent = NAMES[lang]; name.lang = lang; }
@@ -149,8 +162,8 @@
         else a.removeAttribute('aria-current');
       });
     }
-    var english = document.querySelector('[data-lang-english]');
-    if (english) english.hidden = lang === 'en';
+    var toggle = document.querySelector('[data-lang-english]');
+    if (toggle) toggle.hidden = lang === 'en';
     if (!translated) englishOnlyNote(lang, dict);
     reveal();
     document.dispatchEvent(new CustomEvent('em:language', { detail: { lang: lang } }));
@@ -173,6 +186,21 @@
     note.textContent = dict['page.englishOnly'];
   };
 
+  var request = function (lang, strings) {
+    var id = ++latest;
+    if (lang === 'en') showEnglish();
+    else if (lang !== current) {
+      Promise.all([strings || load(lang), domReady]).then(function (r) {
+        if (id === latest) apply(lang, r[0]);
+      }, function () {
+        // No strings (offline, blocked): the page is English. The choice
+        // stays saved, so the next page or visit tries again.
+        if (id === latest) showEnglish();
+      });
+    }
+    return id;
+  };
+
   var choose = function (lang) {
     save(lang);
     // A ?lang= left in the address would bring the old choice back on reload.
@@ -181,8 +209,7 @@
       url.searchParams.delete('lang');
       history.replaceState(history.state, '', url.pathname + url.search + url.hash);
     }
-    if (lang === current) return;
-    load(lang).then(function (dict) { apply(lang, dict); }, function () {});
+    request(lang);
   };
 
   /* --- The switcher ---------------------------------------------------------- */
@@ -249,12 +276,13 @@
   };
 
   domReady.then(wire);
-  if (strings) {
-    Promise.all([strings, domReady]).then(function (r) { apply(wanted, r[0]); }, function () {
-      // No strings (offline, blocked): the page stays in English.
-      setRootLang('en');
-      reveal();
-    });
+  if (boot.strings) {
+    var first = request(boot.lang, boot.strings);
+    // The bootstrap's 3 s limit, or its strings failing: English, and an
+    // answer that comes in later is dropped.
+    boot.fail = function () {
+      if (latest === first) { latest++; showEnglish(); }
+    };
   }
 
   // For docs/script.js: the active language's text for a key, else English.

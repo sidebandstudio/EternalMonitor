@@ -45,7 +45,7 @@
   "index.gpu.alt": "Die Seite Leistung der Windows-App: Raten für Aufnahme, Kodierung und Senden, Bandbreite und ein Diagramm der Kodierzeit pro Bild.",
   "index.feedback.title": "Feedback aus beiden Apps senden.",
   "index.feedback.text": "Updates mit einem Klick auf dem PC. Das iPad aktualisiert sich über TestFlight.",
-  "index.feedback.alt": "Die Einstellungen der iPad-App: Send feedback, Check for updates automatically und Über mit der Version, dem Quellcode, Auf GitHub mit Stern markieren und Kontakt.",
+  "index.feedback.alt": "Die Einstellungen der iPad-App: Send feedback, Automatisch nach Updates suchen und Über mit der Version, dem Quellcode, Auf GitHub mit Stern markieren und Kontakt.",
   "index.numbers.label": "In Zahlen",
   "index.numbers.upTo": "Bis zu",
   "index.numbers.bitrate": "Adaptive Bitrate",

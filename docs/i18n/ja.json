@@ -45,7 +45,7 @@
   "index.gpu.alt": "Windows アプリのパフォーマンスページ。キャプチャ、エンコード、送信のレート、帯域幅、フレームごとのエンコード時間のグラフ。",
   "index.feedback.title": "どちらのアプリからもフィードバックを送れます。",
   "index.feedback.text": "PC はワンクリックでアップデート。iPad は TestFlight でアップデートします。",
-  "index.feedback.alt": "iPad アプリの設定。Send feedback、Check for updates automatically、そしてバージョン、ソースコード、GitHub で EternalMonitor にスター、お問い合わせのある「情報」。",
+  "index.feedback.alt": "iPad アプリの設定。Send feedback、アップデートを自動的に確認、そしてバージョン、ソースコード、GitHub で EternalMonitor にスター、お問い合わせのある「情報」。",
   "index.numbers.label": "数字で見る",
   "index.numbers.upTo": "最大",
   "index.numbers.bitrate": "可変ビットレート",

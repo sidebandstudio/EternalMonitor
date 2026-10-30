@@ -1,6 +1,7 @@
 """site_i18n.py must keep every language file in step with the site's English."""
 import json
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -21,15 +22,33 @@ class RealSiteTest(unittest.TestCase):
         for lang in site_i18n.LANGS:
             self.assertTrue((DOCS / "i18n" / f"{lang}.json").is_file(), lang)
 
+    def bootstrap(self, html):
+        """The inline language script in <head> and its opening tag."""
+        head = html[:html.index("</head>")]
+        match = re.search(r"(<script(?: data-translated)?>)(\s*/\* The language, before anything shows\..*?)</script>", head, re.S)
+        self.assertIsNotNone(match)
+        return match.group(1), match.group(2)
+
     def test_translated_pages_mark_their_copy(self):
         for name in site_i18n.TRANSLATED:
             html = (DOCS / name).read_text()
-            self.assertIn('<script src="i18n.js" data-translated></script>', html, name)
+            self.assertEqual(self.bootstrap(html)[0], "<script data-translated>", name)
             self.assertGreater(html.count("data-i18n"), 50, name)
         for name in site_i18n.UNTRANSLATED:
             html = (DOCS / name).read_text()
-            self.assertIn('<script src="i18n.js"></script>', html, name)
+            self.assertEqual(self.bootstrap(html)[0], "<script>", name)
             self.assertIn("data-lang-english", html, name)
+
+    def test_english_never_waits_for_a_script(self):
+        # The language is picked inline, the same way on every page, and
+        # i18n.js loads without holding up the page.
+        pages = site_i18n.TRANSLATED + site_i18n.UNTRANSLATED
+        scripts = {name: self.bootstrap((DOCS / name).read_text())[1] for name in pages}
+        self.assertEqual(len(set(scripts.values())), 1, "the bootstrap differs between pages")
+        for name in pages:
+            html = (DOCS / name).read_text()
+            self.assertIn('<script src="i18n.js" async></script>', html, name)
+            self.assertEqual(len(re.findall(r'<script src="i18n\.js"', html)), 1, name)
 
 
 class ContentTest(unittest.TestCase):

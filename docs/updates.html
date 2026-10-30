@@ -4,7 +4,49 @@
   <meta charset="UTF-8">
   <script>document.documentElement.className = 'js';</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <script src="i18n.js"></script>
+  <script>
+    /* The language, before anything shows. English needs nothing more; another
+       language starts loading here and the page waits for it, at most 3 s.
+       docs/i18n.js explains; every page has this same script. */
+    (function () {
+      var root = document.documentElement;
+      var match = function (tag) {
+        var p = String(tag || '').toLowerCase().split(/[-_]/);
+        // Traditional Chinese has no translation: null means English.
+        if (p[0] === 'zh') return p.indexOf('hans') < 0 && (p.indexOf('hant') > 0 || /^(tw|hk|mo)$/.test(p[1] || '')) ? null : 'zh-Hans';
+        if (p[0] === 'pt') return 'pt-BR';
+        return /^(en|es|ar|hi|ru|ja|fr|de|ko)$/.test(p[0]) ? p[0] : '';
+      };
+      var lang = match(new URLSearchParams(location.search).get('lang'));
+      try {
+        if (lang) localStorage.setItem('em-lang', lang);
+        else lang = match(localStorage.getItem('em-lang'));
+      } catch (e) {}
+      var list = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+      for (var i = 0; !lang && i < list.length; i++) {
+        lang = match(list[i]);
+        if (lang === null) lang = 'en';
+      }
+      var boot = window.emLang = { lang: lang || 'en', translated: document.currentScript.hasAttribute('data-translated') };
+      if (boot.lang === 'en') return;
+      root.classList.add('not-english', 'i18n-wait');
+      if (boot.translated) { root.lang = boot.lang; root.dir = boot.lang === 'ar' ? 'rtl' : 'ltr'; }
+      // Too slow or no strings: English (docs/i18n.js does it once it runs).
+      var english = function () {
+        clearTimeout(boot.timer);
+        if (boot.fail) return boot.fail();
+        boot.lang = 'en';
+        boot.strings = null;
+        root.classList.remove('not-english', 'i18n-wait');
+        root.lang = 'en';
+        root.dir = 'ltr';
+      };
+      boot.timer = setTimeout(english, 3000);
+      boot.strings = fetch('i18n/' + boot.lang + '.json').then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+      boot.strings.catch(english);
+    })();
+  </script>
+  <script src="i18n.js" async></script>
   <title>Updates | EternalMonitor</title>
   <meta name="description" content="What's new in each EternalMonitor release, and what it fixes.">
   <link rel="canonical" href="https://eternalmonitor.dev/updates.html">

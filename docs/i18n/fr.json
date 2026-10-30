@@ -45,7 +45,7 @@
   "index.gpu.alt": "La page Performances de l'app Windows : débits de capture, d'encodage et d'envoi, bande passante, et un graphique du temps d'encodage par image.",
   "index.feedback.title": "Envoyez un avis depuis l'une ou l'autre app.",
   "index.feedback.text": "Mises à jour en un clic sur le PC. L'iPad se met à jour via TestFlight.",
-  "index.feedback.alt": "Les réglages de l'app iPad : Send feedback, Check for updates automatically et À propos, avec la version, le code source, Mettre une étoile sur GitHub et Contact.",
+  "index.feedback.alt": "Les réglages de l'app iPad : Send feedback, Rechercher les mises à jour automatiquement et À propos, avec la version, le code source, Mettre une étoile sur GitHub et Contact.",
   "index.numbers.label": "En chiffres",
   "index.numbers.upTo": "Jusqu'à",
   "index.numbers.bitrate": "Débit adaptatif",

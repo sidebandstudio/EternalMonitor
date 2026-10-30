@@ -45,7 +45,7 @@
   "index.gpu.alt": "Windows 앱의 성능 페이지: 캡처, 인코딩, 전송 속도, 대역폭, 프레임당 인코딩 시간 그래프.",
   "index.feedback.title": "두 앱 어디서나 피드백을 보내세요.",
   "index.feedback.text": "PC는 클릭 한 번으로 업데이트. iPad는 TestFlight로 업데이트됩니다.",
-  "index.feedback.alt": "iPad 앱의 설정: Send feedback, Check for updates automatically, 그리고 버전, 소스 코드, GitHub에서 EternalMonitor에 별표, 문의가 있는 정보.",
+  "index.feedback.alt": "iPad 앱의 설정: Send feedback, 자동으로 업데이트 확인, 그리고 버전, 소스 코드, GitHub에서 EternalMonitor에 별표, 문의가 있는 정보.",
   "index.numbers.label": "숫자로 보기",
   "index.numbers.upTo": "최대",
   "index.numbers.bitrate": "적응형 비트레이트",
