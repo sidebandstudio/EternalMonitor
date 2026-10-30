@@ -837,6 +837,20 @@ mod tests {
         panic!("the path already names it")
     }
 
+    /// Waits for the lookup thread to end, however slowly a loaded PC runs
+    /// it. A describe closure that panicked leaves [`LOOKING`] set, so the
+    /// wait gives up after a minute instead of at the CI job's timeout.
+    fn lookup_ended() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while LOOKING.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the port holder lookup still runs after 60 s; did a describe closure panic?"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// A program whose file is slow to read (a network share) goes by its
     /// file name after [`LOOKUP`], and no second read starts while it runs.
     /// Its path still names Windows, a service host and another copy at
@@ -845,18 +859,21 @@ mod tests {
     fn a_slow_description_leaves_the_program_named_by_its_file() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let slow = r"\\share\tools\slow.exe";
+        lookup_ended();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let by = identify(1234, 0, image(slow), move |_| {
             let _ = release_rx.recv();
             Some("Slow Tool".into())
         });
-        let took = started.elapsed();
+        // A lower bound, which load can't break. The read is held until
+        // `release_tx` drops, so it still running proves the call returned
+        // without waiting for it.
+        assert!(started.elapsed() >= LOOKUP);
         assert_eq!(by, HeldBy::Program("slow.exe".into()));
-        assert!(took >= LOOKUP && took < LOOKUP * 4, "{took:?}");
+        assert!(LOOKING.load(Ordering::Acquire), "the slow one still runs");
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
-        let started = std::time::Instant::now();
         let by = identify(1234, 0, image(r"C:\Tools\quick.exe"), {
             let ran = ran.clone();
             move |_| {
@@ -885,25 +902,30 @@ mod tests {
             HeldBy::WindowsService
         );
         assert_eq!(identify(1234, 0, |_| None, not_read), HeldBy::Unknown);
-        assert!(started.elapsed() < LOOKUP, "didn't wait");
+        // None of them waited for the slow read, which is still held, and
+        // quick.exe's read didn't start (a started one is waited for and
+        // would have named it "Quick").
+        assert!(LOOKING.load(Ordering::Acquire), "didn't wait");
 
         drop(release_tx);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while identify(1234, 0, image(slow), |_| None) != HeldBy::Program("Slow Tool".into()) {
-            assert!(std::time::Instant::now() < deadline, "the slow one ends");
-            thread::sleep(Duration::from_millis(10));
-        }
-        // A later read for the same process that would be slow isn't waited
-        // for.
-        let started = std::time::Instant::now();
+        // Polling here could start a read of its own between the slow read
+        // being kept and its thread ending, and keep that one instead.
+        lookup_ended();
+        // A later read for the same process isn't started: the kept
+        // description answers.
+        let read_again = std::sync::Arc::new(AtomicBool::new(false));
         assert_eq!(
-            identify(1234, 0, image(slow), |_| {
-                thread::sleep(LOOKUP * 2);
-                None
+            identify(1234, 0, image(slow), {
+                let read_again = read_again.clone();
+                move |_| {
+                    read_again.store(true, Ordering::SeqCst);
+                    None
+                }
             }),
             HeldBy::Program("Slow Tool".into())
         );
-        assert!(started.elapsed() < LOOKUP, "didn't read again");
+        lookup_ended();
+        assert!(!read_again.load(Ordering::SeqCst), "didn't read again");
         assert_eq!(identify(7, 7, |_| None, not_read), HeldBy::ThisCopy);
     }
 
@@ -914,14 +936,8 @@ mod tests {
     fn another_process_at_the_same_path_is_read_again() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let tool = r"C:\Tools\tool.exe";
-        // Waits for the lookup thread to end, however slowly a loaded PC
-        // runs it. A lookup that hadn't ended yet kept the next process's
-        // from starting, and a quick read then kept no description for it.
-        let lookup_ended = || {
-            while LOOKING.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-            }
-        };
+        // A lookup that hadn't ended yet kept the next process's from
+        // starting, and a quick read then kept no description for it.
         for (pid, at) in [(1234, 1), (5678, 1), (1234, 2)] {
             let own = format!("Tool {pid} from {at}");
             lookup_ended();
