@@ -341,10 +341,11 @@ small { font-size: 0.875rem; }
 }
 
 /* --- Hero stage --------------------------------------------------------------
-   A laptop and an iPad on its dock, joined by a USB-C cable: one render of the
-   two devices with their displays cut out (assets/hero/devices), the screens
-   beneath it and the cable above it, all placed in percent of the render's
-   2709 x 980 canvas (site-demos/capture/hero_compose.py prints the numbers).
+   A laptop and an iPad on its dock, joined by a USB-C cable: one picture of the
+   two devices and their shadow on the desk, the displays cut out
+   (assets/hero/devices), the screens beneath it and the cable above it, all
+   placed in percent of the picture's 2709 x 980 canvas
+   (site-demos/capture/hero_compose.py prints the numbers).
    script.js switches the screens with the two radio groups; without it the
    picture stays in its first state and the radios are hidden. */
 
@@ -355,7 +356,7 @@ small { font-size: 0.875rem; }
 .rig > img, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
 .rig-devices { inset: 0; width: 100%; height: 100%; }
 .rig-laptop { left: 5.906%; top: 5.612%; width: 39.793%; height: 60.51%; }
-.rig-ipad { left: 66.002%; top: 24.694%; width: 32.226%; height: 61.224%; }
+.rig-ipad { left: 64.747%; top: 8.469%; width: 32.927%; height: 62.857%; }
 .rig-laptop, .rig-ipad { overflow: hidden; background: #000; }
 /* A switch lays the new picture over the old one, which stays whole beneath
    it until the new one is complete and only then goes. On the laptop the new
@@ -368,12 +369,12 @@ small { font-size: 0.875rem; }
 /* Mirroring, the iPad shows the laptop's picture whole, with bars. */
 .rig-ipad .mirror { display: block; background: #000; }
 .rig-ipad .mirror img { object-fit: contain; }
-.rig-cable { left: 48.911%; top: 52.857%; width: 16.131%; height: auto; transition: opacity 0.5s ease; }
+.rig-cable { left: 41.824%; top: 37.653%; width: 26.984%; height: auto; transition: opacity 0.5s ease; }
 .stage[data-link="wifi"] .rig-cable { opacity: 0; }
 /* Over Wi-Fi: the cable is gone and a calm signal sits between the devices.
    It ripples outward twice as it arrives, then rests, all within five seconds. */
 .rig-air {
-  left: 53.6%; top: 46%; width: 3.4%; height: auto;
+  left: 55.6%; top: 44%; width: 3.4%; height: auto;
   fill: none; stroke: var(--text); stroke-width: 3.2; stroke-linecap: round;
   opacity: 0; transform: translateY(8%); transition: opacity 0.5s ease, transform 0.6s var(--ease-out);
 }
