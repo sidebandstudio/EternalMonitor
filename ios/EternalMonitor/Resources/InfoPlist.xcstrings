@@ -1,0 +1,150 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "NSCameraUsageDescription" : {
+      "comment" : "Info.plist permission prompt; iPadOS shows it in the device language",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "امسح رمز QR الظاهر في EternalMonitor على الكمبيوتر للاتصال دون كتابة عنوانه."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scanne den QR-Code, den EternalMonitor auf deinem PC zeigt, um ohne Eingabe der Adresse zu verbinden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scan the QR code shown in EternalMonitor on your PC to connect without typing its address."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escanea el código QR que muestra EternalMonitor en tu PC para conectarte sin escribir la dirección."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scannez le code QR affiché dans EternalMonitor sur votre PC pour vous connecter sans saisir son adresse."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "पता लिखे बिना कनेक्ट करने के लिए अपने PC पर EternalMonitor में दिखाया गया QR कोड स्कैन करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC の EternalMonitor に表示された QR コードをスキャンすると、アドレスを入力せずに接続できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC의 EternalMonitor에 표시된 QR 코드를 스캔하면 주소를 입력하지 않고 연결할 수 있습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escaneie o código QR exibido no EternalMonitor do seu PC para conectar sem digitar o endereço."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отсканируйте QR-код в EternalMonitor на ПК, чтобы подключиться без ввода адреса."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "扫描电脑上 EternalMonitor 显示的二维码，无需输入地址即可连接。"
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription" : {
+      "comment" : "Info.plist permission prompt; iPadOS shows it in the device language",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "يستقبل EternalMonitor صورة كمبيوتر Windows عبر الشبكة المحلية."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor empfängt das Bild deines Windows-PCs über das lokale Netzwerk."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor receives video frames from your Windows PC over the local network."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor recibe la imagen de tu PC con Windows a través de la red local."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor reçoit l'image de votre PC Windows via le réseau local."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor लोकल नेटवर्क पर आपके Windows PC से वीडियो फ़्रेम पाता है।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor はローカルネットワーク経由で Windows PC の映像を受信します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor는 로컬 네트워크를 통해 Windows PC의 화면을 받습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O EternalMonitor recebe a imagem do seu PC com Windows pela rede local."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor получает изображение с ПК с Windows по локальной сети."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "EternalMonitor 通过本地网络接收 Windows 电脑的画面。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

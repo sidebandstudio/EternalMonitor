@@ -68,9 +68,13 @@ invite link.
 
 1. Make sure the PC and iPad are on the same network, and EternalMonitor is
    open on the PC.
-2. Open EternalMonitor on the iPad. The first time, the iPad asks whether
-   EternalMonitor can **find and connect to devices on your local network**.
-   Tap **Allow**. Without this, the iPad cannot see your PC.
+2. Open EternalMonitor on the iPad. The first time, a short setup asks for
+   your **Language**, then explains **Local network**: tap **Continue**, and
+   when iPadOS asks whether EternalMonitor can **find and connect to devices
+   on your local network**, tap **Allow**. Without this, the iPad cannot see
+   your PC. Its last step offers the ways to connect below. Any step can be
+   skipped, and **Run setup again** in the app's settings opens it later. The
+   language can also be changed under **Language** in the app's settings.
 3. Choose one of these ways to connect:
    - **Tap your PC.** The iPad looks for PCs by itself. Tap your PC under
      **Found on this network** and it connects. While it says **Finding…**,

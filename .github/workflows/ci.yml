@@ -148,11 +148,11 @@ jobs:
           xcodebuild -version
           UDID=$(python3 scripts/ci_simulator.py citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Run iOS unit tests and connection/settings UI tests
+      - name: Run iOS unit tests and connection/settings/setup UI tests
         env:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests
+          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests -only-testing:EternalMonitorUITests/SetupTests
       - name: Check the ios-test-evidence artifact for secret values
         # Artifacts are public and not masked like the job log.
         id: evidence-scan
