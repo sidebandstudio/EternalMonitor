@@ -14,8 +14,8 @@
 
 pub mod bidi;
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -210,6 +210,8 @@ struct Table {
     logical: HashMap<&'static str, &'static str>,
     /// Drawn text → key, for automation names and Arabic wrapping.
     keys: HashMap<&'static str, &'static str>,
+    /// Drawn text that more than one key translates to.
+    shared: HashSet<&'static str>,
 }
 
 fn parse(json: &str) -> BTreeMap<String, String> {
@@ -226,6 +228,7 @@ fn table(lang: Lang) -> &'static Table {
             shown: HashMap::new(),
             logical: HashMap::new(),
             keys: HashMap::new(),
+            shared: HashSet::new(),
         };
         for (key, value) in parse(lang.strings()) {
             let key = leak(key);
@@ -236,7 +239,9 @@ fn table(lang: Lang) -> &'static Table {
             };
             table.logical.insert(key, leak(value));
             table.shown.insert(key, shown);
-            table.keys.insert(shown, key);
+            if table.keys.insert(shown, key).is_some() {
+                table.shared.insert(shown);
+            }
         }
         table
     })
@@ -246,6 +251,10 @@ thread_local! {
     // The window draws on one thread. Per thread, so the unit tests that
     // change it do not race each other.
     static ACTIVE: Cell<Lang> = const { Cell::new(Lang::En) };
+    // Drawn text this pass → its English, where the tables cannot tell:
+    // [`trf`] text with its values filled in, and a translation two keys
+    // share, by the key it was last drawn for. Cleared by [`begin_pass`].
+    static DRAWN: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 /// The language the window draws in.
@@ -266,8 +275,29 @@ pub fn is_rtl() -> bool {
 pub fn tr(key: &'static str) -> &'static str {
     match active() {
         Lang::En => key,
-        lang => table(lang).shown.get(key).copied().unwrap_or(key),
+        lang => {
+            let table = table(lang);
+            let shown = table.shown.get(key).copied().unwrap_or(key);
+            if table.shared.contains(shown) {
+                remember(shown, key);
+            }
+            shown
+        }
     }
+}
+
+fn remember(shown: &str, english: &str) {
+    DRAWN.with(|drawn| {
+        drawn
+            .borrow_mut()
+            .insert(shown.to_string(), english.to_string())
+    });
+}
+
+/// Forgets the text [`tr`] and [`trf`] drew in the last pass. The window
+/// calls it as each pass begins.
+pub fn begin_pass() {
+    DRAWN.with(|drawn| drawn.borrow_mut().clear());
 }
 
 /// [`tr`] with `{name}` placeholders filled in. In Arabic each value is
@@ -283,7 +313,9 @@ pub fn trf(key: &'static str, args: &[(&str, &str)]) -> String {
             .unwrap_or(key)
             .to_string(),
     };
+    let mut english = key.to_string();
     for (name, value) in args {
+        english = english.replace(&format!("{{{name}}}"), value);
         let value = if lang.is_rtl() {
             format!("{}{value}{}", bidi::FSI, bidi::PDI)
         } else {
@@ -291,20 +323,44 @@ pub fn trf(key: &'static str, args: &[(&str, &str)]) -> String {
         };
         text = text.replace(&format!("{{{name}}}"), &value);
     }
-    if lang.is_rtl() {
+    let text = if lang.is_rtl() {
         bidi::visual(&text)
     } else {
         text
+    };
+    if lang != Lang::En {
+        remember(&text, &english);
     }
+    text
 }
 
 /// The English text a widget shows `shown` for: its automation name, which
-/// scripts and tests find it by in every language.
-pub fn name(shown: &str) -> &str {
-    match active() {
-        Lang::En => shown,
-        lang => table(lang).keys.get(shown).copied().unwrap_or(shown),
+/// scripts and tests find it by in every language. Text joined with " · ",
+/// such as a status line, is named part by part.
+pub fn name(shown: &str) -> String {
+    let lang = active();
+    if lang == Lang::En {
+        return shown.to_string();
     }
+    let english = |part: &str| -> Option<String> {
+        DRAWN
+            .with(|drawn| drawn.borrow().get(part).cloned())
+            .or_else(|| table(lang).keys.get(part).map(|key| key.to_string()))
+    };
+    if let Some(name) = english(shown) {
+        return name;
+    }
+    if !shown.contains('·') {
+        return shown.to_string();
+    }
+    shown
+        .split('·')
+        .map(|part| match english(part.trim()) {
+            Some(name) => part.replace(part.trim(), &name),
+            None => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("·")
 }
 
 /// `shown` in reading order, when it is a right-to-left translation; for

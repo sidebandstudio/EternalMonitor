@@ -102,7 +102,7 @@ pub fn paragraph(ui: &mut Ui, text: RichText) -> Response {
 pub fn name_label(response: &Response, shown: &str) {
     let name = i18n::name(shown);
     if name != shown {
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, name));
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &name));
     }
 }
 

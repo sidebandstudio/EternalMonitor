@@ -85,13 +85,16 @@ impl AnalyzerApp {
                 ui.set_width(WIDTH);
                 ui.spacing_mut().item_spacing.y = 6.0;
                 let (title, subtitle) = heading(step);
-                ui.label(overline(&trf(
-                    "Step {step} of {total}",
-                    &[
-                        ("step", &(setup.step + 1).to_string()),
-                        ("total", &STEPS.len().to_string()),
-                    ],
-                )));
+                widgets::overline_label(
+                    ui,
+                    &trf(
+                        "Step {step} of {total}",
+                        &[
+                            ("step", &(setup.step + 1).to_string()),
+                            ("total", &STEPS.len().to_string()),
+                        ],
+                    ),
+                );
                 let response = ui.label(
                     RichText::new(title)
                         .family(semibold())
