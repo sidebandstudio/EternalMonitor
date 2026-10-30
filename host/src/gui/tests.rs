@@ -327,6 +327,12 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         "{body}"
     );
     assert!(body.contains("Restart"), "{body}");
+    // Kepler cards (GTX 600/700) stop at driver 470 and can't install 570.
+    assert!(body.contains("if your graphics card supports it"), "{body}");
+    assert!(
+        body.contains("Older cards keep using the processor"),
+        "{body}"
+    );
     for jargon in ["NVENC", "API", "libx264", "encoder", "http"] {
         assert!(!body.contains(jargon), "{body}");
     }

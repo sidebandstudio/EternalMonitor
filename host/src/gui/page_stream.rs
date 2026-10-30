@@ -763,7 +763,7 @@ pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: b
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
         format!(
-            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, then click Restart.",
+            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
             crate::encoder::NVENC_MIN_DRIVER
         )
     } else {
