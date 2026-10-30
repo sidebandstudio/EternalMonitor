@@ -74,8 +74,10 @@ impl FakeDisplay {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // Loaded before the lock: loading starts the record's writer.
+        let loaded = Memory::load(memory.join(FILE_NAME), fingerprint, wall, Instant::now());
         let mut state = shared.second_screen.lock();
-        state.memory = Memory::load(memory.join(FILE_NAME), fingerprint, wall, Instant::now());
+        state.memory = loaded;
         state.fake_desktop_away = Some(self.0.desktop_away.clone());
         drop(state);
         *shared.vdd_worker.fake.lock() = Some(self.clone());
