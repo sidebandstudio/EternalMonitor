@@ -172,6 +172,7 @@
   "common.copied": "Copied",
   "download.form.placeholder.idea": "What would make EternalMonitor more useful for you?",
   "download.form.placeholder.hello": "Anything at all. How you use it, what you study, what you draw.",
+  "download.ipad.version": "v{version}, build {build}",
   "download.beta.missing": "The first Beta build is on its way. Use Stable until then.",
   "download.beta.build": "A new build comes out each night with the fixes that landed that day.",
   "download.beta.versionBuiltFrom": "Version {version}, built {date} from {commit}",

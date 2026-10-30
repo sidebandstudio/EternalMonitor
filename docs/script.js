@@ -411,6 +411,18 @@
     var tfLink = document.getElementById('testflight-link');
     var notesLink = document.getElementById('release-notes-link');
     var htmlTag = versionEls.length ? versionEls[0].textContent.trim() : '';
+    // The iPad build line, from the page's own text until latest.json answers,
+    // in the visitor's language.
+    var ipadShown = ipadEls.length && ipadEls[0].textContent.trim().match(/^v(\d+\.\d+\.\d+), build (\d+)$/);
+    ipadShown = ipadShown ? { version: ipadShown[1], build: ipadShown[2] } : null;
+    var drawIpad = function () {
+      if (!ipadShown) return;
+      var text = t('download.ipad.version', 'v{version}, build {build}')
+        .replace('{version}', ipadShown.version).replace('{build}', ipadShown.build);
+      ipadEls.forEach(function (el) { el.textContent = text; });
+    };
+    drawIpad();
+    onLanguage(drawIpad);
 
     var formatBytes = function (n) {
       if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
@@ -431,7 +443,8 @@
         if (notesLink) notesLink.href = 'https://github.com/' + REPO + '/releases/tag/' + tag;
         var ipad = latest.ipad || {};
         if (ipad.version && ipad.build) {
-          ipadEls.forEach(function (el) { el.textContent = 'v' + ipad.version + ', build ' + ipad.build; });
+          ipadShown = { version: String(ipad.version), build: String(ipad.build) };
+          drawIpad();
         }
         if (tfLink && /^https:\/\/testflight\.apple\.com\/join\/[A-Za-z0-9]+$/.test(ipad.testflight || '')) {
           tfLink.href = ipad.testflight;

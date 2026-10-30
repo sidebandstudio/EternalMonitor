@@ -1790,7 +1790,8 @@ html:lang(ko) { word-break: keep-all; }
 /* Right to left. Screenshots, the logo, code, versions and checksums keep
    their left-to-right order. */
 [dir="rtl"] :is(.brand, .stage, .tablet, pre, code) { direction: ltr; }
-[dir="rtl"] :is(#release-meta, [data-win-version], [data-ipad-version]) { direction: ltr; unicode-bidi: isolate; }
+[dir="rtl"] :is(#release-meta, [data-win-version]) { direction: ltr; unicode-bidi: isolate; }
+[dir="rtl"] [data-ipad-version] { unicode-bidi: isolate; }
 [dir="rtl"] .sha code { text-align: left; }
 [dir="rtl"] .skip-link { left: auto; right: 16px; }
 [dir="rtl"] .nav .btn { margin-left: 0; margin-right: 6px; }
