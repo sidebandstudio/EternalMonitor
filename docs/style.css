@@ -1496,6 +1496,18 @@ html.js .reveal.visible { opacity: 1; transform: none; }
   .nav-link .count { display: none; }
 }
 
+/* Below 360px the brand shows its mark only; the link keeps its name for
+   screen readers. Neither side of the bar may shrink, so nothing overlaps. */
+.brand-mark, .brand > img, .nav-links { flex: none; }
+@media (max-width: 360px) {
+  .brand > span:last-child {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
 /* "Built by engineers from": the companies Sideband Studio's engineers have
    worked at. The logos are the companies' own files; one filter turns each into
    flat white and the opacity mutes it, so they read the same on the plain page
