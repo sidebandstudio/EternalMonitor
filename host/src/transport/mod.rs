@@ -173,6 +173,11 @@ pub async fn start_sender(
 
     let local_addr = socket.local_addr()?;
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
+    // The Address row and QR code follow every bind, so a chosen network
+    // that came back shows its address. Resolved before locking: the stats
+    // lock is shared with every pipeline thread.
+    let shown = crate::gui::shown_address(bind_ip, listen_port);
+    PIPELINE_STATS.lock().set_listen_addr(shown);
     PIPELINE_STATS
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());

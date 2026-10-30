@@ -1670,7 +1670,12 @@ pub fn detect_local_ip(listen_port: u16) -> String {
 /// every network, else the chosen network's address. "unknown" while that
 /// network isn't connected.
 pub fn listen_address(choice: &crate::network::ListenOn, listen_port: u16) -> String {
-    match crate::network::listen_ip_now(choice) {
+    shown_address(crate::network::listen_ip_now(choice), listen_port)
+}
+
+/// What the Address row shows for a stream listening on `ip`.
+pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
+    match ip {
         ip if ip.is_unspecified() => detect_local_ip(listen_port),
         ip if ip.is_loopback() => format!("unknown:{listen_port}"),
         ip => format!("{ip}:{listen_port}"),
