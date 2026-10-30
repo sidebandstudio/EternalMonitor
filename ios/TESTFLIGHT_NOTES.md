@@ -1,7 +1,7 @@
 # EternalMonitor 0.3.4: What to Test
 
-Windows and iPad versions listed on the
-download page work together. Each 0.3.4 app works with the other app on 0.3.3.
+Windows and iPad versions listed on the download page work together.
+Each 0.3.4 app works with the other app on 0.3.3.
 
 This release fixes the problems people reported with 0.3.3 and keeps the
 stream going through slow links, slow disks and stuck graphics drivers.
@@ -12,9 +12,9 @@ stream going through slow links, slow disks and stuck graphics drivers.
   start on PCs with AMD graphics. On Intel graphics it draws with DirectX 12,
   not Intel's Vulkan driver, which crashed on some PCs.
 - On laptops with two graphics cards that showed no picture, the PC spots
-  that Windows runs it on the wrong card and switches it in one click. When
-  Windows moves the screen to the other card, the PC tries the second screen
-  again instead of leaving the iPad blank.
+  that Windows runs it on the wrong card and switches it in one click. If
+  Windows moves the screen across cards, later connections retry the second
+  screen rather than stay on a blank mirror.
 - Over USB on slower PCs, the picture no longer freezes after a big screen
   change. Quality steps down instead.
 - After a lost frame on Wi-Fi, the iPad keeps the last clear picture instead
@@ -41,8 +41,8 @@ stream going through slow links, slow disks and stuck graphics drivers.
   mirrors and tries again later, or at once after a driver, Windows or
   EternalMonitor update.
 - A stuck graphics driver no longer freezes a session: its calls are
-  time-limited. A slow encoder start keeps hardware encoding, and a stuck one hands the
-  picture to the CPU until the driver answers.
+  time-limited. A slow encoder start keeps hardware encoding, and a stuck one
+  hands the picture to the CPU until the driver answers.
 - On a slow disk, falling back from the second screen no longer pauses the
   stream.
 - After a stall, Apple Pencil strokes no longer lose points.
