@@ -25,7 +25,7 @@ prep
 [ "${1:-}" = "--prep" ] && exit 0
 
 # name:poster second:MP4 CRF:WebM CRF. Busy films get higher CRFs to stay in budget.
-FILMS=(second-screen:4.2:32:48 pair:4.4:26:41 fit:4.0:25:38 performance:4.0:30:46 pencil:3.0:26:40 feedback:4.5:27:43)
+FILMS=(second-screen:4.2:32:48 pair:4.4:26:41 fit:4.0:25:38 performance:4.0:30:46 pencil:6.6:26:40 feedback:4.5:27:43)
 mkdir -p "$OUT" renders
 for entry in "${FILMS[@]}"; do
   IFS=: read -r name poster crf264 crfvp9 <<< "$entry"

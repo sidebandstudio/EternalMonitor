@@ -1,0 +1,15 @@
+/* Apple Pencil film: the iPad app, recorded in the simulator in landscape
+   while a host streamed a painting full screen (footage/ipad-pencil.mp4,
+   2420 x 1668, the iPad's own pixels). The camera, the pencil and the strokes
+   are placed by pencil.js in those screen pixels. */
+.bg { background-image: url('art/dunes.webp'); background-position: 40% 60%; }
+#cam { position: absolute; left: 0; top: 0; width: 2500px; height: 1748px; transform-origin: 0 0; }
+#tab { left: 0; top: 0; width: 2500px; height: 1748px; border-radius: 96px; border-width: 3px; }
+#tab .ipad-screen { left: 40px; top: 40px; width: 2420px; height: 1668px; border-radius: 58px; }
+#tab video, #tab canvas { position: absolute; left: 0; top: 0; width: 2420px; height: 1668px; }
+/* The pencil's tip is at (52, 740) inside its 800px square. */
+#pencil { position: absolute; left: 0; top: 0; width: 800px; height: 800px; transform-origin: 52px 740px; }
+#pencil img { width: 800px; height: 800px; display: block; }
+/* The shadow sits outside the turning pencil, so the light stays put. */
+#shadow { position: absolute; inset: 0; }
+#dip { position: absolute; inset: 0; background: #0a0a0b; opacity: 0; }
