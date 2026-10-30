@@ -267,6 +267,9 @@ fn identify(
     })
 }
 
+/// Set while [`described`] reads a description; tests wait for it to clear.
+static LOOKING: AtomicBool = AtomicBool::new(false);
+
 /// The description of the file `process` runs, as `describe` reads it within
 /// [`LOOKUP`]. The description read for a process is kept, so a later slow
 /// read doesn't change what the Stream page calls it. Another process, even
@@ -275,7 +278,6 @@ fn described(
     process: Process,
     describe: impl FnOnce(&str) -> Option<String> + Send + 'static,
 ) -> Option<String> {
-    static LOOKING: AtomicBool = AtomicBool::new(false);
     static READ: Mutex<Option<(Process, Option<String>)>> = Mutex::new(None);
     if let Some((_, description)) = READ
         .lock()
@@ -912,8 +914,17 @@ mod tests {
     fn another_process_at_the_same_path_is_read_again() {
         let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let tool = r"C:\Tools\tool.exe";
+        // Waits for the lookup thread to end, however slowly a loaded PC
+        // runs it. A lookup that hadn't ended yet kept the next process's
+        // from starting, and a quick read then kept no description for it.
+        let lookup_ended = || {
+            while LOOKING.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
         for (pid, at) in [(1234, 1), (5678, 1), (1234, 2)] {
             let own = format!("Tool {pid} from {at}");
+            lookup_ended();
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let by = identify(pid, 0, started(tool, at), {
                 let own = own.clone();
@@ -924,11 +935,12 @@ mod tests {
             });
             assert_eq!(by, HeldBy::Program("tool.exe".into()), "{own}");
             drop(release_tx);
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while identify(pid, 0, started(tool, at), |_| None) != HeldBy::Program(own.clone()) {
-                assert!(std::time::Instant::now() < deadline, "{own} is read");
-                thread::sleep(Duration::from_millis(10));
-            }
+            lookup_ended();
+            assert_eq!(
+                identify(pid, 0, started(tool, at), |_| None),
+                HeldBy::Program(own.clone()),
+                "{own} is read"
+            );
         }
     }
 
