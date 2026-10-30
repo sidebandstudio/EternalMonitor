@@ -14,9 +14,10 @@
 //!   `feedback_panel.rs`);
 //! - in first-run setup, "Next", "Back", "Skip setup" and "Done".
 //!
-//! These names stay English in every language: after each pass,
-//! [`EnglishNames`] renames whatever shows a translation by its English key
-//! (`crate::i18n::name`), egui's own widgets included.
+//! In another language these widgets show and are named by the translation,
+//! and keep their English name as their UI Automation AutomationId (AccessKit
+//! `author_id`, see `widgets::automation_id`): scripts and tests find them by
+//! that id first, then by name, so the same name works in every language.
 
 mod feedback_panel;
 mod fonts;
@@ -59,43 +60,6 @@ use eternal_wire::v2::control::ReceiverReport;
 use icons::Icon;
 use theme::*;
 use widgets::Tone;
-
-/// Names every widget that shows a translation by its English text, in the
-/// AccessKit tree the pass hands to UI Automation.
-struct EnglishNames;
-
-impl egui::plugin::Plugin for EnglishNames {
-    fn debug_name(&self) -> &'static str {
-        "EnglishNames"
-    }
-
-    fn on_begin_pass(&mut self, _ui: &mut egui::Ui) {
-        i18n::begin_pass();
-    }
-
-    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
-        use egui::accesskit::Role;
-        if i18n::active() == Lang::En {
-            return;
-        }
-        let Some(update) = output.platform_output.accesskit_update.as_mut() else {
-            return;
-        };
-        for (_, node) in &mut update.nodes {
-            if let Some(name) = node.label().map(i18n::name) {
-                node.set_label(name);
-            }
-            // What someone typed is theirs, even when it matches a translation.
-            let typed = matches!(
-                node.role(),
-                Role::TextInput | Role::MultilineTextInput | Role::PasswordInput
-            );
-            if let Some(name) = node.value().filter(|_| !typed).map(i18n::name) {
-                node.set_value(name);
-            }
-        }
-    }
-}
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 enum Page {
@@ -411,7 +375,6 @@ impl AnalyzerApp {
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
-        cc.egui_ctx.add_plugin(EnglishNames);
         let language = theme::install(&cc.egui_ctx, i18n::resolve(persisted.language.as_deref()));
         i18n::activate(language);
         info!(language = language.code(), "Window language");
@@ -1068,6 +1031,7 @@ impl eframe::App for AnalyzerApp {
         if let Some(language) = self.pending_language.take() {
             i18n::activate(language);
         }
+        i18n::begin_pass();
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= Duration::from_millis(800) {
                 self.settings_dirty_at = None;
@@ -1234,10 +1198,12 @@ impl AnalyzerApp {
                 );
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.label(faint(trf(
+                    let version = trf(
                         "Version {version}",
                         &[("version", env!("CARGO_PKG_VERSION"))],
-                    )));
+                    );
+                    let response = ui.label(faint(&version));
+                    widgets::automation_id(&response, &version);
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
                     ui.add_space(6.0);
@@ -1282,9 +1248,8 @@ impl AnalyzerApp {
     fn nav_item(&mut self, ui: &mut egui::Ui, page: Page, icon: Icon, label: &str) -> Rect {
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, i18n::name(label))
-        });
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        widgets::automation_id(&response, label);
         if response.clicked() {
             self.page = page;
         }
@@ -1379,9 +1344,9 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     let response = ui.label(strong(&title));
-                    widgets::name_label(&response, &title);
+                    widgets::automation_id(&response, &title);
                     let response = ui.add(egui::Label::new(faint(&detail)).truncate());
-                    widgets::name_label(&response, &detail);
+                    widgets::automation_id(&response, &detail);
                 });
             });
         });
@@ -1534,7 +1499,7 @@ impl AnalyzerApp {
                             .size(20.0)
                             .color(TEXT),
                     );
-                    widgets::name_label(&response, title);
+                    widgets::automation_id(&response, title);
                     ui.add(
                         egui::Label::new(muted(
                             "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",

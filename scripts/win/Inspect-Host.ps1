@@ -34,15 +34,27 @@ if ($window.Current.ProcessId -ne $p.Id -or $handle -eq [IntPtr]::Zero) { throw 
 # Raise only the named GUI belonging to the verified tracked process.
 if (![EMHostWindow]::SetWindowPos($handle,[IntPtr](-1),30,10,1100,1000,0x40)) { throw 'Could not raise the tracked host' }
 [void][EMHostWindow]::SetForegroundWindow($handle)
-# Names follow the automation contract in host/src/gui/mod.rs. Navigation
-# and the QR code are buttons; a label with the same text must not match.
+# Names follow the automation contract in host/src/gui/mod.rs. In any
+# language a control showing a translation keeps its English name as its
+# AutomationId, so look that up first, then the name (text never translated).
+function Find-HostElement([string]$Name, $ControlType) {
+    foreach ($property in @([System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+                            [System.Windows.Automation.AutomationElement]::NameProperty)) {
+        $condition = New-Object System.Windows.Automation.PropertyCondition($property,$Name)
+        if ($ControlType) {
+            $condition = New-Object System.Windows.Automation.AndCondition($condition,
+                (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,$ControlType)))
+        }
+        $element = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+        if ($element) { return $element }
+    }
+    return $null
+}
+# Navigation and the QR code are buttons; a label with the same text must not match.
 function Invoke-HostControl([string]$Name) {
-    $condition = New-Object System.Windows.Automation.AndCondition(
-        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)),
-        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button)))
     $deadline = (Get-Date).AddSeconds(5)
     do {
-        $control = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+        $control = Find-HostElement $Name ([System.Windows.Automation.ControlType]::Button)
         if ($control) { break }
         if ((Get-Date) -gt $deadline) { throw "Host control is absent: $Name" }
         Start-Sleep -Milliseconds 100
@@ -57,24 +69,26 @@ if ($View -eq 'QR') { Invoke-HostControl 'QR code' }
 Start-Sleep -Milliseconds 300
 $nodes = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
 $names = @($nodes | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
+$ids = @($nodes | ForEach-Object { $_.Current.AutomationId } | Where-Object { $_ })
+# English names, whatever the window's language: ids, then names.
+$english = @($ids + $names)
 if ($View -eq 'Stream') {
     foreach ($label in @('Pairing','USB connection','PC audio')) {
-        if (!($names -contains $label)) { throw "Host Stream card absent: $label" }
+        if (!($english -contains $label)) { throw "Host Stream card absent: $label" }
     }
     if ($Connected) {
         foreach ($label in @('Connected iPad','Decode rate','Repaired fragments')) {
-            if (!($names -contains $label)) { throw "Connected client evidence absent: $label" }
+            if (!($english -contains $label)) { throw "Connected client evidence absent: $label" }
         }
-        if ($names -contains 'Waiting for an iPad') { throw 'Host GUI has no connected client' }
+        if ($english -contains 'Waiting for an iPad') { throw 'Host GUI has no connected client' }
     }
 }
-if ($View -eq 'Settings' -and !($names -contains 'Encoder input')) { throw 'Settings content did not appear' }
-if ($View -eq 'QR' -and !($names -contains 'Scan to connect')) { throw 'QR modal did not appear' }
+if ($View -eq 'Settings' -and !($english -contains 'Encoder input')) { throw 'Settings content did not appear' }
+if ($View -eq 'QR' -and !($english -contains 'Scan to connect')) { throw 'QR modal did not appear' }
 $autostart = $null
 if ($TestAutostart) {
     if ($View -ne 'Settings') { throw 'Autostart must be tested from Settings' }
-    $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Start on Windows startup')
-    $checkbox = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+    $checkbox = Find-HostElement 'Start on Windows startup' $null
     $toggle = $null
     if (!$checkbox -or !$checkbox.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$toggle)) {
         throw 'Startup checkbox has no UI Automation toggle'
@@ -121,4 +135,4 @@ try {
     $graphics.CopyFromScreen([int]$rect.X,[int]$rect.Y,0,0,$bitmap.Size)
     $bitmap.Save($Path,[Drawing.Imaging.ImageFormat]::Png)
 } finally { $graphics.Dispose(); $bitmap.Dispose() }
-@{pid=$p.Id; view=$View; labels=$names; screenshot=$Path; autostart=$autostart} | ConvertTo-Json -Depth 4
+@{pid=$p.Id; view=$View; labels=$names; ids=$ids; screenshot=$Path; autostart=$autostart} | ConvertTo-Json -Depth 4

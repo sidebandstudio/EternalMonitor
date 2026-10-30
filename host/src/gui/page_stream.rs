@@ -417,16 +417,18 @@ impl AnalyzerApp {
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.add_space(3.0);
-                            ui.add(
+                            let response = ui.add(
                                 egui::Label::new(
-                                    RichText::new(title)
+                                    RichText::new(&title)
                                         .family(semibold())
                                         .size(18.0)
                                         .color(TEXT),
                                 )
                                 .truncate(),
                             );
-                            ui.add(egui::Label::new(muted(subtitle)).truncate());
+                            widgets::automation_id(&response, &title);
+                            let response = ui.add(egui::Label::new(muted(&subtitle)).truncate());
+                            widgets::automation_id(&response, &subtitle);
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -523,7 +525,7 @@ impl AnalyzerApp {
             ui.spacing_mut().item_spacing.x = 12.0;
             let label = tr("Use the iPad as");
             let response = ui.label(RichText::new(label).family(medium()).color(TEXT));
-            widgets::name_label(&response, label);
+            widgets::automation_id(&response, label);
             // A particular monitor (chosen in Settings) is still a mirror.
             widgets::segmented(
                 ui,
@@ -623,7 +625,9 @@ impl AnalyzerApp {
             });
         } else {
             widgets::overline_label(ui, tr("Pairing code"));
-            ui.label(muted(tr("Not needed while pairing is off.")));
+            let note = tr("Not needed while pairing is off.");
+            let response = ui.label(muted(note));
+            widgets::automation_id(&response, note);
         }
         if copy && online {
             self.copy(ui.ctx(), Copied::Address, snap.listen_addr.clone());
@@ -739,36 +743,42 @@ impl AnalyzerApp {
             )
         };
         let mut choice = current.clone();
-        widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(ui, |ui| {
-            ui.set_min_width(width);
-            if ui
-                .selectable_label(choice.is_empty(), tr(CAPTURE_AUTO_LABEL))
-                .clicked()
-            {
-                choice = String::new();
-            }
-            // Managed virtual display — created on demand, removed when not in use.
-            if ui
-                .selectable_label(
+        let combo = widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(
+            ui,
+            |ui| {
+                ui.set_min_width(width);
+                let auto = ui.selectable_label(choice.is_empty(), tr(CAPTURE_AUTO_LABEL));
+                widgets::automation_id(&auto, tr(CAPTURE_AUTO_LABEL));
+                if auto.clicked() {
+                    choice = String::new();
+                }
+                // Managed virtual display — created on demand, removed when not in use.
+                let virtual_display = ui.selectable_label(
                     choice == CAPTURE_VIRTUAL_SENTINEL,
                     tr(CAPTURE_VIRTUAL_LABEL),
-                )
-                .clicked()
-            {
-                choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
-            }
-            if !outputs.is_empty() {
-                ui.separator();
-            }
-            for o in &outputs {
-                if ui
-                    .selectable_label(choice == o.device_name, super::format_output_label(o))
-                    .clicked()
-                {
-                    choice = o.device_name.clone();
+                );
+                widgets::automation_id(&virtual_display, tr(CAPTURE_VIRTUAL_LABEL));
+                if virtual_display.clicked() {
+                    choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
                 }
-            }
-        });
+                if !outputs.is_empty() {
+                    ui.separator();
+                }
+                for o in &outputs {
+                    if ui
+                        .selectable_label(choice == o.device_name, super::format_output_label(o))
+                        .clicked()
+                    {
+                        choice = o.device_name.clone();
+                    }
+                }
+            },
+        );
+        widgets::automation_id_as(
+            &combo.response,
+            "How the iPad shows your PC",
+            &selected_text,
+        );
         if choice != current {
             self.set_capture_display(choice);
         }

@@ -1,14 +1,16 @@
 #![cfg(target_os = "macos")]
 //! Settings and every first-run setup step in eight languages, driven
-//! through the English automation names every language keeps. On macOS the
-//! system fonts stand in for the Windows ones (see `gui/fonts.rs`).
+//! through the English AutomationIds (AccessKit `author_id`) that widgets
+//! showing a translation keep in every language. On macOS the system fonts
+//! stand in for the Windows ones (see `gui/fonts.rs`).
 //!
 //! Setup is drawn at the window's minimum size, 820 × 560, where it must
 //! fit in every language.
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
+use egui_kittest::kittest::{AccessKitNode, By, NodeT, Queryable};
+use egui_kittest::{Harness, SnapshotResults};
 use eternal_host::control::{GuiControl, SharedControl};
 use eternal_host::gui::AnalyzerApp;
 use eternal_host::settings::SettingsFile;
@@ -72,8 +74,27 @@ fn snapshot(harness: &mut Harness<'_, AnalyzerApp>, shared: &SharedControl, name
     harness.snapshot(name);
 }
 
+/// A widget's name as UI Automation reads it: a label's text is its value.
+fn name_of(node: &AccessKitNode<'_>) -> Option<String> {
+    if node.role() == Role::Label {
+        node.value()
+    } else {
+        node.label()
+    }
+}
+
+/// The widget `name` names in English, as `scripts/win/Inspect-Host.ps1`
+/// finds it: by its AutomationId, which whatever shows a translation has in
+/// every language, else, for text never translated, by its name.
+fn id(name: &str) -> By<'_> {
+    By::new().predicate(move |node| match node.author_id() {
+        Some(id) => id == name,
+        None => name_of(node).as_deref() == Some(name),
+    })
+}
+
 fn click(harness: &mut Harness<'_, AnalyzerApp>, role: Role, name: &str) {
-    harness.get_by_role_and_label(role, name).click();
+    harness.get(id(name).role(role)).click();
     harness.run_steps(4);
 }
 
@@ -86,7 +107,8 @@ fn languages_settings_and_setup() {
     settings_and_setup_in_each_language(&shared, &mut results);
     upgrades_never_open_setup(&dir, &shared);
     a_fresh_install_opens_setup_and_a_language_applies_at_once(&dir, &shared);
-    every_name_stays_english(&shared);
+    every_translation_keeps_an_english_id(&shared);
+    typed_text_stays_as_typed(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
 }
@@ -100,23 +122,20 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
         // Settings, whole page.
         let mut settings = harness(&shared, egui::vec2(1040.0, 1780.0));
         click(&mut settings, Role::Button, "Settings");
-        // Every name below stays English whatever the window shows.
-        for label in [
-            "DISPLAY",
-            "Frame rate",
-            "Language",
-            "Setup",
-            "Video quality limit",
-        ] {
-            settings.get_by_label(label);
+        // Every id below stays English whatever the window shows. The
+        // language menu has its row's title as its id.
+        for label in ["DISPLAY", "Frame rate", "Setup", "Video quality limit"] {
+            settings.get(id(label));
         }
+        settings.get(id("Language").role(Role::Label));
+        settings.get(id("Language").role(Role::ComboBox));
         snapshot(&mut settings, &shared, &format!("lang-{code}-settings"));
         results.extend_harness(&mut settings);
 
         // Setup, at the minimum window size.
         let mut setup = harness(&shared, egui::vec2(820.0, 560.0));
         click(&mut setup, Role::Button, "Settings");
-        setup.get_by_label("Run setup again").scroll_to_me();
+        setup.get(id("Run setup again")).scroll_to_me();
         setup.run_steps(4);
         click(&mut setup, Role::Button, "Run setup again");
         for (index, step) in STEPS.iter().enumerate() {
@@ -126,7 +145,7 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
             if *step == "connect" {
                 // USB brings up the Apple Devices check; this Mac has none.
                 click(&mut setup, Role::RadioButton, "USB");
-                setup.get_by_label("Get Apple Devices");
+                setup.get(id("Get Apple Devices"));
             }
             snapshot(
                 &mut setup,
@@ -141,7 +160,7 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
             click(&mut setup, Role::Button, next);
         }
         assert!(
-            setup.query_by_label("Skip setup").is_none(),
+            setup.query(id("Skip setup")).is_none(),
             "Done closes setup ({code})"
         );
         results.extend_harness(&mut setup);
@@ -159,9 +178,9 @@ fn upgrades_never_open_setup(dir: &std::path::Path, shared: &SharedControl) {
         eternal_host::settings::note_launch();
         assert!(!eternal_host::settings::fresh_install(), "{case}");
         let mut h = harness(shared, egui::vec2(1040.0, 720.0));
-        assert!(h.query_by_label("Skip setup").is_none(), "{case}");
+        assert!(h.query(id("Skip setup")).is_none(), "{case}");
         click(&mut h, Role::Button, "Settings");
-        h.get_by_label("Run setup again");
+        h.get(id("Run setup again"));
     };
     let fresh_profile = || {
         let _ = std::fs::remove_dir_all(&profile);
@@ -198,7 +217,7 @@ fn upgrades_never_open_setup(dir: &std::path::Path, shared: &SharedControl) {
 
 /// A fresh install, with no settings folder yet, opens setup at launch; a
 /// language picked there applies at once, and the Stream page keeps its
-/// English automation names.
+/// English AutomationIds.
 fn a_fresh_install_opens_setup_and_a_language_applies_at_once(
     dir: &std::path::Path,
     shared: &SharedControl,
@@ -213,21 +232,26 @@ fn a_fresh_install_opens_setup_and_a_language_applies_at_once(
     h.get_by_label("Skip setup");
     h.get_by_label("Welcome to EternalMonitor");
     click(&mut h, Role::RadioButton, "Deutsch");
-    // The window draws German now; its names stay English.
+    // The window draws and is named in German now; its ids stay English.
     assert_eq!(eternal_host::i18n::active(), eternal_host::i18n::Lang::De);
     assert_eq!(eternal_host::i18n::tr("Settings"), "Einstellungen");
-    h.get_by_label("Welcome to EternalMonitor");
+    let welcome = h.get(id("Welcome to EternalMonitor"));
+    assert_eq!(
+        name_of(&welcome.accesskit_node()).as_deref(),
+        Some(eternal_host::i18n::tr("Welcome to EternalMonitor"))
+    );
+    assert!(h.query_by_label("Welcome to EternalMonitor").is_none());
     let saved: SettingsFile =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(saved.language.as_deref(), Some("de"));
 
     click(&mut h, Role::Button, "Next");
     click(&mut h, Role::Button, "Back");
-    h.get_by_label("Welcome to EternalMonitor");
+    h.get(id("Welcome to EternalMonitor"));
     click(&mut h, Role::Button, "Skip setup");
-    assert!(h.query_by_label("Skip setup").is_none());
+    assert!(h.query(id("Skip setup")).is_none());
 
-    // scripts/win/Inspect-Host.ps1 reads these names on a German window too.
+    // scripts/win/Inspect-Host.ps1 finds these on a German window too.
     for label in [
         "Pairing",
         "USB connection",
@@ -237,15 +261,15 @@ fn a_fresh_install_opens_setup_and_a_language_applies_at_once(
     ] {
         // "Waiting for an iPad" is in the sidebar and the iPad card.
         assert!(
-            h.get_all_by_label(label).next().is_some(),
-            "{label} is named in English"
+            h.get_all(id(label)).next().is_some(),
+            "{label} has its English id"
         );
     }
-    h.get_by_role_and_label(Role::Button, "Settings");
-    h.get_by_role_and_label(Role::Button, "QR code");
+    h.get(id("Settings").role(Role::Button));
+    h.get(id("QR code").role(Role::Button));
 
     // Mirror or second screen, from the Stream page, keeps working.
-    h.get_by_label("Second screen").click();
+    h.get(id("Second screen")).click();
     h.run_steps(4);
     assert_eq!(
         *shared.capture_target.lock(),
@@ -366,9 +390,11 @@ fn stream_to_an_ipad(shared: &SharedControl) {
 }
 
 /// Every page, the display menu and each setup step in German and Arabic,
-/// with an iPad streaming: no automation name or value is a translation.
-fn every_name_stays_english(shared: &SharedControl) {
-    use egui_kittest::kittest::NodeT;
+/// with an iPad streaming: whatever shows a translation has an English id
+/// and is named by the translation, in reading order, as a screen reader
+/// says it; Arabic is drawn reordered (see `i18n/bidi.rs`).
+fn every_translation_keeps_an_english_id(shared: &SharedControl) {
+    use eternal_host::i18n::{bidi, tr, Lang};
 
     let english: std::collections::BTreeMap<String, String> =
         serde_json::from_str(include_str!("../src/i18n/strings/en.json")).unwrap();
@@ -383,23 +409,77 @@ fn every_name_stays_english(shared: &SharedControl) {
     for code in ["de", "ar"] {
         save_language(Some(code));
         let mut h = harness(shared, egui::vec2(1040.0, 1780.0));
-        let translations: Vec<&str> = keys
+        let lang = Lang::from_code(code).unwrap();
+        // Key → (as drawn, as written), where the translation differs.
+        let translations: Vec<(&str, &str, String)> = keys
             .iter()
-            .map(|key| eternal_host::i18n::tr(key))
-            .zip(&keys)
-            .filter(|(shown, key)| shown != *key)
-            .map(|(shown, _)| shown)
+            .filter_map(|key| {
+                let shown = tr(key);
+                let written = eternal_host::i18n::logical(shown).unwrap_or(shown);
+                (shown != *key).then(|| (*key, shown, written.to_string()))
+            })
             .collect();
+        // Which translation `text` is, and whether it is in reading order.
+        let translation = |text: &str| -> Option<bool> {
+            translations.iter().find_map(|(_, shown, written)| {
+                let matches = |form: &str| text == form || text == form.to_uppercase();
+                if matches(written) {
+                    Some(true)
+                } else if matches(shown) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
         let check = |h: &Harness<'_, AnalyzerApp>, place: &str| {
             for node in h.root().children_recursive() {
                 let node = node.accesskit_node();
-                for text in [node.label(), node.value()].into_iter().flatten() {
-                    let translated = translations.iter().any(|shown| {
-                        text == *shown
-                            || text == shown.to_uppercase()
-                            || text.split('·').any(|part| part.trim() == *shown)
-                    });
-                    assert!(!translated, "{code} {place}: {text:?} is not English");
+                // What someone types is checked in `typed_text_stays_as_typed`.
+                let typed = |node: &AccessKitNode<'_>| {
+                    matches!(
+                        node.role(),
+                        Role::TextInput | Role::MultilineTextInput | Role::TextRun
+                    )
+                };
+                if typed(&node) || node.parent().is_some_and(|parent| typed(&parent)) {
+                    continue;
+                }
+                let Some(name) = name_of(&node) else { continue };
+                let parts: Vec<Option<bool>> = name
+                    .split('·')
+                    .map(|part| translation(part.trim()))
+                    .collect();
+                if parts.iter().all(Option::is_none) {
+                    // Never translated: English, or a value such as a name.
+                    continue;
+                }
+                assert!(
+                    !parts.contains(&Some(false)) || !lang.is_rtl(),
+                    "{code} {place}: {name:?} is named in drawing order, not as written"
+                );
+                let id = node.author_id();
+                assert!(
+                    id.is_some_and(|id| id != name
+                        && translation(id).is_none()
+                        && !id.chars().any(bidi::is_arabic)),
+                    "{code} {place}: {name:?} has no English id ({id:?})"
+                );
+            }
+            // Whatever has a translated key as its id is named by the
+            // translation; a combo box by the choice it shows.
+            for (key, _, written) in &translations {
+                let has_id = By::new().predicate(|node| node.author_id() == Some(key));
+                for node in h.query_all(has_id) {
+                    let node = node.accesskit_node();
+                    if node.role() == Role::ComboBox {
+                        continue;
+                    }
+                    assert_eq!(
+                        name_of(&node).as_deref(),
+                        Some(written.as_str()),
+                        "{code} {place}: {key:?} is named by its translation"
+                    );
                 }
             }
         };
@@ -410,33 +490,53 @@ fn every_name_stays_english(shared: &SharedControl) {
             "Connected iPad",
             "Decode rate",
             "Repaired fragments",
-            "Streaming to Test iPad Pro",
             &format!("Version {}", env!("CARGO_PKG_VERSION")),
         ] {
-            h.get_by_label(label);
+            h.get(id(label));
         }
+        let streaming = h.get(id("Streaming to Test iPad Pro"));
+        let written =
+            eternal_host::i18n::trf("Streaming to {device}", &[("device", "Test iPad Pro")]);
+        let written = if lang.is_rtl() {
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(include_str!(
+                "../src/i18n/strings/ar.json"
+            ))
+            .unwrap()["Streaming to {device}"]
+                .replace(
+                    "{device}",
+                    &format!("{}Test iPad Pro{}", bidi::FSI, bidi::PDI),
+                )
+        } else {
+            written
+        };
+        assert_eq!(
+            name_of(&streaming.accesskit_node()),
+            Some(written),
+            "{code}: text with values is read as written"
+        );
         check(&h, "Stream");
         click(&mut h, Role::Button, "Performance");
         check(&h, "Performance");
         click(&mut h, Role::Button, "Settings");
         // The display menu's choices.
-        h.get_by_value("Mirror my screen").click();
+        h.get(id("How the iPad shows your PC").role(Role::ComboBox))
+            .click();
         h.run_steps(4);
-        h.get_by_label("Mirror my screen");
-        h.get_by_label("Second screen");
+        h.get(id("Mirror my screen"));
+        h.get(id("Second screen"));
         check(&h, "Settings, display menu open");
         h.key_press(egui::Key::Escape);
         h.run_steps(4);
         // Settings' audio row and setup's show one translation.
-        h.get_by_role_and_label(Role::Label, "Stream PC audio");
+        h.get(id("Stream PC audio").role(Role::Label));
         click(&mut h, Role::Button, "Run setup again");
         for (index, step) in STEPS.iter().enumerate() {
-            h.get_by_label(&format!("STEP {} OF {}", index + 1, STEPS.len()));
+            h.get(id(&format!("STEP {} OF {}", index + 1, STEPS.len())));
             if *step == "connect" {
                 click(&mut h, Role::RadioButton, "USB");
             }
             if *step == "show" {
-                h.get_by_role_and_label(Role::Label, "Play PC audio");
+                h.get(id("Play PC audio").role(Role::Label));
             }
             check(&h, &format!("setup step {}", index + 1));
             let next = if index + 1 == STEPS.len() {
@@ -445,6 +545,47 @@ fn every_name_stays_english(shared: &SharedControl) {
                 "Next"
             };
             click(&mut h, Role::Button, next);
+        }
+    }
+}
+
+/// What someone types in the feedback box stays exactly as typed, in the
+/// field and in the text runs a screen reader reads it from, even when it
+/// is a translation the window shows elsewhere ("Einstellungen" is German
+/// for Settings), and the field has no id of its own.
+fn typed_text_stays_as_typed(shared: &SharedControl) {
+    let runs = |h: &Harness<'_, AnalyzerApp>| -> String {
+        h.root()
+            .children_recursive()
+            .map(|node| node.accesskit_node())
+            .filter(|node| node.role() == Role::TextRun)
+            .filter_map(|node| node.value())
+            .collect()
+    };
+    for code in ["de", "ar"] {
+        save_language(Some(code));
+        let mut h = harness(shared, egui::vec2(1040.0, 1000.0));
+        click(&mut h, Role::Button, "Send feedback");
+        h.get_by_role(Role::MultilineTextInput).click();
+        h.run_steps(2);
+        let mut typed = "Einstellungen Grüße, Ünïcödé — 日本語".to_string();
+        h.get_by_role(Role::MultilineTextInput).type_text(&typed);
+        h.run_steps(4);
+        let field = h.get_by_role(Role::MultilineTextInput);
+        assert_eq!(field.value().as_deref(), Some(typed.as_str()), "{code}");
+        assert_eq!(field.accesskit_node().author_id(), None, "{code}");
+        assert_eq!(runs(&h), typed, "{code}: the text runs read what was typed");
+        if code == "ar" {
+            // The Arabic for Settings, typed in the Arabic window. egui 0.36
+            // builds text runs from the shaped glyphs, which for Arabic are
+            // not the characters typed, so only the field's value is exact.
+            let arabic = eternal_host::i18n::logical(eternal_host::i18n::tr("Settings")).unwrap();
+            h.get_by_role(Role::MultilineTextInput)
+                .type_text(&format!(" {arabic}"));
+            h.run_steps(4);
+            typed = format!("{typed} {arabic}");
+            let field = h.get_by_role(Role::MultilineTextInput);
+            assert_eq!(field.value().as_deref(), Some(typed.as_str()), "{code}");
         }
     }
 }

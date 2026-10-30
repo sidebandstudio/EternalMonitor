@@ -242,23 +242,50 @@ fn a_choice_in_the_app_wins_over_the_installer_and_the_system() {
     }
 }
 
-#[test]
-fn translations_switch_and_name_back_to_english() {
-    activate(Lang::De);
-    assert_eq!(tr("Settings"), "Einstellungen");
-    assert_eq!(name("Einstellungen"), "Settings");
-    assert_eq!(tr("No such key"), "No such key");
-    assert_eq!(
-        trf("Streaming to {device}", &[("device", "iPad Pro")]),
-        strings(Lang::De)["Streaming to {device}"].replace("{device}", "iPad Pro")
-    );
-    activate(Lang::En);
-    assert_eq!(tr("Settings"), "Settings");
-    assert_eq!(name("Einstellungen"), "Einstellungen");
+fn ids(shown: &str) -> Option<(String, String)> {
+    automation(shown).map(|names| (names.id, names.name))
 }
 
 #[test]
-fn arabic_translations_are_drawn_in_visual_order_and_named_in_english() {
+fn translations_switch_and_keep_their_english_ids() {
+    activate(Lang::De);
+    assert_eq!(tr("Settings"), "Einstellungen");
+    assert_eq!(
+        ids("Einstellungen"),
+        Some(("Settings".into(), "Einstellungen".into()))
+    );
+    assert_eq!(tr("No such key"), "No such key");
+    assert_eq!(ids("No such key"), None);
+    let streaming = trf("Streaming to {device}", &[("device", "iPad Pro")]);
+    assert_eq!(
+        streaming,
+        strings(Lang::De)["Streaming to {device}"].replace("{device}", "iPad Pro")
+    );
+    assert_eq!(
+        ids(&streaming),
+        Some(("Streaming to iPad Pro".into(), streaming.clone()))
+    );
+    // A status line is read part by part.
+    let mirroring = tr("Mirroring");
+    assert_eq!(
+        ids(&format!("USB  ·  {mirroring}  ·  60 fps")),
+        Some((
+            "USB  ·  Mirroring  ·  60 fps".into(),
+            format!("USB  ·  {mirroring}  ·  60 fps")
+        ))
+    );
+    activate(Lang::En);
+    assert_eq!(tr("Settings"), "Settings");
+    // English names itself: the id is the name there.
+    assert_eq!(
+        ids("Settings"),
+        Some(("Settings".into(), "Settings".into()))
+    );
+    assert_eq!(ids("Einstellungen"), None);
+}
+
+#[test]
+fn arabic_translations_are_drawn_in_visual_order_and_read_as_written() {
     activate(Lang::Ar);
     let settings = tr("Settings");
     assert_eq!(
@@ -266,8 +293,25 @@ fn arabic_translations_are_drawn_in_visual_order_and_named_in_english() {
         strings(Lang::Ar)["Settings"],
         "one word stays as is"
     );
-    assert_eq!(name(settings), "Settings");
+    assert_eq!(ids(settings), Some(("Settings".into(), settings.into())));
     assert!(logical(settings).is_some());
+    // A sentence is drawn reordered and read in its own order.
+    let written = &strings(Lang::Ar)["Open EternalMonitor on your iPad"];
+    let shown = tr("Open EternalMonitor on your iPad");
+    assert_ne!(shown, written);
+    assert_eq!(
+        ids(shown),
+        Some(("Open EternalMonitor on your iPad".into(), written.clone()))
+    );
+    let streaming = trf("Streaming to {device}", &[("device", "Test iPad Pro")]);
+    let read = strings(Lang::Ar)["Streaming to {device}"].replace(
+        "{device}",
+        &format!("{}Test iPad Pro{}", bidi::FSI, bidi::PDI),
+    );
+    assert_eq!(
+        ids(&streaming),
+        Some(("Streaming to Test iPad Pro".into(), read))
+    );
     activate(Lang::En);
     assert_eq!(logical("Settings"), None);
 }

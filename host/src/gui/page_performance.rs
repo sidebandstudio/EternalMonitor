@@ -189,8 +189,10 @@ pub(super) fn page_header(ui: &mut Ui, title: &str, subtitle: &str, actions: imp
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(super::theme::title(title));
-                ui.label(muted(subtitle));
+                let response = ui.label(super::theme::title(title));
+                super::widgets::automation_id(&response, title);
+                let response = ui.label(muted(subtitle));
+                super::widgets::automation_id(&response, subtitle);
             });
             ui.with_layout(Layout::right_to_left(Align::Center), actions);
         },

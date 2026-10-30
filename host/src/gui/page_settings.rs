@@ -229,13 +229,15 @@ impl AnalyzerApp {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(heading("EternalMonitor"));
-                    ui.label(muted(format!(
+                    let about = format!(
                         "{} · Built by Sideband Studio",
                         trf(
                             "Version {version}",
                             &[("version", env!("CARGO_PKG_VERSION"))]
                         )
-                    )));
+                    );
+                    let response = ui.label(muted(&about));
+                    widgets::automation_id(&response, &about);
                 });
             });
             ui.add_space(10.0);
@@ -267,18 +269,21 @@ impl AnalyzerApp {
             None => RichText::new(tr("System language")),
             Some(lang) => RichText::new(lang.native_name()).family(name_family(lang)),
         };
+        // Each by its name in English: "System language", or the language's own.
+        let id = |lang: Option<Lang>| lang.map_or("System language", Lang::native_name);
         let mut choice = None;
-        widgets::combo_rich(ui.id().with("language"), label(chosen), width).show_ui(ui, |ui| {
-            ui.set_min_width(width);
-            for option in std::iter::once(None).chain(Lang::ALL.map(Some)) {
-                if ui
-                    .selectable_label(option == chosen, label(option))
-                    .clicked()
-                {
-                    choice = Some(option.map_or(i18n::SYSTEM, Lang::code));
+        let combo =
+            widgets::combo_rich(ui.id().with("language"), label(chosen), width).show_ui(ui, |ui| {
+                ui.set_min_width(width);
+                for option in std::iter::once(None).chain(Lang::ALL.map(Some)) {
+                    let response = ui.selectable_label(option == chosen, label(option));
+                    widgets::automation_id_as(&response, id(option), label(option).text());
+                    if response.clicked() {
+                        choice = Some(option.map_or(i18n::SYSTEM, Lang::code));
+                    }
                 }
-            }
-        });
+            });
+        widgets::automation_id_as(&combo.response, "Language", label(chosen).text());
         if let Some(choice) = choice {
             self.set_language(&ui.ctx().clone(), choice);
         }

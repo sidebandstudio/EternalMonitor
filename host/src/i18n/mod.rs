@@ -8,9 +8,10 @@
 //!
 //! Each language is a JSON file from English text to its translation,
 //! compiled in. The English text is the key, so the source reads as it did
-//! and an untranslated key shows in English. Automation names stay English:
-//! widgets name themselves with [`name`], which maps a shown translation back
-//! to its key.
+//! and an untranslated key shows in English. A widget showing a translation
+//! reports it to UI Automation through [`automation`]: its English text as
+//! the AutomationId, which scripts and tests find it by in every language,
+//! and the translation, in reading order, as the name a screen reader says.
 
 pub mod bidi;
 
@@ -208,7 +209,7 @@ struct Table {
     shown: HashMap<&'static str, &'static str>,
     /// Key → the text in reading order.
     logical: HashMap<&'static str, &'static str>,
-    /// Drawn text → key, for automation names and Arabic wrapping.
+    /// Drawn text → key, for automation ids and Arabic wrapping.
     keys: HashMap<&'static str, &'static str>,
     /// Drawn text that more than one key translates to.
     shared: HashSet<&'static str>,
@@ -251,10 +252,11 @@ thread_local! {
     // The window draws on one thread. Per thread, so the unit tests that
     // change it do not race each other.
     static ACTIVE: Cell<Lang> = const { Cell::new(Lang::En) };
-    // Drawn text this pass → its English, where the tables cannot tell:
-    // [`trf`] text with its values filled in, and a translation two keys
-    // share, by the key it was last drawn for. Cleared by [`begin_pass`].
-    static DRAWN: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    // Drawn text this pass → its English and its reading order, where the
+    // tables cannot tell: [`trf`] text with its values filled in, and a
+    // translation two keys share, by the key it was last drawn for. Cleared
+    // by [`begin_pass`].
+    static DRAWN: RefCell<HashMap<String, (String, String)>> = RefCell::new(HashMap::new());
 }
 
 /// The language the window draws in.
@@ -279,18 +281,19 @@ pub fn tr(key: &'static str) -> &'static str {
             let table = table(lang);
             let shown = table.shown.get(key).copied().unwrap_or(key);
             if table.shared.contains(shown) {
-                remember(shown, key);
+                remember(shown, key, table.logical.get(key).copied().unwrap_or(key));
             }
             shown
         }
     }
 }
 
-fn remember(shown: &str, english: &str) {
+fn remember(shown: &str, english: &str, logical: &str) {
     DRAWN.with(|drawn| {
-        drawn
-            .borrow_mut()
-            .insert(shown.to_string(), english.to_string())
+        drawn.borrow_mut().insert(
+            shown.to_string(),
+            (english.to_string(), logical.to_string()),
+        )
     });
 }
 
@@ -323,44 +326,64 @@ pub fn trf(key: &'static str, args: &[(&str, &str)]) -> String {
         };
         text = text.replace(&format!("{{{name}}}"), &value);
     }
-    let text = if lang.is_rtl() {
+    let shown = if lang.is_rtl() {
         bidi::visual(&text)
     } else {
-        text
+        text.clone()
     };
-    if lang != Lang::En {
-        remember(&text, &english);
-    }
-    text
+    remember(&shown, &english, &text);
+    shown
 }
 
-/// The English text a widget shows `shown` for: its automation name, which
-/// scripts and tests find it by in every language. Text joined with " · ",
-/// such as a status line, is named part by part.
-pub fn name(shown: &str) -> String {
+/// What UI Automation reads for a widget showing a translation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Automation {
+    /// The English text: the AutomationId, the same in every language and
+    /// the widget's name in English.
+    pub id: String,
+    /// The text as shown, in reading order: the name a screen reader says.
+    pub name: String,
+}
+
+/// How UI Automation reads a widget that shows `shown`, in any language,
+/// English included. `None` for text that is never translated. Text joined
+/// with " · ", such as a status line, is read part by part.
+pub fn automation(shown: &str) -> Option<Automation> {
     let lang = active();
-    if lang == Lang::En {
-        return shown.to_string();
-    }
-    let english = |part: &str| -> Option<String> {
+    let lookup = |part: &str| -> Option<(String, String)> {
         DRAWN
             .with(|drawn| drawn.borrow().get(part).cloned())
-            .or_else(|| table(lang).keys.get(part).map(|key| key.to_string()))
+            .or_else(|| {
+                let table = table(lang);
+                let key = *table.keys.get(part)?;
+                let logical = table.logical.get(key).copied().unwrap_or(key);
+                Some((key.to_string(), logical.to_string()))
+            })
     };
-    if let Some(name) = english(shown) {
-        return name;
+    if let Some((id, name)) = lookup(shown) {
+        return Some(Automation { id, name });
     }
     if !shown.contains('·') {
-        return shown.to_string();
+        return None;
     }
-    shown
-        .split('·')
-        .map(|part| match english(part.trim()) {
-            Some(name) => part.replace(part.trim(), &name),
-            None => part.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("·")
+    let (mut ids, mut names, mut found) = (Vec::new(), Vec::new(), false);
+    for part in shown.split('·') {
+        match lookup(part.trim()) {
+            Some((id, name)) => {
+                found = true;
+                ids.push(part.replace(part.trim(), &id));
+                names.push(part.replace(part.trim(), &name));
+            }
+            None => {
+                ids.push(part.to_string());
+                names.push(part.to_string());
+            }
+        }
+    }
+    found.then(|| Automation {
+        id: ids.join("·"),
+        name: names.join("·"),
+    })
 }
 
 /// `shown` in reading order, when it is a right-to-left translation; for

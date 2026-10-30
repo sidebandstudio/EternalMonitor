@@ -101,7 +101,7 @@ impl AnalyzerApp {
                         .size(20.0)
                         .color(TEXT),
                 );
-                widgets::name_label(&response, title);
+                widgets::automation_id(&response, title);
                 widgets::wrapped(ui, subtitle, muted);
                 ui.add_space(14.0);
                 let top = ui.cursor().top();
@@ -149,14 +149,14 @@ impl AnalyzerApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for option in row {
-                    let (text, name) = match option {
+                    let (text, id) = match option {
                         None => (RichText::new(tr("System language")), "System language"),
                         Some(lang) => (
                             RichText::new(lang.native_name()).family(name_family(*lang)),
                             lang.native_name(),
                         ),
                     };
-                    if widgets::choice_tile(ui, *option == chosen, text, name, size).clicked() {
+                    if widgets::choice_tile(ui, *option == chosen, text, id, size).clicked() {
                         choice = Some(option.map_or(i18n::SYSTEM, Lang::code));
                     }
                 }
@@ -336,7 +336,9 @@ impl AnalyzerApp {
                 if required {
                     ui.label(mono(format!("{} {}", &code[..3], &code[3..]), 19.0));
                 } else {
-                    ui.label(muted(tr("Not needed while pairing is off.")));
+                    let note = tr("Not needed while pairing is off.");
+                    let response = ui.label(muted(note));
+                    widgets::automation_id(&response, note);
                 }
                 ui.add_space(6.0);
                 widgets::overline_label(ui, tr("Address"));
