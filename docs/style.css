@@ -1587,3 +1587,28 @@ html.js .pedigree.reveal.visible li { opacity: 1; transform: none; }
 @media (prefers-reduced-motion: reduce) {
   html.js .pedigree.reveal li { opacity: 1; transform: none; transition: none; }
 }
+
+/* --- Download page on narrow phones ---------------------------------------------- */
+/* Single-column tracks may shrink below their content, and long button labels,
+   badges and addresses wrap instead of pushing the cards past the screen. */
+@media (max-width: 760px) {
+  .dl-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 860px) {
+  .feedback { grid-template-columns: minmax(0, 1fr); }
+}
+.dl-card, .feedback > * { min-width: 0; }
+.dl-card .card-head { flex-wrap: wrap; row-gap: 10px; }
+.dl-card .card-head h2 { min-width: 0; }
+.dl-card .btn, .feedback .btn { max-width: 100%; white-space: normal; text-align: center; }
+.dl-card .btn-lg, .feedback .btn-lg { height: auto; min-height: 50px; padding-block: 12px; line-height: 1.25; }
+.feedback a, .dl-meta a { overflow-wrap: anywhere; }
+@media (max-width: 380px) {
+  .dl-card, .feedback { padding: 22px 20px; }
+  /* The pill sits under the title, beside the tile, rather than alone on a row. */
+  .dl-card .card-head { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 14px; }
+  .dl-card .card-head .platform { grid-row: span 2; }
+  .dl-card .card-head .badge { justify-self: start; }
+  /* Room for the whole host on one line before the path. */
+  .term-cmd { padding: 12px 14px; font-size: 0.75rem; }
+}
