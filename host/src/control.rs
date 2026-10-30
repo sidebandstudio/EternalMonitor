@@ -45,6 +45,9 @@ pub struct SharedControl {
     /// With `UnsupportedOnThisGpu`: the card the captured screen is wired to
     /// and the switch that would move EternalMonitor onto it.
     pub gpu_diagnosis: Arc<Mutex<Option<crate::gpu_preference::Diagnosis>>>,
+    /// Which card the mirrored screen is on, as captures find it, to tell
+    /// when Windows moves it to another card while the app runs.
+    pub screen_watch: Arc<Mutex<crate::gpu_preference::ScreenWatch>>,
     /// A switch made from that notice, as saved in settings. Capture
     /// records its outcome here; the GUI saves it.
     pub gpu_switch: Arc<Mutex<Option<crate::gpu_preference::SwitchRecord>>>,
@@ -174,6 +177,7 @@ impl SharedControl {
             vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
             gpu_diagnosis: Arc::new(Mutex::new(None)),
+            screen_watch: Arc::new(Mutex::new(crate::gpu_preference::ScreenWatch::new())),
             gpu_switch: Arc::new(Mutex::new(None)),
             gpu_changed_here: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gpu_facts: Arc::new(Mutex::new(None)),

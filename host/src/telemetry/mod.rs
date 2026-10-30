@@ -14,6 +14,11 @@ use std::{
 mod periodic;
 mod redact;
 use periodic::Periodic;
+#[cfg(any(windows, test))]
+pub(crate) use redact::note_audio_device;
+pub(crate) use redact::note_client_device;
+#[cfg(windows)]
+pub(crate) use redact::note_hardware;
 
 const MAX_FILES: usize = 512;
 /// The longest line or message that uploads. Redaction slows down faster
@@ -442,12 +447,21 @@ pub fn record(line: &str) {
     if enabled() {
         if let Some(sender) = SENDER.get() {
             if sender
-                .try_send(Queued::Line(capped(line).to_owned()))
+                .try_send(Queued::Line(queued(capped(line), &redact::NAMES.read())))
                 .is_err()
             {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+/// `line` as the queue keeps it: redacted with the device names known now,
+/// so a name the registry lets go later stays out of it. A session summary
+/// stays as written. The upload redacts it again, which changes nothing.
+fn queued(line: &str, names: &redact::Names) -> String {
+    match session_summary(line) {
+        Some(_) => line.to_owned(),
+        None => redact::redact(line, names),
     }
 }
 /// `line`'s first [`MAX_LINE_BYTES`], whole characters only.
@@ -561,8 +575,13 @@ pub(crate) fn session_summary(line: &str) -> Option<&str> {
         .strip_prefix("INFO ")
         .filter(|message| message.starts_with("session_summary v="))
 }
+/// What uploads say for `line`.
+#[cfg(test)]
+pub(crate) fn uploaded(line: &str) -> String {
+    event(line, level(line)).message
+}
 fn event(line: &str, level: &str) -> Event {
-    event_with(line, level, &redact::NAMES)
+    event_with(line, level, &redact::NAMES.read())
 }
 /// A session summary uploads as written. Other lines leave out the user's
 /// and the PC's names (see [`redact`]).
@@ -1642,11 +1661,27 @@ mod tests {
             summary.to_string(),
         ] {
             let uploaded = event(&line, level(&line));
+            // The iPad's name, the rest of its line, is left out (see `redact`).
+            let message = match line.split_once(" device=") {
+                Some((head, _)) => format!("{head} device=<device-name>"),
+                None => line.clone(),
+            };
             assert_eq!(
                 (uploaded.category.as_str(), uploaded.message),
-                ("host", line)
+                ("host", message)
             );
         }
+    }
+    #[test]
+    fn uploads_name_a_device_by_its_kind() {
+        let line = "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+                    device=Headphones (Maria's AirPods) rate=48000 channels=2";
+        let uploaded = event(line, level(line));
+        assert_eq!(
+            uploaded.message,
+            "2026-10-30T09:12:00.123456Z  INFO WASAPI loopback active \
+             device=<headphones> rate=48000 channels=2"
+        );
     }
     /// Lines a streaming host logs over `seconds`, at their real rates.
     fn streaming_lines(seconds: u32) -> Vec<String> {
@@ -1828,6 +1863,30 @@ mod tests {
 
     /// Names that are also the summary's own tokens leave it byte for byte,
     /// while the same words elsewhere are names.
+    /// A line is redacted as it is queued: a device name the registry lets
+    /// go later stays out of its upload.
+    #[test]
+    fn a_queued_line_keeps_out_a_device_name_seen_before_many_others() {
+        let mut names = redact::Names::new(None, None, None);
+        let mut queue = Vec::new();
+        for i in 0..41 {
+            let name = format!("Zoe's iPad {i}");
+            names.note_device(&name, "<device-name>");
+            queue.push(queued(
+                &format!("2026-10-30T09:12:00.000000Z  INFO Pairing approved for {name}"),
+                &names,
+            ));
+        }
+        for i in 0..64 {
+            names.note_device(&format!("Kim's iPad {i}"), "<device-name>");
+        }
+        for line in queue {
+            assert_eq!(
+                event_with(&line, "info", &names).message,
+                "2026-10-30T09:12:00.000000Z  INFO Pairing approved for <device-name>"
+            );
+        }
+    }
     #[test]
     fn a_session_summary_is_never_redacted() {
         let names = redact::Names::new(Some(r"C:\Users\steady"), Some("mirror"), Some("wifi"));
