@@ -682,31 +682,6 @@ small { font-size: 0.875rem; }
   grid-template-columns: 1fr 1fr;
   gap: 20px;
 }
-/* Not out yet: Mac and iPhone Duo under the two shipping apps, smaller and
-   with no button. Matches the download page's row. */
-.coming { margin-top: clamp(48px, 6vw, 72px); }
-.coming h3 { font-size: clamp(1.375rem, 1.15rem + 0.6vw, 1.75rem); letter-spacing: -0.03em; line-height: 1.1; }
-.coming-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
-.coming-card { display: flex; align-items: flex-start; gap: 18px; padding: 24px; border-radius: var(--r-lg); background: var(--surface); }
-.coming-tile { flex: none; width: 48px; height: 48px; }
-.coming-card h4 { font-size: 1.125rem; }
-.coming-card p { margin-top: 6px; color: var(--muted); }
-.coming-card .coming-note {
-  display: inline-flex;
-  align-items: center;
-  height: 32px;
-  margin-top: 14px;
-  padding: 0 14px;
-  border-radius: 999px;
-  background: var(--raised);
-  color: var(--faint);
-  font-size: 0.875rem;
-  font-weight: 500;
-}
-@media (max-width: 760px) {
-  .coming-grid { grid-template-columns: 1fr; }
-  .coming-card { padding: 20px; gap: 16px; }
-}
 .card {
   padding: 28px;
   border: 1px solid var(--border);
@@ -731,6 +706,7 @@ small { font-size: 0.875rem; }
 }
 .card-head .icon svg { width: 20px; height: 20px; }
 .card-head h3 { flex: 1; font-size: 1.25rem; }
+.card-head:has(.platform) { gap: 16px; }
 .card > p { color: var(--muted); }
 .card .btn { margin-top: 20px; }
 
@@ -873,12 +849,14 @@ small { font-size: 0.875rem; }
 .channel-note { margin-top: 14px; color: var(--muted); }
 .dl-all { margin-top: 20px; }
 /* Mac and iPhone Duo, not out yet: quieter than the download cards, with no
-   button. Their tiles turn to night on Beta like the iPad card's. */
+   button. Also under the two apps on the home page, one heading level down.
+   On the download page their tiles turn to night on Beta like the iPad card's. */
 .soon { margin-top: clamp(64px, 8vw, 104px); }
-.soon h2 { font-size: clamp(1.5rem, 1.2rem + 0.8vw, 1.875rem); letter-spacing: -0.03em; line-height: 1.1; }
+.soon > h2, .soon > h3 { font-size: clamp(1.5rem, 1.2rem + 0.8vw, 1.875rem); letter-spacing: -0.03em; line-height: 1.1; }
 .soon-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
 .soon-card { display: flex; align-items: flex-start; gap: 18px; padding: 24px; border-radius: var(--r-lg); background: var(--surface); }
 .soon-card .platform { width: 48px; height: 48px; }
+.soon-body h4 { font-size: 1.125rem; }
 .soon-body p { margin-top: 6px; color: var(--muted); }
 .soon-body .soon-link {
   display: inline-flex;
