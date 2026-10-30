@@ -254,16 +254,22 @@
   };
   document.querySelectorAll('[data-copy]').forEach(function (btn) {
     var reset = null;
+    var shown = null;
     // While "Copied" shows, the button's own label nodes wait in __i18nHold,
-    // where docs/i18n.js takes them as the English if the language changes.
+    // where docs/i18n.js takes them as the English if it translates the button.
     var release = function () {
       clearTimeout(reset);
       reset = null;
       var held = btn.__i18nHold || [];
       btn.__i18nHold = null;
-      return held;
+      // "Copied" still showing means nothing relabelled the button (the timer,
+      // English chosen again, or a language that fell back): its label goes back.
+      if (shown && shown.parentNode === btn) {
+        btn.textContent = '';
+        held.forEach(function (n) { btn.appendChild(n); });
+      }
+      shown = null;
     };
-    // A language change relabels the button itself; the old label must not come back.
     onLanguage(release);
     btn.addEventListener('click', function () {
       var target = document.getElementById(btn.getAttribute('data-copy'));
@@ -271,12 +277,10 @@
       copyText(target.textContent.trim(), function () {
         if (!reset) btn.__i18nHold = Array.prototype.slice.call(btn.childNodes);
         clearTimeout(reset);
-        btn.textContent = t('common.copied', 'Copied');
-        reset = setTimeout(function () {
-          var held = release();
-          btn.textContent = '';
-          held.forEach(function (n) { btn.appendChild(n); });
-        }, 1800);
+        shown = document.createTextNode(t('common.copied', 'Copied'));
+        btn.textContent = '';
+        btn.appendChild(shown);
+        reset = setTimeout(release, 1800);
       });
     });
   });
