@@ -55,6 +55,15 @@
       sessionStorage.setItem('mac-notice', 'off');
       notice.remove();
     });
+    // On the home page it stays out of the way while the hero's picture is on
+    // screen, so it never covers the picture or its switches.
+    var hero = document.querySelector('.stage');
+    if (hero && 'IntersectionObserver' in window) {
+      notice.hidden = true;
+      new IntersectionObserver(function (entries) {
+        notice.hidden = entries[0].isIntersecting;
+      }).observe(hero);
+    }
     document.body.appendChild(notice);
   }
 
