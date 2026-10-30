@@ -14,7 +14,7 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Scanne den QR-Code, den EternalMonitor auf deinem PC zeigt, um ohne Eingabe der Adresse zu verbinden."
+            "value" : "Scanne den QR-Code, den EternalMonitor auf deinem PC zeigt, um dich ohne Adresseingabe zu verbinden."
           }
         },
         "en" : {

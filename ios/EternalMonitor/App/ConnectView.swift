@@ -201,8 +201,7 @@ struct ConnectView: View {
                     didPrefillFromLastHost = true
                 }
                 if !didSeeOnboarding {
-                    if FirstRun.isFreshInstall(lastHost: settings.lastHost, hasPairings: pairings.hasPairings,
-                                               hasRecents: !recentStore.connections.isEmpty) {
+                    if FirstRun.isFreshInstall(saved: FirstRun.saved, hasPairings: pairings.hasPairings) {
                         // Setup explains Local Network before the search
                         // makes iPadOS ask for it.
                         showSetup = true

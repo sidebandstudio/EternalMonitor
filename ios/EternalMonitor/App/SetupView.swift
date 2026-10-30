@@ -2,11 +2,32 @@ import SwiftUI
 
 /// Who sees first-run setup.
 enum FirstRun {
-    /// A fresh install: no saved PC, no paired PC and no recent connection.
-    /// Anyone updating from before setup has one of those or closed the old
-    /// tips card (`didSeeOnboarding`), and goes straight to the connect screen.
-    static func isFreshInstall(lastHost: String, hasPairings: Bool, hasRecents: Bool) -> Bool {
-        lastHost.isEmpty && !hasPairings && !hasRecents
+    /// Saved values that only a person's use of the app writes, in this
+    /// version or one from before setup: a setting changed, the tips card
+    /// closed, a PC connected to or tried, an update or feedback prompt
+    /// answered. The app writes others on its own at launch (diagnostics
+    /// installation ID, crash marker, update checks, remote config), so they
+    /// say nothing about an earlier install. The language is new with setup.
+    /// `preferUSB` and `promotionEnabled` are settings older versions had.
+    static let upgradeKeys: Set<String> = [
+        "didSeeOnboarding", "lastHost", "lastPort", "recentConnections", "deviceId",
+        "playPCaudio", "allowUSB", "showHUD", "keepScreenAwake", "autoResumeOnForeground",
+        "controlPC", "drawingMode", "commandAsControl", "autoReconnect", "targetFPS", "pictureFit",
+        "preferUSB", "promotionEnabled",
+        "checkForUpdates", "updateDismissedBuild", "updatePopupClosedBuild",
+        DiagnosticsUpload.enabledKey, FeedbackAsk.sessionsKey, FeedbackAsk.doneKey,
+    ]
+
+    /// A fresh install: no PC paired and none of `upgradeKeys` saved.
+    /// Anyone updating from before setup has one of them and goes straight
+    /// to the connect screen.
+    static func isFreshInstall(saved: [String: Any], hasPairings: Bool) -> Bool {
+        !hasPairings && upgradeKeys.isDisjoint(with: saved.keys)
+    }
+
+    /// What this install has saved. Launch arguments are not in it.
+    static var saved: [String: Any] {
+        Bundle.main.bundleIdentifier.flatMap(UserDefaults.standard.persistentDomain(forName:)) ?? [:]
     }
 }
 

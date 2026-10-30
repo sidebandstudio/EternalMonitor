@@ -91,12 +91,39 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(UserDefaults.standard.string(forKey: LanguageStore.defaultsKey), before)
     }
 
-    /// Only a fresh install sees setup.
+    /// Only a fresh install sees setup. What the app saves by itself at
+    /// launch doesn't count; anything a person's use saved does, a single
+    /// changed setting included.
     func testSetupIsForFreshInstallsOnly() {
-        XCTAssertTrue(FirstRun.isFreshInstall(lastHost: "", hasPairings: false, hasRecents: false))
-        XCTAssertFalse(FirstRun.isFreshInstall(lastHost: "192.168.1.20", hasPairings: false, hasRecents: false))
-        XCTAssertFalse(FirstRun.isFreshInstall(lastHost: "", hasPairings: true, hasRecents: false))
-        XCTAssertFalse(FirstRun.isFreshInstall(lastHost: "", hasPairings: false, hasRecents: true))
+        let launchWrites: [String: Any] = [
+            "diagnosticsInstallationID": "A1B2", ForegroundMarker.key: ["version": "0.3.3"],
+            "remoteConfigFetchedAt": Date(), "updateCheckedAt": Date(), "updateAvailableBuild": 40,
+            LanguageStore.defaultsKey: "",
+        ]
+        XCTAssertTrue(FirstRun.isFreshInstall(saved: [:], hasPairings: false))
+        XCTAssertTrue(FirstRun.isFreshInstall(saved: launchWrites, hasPairings: false))
+        XCTAssertFalse(FirstRun.isFreshInstall(saved: launchWrites, hasPairings: true))
+        let upgrades: [String: Any] = [
+            "playPCaudio": false, "targetFPS": 120, "pictureFit": "fill", "allowUSB": false,
+            "didSeeOnboarding": false, "lastHost": "192.168.1.20", "recentConnections": Data(),
+            "deviceId": "42", "checkForUpdates": false, DiagnosticsUpload.enabledKey: true,
+            FeedbackAsk.doneKey: true, "preferUSB": false, "promotionEnabled": false,
+        ]
+        for (key, value) in upgrades {
+            XCTAssertFalse(FirstRun.isFreshInstall(saved: launchWrites.merging([key: value]) { $1 }, hasPairings: false), key)
+        }
+    }
+
+    /// The cable card's usual statuses follow the language; its problem
+    /// stays English.
+    func testUSBStatusesFollowTheLanguage() {
+        LanguageStore.shared.choice = .de
+        XCTAssertEqual(USBStatusText.describe("USB: connecting"), "Verbinden per Kabel…")
+        XCTAssertEqual(USBStatusText.describe("USB: connected to Studio PC"), "Per Kabel mit Studio PC verbunden.")
+        XCTAssertEqual(USBStatusText.describe("USB: off"), "Aus. Schalte es ein, um per Kabel zu verbinden.")
+        XCTAssertEqual(USBStatusText.describe("USB: unavailable"), "The cable can't be used right now. Wi-Fi still works.")
+        LanguageStore.shared.choice = .ja
+        XCTAssertEqual(USBStatusText.describe("USB: connected to Studio PC"), "ケーブルで Studio PC に接続済み。")
     }
 }
 

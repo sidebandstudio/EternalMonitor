@@ -856,6 +856,149 @@
         }
       }
     },
+    "Connected to %@ over the cable." : {
+      "comment" : "The PC's name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "متصل بـ %@ عبر الكابل."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per Kabel mit %@ verbunden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connected to %@ over the cable."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conectado a %@ por cable."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connecté à %@ par câble."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "केबल से %@ से कनेक्ट है।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ケーブルで %@ に接続済み。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "케이블로 %@에 연결됨."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conectado a %@ pelo cabo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключено к %@ по кабелю."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已通过线缆连接到 %@。"
+          }
+        }
+      }
+    },
+    "Connecting over the cable…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "جارٍ الاتصال عبر الكابل…"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verbinden per Kabel…"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connecting over the cable…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conectando por cable…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connexion par câble…"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "केबल से कनेक्ट हो रहा है…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ケーブルで接続中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "케이블로 연결 중…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conectando pelo cabo…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключение по кабелю…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在通过线缆连接…"
+          }
+        }
+      }
+    },
     "Connecting…" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -2018,7 +2161,7 @@
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Llenar la pantalla"
+            "value" : "Rellenar la pantalla"
           }
         },
         "fr" : {
@@ -3843,6 +3986,77 @@
         }
       }
     },
+    "Off. Turn on to connect with a cable." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "متوقف. شغّله للاتصال عبر كابل."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus. Schalte es ein, um per Kabel zu verbinden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off. Turn on to connect with a cable."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desactivado. Actívalo para conectar con un cable."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Désactivé. Activez pour vous connecter avec un câble."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "बंद है। केबल से कनेक्ट करने के लिए चालू करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフです。ケーブルで接続するにはオンにしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "꺼져 있습니다. 케이블로 연결하려면 켜세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desativado. Ative para conectar com um cabo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выключено. Включите, чтобы подключаться по кабелю."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已关闭。打开后可用线缆连接。"
+          }
+        }
+      }
+    },
     "On" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4697,6 +4911,77 @@
         }
       }
     },
+    "Paused. Tap Connect USB to use the cable again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "متوقف مؤقتًا. اضغط اتصال USB لاستخدام الكابل مرة أخرى."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pausiert. Tippe auf „USB verbinden“, um das Kabel wieder zu nutzen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Paused. Tap Connect USB to use the cable again."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "En pausa. Toca Conectar USB para volver a usar el cable."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "En pause. Touchez Connecter en USB pour réutiliser le câble."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "रुका हुआ है। केबल फिर से इस्तेमाल करने के लिए USB कनेक्ट करें पर टैप करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "一時停止中です。ケーブルをもう一度使うには「USB で接続」をタップしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일시 정지됨. 케이블을 다시 사용하려면 USB 연결을 탭하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pausado. Toque em Conectar USB para usar o cabo de novo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пауза. Нажмите «Подключить USB», чтобы снова использовать кабель."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已暂停。轻点“连接 USB”以再次使用线缆。"
+          }
+        }
+      }
+    },
     "Picture" : {
       "comment" : "Setting: Fit or Fill",
       "extractionState" : "manual",
@@ -4870,7 +5155,7 @@
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Branchez le câble pour connecter"
+            "value" : "Branchez le câble pour vous connecter"
           }
         },
         "hi" : {
@@ -4912,7 +5197,6 @@
       }
     },
     "Plug this iPad into your PC. Keep Apple Devices open on the PC." : {
-      "comment" : "Setup only; the connect screen's USB status line stays English",
       "extractionState" : "manual",
       "localizations" : {
         "ar" : {
@@ -5019,7 +5303,7 @@
         "hi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "अपने PC पर EternalMonitor के QR कोड की ओर कैमरा करें"
+            "value" : "अपने PC पर EternalMonitor में दिख रहे QR कोड की ओर कैमरा करें"
           }
         },
         "ja" : {
@@ -5416,13 +5700,13 @@
         "ar" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "أعد الاتصال الآن للتطبيق"
+            "value" : "أعد الاتصال الآن لتطبيق التغييرات"
           }
         },
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Jetzt neu verbinden"
+            "value" : "Zum Anwenden neu verbinden"
           }
         },
         "en" : {
@@ -6382,7 +6666,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "전체 화면 보기"
+            "value" : "전체 영상 보기"
           }
         },
         "pt-BR" : {
@@ -6749,7 +7033,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Оценить EternalMonitor на GitHub"
+            "value" : "Поставить звезду EternalMonitor на GitHub"
           }
         },
         "zh-Hans" : {
@@ -7368,7 +7652,7 @@
         "hi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld से. बाद फिर कोशिश करें"
+            "value" : "%lld सेकंड बाद फिर कोशिश करें"
           }
         },
         "ja" : {
