@@ -81,6 +81,8 @@ final class RelayTouchUIView: UIView {
     private var holdTimer: DispatchWorkItem?
     private var hudTapFired = false
     private var softwareKeyboardPresented = false
+    /// When the last hardware key press arrived.
+    private var hardwareKeyUptime: TimeInterval?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -196,12 +198,16 @@ final class RelayTouchUIView: UIView {
         let visible = window.bounds.intersection(window.screen.coordinateSpace.convert(frame, to: window))
         let accessoryHeight = keyboardInput.inputAccessoryView?.bounds.height ?? 0
         if !visible.isNull && visible.height > accessoryHeight + window.safeAreaInsets.bottom + 1 {
+            if !softwareKeyboardPresented { hardwareKeyUptime = nil }
             softwareKeyboardPresented = true
         } else if softwareKeyboardPresented {
             // The system Hide Keyboard key leaves an accessory-only responder.
             // Finish that dismissal, while still permitting an accessory bar
             // when a physical keyboard was attached from the start.
             softwareKeyboardPresented = false
+            // A hardware keyboard's first key shrinks the software keyboard
+            // the same way. Keep the bar then, or the keys typed next are lost.
+            if let hardwareKeyUptime, ProcessInfo.processInfo.systemUptime - hardwareKeyUptime < 1 { return }
             keyboardVisible = false
             DispatchQueue.main.async { [weak self] in self?.keyboardInput.resignFirstResponder() }
         }
@@ -255,6 +261,7 @@ final class RelayTouchUIView: UIView {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if presses.contains(where: { $0.key != nil }) { hardwareKeyUptime = ProcessInfo.processInfo.systemUptime }
         guard active, keyboardSupported else { return super.pressesBegan(presses, with: event) }
         for press in presses {
             guard let key = press.key else { continue }
