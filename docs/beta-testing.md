@@ -161,6 +161,9 @@ update before the matching iPad build can be installed.
    Connect that Apple approved the build (set `ASC_KEY_ID`, `ASC_ISSUER_ID`
    and `ASC_KEY_PATH`), and writes both `docs/download.html` and
    `docs/latest.json`. Either platform can go alone.
+   It also reads https://eternalmonitor.dev/latest.json and refuses anything
+   older than what is live there, since this checkout's copy may be behind;
+   `--skip-live-check` goes ahead when the site cannot be read.
 2. It runs `scripts/check-versions.sh`, which fails when the two files
    disagree (CI runs it on every pull request), and prints the git commands
    for the pull request.

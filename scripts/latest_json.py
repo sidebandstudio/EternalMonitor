@@ -3,9 +3,9 @@
 
   latest_json.py publish [--windows VERSION] [--ipad VERSION --build N] [--note TEXT] [--not-recommended]
                          [--rollout-start YYYY-MM-DDTHH:MM:SSZ --rollout-days N]
-                         [--windows-config FILE|none] [--ipad-config FILE|none]
+                         [--windows-config FILE|none] [--ipad-config FILE|none] [--skip-live-check]
   latest_json.py rollback [--windows VERSION] [--ipad VERSION] [--note TEXT] [--not-recommended]
-                          [--windows-config FILE|none] [--ipad-config FILE|none]
+                          [--windows-config FILE|none] [--ipad-config FILE|none] [--skip-live-check]
 
 Windows takes the installer's SHA-256 from GitHub release vVERSION: the
 release must be published and stable, and its asset digest (or the installer,
@@ -18,6 +18,14 @@ Connect with the ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 or ASC_KEY_PATH that
 testflight_review.py takes. rollback takes an older version that
 docs/latest.json published before, with the iPad build from its git history,
 and checks App Store Connect too when those variables are set.
+
+This checkout's docs/latest.json can be behind the one the apps read, so both
+commands also compare with https://eternalmonitor.dev/latest.json: publish
+refuses a Windows version, iPad version or iPad build older than the live
+one, and rollback refuses one that is not older. A platform the command
+leaves alone must not be older than the live one either, or the branch needs
+updating first. If the live manifest cannot be read, both commands stop
+unless --skip-live-check is given.
 
 Both apps only offer a strictly newer version than the one installed, so a
 rollback never prompts anyone already on the bad release; it stops new
@@ -41,6 +49,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -53,6 +62,7 @@ INSTALLER = "EternalMonitor-Setup.exe"
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024  # host/src/updates.rs
 TESTFLIGHT = re.compile(r"https://testflight\.apple\.com/join/[A-Za-z0-9]+")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
+LIVE = "https://eternalmonitor.dev/latest.json"
 
 
 class ManifestError(Exception):
@@ -115,6 +125,50 @@ def windows_release(version, release=github_release, download=download_sha256):
     if actual != sha256:
         raise ManifestError(f"{tag}'s installer SHA-256 differs from its release body")
     return sha256, asset["size"]
+
+
+def live_manifest():
+    """The docs/latest.json GitHub Pages serves to the apps now."""
+    # A query string keeps a cached copy from before the last deploy out of the way.
+    request = urllib.request.Request(f"{LIVE}?checked={int(time.time())}",
+                                     headers={"Cache-Control": "no-cache", "User-Agent": "EternalMonitor-latest-json"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)
+    except (OSError, ValueError) as error:
+        raise ManifestError(f"could not read {LIVE} ({error}); retry, or pass --skip-live-check") from None
+
+
+def check_live(args, latest, live):
+    """Refuse to move a platform the wrong way past what the apps read now."""
+    try:
+        windows, ipad, build = live["windows"]["version"], live["ipad"]["version"], live["ipad"]["build"]
+        if not (VERSION.fullmatch(windows) and VERSION.fullmatch(ipad)) or type(build) is not int:
+            raise TypeError
+    except (KeyError, TypeError):
+        raise ManifestError(f"{LIVE} has no valid Windows version, iPad version and iPad build") from None
+    def older(named, what, than):
+        # A platform the command leaves alone comes from this checkout, which may be behind.
+        if named:
+            return ManifestError(f"{what} is older than the live {than}; use rollback")
+        return ManifestError(f"this checkout's docs/latest.json names {what}, older than the live {than}; "
+                             "update the branch")
+
+    rollback = args.command == "rollback"
+    new = latest["windows"]["version"]
+    if rollback and args.windows:
+        if version_key(new) >= version_key(windows):
+            raise ManifestError(f"Windows {new} is not older than the live {windows}; use publish")
+    elif version_key(new) < version_key(windows):
+        raise older(args.windows, f"Windows {new}", windows)
+    new, new_build = latest["ipad"]["version"], latest["ipad"]["build"]
+    if rollback and args.ipad:
+        if new_build >= build:
+            raise ManifestError(f"iPad {new} build {new_build} is not older than the live build {build}; use publish")
+    elif new_build < build:
+        raise older(args.ipad, f"iPad {new} build {new_build}", f"build {build}")
+    elif version_key(new) < version_key(ipad):
+        raise older(args.ipad, f"iPad {new} build {new_build}", f"iPad {ipad}")
 
 
 def published_ipad_builds(root, version):
@@ -317,7 +371,8 @@ def asc_from_env():
     return testflight_review.AppStoreConnect.from_env() if os.environ.get("ASC_KEY_ID") else None
 
 
-def main(argv=None, root=ROOT, release=github_release, download=download_sha256, connect=asc_from_env):
+def main(argv=None, root=ROOT, release=github_release, download=download_sha256, connect=asc_from_env,
+         live=live_manifest):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("publish", "rollback"))
     parser.add_argument("--windows", metavar="VERSION")
@@ -329,6 +384,8 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
     parser.add_argument("--rollout-days", type=int, metavar="N", help="over this many days, 0 to 14")
     parser.add_argument("--windows-config", metavar="FILE", help="windows.config as a JSON file, or none")
     parser.add_argument("--ipad-config", metavar="FILE", help="ipad.config as a JSON file, or none")
+    parser.add_argument("--skip-live-check", action="store_true",
+                        help=f"do not compare with {LIVE} (when it cannot be read)")
     args = parser.parse_args(argv)
     if not (args.windows or args.ipad or args.windows_config or args.ipad_config):
         parser.error("name --windows, --ipad, a config, or several")
@@ -348,6 +405,10 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
     before = {manifest: manifest.read_text(), page: page.read_text()}
     try:
         latest, size, changes = build_manifest(args, json.loads(before[manifest]), release, download, connect, root)
+        if args.skip_live_check:
+            print(f"{LIVE} was not checked (--skip-live-check): confirm nothing goes older than it by mistake")
+        else:
+            check_live(args, latest, live())
         html = update_page(before[page], latest, size)
     except (ManifestError, testflight_review.AscError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(f"latest_json.py: {error}")
