@@ -6,8 +6,7 @@ what has already shipped.
 
 ## Next release: 0.3.4
 
-Version 0.3.4 is in testing. Its draft
-[release notes](https://github.com/sidebandstudio/EternalMonitor/pull/142) include:
+Version 0.3.4 is in testing. It brings:
 
 - **11 languages in both apps.** Pick one in a new first-run setup or in Settings.
 - **The right graphics card on dual-graphics laptops.** When Windows runs
@@ -25,7 +24,7 @@ Version 0.3.4 is in testing. Its draft
 - **Signed Windows installer.** Code signing is built into the release pipeline
   and turns on once the signing account is set up.
 - **iPad app on the App Store.** The iPad app installs through TestFlight today.
-  An App Store release comes next.
+  An App Store release is planned.
 - **Community compatibility list.** Measured results from the PCs and iPads
   people use: which setups work, how smooth they feel and the latency the apps
   report, published on the [compatibility page](https://eternalmonitor.dev/compatibility.html).
@@ -36,8 +35,6 @@ Version 0.3.4 is in testing. Its draft
 
 ## Help build it
 
-Issues labelled
-[good first issue](https://github.com/sidebandstudio/EternalMonitor/labels/good%20first%20issue)
-are small and self-contained. For anything on this page, read
+For anything on this page, read
 [CONTRIBUTING.md](CONTRIBUTING.md) and talk it through on the
 [Sideband Discord](https://discord.gg/Xc7NykBZ6z) first.

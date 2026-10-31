@@ -46,8 +46,9 @@ and Pencil stroke goes back to the PC.
    [EternalMonitor TestFlight link](https://testflight.apple.com/join/ppc9QfXc)
    on the iPad and tap **Install**.
 3. **Connect.** With both apps open on the same network, tap your PC on the iPad
-   or scan the QR code the PC shows. For USB, plug in the cable and keep Apple's
-   free [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) app open on the PC.
+   or scan the QR code the PC shows. For USB, on Windows 10 22H2 or Windows 11,
+   plug in the cable and keep Apple's free
+   [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) app open on the PC.
 
 The [setup guide](SETUP.md) walks through every step with the exact button names.
 The [download page](https://eternalmonitor.dev/download.html) lists the Windows and
@@ -117,8 +118,8 @@ once Windows adds it. [RELEASE_NOTES.md](RELEASE_NOTES.md) covers every version,
 and [ROADMAP.md](ROADMAP.md) what comes next.
 
 The v0.3.3 release checks passed on Windows, macOS and iPad simulators, and
-[docs/hardware-verification.md](docs/hardware-verification.md) records the
-physical-device results.
+[docs/hardware-verification.md](docs/hardware-verification.md) records hands-on
+results on a real PC and iPad from v0.3.0.
 
 Both apps share diagnostics so problems can be found and fixed: device details,
 app errors and stream statistics, including PC and iPad names, audio device names
@@ -276,9 +277,8 @@ streaming system test on every pull request.
 ## Contributing
 
 Contributions are welcome, from transport and encoders to rendering and docs.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Issues
-labelled [good first issue](https://github.com/sidebandstudio/EternalMonitor/labels/good%20first%20issue)
-are a place to start, and [ROADMAP.md](ROADMAP.md) shows the larger work ahead. To
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; it lists
+good first contributions, and [ROADMAP.md](ROADMAP.md) shows the larger work ahead. To
 talk an idea through first, ask on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
 
 ## Contact
