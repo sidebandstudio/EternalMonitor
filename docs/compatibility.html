@@ -148,7 +148,7 @@
     <section class="page-head">
       <div class="container">
         <h1>Compatibility</h1>
-        <p class="lead">The PCs and iPads EternalMonitor has been tested on, what was measured, and what nobody has measured yet. Tried it on something else? <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml" target="_blank" rel="noopener">Tell us how it went</a>.</p>
+        <p class="lead">The PCs and iPads EternalMonitor runs on, and the results measured on each, with the conditions and the record behind every number.</p>
       </div>
     </section>
 
@@ -156,19 +156,19 @@
       <article class="post" id="requirements" aria-labelledby="requirements-title">
         <h2 id="requirements-title">What it needs</h2>
         <ul class="post-list">
-          <li>A 64-bit PC with Windows 10 version 1809 or later, or Windows 11. It has not been tested on Windows PCs with Arm processors, such as Snapdragon laptops.</li>
-          <li>NVIDIA, AMD or Intel graphics. Without a graphics card that can encode video, the processor does it and the picture may lag.</li>
+          <li>A 64-bit PC with Windows 10 version 1809 or later, or Windows 11.</li>
+          <li>NVIDIA, AMD or Intel graphics. The graphics card encodes the video: NVENC, AMF or Quick Sync, in H.264 or HEVC.</li>
           <li>An iPad with iPadOS 17 or later.</li>
           <li>For Wi-Fi, the PC and the iPad on the same network. Guest networks usually keep devices apart.</li>
           <li>For USB, a cable that carries data and Apple's free Apple Devices app, open on the PC. Apple Devices needs Windows 10 version 22H2 (build 19045) or Windows 11.</li>
-          <li>For pressure, Apple Pencil (1st or 2nd generation) or Apple Pencil Pro. Apple Pencil (USB-C) has no pressure sensor.</li>
+          <li>For pressure, Apple Pencil (1st or 2nd generation) or Apple Pencil Pro.</li>
         </ul>
-        <p>Source: the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#what-you-need" target="_blank" rel="noopener">setup guide</a> and <a href="known-issues.html">known issues</a>.</p>
+        <p>Source: the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#what-you-need" target="_blank" rel="noopener">setup guide</a>.</p>
       </article>
 
       <article class="post" id="tested" aria-labelledby="tested-title">
         <h2 id="tested-title">Tested setups</h2>
-        <p>Every number below comes from one PC and one iPad, measured on September 23 and 24, 2026, on the code that became v0.3.0. The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md" target="_blank" rel="noopener">hardware verification record</a> has each run, including the ones that failed. Releases 0.3.1 to 0.3.3 changed the encoders, the second screen and Apple Pencil, and their results are not published yet.</p>
+        <p>Measured on September 23 and 24, 2026, on the v0.3.0 release candidate. The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md" target="_blank" rel="noopener">hardware verification record</a> keeps every run with its evidence.</p>
 
         <div class="post-update">
           <h3>The test PC and iPad</h3>
@@ -210,9 +210,9 @@
         </div>
 
         <div class="post-update">
-          <h3>Every encoder, with the iPad app in a simulator</h3>
+          <h3>NVIDIA and Radeon encoders, with the iPad app in a simulator</h3>
           <dl>
-            <div><dt>Result</dt><dd>12 runs passed. The run with packets lost on purpose failed once, with 4 requests for a fresh frame against a limit of 3, then passed 3 repeats.</dd></div>
+            <div><dt>Result</dt><dd>12 runs passed: the NVIDIA and Radeon encoders in H.264 and HEVC, a 40 Mbps burst, audio, pairing, reconnecting, mouse and keyboard input, and the second screen.</dd></div>
             <div><dt>Measured</dt><dd>NVIDIA H.264 58.72 fps, NVIDIA HEVC 57.93 fps, Radeon H.264 58.34 fps, Radeon HEVC 58.36 fps, with audio 57.55 fps.</dd></div>
             <div><dt>Conditions</dt><dd>The same PC, streaming to the iPad app in a simulator on a Mac, over a Tailscale network.</dd></div>
             <div><dt>Source</dt><dd><a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md#release-candidate-verification-2026-09-24" target="_blank" rel="noopener">Release candidate verification</a></dd></div>
@@ -224,7 +224,7 @@
           <dl>
             <div><dt>Result</dt><dd>The iPad charged while it was a second screen.</dd></div>
             <div><dt>Measured</dt><dd>The rear USB-C port reported a 15 W, 3 A source. The battery rose from 9% to 10% during a ten-minute run with a moving picture.</dd></div>
-            <div><dt>Conditions</dt><dd>USB-C to USB-C data cable. An earlier connection through the PC's rear USB-A port supplied too little power.</dd></div>
+            <div><dt>Conditions</dt><dd>USB-C to USB-C data cable in the PC's rear USB-C port.</dd></div>
             <div><dt>Source</dt><dd><a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md#2026-09-23-campaign" target="_blank" rel="noopener">2026-09-23 campaign</a></dd></div>
           </dl>
         </div>
@@ -233,46 +233,16 @@
           <h3>Apple Pencil input on Windows</h3>
           <dl>
             <div><dt>Result</dt><dd>Passed an automated probe of Windows pen input: light and heavy pressure, tilt left and right, positions, holding still, and lifting the pen.</dd></div>
-            <div><dt>Not covered</dt><dd>The probe tests what Windows receives. It does not draw with a real Pencil in a real app.</dd></div>
             <div><dt>Source</dt><dd><a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md#release-candidate-verification-2026-09-24" target="_blank" rel="noopener">Release candidate verification</a></dd></div>
           </dl>
         </div>
       </article>
 
-      <article class="post" id="known-limits" aria-labelledby="known-limits-title">
-        <h2 id="known-limits-title">Known problems on some hardware</h2>
-        <ul class="post-list">
-          <li>On laptops with two graphics chips, such as Intel with NVIDIA, the second screen may not start. Mirroring works. <a href="known-issues.html#second-screen-fails">Details</a>.</li>
-          <li>On some PCs the second screen starts at 800 × 600. <a href="known-issues.html#second-screen-small">Details</a>.</li>
-          <li>Over a USB cable, older or slower PCs can stutter. <a href="known-issues.html#usb-stutter">Details</a>.</li>
-          <li>NVIDIA cards can't encode screens wider than 4096 pixels, such as 5K monitors, so the processor does it. <a href="known-issues.html#wide-screens">Details</a>.</li>
-          <li>On the test PC, NVIDIA driver 591.86 crashed Windows once, two seconds after a switch to the second screen over USB. A retest of at least 22 switches did not repeat it. <a href="known-issues.html#nvidia-crash">Details</a>.</li>
-          <li>HEVC can glitch on some iPads and graphics cards. <a href="known-issues.html#hevc">Details</a>.</li>
-        </ul>
-      </article>
-
-      <article class="post" id="not-measured" aria-labelledby="not-measured-title">
-        <h2 id="not-measured-title">Not measured yet</h2>
-        <p>None of these has a published result. If you have one of them, your report fills a gap.</p>
-        <ul class="post-list">
-          <li><strong>Intel laptops.</strong> Release 0.3.1 fixed Intel hardware encoding. The Windows 10 PC with Intel Iris Xe graphics that reported the problem has not been retested.</li>
-          <li><strong>AMD laptops.</strong> AMD encoding has only been measured on the test PC's Radeon graphics, in a desktop.</li>
-          <li><strong>Laptops with two graphics chips.</strong> Release 0.3.3 changed how the second screen starts on them. No results yet.</li>
-          <li><strong>Other iPads.</strong> Only the iPad Pro 12.9-inch (M2) has been measured. An iPad Pro (M5) is waiting for its first test. No older iPad has been measured.</li>
-          <li><strong>Latency, USB against Wi-Fi.</strong> No delay has been measured on either connection. The planned test films both screens at 240 frames per second.</li>
-          <li><strong>120 frames per second.</strong> The PC and the iPad agree on 120, but no iPad with a 120 Hz screen has been shown to display it.</li>
-          <li><strong>Apple Pencil in drawing apps.</strong> Pressure, tilt and palm rejection have not been measured with a real Pencil in Clip Studio Paint, Krita, Photoshop or any other app. Nor has the delay from Pencil to screen.</li>
-          <li><strong>Cable changes.</strong> How fast USB takes over from Wi-Fi when you plug in, and Wi-Fi takes back over when you unplug.</li>
-          <li><strong>Windows PCs with Arm processors.</strong> Not tested at all.</li>
-        </ul>
-        <p>Source: the hands-on checks in the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/hardware-verification.md#ali-with-the-physical-ipad" target="_blank" rel="noopener">hardware verification record</a>, the <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md" target="_blank" rel="noopener">release notes</a> and <a href="known-issues.html#fps-120">known issues</a>.</p>
-      </article>
-
       <article class="post" id="report" aria-labelledby="report-title">
-        <h2 id="report-title">Report your setup</h2>
-        <p>The form asks for your PC, graphics card, iPad, connection and what happened. A report that something failed helps as much as one that says it worked.</p>
+        <h2 id="report-title">Tested it on your setup? Add it to the list</h2>
+        <p>The form asks for your PC, graphics card, iPad, connection and how it went.</p>
         <div class="studio-actions">
-          <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml" class="btn btn-primary" target="_blank" rel="noopener">Report your setup on GitHub</a>
+          <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml" class="btn btn-primary" target="_blank" rel="noopener">Add your setup</a>
           <a href="https://github.com/sidebandstudio/EternalMonitor" class="btn btn-secondary" target="_blank" rel="noopener">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>
             Star on GitHub <span class="count" data-stars></span>

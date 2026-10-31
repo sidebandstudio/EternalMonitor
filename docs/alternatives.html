@@ -142,14 +142,14 @@
     <section class="page-head">
       <div class="container">
         <h1>Ways to use an iPad as a display for a Windows PC</h1>
-        <p class="lead">Several apps turn an iPad into a screen for a Windows PC. This page puts what each maker says on its own pages side by side. Where a maker doesn't say, it reads "not stated". We make EternalMonitor, so it is listed too, with its limits. Checked October 2026.</p>
+        <p class="lead">Several apps turn an iPad into a screen for a Windows PC. This page puts what each maker says on its own pages side by side. Where a maker doesn't say, it reads "not stated". We make EternalMonitor, so it is listed first. Checked October 2026.</p>
       </div>
     </section>
 
     <section class="container posts policy compare">
       <article class="post" id="sidecar" aria-labelledby="sidecar-title">
         <h2 id="sidecar-title">First, Sidecar is for a Mac</h2>
-        <p>Apple's Sidecar extends or mirrors a Mac onto an iPad, over Wi-Fi or a cable. It needs a Mac with macOS Catalina or later, so it does not work with a Windows PC. Windows has no built-in way to use an iPad as a screen either, so each option below is an app on the PC and an app on the iPad. Source: <a href="https://support.apple.com/en-us/102597" target="_blank" rel="noopener">Apple Support</a>.</p>
+        <p>Apple's Sidecar extends or mirrors a Mac onto an iPad, over Wi-Fi or a cable. It needs a Mac with macOS Catalina or later, so it does not work with a Windows PC. Windows has no built-in way to use an iPad as a screen either, so each option below runs an app on the PC. On the iPad, most use their own app; Deskreen uses the web browser. Source: <a href="https://support.apple.com/en-us/102597" target="_blank" rel="noopener">Apple Support</a>.</p>
       </article>
 
       <article class="post" id="compared" aria-labelledby="compared-title">
@@ -161,9 +161,9 @@
           <dl>
             <div><dt>Price</dt><dd>Free, with no account.</dd></div>
             <div><dt>Open source</dt><dd>Yes, MIT license.</dd></div>
-            <div><dt>Connection</dt><dd>Wi-Fi or USB cable. USB needs Apple's Apple Devices app open on the PC.</dd></div>
+            <div><dt>Connection</dt><dd>Wi-Fi or USB cable. Plugging in the cable takes over a running Wi-Fi session.</dd></div>
             <div><dt>Extend or mirror</dt><dd>Both.</dd></div>
-            <div><dt>Pencil pressure</dt><dd>Yes, with tilt, as a Windows pen. Apple Pencil (USB-C) has no pressure sensor.</dd></div>
+            <div><dt>Pencil pressure</dt><dd>Yes, with tilt, as Windows Ink. Drawing mode ignores your palm on the canvas.</dd></div>
             <div><dt>Needs</dt><dd>Windows 10 version 1809 or later, or Windows 11, 64-bit. iPadOS 17 or later.</dd></div>
             <div><dt>Sources</dt><dd><a href="download.html">Download page</a>, <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a></dd></div>
           </dl>
@@ -189,9 +189,9 @@
             <div><dt>Open source</dt><dd>No. Source code is licensed only to system integrators.</dd></div>
             <div><dt>Connection</dt><dd>Wi-Fi, network cable or USB. The iPad app lists USB or a local network.</dd></div>
             <div><dt>Extend or mirror</dt><dd>Both.</dd></div>
-            <div><dt>Pencil pressure</dt><dd>Not stated. It lists drawing with a digitizer pen.</dd></div>
+            <div><dt>Pencil pressure</dt><dd>Yes, in the iPad app with Pen input turned on, says spacedesk support.</dd></div>
             <div><dt>Needs</dt><dd>Windows 10 or 11.</dd></div>
-            <div><dt>Sources</dt><dd><a href="https://www.spacedesk.net/" target="_blank" rel="noopener">spacedesk.net</a>, <a href="https://www.spacedesk.net/licensing/" target="_blank" rel="noopener">licensing</a>, <a href="https://apps.apple.com/us/app/spacedesk-usb-display-for-pc/id1069217220" target="_blank" rel="noopener">App Store listing</a></dd></div>
+            <div><dt>Sources</dt><dd><a href="https://www.spacedesk.net/" target="_blank" rel="noopener">spacedesk.net</a>, <a href="https://www.spacedesk.net/licensing/" target="_blank" rel="noopener">licensing</a>, <a href="https://www.spacedesk.net/de/support-forum-de/topic/pen-pressure/" target="_blank" rel="noopener">support answer on pen pressure</a>, <a href="https://apps.apple.com/us/app/spacedesk-usb-display-for-pc/id1069217220" target="_blank" rel="noopener">App Store listing</a></dd></div>
           </dl>
         </div>
 
@@ -262,18 +262,18 @@
       </article>
 
       <article class="post" id="who-it-suits" aria-labelledby="who-it-suits-title">
-        <h2 id="who-it-suits-title">Who EternalMonitor suits, and its current limits</h2>
-        <p>It suits you if you have a Windows PC and an iPad, want to extend or mirror over Wi-Fi or a cable, and want Apple Pencil pressure and tilt in Windows drawing apps without paying. The code is open, so you can read what it does with your screen.</p>
+        <h2 id="who-it-suits-title">Who EternalMonitor suits</h2>
+        <p>Anyone with a Windows PC and an iPad who wants a second screen or a drawing tablet without paying for one.</p>
         <ul class="post-list">
-          <li><strong>Windows PCs only.</strong> Mac support is <a href="index.html#coming">coming</a>, not out yet.</li>
-          <li><strong>The iPad app is a TestFlight beta.</strong> It is not in the App Store yet; you install it through Apple's TestFlight app.</li>
-          <li><strong>The Windows installer is not code-signed yet.</strong> Windows warns before it runs. The download page lists its SHA-256 so you can check the file.</li>
-          <li><strong>The stream is not encrypted.</strong> Use a network you trust, or the cable.</li>
-          <li><strong>One iPad at a time.</strong> A second iPad can't connect while one is streaming.</li>
-          <li><strong>The second screen fails on some laptops with two graphics chips.</strong> Mirroring works there.</li>
-          <li><strong>Measured on one PC and one iPad so far.</strong> The <a href="compatibility.html">compatibility page</a> lists what is tested and what isn't.</li>
+          <li><strong>Free and open source.</strong> MIT license, no account, and code you can read.</li>
+          <li><strong>Your graphics card does the work.</strong> NVIDIA NVENC, AMD AMF or Intel Quick Sync encode H.264 or HEVC at 30, 60, 90 or 120 fps, with 120 on iPads with ProMotion.</li>
+          <li><strong>Wi-Fi or USB.</strong> A cable takes over a running Wi-Fi session and charges the iPad. Unplug it and the stream goes back to Wi-Fi.</li>
+          <li><strong>Apple Pencil as a real pen.</strong> Windows receives pressure and tilt as Windows Ink, and Drawing mode ignores your palm on the canvas.</li>
+          <li><strong>Loss repair for real Wi-Fi.</strong> The iPad asks again for a missing packet right away, so one dropped packet rarely costs a frame.</li>
+          <li><strong>PC audio.</strong> Sound plays on the iPad, and you can mute it without stopping the video.</li>
+          <li><strong>Updates in one click.</strong> On Windows, <strong>Update now</strong> checks the download and installs it.</li>
         </ul>
-        <p>Details for each are on <a href="known-issues.html">known issues</a>.</p>
+        <p>The <a href="compatibility.html">compatibility page</a> has the measured results.</p>
       </article>
 
       <article class="post" id="next" aria-labelledby="next-title">

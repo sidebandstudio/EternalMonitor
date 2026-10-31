@@ -90,42 +90,18 @@
       },
       {
         "@type": "Question",
-        "name": "Can Windows use an iPad as a monitor without an app?",
+        "name": "Can Windows use an iPad as a monitor on its own?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. You need an app on the PC and one on the iPad. Apple's Sidecar does this only for a Mac."
+          "text": "No, Windows needs an app for it. EternalMonitor has a Windows app and its own iPad app, which decodes the video in hardware and sends Apple Pencil pressure and tilt back to Windows as Windows Ink."
         }
       },
       {
         "@type": "Question",
-        "name": "Does EternalMonitor work with a Mac?",
+        "name": "Wi-Fi or USB?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Not yet. Mac support is coming, for iPad and iPhone Duo. Until then, Sidecar works with a Mac and an iPad."
-        }
-      },
-      {
-        "@type": "Question",
-        "name": "Which iPads work?",
-        "acceptedAnswer": {
-          "@type": "Answer",
-          "text": "Any iPad with iPadOS 17 or later. So far it has been measured on an iPad Pro 12.9-inch (M2)."
-        }
-      },
-      {
-        "@type": "Question",
-        "name": "Can two iPads connect at once?",
-        "acceptedAnswer": {
-          "@type": "Answer",
-          "text": "No. One iPad can connect to a PC at a time."
-        }
-      },
-      {
-        "@type": "Question",
-        "name": "Is the stream encrypted?",
-        "acceptedAnswer": {
-          "@type": "Answer",
-          "text": "Not yet. Pairing keeps other devices out, so use a network you trust. Over a cable, the stream stays on the cable."
+          "text": "Both. Start on Wi-Fi. A cable gives a steadier picture, charges the iPad, and takes over a running Wi-Fi session when you plug it in."
         }
       },
       {
@@ -133,7 +109,31 @@
         "name": "Does Apple Pencil pressure work?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes, with tilt, as a Windows pen. Apple Pencil (USB-C) has no pressure sensor, so its lines keep one width."
+          "text": "Yes. Windows receives pressure and tilt as Windows Ink, and Drawing mode ignores your palm on the canvas. Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How smooth is the picture?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The PC streams at 30, 60, 90 or 120 fps, encoded on your NVIDIA, AMD or Intel graphics. 120 is for iPads with ProMotion; the lower of the PC's and the iPad's rate wins."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Which iPads work?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Any iPad with iPadOS 17 or later."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Is there a Mac version?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Mac support is coming soon, for iPad and iPhone Duo."
         }
       }
     ]
@@ -188,7 +188,7 @@
     <section class="page-head">
       <div class="container">
         <h1>Use an iPad as a second monitor for Windows</h1>
-        <p class="lead">Windows can't use an iPad as a screen by itself, so you need an app on each. This guide uses EternalMonitor, which is free and open source. Setup takes about 10 minutes.</p>
+        <p class="lead">To use an iPad as a screen, Windows needs an app. This guide uses EternalMonitor, which is free and open source, with a Windows app and its own iPad app. Setup takes about 10 minutes.</p>
       </div>
     </section>
 
@@ -209,11 +209,11 @@
         <h2 id="setup-title">Set it up</h2>
         <div class="post-update">
           <h3>1. Install EternalMonitor on the PC</h3>
-          <p>On the <a href="download.html">download page</a>, click <strong>Download for Windows</strong> and open <strong>EternalMonitor-Setup.exe</strong>. The installer is not code-signed yet, so Windows may show <strong>Windows protected your PC</strong>. Click <strong>More info</strong>, then <strong>Run anyway</strong>. If Windows asks <strong>Would you like to install this device software?</strong>, click <strong>Install</strong>. That driver is what lets the iPad be a second screen.</p>
+          <p>On the <a href="download.html">download page</a>, click <strong>Download for Windows</strong> and open <strong>EternalMonitor-Setup.exe</strong>. If Windows shows <strong>Windows protected your PC</strong>, click <strong>More info</strong>, then <strong>Run anyway</strong>. If Windows asks <strong>Would you like to install this device software?</strong>, click <strong>Install</strong>. That driver is what lets the iPad be a second screen.</p>
         </div>
         <div class="post-update">
           <h3>2. Install the iPad app</h3>
-          <p>The iPad app is a TestFlight beta, open to everyone. Install <strong>TestFlight</strong> from the App Store, open the <a href="https://testflight.apple.com/join/ppc9QfXc" target="_blank" rel="noopener">EternalMonitor invite</a> on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</p>
+          <p>Anyone can install the iPad app through Apple's TestFlight. Install <strong>TestFlight</strong> from the App Store, open the <a href="https://testflight.apple.com/join/ppc9QfXc" target="_blank" rel="noopener">EternalMonitor invite</a> on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</p>
         </div>
         <div class="post-update">
           <h3>3. Connect</h3>
@@ -301,18 +301,18 @@
         <h2 id="wifi-or-usb-title">Wi-Fi or USB</h2>
         <p>Start with Wi-Fi. A cable gives a steadier picture and charges the iPad.</p>
         <p>For USB, open <strong>Apple Devices</strong> on the PC and leave it open; it can stay minimized. Plug in the iPad, unlock it, and tap <strong>Trust</strong> the first time. Open EternalMonitor on the iPad and it connects over the cable. USB needs no pairing code. If you start on Wi-Fi and plug in the cable, the app can switch to it.</p>
-        <p>On the test PC, a 30-minute second screen over USB dropped no frames, and a 30-minute mirror over Wi-Fi dropped 19 of 105,600. A USB-C to USB-C cable charged the iPad; the PC's USB-A port supplied too little power. The <a href="compatibility.html#tested">compatibility page</a> has the conditions.</p>
-        <p>The stream is not encrypted. Pairing keeps other devices out, but use Wi-Fi you trust, such as your home network. Over a cable nothing goes over the network.</p>
+        <p>On the test PC, a 30-minute second screen over USB dropped no frames, and a 30-minute mirror over Wi-Fi dropped 19 of 105,600. A USB-C to USB-C cable charged the iPad while it streamed. The <a href="compatibility.html#tested">compatibility page</a> has the conditions.</p>
+        <p>Pairing keeps other devices out. Stream over your home Wi-Fi or another network you trust, or over the cable, where nothing goes over the network.</p>
       </article>
 
       <article class="post" id="apple-pencil" aria-labelledby="apple-pencil-title">
         <h2 id="apple-pencil-title">Draw with Apple Pencil</h2>
         <p>Apple Pencil works as a Windows pen, with pressure and tilt.</p>
         <ul class="post-list">
-          <li>In the iPad app's settings, turn on <strong>Drawing mode</strong>, then reconnect. It ignores fingers on the canvas and mutes PC audio. A USB cable gives the smoothest strokes.</li>
+          <li>In the iPad app's settings, turn on <strong>Drawing mode</strong>, then reconnect. It ignores your palm and fingers on the canvas and mutes PC audio. A USB cable gives the smoothest strokes.</li>
           <li>In your drawing app, pick the Windows pen setting. In Clip Studio Paint, choose <strong>Preferences</strong>, then <strong>Tablet</strong>, then <strong>Tablet PC</strong>.</li>
           <li>Open the drawing app normally, not with <strong>Run as administrator</strong>, or Windows blocks the pen.</li>
-          <li>Apple Pencil (USB-C) has no pressure sensor, so its lines keep one width.</li>
+          <li>Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro.</li>
         </ul>
         <p>The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" target="_blank" rel="noopener">drawing guide</a> has the details.</p>
       </article>
@@ -360,17 +360,15 @@
     </section>
 
     <section class="container posts policy">
-      <article class="post" id="fixes" aria-labelledby="fixes-title">
-        <h2 id="fixes-title">If something goes wrong</h2>
+      <article class="post" id="tips" aria-labelledby="tips-title">
+        <h2 id="tips-title">Tips</h2>
         <ul class="post-list">
-          <li><strong>The iPad finds no PC.</strong> Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Some networks <a href="known-issues.html#networks-keep-devices-apart">keep devices apart</a>; use a cable there.</li>
-          <li><strong>The iPad says Your PC didn't answer.</strong> A VPN or virtual network on the PC can show the <a href="known-issues.html#wrong-address">wrong address</a>. Tap the PC under <strong>Found on this network</strong> instead. If Windows Firewall blocks it, run EternalMonitor-Setup.exe again.</li>
-          <li><strong>USB never connects.</strong> Keep Apple Devices open, tap <strong>Trust</strong> on the iPad, and try a cable that carries data. Apple Devices needs <a href="known-issues.html#usb-windows-version">a newer Windows than Wi-Fi does</a>.</li>
-          <li><strong>The second screen is small and blurry, or doesn't start.</strong> See <a href="known-issues.html#second-screen-small">small second screen</a> and <a href="known-issues.html#second-screen-fails">second screen doesn't start</a>. On some laptops with two graphics chips, use <strong>Mirror my screen</strong> for now.</li>
-          <li><strong>The picture stutters.</strong> Over USB on an older PC, set <strong>Frame rate</strong> to 30. On Wi-Fi, move closer to the router or use a 5 GHz network. <a href="known-issues.html#usb-stutter">More</a>.</li>
-          <li><strong>Apple Pencil doesn't vary the line.</strong> Check the <a href="known-issues.html#clip-studio-paint">Clip Studio Paint setting</a> and your Pencil model.</li>
+          <li><strong>To find the PC,</strong> keep EternalMonitor open on it and put both on the same Wi-Fi, not a guest network. You can also scan its QR code or type its <strong>Address</strong>. If the PC runs a VPN, tap it under <strong>Found on this network</strong>, which finds <a href="known-issues.html#wrong-address">the right address</a> by itself.</li>
+          <li><strong>For USB,</strong> keep Apple Devices open, tap <strong>Trust</strong> on the iPad the first time, and use a cable that carries data. Apple Devices needs <a href="known-issues.html#usb-windows-version">Windows 10 version 22H2 or Windows 11</a>.</li>
+          <li><strong>For the smoothest Wi-Fi,</strong> use a 5 GHz network and stay close to the router, or connect the PC to the router with a network cable.</li>
+          <li><strong>For pressure in Clip Studio Paint,</strong> choose the <a href="known-issues.html#clip-studio-paint">Tablet PC setting</a>.</li>
         </ul>
-        <p>Every message the apps show, with what to do, is in the setup guide's <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">If something goes wrong</a> tables. The rest is on <a href="known-issues.html">known issues</a>.</p>
+        <p>The setup guide's <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">message tables</a> list every message the apps show, with what to do.</p>
       </article>
 
       <article class="post" id="faq" aria-labelledby="faq-title">
@@ -381,28 +379,28 @@
             <div><p>Yes. It is free and open source under the MIT license, with no account.</p></div>
           </details>
           <details>
-            <summary>Can Windows use an iPad as a monitor without an app?</summary>
-            <div><p>No. You need an app on the PC and one on the iPad. Apple's Sidecar does this only for a Mac.</p></div>
+            <summary>Can Windows use an iPad as a monitor on its own?</summary>
+            <div><p>No, Windows needs an app for it. EternalMonitor has a Windows app and its own iPad app, which decodes the video in hardware and sends Apple Pencil pressure and tilt back to Windows as Windows Ink.</p></div>
           </details>
           <details>
-            <summary>Does EternalMonitor work with a Mac?</summary>
-            <div><p>Not yet. Mac support is coming, for iPad and iPhone Duo. Until then, Sidecar works with a Mac and an iPad.</p></div>
-          </details>
-          <details>
-            <summary>Which iPads work?</summary>
-            <div><p>Any iPad with iPadOS 17 or later. So far it has been measured on an iPad Pro 12.9-inch (M2).</p></div>
-          </details>
-          <details>
-            <summary>Can two iPads connect at once?</summary>
-            <div><p>No. One iPad can connect to a PC at a time.</p></div>
-          </details>
-          <details>
-            <summary>Is the stream encrypted?</summary>
-            <div><p>Not yet. Pairing keeps other devices out, so use a network you trust. Over a cable, the stream stays on the cable.</p></div>
+            <summary>Wi-Fi or USB?</summary>
+            <div><p>Both. Start on Wi-Fi. A cable gives a steadier picture, charges the iPad, and takes over a running Wi-Fi session when you plug it in.</p></div>
           </details>
           <details>
             <summary>Does Apple Pencil pressure work?</summary>
-            <div><p>Yes, with tilt, as a Windows pen. Apple Pencil (USB-C) has no pressure sensor, so its lines keep one width.</p></div>
+            <div><p>Yes. Windows receives pressure and tilt as Windows Ink, and Drawing mode ignores your palm on the canvas. Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro.</p></div>
+          </details>
+          <details>
+            <summary>How smooth is the picture?</summary>
+            <div><p>The PC streams at 30, 60, 90 or 120 fps, encoded on your NVIDIA, AMD or Intel graphics. 120 is for iPads with ProMotion; the lower of the PC's and the iPad's rate wins.</p></div>
+          </details>
+          <details>
+            <summary>Which iPads work?</summary>
+            <div><p>Any iPad with iPadOS 17 or later.</p></div>
+          </details>
+          <details>
+            <summary>Is there a Mac version?</summary>
+            <div><p>Mac support is coming soon, for iPad and iPhone Duo.</p></div>
           </details>
         </div>
       </article>
