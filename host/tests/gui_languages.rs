@@ -105,6 +105,7 @@ fn languages_settings_and_setup() {
     let (dir, shared) = fixture();
     let mut results = SnapshotResults::new();
     settings_and_setup_in_each_language(&shared, &mut results);
+    paused_card_and_pairing_off_in_long_languages(&shared, &mut results);
     upgrades_never_open_setup(&dir, &shared);
     a_fresh_install_opens_setup_and_a_language_applies_at_once(&dir, &shared);
     every_translation_keeps_an_english_id(&shared);
@@ -169,6 +170,92 @@ fn settings_and_setup_in_each_language(shared: &SharedControl, results: &mut Sna
             "Done closes setup ({code})"
         );
         results.extend_harness(&mut setup);
+    }
+}
+
+/// Too many wrong codes, as from iPads on the network, pause code pairing.
+fn pause_code_pairing(shared: &SharedControl) {
+    use eternal_host::transport::link::PeerId;
+    use eternal_wire::v2::control::Hello2;
+
+    let now = std::time::Instant::now();
+    let mut pairing = shared.pairing.lock();
+    let wrong = pairing.code() % 999_999 + 1;
+    for n in 0..eternal_host::pairing::CODE_BUDGET as u32 {
+        let peer = PeerId::udp(std::net::SocketAddr::from((
+            [192, 0, 2, 100 + n as u8],
+            50000,
+        )));
+        let hello = Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 900 + n,
+            listen_port: 50000,
+            decoder_caps: 3,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 120,
+            device_name: "Unknown iPad".into(),
+            device_id: 99,
+            preferred_fps: 60,
+            auth_token: [0; 16],
+            pairing_code: wrong,
+        };
+        assert!(pairing.authorize(peer, &hello, now).is_err());
+    }
+    assert!(pairing.code_pairing_paused(now).is_some());
+}
+
+/// The Stream page's paused card, whose Resume button is about 30
+/// characters in French, and Settings' pairing-off warning, in French and
+/// Arabic: inside the window, and the text never under the button or the
+/// next row.
+fn paused_card_and_pairing_off_in_long_languages(
+    shared: &SharedControl,
+    results: &mut SnapshotResults,
+) {
+    let paused = "Too many wrong codes were typed, so code pairing is paused for 10 more minutes. The QR code and USB still work. Resuming gives a new code.";
+    let warning = "Pairing is off, so any iPad on your network can connect, and use this PC's mouse and keyboard, without a code. Turn it on unless every device on this network is yours.";
+    let size = egui::vec2(1040.0, 900.0);
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for code in ["fr", "ar"] {
+        save_language(Some(code));
+        pause_code_pairing(shared);
+        let mut h = harness(shared, size);
+        let text = h.get(id(paused)).rect();
+        let resume = h.get(id("Resume code pairing").role(Role::Button)).rect();
+        assert!(window.contains_rect(text), "{code}: {text:?}");
+        assert!(window.contains_rect(resume), "{code}: {resume:?}");
+        assert!(text.bottom() <= resume.top(), "{code}: {text:?} {resume:?}");
+        snapshot(
+            &mut h,
+            shared,
+            &format!("lang-{code}-stream-code-pairing-paused"),
+        );
+        results.extend_harness(&mut h);
+        click(&mut h, Role::Button, "Resume code pairing");
+        assert!(h.query(id("Resume code pairing")).is_none(), "{code}");
+
+        let mut h = harness(shared, size);
+        click(&mut h, Role::Button, "Settings");
+        let switch = || id("Require pairing").role(Role::CheckBox);
+        h.get(switch()).scroll_to_me();
+        h.run_steps(4);
+        click(&mut h, Role::CheckBox, "Require pairing");
+        assert!(!shared.pairing.lock().required, "{code}");
+        h.get(id(warning)).scroll_to_me();
+        h.run_steps(4);
+        let text = h.get(id(warning)).rect();
+        let next = h.get(id("Forget all iPads").role(Role::Button)).rect();
+        assert!(window.contains_rect(text), "{code}: {text:?}");
+        assert!(text.bottom() <= next.top(), "{code}: {text:?} {next:?}");
+        snapshot(&mut h, shared, &format!("lang-{code}-settings-pairing-off"));
+        results.extend_harness(&mut h);
+        click(&mut h, Role::CheckBox, "Require pairing");
+        assert!(shared.pairing.lock().required, "{code}");
     }
 }
 

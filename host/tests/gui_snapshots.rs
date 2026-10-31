@@ -608,6 +608,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     reset_keeps_environment_overrides(&shared, &dir, &mut results);
     waiting_for_the_port_can_be_stopped(&shared, &mut results);
     code_pairing_pause_says_why_and_resumes(&shared, &mut results);
+    setup_shows_the_code_pairing_pause(&shared, &mut results);
     listen_on_is_chosen_and_reset(&shared, &dir, &mut results);
     pairing_off_is_warned(&shared, &dir, &mut results);
     a_vpn_address_gets_a_home_network_hint(&shared);
@@ -618,40 +619,10 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
 /// Too many wrong codes pause code pairing. The Stream page says why and
 /// what still works, and Resume code pairing gives a new code at once.
 fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut SnapshotResults) {
-    let now = Instant::now();
-    {
-        let mut pairing = shared.pairing.lock();
-        let wrong = pairing.code() % 999_999 + 1;
-        for n in 0..eternal_host::pairing::CODE_BUDGET as u32 {
-            let peer = PeerId::udp(std::net::SocketAddr::from((
-                [192, 0, 2, 100 + n as u8],
-                50000,
-            )));
-            let hello = Hello2 {
-                proto_min: 2,
-                proto_max: 2,
-                client_nonce: 900 + n,
-                listen_port: 50000,
-                decoder_caps: 3,
-                feature_caps: 0,
-                screen_px_w: 2420,
-                screen_px_h: 1668,
-                screen_pt_w: 1210,
-                screen_pt_h: 834,
-                refresh_hz: 120,
-                device_name: "Unknown iPad".into(),
-                device_id: 99,
-                preferred_fps: 60,
-                auth_token: [0; 16],
-                pairing_code: wrong,
-            };
-            assert!(pairing.authorize(peer, &hello, now).is_err());
-        }
-        assert!(pairing.code_pairing_paused(now).is_some());
-    }
+    pause_code_pairing(shared);
     let paused_code = shared.pairing.lock().code();
     let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
-    window.get_by_label("Too many wrong codes were typed, so code pairing is paused for 10 more minutes. The QR code and USB still work. Resuming gives a new code.");
+    window.get_by_label(CODE_PAIRING_PAUSED);
     assert!(window.query_by_label("New code").is_none());
     window.snapshot("stream-code-pairing-paused");
     results.extend_harness(&mut window);
@@ -666,6 +637,82 @@ fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut
     assert_ne!(shared.pairing.lock().code(), paused_code);
     assert!(window.query_by_label("Resume code pairing").is_none());
     window.get_by_label("New code");
+}
+
+/// Setup's Pair step says the same in place of the code, beside the QR
+/// code, and Resume code pairing shows a new code there.
+fn setup_shows_the_code_pairing_pause(shared: &SharedControl, results: &mut SnapshotResults) {
+    pause_code_pairing(shared);
+    let paused_code = shared.pairing.lock().code();
+    let mut window = harness(shared, egui::vec2(820.0, 560.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Run setup again").scroll_to_me();
+    window.run_steps(4);
+    nav(&mut window, "Run setup again");
+    for _ in 0..4 {
+        nav(&mut window, "Next");
+    }
+    // The Pair step looks up the LAN address, like the QR dialog. Put the
+    // fixed fixture back for a deterministic image.
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+    window.run_steps(4);
+    window.get_by_label("Connect your iPad");
+    window.get_by_label(CODE_PAIRING_PAUSED);
+    let shown = |code: u32| {
+        let code = format!("{code:06}");
+        format!("{} {}", &code[..3], &code[3..])
+    };
+    assert!(window.query_by_label(&shown(paused_code)).is_none());
+    window.snapshot("setup-pair-code-pairing-paused");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Resume code pairing").click();
+    window.run_steps(4);
+    assert!(shared
+        .pairing
+        .lock()
+        .code_pairing_paused(Instant::now())
+        .is_none());
+    let code = shared.pairing.lock().code();
+    assert_ne!(code, paused_code);
+    assert!(window.query_by_label("Resume code pairing").is_none());
+    window.get_by_label(&shown(code));
+    nav(&mut window, "Done");
+}
+
+const CODE_PAIRING_PAUSED: &str = "Too many wrong codes were typed, so code pairing is paused for 10 more minutes. The QR code and USB still work. Resuming gives a new code.";
+
+/// Too many wrong codes, as from iPads on the network, pause code pairing.
+fn pause_code_pairing(shared: &SharedControl) {
+    let now = Instant::now();
+    let mut pairing = shared.pairing.lock();
+    let wrong = pairing.code() % 999_999 + 1;
+    for n in 0..eternal_host::pairing::CODE_BUDGET as u32 {
+        let peer = PeerId::udp(std::net::SocketAddr::from((
+            [192, 0, 2, 100 + n as u8],
+            50000,
+        )));
+        let hello = Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 900 + n,
+            listen_port: 50000,
+            decoder_caps: 3,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 120,
+            device_name: "Unknown iPad".into(),
+            device_id: 99,
+            preferred_fps: 60,
+            auth_token: [0; 16],
+            pairing_code: wrong,
+        };
+        assert!(pairing.authorize(peer, &hello, now).is_err());
+    }
+    assert!(pairing.code_pairing_paused(now).is_some());
 }
 
 /// Turning pairing off in Settings says what that allows, until it is on

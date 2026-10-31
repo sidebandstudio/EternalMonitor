@@ -936,8 +936,6 @@ impl AnalyzerApp {
         }
     }
 
-    /// Reads the graphics cards and EternalMonitor's own preference when
-    /// Troubleshooting opens. Outside Windows the fixture's facts stay.
     /// Troubleshooting's Listen on choice, applied when the stream restarts.
     fn set_listen_on(&mut self, choice: crate::network::ListenOn) {
         if *self.control.shared.listen_on.lock() == choice {
@@ -971,6 +969,8 @@ impl AnalyzerApp {
         }
     }
 
+    /// Reads the graphics cards and EternalMonitor's own preference when
+    /// Troubleshooting opens. Outside Windows the fixture's facts stay.
     fn refresh_gpu_facts(&mut self) {
         if let Some(facts) = crate::gpu_preference::facts() {
             *self.control.shared.gpu_facts.lock() = Some(facts);

@@ -315,10 +315,15 @@ impl AnalyzerApp {
 
     fn pair_step(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
         let address = self.qr_address(snap);
-        let (code, required) = {
+        let (code, required, paused) = {
             let pairing = self.control.shared.pairing.lock();
-            (format!("{:06}", pairing.code()), pairing.required)
+            (
+                format!("{:06}", pairing.code()),
+                pairing.required,
+                pairing.code_pairing_paused(std::time::Instant::now()),
+            )
         };
+        let mut resume = false;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 22.0;
             self.qr_tile(ui, &address, 196.0);
@@ -334,7 +339,16 @@ impl AnalyzerApp {
                 );
                 ui.add_space(10.0);
                 widgets::overline_label(ui, tr("Pairing code"));
-                if required {
+                if let (true, Some(left)) = (required, paused) {
+                    widgets::paragraph(
+                        ui,
+                        RichText::new(super::page_stream::code_pairing_paused_text(left))
+                            .size(SMALL)
+                            .color(WARNING),
+                    );
+                    resume = widgets::button(ui, Tone::Secondary, None, tr("Resume code pairing"))
+                        .clicked();
+                } else if required {
                     ui.label(mono(format!("{} {}", &code[..3], &code[3..]), 19.0));
                 } else {
                     let note = tr("Not needed while pairing is off.");
@@ -346,6 +360,9 @@ impl AnalyzerApp {
                 ui.add(egui::Label::new(mono(address.clone(), 15.0)).truncate());
             });
         });
+        if resume {
+            self.resume_code_pairing();
+        }
     }
 }
 

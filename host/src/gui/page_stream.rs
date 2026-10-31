@@ -1170,7 +1170,6 @@ fn home_address(
     hints.get(ip.parse().ok()?)
 }
 
-/// Overline label, a large monospaced value and trailing controls.
 /// Why the code is gone from the Stream page, for how long, and what
 /// still works.
 pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
@@ -1181,6 +1180,7 @@ pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
     )
 }
 
+/// Overline label, a large monospaced value and trailing controls.
 fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
