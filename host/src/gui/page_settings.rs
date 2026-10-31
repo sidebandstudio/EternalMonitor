@@ -129,6 +129,17 @@ impl AnalyzerApp {
             if require != required {
                 self.set_require_pairing(require);
             }
+            if !require {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(PAIRING_OFF_WARNING)
+                            .size(SMALL)
+                            .color(WARNING),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(10.0);
+            }
             widgets::divider(ui);
             let mut forget = false;
             widgets::setting_row(
@@ -230,6 +241,9 @@ impl AnalyzerApp {
         });
     }
 }
+
+/// Under Require pairing while it is off.
+pub(super) const PAIRING_OFF_WARNING: &str = "Pairing is off, so any iPad on your network can connect, and use this PC's mouse and keyboard, without a code. Turn it on unless every device on this network is yours.";
 
 /// The Video encoder choices in words a user knows: the maker of the
 /// graphics card, or the processor.

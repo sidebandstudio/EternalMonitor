@@ -303,7 +303,7 @@ posting evidence publicly. Keep screenshots of a tester's desktop private.
 
 ## Troubleshooting and known limits
 
-The v0.3 installer creates TCP and UDP firewall rules. For an older install or
+The installer creates a UDP firewall rule (v0.3.3 and older also created a TCP rule). For an older install or
 another security product, check the host's allowed-app rule and network profile.
 Guest networks and subnet boundaries can block discovery; try a reachable manual
 LAN address. Use the packet/repair, encoder and decoder diagnostics to distinguish

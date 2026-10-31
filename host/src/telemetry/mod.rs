@@ -1841,12 +1841,14 @@ mod tests {
         let names = redact::Names::new(Some(r"C:\Users\vpn"), Some("vpn"), Some("wifi"));
         let adapters = [
             crate::network::Adapter {
+                name: "Wi-Fi".into(),
                 kind: crate::network::Kind::Wifi,
                 up: true,
                 gateway: true,
                 ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
             },
             crate::network::Adapter {
+                name: "Tailscale".into(),
                 kind: crate::network::Kind::Vpn,
                 up: true,
                 gateway: false,

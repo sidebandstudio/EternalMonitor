@@ -247,7 +247,7 @@ streaming system test on every pull request.
 | `ETERNAL_AMF_DIAG` | `1` writes AMF bitstream diagnostics |
 | `ETERNAL_LEGACY_PTS` | `1` restores the old frame-counter timestamps |
 | `ETERNAL_DROP`, `ETERNAL_REORDER`, `ETERNAL_JITTER_MS` | Test only: inject loss, reordering or jitter |
-| `ETERNAL_USB_DIRECT` | Test only: a TCP endpoint in place of the USB tunnel |
+| `ETERNAL_USB_DIRECT` | Test only: a TCP endpoint in place of the USB tunnel. Read only by debug builds and builds with the `usb-direct` feature |
 
 </details>
 
