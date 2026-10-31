@@ -87,8 +87,7 @@ or screenshots of someone's desktop. The host log records the current pairing co
 
 Describe what changed and why, and how you tested it: the commands you ran and,
 for hardware changes, the GPU, Windows version and iPad model. Screenshots help for
-UI changes. Draft pull requests are welcome if you'd like feedback early. Every
-pull request gets a review before it merges.
+UI changes. Draft pull requests are welcome if you'd like feedback early.
 
 ## Maintainer review
 
