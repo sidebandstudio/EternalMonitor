@@ -1,0 +1,12 @@
+ui/
+renders/
+art/*.png
+art/*.log
+snapshots/
+.hyperframes/
+footage/desktop.png
+footage/pair-dialog.png
+footage/desktop-pair.png
+footage/pair-live.png
+footage/hero-laptop-*.png
+footage/hero-ipad.png

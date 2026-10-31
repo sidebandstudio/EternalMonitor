@@ -59,6 +59,22 @@ fn versions_compare_as_semver_and_ignore_previews_build_metadata_and_garbage() {
 }
 
 #[test]
+fn beta_channel_builds_are_never_offered_and_get_the_next_stable_release() {
+    // scripts/nightly.py versions the nightly Beta channel <next>-beta.<YYYYMMDD>.<run>.
+    let beta = "0.3.4-beta.20261030.12";
+    assert_eq!(newer_stable(beta, "0.3.3"), None);
+    assert_eq!(newer_stable(&format!("v{beta}"), "0.3.3"), None);
+    assert_eq!(newer_stable("0.3.3", beta), None);
+    assert_eq!(newer_stable("0.3.4", beta), Some("0.3.4".into()));
+    assert_eq!(newer_stable("0.3.4", "0.3.4-beta.1"), Some("0.3.4".into()));
+    // Dated builds sort above the hand-made 0.3.4-beta.1, below 0.3.4.
+    let parse = |v: &str| semver::Version::parse(v).unwrap();
+    assert!(parse("0.3.4-beta.1") < parse(beta));
+    assert!(parse(beta) < parse("0.3.4-beta.20261031.13"));
+    assert!(parse(beta) < parse("0.3.4"));
+}
+
+#[test]
 fn manifest_must_name_a_stable_github_installer_with_a_sha256() {
     let endpoints = Endpoints::production();
     let parsed = parse_manifest(

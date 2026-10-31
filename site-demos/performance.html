@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1480, height=1040">
+  <title>Your graphics card does the work</title>
+  <link rel="stylesheet" href="shared.css">
+  <script src="vendor/gsap.min.js"></script>
+  <script src="film.js"></script>
+  <style>
+    .bg { background-image: url('art/valley.webp'); background-position: 50% 55%; }
+    /* Three PCs, each drawn by the Windows app itself on its own GPU:
+       footage/host-performance-{nvidia,amd,intel}.mp4, 3.2 s each. */
+    .win { left: 0; top: 0; width: 2080px; transform-origin: 0 0; }
+    .win .win-view { width: 2080px; height: 2000px; }
+    .win video { width: 2080px; height: 2000px; }
+    #chip { left: 0; right: 0; top: 19px; margin: 0 auto; width: max-content; gap: 22px; padding: 0 28px 0 22px; }
+    #chip .gpu { color: #71717a; }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="performance" data-start="0" data-width="1480" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <!-- Each PC's window is on screen for its session and the slides either
+         side; the loop's slide needs the Intel tail at the start and the
+         NVIDIA lead-in at the end. -->
+    <div class="win" id="win-i0"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-i0" src="footage/host-performance-intel.mp4" data-start="0" data-media-start="2.9667" data-duration="0.2333" muted playsinline></video></div></div>
+    <div class="win" id="win-n"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-n" src="footage/host-performance-nvidia.mp4" data-start="0" data-media-start="0.3" data-duration="2.9" muted playsinline></video></div></div>
+    <div class="win" id="win-a"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-a" src="footage/host-performance-amd.mp4" data-start="2.3667" data-duration="3.2" muted playsinline></video></div></div>
+    <div class="win" id="win-i"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-i" src="footage/host-performance-intel.mp4" data-start="5.0333" data-duration="2.9667" muted playsinline></video></div></div>
+    <div class="win" id="win-n2"><div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+      <div class="win-view"><video id="v-n2" src="footage/host-performance-nvidia.mp4" data-start="7.7" data-duration="0.3" muted playsinline></video></div></div>
+
+    <div class="chip" id="chip"><span class="dot"></span><span class="gpu" id="g0">NVIDIA</span><span class="gpu" id="g1">AMD</span><span class="gpu" id="g2">Intel</span></div>
+  </div>
+  <script src="performance.js"></script>
+</body>
+</html>

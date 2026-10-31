@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1024, height=1536">
+  <title>What the iPad's camera sees</title>
+  <!-- The camera view for the pairing film's QR scanner: the PC's monitor in
+       a dark room (art/monitor-room.webp, generated), its screen showing the
+       Windows app's own Scan to connect dialog (footage/pair-dialog.png, a
+       frame of host-pair.mp4) over the wallpaper. The camera is held up, finds
+       focus and moves in on the code. capture-camera.sh renders it to the MP4
+       the simulator's scanner plays (it has no camera of its own). -->
+  <script src="../vendor/gsap.min.js"></script>
+  <style>
+    html, body { margin: 0; background: #000; }
+    #root { position: relative; width: 100%; height: 100%; overflow: hidden; background: #05070b; }
+    #cam { position: absolute; left: 0; top: 0; width: 1024px; height: 1536px; transform-origin: 0 0; }
+    #room { position: absolute; left: 0; top: 0; width: 1024px; height: 1536px; }
+    /* The PC's desktop, 1920 x 1200, mapped onto the monitor's screen. */
+    #screen { position: absolute; left: 0; top: 0; width: 1920px; height: 1200px; transform-origin: 0 0; overflow: hidden; background: #0b0e14 url('../art/wallpaper.webp') center / cover; }
+    #app { position: absolute; left: 440px; top: 220px; width: 1040px; border-radius: 9px; overflow: hidden; background: #0e0e10; box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.85); }
+    #app .bar { height: 30px; background: #0a0a0b; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+    #app img { display: block; width: 1040px; height: 720px; }
+    /* A camera sees a screen with lifted blacks and a soft sheen. */
+    #sheen { position: absolute; inset: 0; background: linear-gradient(115deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 45%), rgba(40, 52, 64, 0.12); }
+    #grain { position: absolute; inset: 0; width: 1024px; height: 1536px; opacity: 0.16; mix-blend-mode: screen; }
+    #vignette { position: absolute; inset: 0; background: radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.55)); }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="camera" data-start="0" data-width="1024" data-height="1536" data-duration="4">
+    <div id="cam">
+      <img id="room" src="../art/monitor-room.webp" alt="">
+      <div id="screen">
+        <div id="app"><div class="bar"></div><img src="../footage/pair-dialog.png" alt=""></div>
+        <div id="sheen"></div>
+      </div>
+    </div>
+    <canvas id="grain" width="512" height="768"></canvas>
+    <div id="vignette"></div>
+  </div>
+  <script>
+    (function () {
+      // The screen's corners in the room photograph: TL, TR, BR, BL.
+      const QUAD = [[89, 471], [940, 500], [943, 986], [84, 1021]];
+      const SW = 1920, SH = 1200;
+      // Square-to-quad homography (Heckbert), scaled to the screen's pixels.
+      const [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = QUAD;
+      const dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+      const dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+      const den = dx1 * dy2 - dx2 * dy1;
+      const g = (dx3 * dy2 - dx2 * dy3) / den, h = (dx1 * dy3 - dx3 * dy1) / den;
+      const a = x1 - x0 + g * x1, b = x3 - x0 + h * x3, d = y1 - y0 + g * y1, e = y3 - y0 + h * y3;
+      document.getElementById('screen').style.transform =
+        `matrix3d(${a / SW},${d / SW},0,${g / SW},${b / SH},${e / SH},0,${h / SH},0,0,1,0,${x0},${y0},0,1)`;
+      const map = (u, v) => { const w = g * u + h * v + 1; return { x: (a * u + b * v + x0) / w, y: (d * u + e * v + y0) / w }; };
+      // The QR code's middle: the dialog's code sits at (520, 348) in the app.
+      const qr = map((440 + 520) / SW, (220 + 30 + 348) / SH);
+
+      const lerp = (p, q, k) => p + (q - p) * k;
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const ease = gsap.parseEase('power2.inOut');
+      function rng(seed) { let s = seed >>> 0; return () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+      function wobble(seed) { const r = rng(seed), v = Array.from({ length: 64 }, r); return (x) => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(v[((i % 64) + 64) % 64], v[(((i + 1) % 64) + 64) % 64], u) - 0.5; }; }
+      const hx = wobble(1), hy = wobble(2), hr = wobble(3);
+
+      const cam = document.getElementById('cam');
+      const grain = document.getElementById('grain'), gctx = grain.getContext('2d');
+      const img = gctx.createImageData(512, 768);
+      function frame(t) {
+        // Held up at the room, then moved in on the code, steadying as it lands.
+        const k = ease(clamp((t - 0.2) / 1.05, 0, 1));
+        const s = lerp(1.08, 3.1, k);
+        const cx = lerp(520, qr.x, k), cy = lerp(780, qr.y, k);
+        const shake = lerp(1, 0.45, k);
+        const jx = 14 * hx(t * 1.6) * shake, jy = 12 * hy(t * 1.4) * shake, rot = (-2.2 * (1 - k) + 1.4 * hr(t * 1.1) * shake);
+        cam.style.transform = `translate(${512 + jx}px, ${768 + jy}px) rotate(${rot}deg) scale(${s}) translate(${-cx}px, ${-cy}px)`;
+        // Focus: soft at first, sharp, a short hunt as it moves in, sharp again.
+        const blur = t < 0.35 ? lerp(6, 0, clamp(t / 0.35, 0, 1)) : t < 0.8 ? 0 : t < 1.2 ? 2.5 * Math.sin(Math.PI * clamp((t - 0.8) / 0.4, 0, 1)) : 0;
+        cam.style.filter = `blur(${blur.toFixed(2)}px) brightness(${lerp(0.92, 1.05, k)})`;
+        // Sensor noise, new every frame but the same on every render.
+        const r = rng(Math.round(t * 30) + 100);
+        for (let i = 0; i < 512 * 768; i++) { const v = r() * 255; img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255; }
+        gctx.putImageData(img, 0, 0);
+      }
+      let now = 0;
+      const clock = { get t() { return now; }, set t(v) { now = v; frame(v); } };
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo(clock, { t: 0 }, { t: 4, duration: 4, ease: 'none', immediateRender: false }, 0);
+      frame(0);
+      window.__timelines['camera'] = tl;
+    })();
+  </script>
+</body>
+</html>

@@ -3,6 +3,9 @@ contact_links:
   - name: Setup help
     url: https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
     about: Step-by-step setup, USB with Apple Devices, and fixes for common problems.
+  - name: Ask on Discord
+    url: https://discord.gg/Xc7NykBZ6z
+    about: Questions, setup help and ideas, on the Sideband Discord.
   - name: Report a security vulnerability
     url: https://github.com/sidebandstudio/EternalMonitor/security/advisories/new
     about: Please report security problems privately, not in a public issue.

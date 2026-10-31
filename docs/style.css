@@ -39,6 +39,32 @@
   font-display: swap;
   src: url('assets/fonts/GeistMono-Medium.woff2') format('woff2');
 }
+/* Caveat (OFL, assets/fonts/OFL-Caveat.txt), only for the download page's
+   handwritten note. Latin and Cyrillic; other scripts fall back to the text face. */
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('assets/fonts/Caveat-Medium-Latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('assets/fonts/Caveat-Medium-LatinExt.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('assets/fonts/Caveat-Medium-Cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
 
 :root {
   --bg: #0a0a0b;
@@ -341,101 +367,129 @@ small { font-size: 0.875rem; }
 }
 
 /* --- Hero stage --------------------------------------------------------------
-   The Windows window, a USB or Wi-Fi link, and the iPad showing the PC. The
-   iPad slides in once and the link draws across; with reduced motion (or no
-   animation support) everything simply sits in place. */
+   A laptop and an iPad on its dock, joined by a USB-C cable: one picture of the
+   two devices and their shadow on the desk, the displays cut out
+   (assets/hero/devices), the screens beneath it and the cable above it, all
+   placed in percent of the picture's 2709 x 980 canvas
+   (site-demos/capture/hero_compose.py prints the numbers).
+   script.js switches the screens with the two radio groups; without it the
+   picture stays in its first state and the radios are hidden. */
 
-.stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(150px, 0.3fr) minmax(0, 1fr);
-  align-items: center;
-  margin-top: clamp(36px, 4.5vw, 64px);
+/* Up to 1240px wide, a little past the text column, with the page's margins. */
+.stage { margin: clamp(32px, 3.5vw, 52px) calc(50% - min(620px, 50vw - 24px)) 0; }
+.rig-fit, .rig { aspect-ratio: 2709 / 980; }
+.rig { position: relative; }
+.rig-devices, .rig-cable, .rig-laptop, .rig-ipad, .rig-air { position: absolute; }
+.rig-devices { inset: 0; width: 100%; height: 100%; }
+.rig-laptop { left: 5.906%; top: 5.612%; width: 39.793%; height: 60.51%; }
+.rig-ipad { left: 64.747%; top: 8.469%; width: 32.927%; height: 62.857%; }
+.rig-laptop, .rig-ipad { overflow: hidden; background: #000; }
+/* A switch lays the new picture over the old one, which stays whole beneath
+   it until the new one is complete and only then goes. On the laptop the new
+   picture fades in. */
+.rig .scr { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 0s linear 0.5s; }
+.rig .scr.on { z-index: 1; opacity: 1; transition: opacity 0.5s ease; }
+/* On the iPad it wipes in from the laptop's side. */
+.rig-ipad > .scr { opacity: 1; clip-path: inset(0 100% 0 0); transition: clip-path 0s linear 0.55s; }
+.rig-ipad > .scr.on { clip-path: inset(0); transition: clip-path 0.55s var(--ease-out); }
+/* Mirroring, the iPad shows the laptop's picture whole, with bars. */
+.rig-ipad .mirror { display: block; background: #000; }
+.rig-ipad .mirror img { object-fit: contain; }
+.rig-cable { left: 41.824%; top: 37.653%; width: 26.984%; height: auto; transition: opacity 0.5s ease; }
+.stage[data-link="wifi"] .rig-cable { opacity: 0; }
+/* Over Wi-Fi: the cable is gone and a calm signal sits between the devices.
+   It ripples outward twice as it arrives, then rests, all within five seconds. */
+.rig-air {
+  left: 55.6%; top: 44%; width: 3.4%; height: auto;
+  fill: none; stroke: var(--text); stroke-width: 3.2; stroke-linecap: round;
+  opacity: 0; transform: translateY(8%); transition: opacity 0.5s ease, transform 0.6s var(--ease-out);
 }
-.stage-link { position: relative; height: 44px; display: grid; place-items: center; }
-.stage-line {
-  position: absolute;
-  left: -8px;
-  right: -8px;
-  top: calc(50% - 1px);
-  height: 2px;
-  background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15));
-  transform-origin: left center;
-}
-.stage-chip {
-  position: relative;
-  padding: 5px 11px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-  background: var(--raised);
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-.stage-ipad { position: relative; }
-/* A signal runs along the link: a full-width layer moved by its own width,
-   carrying one dot, so only transform and opacity change. */
-.stage-line::after {
-  content: "";
-  position: absolute;
-  inset: -3px 0;
-  background: radial-gradient(circle at 4px 50%, #fff 0 2px, var(--accent) 3px, transparent 5px) no-repeat;
-  opacity: 0;
-}
+.rig-air circle { fill: var(--text); stroke: none; }
+.stage[data-link="wifi"] .rig-air { opacity: 1; transform: none; }
 @media (prefers-reduced-motion: no-preference) {
-  .stage-line::after { animation: stage-signal 2.6s ease-in-out 1.8s infinite; }
-  .stage-ipad { animation: stage-slide 1s var(--ease-out) 0.2s both; }
-  .stage-line { animation: stage-draw 0.6s ease-out 0.9s both; }
-  .stage-chip { animation: stage-fade 0.5s ease-out 1.3s both; }
+  .stage[data-link="wifi"] .rig-air path { animation: air 2s ease-in-out 2; }
+  .stage[data-link="wifi"] .rig-air .a2 { animation-delay: 0.25s; }
+  .stage[data-link="wifi"] .rig-air .a3 { animation-delay: 0.5s; }
 }
-@keyframes stage-slide { from { opacity: 0; transform: translateX(18%); } to { opacity: 1; transform: none; } }
-@keyframes stage-draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-@keyframes stage-fade { from { opacity: 0; } to { opacity: 1; } }
-@keyframes stage-signal { 0% { transform: translateX(-4px); opacity: 0; } 15%, 80% { opacity: 1; } 100% { transform: translateX(calc(100% - 8px)); opacity: 0; } }
+@keyframes air { 0%, 100% { opacity: 1; } 35% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) {
+  .rig .scr, .rig .scr.on, .rig-ipad > .scr, .rig-ipad > .scr.on { transition: none; }
+  .rig-cable, .rig-air { transition-duration: 0.01s; }
+}
+/* Phones get their own picture (assets/hero/devices-narrow, a 2240 x 1200
+   canvas): the iPad stands in front of the laptop's right side, larger, and
+   its cable runs back behind the dock. */
 @media (max-width: 720px) {
-  .stage { grid-template-columns: 1fr; justify-items: center; }
-  .stage-pc { width: 100%; }
-  .stage-link { height: 52px; width: 100%; }
-  .stage-line { left: calc(50% - 1px); right: auto; top: 0; bottom: 0; width: 2px; height: auto; transform-origin: center top;
-    background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15)); }
-  .stage-ipad { width: 78%; }
-  .stage-line::after { display: none; }
-  @media (prefers-reduced-motion: no-preference) {
-    .stage-ipad { animation-name: stage-rise; }
-    .stage-line { animation-name: stage-draw-down; }
-  }
+  .rig-fit, .rig { aspect-ratio: 2240 / 1200; }
+  .rig-laptop { left: 7.054%; top: 4.583%; width: 48.125%; height: 49.417%; }
+  .rig-ipad { left: 41.696%; top: 18.167%; width: 54.375%; height: 70%; }
+  .rig-cable { left: 17.679%; top: 50.5%; width: 30.848%; }
+  .rig-air { left: 62%; top: 3.5%; width: 5.4%; }
 }
-@keyframes stage-rise { from { opacity: 0; transform: translateY(12%); } to { opacity: 1; transform: none; } }
-@keyframes stage-draw-down { from { transform: scaleY(0); } to { transform: scaleY(1); } }
 
-/* --- Feature showcase ---------------------------------------------------------
-   One loud line per feature over a real capture. The two switches are radio
-   inputs, so they work without JavaScript; each swaps between two real
-   captures, and the Second screen switch moves a drawn iPad next to a drawn
-   monitor. */
-
-.show { padding-block: clamp(56px, 8vw, 112px); border-top: 1px solid var(--border); }
-.show:first-of-type { border-top: 0; padding-top: 0; }
-.show-head h3 {
-  max-width: 20ch;
-  font-size: clamp(1.875rem, 1rem + 2.6vw, 3rem);
-  letter-spacing: -0.04em;
-  line-height: 1.05;
+/* The two choices under the picture: what the iPad is, and how it is joined. */
+.rig-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 14px 36px;
+  margin-top: clamp(20px, 2.5vw, 32px);
 }
-.show-head p { margin-top: 14px; max-width: 34ch; font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem); color: var(--muted); }
-.show-split {
-  display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
-  gap: clamp(32px, 6vw, 88px);
+/* Each option stays whole; when a language's names do not fit beside the
+   legend, the pill wraps under it as one piece. */
+.rig-controls fieldset { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
+/* Floated, the legend is an ordinary flex item, so it lines up with its pill. */
+.rig-controls legend { float: left; padding: 0; font-size: 0.9375rem; color: var(--muted); }
+.rig-controls .sw { padding: 3px; }
+.rig-controls input { position: absolute; opacity: 0; pointer-events: none; }
+.rig-controls label {
+  display: inline-flex;
   align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 15px;
+  white-space: nowrap;
+  word-break: keep-all;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
-.show-split.flip .show-head { order: 2; }
-@media (max-width: 860px) {
-  .show-split { grid-template-columns: 1fr; }
-  .show-split.flip .show-head { order: 0; }
+.rig-controls label svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.rig-controls label svg .fill { fill: currentColor; stroke: none; }
+.rig-controls input:checked + label { background: var(--text); color: var(--bg); }
+.rig-controls input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rig-controls label:active { transform: scale(0.97); }
+.no-js .rig-controls { display: none; }
+/* On a screen of ordinary height the whole hero fits it: the text keeps its
+   size, and the picture shrinks to the height that is left, so the picture and
+   its choices are both in view when the page opens. */
+@media (min-width: 721px) and (min-height: 600px) {
+  .hero { --hero-top: clamp(28px, 4.5svh, 64px); padding-top: var(--hero-top); }
+  .hero > .container { display: flex; flex-direction: column; max-height: calc(100svh - var(--nav-h) - var(--note-h, 0px) - var(--hero-top) - 20px); }
+  .hero-text { flex: none; width: 100%; }
+  .stage { display: flex; flex-direction: column; min-height: 0; margin-top: clamp(24px, 3.4svh, 52px); }
+  .rig-fit { flex: 0 1 auto; min-height: 0; container-type: size; }
+  .rig { width: min(100cqw, 100cqh * 2709 / 980); margin-inline: auto; }
+  .rig-controls { flex: none; margin-top: clamp(14px, 2.4svh, 32px); }
+}
+/* Phones: each choice on one compact row, its name beside it. */
+@media (max-width: 720px) {
+  .stage { margin-inline: calc(50% - 50vw + 10px); }
+  .rig-controls { flex-direction: column; align-items: stretch; gap: 8px; width: min(100% - 20px, 360px); margin-inline: auto; margin-top: 18px; }
+  .rig-controls fieldset { justify-content: space-between; gap: 8px 10px; }
+  .rig-controls legend { font-size: 0.9375rem; }
+  .rig-controls .sw { padding: 2px; gap: 2px; margin-inline-start: auto; }
+  .rig-controls .sw label { min-height: 34px; padding: 0 12px; gap: 6px; }
+  .rig-controls label svg { width: 15px; height: 15px; }
+}
+/* Too narrow for the names: they are still read out, and the pills centre. */
+@media (max-width: 360px) {
+  .rig-controls fieldset { justify-content: center; }
+  .rig-controls .sw { margin-inline: auto; }
+  .rig-controls legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 }
 
-.switch-demo { margin-top: 28px; }
-.sw-input { position: absolute; opacity: 0; pointer-events: none; }
+/* --- Switch -------------------------------------------------------------------
+   A pill of options, used by the download page's channel switch. */
+
 .sw {
   display: inline-flex;
   gap: 4px;
@@ -453,96 +507,6 @@ small { font-size: 0.875rem; }
   cursor: pointer;
 }
 .sw label:hover { color: var(--text); }
-#mode-mirror:checked ~ .sw label[for="mode-mirror"],
-#mode-second:checked ~ .sw label[for="mode-second"],
-#pic-fit:checked ~ .sw label[for="pic-fit"],
-#pic-fill:checked ~ .sw label[for="pic-fill"] { background: var(--text); color: var(--bg); }
-#mode-mirror:focus-visible ~ .sw label[for="mode-mirror"],
-#mode-second:focus-visible ~ .sw label[for="mode-second"],
-#pic-fit:focus-visible ~ .sw label[for="pic-fit"],
-#pic-fill:focus-visible ~ .sw label[for="pic-fill"] { outline: 2px solid var(--accent); outline-offset: 2px; }
-
-.swap { position: relative; }
-.swap img { display: block; width: 100%; }
-/* The inactive capture is hidden from assistive technology as well as from
-   sight: visibility flips at the end of the fade out and at the start of the
-   fade in, so only the shown capture is in the accessibility tree. */
-.swap .swap-a { visibility: visible; transition: visibility 0s; }
-.swap .swap-b {
-  position: absolute; inset: 0; height: 100%;
-  opacity: 0; visibility: hidden;
-  transition: opacity 0.45s ease-out, visibility 0s linear 0.45s;
-}
-#mode-second:checked ~ .modes .swap-b,
-#pic-fill:checked ~ .fill-tablet .swap-b { opacity: 1; visibility: visible; transition: opacity 0.45s ease-out, visibility 0s; }
-#mode-second:checked ~ .modes .swap-a,
-#pic-fill:checked ~ .fill-tablet .swap-a { visibility: hidden; transition: visibility 0s linear 0.45s; }
-
-.modes {
-  display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
-  gap: clamp(24px, 4vw, 56px);
-  align-items: center;
-  margin-top: 24px;
-}
-.displays { position: relative; height: clamp(120px, 14vw, 180px); }
-.d-monitor, .d-ipad { position: absolute; top: 50%; border-radius: 8px; }
-.d-monitor {
-  left: 0;
-  width: 54%;
-  aspect-ratio: 16 / 10;
-  transform: translateY(-58%);
-  border: 2px solid var(--border-strong);
-  background: var(--surface);
-}
-.d-stand { position: absolute; left: 38%; right: 38%; bottom: -14px; height: 10px; border-radius: 0 0 4px 4px; background: var(--border-strong); }
-.d-ipad {
-  left: 0;
-  width: 36%;
-  aspect-ratio: 4 / 3;
-  border: 2px solid var(--accent);
-  border-radius: 10px;
-  background: rgba(var(--accent-rgb), 0.1);
-  /* Mirror: the iPad shows the monitor's picture, so it sits on top of it. */
-  transform: translate(25%, -54%);
-  transition: transform 0.6s var(--ease-out);
-}
-/* Second screen: the iPad becomes its own display, beside the monitor. */
-#mode-second:checked ~ .modes .d-ipad { transform: translate(158%, -50%); }
-
-.fill-tablet { max-width: 820px; margin-top: 24px; }
-
-@media (max-width: 860px) {
-  .modes { grid-template-columns: 1fr; }
-  .displays { height: 150px; max-width: 360px; width: 100%; margin-inline: auto; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .swap .swap-a, .swap .swap-b, #mode-second:checked ~ .modes .swap-a, #mode-second:checked ~ .modes .swap-b,
-  #pic-fill:checked ~ .fill-tablet .swap-a, #pic-fill:checked ~ .fill-tablet .swap-b, .d-ipad { transition: none; }
-}
-
-.tiles {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 20px;
-  padding-top: clamp(56px, 8vw, 112px);
-  border-top: 1px solid var(--border);
-}
-.tile {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: clamp(22px, 3vw, 32px);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  overflow: hidden;
-}
-.tile h3 { font-size: clamp(1.375rem, 1rem + 1vw, 1.75rem); letter-spacing: -0.03em; }
-.tile p { color: var(--muted); }
-.tile .pc-window, .tile-shot { margin-top: auto; padding-top: 18px; }
-.tile-shot img { width: 100%; border-radius: 12px; border: 1px solid var(--border-strong); }
-@media (max-width: 860px) { .tiles { grid-template-columns: 1fr; } }
 
 .numbers .fact dt { font-size: 0.9375rem; color: var(--muted); }
 .numbers .fact .n { font-family: var(--font); font-weight: 500; letter-spacing: -0.04em; }
@@ -571,31 +535,120 @@ small { font-size: 0.875rem; }
   .how { grid-template-columns: 1fr; }
 }
 
-/* --- Device frames ---------------------------------------------------------- */
+/* --- Watch it work: short films of each feature ---------------------------------
+   Six columns, three rows of two or three cards. Each film is a muted loop at
+   twice the card's size; script.js plays it only while it is on screen. The
+   poster is a <picture> under the video, so on a phone only the phone
+   version's poster and film are fetched (index.html picks them by media). */
 
-.pc-window {
-  border-radius: 12px;
+.bento {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 16px;
+}
+.demo {
+  position: relative;
+  display: grid;
   overflow: hidden;
-  background: #0e0e10;
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
+  border-radius: 24px;
+  background: var(--surface);
+  isolation: isolate;
 }
-.pc-titlebar {
+/* Two, three or four of the six columns. Each card has its film's shape, and
+   at full width the three shapes come out the same height. */
+.demo-w2 { grid-column: span 2; aspect-ratio: 728 / 1040; }
+.demo-w3 { grid-column: span 3; aspect-ratio: 1104 / 1040; }
+.demo-w4 { grid-column: span 4; aspect-ratio: 1480 / 1040; }
+.demo-media { position: absolute; inset: 0; transition: transform 0.6s var(--ease-out); }
+.demo-poster img, .demo-film {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.demo-film { background: transparent; }
+/* A neutral scrim keeps the label readable over the film. The label is a
+   grid item at the card's foot rather than positioned, so the link's target
+   below fills the card and not just this strip. */
+.demo-foot {
+  z-index: 1;
+  align-self: end;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: space-between;
-  height: 32px;
-  padding: 0 10px 0 12px;
-  background: #0a0a0b;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.75rem;
-  color: var(--muted);
+  gap: 16px;
+  padding: 56px 22px 20px;
+  background: linear-gradient(to top, rgba(10, 10, 11, 0.92), rgba(10, 10, 11, 0.6) 55%, rgba(10, 10, 11, 0));
 }
-.pc-titlebar .t { display: inline-flex; align-items: center; gap: 8px; }
-.pc-titlebar .t img { width: 14px; height: 14px; border-radius: 4px; }
-.pc-titlebar .wc { display: inline-flex; gap: 14px; color: var(--faint); }
-.pc-titlebar .wc svg { width: 10px; height: 10px; }
-.pc-window img { width: 100%; }
+.demo-foot h3 { font-size: 1.125rem; letter-spacing: -0.015em; line-height: 1.25; }
+.demo-more {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9375rem;
+  color: var(--muted);
+  transition: color 0.15s ease-out;
+}
+.demo-more span { display: inline-block; transition: transform 0.2s var(--ease-out); }
+/* The arrow is drawn here, not in the copy, so it points the reading way. */
+.demo-arrow::before { content: "\2192"; }
+[dir="rtl"] .demo-arrow::before { content: "\2190"; }
+/* The whole card is the link's target. */
+.demo-more::after { content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
+.demo:hover .demo-more, .demo-more:focus-visible { color: var(--text); }
+.demo:hover .demo-more span { transform: translateX(3px); }
+[dir="rtl"] .demo:hover .demo-more span { transform: translateX(-3px); }
+.demo-more:focus-visible { outline: none; }
+.demo:has(.demo-more:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
+.demo:hover .demo-media { transform: scale(1.015); }
+/* Pause and play, one per film (script.js adds it). It sits above the card's
+   link target and shows the action it will take. */
+.demo-toggle {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(10, 10, 11, 0.72);
+  color: var(--text);
+  cursor: pointer;
+  opacity: 0.78;
+  transition: opacity 0.15s ease-out, background-color 0.15s ease-out, transform 0.15s var(--ease-out);
+}
+.demo-toggle svg { width: 16px; height: 16px; }
+.demo-toggle .ico-play, .demo-toggle.is-paused .ico-pause { display: none; }
+.demo-toggle.is-paused .ico-play { display: block; }
+.demo:hover .demo-toggle, .demo-toggle:focus-visible { opacity: 1; }
+.demo-toggle:hover { background: rgba(10, 10, 11, 0.9); }
+.demo-toggle:active { transform: scale(0.94); }
+.demo-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 900px) {
+  .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .demo-w2, .demo-w3 { grid-column: span 1; }
+  .demo-w4 { grid-column: span 2; }
+}
+/* Phones: every film is the same tall shape (the -m versions), and the label
+   sits in its own row under it, so it never covers the film. */
+@media (max-width: 600px) {
+  .bento { grid-template-columns: 1fr; gap: 12px; }
+  .demo { display: flex; flex-direction: column; }
+  .demo-w2, .demo-w3, .demo-w4 { grid-column: auto; aspect-ratio: auto; }
+  .demo-media { position: relative; inset: auto; aspect-ratio: 728 / 1040; overflow: hidden; }
+  .demo-foot { align-self: stretch; min-height: 82px; align-items: center; padding: 14px 18px 16px; background: none; }
+  .demo-toggle { top: 12px; right: 12px; width: 44px; height: 44px; }
+}
+
+/* --- Device frames ---------------------------------------------------------- */
 
 .tablet {
   position: relative;
@@ -616,23 +669,6 @@ small { font-size: 0.875rem; }
 }
 .tablet.portrait .screen { border-radius: 6% / 4.5%; }
 .tablet .screen img { width: 100%; }
-
-/* --- Pair: Windows QR dialog beside the iPad pairing sheet -------------------- */
-
-.pair {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  align-items: end;
-}
-/* A Windows dialog on its own: the crop follows its rounded edge. */
-.dialog-shot img {
-  width: 100%;
-  border-radius: 3.7% / 2.7%;
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
-}
-
 
 /* --- Facts ------------------------------------------------------------------- */
 
@@ -730,6 +766,7 @@ small { font-size: 0.875rem; }
 }
 .card-head .icon svg { width: 20px; height: 20px; }
 .card-head h3 { flex: 1; font-size: 1.25rem; }
+.card-head:has(.platform) { gap: 16px; }
 .card > p { color: var(--muted); }
 .card .btn { margin-top: 20px; }
 
@@ -845,10 +882,285 @@ small { font-size: 0.875rem; }
 
 .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .dl-card { display: flex; flex-direction: column; }
+.dl-card .card-head { gap: 16px; }
+/* The app icon's tile with the platform drawn in it. The iPad card is shared by
+   both channels, so its night tile fades in over the day one like .brand-night. */
+.platform { position: relative; flex: none; width: 56px; height: 56px; }
+.platform img { width: 100%; height: 100%; }
+/* Pills in the text face, like the rest of the card. */
+.dl-card .badge { font-family: var(--font); font-size: 0.8125rem; letter-spacing: 0; }
 .dl-card .btn { margin-top: 0; }
 .dl-actions { margin-top: 22px; }
 .dl-meta { margin-top: 10px; font-size: 0.875rem; color: var(--faint); }
 .dl-meta a { color: var(--muted); }
+/* Stable or Beta: links shaped like the home page's .sw switches. */
+.channel-switch { margin-top: 28px; }
+.channel-switch a {
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+}
+.channel-switch a:hover { color: var(--text); }
+.channel-switch a[aria-current] { background: var(--text); color: var(--bg); }
+.no-js .channel-switch { display: none; }
+.channel-note { margin-top: 14px; color: var(--muted); }
+/* On Stable, a handwritten note beside the switch with an arrow to Beta. The
+   arrow's ink is a filled outline (the pen's width varies); a mask along its
+   centre line draws it in once, then the two strokes of the head. Beta hides
+   it. On phones the arrow points up at Beta and the note runs under it. */
+.channel-row { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 4px; margin-top: 28px; }
+.channel-row .channel-switch { margin-top: 0; }
+.no-js .beta-hint { display: none; }
+/* Once this visit has found no Beta release, Stable stops pointing at it. */
+.beta-missing .beta-hint { display: none; }
+.beta-hint { display: flex; align-items: center; gap: 2px; min-width: 0; color: var(--accent); }
+.beta-hint p {
+  max-width: 13em;
+  font-family: 'Caveat', var(--font);
+  font-weight: 500;
+  font-size: 1.5rem;
+  line-height: 1.05;
+  /* English shown on a right-to-left page keeps its punctuation in place. */
+  unicode-bidi: plaintext;
+  transform: rotate(-2deg);
+}
+.beta-arrow { flex: none; overflow: visible; }
+.beta-arrow-narrow { display: none; }
+.beta-line { fill: currentColor; }
+.beta-ink { fill: none; stroke: #fff; stroke-width: 6; stroke-dasharray: 1 1; }
+.beta-head { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-dasharray: 1 1; }
+html.js .beta-hint.reveal:not(.visible) :is(.beta-ink, .beta-head),
+.channel-beta .beta-hint :is(.beta-ink, .beta-head) { stroke-dashoffset: 1; }
+/* A round cap would leave a dot at the tip before the head is drawn. */
+html.js .beta-hint.reveal:not(.visible) .beta-head,
+.channel-beta .beta-hint .beta-head { opacity: 0; }
+html.js.channel-beta .beta-hint.reveal { opacity: 0; visibility: hidden; transition: opacity 0.35s ease, transform 0.5s var(--ease-out), visibility 0s 0.35s; }
+@media (prefers-reduced-motion: no-preference) {
+  .beta-ink { transition: stroke-dashoffset 0.9s cubic-bezier(0.45, 0, 0.3, 1) 0.3s; }
+  .beta-head { transition: stroke-dashoffset 0.16s ease-out 1.15s, opacity 0s 1.15s; }
+  .beta-head + .beta-head { transition-delay: 1.3s; }
+  .channel-beta .beta-hint :is(.beta-ink, .beta-head) { transition: stroke-dashoffset 0.3s ease-in; }
+}
+@media (max-width: 560px) {
+  .channel-row { row-gap: 2px; }
+  /* The hint spans the row's columns: the arrow starts 52px back from the
+     second, under Beta, whatever the labels' widths, and the note takes the
+     full width beneath it. */
+  .beta-hint { grid-column: 1 / -1; grid-row: 2; display: grid; grid-template-columns: subgrid; gap: 0 4px; }
+  .beta-arrow { grid-column: 2; margin-inline-start: -52px; }
+  .beta-arrow-wide { display: none; }
+  .beta-arrow-narrow { display: block; }
+  .beta-hint p { grid-column: 1 / -1; max-width: none; font-size: 1.3125rem; }
+  html.js.channel-beta .beta-hint.reveal { display: none; }
+}
+.dl-all { margin-top: 20px; }
+/* Mac and iPhone Duo, not out yet: quieter than the download cards, with no
+   button. Also under the two apps on the home page, one heading level down.
+   On the download page their tiles turn to night on Beta like the iPad card's. */
+.soon { margin-top: clamp(64px, 8vw, 104px); }
+.soon > h2, .soon > h3 { font-size: clamp(1.5rem, 1.2rem + 0.8vw, 1.875rem); letter-spacing: -0.03em; line-height: 1.1; }
+.soon-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+.soon-card { display: flex; align-items: flex-start; gap: 18px; padding: 24px; border-radius: var(--r-lg); background: var(--surface); }
+.soon-card .platform { width: 48px; height: 48px; }
+.soon-body h4 { font-size: 1.125rem; }
+.soon-body p { margin-top: 6px; color: var(--muted); }
+.soon-body .soon-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  margin-top: 14px;
+  padding: 6px 14px;
+  line-height: 1.4;
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--faint);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+a.soon-link { color: var(--text); text-decoration: none; }
+a.soon-link:hover { background: var(--border); }
+@media (max-width: 760px) {
+  .soon-grid { grid-template-columns: 1fr; }
+  .soon-card { padding: 20px; gap: 16px; }
+}
+
+/* --- Download page: the Beta channel at night ---------------------------------
+   html.channel-beta (set before first paint from ?channel=beta, then by the
+   switch) shows the Beta card and fades in a night sky. Every change animates
+   opacity or transform only, and only when motion is allowed. The night layers
+   are not rendered at all until html.night-ready (the first visit to Beta), so
+   Stable renders exactly as it did without them. */
+html:not(.channel-beta) #windows-beta,
+.channel-beta #windows { display: none; }
+
+.night-sky {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: -1;
+  height: 660px;
+  overflow: hidden;
+  display: none;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse 34% 26% at 6% 74%, rgba(70, 92, 230, 0.26), transparent 70%),
+    radial-gradient(ellipse 30% 24% at 96% 66%, rgba(146, 84, 222, 0.22), transparent 70%),
+    linear-gradient(180deg, #0a0d27 0%, #121848 38%, rgba(18, 24, 72, 0.55) 70%, rgba(10, 10, 11, 0) 100%);
+}
+.night-ready .night-sky { display: block; }
+.channel-beta .night-sky { opacity: 1; }
+/* A fixed field centred on the page, so the heading column always falls in the
+   part download.html leaves without stars. */
+.stars { position: absolute; top: 0; left: 50%; width: 2560px; max-width: none; height: 660px; margin-left: -1280px; }
+.moon {
+  position: absolute;
+  top: 92px;
+  right: 9%;
+  width: 104px;
+  height: 104px;
+  opacity: 0;
+  transform: translate3d(0, 36px, 0) rotate(-14deg);
+}
+.channel-beta .moon { opacity: 1; transform: none; }
+.shooting-star {
+  position: absolute;
+  top: 120px;
+  left: 62%;
+  width: 150px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #f4f5ff, rgba(244, 245, 255, 0));
+  opacity: 0;
+}
+
+.brand-mark { position: relative; display: inline-flex; }
+.brand-night, .platform-night { position: absolute; inset: 0; display: none; opacity: 0; }
+.night-ready .brand-night, .night-ready .platform-night { display: block; }
+.channel-beta .brand-night, .channel-beta .platform-night { opacity: 1; }
+
+/* The cards and buttons the two channels share take on a moonlit tint. */
+.night-ready .dl-card, .night-ready .soon-card { position: relative; }
+.night-ready .dl-card::before, .night-ready .soon-card::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(165, 176, 255, 0.3);
+  background: linear-gradient(180deg, rgba(92, 104, 235, 0.09), rgba(92, 104, 235, 0) 55%);
+  pointer-events: none;
+  opacity: 0;
+}
+.channel-beta .dl-card::before, .channel-beta .soon-card::before { opacity: 1; }
+.night-ready .dl-card .btn-primary { position: relative; isolation: isolate; }
+.night-ready .dl-card .btn-primary::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: -1;
+  border-radius: inherit;
+  background: #c3cbff;
+  opacity: 0;
+}
+.channel-beta .dl-card .btn-primary::before { opacity: 1; }
+.channel-beta .dl-card .btn-primary:hover::before { background: #d9deff; }
+.channel-beta .channel-switch { border-color: rgba(165, 176, 255, 0.3); }
+.channel-beta .channel-switch a[aria-current] { background: #e4e8ff; color: #0b0f2e; }
+.channel-beta .dl-card .badge-accent { background: rgba(195, 203, 255, 0.12); color: #c3cbff; border-color: rgba(195, 203, 255, 0.28); }
+.channel-beta .dl-card .specs li::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c3cbff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.2l2.8 2.8 6.2-6.3'/%3E%3C/svg%3E");
+}
+.channel-beta .dl-card a:not(.btn):hover { text-decoration-color: #c3cbff; }
+#windows-beta .channel-note { color: #c9cff5; }
+.channel-beta .soon-link { background: rgba(195, 203, 255, 0.1); color: #c3cbff; }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* About T3's pace: a quick start and a long settle, both ways. */
+  .night-sky, .brand-night, .platform-night, .dl-card::before, .soon-card::before, .dl-card .btn-primary::before {
+    transition: opacity 0.9s var(--ease-out);
+  }
+  .moon { transition: opacity 1.1s var(--ease-out) 0.15s, transform 1.4s var(--ease-out) 0.15s; }
+  /* About a minute of twinkling per visit to Beta, then the stars hold still. */
+  .channel-beta .stars-b { animation: twinkle 4.2s ease-in-out 14; }
+  .channel-beta .stars-c { animation: twinkle 6.6s ease-in-out -2.4s 9; }
+  .channel-beta .shooting-star { animation: shoot 1.3s cubic-bezier(0.3, 0.1, 0.2, 1) 1.1s both; }
+  .channel-switching .dl-card:not(#ipad) { animation: card-in 0.5s var(--ease-out) both; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* An instant switch, not the site-wide 0.01 ms transition. */
+  .night-sky, .moon, .brand-night, .platform-night, .dl-card::before, .soon-card::before, .dl-card .btn-primary::before { transition: none !important; }
+}
+/* script.js sets html.sky-paused while the tab is hidden or the sky is
+   scrolled out of view, so the sky's animations wait for someone to see them. */
+.sky-paused .night-sky * { animation-play-state: paused; }
+@keyframes twinkle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes shoot {
+  0% { opacity: 0; transform: translate3d(0, 0, 0) rotate(-24deg); }
+  12%, 60% { opacity: 1; }
+  100% { opacity: 0; transform: translate3d(-440px, 196px, 0) rotate(-24deg); }
+}
+@keyframes card-in {
+  from { opacity: 0; transform: translate3d(0, 10px, 0); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 760px) {
+  .night-sky { height: 520px; }
+  .moon { top: 74px; right: 5%; width: 68px; height: 68px; }
+  .shooting-star { top: 96px; left: 48%; width: 96px; }
+  .platform { width: 48px; height: 48px; }
+}
+/* The PowerShell one-liner, set on Windows PowerShell's own console blue. */
+.term {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "what copy" "cmd cmd";
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 22px;
+}
+.term-what { grid-area: what; font-size: 0.9375rem; color: var(--muted); }
+.term-copy { grid-area: copy; }
+.term-cmd {
+  grid-area: cmd;
+  padding: 14px 18px;
+  border-radius: var(--r-md);
+  background: #012456;
+  color: #eeedf0;
+  font-family: var(--mono); /* taste-skill-ignore: the line is literal PowerShell code */
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.term-cmd code { font: inherit; color: #ffffff; }
+.term-cmd .term-ps { color: #9fb4d8; }
+.term-copy {
+  flex: none;
+  height: 34px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: #012456;
+  color: #ffffff;
+  font: 600 0.875rem/1 var(--font);
+  cursor: pointer;
+  transition: background-color 0.15s ease-out, transform 0.1s ease-out;
+}
+.term-copy:hover { background: #0b3a7e; }
+.term-copy:active { transform: scale(0.96); }
+.term-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.channel-beta .term-copy:focus-visible { outline-color: #c3cbff; }
+@media (max-width: 760px) {
+  .term { grid-template-columns: 1fr; grid-template-areas: "what" "cmd" "copy"; }
+  .term-copy { height: 44px; }
+}
 .sha {
   margin-top: 18px;
   padding: 12px 14px;
@@ -1176,33 +1488,26 @@ fieldset { border: 0; min-width: 0; }
 
 /* --- Mac notice ------------------------------------------------------------------- */
 
-.mac-notice {
-  position: fixed;
-  left: 16px;
-  bottom: 16px;
-  z-index: 90;
-  max-width: 440px;
-  padding: 12px 14px;
-  border-radius: var(--r-md);
-  background: var(--raised);
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.9);
-  font-size: 0.9rem;
-  color: var(--muted);
-}
-.mac-notice-inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; width: auto; }
-@media (max-width: 560px) { .mac-notice { left: 12px; right: 12px; bottom: 12px; max-width: none; } }
+/* Mac visitors: a band under the header, in the page's flow, so it never covers
+   anything. It shows while the head script's html.mac is set; --note-h is its
+   height, which the hero leaves room for. */
+.mac-notice { display: none; background: var(--surface); color: var(--muted); font-size: 0.9rem; }
+html.mac { --note-h: 48px; }
+html.mac .mac-notice { display: block; }
+@media (max-width: 1239px) { html.mac { --note-h: 64px; } }
+.mac-notice-inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: var(--note-h); padding-block: 8px; }
 .mac-notice strong { color: var(--text); font-weight: 500; margin-right: 6px; }
 .mac-notice a { color: var(--text); text-decoration: underline; text-underline-offset: 0.18em; }
 .mac-notice-close {
   flex: none;
-  width: 30px; height: 30px;
+  width: 32px; height: 32px;
+  margin-right: -6px;
   border-radius: 8px;
-  border: 1px solid var(--border);
+  border: 0;
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 1.1rem;
+  font-size: 1.25rem;
   cursor: pointer;
 }
 .mac-notice-close:hover { color: var(--text); background: var(--raised); }
@@ -1221,9 +1526,9 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 @media (max-width: 720px) {
   .caption, .fact .d, .hero-meta, .footer, .status-line, .chip span, .toc,
   .mac-notice, .field label, .field legend, .dl-meta, .nav-link { font-size: 0.9375rem; }
-  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label, .stage-chip, .post-meta,
+  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label, .post-meta,
   .sha .btn-sm, .toc h2 { font-size: 0.875rem; }
-  .nav-link .count, .btn .count, .pc-titlebar, .sha code { font-size: 0.8125rem; }
+  .nav-link .count, .btn .count, .sha code { font-size: 0.8125rem; }
   .fallback pre, .source-body pre { font-size: 0.875rem; }
   pre code { font-size: 1em; }
 }
@@ -1240,3 +1545,333 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .policy .post-list { margin-top: 16px; }
 .policy .post-update { margin-top: 20px; }
 .policy .post-update dl { margin-top: 0; }
+
+/* --- Discord link and the "Built by engineers from" strip ------------------------
+   Kept in one block at the end of the file. The Discord link reuses .nav-link. The
+   header gained a link, so it now compacts earlier: below 940px GitHub and Discord
+   drop their words (screen readers still hear them), below 820px the text links
+   go, and on phones the right-hand group tightens so the brand keeps its name.
+   Away from English the labels run longer, so the two keep only their icons at
+   every width. */
+
+.nav-link { white-space: nowrap; }
+.nav-link svg { flex: none; }
+@media (max-width: 940px) {
+  .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
+  .nav-link[href^="https://discord.gg/"] > span {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
+}
+.not-english .nav-link[href="https://github.com/sidebandstudio/EternalMonitor"] > span:not(.count),
+.not-english .nav-link[href^="https://discord.gg/"] > span {
+  position: absolute;
+  width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media (min-width: 481px) {
+  .not-english .nav-link[href^="https://discord.gg/"] { padding-inline: 10px; }
+}
+@media (max-width: 820px) {
+  .nav .hide-sm { display: none !important; }
+}
+@media (max-width: 480px) {
+  .nav-links { gap: 2px; }
+  .nav-link, .nav-link[href^="https://discord.gg/"] { padding-inline: 6px; }
+  .nav .btn-sm { padding-inline: 12px; }
+  .nav .count-star { display: none; }
+}
+/* At 500px and below the star count goes too, so the brand keeps its full name
+   beside the language switcher. */
+@media (max-width: 500px) {
+  .nav-link .count { display: none; }
+}
+
+/* Below 360px the brand shows its mark only; the link keeps its name for
+   screen readers. Neither side of the bar may shrink, so nothing overlaps. */
+.brand-mark, .brand > img, .nav-links { flex: none; }
+@media (max-width: 360px) {
+  .brand > span:last-child {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+/* Away from English the English toggle takes that room up to 374px. */
+@media (max-width: 374px) {
+  .not-english .brand > span:last-child {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* "Built by engineers from": the companies Sideband Studio's engineers have
+   worked at. The logos are the companies' own files; one filter turns each into
+   flat white, slightly muted, so they read the same on the plain page and in the
+   Beta night sky. Each logo has its own height, set by eye so the six carry
+   equal weight: a tall emblem sits lower than a thin, wide wordmark, and the
+   long MIT Lincoln Laboratory lockup gets the widest place on every layout. */
+.pedigree { --s: 1; padding-top: clamp(64px, 8vw, 112px); }
+.pedigree.center .pedigree-title { text-align: center; }
+.pedigree-title {
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 0.95rem + 0.45vw, 1.3125rem);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.pedigree-logos {
+  list-style: none;
+  margin-top: clamp(28px, 3vw, 40px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.pedigree-logos li { display: flex; justify-content: center; }
+.pedigree-logos img {
+  display: block;
+  width: auto;
+  height: calc(var(--h) * var(--s));
+  filter: brightness(0) invert(1);
+  opacity: 0.86;
+}
+.logo-aws { --h: 46px; }
+.logo-amazon { --h: 38px; }
+.logo-sonos { --h: 24px; }
+.logo-mit-lincoln-laboratory { --h: 34px; }
+.logo-summit-partners { --h: 34px; }
+.logo-philips { --h: 21px; }
+/* The download page puts it under the cards, closer than a section break. */
+.dl-all + .pedigree { padding-top: clamp(48px, 6vw, 80px); }
+
+/* Below 1160px the row no longer fits: two rows, AWS, Amazon and Sonos, then
+   MIT Lincoln Laboratory, Summit Partners and Philips. Each row runs from margin
+   to margin. The ::before is the line break (flex has none), its height the gap. */
+@media (max-width: 1160px) {
+  .pedigree { --s: 0.9; }
+  .pedigree-logos { flex-wrap: wrap; gap: 0 24px; }
+  .pedigree-logos::before { content: ""; order: 1; flex: 0 0 100%; height: 40px; }
+  .pedigree-logos li:nth-child(n+4) { order: 2; }
+}
+/* Phones and small tablets: three rows, MIT Lincoln Laboratory alone in the
+   middle at full width. */
+@media (max-width: 720px) {
+  .pedigree { --s: 0.8; }
+  .pedigree-logos { gap: 0 16px; }
+  .pedigree-logos::before, .pedigree-logos::after { content: ""; flex: 0 0 100%; height: 32px; }
+  .pedigree-logos::after { order: 3; }
+  .pedigree-logos li:nth-child(n+5) { order: 4; }
+  .pedigree-logos li:nth-child(4) { flex: 0 0 100%; justify-content: flex-start; }
+  .pedigree.center .pedigree-logos li:nth-child(4) { justify-content: center; }
+  .pedigree-logos .logo-mit-lincoln-laboratory { width: min(100%, 340px); height: auto; }
+}
+@media (max-width: 360px) {
+  .pedigree { --s: 0.72; }
+}
+
+/* The logos come in one after another, once, after the strip itself starts to rise. */
+html.js .pedigree.reveal li {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.6s var(--ease-out), transform 0.7s var(--ease-out);
+}
+html.js .pedigree.reveal.visible li { opacity: 1; transform: none; }
+.pedigree li:nth-child(2) { transition-delay: 70ms; }
+.pedigree li:nth-child(3) { transition-delay: 140ms; }
+.pedigree li:nth-child(4) { transition-delay: 210ms; }
+.pedigree li:nth-child(5) { transition-delay: 280ms; }
+.pedigree li:nth-child(6) { transition-delay: 350ms; }
+@media (prefers-reduced-motion: reduce) {
+  html.js .pedigree.reveal li { opacity: 1; transform: none; transition: none; }
+}
+
+/* --- Download page on narrow phones ---------------------------------------------- */
+/* Single-column tracks may shrink below their content, and long button labels,
+   badges and addresses wrap instead of pushing the cards past the screen. */
+@media (max-width: 760px) {
+  .dl-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 860px) {
+  .feedback { grid-template-columns: minmax(0, 1fr); }
+}
+.dl-card, .feedback > * { min-width: 0; }
+.dl-card .card-head { flex-wrap: wrap; row-gap: 10px; }
+.dl-card .card-head h2 { min-width: 0; }
+.dl-card .btn, .feedback .btn { max-width: 100%; white-space: normal; text-align: center; }
+.dl-card .btn-lg, .feedback .btn-lg { height: auto; min-height: 50px; padding-block: 12px; line-height: 1.25; }
+.feedback a, .dl-meta a { overflow-wrap: anywhere; }
+@media (max-width: 380px) {
+  .dl-card, .feedback { padding: 22px 20px; }
+  /* The pill sits under the title, beside the tile, rather than alone on a row. */
+  .dl-card .card-head { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 14px; }
+  .dl-card .card-head .platform { grid-row: span 2; }
+  .dl-card .card-head .badge { justify-self: start; }
+  /* Room for the whole host on one line before the path. */
+  .term-cmd { padding: 12px 14px; font-size: 0.75rem; }
+}
+
+/* --- Languages (i18n.js) -------------------------------------------------------
+   The switcher and the English toggle in the nav, the page held back while its
+   strings load, each script's system fonts, and Arabic right to left. */
+
+html.i18n-wait body { visibility: hidden; }
+.no-js .lang, .no-js .lang-english { display: none; }
+
+.lang { position: relative; }
+.lang-button { border: 0; background: transparent; font-family: inherit; cursor: pointer; }
+.lang-button svg { flex: none; }
+.lang-button::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-inline-start: -1px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  transform: translateY(-2px) rotate(45deg);
+  opacity: 0.7;
+}
+.lang-button[aria-expanded="true"] { color: var(--text); background: var(--raised); }
+.lang-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  inset-inline-end: 0;
+  z-index: 110;
+  min-width: 212px;
+  max-height: calc(100vh - var(--nav-h) - 16px);
+  overflow-y: auto;
+  padding: 6px;
+  list-style: none;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.9);
+}
+.lang-menu a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.9375rem;
+  text-decoration: none;
+}
+.lang-menu a:hover, .lang-menu a:focus-visible { color: var(--text); background: var(--hover); }
+.lang-menu a:focus-visible { outline-offset: -2px; }
+.lang-menu a[aria-current] { color: var(--text); }
+.lang-menu a[aria-current]::after {
+  content: "";
+  flex: none;
+  width: 14px;
+  height: 14px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23e8ff47' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.2l2.8 2.8 6.2-6.3'/%3E%3C/svg%3E") no-repeat center / contain;
+}
+/* Shown only away from English: one tap back, for visitors switched by their browser. */
+.lang-english { border: 1px solid var(--border-strong); color: var(--text); }
+.lang-note { width: fit-content; margin-top: 14px; font-size: 0.9375rem; color: var(--faint); }
+
+
+/* Geist covers Latin and Cyrillic. Other scripts take the system's font for
+   them, named so each platform picks its native one, without Latin tracking. */
+html:lang(ar) { --font: 'Geist', 'SF Arabic', 'Geeza Pro', 'Segoe UI', 'Noto Sans Arabic', Tahoma, sans-serif; }
+html:lang(hi) { --font: 'Geist', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Nirmala UI', 'Noto Sans Devanagari', sans-serif; }
+html:lang(zh-Hans) { --font: 'Geist', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif; }
+html:lang(ja) { --font: 'Geist', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', Meiryo, 'Noto Sans JP', sans-serif; }
+html:lang(ko) { --font: 'Geist', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif; }
+html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) * { letter-spacing: 0; }
+html:is(:lang(ar), :lang(hi)) :is(h1, h2) { line-height: 1.3; }
+html:is(:lang(zh), :lang(ja), :lang(ko)) :is(h1, h2) { line-height: 1.2; }
+html:lang(ja) :is(h1, h2, h3) { word-break: auto-phrase; }
+html:lang(ko) { word-break: keep-all; }
+
+/* Right to left. Screenshots, the logo, code, versions and checksums keep
+   their left-to-right order. */
+[dir="rtl"] :is(.brand, .stage, .tablet, pre, code) { direction: ltr; }
+[dir="rtl"] :is(#release-meta, [data-win-version]) { direction: ltr; unicode-bidi: isolate; }
+[dir="rtl"] [data-ipad-version] { unicode-bidi: isolate; }
+[dir="rtl"] .sha code { text-align: left; }
+[dir="rtl"] .skip-link { left: auto; right: 16px; }
+[dir="rtl"] .nav .btn { margin-left: 0; margin-right: 6px; }
+[dir="rtl"] .btn .count { margin: 0 4px 0 0; padding: 0 10px 0 0; border-left: 0; border-right: 1px solid var(--border-strong); }
+[dir="rtl"] .fact + .fact { border-left: 0; border-right: 1px solid var(--border); }
+[dir="rtl"] .fact .n { unicode-bidi: plaintext; text-align: right; }
+[dir="rtl"] .fact .n small { margin: 0 4px; }
+[dir="rtl"] .specs li { padding: 5px 24px 5px 0; }
+[dir="rtl"] .specs li::before { left: auto; right: 0; }
+[dir="rtl"] .field select { padding-right: 13px; padding-left: 36px; background-position: left 12px center; }
+[dir="rtl"] .source-body ul { padding-left: 0; padding-right: 1.2em; }
+[dir="rtl"] .mac-notice strong { margin-right: 0; margin-left: 6px; }
+[dir="rtl"] :is(#feedback-send, .ways li) svg { transform: scaleX(-1); }
+[dir="rtl"] .beta-arrow { transform: scaleX(-1); }
+[dir="rtl"] .beta-hint p { text-align: right; }
+@media (max-width: 760px) {
+  [dir="rtl"] .fact + .fact { border-right: 0; }
+}
+@media (max-width: 480px) {
+  [dir="rtl"] .nav .btn { margin-right: 0; }
+}
+
+/* Away from English the phone nav makes room for the English toggle: the
+   GitHub link goes (it is in the footer too) and the page's button keeps
+   only its icon, its word still read to screen readers. */
+.nav .btn-sm svg { display: none; }
+@media (max-width: 720px) {
+  .not-english .nav-links > a[href*="github.com"] { display: none; }
+  .not-english .nav .btn-sm { width: 36px; padding: 0; }
+  .not-english .nav .btn-sm svg { display: block; }
+  .not-english .nav .btn-sm > span {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (max-width: 390px) {
+  .lang-button::after { display: none; }
+}
+/* Narrow desktops: the switcher keeps only its globe, and away from English
+   the page links (also in the footer) give way to the toggle; with the
+   Discord link in the bar, translated links need that room up to 1180px. */
+@media (max-width: 990px) {
+  .lang-button .lang-name {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (max-width: 1180px) {
+  .not-english .nav-links > .hide-sm { display: none; }
+}
+/* English phones under 400px: the GitHub link (also in the footer) goes too. */
+@media (max-width: 400px) {
+  .nav-links > a[href*="github.com"] { display: none; }
+}
+/* Longer translated labels may wrap on phones rather than widen the page. */
+@media (max-width: 560px) {
+  .not-english :is(.card, .form-actions, .hero-actions, .studio-actions) .btn {
+    height: auto;
+    min-height: 44px;
+    padding-block: 11px;
+    white-space: normal;
+    line-height: 1.25;
+    text-align: center;
+  }
+  .not-english :is(.card, .form-actions, .hero-actions, .studio-actions) .btn-lg { min-height: 50px; }
+}
+/* Small phones: the hero buttons' labels get the room their padding took,
+   so "Windows 版をダウンロード" keeps its last kana. */
+@media (max-width: 360px) {
+  .not-english .hero-actions .btn-lg { padding-inline: 12px; }
+}
+/* Geist Mono has no Arabic, Devanagari or CJK: translated labels set in it
+   (badges, the link chip, Copy) use the text font there. */
+html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) :is(.badge:not([data-win-version]), .sha .btn) { font-family: var(--font); }

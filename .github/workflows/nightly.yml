@@ -1,0 +1,180 @@
+name: Beta builds
+
+# The Beta channel. Once a night, builds the Windows installer from the branch
+# with the newest fixes and publishes it as a GitHub pre-release under a
+# beta-YYYYMMDD-<sha> tag. The moving "beta" pre-release always holds the
+# newest one, so
+# https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe
+# never changes (docs/download.html?channel=beta links it). No tag here starts
+# with v, so release.yml and testflight.yml never run for a beta build, and
+# docs/latest.json, /releases/latest and the apps' update checks never see
+# one. scripts/nightly.py has the version, branch and retention rules.
+#
+# Only a run on main publishes. A manual run with dry_run, on any other
+# branch or for a pull request that changes this pipeline, builds and scans
+# the installer and uploads it as a run artifact. The build itself is
+# beta-installer.yml; a pull request runs its own code, so its build gets no
+# secrets (scripts/test_workflow_secrets.py).
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and scan, but publish nothing
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+      - .github/workflows/beta-installer.yml
+      - scripts/nightly.py
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && github.ref || 'nightly' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      branch: ${{ steps.plan.outputs.branch }}
+      sha: ${{ steps.plan.outputs.sha }}
+      revision: ${{ steps.plan.outputs.revision }}
+      stable: ${{ steps.plan.outputs.stable }}
+      version: ${{ steps.plan.outputs.version }}
+      title: ${{ steps.plan.outputs.title }}
+      tag: ${{ steps.plan.outputs.tag }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: scripts
+
+      - name: Choose the branch, commit and version
+        id: plan
+        env:
+          NIGHTLY_BRANCH: ${{ vars.NIGHTLY_BRANCH }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          # Reads the beta release's completion marker.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/nightly.py plan --branch "$NIGHTLY_BRANCH" --run "$GITHUB_RUN_NUMBER" > plan.txt
+          cat plan.txt >> "$GITHUB_OUTPUT"
+          get() { sed -n "s/^$1=//p" plan.txt; }
+          changed=$(get changed)
+          dry=false
+          if [[ "$DRY_RUN" == true || "$GITHUB_REF" != refs/heads/main ]]; then dry=true; fi
+          # A dry run always builds; a real run skips a commit already published.
+          build=$([[ $dry == true || $changed == true ]] && echo true || echo false)
+          publish=$([[ $dry == false && $changed == true ]] && echo true || echo false)
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $(get title)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | $(get version) |"
+            echo "| Branch | \`$(get branch)\` |"
+            echo "| Commit | $(get sha) |"
+            echo "| Published stable | $(get stable) |"
+            echo "| Tag | \`$(get tag)\` |"
+            echo "| Last published commit | $(get last) |"
+            echo "| Build | $build |"
+            echo "| Publish | $publish$([[ $dry == true ]] && echo ' (dry run)') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat plan.txt
+          echo "build=$build publish=$publish"
+
+  build:
+    name: Windows installer
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.build == 'true'
+    permissions:
+      contents: read
+      # Lets azure/login exchange this run's OIDC token for Artifact Signing access.
+      id-token: write
+    uses: ./.github/workflows/beta-installer.yml
+    with:
+      sha: ${{ needs.plan.outputs.sha }}
+      version: ${{ needs.plan.outputs.version }}
+      revision: ${{ needs.plan.outputs.revision }}
+    secrets: inherit
+
+  # The same build for a pull request, which runs its own code: no secrets,
+  # so no diagnostics credentials and no signing, and no OIDC token.
+  check:
+    name: Windows installer (pull request, no secrets)
+    needs: plan
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/beta-installer.yml
+    with:
+      sha: ${{ needs.plan.outputs.sha }}
+      version: ${{ needs.plan.outputs.version }}
+      revision: ${{ needs.plan.outputs.revision }}
+
+  publish:
+    name: Publish
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSET: EternalMonitor-Setup-beta.exe
+      BRANCH: ${{ needs.plan.outputs.branch }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      STABLE: ${{ needs.plan.outputs.stable }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TITLE: ${{ needs.plan.outputs.title }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/nightly.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: EternalMonitor-Setup-beta
+          path: dist
+
+      - name: Check the installer is the one the build scanned
+        run: |
+          echo "$SHA256  dist/EternalMonitor-Setup.exe" | sha256sum --check
+          mv dist/EternalMonitor-Setup.exe "dist/$ASSET"
+          python3 scripts/nightly.py notes --version "$VERSION" --branch "$BRANCH" \
+            --sha "$SHA" --stable "$STABLE" --sha256 "$SHA256" > notes.md
+
+      # The dated release first, checked anonymously; then the fixed beta link,
+      # swapped by renames and checked byte for byte before the old asset goes;
+      # the beta tag; and last the marker plan reads to skip a finished commit,
+      # so a run that stops partway is finished by the next one (nightly.py
+      # publish()).
+      - name: Publish and point the beta download link at it
+        run: python3 scripts/nightly.py publish --tag "$TAG" --sha "$SHA" --title "$TITLE" --notes-file notes.md "dist/$ASSET"
+
+      - name: Keep the newest 7 beta builds
+        run: |
+          gh release list --limit 200 --json tagName,isPrerelease,createdAt > releases.json
+          python3 scripts/nightly.py expired --keep 7 < releases.json | while read -r tag; do
+            echo "Deleting $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
