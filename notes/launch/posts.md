@@ -99,9 +99,9 @@ open source (MIT), with no account.
   left of or above your main one.
 - Over a USB cable, Drawing mode asks for the iPad's highest refresh rate, and
   the PC can stream at up to 120 fps.
-- Every Pencil sample reaches Windows once, in order. The iPad sends the
-  precise positions it measures and no predicted points, which CSP couldn't
-  take back once painted.
+- The iPad sends the Pencil's precise positions and all its measured
+  samples, without throttling them to the video's frame rate. It never sends
+  predicted points, which CSP couldn't take back once painted.
 
 Setup in CSP takes one setting: Preferences > Tablet > Using tablet service >
 Tablet PC. The full guide, including pressure settings, is here:
@@ -141,8 +141,9 @@ up front.
 **r/rust title.** EternalMonitor: a Rust host that streams a Windows desktop to an iPad with UDP loss repair and Windows Ink pen injection
 
 **Attach (r/rust).** `docs/assets/readme/how-it-works-dark.svg` exported to
-PNG, or `docs/assets/demos/performance.mp4` (three PCs, one per GPU maker, each
-encoding on its own card).
+PNG, or `docs/assets/demos/performance.mp4` (the Windows app's Performance
+page with each of its GPU encoders: NVIDIA NVENC, AMD AMF and Intel Quick
+Sync).
 
 **Body.**
 

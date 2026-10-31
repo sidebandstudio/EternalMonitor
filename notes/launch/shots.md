@@ -7,8 +7,9 @@ notifications, and keep names, email and chat windows off both screens.
 
 Until the recording exists, the site films in `docs/assets/demos/` stand in.
 Each has a wide version (`name.mp4`, `name.webm`) and a phone-shaped one
-(`name-m.mp4`). They are animations built from the apps' own footage, so they
-are good for a post but not a substitute for the real thing in the art post.
+(`name-m.mp4`). They are animations built around the apps' real interface, with
+sample numbers, so they are good for a post but not a substitute for a real
+recording, least of all in the art post.
 
 ## Shot 1. A window dragged onto the iPad
 
@@ -50,7 +51,7 @@ are good for a post but not a substitute for the real thing in the art post.
 
 | Film | Shows | Good for |
 | --- | --- | --- |
-| `performance.mp4` | Three PCs, one per GPU maker, each encoding on its own card, with live counters | The developer post, GPU questions |
+| `performance.mp4` | The Windows app's Performance page with each of its GPU encoders: NVIDIA NVENC, AMD AMF and Intel Quick Sync | The developer post, GPU questions |
 | `fit.mp4` | Switching between Fit and Fill on the iPad | Replies about picture size |
 | `pair.mp4` | Pairing with a QR code | Replies about setup |
 | `feedback.mp4` | Send feedback from the app | Community posts |

@@ -134,6 +134,14 @@ class Missing(unittest.TestCase):
         with self.assertRaisesRegex(rn.NotesError, "no '## EternalMonitor v9.9.9' section"):
             rn.body("v9.9.9", SHA, TEMPLATE, NOTES, strict=True)
 
+    def test_an_empty_section_counts_as_missing(self):
+        notes = "## EternalMonitor v1.2.0\n\n  \n\n## EternalMonitor v1.1.0\n\n- Fixed a thing.\n"
+        with self.assertRaisesRegex(rn.NotesError, "v1.2.0' section is empty"):
+            rn.body("v1.2.0", SHA, TEMPLATE, notes, strict=True)
+        body, warning = rn.body("v1.2.0", SHA, TEMPLATE, notes, strict=False)
+        self.assertTrue(warning.startswith("::warning::"))
+        self.assertNotIn("What's new", body)
+
     def test_otherwise_it_warns_and_keeps_the_link(self):
         for tag in ("v9.9.9", "v0.3.4-rc.1", "main"):
             body, warning = rn.body(tag, SHA, TEMPLATE, NOTES, strict=False)

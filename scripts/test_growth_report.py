@@ -28,14 +28,17 @@ STARS = [star("2026-06-12T09:42:33Z", n) for n in range(95)] + [
     star("2026-10-31T09:00:00Z", 100),
 ]
 RELEASES = [
-    {"tag_name": "beta", "prerelease": True, "published_at": "2026-10-30T20:42:57Z",
+    # Drafts reach maintainer tokens, with no date and nothing downloaded yet.
+    {"tag_name": "v0.3.4", "draft": True, "prerelease": False, "published_at": None,
+     "assets": [{"name": "EternalMonitor-Setup.exe", "download_count": 0}]},
+    {"tag_name": "beta", "draft": False, "prerelease": True, "published_at": "2026-10-30T20:42:57Z",
      "assets": [{"name": "EternalMonitor-Setup-beta.exe", "download_count": 4}]},
-    {"tag_name": "windows-0.3.4-beta.1", "prerelease": True, "published_at": "2026-10-30T02:13:09Z",
+    {"tag_name": "windows-0.3.4-beta.1", "draft": False, "prerelease": True, "published_at": "2026-10-30T02:13:09Z",
      "assets": [{"name": "EternalMonitor-0.3.4-beta.1-Setup.exe", "download_count": 6},
                 {"name": "SHA256SUMS.txt", "download_count": 2}]},
-    {"tag_name": "v0.3.3", "prerelease": False, "published_at": "2026-10-27T14:43:03Z",
+    {"tag_name": "v0.3.3", "draft": False, "prerelease": False, "published_at": "2026-10-27T14:43:03Z",
      "assets": [{"name": "EternalMonitor-Setup.exe", "download_count": 470}]},
-    {"tag_name": "v0.3.2", "prerelease": False, "published_at": "2026-10-23T16:55:35Z",
+    {"tag_name": "v0.3.2", "draft": False, "prerelease": False, "published_at": "2026-10-23T16:55:35Z",
      "assets": [{"name": "EternalMonitor-Setup.exe", "download_count": 313}]},
 ]
 RESPONSES = {
@@ -115,6 +118,28 @@ class Report(unittest.TestCase):
         report = json.loads(out)
         self.assertEqual(report["generated_at"], "2026-10-31T12:00:00Z")
         self.assertEqual(report["stars"]["last_28_days"], 5)
+
+    def test_drafts_are_left_out(self):
+        report = gr.collect(Recorded(), REPO, NOW)
+        self.assertEqual([r["tag"] for r in report["downloads"]["releases"]],
+                         ["beta", "windows-0.3.4-beta.1", "v0.3.3", "v0.3.2"])
+        code, out = run()
+        self.assertEqual(code, 0)
+        self.assertNotRegex(out, r"(?m)^  v0\.3\.4 ")
+
+    def test_website_below_the_top_ten_is_unknown(self):
+        others = [{"referrer": f"site{n}.example", "count": 50 - n, "uniques": 10} for n in range(10)]
+        responses = dict(RESPONSES)
+        responses[f"repos/{REPO}/traffic/popular/referrers"] = others
+        report = gr.collect(Recorded(responses), REPO, NOW)
+        self.assertIsNone(report["traffic"]["website_clicks"])
+        code, out = run("--json", get=Recorded(responses))
+        self.assertIsNone(json.loads(out)["traffic"]["website_clicks"])
+        code, out = run(get=Recorded(responses))
+        self.assertIn("Website-to-GitHub views (eternalmonitor.dev referrer): not listed in the top 10", out)
+        # With fewer than ten listed, a missing website had no views at all.
+        responses[f"repos/{REPO}/traffic/popular/referrers"] = others[:3]
+        self.assertEqual(gr.collect(Recorded(responses), REPO, NOW)["traffic"]["website_clicks"], 0)
 
     def test_without_push_access_the_rest_still_prints(self):
         code, out = run(get=Recorded(refuse=("traffic",)))
