@@ -13,6 +13,13 @@
 # for that width. It is rendered once at high quality, then encoded for the web:
 # H.264 MP4 (yuv420p, faststart), VP9 WebM and a WebP poster, the MP4 and
 # WebM together kept near 1.5 MB. Needs Node, ffmpeg and cwebp.
+#
+#   site-demos/render.sh readme-demo   only the README's demo
+#
+# readme-demo.html plays second-screen and pencil as one 1280 x 720 loop. It
+# becomes docs/assets/readme-demo.webp, an animated WebP at 860 px and 15 fps
+# under 4 MB, because GitHub doesn't play a repository's own video files in a
+# README. Needs img2webp too. Lower quality bands the dark sky.
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT=../docs/assets/demos
@@ -53,3 +60,13 @@ for entry in "${FILMS[@]}"; do
   [[ $comp == .* ]] && rm -f "$comp"
   ls -l "$OUT/$name".{mp4,webm,webp} | awk '{print "   " $5 "\t" $9}'
 done
+
+if [ $# -eq 0 ] || [[ " $* " == *" readme-demo "* ]]; then
+  echo "== readme-demo"
+  master=renders/readme-demo-master.mp4
+  $HF render -c readme-demo.html --fps 30 --crf 10 --quiet -o "$master"
+  rm -rf renders/readme-demo-frames && mkdir renders/readme-demo-frames
+  ffmpeg -v error -y -i "$master" -vf "fps=15,scale=860:-2:flags=lanczos" renders/readme-demo-frames/%04d.png
+  img2webp -loop 0 -sharp_yuv -lossy -q 82 -m 6 -d 67 renders/readme-demo-frames/*.png -o ../docs/assets/readme-demo.webp
+  ls -l ../docs/assets/readme-demo.webp | awk '{print "   " $5 "\t" $9}'
+fi

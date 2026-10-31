@@ -6,6 +6,9 @@ contact_links:
   - name: Ask on Discord
     url: https://discord.gg/Xc7NykBZ6z
     about: Questions, setup help and ideas, on the Sideband Discord.
+  - name: Share your setup on Discord
+    url: https://discord.gg/Xc7NykBZ6z
+    about: Show the PC and iPad you use EternalMonitor with, or use the Compatibility report form above.
   - name: Report a security vulnerability
     url: https://github.com/sidebandstudio/EternalMonitor/security/advisories/new
     about: Please report security problems privately, not in a public issue.

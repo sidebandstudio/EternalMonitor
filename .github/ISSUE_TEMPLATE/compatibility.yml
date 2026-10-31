@@ -1,0 +1,171 @@
+name: Compatibility report
+description: Tell us how EternalMonitor runs on your PC and iPad, whether it works well or not.
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing your setup. Reports like this one build the
+        [compatibility page](https://eternalmonitor.dev/compatibility.html), so other people can
+        see what works on hardware like theirs. If something is broken, a
+        [bug report](https://github.com/sidebandstudio/EternalMonitor/issues/new?template=bug_report.yml)
+        with the host log helps us fix it.
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Works well
+        - Works, with some problems
+        - Doesn't work
+    validations:
+      required: true
+  - type: dropdown
+    id: pc-type
+    attributes:
+      label: PC type
+      options:
+        - Laptop
+        - Desktop
+        - Other (mini PC, handheld, tablet)
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: Processor
+      placeholder: Intel Core i7-12700H
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card(s)
+      description: List every graphics card or chip in the PC. The PC window's Performance page names the one EternalMonitor uses.
+      placeholder: Intel Iris Xe and NVIDIA GeForce RTX 3060 Laptop GPU
+    validations:
+      required: true
+  - type: dropdown
+    id: hybrid
+    attributes:
+      label: Hybrid graphics
+      description: Does the PC have two graphics chips that Windows switches between, as many laptops do?
+      options:
+        - "Yes"
+        - "No"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: In Windows, open Settings > System > About.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: ipad
+    attributes:
+      label: iPad model and iPadOS version
+      description: On the iPad, open Settings > General > About.
+      placeholder: iPad Air 11-inch (M2), iPadOS 26.1
+    validations:
+      required: true
+  - type: input
+    id: pc-version
+    attributes:
+      label: EternalMonitor version on the PC
+      description: Shown at the bottom of the PC window's sidebar.
+      placeholder: 0.3.3
+    validations:
+      required: true
+  - type: input
+    id: ipad-version
+    attributes:
+      label: iPad app version
+      description: Shown at the bottom of the app's settings on the iPad. The number in brackets is the TestFlight build.
+      placeholder: 0.3.3 (364)
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - Wi-Fi
+        - USB cable
+        - Both
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: "**Use the iPad as** on the PC's Stream page."
+      options:
+        - Second screen (extend)
+        - Mirror my screen
+        - Both
+    validations:
+      required: true
+  - type: dropdown
+    id: fps
+    attributes:
+      label: Frame rate setting
+      description: "**Frame rate** in the PC window's Settings."
+      options:
+        - "30"
+        - "60"
+        - "90"
+        - "120"
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: worked
+    attributes:
+      label: What worked?
+      description: Tick everything that worked. Leave out what you didn't try.
+      options:
+        - label: Picture
+        - label: Touch (tap, drag, scroll)
+        - label: Keyboard
+        - label: Apple Pencil pressure
+        - label: Apple Pencil tilt
+        - label: PC audio
+  - type: dropdown
+    id: smoothness
+    attributes:
+      label: How smooth did it feel?
+      options:
+        - Smooth, like a real monitor
+        - Mostly smooth, with an occasional stutter
+        - Choppy
+        - Unusable
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers from the apps
+      description: |
+        Copy any numbers you can see while streaming, as they read after a minute or so.
+        - PC window, Stream page: Frame rate, Delay and Connection, and in the Connected iPad card: Round-trip time, End-to-end latency, Decode rate and Unrecovered loss.
+        - PC window, Performance page: Encode time (avg and peak) and Encoder.
+        - iPad: turn on Show stream stats in the app's settings, then tap the stats to open Connection quality: Loss, Round trip, Dropped, Repaired, Jitter and Latency.
+      placeholder: |
+        Frame rate 60 fps, Delay 18 ms, Connection Good
+        Encode time avg 3.1 ms, peak 6.0 ms, Encoder H.264 · NVENC
+        iPad: Loss 0.0 %, Round trip 4 ms, Latency 21 ms
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: What you use it for, what didn't work, or what you changed to make it work.
+  - type: checkboxes
+    id: listing
+    attributes:
+      label: Compatibility page
+      options:
+        - label: You may list this setup and its results on the public compatibility page.
