@@ -25,9 +25,9 @@ Connect your iPad over Wi-Fi or USB, with touch and Apple Pencil support.
 </p>
 
 EternalMonitor turns an iPad into a monitor for your Windows PC. It is free, open
-source under the MIT license, and needs no account. Your graphics card encodes the
-screen at up to 120 fps, the iPad decodes it in hardware, and every tap, keystroke
-and Pencil stroke goes back to the PC.
+source under the MIT license, and needs no account. The PC streams at up to
+120 fps, with hardware encoding on supported graphics cards and hardware decoding
+on the iPad, and every tap, keystroke and Pencil stroke goes back to the PC.
 
 <a id="download"></a>
 
@@ -65,7 +65,7 @@ If EternalMonitor is useful to you, a star helps other people find it.
   iPad disconnects, so a quick reconnect reuses it and Windows never keeps a
   phantom monitor around.
 - **Wi-Fi or USB.** Stream over your home network, or plug in a cable for a
-  steadier picture that also charges the iPad. A cable takes over a running
+  steadier picture that can also charge the iPad from a USB-C port. A cable takes over a running
   Wi-Fi session, and unplugging it falls back to Wi-Fi.
 - **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt,
   and the pen lands under the tip on any monitor layout. Drawing mode ignores your
@@ -73,7 +73,7 @@ If EternalMonitor is useful to you, a star helps other people find it.
 - **Touch, keyboard and pointer.** Tap to click, drag, scroll with two fingers and
   hold to right-click. Hardware keyboards, trackpads and mice work too, with
   sticky modifiers and middle-click.
-- **Your graphics card does the work.** NVIDIA, AMD and Intel graphics encode the
+- **Hardware encoding.** Supported NVIDIA, AMD and Intel graphics encode the
   stream at 30, 60, 90 or 120 fps.
 - **Loss repair on Wi-Fi.** When a packet goes missing, the iPad asks for it again
   right away, so one dropped packet rarely costs a frame. The bitrate follows your
@@ -136,9 +136,9 @@ copy or export a report.
   <img src="docs/assets/readme/how-it-works-light.svg" width="1120" alt="The Windows PC captures the desktop, encodes the video on the GPU and sends it over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is captured with WASAPI, encoded as Opus and played on the iPad. Touch, Pencil, keyboard and trackpad input travels back to the PC, which injects it.">
 </picture>
 
-The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
-the GPU through FFmpeg (NVIDIA NVENC, AMD AMF or Intel Quick Sync, H.264 by
-default or HEVC), and sends each frame as numbered UDP fragments. Over USB
+The Windows host is written in Rust. It captures the desktop with DXGI, encodes
+through FFmpeg with NVIDIA NVENC, AMD AMF or Intel Quick Sync on supported
+graphics hardware (H.264 by default, or HEVC), and sends each frame as numbered UDP fragments. Over USB
 the same messages travel through a framed tunnel that Apple's device service
 provides. The iPad app is native Swift. It reassembles fragments, decodes with
 VideoToolbox and renders with Metal. On Wi-Fi it also requests any fragments
