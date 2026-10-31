@@ -141,22 +141,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "unknown".to_string())
     };
 
-    info!("══════════════════════════════════");
-    info!("  EternalMonitor v{}", env!("CARGO_PKG_VERSION"));
-    info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
-    info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
-    info!("  Encoder: {}", gpu_info.codec_display_name);
-    info!("  Capture: {}", capture_summary);
-    info!("  Listen:  0.0.0.0:{}", listen_port);
-    info!("══════════════════════════════════");
-    eternal_host::network::log_addresses();
-
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.
     // (Previously only the GUI applied them, seconds later — and headless
     // runs never did.) The GUI re-applies the same values at startup, which
     // is idempotent.
     let mut persisted = eternal_host::settings::SettingsFile::load();
+    // The address the stream binds (transport::start_sender), with the
+    // Listen on choice applied.
+    let listen_ip = eternal_host::network::listen_ip_now(&persisted.listen_on);
+
+    info!("══════════════════════════════════");
+    info!("  EternalMonitor v{}", env!("CARGO_PKG_VERSION"));
+    info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
+    info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
+    info!("  Encoder: {}", gpu_info.codec_display_name);
+    info!("  Capture: {}", capture_summary);
+    info!("  Listen:  {}:{}", listen_ip, listen_port);
+    info!("══════════════════════════════════");
+    eternal_host::network::log_addresses();
+
     let auth_token = persisted
         .ensure_auth_token()
         .map_err(eternal_host::startup::fatal)?;
