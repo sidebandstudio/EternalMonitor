@@ -1,0 +1,8 @@
+Use case: stylized-concept
+Asset type: full-bleed background plate behind a floating product window in a dark website card
+Style/medium: soft painterly digital gouache with visible brush texture, like a matte painting for an animated film; calm, quiet, no characters
+Lighting/mood: deep night, cool moonlight, a still and peaceful late-night study mood
+Color palette: almost black ink blue #0b0e14 and #121722 dominate, desaturated slate and teal mid-tones, a few tiny warm window lights, one restrained pale yellow-green glow #e8ff47 used only as a faint distant light; overall very dark so white UI on top stays legible
+Composition/framing: horizon in the lower third, large calm sky with sparse soft stars filling the upper two thirds; the centre of the frame must be low-detail and dark because a product window will cover it
+Constraints: no text, no logos, no watermark, no people, no devices, no screens, no UI
+Avoid: saturated purple or violet, neon, lens flare, busy detail in the centre, photorealism, gradients that look digital
