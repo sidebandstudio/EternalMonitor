@@ -24,6 +24,10 @@
   };
   var REPO = 'sidebandstudio/EternalMonitor';
   var FEEDBACK_TO = 'hello@sideband.studio';
+  // Text this script writes, in the page's language (docs/i18n.js), else the
+  // English given here. Each is redrawn when the visitor changes language.
+  var t = function (key, english) { return window.emI18n ? window.emI18n.t(key, english) : english; };
+  var onLanguage = function (redraw) { document.addEventListener('em:language', redraw); };
 
   /* --- Nav: hairline once the page scrolls ------------------------------ */
   var nav = document.querySelector('.nav');
@@ -45,13 +49,24 @@
   if (isMac && nav && sessionStorage.getItem('mac-notice') !== 'off') {
     var notice = document.createElement('aside');
     notice.className = 'mac-notice';
-    notice.setAttribute('aria-label', 'Note for Mac visitors');
     notice.innerHTML =
-      '<div class="container mac-notice-inner">' +
-      '<p><strong>On a Mac?</strong>EternalMonitor streams from Windows PCs. macOS already has ' +
-      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a> for this.</p>' +
-      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button></div>';
-    notice.querySelector('.mac-notice-close').addEventListener('click', function () {
+      '<div class="container mac-notice-inner"><p></p>' +
+      '<a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>' +
+      '<button type="button" class="mac-notice-close">&times;</button></div>';
+    var macText = notice.querySelector('p'), sidecar = notice.querySelector('a');
+    var macClose = notice.querySelector('.mac-notice-close');
+    var macCopy = function () {
+      notice.setAttribute('aria-label', t('mac.label', 'Note for Mac visitors'));
+      macClose.setAttribute('aria-label', t('mac.dismiss', 'Dismiss'));
+      var strong = document.createElement('strong');
+      strong.textContent = t('mac.title', 'On a Mac?');
+      var around = t('mac.text', 'EternalMonitor streams from Windows PCs. macOS already has {sidecar} for this.').split('{sidecar}');
+      macText.textContent = '';
+      macText.append(strong, around[0], sidecar, around[1] || '');
+    };
+    macCopy();
+    onLanguage(macCopy);
+    macClose.addEventListener('click', function () {
       sessionStorage.setItem('mac-notice', 'off');
       notice.remove();
     });
@@ -107,7 +122,7 @@
     var setPlayLabel = function () {
       if (!playBtn) return;
       var playing = !clip.paused && !clip.ended;
-      playBtn.querySelector('.label').textContent = playing ? 'Pause' : 'Play';
+      playBtn.querySelector('.label').textContent = playing ? t('clip.pause', 'Pause') : t('clip.play', 'Play');
       playBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
       // SVG elements have no `hidden` property, so toggle the attribute.
       playBtn.querySelector('.ico-play').toggleAttribute('hidden', playing);
@@ -120,6 +135,7 @@
     clip.addEventListener('play', setPlayLabel);
     clip.addEventListener('pause', setPlayLabel);
     setPlayLabel();
+    onLanguage(setPlayLabel);
 
     if ('IntersectionObserver' in window) {
       new IntersectionObserver(function (entries) {
@@ -157,7 +173,9 @@
       svg.appendChild(path);
       return svg;
     };
+    var shownStars = null;
     var showStars = function (text) {
+      shownStars = text;
       // Screen readers hear "GitHub, 180 stars", not a bare number.
       starEls.forEach(function (el) {
         el.textContent = '';
@@ -165,10 +183,11 @@
         el.appendChild(document.createTextNode(text));
         var unit = document.createElement('span');
         unit.className = 'visually-hidden';
-        unit.textContent = text === '1' ? ' star' : ' stars';
+        unit.textContent = ' ' + (text === '1' ? t('stars.one', 'star') : t('stars.other', 'stars'));
         el.appendChild(unit);
       });
     };
+    onLanguage(function () { if (shownStars) showStars(shownStars); });
     var keepStars = function (text) {
       showStars(text);
       try { localStorage.setItem(STARS_KEY, JSON.stringify({ text: text, at: Date.now() })); } catch (e) {}
@@ -234,13 +253,34 @@
     document.body.removeChild(ta);
   };
   document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    var reset = null;
+    var shown = null;
+    // While "Copied" shows, the button's own label nodes wait in __i18nHold,
+    // where docs/i18n.js takes them as the English if it translates the button.
+    var release = function () {
+      clearTimeout(reset);
+      reset = null;
+      var held = btn.__i18nHold || [];
+      btn.__i18nHold = null;
+      // "Copied" still showing means nothing relabelled the button (the timer,
+      // English chosen again, or a language that fell back): its label goes back.
+      if (shown && shown.parentNode === btn) {
+        btn.textContent = '';
+        held.forEach(function (n) { btn.appendChild(n); });
+      }
+      shown = null;
+    };
+    onLanguage(release);
     btn.addEventListener('click', function () {
       var target = document.getElementById(btn.getAttribute('data-copy'));
       if (!target) return;
-      var original = btn.textContent;
       copyText(target.textContent.trim(), function () {
-        btn.textContent = 'Copied';
-        setTimeout(function () { btn.textContent = original; }, 1800);
+        if (!reset) btn.__i18nHold = Array.prototype.slice.call(btn.childNodes);
+        clearTimeout(reset);
+        shown = document.createTextNode(t('common.copied', 'Copied'));
+        btn.textContent = '';
+        btn.appendChild(shown);
+        reset = setTimeout(release, 1800);
       });
     });
   });
@@ -264,16 +304,17 @@
       var msg = document.getElementById('fb-message');
       if (msg) {
         msg.placeholder = kind() === 'Bug'
-          ? 'What you expected, what happened instead, and any message word for word.'
+          ? t('download.form.placeholder.bug', 'What you expected, what happened instead, and any message word for word.')
           : kind() === 'Idea'
-            ? 'What would make EternalMonitor more useful for you?'
-            : 'Anything at all. How you use it, what you study, what you draw.';
+            ? t('download.form.placeholder.idea', 'What would make EternalMonitor more useful for you?')
+            : t('download.form.placeholder.hello', 'Anything at all. How you use it, what you study, what you draw.');
       }
     };
     Array.prototype.forEach.call(form.querySelectorAll('input[name="kind"]'), function (r) {
       r.addEventListener('change', syncKind);
     });
     syncKind();
+    onLanguage(syncKind);
 
     var compose = function () {
       var lines = [value('fb-message'), ''];

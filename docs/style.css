@@ -1240,3 +1240,156 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .policy .post-list { margin-top: 16px; }
 .policy .post-update { margin-top: 20px; }
 .policy .post-update dl { margin-top: 0; }
+
+/* --- Languages (i18n.js) -------------------------------------------------------
+   The switcher and the English toggle in the nav, the page held back while its
+   strings load, each script's system fonts, and Arabic right to left. */
+
+html.i18n-wait body { visibility: hidden; }
+.no-js .lang, .no-js .lang-english { display: none; }
+
+.lang { position: relative; }
+.lang-button { border: 0; background: transparent; font-family: inherit; cursor: pointer; }
+.lang-button svg { flex: none; }
+.lang-button::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-inline-start: -1px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  transform: translateY(-2px) rotate(45deg);
+  opacity: 0.7;
+}
+.lang-button[aria-expanded="true"] { color: var(--text); background: var(--raised); }
+.lang-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  inset-inline-end: 0;
+  z-index: 110;
+  min-width: 212px;
+  max-height: calc(100vh - var(--nav-h) - 16px);
+  overflow-y: auto;
+  padding: 6px;
+  list-style: none;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.9);
+}
+.lang-menu a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.9375rem;
+  text-decoration: none;
+}
+.lang-menu a:hover, .lang-menu a:focus-visible { color: var(--text); background: var(--hover); }
+.lang-menu a:focus-visible { outline-offset: -2px; }
+.lang-menu a[aria-current] { color: var(--text); }
+.lang-menu a[aria-current]::after {
+  content: "";
+  flex: none;
+  width: 14px;
+  height: 14px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23e8ff47' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.2l2.8 2.8 6.2-6.3'/%3E%3C/svg%3E") no-repeat center / contain;
+}
+/* Shown only away from English: one tap back, for visitors switched by their browser. */
+.lang-english { border: 1px solid var(--border-strong); color: var(--text); }
+.lang-note { width: fit-content; margin-top: 14px; font-size: 0.9375rem; color: var(--faint); }
+
+
+/* Geist covers Latin and Cyrillic. Other scripts take the system's font for
+   them, named so each platform picks its native one, without Latin tracking. */
+html:lang(ar) { --font: 'Geist', 'SF Arabic', 'Geeza Pro', 'Segoe UI', 'Noto Sans Arabic', Tahoma, sans-serif; }
+html:lang(hi) { --font: 'Geist', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Nirmala UI', 'Noto Sans Devanagari', sans-serif; }
+html:lang(zh-Hans) { --font: 'Geist', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif; }
+html:lang(ja) { --font: 'Geist', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', Meiryo, 'Noto Sans JP', sans-serif; }
+html:lang(ko) { --font: 'Geist', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif; }
+html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) * { letter-spacing: 0; }
+html:is(:lang(ar), :lang(hi)) :is(h1, h2) { line-height: 1.3; }
+html:is(:lang(zh), :lang(ja), :lang(ko)) :is(h1, h2) { line-height: 1.2; }
+html:lang(ja) :is(h1, h2, h3) { word-break: auto-phrase; }
+html:lang(ko) { word-break: keep-all; }
+
+/* Right to left. Screenshots, the logo, code, versions and checksums keep
+   their left-to-right order. */
+[dir="rtl"] :is(.brand, .stage, .modes, .pair, .pc-window, .tablet, .dialog-shot, pre, code) { direction: ltr; }
+[dir="rtl"] :is(#release-meta, [data-win-version], [data-ipad-version]) { direction: ltr; unicode-bidi: isolate; }
+[dir="rtl"] .sha code { text-align: left; }
+[dir="rtl"] .skip-link { left: auto; right: 16px; }
+[dir="rtl"] .nav .btn { margin-left: 0; margin-right: 6px; }
+[dir="rtl"] .btn .count { margin: 0 4px 0 0; padding: 0 10px 0 0; border-left: 0; border-right: 1px solid var(--border-strong); }
+[dir="rtl"] .fact + .fact { border-left: 0; border-right: 1px solid var(--border); }
+[dir="rtl"] .fact .n { unicode-bidi: plaintext; text-align: right; }
+[dir="rtl"] .fact .n small { margin: 0 4px; }
+[dir="rtl"] .specs li { padding: 5px 24px 5px 0; }
+[dir="rtl"] .specs li::before { left: auto; right: 0; }
+[dir="rtl"] .field select { padding-right: 13px; padding-left: 36px; background-position: left 12px center; }
+[dir="rtl"] .source-body ul { padding-left: 0; padding-right: 1.2em; }
+[dir="rtl"] .mac-notice { left: auto; right: 16px; }
+[dir="rtl"] .mac-notice strong { margin-right: 0; margin-left: 6px; }
+[dir="rtl"] :is(#feedback-send, .ways li) svg { transform: scaleX(-1); }
+@media (max-width: 760px) {
+  [dir="rtl"] .fact + .fact { border-right: 0; }
+}
+@media (max-width: 560px) {
+  [dir="rtl"] .mac-notice { left: 12px; }
+}
+@media (max-width: 480px) {
+  [dir="rtl"] .nav .btn { margin-right: 0; }
+}
+
+/* Away from English the phone nav makes room for the English toggle: the
+   GitHub link goes (it is in the footer too) and the page's button keeps
+   only its icon, its word still read to screen readers. */
+.nav .btn-sm svg { display: none; }
+@media (max-width: 720px) {
+  .not-english .nav-links > a[href*="github.com"] { display: none; }
+  .not-english .nav .btn-sm { width: 36px; padding: 0; }
+  .not-english .nav .btn-sm svg { display: block; }
+  .not-english .nav .btn-sm > span {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (max-width: 380px) {
+  .lang-button::after { display: none; }
+}
+/* Narrow desktops: the switcher keeps only its globe, and away from English
+   the page links (also in the footer) give way to the toggle. */
+@media (max-width: 960px) {
+  .lang-button .lang-name {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (max-width: 900px) {
+  .not-english .nav-links > .hide-sm { display: none; }
+}
+@media (max-width: 340px) {
+  .nav-links > a[href*="github.com"] { display: none; }
+}
+/* Longer translated labels may wrap on phones rather than widen the page. */
+@media (max-width: 560px) {
+  .not-english :is(.card, .form-actions, .hero-actions, .studio-actions) .btn {
+    height: auto;
+    min-height: 44px;
+    padding-block: 11px;
+    white-space: normal;
+    line-height: 1.25;
+    text-align: center;
+  }
+  .not-english :is(.card, .form-actions, .hero-actions, .studio-actions) .btn-lg { min-height: 50px; }
+}
+/* Geist Mono has no Arabic, Devanagari or CJK: translated labels set in it
+   (badges, the link chip, Copy) use the text font there. */
+html:is(:lang(ar), :lang(hi), :lang(zh), :lang(ja), :lang(ko)) :is(.badge:not([data-win-version]), .stage-chip, .sha .btn) { font-family: var(--font); }
