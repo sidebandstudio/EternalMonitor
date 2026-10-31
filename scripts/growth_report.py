@@ -10,7 +10,9 @@ the report still prints. GitHub keeps traffic for 14 days only, so save a
 report before and after a launch to compare them.
 
 The eternalmonitor.dev referrer counts views of GitHub pages reached from the
-website, which is the website-to-GitHub click count.
+website, which is the website-to-GitHub click count. GitHub lists only the top
+ten referrers, so when ten are listed without the website its count is unknown
+(null in --json). Draft releases are left out: they have no downloads or date.
 """
 import argparse
 import datetime
@@ -21,6 +23,7 @@ import sys
 REPO = "sidebandstudio/EternalMonitor"
 STAR_JSON = "application/vnd.github.star+json"
 WEBSITE = "eternalmonitor.dev"
+REFERRER_LIMIT = 10  # GitHub returns at most the top ten referrers
 
 
 class GhError(Exception):
@@ -65,6 +68,8 @@ def stars(get, repo, now):
 def downloads(get, repo):
     releases = []
     for release in pages(get, f"repos/{repo}/releases"):
+        if release["draft"]:
+            continue
         assets = [{"name": a["name"], "downloads": a["download_count"]} for a in release["assets"]]
         releases.append({
             "tag": release["tag_name"],
@@ -96,8 +101,16 @@ def traffic(get, repo):
         "unique_cloners": clones["uniques"],
         "referrers": [{"referrer": r["referrer"], "views": r["count"], "unique": r["uniques"]} for r in referrers],
         "paths": [{"path": p["path"], "title": p["title"], "views": p["count"], "unique": p["uniques"]} for p in paths],
-        "website_clicks": next((r["count"] for r in referrers if r["referrer"] == WEBSITE), 0),
+        "website_clicks": website_clicks(referrers),
     }
+
+
+def website_clicks(referrers):
+    """Views referred by the website; None when it may be below GitHub's top ten."""
+    for referrer in referrers:
+        if referrer["referrer"] == WEBSITE:
+            return referrer["count"]
+    return None if len(referrers) >= REFERRER_LIMIT else 0
 
 
 def collect(get, repo, now):
@@ -135,11 +148,14 @@ def text(report):
     if "error" in t:
         lines.append(f"Traffic: not available ({t['error']})")
         return "\n".join(lines) + "\n"
+    website = t["website_clicks"]
+    if website is None:
+        website = f"not listed in the top {REFERRER_LIMIT}"
     lines += [
         "Traffic, last 14 days",
         f"  Views    {t['views']}  ({t['unique_visitors']} unique visitors)",
         f"  Clones   {t['clones']}  ({t['unique_cloners']} unique)",
-        f"  Website-to-GitHub views ({WEBSITE} referrer): {t['website_clicks']}",
+        f"  Website-to-GitHub views ({WEBSITE} referrer): {website}",
         "",
         "Top referrers                  views  unique",
     ]
