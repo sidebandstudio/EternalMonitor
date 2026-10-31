@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Night coast references</title>
+  <!-- A working document for the films' PC desktop: a painter's reference
+       sheet, captured by capture-doc.sh in headless Chrome at 760 x 780. -->
+  <style>
+    @font-face { font-family: 'Geist'; font-weight: 400; src: url('../../docs/assets/fonts/Geist-Regular.woff2') format('woff2'); }
+    @font-face { font-family: 'Geist'; font-weight: 500; src: url('../../docs/assets/fonts/Geist-Medium.woff2') format('woff2'); }
+    @font-face { font-family: 'Geist'; font-weight: 600; src: url('../../docs/assets/fonts/Geist-SemiBold.woff2') format('woff2'); }
+    html, body { margin: 0; }
+    body { width: 760px; height: 780px; overflow: hidden; background: #f2f0eb; color: #18191c; font-family: 'Geist', sans-serif; -webkit-font-smoothing: antialiased; }
+    main { padding: 34px 36px; }
+    header { display: flex; align-items: baseline; justify-content: space-between; }
+    h1 { margin: 0; font-size: 34px; font-weight: 600; letter-spacing: -0.03em; }
+    header span { font-size: 15px; color: #6c6c72; }
+    p { margin: 10px 0 0; font-size: 15px; line-height: 1.5; color: #3d3e43; max-width: 560px; }
+    figure { margin: 0; }
+    img { display: block; width: 100%; object-fit: cover; border-radius: 6px; }
+    figcaption { margin-top: 7px; font-size: 13px; color: #6c6c72; }
+    .lead { margin-top: 22px; }
+    .lead img { height: 300px; object-position: 50% 42%; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 18px; }
+    .grid img { height: 124px; }
+    .swatches { display: flex; gap: 10px; margin-top: 22px; }
+    .swatches div { flex: 1; }
+    .swatches i { display: block; height: 46px; border-radius: 6px; }
+    .swatches b { display: block; margin-top: 6px; font-size: 12px; font-weight: 500; color: #3d3e43; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>Night coast</h1><span>Scene 12 · light references</span></header>
+    <p>Moon high on the right, its path on the water kept narrow. Rocks stay near black; the only warm light is the harbour lamp.</p>
+    <figure class="lead"><img src="../art/coast.webp" alt=""><figcaption>Key frame: moonlight on the bay</figcaption></figure>
+    <div class="grid">
+      <figure><img src="../art/lake.webp" alt="" style="object-position: 60% 60%"><figcaption>Reflections, still water</figcaption></figure>
+      <figure><img src="../art/dunes.webp" alt="" style="object-position: 30% 70%"><figcaption>Cold sand, low horizon</figcaption></figure>
+      <figure><img src="../art/hills.webp" alt="" style="object-position: 70% 70%"><figcaption>Ridge lights</figcaption></figure>
+    </div>
+    <div class="swatches">
+      <div><i style="background:#0b0e14"></i><b>Sky #0B0E14</b></div>
+      <div><i style="background:#1d2a36"></i><b>Sea #1D2A36</b></div>
+      <div><i style="background:#4f6773"></i><b>Mist #4F6773</b></div>
+      <div><i style="background:#c9d3d6"></i><b>Moon #C9D3D6</b></div>
+      <div><i style="background:#e0a65a"></i><b>Lamp #E0A65A</b></div>
+    </div>
+  </main>
+</body>
+</html>
