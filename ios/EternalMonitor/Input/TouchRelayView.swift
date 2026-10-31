@@ -208,6 +208,9 @@ final class RelayTouchUIView: UIView {
         let accessoryHeight = keyboardInput.inputAccessoryView?.bounds.height ?? 0
         if !visible.isNull && visible.height > accessoryHeight + window.safeAreaInsets.bottom + 1 {
             if !softwareKeyboardPresented { hardwareKeyUptime = nil }
+            // Shown again: a Hide still waiting belongs to the old keyboard.
+            pendingHide?.cancel()
+            pendingHide = nil
             softwareKeyboardPresented = true
         } else if softwareKeyboardPresented {
             // The system Hide Keyboard key leaves an accessory-only responder.
@@ -227,6 +230,8 @@ final class RelayTouchUIView: UIView {
                 keyboardVisible = false
                 keyboardInput.resignFirstResponder()
             }
+            // Only the newest collapse can finish Hide Keyboard.
+            pendingHide?.cancel()
             pendingHide = hide
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.collapseBeforeKey, execute: hide)
         }

@@ -34,11 +34,18 @@ final class KeyboardCollapseTests: XCTestCase {
     private var input: RelayKeyboardInputView!
     private var events: [WireInputEvent] = []
     private var dismissals = 0
+    /// The simulator's real keyboard is up during these tests, and UIKit
+    /// posts its true frames to the default center within milliseconds of
+    /// each frame a test posts. The relay hears only this test's frames.
+    private let frames = NotificationCenter()
 
     override func setUp() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         window = UIWindow(windowScene: scene)
         relay = RelayTouchUIView(frame: window.bounds)
+        NotificationCenter.default.removeObserver(relay!, name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
+        frames.addObserver(relay!, selector: Selector(("keyboardFrameChanged:")),
+            name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
         relay.keyboardSupported = true
         relay.onEvents = { [unowned self] in events += $0 }
         relay.onKeyboardDismiss = { [unowned self] in dismissals += 1 }
@@ -48,7 +55,6 @@ final class KeyboardCollapseTests: XCTestCase {
         relay.keyboardVisible = true
         relay.updateKeyboardPresentation()
         XCTAssertTrue(input.isFirstResponder)
-        settleRealKeyboard()
     }
 
     override func tearDown() async throws {
@@ -57,24 +63,11 @@ final class KeyboardCollapseTests: XCTestCase {
         window = nil
     }
 
-    /// The simulator's own keyboard animates in and posts frames too. Let it
-    /// finish so only this test's frames reach the relay afterwards.
-    private func settleRealKeyboard() {
-        var last = Date()
-        let observer = NotificationCenter.default.addObserver(
-            forName: UIResponder.keyboardDidChangeFrameNotification, object: nil, queue: nil) { _ in last = Date() }
-        defer { NotificationCenter.default.removeObserver(observer) }
-        let deadline = Date().addingTimeInterval(8)
-        while Date() < deadline && Date().timeIntervalSince(last) < 1 {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        }
-    }
-
     /// Posts a keyboard frame of the given height at the bottom of the screen.
     private func keyboardFrame(height: CGFloat) {
         let screen = window.screen.bounds
         let frame = CGRect(x: 0, y: screen.height - height, width: screen.width, height: height)
-        NotificationCenter.default.post(name: UIResponder.keyboardDidChangeFrameNotification, object: nil,
+        frames.post(name: UIResponder.keyboardDidChangeFrameNotification, object: nil,
             userInfo: [UIResponder.keyboardFrameEndUserInfoKey: frame])
     }
 
@@ -166,5 +159,31 @@ final class KeyboardCollapseTests: XCTestCase {
         spin(0.3)
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertEqual(dismissals, 1)
+    }
+
+    /// A Hide still waiting when the keyboard shows again belongs to the old
+    /// keyboard and must not close the new one.
+    func testAKeyboardShownAgainOutlivesTheOldHide() {
+        keyboardFrame(height: 400)
+        keyboardFrame(height: barHeight)
+        keyboardFrame(height: 400)
+        spin(0.3)
+        XCTAssertTrue(input.isFirstResponder)
+        XCTAssertTrue(relay.keyboardVisible)
+        XCTAssertEqual(dismissals, 0)
+    }
+
+    /// Only the newest collapse can finish Hide Keyboard, so a key that
+    /// explains it keeps the keyboard.
+    func testAKeyAfterTwoCollapsesKeepsTheKeyboard() {
+        keyboardFrame(height: 400)
+        keyboardFrame(height: barHeight)
+        keyboardFrame(height: 400)
+        keyboardFrame(height: barHeight)
+        relay.pressesBegan([HardwarePress(.keyboardA)], with: nil)
+        spin(0.3)
+        XCTAssertTrue(input.isFirstResponder)
+        XCTAssertTrue(relay.keyboardVisible)
+        XCTAssertEqual(dismissals, 0)
     }
 }
