@@ -1,5 +1,6 @@
 """latest_json.py must only ever point the apps at a release people can install."""
 import contextlib
+import http.client
 import io
 import json
 import pathlib
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -64,8 +66,9 @@ class LatestJsonTest(unittest.TestCase):
             (self.tmp / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / name, self.tmp / name)
         self.releases = {f"v{v}": release(v) for v in SHA}
-        self.downloads = []
+        self.downloads, self.release_lookups = [], []
         self.asc = None
+        self.live = None  # the live manifest: None for this checkout's, or an error to raise
         self.git("init", "-q")
         # History: 0.3.2 everywhere, then Windows 0.3.3 and iPad 0.3.3 build 364.
         self.publish_state(manifest("0.3.2", "0.3.2", 316))
@@ -98,19 +101,24 @@ class LatestJsonTest(unittest.TestCase):
         return self.asc and testflight_review.AppStoreConnect("K1", "issuer", b"pem", transport=self.asc,
                                                               sign=lambda pem, message: b"\1" * 64)
 
-    def run_tool(self, *argv):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            latest_json.main(list(argv), root=self.tmp, release=self.releases.__getitem__,
+    def live_manifest(self):
+        if isinstance(self.live, Exception):
+            raise self.live
+        return self.live or json.loads((self.tmp / "docs/latest.json").read_text())
+
+    def run_tool(self, *argv, live=None):
+        out, self.stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(self.stderr):
+            latest_json.main(list(argv), root=self.tmp,
+                             release=lambda tag: self.release_lookups.append(tag) or self.releases[tag],
                              download=lambda url, size: self.downloads.append(url) or self.download_sha,
-                             connect=self.connect)
+                             connect=self.connect, live=live or self.live_manifest)
         return out.getvalue()
 
-    def fails(self, *argv):
+    def fails(self, *argv, live=None):
         before = {name: (self.tmp / name).read_text() for name in ("docs/latest.json", "docs/download.html")}
-        with self.assertRaises(SystemExit) as raised, contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            self.run_tool(*argv)
+        with self.assertRaises(SystemExit) as raised, contextlib.redirect_stdout(io.StringIO()):
+            self.run_tool(*argv, live=live)
         for name, text in before.items():
             self.assertEqual((self.tmp / name).read_text(), text, name)
         return str(raised.exception.code)
@@ -205,6 +213,133 @@ class LatestJsonTest(unittest.TestCase):
         self.bump_tree("0.3.4")
         self.asc = FakeTestFlight()
         self.assertIn("use rollback", self.fails("publish", "--ipad", "0.3.2", "--build", "401"))
+
+    # ── The live manifest, which this checkout's copy can trail ──
+
+    def test_publish_refuses_an_ipad_build_older_than_the_live_one(self):
+        self.bump_tree("0.3.4")
+        self.asc = FakeTestFlight()
+        self.live = manifest("0.3.4", "0.3.4", 401)
+        message = self.fails("publish", "--windows", "0.3.4", "--ipad", "0.3.4", "--build", "400")
+        self.assertIn("iPad 0.3.4 build 400 is older than the live build 401; use rollback "
+                      "(--skip-live-check overrides this)", message)
+
+    def test_the_live_check_comes_before_github_and_app_store_connect(self):
+        self.bump_tree("0.3.4")
+        self.asc = FakeTestFlight()
+        self.live = manifest("0.3.4", "0.3.4", 401)
+        self.assertIn("older than the live build 401",
+                      self.fails("publish", "--windows", "0.3.4", "--ipad", "0.3.4", "--build", "400"))
+        self.assertEqual((self.release_lookups, self.asc.lookups), ([], []))
+
+    def test_publish_refuses_an_ipad_version_older_than_the_live_one(self):
+        self.asc = FakeTestFlight()
+        self.live = manifest("0.3.3", "0.3.4", 401)
+        message = self.fails("publish", "--ipad", "0.3.3", "--build", "402")
+        self.assertIn("iPad 0.3.3 build 402 is older than the live iPad 0.3.4; use rollback", message)
+
+    def test_publish_refuses_a_windows_version_older_than_the_live_one(self):
+        self.live = manifest("0.3.4", "0.3.3", 364)
+        message = self.fails("publish", "--windows", "0.3.3")
+        self.assertIn("Windows 0.3.3 is older than the live 0.3.4; use rollback", message)
+
+    def test_publish_refuses_to_carry_a_stale_platform_back(self):
+        # Only Windows is named, but the iPad entry written is this checkout's, which trails the live one.
+        self.bump_tree("0.3.4")
+        self.live = manifest("0.3.3", "0.3.4", 401)
+        message = self.fails("publish", "--windows", "0.3.4")
+        self.assertIn("this checkout's docs/latest.json names iPad 0.3.3 build 364, older than the live build 401; "
+                      "update the branch", message)
+        self.live = manifest("0.3.4", "0.3.3", 364)
+        message = self.fails("publish", "--ipad-config", "none")
+        self.assertIn("names Windows 0.3.3, older than the live 0.3.4", message)
+
+    def test_publish_equal_to_or_newer_than_the_live_one_goes_ahead(self):
+        self.bump_tree("0.3.4")
+        self.asc = FakeTestFlight()
+        self.live = manifest("0.3.4", "0.3.4", 401)
+        self.run_tool("publish", "--windows", "0.3.4", "--ipad", "0.3.4", "--build", "401")
+        self.assertEqual(self.latest(), manifest("0.3.4", "0.3.4", 401))
+        self.run_tool("publish", "--ipad", "0.3.4", "--build", "402")
+        self.assertEqual(self.latest()["ipad"]["build"], 402)
+        self.live = manifest("0.3.3", "0.3.3", 364)
+        self.bump_tree("0.3.5")
+        self.releases["v0.3.5"] = release("0.3.5", sha="5" * 64)
+        self.run_tool("publish", "--windows", "0.3.5")
+        self.assertEqual(self.latest()["windows"]["version"], "0.3.5")
+
+    def test_a_live_manifest_that_cannot_be_read_stops_both_commands(self):
+        offline = mock.patch.object(latest_json.urllib.request, "urlopen", side_effect=urllib.error.URLError("offline"))
+        self.bump_tree("0.3.4")
+        with offline as urlopen:
+            message = self.fails("publish", "--windows", "0.3.4", live=latest_json.live_manifest)
+            self.assertIn("could not read https://eternalmonitor.dev/latest.json", message)
+            self.assertIn("--skip-live-check", message)
+            self.assertLessEqual(urlopen.call_args.kwargs["timeout"], 10)
+            self.assertIn("could not read", self.fails("rollback", "--windows", "0.3.2", "--ipad", "0.3.2",
+                                                       live=latest_json.live_manifest))
+            out = self.run_tool("publish", "--windows", "0.3.4", "--skip-live-check", live=latest_json.live_manifest)
+            self.assertIn("was not checked (--skip-live-check)", self.stderr.getvalue())
+            self.assertNotIn("was not checked", out)
+            self.assertIn("The check against https://eternalmonitor.dev/latest.json was skipped (--skip-live-check).",
+                          out.splitlines()[-1], "the pull request body says so")
+            self.assertEqual(self.latest()["windows"]["version"], "0.3.4")
+            self.run_tool("rollback", "--windows", "0.3.3", "--skip-live-check", live=latest_json.live_manifest)
+            self.assertEqual(self.latest()["windows"]["version"], "0.3.3")
+        for body in (b"<html>Not found</html>", b'{"windows": {"version": "0.3.3"}}'):
+            with self.subTest(body=body), mock.patch.object(latest_json.urllib.request, "urlopen",
+                                                            return_value=io.BytesIO(body)):
+                self.assertIn("eternalmonitor.dev/latest.json",
+                              self.fails("publish", "--windows", "0.3.4", live=latest_json.live_manifest))
+        # A checked run says nothing about skipping.
+        out = self.run_tool("publish", "--windows", "0.3.4")
+        self.assertNotIn("skipped", out)
+        self.assertEqual(self.stderr.getvalue(), "")
+
+    def test_a_truncated_live_manifest_stops_both_commands(self):
+        class Truncated(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"schema": 1, "win', 900)
+
+        self.bump_tree("0.3.4")
+        for argv in (["publish", "--windows", "0.3.4"], ["rollback", "--windows", "0.3.2", "--ipad", "0.3.2"]):
+            with self.subTest(argv), mock.patch.object(latest_json.urllib.request, "urlopen",
+                                                       return_value=Truncated()):
+                message = self.fails(*argv, live=latest_json.live_manifest)
+                self.assertIn("could not read https://eternalmonitor.dev/latest.json (IncompleteRead", message)
+                self.assertIn("retry, or pass --skip-live-check", message)
+
+    def test_the_live_manifest_is_read_from_the_site(self):
+        served = io.BytesIO(json.dumps(manifest("0.3.4", "0.3.3", 364)).encode())
+        with mock.patch.object(latest_json.urllib.request, "urlopen", return_value=served) as urlopen:
+            message = self.fails("publish", "--windows", "0.3.3", live=latest_json.live_manifest)
+        self.assertIn("older than the live 0.3.4", message)
+        self.assertTrue(urlopen.call_args.args[0].full_url.startswith("https://eternalmonitor.dev/latest.json?"))
+
+    def test_rollback_goes_below_the_live_manifest_only(self):
+        # A stale checkout can still roll back below what is live.
+        self.live = manifest("0.3.4", "0.3.4", 401)
+        self.run_tool("rollback", "--windows", "0.3.2", "--ipad", "0.3.2")
+        self.assertEqual(self.latest(), manifest("0.3.2", "0.3.2", 316))
+        # Rolling "back" above what is live is a publish.
+        self.publish_state(manifest("0.3.3", "0.3.3", 364))
+        self.live = manifest("0.3.2", "0.3.3", 364)
+        self.assertIn("Windows 0.3.3 is newer than the live 0.3.2; use publish (--skip-live-check overrides this)",
+                      self.fails("rollback", "--windows", "0.3.3"))
+        self.live = manifest("0.3.3", "0.3.2", 316)
+        self.assertIn("iPad 0.3.3 build 364 is newer than the live build 316; use publish",
+                      self.fails("rollback", "--ipad", "0.3.3"))
+        # A platform the rollback leaves alone must not trail the live one.
+        self.live = manifest("0.3.3", "0.3.4", 401)
+        self.assertIn("names iPad 0.3.3 build 364, older than the live build 401",
+                      self.fails("rollback", "--windows", "0.3.2"))
+
+    def test_rollback_to_the_live_release_corrects_a_checkout_ahead_of_it(self):
+        # A publish of 0.3.3 merged but Pages never deployed it: the apps still read 0.3.2.
+        self.live = manifest("0.3.2", "0.3.2", 316)
+        self.assertIn("use rollback", self.fails("publish", "--windows", "0.3.2"))
+        self.run_tool("rollback", "--windows", "0.3.2", "--ipad", "0.3.2")
+        self.assertEqual(self.latest(), manifest("0.3.2", "0.3.2", 316))
 
     def test_a_version_check_that_cannot_start_restores_both_files(self):
         self.bump_tree("0.3.4")
