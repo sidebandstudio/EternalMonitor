@@ -150,10 +150,12 @@ AVOption. Quiet periods use explicitly reset, compact Opus silence packets.
 Pairing is required by default. A random 128-bit host token authenticates known
 iPads; a six-digit code authorizes first contact and rotates after success. Five
 failed attempts per source IP in a minute trigger the cooldown; the tracking map
-is bounded. QR links include the token. The iPad stores learned credentials in
-Keychain, clears rejected stale tokens, and offers Forget paired hosts. USB trusts
-physical access. This is access control over an unencrypted local connection;
-video, audio, input and pairing credentials are not confidential on the network.
+is bounded. Ten wrong codes from all addresses in ten minutes pause code pairing
+and change the code. Only a new pairing's ACK carries the token. QR links include
+the token. The iPad stores learned credentials in Keychain, clears rejected stale
+tokens, and offers Forget paired hosts. USB trusts physical access. This is
+access control over an unencrypted local connection; video, audio, input and
+pairing credentials are not confidential on the network.
 
 Touch coordinates are normalized within the displayed video, excluding letterbox
 bars. The host maps them through the captured output rectangle onto the Windows
@@ -185,7 +187,7 @@ an opt-in Win mapping; iPadOS retains its reserved shortcuts.
 The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
 Users read/execute permission. The host starts a virtual display only for a
 connected client, writes the requested mode first in VDD XML, and reports actual
-task failures. It also ships TCP/UDP firewall rules. Runtime upgrade, task-ACL and
+task failures. It also ships a UDP firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
 mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,

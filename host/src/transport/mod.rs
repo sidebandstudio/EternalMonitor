@@ -1060,6 +1060,104 @@ mod tests {
         }
     }
 
+    /// `start_sender` itself, with a native pen device that takes every
+    /// frame (Windows' own off Windows). A stall delivers 64 samples at
+    /// once while the encoder always has a frame ready, which the loop takes
+    /// in a branch ahead of the pen's wake-up. The spacing holds back all
+    /// but the first burst, and the loop sends the rest within a few times
+    /// the spacing, one chunk at the top of each pass.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_loop_sends_a_held_pen_backlog_while_video_is_always_ready() {
+        use crate::input::{native_pen, CaptureGeometry, PenPhase, PenSample};
+        const SAMPLES: usize = 64;
+        const VIDEO_QUEUE: usize = 1 << 16;
+        let output = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let taken = native_pen::install();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (delivered, queued) = runtime.block_on(async {
+            let shared = SharedControl::new(0, 15_000_000);
+            shared.running.store(true, Ordering::SeqCst);
+            *shared.capture_geometry.lock() = Some(output);
+            let (nal_tx, nal_rx) = mpsc::channel(VIDEO_QUEUE);
+            let (_audio_tx, audio_rx) = mpsc::channel(1);
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let frame = |sequence| NALUnit {
+                data: vec![0, 0, 0, 1, 0x41],
+                sequence,
+                timestamp: Instant::now(),
+                encode_duration_us: 0,
+                is_keyframe: false,
+            };
+            // A full queue, kept full until the loop stops and drops it.
+            let mut sequence = 0;
+            while nal_tx.try_send(frame(sequence)).is_ok() {
+                sequence += 1;
+            }
+            let video = std::thread::spawn(move || {
+                while nal_tx.blocking_send(frame(sequence)).is_ok() {
+                    sequence += 1;
+                }
+                sequence
+            });
+            let delivered = Instant::now();
+            native_pen::with(|device| {
+                for x in 0..SAMPLES as u16 {
+                    let sample = PenSample {
+                        phase: if x == 0 {
+                            PenPhase::Down
+                        } else {
+                            PenPhase::Move
+                        },
+                        x: i32::from(x),
+                        y: 10,
+                        x_norm: x,
+                        y_norm: 10,
+                        pressure: 512,
+                        tilt_x: 0,
+                        tilt_y: 0,
+                    };
+                    device.deliver(sample, native_pen::SCREEN, Some(output), Instant::now());
+                }
+            });
+            assert!(
+                taken.borrow().len() < SAMPLES / 2,
+                "the spacing must hold the backlog back"
+            );
+            let stop = shared.clone();
+            let watch = async {
+                while taken.borrow().len() < SAMPLES && delivered.elapsed() < Duration::from_secs(2)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                stop.stop();
+            };
+            let (sent, ()) = tokio::join!(
+                start_sender(nal_rx, audio_rx, 0, shared, supervisor_tx),
+                watch
+            );
+            sent.unwrap();
+            (delivered, video.join().unwrap())
+        });
+        let taken = taken.borrow();
+        let order: Vec<_> = taken.iter().map(|(frame, _)| frame.x_norm).collect();
+        assert_eq!(order, (0..SAMPLES as u16).collect::<Vec<_>>());
+        let drained = taken.last().unwrap().1 - delivered;
+        // 58 held frames 250 µs apart take 15 ms; the 50 ms tick alone
+        // would take 500 ms.
+        assert!(drained < Duration::from_millis(250), "{drained:?}");
+        // The loop kept taking video.
+        assert!(queued > (VIDEO_QUEUE + SAMPLES) as u64, "{queued}");
+    }
+
     #[test]
     fn a_failed_send_names_the_link_and_repeats_identically() {
         let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
