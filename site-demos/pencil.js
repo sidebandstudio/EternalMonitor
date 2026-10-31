@@ -12,9 +12,12 @@
 //   height follow the same samples as the strokes.
 //
 // Coordinates are the iPad screen's own pixels (2420 x 1668). The root's
-// width picks the framing, so pencil-m.html shares this script.
+// width picks the framing, so pencil-m.html shares this script. readme-demo.html
+// plays it as one scene: there it leaves the background to the host and hands
+// its timeline over in window.__films.
 (function () {
   const root = document.getElementById('root');
+  const hosted = !!document.querySelector('[data-film="pencil"]');
   const ID = root.dataset.compositionId;
   const W = +root.dataset.width, H = +root.dataset.height;
   const SCREEN = { x: 40, y: 40 };           // the screen inside the iPad frame
@@ -23,6 +26,7 @@
     // centre of the shot in screen pixels, and frame pixels per screen pixel
     1104: { wide: { x: 1210, y: 834, s: 0.4 }, close: { x: 1790, y: 1250, s: 0.72 } },
     728: { wide: { x: 1500, y: 930, s: 0.4 }, close: { x: 1790, y: 1350, s: 0.62 } },
+    1280: { wide: { x: 1210, y: 834, s: 0.38 }, close: { x: 1690, y: 1250, s: 0.7 } },
   };
   const shot = SHOTS[W];
   const ease = gsap.parseEase('power2.inOut');
@@ -317,12 +321,15 @@
   }
 
   const tl = gsap.timeline({ paused: true });
-  tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
-  tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+  if (!hosted) {
+    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+  }
   // GSAP writes the time into this setter on every seek, callbacks or not.
   let now = 0;
   const clock = { get t() { return now; }, set t(v) { now = v; frame(v); } };
   tl.fromTo(clock, { t: 0 }, { t: 8, duration: 8, ease: 'none', immediateRender: false }, 0);
   frame(0);
-  window.__timelines[ID] = tl;
+  if (hosted) (window.__films = window.__films || {}).pencil = tl;
+  else window.__timelines[ID] = tl;
 })();
