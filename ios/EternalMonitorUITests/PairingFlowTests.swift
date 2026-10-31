@@ -16,8 +16,9 @@ final class PairingFlowTests: UITestCase {
         XCTAssertTrue(input.waitForExistence(timeout: 10))
         input.tap()
         let wrongCode = code == "000000" ? "000001" : "000000"
+        // The sixth digit pairs. On iPadOS 27 the number pad opens over the
+        // Pair button, so typing the code must be the only step.
         input.typeText(wrongCode)
-        app.buttons["pairing.submit"].tap()
         let error = app.staticTexts["pairing.error"]
         XCTAssertTrue(error.waitForExistence(timeout: 5))
         XCTAssertTrue(error.label.contains("didn’t match"))
@@ -25,7 +26,6 @@ final class PairingFlowTests: UITestCase {
         capture("pairing-wrong-code", app: app)
         input.tap()
         input.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 6) + code)
-        app.buttons["pairing.submit"].tap()
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         // The stream can start while the code sheet is still closing; wait
         // for the sheet to go. The timeout is only a backstop.

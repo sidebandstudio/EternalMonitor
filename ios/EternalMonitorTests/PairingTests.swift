@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import EternalMonitor
 
@@ -139,5 +140,60 @@ final class PairingControlTests: XCTestCase {
         XCTAssertEqual(channel.currentSessionId, 0)
         queue.sync { channel.handleControl(ack(second.clientNonce, .ok)) }
         XCTAssertEqual(channel.currentSessionId, 41)
+    }
+}
+
+/// On iPadOS 27 the number pad opens over the Pair button, so the sixth
+/// digit pairs by itself. These drive the real sheet's code field.
+@MainActor
+final class PairingSheetAutoSubmitTests: XCTestCase {
+    func testSixthDigitPairsOnceAndNotWhileWaiting() throws {
+        let model = PairingSheetModel()
+        var calls = 0
+        var sent: [UInt32] = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        defer { window.isHidden = true }
+        // Submits as ConnectionManager.submitPairing does.
+        window.rootViewController = UIHostingController(rootView: PairingSheet(model: model, submit: {
+            calls += 1
+            if let code = model.submit() { sent.append(code) }
+        }, cancel: {}))
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        func type(_ code: String) {
+            model.code = code
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        }
+
+        type("12345")
+        XCTAssertEqual(calls, 0)
+        XCTAssertNil(model.error)
+        type("123456")
+        XCTAssertEqual(sent, [123456])
+        XCTAssertTrue(model.submitting)
+        // A seventh digit is trimmed and sends nothing; nor does a new
+        // code while the first is being checked.
+        type("1234567")
+        XCTAssertEqual(model.code, "123456")
+        type("12345")
+        type("123459")
+        XCTAssertEqual(calls, 1)
+
+        // A refused code stays in the field without going again.
+        model.reject(.unauthorized)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(calls, 1)
+        // Pasting with spaces completes it too.
+        type("")
+        type("65 43 21")
+        XCTAssertEqual(model.code, "654321")
+        XCTAssertEqual(sent, [123456, 654321])
+
+        // Not during the "Try again in N s" wait.
+        model.reject(.rateLimited)
+        type("65432")
+        type("654320")
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(sent, [123456, 654321])
     }
 }

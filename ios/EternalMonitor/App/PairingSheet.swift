@@ -64,6 +64,7 @@ struct PairingSheet: View {
                             // Digits only, at most six.
                             let digits = String(code.filter(\.isNumber).prefix(6))
                             if digits != code { model.code = digits }
+                            else if model.editCompletesCode() { submit() }
                         }
                         .accessibilityLabel(L("Pairing code"))
                         .accessibilityIdentifier("pairing.code")
