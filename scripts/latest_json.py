@@ -22,10 +22,12 @@ and checks App Store Connect too when those variables are set.
 This checkout's docs/latest.json can be behind the one the apps read, so both
 commands also compare with https://eternalmonitor.dev/latest.json: publish
 refuses a Windows version, iPad version or iPad build older than the live
-one, and rollback refuses one that is not older. A platform the command
-leaves alone must not be older than the live one either, or the branch needs
-updating first. If the live manifest cannot be read, both commands stop
-unless --skip-live-check is given.
+one, and rollback refuses one newer than it. Rolling back to the live one
+corrects a checkout that is ahead of it, as after a publish that never
+deployed. A platform the command leaves alone must not be older than the live
+one either, or the branch needs updating first. This check runs before any
+GitHub or App Store Connect lookup. If the live manifest cannot be read, both
+commands stop; --skip-live-check overrides the check.
 
 Both apps only offer a strictly newer version than the one installed, so a
 rollback never prompts anyone already on the bad release; it stops new
@@ -41,6 +43,7 @@ files are restored. Then the git commands for the pull request are printed.
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -135,36 +138,49 @@ def live_manifest():
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, http.client.HTTPException) as error:
         raise ManifestError(f"could not read {LIVE} ({error}); retry, or pass --skip-live-check") from None
 
 
-def check_live(args, latest, live):
-    """Refuse to move a platform the wrong way past what the apps read now."""
+def check_live(args, current, live, root):
+    """Refuse to move a platform the wrong way past what the apps read now.
+
+    The versions and build compared come from the arguments and this checkout, so this runs
+    before build_manifest's lookups and needs no second pass after them."""
+    def refuse(message):
+        return ManifestError(f"{message} (--skip-live-check overrides this)")
     try:
         windows, ipad, build = live["windows"]["version"], live["ipad"]["version"], live["ipad"]["build"]
         if not (VERSION.fullmatch(windows) and VERSION.fullmatch(ipad)) or type(build) is not int:
             raise TypeError
     except (KeyError, TypeError):
-        raise ManifestError(f"{LIVE} has no valid Windows version, iPad version and iPad build") from None
+        raise refuse(f"{LIVE} has no valid Windows version, iPad version and iPad build") from None
     def older(named, what, than):
         # A platform the command leaves alone comes from this checkout, which may be behind.
         if named:
-            return ManifestError(f"{what} is older than the live {than}; use rollback")
-        return ManifestError(f"this checkout's docs/latest.json names {what}, older than the live {than}; "
-                             "update the branch")
+            return refuse(f"{what} is older than the live {than}; use rollback")
+        return refuse(f"this checkout's docs/latest.json names {what}, older than the live {than}; "
+                      "update the branch")
 
+    # A rollback may go back to the live release: build_manifest still requires it to be older than
+    # this checkout, which then is ahead of the live one (a publish that has not deployed).
     rollback = args.command == "rollback"
-    new = latest["windows"]["version"]
+    new = args.windows or current["windows"]["version"]
     if rollback and args.windows:
-        if version_key(new) >= version_key(windows):
-            raise ManifestError(f"Windows {new} is not older than the live {windows}; use publish")
+        if version_key(new) > version_key(windows):
+            raise refuse(f"Windows {new} is newer than the live {windows}; use publish")
     elif version_key(new) < version_key(windows):
         raise older(args.windows, f"Windows {new}", windows)
-    new, new_build = latest["ipad"]["version"], latest["ipad"]["build"]
+    new = args.ipad or current["ipad"]["version"]
+    if not args.ipad:
+        new_build = current["ipad"]["build"]
+    elif rollback:
+        new_build = rollback_build(root, args.ipad)
+    else:
+        new_build = args.build
     if rollback and args.ipad:
-        if new_build >= build:
-            raise ManifestError(f"iPad {new} build {new_build} is not older than the live build {build}; use publish")
+        if new_build > build:
+            raise refuse(f"iPad {new} build {new_build} is newer than the live build {build}; use publish")
     elif new_build < build:
         raise older(args.ipad, f"iPad {new} build {new_build}", f"build {build}")
     elif version_key(new) < version_key(ipad):
@@ -186,6 +202,14 @@ def published_ipad_builds(root, version):
         if shown.returncode == 0 and ipad.get("version") == version and isinstance(ipad.get("build"), int):
             builds.add(ipad["build"])
     return builds
+
+
+def rollback_build(root, version):
+    """The iPad build a rollback to `version` names: the newest docs/latest.json published for it."""
+    builds = published_ipad_builds(root, version)
+    if not builds:
+        raise ManifestError(f"docs/latest.json never published iPad {version} on this branch")
+    return max(builds)
 
 
 def check_testflight(asc, version, build):
@@ -323,10 +347,7 @@ def build_manifest(args, current, release, download, connect, root):
         asc = connect()
         old = current["ipad"]["build"]
         if args.command == "rollback":
-            builds = published_ipad_builds(root, args.ipad)
-            if not builds:
-                raise ManifestError(f"docs/latest.json never published iPad {args.ipad} on this branch")
-            build = max(builds)
+            build = rollback_build(root, args.ipad)
             if build >= old:
                 raise ManifestError(f"iPad {args.ipad} build {build} is not older than the published build {old}")
         else:
@@ -354,7 +375,7 @@ def build_manifest(args, current, release, download, connect, root):
     return latest, size, changes
 
 
-def pull_request_commands(command, changes, latest):
+def pull_request_commands(command, changes, latest, skipped_live_check=False):
     verb = "Roll back the update manifest to" if command == "rollback" else "Publish"
     title = f"{verb} {' and '.join(changes)}"
     slug = re.sub(r"[^a-z0-9.]+", "-", f"{command} {' '.join(changes)}".lower()).strip("-")
@@ -362,6 +383,8 @@ def pull_request_commands(command, changes, latest):
     body = (f"Points docs/latest.json and docs/download.html at Windows {windows['version']} "
             f"(SHA-256 {windows['sha256']}, from the GitHub release) and iPad {latest['ipad']['version']} "
             f"build {latest['ipad']['build']}. Written by scripts/latest_json.py; scripts/check-versions.sh passes.")
+    if skipped_live_check:
+        body += f" The check against {LIVE} was skipped (--skip-live-check)."
     return [f"git switch -c {slug}", "git add docs/latest.json docs/download.html",
             f"git commit -m {shlex.quote(title)}", f"git push -u origin {slug}",
             f"gh pr create --base main --title {shlex.quote(title)} --body {shlex.quote(body)}"]
@@ -404,11 +427,13 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
     manifest, page = root / "docs/latest.json", root / "docs/download.html"
     before = {manifest: manifest.read_text(), page: page.read_text()}
     try:
-        latest, size, changes = build_manifest(args, json.loads(before[manifest]), release, download, connect, root)
+        current = json.loads(before[manifest])
         if args.skip_live_check:
-            print(f"{LIVE} was not checked (--skip-live-check): confirm nothing goes older than it by mistake")
+            print(f"{LIVE} was not checked (--skip-live-check): confirm nothing goes older than it by mistake",
+                  file=sys.stderr)
         else:
-            check_live(args, latest, live())
+            check_live(args, current, live(), root)
+        latest, size, changes = build_manifest(args, current, release, download, connect, root)
         html = update_page(before[page], latest, size)
     except (ManifestError, testflight_review.AscError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(f"latest_json.py: {error}")
@@ -426,7 +451,7 @@ def main(argv=None, root=ROOT, release=github_release, download=download_sha256,
         sys.exit(f"scripts/check-versions.sh {problem}")
     print(check.stdout, end="")
     print(f"docs/latest.json and docs/download.html now name {' and '.join(changes)}. Open the pull request:\n")
-    print("\n".join(pull_request_commands(args.command, changes, latest)))
+    print("\n".join(pull_request_commands(args.command, changes, latest, args.skip_live_check)))
 
 
 if __name__ == "__main__":
