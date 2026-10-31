@@ -957,6 +957,9 @@ html.js.channel-beta .beta-hint.reveal { opacity: 0; visibility: hidden; transit
   html.js.channel-beta .beta-hint.reveal { display: none; }
 }
 .dl-all { margin-top: 20px; }
+/* One line asking for a star, then the button, under the downloads. */
+.dl-star { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 20px; }
+.dl-star p { color: var(--muted); font-size: 0.9375rem; }
 /* Mac and iPhone Duo, not out yet: quieter than the download cards, with no
    button. Also under the two apps on the home page, one heading level down.
    On the download page their tiles turn to night on Beta like the iPad card's. */
