@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import EternalMonitor
 
@@ -139,5 +140,118 @@ final class PairingControlTests: XCTestCase {
         XCTAssertEqual(channel.currentSessionId, 0)
         queue.sync { channel.handleControl(ack(second.clientNonce, .ok)) }
         XCTAssertEqual(channel.currentSessionId, 41)
+    }
+}
+
+/// On iPadOS 27 the number pad opens over the Pair button, so the sixth
+/// digit pairs by itself. These drive the real sheet's code field.
+@MainActor
+final class PairingSheetAutoSubmitTests: XCTestCase {
+    private let model = PairingSheetModel()
+    private var window: UIWindow!
+    private var calls = 0
+    private var sent: [UInt32] = []
+
+    override func setUp() async throws {
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        // Submits as ConnectionManager.submitPairing does.
+        window.rootViewController = UIHostingController(rootView: PairingSheet(model: model, submit: { [unowned self] in
+            calls += 1
+            if let code = model.submit() { sent.append(code) }
+        }, cancel: {}))
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+    }
+
+    override func tearDown() async throws {
+        window.isHidden = true
+        window = nil
+    }
+
+    private func type(_ code: String) {
+        model.code = code
+        spin(0.3)
+    }
+
+    private func spin(_ seconds: TimeInterval) {
+        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+    }
+
+    func testSixthDigitPairsOnceAndNotWhileWaiting() {
+        type("12345")
+        XCTAssertEqual(calls, 0)
+        XCTAssertNil(model.error)
+        type("123456")
+        XCTAssertEqual(sent, [123456])
+        XCTAssertTrue(model.submitting)
+        // A seventh digit is trimmed and sends nothing.
+        type("1234567")
+        XCTAssertEqual(model.code, "123456")
+        XCTAssertEqual(calls, 1)
+
+        // A refused code stays in the field without going again, even when
+        // it is typed again.
+        model.reject(.unauthorized)
+        spin(0.3)
+        type("12345")
+        type("123456")
+        XCTAssertEqual(calls, 1)
+        // Pasting with spaces completes it too.
+        type("")
+        type("65 43 21")
+        XCTAssertEqual(model.code, "654321")
+        XCTAssertEqual(sent, [123456, 654321])
+
+        // Not during the "Try again in N s" wait.
+        model.reject(.rateLimited)
+        type("65432")
+        type("654320")
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(sent, [123456, 654321])
+    }
+
+    /// Select all and paste, or AutoFill, swaps one whole code for another.
+    func testAReplacedCodePairsAfterARefusal() {
+        type("123456")
+        model.reject(.unauthorized)
+        spin(0.3)
+        type("654321")
+        XCTAssertEqual(sent, [123456, 654321])
+    }
+
+    /// A correction finished while the first code is being checked goes once
+    /// that one is refused, if it is still in the field.
+    func testACorrectionWhileCheckingPairsAfterTheRefusal() {
+        type("123456")
+        type("12345")
+        type("123457")
+        XCTAssertEqual(calls, 1)
+        model.reject(.unauthorized)
+        spin(0.3)
+        XCTAssertEqual(sent, [123456, 123457])
+        XCTAssertTrue(model.submitting)
+
+        // One changed back to the code being checked doesn't go again when
+        // that check times out.
+        type("12345")
+        type("123457")
+        model.timedOut()
+        spin(0.3)
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(sent, [123456, 123457])
+    }
+
+    /// A code finished during the "Try again in N s" wait goes when it ends.
+    func testACodeTypedDuringTheWaitPairsWhenItEnds() {
+        type("123456")
+        // As if the PC had refused 58.5 s ago, so the wait ends shortly.
+        model.reject(.rateLimited, now: Date().addingTimeInterval(-58.5))
+        type("65432")
+        type("654321")
+        XCTAssertEqual(calls, 1)
+        spin(1.5)
+        XCTAssertEqual(sent, [123456, 654321])
+        spin(1)
+        XCTAssertEqual(calls, 2)
     }
 }
