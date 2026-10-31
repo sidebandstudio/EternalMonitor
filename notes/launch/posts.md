@@ -39,7 +39,6 @@ the iPad); on a phone-first venue use `second-screen-m.mp4`.
 
 I made EternalMonitor, a Windows app and an iPad app that turn the iPad into a
 monitor for your PC. It's free, open source under MIT, and needs no account.
-(Add a line here about why you built it.)
 
 What it does:
 
