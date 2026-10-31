@@ -16,8 +16,7 @@ files say. The download count is from `scripts/growth_report.py` on
 
 **Venue.** r/ipad. Second choice r/apple, as a developer self-post on a Sunday.
 
-**Venue rules (note for Ali).** I could not open r/ipad's rules page from the
-build machine, because Reddit blocks it without a login. Read
+**Venue rules.** Reddit shows the rules page only to signed-in visitors. Read
 https://www.reddit.com/r/ipad/about/rules before posting and look for a weekly
 self-promotion thread. A rules index (threadfox.vip, read 2026-09-26) says
 r/apple allows developer self-promotion on Sundays only, Pacific time, as a
@@ -40,17 +39,16 @@ the iPad); on a phone-first venue use `second-screen-m.mp4`.
 
 I made EternalMonitor, a Windows app and an iPad app that turn the iPad into a
 monitor for your PC. It's free, open source under MIT, and needs no account.
-(Add a line here about why you built it. Your own reason will beat anything
-written for you.)
+(Add a line here about why you built it.)
 
 What it does:
 
 - Adds the iPad as an extra display beside your monitor, or mirrors any screen
   you have. Drag windows onto it like any other monitor.
 - Streams over your home Wi-Fi, or over a USB cable for a steadier picture that
-  also charges the iPad. Plug the cable in during a Wi-Fi session and it takes
+  can also charge the iPad from a USB-C port. Plug the cable in during a Wi-Fi session and it takes
   over; unplug it and the stream carries on over Wi-Fi.
-- Your graphics card does the encoding: NVIDIA, AMD or Intel, at 30, 60, 90 or
+- Supported NVIDIA, AMD and Intel graphics do the encoding, at 30, 60, 90 or
   120 fps (120 on iPads with ProMotion). The bitrate adapts between 4 and
   50 Mbps.
 - When Wi-Fi drops a packet, the iPad asks for that piece again right away, so
@@ -79,8 +77,7 @@ Happy to answer questions about setups. I'd love to hear what you pair it with.
 **Venue.** r/ClipStudio. Clip Studio Paint is the one art app the docs cover
 step by step, so this post names only it.
 
-**Venue rules (note for Ali).** I could not open r/ClipStudio's rules page or
-find a quoted copy. Read https://www.reddit.com/r/ClipStudio/about/rules before
+**Venue rules.** No quoted copy of r/ClipStudio's rules was found. Read https://www.reddit.com/r/ClipStudio/about/rules before
 posting. Art subreddits often limit tool promotion to a flair or a weekly
 thread, so look for both. Lead with the drawing, not the download link, and
 say you made the app.
@@ -128,7 +125,7 @@ If you try it, I'd love to see what you draw with it.
 **Venue.** Show HN first. Then r/rust a few days later, with the Rust details
 up front.
 
-**Venue rules (note for Ali).**
+**Venue rules.**
 
 - Show HN (https://news.ycombinator.com/showhn.html, read 2026-10-31). The
   title must start with "Show HN". It has to be something people can try, and
@@ -136,7 +133,7 @@ up front.
   count, so post the project as a whole, not a version. Don't ask anyone to
   upvote or comment. Post the repo URL; HN has no image attachments. Add the
   first comment yourself with the body below.
-- r/rust. I could not open the rules page. A quoted copy (threadfox.vip, read
+- r/rust. Check the rules page signed in. A quoted copy (threadfox.vip, read
   2026-09-26) shows no self-promotion rule, but posts must be about Rust,
   low-effort posts are removed, and the Rust Code of Conduct applies. Check
   https://www.reddit.com/r/rust/about/rules before posting. Keep the Rust
