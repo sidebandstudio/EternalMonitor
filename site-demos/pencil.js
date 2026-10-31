@@ -13,8 +13,8 @@
 //
 // Coordinates are the iPad screen's own pixels (2420 x 1668). The root's
 // width picks the framing, so pencil-m.html shares this script. readme-demo.html
-// plays it as one scene: there it leaves the background to the host and hands
-// its timeline over in window.__films.
+// and launch-film.html play it as one scene: there it leaves the background to
+// the host and hands its timeline over in window.__films.
 (function () {
   const root = document.getElementById('root');
   const hosted = !!document.querySelector('[data-film="pencil"]');
@@ -27,6 +27,8 @@
     1104: { wide: { x: 1210, y: 834, s: 0.4 }, close: { x: 1790, y: 1250, s: 0.72 } },
     728: { wide: { x: 1500, y: 930, s: 0.4 }, close: { x: 1790, y: 1350, s: 0.62 } },
     1280: { wide: { x: 1210, y: 834, s: 0.38 }, close: { x: 1690, y: 1250, s: 0.7 } },
+    // launch-film.html: lower in the frame, under the film's title.
+    1920: { wide: { x: 1210, y: 621, s: 0.47 }, close: { x: 1790, y: 1190, s: 0.9 } },
   };
   const shot = SHOTS[W];
   const ease = gsap.parseEase('power2.inOut');

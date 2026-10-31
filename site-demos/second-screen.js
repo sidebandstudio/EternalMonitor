@@ -7,8 +7,8 @@
 // its displays, and coming back mirrored.
 //
 // The root's width picks the framing, so second-screen-m.html shares this.
-// readme-demo.html plays it as one scene: there it leaves the background to
-// the host and hands its timeline over in window.__films.
+// readme-demo.html and launch-film.html play it as one scene: there it leaves
+// the background to the host and hands its timeline over in window.__films.
 (function () {
   const root = document.getElementById('root');
   const hosted = !!document.querySelector('[data-film="second-screen"]');
@@ -44,6 +44,12 @@
       settle: { x: 760, y: 466, s: 0.71 },
       close: { x: 300, y: 190, s: 2.2 },
       carry: { x: 1000, y: 400, s: 1.0 },
+    },
+    1920: {
+      rest: { x: 768, y: 350, s: 0.8 },
+      settle: { x: 760, y: 350, s: 0.775 },
+      close: { x: 294, y: 160, s: 2.6 },
+      carry: { x: 1000, y: 300, s: 1.1 },
     },
   }[W];
   const cam = (p) => ({ x: W / 2 - p.x * p.s, y: H / 2 - p.y * p.s, scale: p.s });

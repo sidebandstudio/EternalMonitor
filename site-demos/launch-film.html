@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1920, height=1080">
+  <title>EternalMonitor: launch film</title>
+  <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="second-screen.css">
+  <link rel="stylesheet" href="pencil.css">
+  <link rel="stylesheet" href="launch-film.css">
+  <script src="vendor/gsap.min.js"></script>
+  <script src="vendor/perfect-freehand.js"></script>
+</head>
+<body>
+  <div id="root" data-composition-id="launch-film" data-start="0" data-width="1920" data-height="1080" data-duration="35.1">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <!-- The Extend your desktop film (second-screen.html), unchanged. Its own
+         0 s is 9.05 s into this film. -->
+    <div class="scene" id="sceneA" data-film="second-screen">
+      <div id="world">
+        <div id="neck"></div><div id="foot"></div>
+        <div id="mon">
+          <div class="screen">
+            <div class="desk" id="deskA" data-layout-ignore>
+              <img class="wall" src="art/wallpaper.webp" alt="">
+              <div class="win appwin">
+                <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                <div class="win-view"><video id="appA" src="footage/host-second-screen.mp4" data-start="9.05" data-duration="8" muted playsinline></video></div>
+              </div>
+              <div class="doc" id="docA"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+              <div class="ptr" id="ptrA"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+            </div>
+            <div class="dark" id="monDark"></div>
+          </div>
+        </div>
+  
+        <div id="pad">
+          <div class="screen">
+            <!-- Mirror my screen: the monitor's desktop again, whole, with bars. -->
+            <div class="layer" id="mirror">
+              <div class="desk" id="deskM" data-layout-ignore>
+                <img class="wall" src="art/wallpaper.webp" alt="">
+                <div class="win appwin">
+                  <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                  <div class="win-view"><video id="appM" src="footage/host-second-screen.mp4" data-start="9.05" data-duration="8" muted playsinline></video></div>
+                </div>
+                <div class="doc" id="docM"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+              </div>
+            </div>
+            <!-- Second screen: the iPad's own display, right of the monitor. -->
+            <div class="layer" id="extend">
+              <div class="desk2" id="deskB" data-layout-ignore>
+                <img class="wall" src="art/wallpaper.webp" alt="">
+                <div class="doc" id="docB"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+                <div class="ptr" id="ptrB"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+              </div>
+            </div>
+            <div class="dark" id="padDark"></div>
+          </div>
+        </div>
+      </div>
+  
+      <div class="chip" id="chip"><span class="dot"></span><span class="say"><span id="say-mirror">Mirror my screen</span><span id="say-second">Second screen</span></span></div>
+    </div>
+    <!-- The Apple Pencil film (pencil.html). Its own 0 s is 15.35 s in. -->
+    <div class="scene" id="sceneB" data-film="pencil">
+      <div id="cam">
+        <div class="ipad" id="tab">
+          <div class="ipad-screen">
+            <video id="sheet" src="footage/ipad-pencil.mp4" data-start="15.35" data-duration="8" muted playsinline></video>
+            <canvas id="ink" width="2420" height="1668"></canvas>
+          </div>
+        </div>
+      </div>
+      <div id="shadow" data-layout-allow-overflow><div id="pencil"><img src="art/stylus.webp" alt=""></div></div>
+      <div id="dip"></div>
+    </div>
+    <!-- Three PCs, one per GPU maker, each in its own session. -->
+    <div class="scene" id="sceneG">
+      <div id="gpus">
+        <div class="gpu" id="gpuN"><div class="crop" data-layout-allow-overflow><video id="v-n" src="footage/host-performance-nvidia.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>NVIDIA</div></div>
+        <div class="gpu" id="gpuA"><div class="crop" data-layout-allow-overflow><video id="v-a" src="footage/host-performance-amd.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>AMD</div></div>
+        <div class="gpu" id="gpuI"><div class="crop" data-layout-allow-overflow><video id="v-i" src="footage/host-performance-intel.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>Intel</div></div>
+      </div>
+    </div>
+
+    <div class="scene" id="sceneF">
+      <div class="mid" id="free"><h2>Free and open source.</h2><p>MIT license. No account.</p></div>
+    </div>
+    <div class="scene" id="sceneE">
+      <div class="mid" id="mark"><img src="ui/icon.png" alt=""><h2>EternalMonitor</h2></div>
+      <div class="mid" id="urls"><div class="site">eternalmonitor.dev</div><div class="gh">github.com/sidebandstudio/EternalMonitor</div></div>
+    </div>
+
+    <!-- The site's hero (docs/index.html), over Wi-Fi, then a cable takes over. -->
+    <div class="scene" id="sceneR">
+      <div id="rig">
+        <div class="rig-laptop"><img id="lapWifi" src="ui/hero/laptop-second-wifi@2x.webp" alt=""><img id="lapUsb" src="ui/hero/laptop-second-usb@2x.webp" alt=""></div>
+        <div class="rig-ipad"><img src="ui/hero/ipad-second@2x.webp" alt=""></div>
+        <img class="rig-devices" src="ui/hero/devices@2x.webp" alt="">
+        <img class="rig-cable" id="cable" src="ui/hero/cable@2x.webp" alt="">
+        <svg class="rig-air" id="air" viewBox="0 0 48 40"><path id="a3" d="M3 14.5a30 30 0 0 1 42 0"/><path id="a2" d="M10 21.5a20 20 0 0 1 28 0"/><path id="a1" d="M17 28.5a10 10 0 0 1 14 0"/><circle cx="24" cy="35" r="2.6"/></svg>
+      </div>
+      <div id="link">
+        <span class="legend">Connected over</span>
+        <span class="sw"><span id="knob"></span><label id="lbUsb"><svg viewBox="0 0 24 24"><path d="M12 19V5M12 15.6 6.4 12.6V9.6M12 13.2l5.6-2.8V8.6"/><path d="M12 1.6 9.4 5.6h5.2Z" class="fill"/><circle cx="6.4" cy="8.2" r="1.7" class="fill"/><rect x="16.1" y="5.4" width="3" height="3" rx="0.3" class="fill"/><circle cx="12" cy="20.2" r="2.1" class="fill"/></svg>USB</label><label id="lbWifi"><svg viewBox="0 0 24 24"><path d="M2.6 9.4a13.4 13.4 0 0 1 18.8 0M5.8 12.7a8.8 8.8 0 0 1 12.4 0M9 16a4.2 4.2 0 0 1 6 0"/><circle cx="12" cy="19.3" r="1.5" class="fill"/></svg>Wi-Fi</label></span>
+      </div>
+    </div>
+
+    <div id="scrim"></div>
+    <div class="cap" id="capHook"><h2>Your Windows PC, on your iPad.</h2><p>Mirror it, extend it, draw on it with Apple Pencil.</p></div>
+    <div class="cap" id="capLink"><h2>Wi-Fi or USB.</h2><p>Plug in a cable and it takes over.</p></div>
+    <div class="cap" id="capA"><h2>Extend your desktop.</h2><p>Or mirror any screen you have.</p></div>
+    <div class="cap" id="capB"><h2>Apple Pencil, as a real pen.</h2><p>Windows Ink pressure and tilt, with palm rejection.</p></div>
+    <div class="cap" id="capG"><h2>Your graphics card does the work.</h2><p>Up to 120 fps on ProMotion iPads.</p></div>
+
+    <div id="seam"></div>
+  </div>
+  <script src="second-screen.js"></script>
+  <script src="pencil.js"></script>
+  <script>
+    // The launch film. It opens on the site's hero, plays the second-screen
+    // and pencil films as they are (they hand over their timelines), then
+    // three GPUs, and ends on the name:
+    //
+    // - 0 to 9.2 s: the hero over Wi-Fi with its headline, then a USB cable
+    //   takes over: the switch moves, the cable draws in, the app says USB.
+    // - 9.05 to 16 s: the second-screen film from its start to its held desk.
+    // - 15.35 to 22.3 s: the pencil film from 0.6 s to the end of its shading.
+    // - 22.2 to 26.9 s: NVIDIA, AMD and Intel PCs, each in its own session
+    //   (3.2 s of footage at 0.68x).
+    // - 26.35 to 30.4 s: free and open source. 30.4 to 35.1 s: the name.
+    //
+    // The cuts sit just after the six evenly spaced stills render.sh takes.
+    (function () {
+      const END = 35.1;
+      const FILM_A = 9.05, FILM_B = 15.35;
+      const FADE = 0.4;
+      const AB = 15.95, BG = 22.25, GF = 26.6, FE = 30.1;
+      const tl = gsap.timeline({ paused: true });
+
+      tl.add(window.__films['second-screen'].paused(false), FILM_A);
+      tl.add(window.__films.pencil.paused(false), FILM_B);
+
+      tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -24, duration: END / 2, ease: 'sine.inOut' }, 0);
+      tl.to('#bg', { scale: 1.06, x: 0, duration: END / 2, ease: 'sine.inOut' }, END / 2);
+
+      // A scene eases away, then the next arrives from slightly smaller. They
+      // barely overlap: two busy scenes over each other read as a smear.
+      const cross = (out, inn, at, origin) => {
+        tl.fromTo(out, { opacity: 1, scale: 1 }, { opacity: 0, scale: 1.04, transformOrigin: origin || '50% 50%', duration: FADE, ease: 'power2.in', immediateRender: false }, at);
+        tl.fromTo(inn, { opacity: 0, scale: 0.97 }, { opacity: 1, scale: 1, transformOrigin: '50% 50%', duration: FADE + 0.3, ease: 'power2.out', immediateRender: false }, at + FADE - 0.15);
+      };
+      const show = (sel, at) => {
+        tl.fromTo(`${sel} h2`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, at);
+        tl.fromTo(`${sel} p`, { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, at + 0.14);
+        tl.set(sel, { opacity: 1 }, at);
+      };
+      const hide = (sel, at) => tl.to(sel, { opacity: 0, y: -12, duration: 0.3, ease: 'power2.in' }, at);
+
+      // --- The hero: the payoff is on screen from the first frame -------------
+      tl.fromTo('#capHook h2', { y: 10 }, { y: 0, duration: 1.2, ease: 'power2.out', immediateRender: true }, 0);
+      tl.fromTo('#capHook p', { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, 0.35);
+      tl.fromTo('#rig', { scale: 1 }, { scale: 1.045, duration: 9.2, ease: 'sine.inOut', immediateRender: true }, 0);
+      hide('#capHook', 3.75);
+      show('#capLink', 4.1);
+
+      // Wi-Fi first: no cable, the signal ripples between the devices.
+      tl.set('#cable', { opacity: 0, clipPath: 'inset(0% 100% 0% 0%)' }, 0);
+      tl.set('#lapUsb', { opacity: 0 }, 0);
+      ['#a1', '#a2', '#a3'].forEach((a, i) => {
+        for (let n = 0; n < 2; n++) {
+          const at = 0.5 + i * 0.25 + n * 2;
+          tl.to(a, { opacity: 0.3, duration: 0.7, ease: 'sine.inOut' }, at);
+          tl.to(a, { opacity: 1, duration: 1.3, ease: 'sine.inOut' }, at + 0.7);
+        }
+      });
+      // The switch: Wi-Fi lit, then USB, and the cable draws in from the laptop.
+      const PLUG = 5.5;
+      tl.fromTo('#link', { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.5, ease: 'power3.out', immediateRender: false }, 4.3);
+      // Where each label sits in the switch (launch-film.css #lbUsb, #lbWifi).
+      const USB = { x: 6, width: 168 }, WIFI = { x: 180, width: 184 };
+      tl.set('#knob', WIFI, 0);
+      tl.set('#lbWifi', { color: '#0a0a0b' }, 0);
+      tl.to('#knob', { ...USB, duration: 0.45, ease: 'power3.inOut' }, PLUG);
+      tl.to('#lbWifi', { color: '#a1a1aa', duration: 0.25 }, PLUG + 0.05);
+      tl.fromTo('#lbUsb', { color: '#a1a1aa' }, { color: '#0a0a0b', duration: 0.25, immediateRender: false }, PLUG + 0.2);
+      tl.to('#air', { opacity: 0, y: 6, duration: 0.4, ease: 'power2.in' }, PLUG + 0.1);
+      tl.to('#cable', { opacity: 1, duration: 0.2 }, PLUG + 0.2);
+      tl.to('#cable', { clipPath: 'inset(0% 0% 0% 0%)', duration: 0.8, ease: 'power2.inOut' }, PLUG + 0.2);
+      tl.to('#lapUsb', { opacity: 1, duration: 0.5, ease: 'power1.inOut' }, PLUG + 0.7);
+
+      // --- Second screen ---------------------------------------------------------
+      cross('#sceneR', '#sceneA', 8.8);
+      hide('#capLink', 8.8);
+      tl.to('#scrim', { opacity: 1, duration: 0.6 }, 9.1);
+      // The title waits for the app's close-up to pull back; the app's own
+      // switch says Second screen, so the film's chip stays hidden.
+      tl.set('#chip', { opacity: 0 }, 0);
+      show('#capA', FILM_A + 2.4);
+
+      // --- Apple Pencil ------------------------------------------------------------
+      hide('#capA', AB - 0.3);
+      cross('#sceneA', '#sceneB', AB - 0.25, '70% 70%');
+      show('#capB', AB + 0.45);
+
+      // --- Three GPUs ----------------------------------------------------------------
+      hide('#capB', BG - 0.3);
+      cross('#sceneB', '#sceneG', BG - 0.25);
+      show('#capG', BG + 0.35);
+      ['#gpuN', '#gpuA', '#gpuI'].forEach((g, i) => {
+        tl.fromTo(g, { opacity: 0, y: 40 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, BG + 0.1 + i * 0.14);
+      });
+      tl.fromTo('#gpus', { scale: 1 }, { scale: 1.035, duration: GF - BG + 0.5, ease: 'sine.inOut', immediateRender: false }, BG);
+
+      // --- Free and open source, then the name ----------------------------------------
+      hide('#capG', GF - 0.25);
+      tl.to('#scrim', { opacity: 0, duration: 0.5 }, GF - 0.1);
+      cross('#sceneG', '#sceneF', GF - 0.25);
+      tl.fromTo('#free h2', { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, GF + 0.12);
+      tl.fromTo('#free p', { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, GF + 0.32);
+      tl.to('#free', { opacity: 0, y: -16, duration: 0.4, ease: 'power2.in' }, FE - 0.1);
+      tl.fromTo('#sceneE', { opacity: 0 }, { opacity: 1, duration: 0.01, immediateRender: false }, FE + 0.3);
+      tl.to('#sceneF', { opacity: 0, duration: 0.01 }, FE + 0.31);
+      tl.fromTo('#mark img', { opacity: 0, scale: 0.86 }, { opacity: 1, scale: 1, duration: 0.7, ease: 'power3.out', immediateRender: false }, FE + 0.3);
+      tl.fromTo('#mark h2', { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, FE + 0.45);
+      tl.fromTo('#urls .site', { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, FE + 0.85);
+      tl.fromTo('#urls .gh', { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, FE + 1.05);
+
+      window.__timelines['launch-film'] = tl;
+    })();
+  </script>
+</body>
+</html>
