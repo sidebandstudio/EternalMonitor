@@ -77,12 +77,15 @@
       <div id="shadow" data-layout-allow-overflow><div id="pencil"><img src="art/stylus.webp" alt=""></div></div>
       <div id="dip"></div>
     </div>
-    <!-- Three PCs, one per GPU maker, each in its own session. -->
+    <!-- Hardware encoding: the three makers and their encoders (README.md,
+         "How it works"), over the site's valley painting. -->
     <div class="scene" id="sceneG">
+      <div class="bg" id="bgG"></div>
+      <div class="bg-dim"></div>
       <div id="gpus">
-        <div class="gpu" id="gpuN"><div class="crop" data-layout-allow-overflow><video id="v-n" src="footage/host-performance-nvidia.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>NVIDIA</div></div>
-        <div class="gpu" id="gpuA"><div class="crop" data-layout-allow-overflow><video id="v-a" src="footage/host-performance-amd.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>AMD</div></div>
-        <div class="gpu" id="gpuI"><div class="crop" data-layout-allow-overflow><video id="v-i" src="footage/host-performance-intel.mp4" data-start="22.2" data-duration="4.7" data-playback-rate="0.68" muted playsinline></video></div><div class="name"><span class="dot"></span>Intel</div></div>
+        <div class="gpu" id="gpuN"><div class="maker">NVIDIA</div><div class="enc">NVENC</div></div>
+        <div class="gpu" id="gpuA"><div class="maker">AMD</div><div class="enc">AMF</div></div>
+        <div class="gpu" id="gpuI"><div class="maker">Intel</div><div class="enc">Quick Sync</div></div>
       </div>
     </div>
 
@@ -91,7 +94,7 @@
     </div>
     <div class="scene" id="sceneE">
       <div class="mid" id="mark"><img src="ui/icon.png" alt=""><h2>EternalMonitor</h2></div>
-      <div class="mid" id="urls"><div class="site">eternalmonitor.dev</div><div class="gh">github.com/sidebandstudio/EternalMonitor</div></div>
+      <div class="mid" id="urls"><div class="site">eternalmonitor.dev</div><div class="gh">github.com/<wbr>sidebandstudio/EternalMonitor</div></div>
     </div>
 
     <!-- The site's hero (docs/index.html), over Wi-Fi, then a cable takes over. -->
@@ -114,7 +117,7 @@
     <div class="cap" id="capLink"><h2>Wi-Fi or USB.</h2><p>Plug in a cable and it takes over.</p></div>
     <div class="cap" id="capA"><h2>Extend your desktop.</h2><p>Or mirror any screen you have.</p></div>
     <div class="cap" id="capB"><h2>Apple Pencil, as a real pen.</h2><p>Windows Ink pressure and tilt, with palm rejection.</p></div>
-    <div class="cap" id="capG"><h2>Your graphics card does the work.</h2><p>Up to 120 fps on ProMotion iPads.</p></div>
+    <div class="cap" id="capG"><h2>Hardware encoding on supported NVIDIA, AMD and Intel graphics.</h2><p>Up to 120 fps on ProMotion iPads.</p></div>
 
     <div id="seam"></div>
   </div>
@@ -123,22 +126,22 @@
   <script>
     // The launch film. It opens on the site's hero, plays the second-screen
     // and pencil films as they are (they hand over their timelines), then
-    // three GPUs, and ends on the name:
+    // hardware encoding on the three GPU makers, and ends on the name:
     //
     // - 0 to 9.2 s: the hero over Wi-Fi with its headline, then a USB cable
     //   takes over: the switch moves, the cable draws in, the app says USB.
     // - 9.05 to 16 s: the second-screen film from its start to its held desk.
     // - 15.35 to 22.3 s: the pencil film from 0.6 s to the end of its shading.
-    // - 22.2 to 26.9 s: NVIDIA, AMD and Intel PCs, each in its own session
-    //   (3.2 s of footage at 0.68x).
-    // - 26.35 to 30.4 s: free and open source. 30.4 to 35.1 s: the name.
+    // - 22.35 to 27.25 s: hardware encoding: NVIDIA NVENC, AMD AMF and Intel
+    //   Quick Sync, as type over the site's valley painting.
+    // - 27.2 to 30.4 s: free and open source. 30.4 to 35.1 s: the name.
     //
     // The cuts sit just after the six evenly spaced stills render.sh takes.
     (function () {
       const END = 35.1;
       const FILM_A = 9.05, FILM_B = 15.35;
       const FADE = 0.4;
-      const AB = 15.95, BG = 22.25, GF = 26.6, FE = 30.1;
+      const AB = 15.95, BG = 22.25, GF = 27.1, FE = 30.1;
       const tl = gsap.timeline({ paused: true });
 
       tl.add(window.__films['second-screen'].paused(false), FILM_A);
@@ -206,14 +209,18 @@
       cross('#sceneA', '#sceneB', AB - 0.25, '70% 70%');
       show('#capB', AB + 0.45);
 
-      // --- Three GPUs ----------------------------------------------------------------
+      // --- Hardware encoding ------------------------------------------------------------
       hide('#capB', BG - 0.3);
       cross('#sceneB', '#sceneG', BG - 0.25);
       show('#capG', BG + 0.35);
+      // Each maker rises in under the title, its encoder a beat later.
       ['#gpuN', '#gpuA', '#gpuI'].forEach((g, i) => {
-        tl.fromTo(g, { opacity: 0, y: 40 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, BG + 0.1 + i * 0.14);
+        const at = BG + 0.75 + i * 0.22;
+        tl.fromTo(g, { opacity: 0, y: 36 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, at);
+        tl.fromTo(`${g} .enc`, { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', immediateRender: false }, at + 0.25);
       });
-      tl.fromTo('#gpus', { scale: 1 }, { scale: 1.035, duration: GF - BG + 0.5, ease: 'sine.inOut', immediateRender: false }, BG);
+      tl.fromTo('#gpus', { scale: 1 }, { scale: 1.03, duration: GF - BG + 0.5, ease: 'sine.inOut', immediateRender: false }, BG);
+      tl.fromTo('#bgG', { scale: 1.06 }, { scale: 1, duration: GF - BG + 0.5, ease: 'sine.inOut', immediateRender: false }, BG - 0.25);
 
       // --- Free and open source, then the name ----------------------------------------
       hide('#capG', GF - 0.25);

@@ -29,9 +29,10 @@ something other than your own project. Say in the post that you made it.
 
 **Attach.** The launch film, `launch-film.mp4` (README.md, "Launch film"): 35 s
 of the site's hero switching from Wi-Fi to USB, a window carried onto the iPad
-as a second screen, Apple Pencil strokes, three GPU makers and the name. It
-shows everything this post lists, so it suits this post best, and it is the one
-to use on X and in Discord too. For a short loop instead, attach
+as a second screen, Apple Pencil strokes, hardware encoding on NVIDIA, AMD and
+Intel graphics, and the name. It covers the second screen, Wi-Fi and USB, Apple
+Pencil, GPU support, and free and open source. It suits this post best, and it
+is the one to use on X and in Discord too. For a short loop instead, attach
 `docs/assets/demos/second-screen.mp4` (a window carried from the monitor onto
 the iPad); on a phone-first venue use `second-screen-m.mp4`.
 

@@ -1,5 +1,5 @@
-/* The launch film: the site's hero, the second-screen and pencil films, three
-   GPUs and the name, in one 1920 x 1080 frame. Sizes are video pixels. */
+/* The launch film: the site's hero, the second-screen and pencil films,
+   hardware encoding and the name, in one 1920 x 1080 frame. Sizes are video pixels. */
 .bg { background-image: url('art/dunes.webp'); background-position: 46% 66%; }
 .scene { position: absolute; inset: 0; }
 
@@ -41,20 +41,15 @@
 /* The second-screen film's chip, and the pencil film's frame. */
 #chip { left: 56px; top: 48px; opacity: 0; }
 
-/* Three PCs, one per GPU maker: a crop of each Performance page, drawn by the
-   Windows app (footage/host-performance-*.mp4, 2 pixels per app point). The
-   crop is app points 256..1008 across and 98..680 down, at 0.718 frame pixels
-   per point. */
-#gpus { position: absolute; left: 114px; top: 330px; width: 1692px; height: 520px; transform-origin: 50% 40%; }
-.gpu { position: absolute; top: 0; width: 540px; }
-.gpu .crop { position: relative; width: 540px; height: 418px; border-radius: 22px; overflow: hidden; background: #0e0e10;
-  border: 2px solid rgba(255, 255, 255, 0.14); box-shadow: 0 50px 120px -40px rgba(0, 0, 0, 0.95), 0 0 0 1px rgba(0, 0, 0, 0.6); }
-.gpu video { position: absolute; left: -183.8px; top: -70.4px; width: 746.7px; height: 718px; max-width: none; }
-.gpu .name { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 30px; font-size: 40px; font-weight: 500; letter-spacing: -0.02em; color: #f4f4f5; }
-.gpu .name .dot { width: 14px; height: 14px; border-radius: 50%; background: #e8ff47; box-shadow: 0 0 0 6px rgba(232, 255, 71, 0.18); }
-#gpuN { left: 0; }
-#gpuA { left: 576px; }
-#gpuI { left: 1152px; }
+/* Hardware encoding: each GPU maker over its encoder, in a row of three. */
+#bgG { background-image: url('art/valley.webp'); background-position: 50% 55%; }
+#capG h2 { max-width: 1480px; margin: 0 auto; font-size: 72px; text-wrap: balance; }
+#gpus { position: absolute; left: 210px; top: 520px; width: 1500px; display: flex; transform-origin: 50% 50%; }
+.gpu { flex: 1; text-align: center; }
+.gpu + .gpu { border-left: 2px solid rgba(255, 255, 255, 0.14); }
+.gpu .maker { font-size: 112px; font-weight: 500; letter-spacing: -0.045em; line-height: 1.1; color: #f4f4f5; }
+.gpu .enc { display: inline-flex; align-items: center; gap: 16px; margin-top: 22px; font-size: 44px; font-weight: 500; letter-spacing: -0.01em; color: #c4c4cc; }
+.gpu .enc::before { content: ''; width: 14px; height: 14px; border-radius: 50%; background: #e8ff47; box-shadow: 0 0 0 6px rgba(232, 255, 71, 0.18); }
 
 /* Free and open source, then the name. */
 #sceneF, #sceneE { background: rgba(8, 9, 12, 0.66); }
@@ -62,16 +57,17 @@
 #free { top: 380px; }
 #free h2 { margin: 0; font-size: 120px; font-weight: 500; letter-spacing: -0.05em; line-height: 1; }
 #free p { margin: 34px 0 0; font-size: 40px; letter-spacing: -0.01em; color: #c4c4cc; }
-#mark { top: 300px; display: flex; flex-direction: column; align-items: center; }
-#mark img { width: 156px; height: 156px; border-radius: 36px; }
-#mark h2 { margin: 40px 0 0; font-size: 120px; font-weight: 500; letter-spacing: -0.05em; line-height: 1; }
-#urls { top: 690px; }
-#urls .site { font-size: 48px; font-weight: 500; letter-spacing: -0.015em; color: #e8ff47; }
-#urls .gh { margin-top: 18px; font-size: 34px; letter-spacing: -0.005em; color: #a1a1aa; }
+#mark { top: 170px; display: flex; flex-direction: column; align-items: center; }
+#mark img { width: 140px; height: 140px; border-radius: 32px; }
+#mark h2 { margin: 32px 0 0; font-size: 120px; font-weight: 500; letter-spacing: -0.05em; line-height: 1; }
+/* The addresses stay at least 12 px tall in a 360 px-wide phone embed. */
+#urls { top: 560px; }
+#urls .site { font-size: 84px; font-weight: 500; letter-spacing: -0.025em; line-height: 1.15; color: #e8ff47; }
+#urls .gh { margin: 26px auto 0; max-width: 1800px; font-size: 68px; font-weight: 500; letter-spacing: -0.02em; line-height: 1.15; color: #d4d4d8; }
 
 #seam { position: absolute; inset: 0; background: #0a0a0b; opacity: 0; }
 
 /* Everything that arrives later starts hidden; the timeline fades it in. */
-#sceneA, #sceneB, #sceneG, #sceneF, #sceneE, #link, .cap h2, .cap p, .gpu, #free h2, #free p,
+#sceneA, #sceneB, #sceneG, #sceneF, #sceneE, #link, .cap h2, .cap p, .gpu, .gpu .enc, #free h2, #free p,
 #mark img, #mark h2, #urls .site, #urls .gh { opacity: 0; }
 #capHook h2 { opacity: 1; }
