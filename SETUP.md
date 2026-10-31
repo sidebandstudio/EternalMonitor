@@ -38,16 +38,33 @@ These versions work together even when their version numbers differ.
    code-signed yet.
 4. Windows asks **Do you want to allow this app to make changes to your
    device?** Click **Yes**.
-5. Click through the installer. Leave **Create a desktop shortcut** ticked if
-   you want an icon on your desktop.
+5. The installer asks for a language, with your Windows language already
+   chosen. Click **OK**; EternalMonitor opens in the same language. Click
+   through the installer. Leave **Create a desktop shortcut** ticked if you
+   want an icon on your desktop.
 6. If Windows asks **Would you like to install this device software?**, click
    **Install**. This is the driver that lets the iPad be a second screen.
 7. On the last page, leave **Launch EternalMonitor now** ticked and click
    **Finish**.
 
-The EternalMonitor window opens and says **Ready for your iPad**. Keep this
-window open while you use the iPad. You can minimize it. Closing it stops
-streaming.
+The first time, the EternalMonitor window opens with a short setup:
+
+- **Welcome to EternalMonitor**: your language.
+- **Starting EternalMonitor**: whether to **Start with Windows**.
+- **How will your iPad connect?**: **Wi-Fi**, **USB** or **Both**. For USB it
+  checks for Apple's Apple Devices app and offers **Get Apple Devices** if it
+  is missing.
+- **What should the iPad show?**: **Mirror my screen** or **Second screen**,
+  and **Play PC audio**.
+- **Connect your iPad**: the QR code and pairing code you use in Step 3. Click
+  **Done**.
+
+Click **Next** to go on, or **Skip setup** to keep the usual settings. To see
+it again, click **Run setup again** in **Settings**. **Language** in
+**Settings** changes the language at any time.
+
+The window then says **Ready for your iPad**. Keep this window open while you
+use the iPad. You can minimize it. Closing it stops streaming.
 
 To open it later, use the desktop shortcut or search for **EternalMonitor** in
 the Start menu. To have it open whenever you sign in to Windows, go to
@@ -68,9 +85,13 @@ invite link.
 
 1. Make sure the PC and iPad are on the same network, and EternalMonitor is
    open on the PC.
-2. Open EternalMonitor on the iPad. The first time, the iPad asks whether
-   EternalMonitor can **find and connect to devices on your local network**.
-   Tap **Allow**. Without this, the iPad cannot see your PC.
+2. Open EternalMonitor on the iPad. The first time, a short setup asks for
+   your **Language**, then explains **Local network**: tap **Continue**, and
+   when iPadOS asks whether EternalMonitor can **find and connect to devices
+   on your local network**, tap **Allow**. Without this, the iPad cannot see
+   your PC. Its last step offers the ways to connect below. Any step can be
+   skipped, and **Run setup again** in the app's settings opens it later. The
+   language can also be changed under **Language** in the app's settings.
 3. Choose one of these ways to connect:
    - **Tap your PC.** The iPad looks for PCs by itself. Tap your PC under
      **Found on this network** and it connects. While it says **Finding…**,
@@ -246,7 +267,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **This iPad couldn't start the connection** | Something on the iPad side didn't start. | Close EternalMonitor on the iPad and open it again. |
 | **Pair with your PC** | This is the first Wi-Fi connection to this PC. | Type the six-digit **Pairing code** from the PC window and tap **Pair iPad**. You only do this once. |
 | **That code didn’t match. Check the PC and try again.** | The code typed isn't the one the PC shows now. | Type the six digits currently shown on the PC. The code changes when someone clicks **New code** on the PC. |
-| **Too many attempts. Wait before trying again.** | The PC stops accepting codes for a minute after several wrong ones. | Wait until the button counts down, then enter the code again. |
+| **Too many attempts. Wait before trying again.** | The PC stops accepting codes from an iPad for a minute after five wrong ones. After ten wrong codes from any iPads in ten minutes, it pauses code pairing for ten minutes and changes the code. | Wait until the button counts down, then enter the code again. If the PC's Stream page says code pairing is paused, scan the QR code, use a USB cable, or click **Resume code pairing** on the PC and type the new code. |
 | **Lost the connection to your PC** | The PC stopped responding during the stream. | The PC may have gone to sleep, closed EternalMonitor, or lost its network. Wake it, check EternalMonitor is open, then tap **Try again**. |
 | **Reconnecting to your PC…** | The iPad is trying to get the stream back by itself. | Keep EternalMonitor open on the PC and wait. |
 | **Couldn't reconnect to your PC** | Every automatic attempt failed. | Check that the PC is awake and EternalMonitor is open, then tap **Try again**. |

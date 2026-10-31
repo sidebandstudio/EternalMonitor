@@ -11,6 +11,7 @@ use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, StreamState};
 use crate::handoff::Handoff;
+use crate::i18n::{tr, trf};
 use crate::updates::{CheckStatus, Notice, OlderSide, IPAD_OUT_OF_DATE, WEBSITE_DOWNLOAD};
 
 /// The popup's last line: what Update now does from here.
@@ -264,6 +265,7 @@ impl AnalyzerApp {
             return;
         };
         let other = self.show_qr_modal
+            || self.setup.is_some()
             || self.feedback.is_some()
             || self.feedback_ask.due(client.info.is_some())
             || egui::Popup::is_any_open(ctx);
@@ -444,7 +446,7 @@ impl AnalyzerApp {
         let mut automatic = self.settings_check_updates;
         widgets::setting_row(
             ui,
-            "Check for updates automatically",
+            tr("Check for updates automatically"),
             "Looks for a new version once a day and tells you when one is ready.",
             64.0,
             |ui| {
@@ -469,14 +471,17 @@ impl AnalyzerApp {
         let mut clicked = false;
         widgets::setting_row(
             ui,
-            &format!("Version {}", env!("CARGO_PKG_VERSION")),
+            &trf(
+                "Version {version}",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            ),
             &description,
             110.0,
             |ui| {
                 let label = if available.is_some() {
-                    "Update now"
+                    tr("Update now")
                 } else {
-                    "Check now"
+                    tr("Check now")
                 };
                 clicked = widgets::button_ex(
                     ui,

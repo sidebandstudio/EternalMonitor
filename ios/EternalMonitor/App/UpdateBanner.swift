@@ -41,7 +41,7 @@ struct UpdateBanner: View {
                             .foregroundStyle(Theme.textMuted)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Button("Open TestFlight") { TestFlightLink.open() }
+                    Button { TestFlightLink.open() } label: { Text(verbatim: "Open TestFlight") }
                         .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                         .accessibilityIdentifier("update.openTestFlight")
                 }
@@ -103,9 +103,11 @@ struct UpdatePopup: View {
                         Button("Later") { close() }
                             .buttonStyle(PillButtonStyle())
                             .accessibilityIdentifier("updatePopup.later")
-                        Button("Open TestFlight") {
+                        Button {
                             close()
                             TestFlightLink.open()
+                        } label: {
+                            Text(verbatim: "Open TestFlight")
                         }
                         .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                         .accessibilityIdentifier("updatePopup.openTestFlight")
@@ -131,11 +133,12 @@ struct UpdatePopup: View {
 /// Settings: automatic checks and, when there is one, the waiting update.
 struct UpdateSettingsSection: View {
     @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var language = LanguageStore.shared
 
     var body: some View {
         Section {
             Toggle(isOn: $updates.automatic) {
-                label("Check for updates automatically", "arrow.triangle.2.circlepath")
+                label(L("Check for updates automatically"), "arrow.triangle.2.circlepath")
             }
             .accessibilityIdentifier("settings.checkForUpdates")
             if updates.automatic, let available = updates.available {
@@ -143,7 +146,7 @@ struct UpdateSettingsSection: View {
                     HStack {
                         label("A new version is ready in TestFlight", "arrow.down.circle")
                         Spacer()
-                        Text("Open TestFlight")
+                        Text(L("Open TestFlight"))
                             .font(.app(15, relativeTo: .callout))
                             .foregroundStyle(Theme.accent)
                     }
@@ -153,7 +156,7 @@ struct UpdateSettingsSection: View {
                 .accessibilityIdentifier("settings.openTestFlight")
             }
         } header: {
-            Text("UPDATES")
+            Text(L("Updates").uppercased())
                 .font(.app(12, .medium, relativeTo: .caption))
                 .tracking(1.1)
                 .foregroundStyle(Theme.textFaint)
@@ -183,7 +186,7 @@ struct VersionMismatchAction: View {
 
     var body: some View {
         if mismatch?.opensTestFlight == true {
-            Button("Open TestFlight") { TestFlightLink.open() }
+            Button { TestFlightLink.open() } label: { Text(verbatim: "Open TestFlight") }
                 .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                 .accessibilityIdentifier("mismatch.openTestFlight")
         }

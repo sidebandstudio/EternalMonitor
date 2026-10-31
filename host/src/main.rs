@@ -14,6 +14,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything below creates the settings folder or a file in it: a
+    // folder that held nothing means a fresh install, which opens first-run
+    // setup. Upgrades never see it.
+    eternal_host::settings::note_launch();
     // Helper modes are dispatched first, before logging and before the
     // single-instance check below: a `--failure-reporter` copy outlives the
     // host it watches and must never be turned away as a second instance,
@@ -167,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pairing = shared.pairing.lock();
         pairing.configure(persisted.require_pairing, auth_token);
         pairing.log_code();
+        pairing.warn_if_off();
     }
     // Each Troubleshooting knob: an environment variable (developers, CI)
     // wins, then the saved setting, then Automatic.
@@ -214,7 +219,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
 
-    let listen_addr = gui::detect_local_ip(listen_port);
+    if persisted.listen_on != eternal_host::network::ListenOn::All {
+        info!(
+            listen_on = persisted.listen_on.label(),
+            "Stream listens on one network (Settings > Troubleshooting)"
+        );
+    }
+    *shared.listen_on.lock() = persisted.listen_on.clone();
+    let listen_addr = gui::listen_address(&persisted.listen_on, listen_port);
     {
         let mut stats = stats::PIPELINE_STATS.lock();
         stats.set_bitrate(initial_bitrate);

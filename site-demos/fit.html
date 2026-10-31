@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=728, height=1040">
+  <title>Fit or fill the iPad</title>
+  <link rel="stylesheet" href="shared.css">
+  <script src="vendor/gsap.min.js"></script>
+  <style>
+    .bg { background-image: url('art/valley.webp'); background-position: 50% 60%; }
+    /* The iPad app, recorded in the simulator while it streamed a PC's picture. */
+    #tab { left: 102px; top: 108px; width: 524px; height: 743px; border-radius: 46px; }
+    #tab .ipad-screen { left: 20px; top: 20px; width: 484px; height: 703px; border-radius: 28px; }
+    #tab video { left: 0; top: 0; width: 484px; height: 703px; object-fit: cover; }
+    #chip { left: 0; right: 0; top: 30px; margin: 0 auto; width: 330px; justify-content: flex-start; }
+    #chip .say { position: relative; display: inline-block; width: 262px; height: 30px; }
+    #chip .say span { position: absolute; left: 0; top: 0; line-height: 30px; }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="fit" data-start="0" data-width="728" data-height="1040" data-duration="8">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <div class="chip" id="chip"><span class="dot"></span><span class="say"><span id="say-fit">Fit: the whole picture</span><span id="say-fill">Fill: edge to edge</span></span></div>
+
+    <div class="ipad" id="tab">
+      <div class="ipad-screen">
+        <video id="film" src="footage/ipad-fit.mp4" data-start="0" data-duration="8" muted playsinline></video>
+        <div class="touch" id="touch"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    // The app switches at 2.03 s and 6.50 s of the recording; the finger lands just before.
+    const FILL_AT = 2.03, FIT_AT = 6.5;
+    // The HUD's picture button, in screen pixels.
+    const BUTTON = { x: 278, y: 666 };
+
+    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -12, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+    tl.fromTo('#tab', { y: 0 }, { y: -8, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#tab', { y: 0, duration: 4, ease: 'sine.inOut' }, 4);
+
+    const tap = (at) => {
+      tl.set('#touch', { left: BUTTON.x, top: BUTTON.y }, 0);
+      tl.fromTo('#touch', { scale: 0.6, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.14, ease: 'power2.out', immediateRender: false }, at - 0.22);
+      tl.to('#touch', { scale: 1.5, opacity: 0, duration: 0.4, ease: 'power2.out' }, at - 0.04);
+    };
+    tap(FILL_AT);
+    tap(FIT_AT);
+
+    // The chip says what the iPad is doing now.
+    tl.set('#say-fill', { opacity: 0 }, 0);
+    const say = (at, show, hide) => {
+      tl.to(hide, { opacity: 0, y: -8, duration: 0.2, ease: 'power2.in' }, at);
+      tl.fromTo(show, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.3, ease: 'power3.out', immediateRender: false }, at + 0.15);
+    };
+    say(FILL_AT, '#say-fill', '#say-fit');
+    say(FIT_AT, '#say-fit', '#say-fill');
+    // The chip hugs whichever phrase it shows.
+    const WIDE = 330, NARROW = 270;
+    tl.set('#chip', { width: WIDE }, 0);
+    tl.to('#chip', { width: NARROW, duration: 0.35, ease: 'power3.inOut' }, FILL_AT + 0.05);
+    tl.to('#chip', { width: WIDE, duration: 0.35, ease: 'power3.inOut' }, FIT_AT + 0.05);
+
+    window.__timelines['fit'] = tl;
+  </script>
+</body>
+</html>

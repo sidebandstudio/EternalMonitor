@@ -144,7 +144,7 @@ xcodebuild build \
     -derivedDataPath "$ROOT/ios/build/e2e" \
     CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- -quiet
 echo "==> Building host"
-(cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
+(cd "$ROOT" && cargo build -q --release -p eternal-host --features usb-direct --locked)
 fi
 APP="$ROOT/ios/build/e2e/Build/Products/Release-iphonesimulator/EternalMonitor.app"
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }

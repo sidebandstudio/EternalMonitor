@@ -118,7 +118,15 @@ pub async fn start_sender(
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
+    let listen_on = shared.listen_on.lock().clone();
+    let bind_ip = crate::network::listen_ip_now(&listen_on);
+    if bind_ip.is_loopback() {
+        warn!(
+            listen_on = listen_on.label(),
+            "The chosen network isn't connected: listening on this PC only until it is (USB still works)"
+        );
+    }
+    let bind_addr = SocketAddr::from((bind_ip, listen_port));
     let socket = {
         let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
         // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
@@ -165,6 +173,11 @@ pub async fn start_sender(
 
     let local_addr = socket.local_addr()?;
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
+    // The Address row and QR code follow every bind, so a chosen network
+    // that came back shows its address. Resolved before locking: the stats
+    // lock is shared with every pipeline thread.
+    let shown = crate::gui::shown_address(bind_ip, listen_port);
+    PIPELINE_STATS.lock().set_listen_addr(shown);
     PIPELINE_STATS
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
@@ -225,6 +238,10 @@ pub async fn start_sender(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A chosen network can connect, or get a new address, after the stream
+    // starts. It is looked at again while nobody streams.
+    let mut network_check = tokio::time::interval(Duration::from_secs(10));
+    network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
     pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pen_spacing = Deadline::new("pen-spacing")?;
@@ -261,6 +278,15 @@ pub async fn start_sender(
                 if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
+            _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+                if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
+                    info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
+                    shared.stop();
+                    if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
+                    }
+                }
+            }
             _ = liveness_tick.tick() => {
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
@@ -288,9 +314,9 @@ pub async fn start_sender(
                                             eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
                                             _ => None,
                                         };
-                                        let mut actions = shared.session.lock().handle_control(
+                                        let mut actions = shared.session.lock().handle_datagram(
                                             src,
-                                            header.session_id,
+                                            &header,
                                             message,
                                             &config,
                                             Instant::now(),
@@ -668,7 +694,7 @@ async fn repair_while_pacing(
                 let Ok((len, peer)) = received else { break; };
                 if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
                     let count = nack.frag_count;
-                    let actions = shared.session.lock().handle_control(PeerId::udp(peer), header.session_id,
+                    let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
                         ControlMessage::Nack(nack), config, Instant::now());
                     if let Some((epoch, seq, missing)) = actions.retransmit {
                         send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
@@ -1032,6 +1058,104 @@ mod tests {
             assert_eq!(source, PeerId::udp(peer));
             assert_eq!(parse_control(&bytes).unwrap().1, expected);
         }
+    }
+
+    /// `start_sender` itself, with a native pen device that takes every
+    /// frame (Windows' own off Windows). A stall delivers 64 samples at
+    /// once while the encoder always has a frame ready, which the loop takes
+    /// in a branch ahead of the pen's wake-up. The spacing holds back all
+    /// but the first burst, and the loop sends the rest within a few times
+    /// the spacing, one chunk at the top of each pass.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_loop_sends_a_held_pen_backlog_while_video_is_always_ready() {
+        use crate::input::{native_pen, CaptureGeometry, PenPhase, PenSample};
+        const SAMPLES: usize = 64;
+        const VIDEO_QUEUE: usize = 1 << 16;
+        let output = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let taken = native_pen::install();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (delivered, queued) = runtime.block_on(async {
+            let shared = SharedControl::new(0, 15_000_000);
+            shared.running.store(true, Ordering::SeqCst);
+            *shared.capture_geometry.lock() = Some(output);
+            let (nal_tx, nal_rx) = mpsc::channel(VIDEO_QUEUE);
+            let (_audio_tx, audio_rx) = mpsc::channel(1);
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let frame = |sequence| NALUnit {
+                data: vec![0, 0, 0, 1, 0x41],
+                sequence,
+                timestamp: Instant::now(),
+                encode_duration_us: 0,
+                is_keyframe: false,
+            };
+            // A full queue, kept full until the loop stops and drops it.
+            let mut sequence = 0;
+            while nal_tx.try_send(frame(sequence)).is_ok() {
+                sequence += 1;
+            }
+            let video = std::thread::spawn(move || {
+                while nal_tx.blocking_send(frame(sequence)).is_ok() {
+                    sequence += 1;
+                }
+                sequence
+            });
+            let delivered = Instant::now();
+            native_pen::with(|device| {
+                for x in 0..SAMPLES as u16 {
+                    let sample = PenSample {
+                        phase: if x == 0 {
+                            PenPhase::Down
+                        } else {
+                            PenPhase::Move
+                        },
+                        x: i32::from(x),
+                        y: 10,
+                        x_norm: x,
+                        y_norm: 10,
+                        pressure: 512,
+                        tilt_x: 0,
+                        tilt_y: 0,
+                    };
+                    device.deliver(sample, native_pen::SCREEN, Some(output), Instant::now());
+                }
+            });
+            assert!(
+                taken.borrow().len() < SAMPLES / 2,
+                "the spacing must hold the backlog back"
+            );
+            let stop = shared.clone();
+            let watch = async {
+                while taken.borrow().len() < SAMPLES && delivered.elapsed() < Duration::from_secs(2)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                stop.stop();
+            };
+            let (sent, ()) = tokio::join!(
+                start_sender(nal_rx, audio_rx, 0, shared, supervisor_tx),
+                watch
+            );
+            sent.unwrap();
+            (delivered, video.join().unwrap())
+        });
+        let taken = taken.borrow();
+        let order: Vec<_> = taken.iter().map(|(frame, _)| frame.x_norm).collect();
+        assert_eq!(order, (0..SAMPLES as u16).collect::<Vec<_>>());
+        let drained = taken.last().unwrap().1 - delivered;
+        // 58 held frames 250 µs apart take 15 ms; the 50 ms tick alone
+        // would take 500 ms.
+        assert!(drained < Duration::from_millis(250), "{drained:?}");
+        // The loop kept taking video.
+        assert!(queued > (VIDEO_QUEUE + SAMPLES) as u64, "{queued}");
     }
 
     #[test]

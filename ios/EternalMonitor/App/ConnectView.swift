@@ -7,10 +7,15 @@ struct ConnectView: View {
     @StateObject private var recentStore = RecentConnectionStore.shared
     @StateObject private var scanner = NetworkScanner()
     @ObservedObject private var pairings = PairingStore.shared
+    @ObservedObject private var language = LanguageStore.shared
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
     @State private var showSettings = false
+    @State private var showSetup = false
+    /// Run setup again was tapped in Settings; setup opens once it closes.
+    @State private var setupAfterSettings = false
+    @State private var setupOutcome: SetupOutcome = .finished
     // track whether we've already pre-filled from lastHost so we
     // don't clobber user edits on every re-render.
     @State private var didPrefillFromLastHost = false
@@ -20,6 +25,8 @@ struct ConnectView: View {
     /// Send feedback was tapped and its sheet is on the way (Mail first
     /// collects diagnostics). Nothing else may open meanwhile.
     @State private var preparingFeedback = false
+    /// Setup was finished or skipped, or this is an upgrade (the name is
+    /// from the tips card setup replaced).
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -70,11 +77,6 @@ struct ConnectView: View {
                                 .entrance(appeared)
 
                             UpdateBanner()
-
-                            if !didSeeOnboarding {
-                                onboardingCard
-                                    .entrance(appeared, delay: 0.08)
-                            }
 
                             if let problem = connectionManager.problem {
                                 problemBanner(problem)
@@ -136,7 +138,7 @@ struct ConnectView: View {
                 // while typing, over a sheet (Settings, QR scanner, pairing,
                 // Mail or the feedback copy sheet) or next to the feedback ask.
                 UpdatePopup(allowed: connectionManager.isIdleOnConnect && focusedField == nil
-                    && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil
+                    && !showSettings && !showSetup && !showQRScanner && connectionManager.pairingPrompt == nil
                     && feedbackRequest == nil && !preparingFeedback && !showsFeedbackAsk)
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -150,15 +152,29 @@ struct ConnectView: View {
                             .foregroundStyle(Theme.text)
                             .frame(width: 44, height: 44)
                     }
-                    .accessibilityLabel("Settings")
+                    .accessibilityLabel(L("Settings"))
                     .accessibilityIdentifier("settings.button")
                 }
             }
             .sheet(item: $connectionManager.pairingPrompt, onDismiss: connectionManager.pairingSheetDismissed) { model in
                 PairingSheet(model: model, submit: connectionManager.submitPairing, cancel: connectionManager.cancel)
+                    .appLanguage()
             }
-            .sheet(isPresented: $showSettings) {
-                SettingsView()
+            .sheet(isPresented: $showSettings, onDismiss: {
+                if setupAfterSettings {
+                    setupAfterSettings = false
+                    showSetup = true
+                }
+            }) {
+                SettingsView(runSetup: {
+                    setupAfterSettings = true
+                    showSettings = false
+                })
+                .appLanguage()
+            }
+            .fullScreenCover(isPresented: $showSetup, onDismiss: finishSetup) {
+                SetupView(scanner: scanner, outcome: $setupOutcome)
+                    .appLanguage()
             }
             .feedbackSheet($feedbackRequest)
             .sheet(isPresented: $showQRScanner) {
@@ -175,6 +191,7 @@ struct ConnectView: View {
                 #if DEBUG
                 if UIPreview.opensSettings { showSettings = true }
                 if UIPreview.opensFeedback { startFeedback(.general) }
+                if UIPreview.opensSetup && !didSeeOnboarding { showSetup = true; return }
                 #endif
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
@@ -183,11 +200,16 @@ struct ConnectView: View {
                     }
                     didPrefillFromLastHost = true
                 }
-                // Look for PCs straight away, so the usual first step is
-                // tapping your PC rather than typing an address.
-                if connectionManager.state == .disconnected && !scanner.isScanning && scanner.hosts.isEmpty {
-                    scanner.startScan()
+                if !didSeeOnboarding {
+                    if FirstRun.isFreshInstall(saved: FirstRun.saved, hasPairings: pairings.hasPairings) {
+                        // Setup explains Local Network before the search
+                        // makes iPadOS ask for it.
+                        showSetup = true
+                        return
+                    }
+                    didSeeOnboarding = true
                 }
+                startScanIfIdle()
             }
             // Back from Settings, where Local Network may now be on: search
             // again rather than keep showing the old denial.
@@ -212,7 +234,7 @@ struct ConnectView: View {
                 Text("EternalMonitor")
                     .font(.app(30, .semibold, relativeTo: .largeTitle))
                     .foregroundStyle(Theme.text)
-                Text("Use this iPad as a second screen for your Windows PC.")
+                Text(L("Use this iPad as a second screen for your Windows PC."))
                     .font(.app(16, relativeTo: .body))
                     .foregroundStyle(Theme.textMuted)
                     .multilineTextAlignment(.center)
@@ -221,45 +243,36 @@ struct ConnectView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: - Onboarding
+    // MARK: - Setup
 
-    private var onboardingCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                SectionHeader(title: "How it works")
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) { didSeeOnboarding = true }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Theme.textFaint)
-                        .frame(width: 32, height: 32)
-                }
-                .accessibilityLabel("Dismiss tips")
-            }
-            onboardingStep(1, "Install and open EternalMonitor on your Windows PC.")
-            onboardingStep(2, "Tap your PC when it appears below, scan the QR code on the PC, or plug in a USB cable.")
-            onboardingStep(3, "The first time on Wi-Fi, type the six-digit pairing code the PC shows.")
-            onboardingStep(4, "Your PC's screen is mirrored at first. To use this iPad as a second screen, choose Second screen in EternalMonitor on the PC.")
+    /// Look for PCs straight away, so the usual first step is tapping your
+    /// PC rather than typing an address.
+    private func startScanIfIdle() {
+        if connectionManager.state == .disconnected && !scanner.isScanning && scanner.hosts.isEmpty {
+            scanner.startScan()
         }
-        .card()
-        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
-    private func onboardingStep(_ n: Int, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Text("\(n)")
-                .font(.appMono(12, medium: true))
-                .foregroundStyle(Theme.onAccent)
-                .frame(width: 22, height: 22)
-                .background(Circle().fill(Theme.accent))
-                .accessibilityHidden(true)
-            Text(text)
-                .font(.app(15, relativeTo: .body))
-                .foregroundStyle(Theme.text)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+    /// Setup closed: carry on with the way to connect it chose.
+    private func finishSetup() {
+        didSeeOnboarding = true
+        let outcome = setupOutcome
+        setupOutcome = .finished
+        switch outcome {
+        case .connect(let host, let port):
+            hostIP = host
+            self.port = String(port)
+            connectionManager.connect(host: host, port: port)
+            return
+        case .scanQR:
+            showQRScanner = true
+        case .usb:
+            settings.allowUSB = true
+            if connectionManager.usbStatus == "USB: disconnected" { connectionManager.resumeUSBConnections() }
+        case .finished:
+            break
         }
+        startScanIfIdle()
     }
 
     // MARK: - Error banner
@@ -321,13 +334,15 @@ struct ConnectView: View {
                             case .retry:
                                 // Only one filled button a card: Open Settings
                                 // comes first where the card offers it.
-                                Button("Try again") { connectionManager.retry() }
+                                // Problem cards stay English, buttons included,
+                                // so they match the steps the card names.
+                                Button { connectionManager.retry() } label: { Text(verbatim: "Try again") }
                                     .buttonStyle(problem.actions.contains(.openSettings)
                                         ? PillButtonStyle()
                                         : PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                                     .accessibilityIdentifier("connect.retry")
                             case .openSettings:
-                                Button("Open Settings") { openAppSettings() }
+                                Button { openAppSettings() } label: { Text(verbatim: "Open Settings") }
                                     .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                                     .accessibilityIdentifier("connect.openSettings")
                             }
@@ -391,7 +406,7 @@ struct ConnectView: View {
     private var connectCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Connect to your PC")
+                Text(L("Connect to your PC"))
                     .font(.app(20, .semibold, relativeTo: .title3))
                     .foregroundStyle(Theme.text)
                 Text("Your PC appears below when EternalMonitor is open on it. You can also scan its QR code, or type the Address it shows.")
@@ -402,8 +417,8 @@ struct ConnectView: View {
             HStack(alignment: .top, spacing: 10) {
                 // .URL keyboard: hostnames and IPv6 need letters and colons, which
                 // a decimal pad made impossible to type.
-                field(label: "PC address", placeholder: "192.168.1.20", text: $hostIP, field: .host, keyboard: .URL)
-                field(label: "Port", placeholder: "9876", text: $port, field: .port, keyboard: .numberPad)
+                field(label: L("PC address"), placeholder: "192.168.1.20", text: $hostIP, field: .host, keyboard: .URL)
+                field(label: L("Port"), placeholder: "9876", text: $port, field: .port, keyboard: .numberPad)
                     .frame(width: 104)
             }
 
@@ -412,7 +427,7 @@ struct ConnectView: View {
                     hostIP = settings.lastHost
                     if settings.lastPort != 0 { port = String(settings.lastPort) }
                 } label: {
-                    Label("Use last PC: \(settings.lastHost)", systemImage: "clock.arrow.circlepath")
+                    Label(L("Use last PC: \(settings.lastHost)"), systemImage: "clock.arrow.circlepath")
                         .font(.app(13, .medium, relativeTo: .footnote))
                         .foregroundStyle(Theme.accent)
                 }
@@ -432,11 +447,11 @@ struct ConnectView: View {
                     connectionManager.connect(host: normalizedHostIP, port: p)
                 }
             } label: {
-                Text("Connect")
+                Text(L("Connect"))
             }
             .buttonStyle(PrimaryButtonStyle())
             .disabled(!canConnect)
-            .accessibilityLabel("Connect to PC")
+            .accessibilityLabel(L("Connect to PC"))
             .accessibilityIdentifier("connect.button")
 
             let layout = sizeClass == .compact
@@ -447,7 +462,7 @@ struct ConnectView: View {
                     focusedField = nil
                     showQRScanner = true
                 } label: {
-                    Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                    Label(L("Scan QR code"), systemImage: "qrcode.viewfinder")
                 }
                 .buttonStyle(SecondaryButtonStyle())
                 .accessibilityIdentifier("connect.qr")
@@ -462,7 +477,7 @@ struct ConnectView: View {
                         } else {
                             Image(systemName: "dot.radiowaves.left.and.right")
                         }
-                        Text(scanner.isScanning ? "Searching…" : "Find PCs")
+                        Text(scanner.isScanning ? L("Searching…") : L("Find PCs"))
                     }
                 }
                 .buttonStyle(SecondaryButtonStyle())
@@ -506,7 +521,7 @@ struct ConnectView: View {
                     }
                 }
                 .focused($focusedField, equals: field)
-                .accessibilityLabel(field == .host ? "PC address" : "Port")
+                .accessibilityLabel(label)
                 .accessibilityIdentifier(field == .host ? "connect.host" : "connect.port")
         }
     }
@@ -518,10 +533,10 @@ struct ConnectView: View {
             HStack(spacing: 14) {
                 PulseRings(size: 44)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Connecting…")
+                    Text(L("Connecting…"))
                         .font(.app(18, .semibold, relativeTo: .headline))
                         .foregroundStyle(Theme.text)
-                    Text(normalizedHostIP.isEmpty ? "Waiting for your PC" : "Reaching \(normalizedHostIP)")
+                    Text(normalizedHostIP.isEmpty ? L("Waiting for your PC") : L("Reaching \(normalizedHostIP)"))
                         .font(.app(14, relativeTo: .callout))
                         .foregroundStyle(Theme.textMuted)
                         .lineLimit(1)
@@ -534,7 +549,7 @@ struct ConnectView: View {
                     connectionManager.cancel()
                 }
             } label: {
-                Text("Cancel")
+                Text(L("Cancel"))
             }
             .buttonStyle(SecondaryButtonStyle())
         }
@@ -555,7 +570,7 @@ struct ConnectView: View {
                         .fill(Theme.surfaceRaised)
                 )
             VStack(alignment: .leading, spacing: 2) {
-                Text("USB cable")
+                Text(L("USB cable"))
                     .font(.app(15, .medium, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
                 Text(USBStatusText.describe(connectionManager.usbStatus))
@@ -566,13 +581,13 @@ struct ConnectView: View {
             }
             Spacer(minLength: 8)
             if settings.allowUSB && connectionManager.usbStatus == "USB: disconnected" {
-                Button("Connect USB") { connectionManager.resumeUSBConnections() }
+                Button(L("Connect USB")) { connectionManager.resumeUSBConnections() }
                     .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                     .accessibilityIdentifier("connect.usb")
             } else if !settings.allowUSB {
-                Button("Turn on") { settings.allowUSB = true }
+                Button(L("Turn on")) { settings.allowUSB = true }
                     .buttonStyle(PillButtonStyle())
-                    .accessibilityLabel("Turn on USB connections")
+                    .accessibilityLabel(L("Turn on USB connections"))
             }
         }
         .card(padding: 14)
@@ -616,10 +631,10 @@ struct ConnectView: View {
                 }
                 HStack(spacing: 10) {
                     if scanner.searchProblem == .localNetworkOff {
-                        Button("Open Settings") { openAppSettings() }
+                        Button { openAppSettings() } label: { Text(verbatim: "Open Settings") }
                             .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                     }
-                    Button("Search again") { scanner.startScan() }
+                    Button { scanner.startScan() } label: { Text(verbatim: "Search again") }
                         .buttonStyle(PillButtonStyle())
                 }
             }
@@ -650,7 +665,7 @@ struct ConnectView: View {
 
     private var discoveredSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Found on this network", trailing: scanner.statusMessage.isEmpty ? nil : scanner.statusMessage)
+            SectionHeader(title: L("Found on this network"), trailing: scanner.statusMessage.isEmpty ? nil : scanner.statusMessage)
                 .padding(.horizontal, 4)
 
             VStack(spacing: 0) {
@@ -673,7 +688,7 @@ struct ConnectView: View {
                     }
                     .buttonStyle(RowButtonStyle())
                     .disabled(isConnecting || host.address == nil)
-                    .accessibilityHint(host.address == nil ? "" : "Connects to this PC")
+                    .accessibilityHint(host.address == nil ? "" : L("Connects to this PC"))
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -683,9 +698,9 @@ struct ConnectView: View {
     }
 
     static func discoveredSubtitle(_ host: DiscoveredHost) -> String {
-        if let address = host.address { return "Tap to connect · \(address)" }
+        if let address = host.address { return L("Tap to connect · \(address)") }
         return host.finding
-            ? "Finding…"
+            ? L("Finding…")
             : "Couldn't get its address. Type the Address shown on the PC."
     }
 
@@ -695,7 +710,7 @@ struct ConnectView: View {
 
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Recent")
+            SectionHeader(title: L("Recent"))
                 .padding(.horizontal, 4)
 
             VStack(spacing: 0) {
@@ -713,7 +728,7 @@ struct ConnectView: View {
                         hostRow(
                             icon: conn.isUSB ? "cable.connector" : "desktopcomputer",
                             title: conn.host,
-                            subtitle: conn.isUSB ? "Plug in the cable to connect" : "Tap to connect",
+                            subtitle: conn.isUSB ? L("Plug in the cable to connect") : L("Tap to connect"),
                             badge: conn.isUSB ? "USB" : "Wi-Fi",
                             paired: conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port)
                         )
@@ -759,7 +774,7 @@ struct ConnectView: View {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textMuted)
-                    .accessibilityLabel("Paired PC")
+                    .accessibilityLabel(L("Paired PC"))
                     .accessibilityIdentifier("recent.paired")
             }
             if let badge {
@@ -770,7 +785,7 @@ struct ConnectView: View {
                     .padding(.vertical, 4)
                     .background(Capsule().fill(Theme.surfaceRaised))
             }
-            Image(systemName: "chevron.right")
+            Image(systemName: "chevron.forward")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.textFaint)
         }

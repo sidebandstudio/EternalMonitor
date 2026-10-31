@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PC desktop</title>
+  <!-- The PC's desktop that the iPad mirrors in the hero and the pairing film:
+       the painted wallpaper, the reference sheet (footage/doc.png) and the
+       Windows app's own frame (art/hero-pc@2x.webp, drawn by the app).
+       1920 x 1080 desktop pixels; capture-doc.sh renders it at 2x. Both
+       windows sit inside the middle 1567 pixels, which an iPad Pro in landscape
+       keeps in Fill. With ?pair it is the pairing film's desktop instead: the
+       app alone, in the middle, as its footage shows it once the iPad joined
+       (footage/pair-live.png). -->
+  <style>
+    @font-face { font-family: 'Geist'; font-weight: 400; src: url('../../docs/assets/fonts/Geist-Regular.woff2') format('woff2'); }
+    html, body { margin: 0; }
+    body { position: relative; width: 1920px; height: 1080px; overflow: hidden; background: #0b0e14 url('../art/wallpaper.webp') center / cover; font-family: 'Geist', sans-serif; -webkit-font-smoothing: antialiased; }
+    .win { position: absolute; overflow: hidden; border-radius: 9px; background: #0e0e10; border: 1px solid rgba(255, 255, 255, 0.16); box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(0, 0, 0, 0.5); }
+    .bar { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 12px; background: #0a0a0b; border-bottom: 1px solid rgba(255, 255, 255, 0.08); font-size: 11px; color: #a1a1aa; }
+    .bar.light { background: #e6e4df; border-bottom-color: rgba(0, 0, 0, 0.08); color: #4a4b50; }
+    .bar .t { display: inline-flex; align-items: center; gap: 7px; }
+    .bar .t img { width: 14px; height: 14px; border-radius: 4px; }
+    .bar .wc { display: inline-flex; gap: 16px; }
+    .bar .wc svg { width: 9px; height: 9px; }
+    .win > img { display: block; }
+    #doc { left: 1070px; top: 70px; width: 760px; }
+    #doc > img { width: 760px; height: 780px; }
+    #app { left: 180px; top: 200px; width: 1040px; }
+    #app > img { width: 1040px; height: auto; }
+    .pair #doc { display: none; }
+    .pair #app { left: 440px; top: 165px; }
+  </style>
+</head>
+<body>
+  <div class="win" id="doc">
+    <div class="bar light"><span class="t">Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+    <img src="../footage/doc.png" alt="">
+  </div>
+  <div class="win" id="app">
+    <div class="bar"><span class="t"><img src="../../docs/assets/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+    <img src="../art/hero-pc@2x.webp" alt="">
+  </div>
+  <script>
+    if (location.search.includes('pair')) {
+      document.body.classList.add('pair');
+      document.querySelector('#app > img').src = '../footage/pair-live.png';
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+Company logos for the "Built by engineers from" strip (index.html, download.html).
+Each file is the company's own artwork, unredrawn: metadata removed, the viewBox
+cropped to the drawing. The page turns every logo one colour with a CSS filter,
+so the original colours stay in the files. Trademarks of their owners.
+
+aws.svg
+  Amazon Web Services logo, 2025 (Amazon.com, Inc. and Koto)
+  https://commons.wikimedia.org/wiki/File:Amazon_Web_Services_2025.svg
+
+amazon.svg
+  Amazon logo, 2024 (Amazon.com, Inc., Koto and NaN)
+  https://commons.wikimedia.org/wiki/File:Amazon_2024.svg
+
+mit-lincoln-laboratory.svg
+  MIT Lincoln Laboratory logo (from https://www.ll.mit.edu/)
+  https://commons.wikimedia.org/wiki/File:MIT_Lincoln_Laboratory_logo.svg
+  Coordinates rounded to 0.1 unit (the viewBox is 2025 units wide).
+  No compact lockup with the name exists: ll.mit.edu's small mark
+  (themes/mitll_theme/assets/logos/mitll-logo.svg) is the emblem alone, so the
+  strip gives this long lockup the widest place instead.
+
+sonos.svg
+  Sonos wordmark, Simple Icons 16.36.0
+  https://simpleicons.org/?q=sonos
+  https://cdn.jsdelivr.net/npm/simple-icons@16.36.0/icons/sonos.svg
+
+summit-partners.svg
+  Summit Partners logo (from https://www.summitpartners.com/)
+  https://commons.wikimedia.org/wiki/File:Summit_Partners_Logo.svg
+  One-colour version: the light-blue sky is the same colour at 45% opacity and
+  the white snow under the ridge is left out, so it shows the page behind.
+
+philips.svg
+  Philips wordmark (2008 identity)
+  https://commons.wikimedia.org/wiki/File:Philips_logo_new.svg
+
+Discord logo mark (inline in each page's header)
+  Discord "Clyde" mark, Simple Icons 16.36.0
+  https://cdn.jsdelivr.net/npm/simple-icons@16.36.0/icons/discord.svg
+  Brand guidelines: https://discord.com/branding

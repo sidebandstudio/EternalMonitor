@@ -7,6 +7,7 @@ import UIKit
 struct TouchRelayView: UIViewRepresentable {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var settings: AppSettings
+    @ObservedObject private var language = LanguageStore.shared
     @Binding var keyboardVisible: Bool
     var active: Bool
     var onToggleHUD: () -> Void
@@ -32,6 +33,7 @@ struct TouchRelayView: UIViewRepresentable {
         view.active = active
         view.keyboardVisible = keyboardVisible
         view.updateKeyboardPresentation()
+        view.updateLanguage()
     }
 }
 
@@ -185,6 +187,8 @@ final class RelayTouchUIView: UIView {
     }
 
     @objc private func resumeInput() { updateKeyboardPresentation() }
+
+    func updateLanguage() { keyboardInput.updateLanguage() }
 
     @objc private func keyboardFrameChanged(_ notification: Notification) {
         guard keyboardVisible, keyboardInput.isFirstResponder, let window,
