@@ -23,7 +23,8 @@ $log = 'D:\AgentWork\em-v030\logs\build-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 Start-Transcript -Path $log -Force | Out-Null
 try {
     rustc --version
-    $buildArgs = @('build','-p','eternal-host','--locked')
+    # usb-direct: the remote runs keep a cabled iPad off with ETERNAL_USB_DIRECT.
+    $buildArgs = @('build','-p','eternal-host','--features','usb-direct','--locked')
     if ($Release) { $buildArgs += '--release' }
     & cargo @buildArgs
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }

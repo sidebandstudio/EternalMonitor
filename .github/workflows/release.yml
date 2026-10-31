@@ -11,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  # Lets azure/login exchange this run's OIDC token for Artifact Signing access.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,12 +24,23 @@ env:
   VDD_RELEASE_TAG: "25.5.2"
   VDD_ASSET: "Virtual.Display.Driver-v25.05.03-setup-x64.exe"
   VDD_SHA256: "ca10b85babecfb636c85b3f04d2306968d4f940dd3dd35767f866207bfba846e"
+  # Azure Artifact Signing's SignTool plugin and the SignTool it needs, from
+  # NuGet, pinned by version AND the package's SHA-256 like the driver above.
+  SIGNING_CLIENT_VERSION: "1.0.146"
+  SIGNING_CLIENT_SHA256: "7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70"
+  SDK_BUILD_TOOLS_VERSION: "10.0.28000.2957"
+  SDK_BUILD_TOOLS_SHA256: "b7163fc6f636172726d0985963e4f7f11c41afe1c7fdfe78f8051877360ed696"
 
 jobs:
   windows-installer:
     name: Windows installer
     runs-on: windows-2022
     timeout-minutes: 60
+    # The release environment holds the Artifact Signing settings and is the
+    # identity Azure trusts for the OIDC login (docs/windows-signing.md). Only
+    # main and version tags use it; dry runs from other branches get no
+    # environment and build unsigned.
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'release' || '' }}
     env:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
       ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
@@ -102,13 +115,102 @@ jobs:
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
-      - name: Build the installer
+      # Signing turns on once the release environment has the Artifact Signing
+      # variables (docs/windows-signing.md). Without them the installer builds
+      # unsigned, as before, and the run carries a warning.
+      - name: Install the Artifact Signing client
+        if: vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        env:
+          SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "artifact-signing"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          function Get-PinnedPackage($id, $version, $sha256) {
+              $name = $id.ToLower()
+              $zip = Join-Path $root "$name.zip"
+              Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/$name/$version/$name.$version.nupkg" -OutFile $zip
+              $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+              if ($hash -ne $sha256) {
+                  throw "$id $version hash mismatch ($hash); re-vet the package before updating the pin."
+              }
+              $dest = Join-Path $root $name
+              Expand-Archive $zip $dest
+              $dest
+          }
+          $client = Get-PinnedPackage "Microsoft.ArtifactSigning.Client" $env:SIGNING_CLIENT_VERSION $env:SIGNING_CLIENT_SHA256
+          $tools = Get-PinnedPackage "Microsoft.Windows.SDK.BuildTools" $env:SDK_BUILD_TOOLS_VERSION $env:SDK_BUILD_TOOLS_SHA256
+          $signtool = @(Get-ChildItem "$tools\bin\*\x64\signtool.exe")
+          if ($signtool.Count -ne 1) { throw "Expected one x64 signtool.exe in the build tools package." }
+          $dlib = Join-Path $client "bin\x64\Azure.CodeSigning.Dlib.dll"
+          if (!(Test-Path $dlib)) { throw "Azure.CodeSigning.Dlib.dll is missing from the client package." }
+
+          # Only the Azure CLI session from azure/login, so a missing login
+          # fails at once instead of probing every other credential type.
+          $metadata = Join-Path $root "metadata.json"
+          @{
+              Endpoint = $env:SIGNING_ENDPOINT
+              CodeSigningAccountName = $env:SIGNING_ACCOUNT
+              CertificateProfileName = $env:SIGNING_PROFILE
+              CorrelationId = "$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+              ExcludeCredentials = @(
+                  "EnvironmentCredential", "WorkloadIdentityCredential", "ManagedIdentityCredential",
+                  "SharedTokenCacheCredential", "VisualStudioCredential", "VisualStudioCodeCredential",
+                  "AzurePowerShellCredential", "AzureDeveloperCliCredential", "InteractiveBrowserCredential")
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8NoBOM
+
+          # Inno Setup replaces $q with a quote and $f with the quoted file.
+          # Artifact Signing certificates last three days, so the timestamp is
+          # what keeps the signature valid afterwards.
+          $command = '$q{0}$q sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $q{1}$q /dmdf $q{2}$q $f' -f $signtool[0].FullName, $dlib, $metadata
+          "INSTALLER_SIGN_COMMAND=$command" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Built ahead of the Azure login: the login's federated token is short-
+      # lived, so it happens right before the step that signs. The installer
+      # script's own cargo build then has nothing left to do.
+      - name: Build the host and updater
         shell: pwsh
         run: |
           if (!$env:ETERNAL_DIAGNOSTICS_ENDPOINT -or !$env:ETERNAL_DIAGNOSTICS_INGEST_KEY) {
               throw "Release diagnostics endpoint and ingest credential must be configured."
           }
-          .\scripts\build-installer.ps1
+          cargo build --release --locked -p eternal-host -p eternal-updater
+
+      - name: Sign in to Azure for Artifact Signing
+        if: vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          if (!$env:INSTALLER_SIGN_COMMAND) {
+              Write-Host "::warning::Artifact Signing is not configured, so this installer is unsigned. See docs/windows-signing.md."
+          }
+          .\scripts\build-installer.ps1 -SignCommand "$env:INSTALLER_SIGN_COMMAND"
+
+      - name: Check the Authenticode signatures
+        if: vars.ARTIFACT_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        run: |
+          # Setup and the two exes it installs. The uninstaller is signed
+          # inside Setup and has no file of its own here.
+          $files = @(
+              "build\out\EternalMonitor-Setup.exe",
+              "build\installer-staging\EternalMonitor-host.exe",
+              "build\installer-staging\EternalMonitor-updater.exe")
+          foreach ($file in $files) {
+              $sig = Get-AuthenticodeSignature $file
+              Write-Host "${file}: $($sig.Status), signed by $($sig.SignerCertificate.Subject)"
+              if ($sig.Status -ne "Valid" -or !$sig.TimeStamperCertificate) {
+                  throw "$file is not validly signed and timestamped."
+              }
+          }
 
       - name: Check the update helper's imports
         shell: pwsh
@@ -125,12 +227,6 @@ jobs:
           $hash = (Get-FileHash "build\out\EternalMonitor-Setup.exe" -Algorithm SHA256).Hash
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "SHA256: $hash"
-
-      - name: Upload installer artifact (dry runs and debugging)
-        uses: actions/upload-artifact@v4
-        with:
-          name: EternalMonitor-Setup
-          path: build\out\EternalMonitor-Setup.exe
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -167,3 +263,28 @@ jobs:
               $releaseArgs += "--prerelease"
           }
           gh release create @releaseArgs
+
+      # Artifacts are public and not masked like the job log. The installer
+      # is the release asset, so this check never holds back a release.
+      - name: Check the installer artifact for secret values
+        id: artifact-scan
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Optional: empty until Artifact Signing is set up (docs/windows-signing.md).
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: >-
+          python scripts/artifact_secrets.py scan
+          --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,GITHUB_TOKEN
+          --optional AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID
+          build/out/EternalMonitor-Setup.exe
+
+      - name: Upload installer artifact (dry runs and debugging)
+        if: always() && steps.artifact-scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-Setup
+          path: build\out\EternalMonitor-Setup.exe

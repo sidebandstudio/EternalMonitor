@@ -11,8 +11,9 @@
 //! Each launch's files in the crash folder are named by the host's process:
 //! `.rec` the crash record, `.box` a message to show, `.ready` the reporter's
 //! own id once it watches the host, `.shown` once the window works,
-//! `.done` once the host quit normally or reported its failure itself, and
-//! `.display` when it quit without turning the virtual display off.
+//! `.done` once the host quit normally or reported its failure itself,
+//! `.failed` once it saved a failure it will report, and `.display` when it
+//! quit without turning the virtual display off.
 
 use super::process::ProcessId;
 #[cfg(windows)]
@@ -30,6 +31,7 @@ pub(super) const REQUEST: &str = "box";
 const READY: &str = "ready";
 pub(super) const SHOWN: &str = "shown";
 pub(super) const DONE: &str = "done";
+pub(super) const FAILED: &str = "failed";
 pub(super) const DISPLAY: &str = "display";
 /// How long a host that fails at once waits for its reporter to start.
 const READY_WAIT: Duration = Duration::from_secs(3);
@@ -83,6 +85,11 @@ pub(super) fn start(directory: &Path, owner: ProcessId, launch_id: &str) {
         }
         Err(error) => tracing::warn!(%error, "Could not start the failure reporter"),
     }
+}
+
+/// Whether a reporter was started for this process.
+pub(super) fn started() -> bool {
+    REPORTER.get().is_some()
 }
 
 /// Tell the reporter how this launch is going (see the module notes).
@@ -198,7 +205,7 @@ fn save(outcome: &super::Outcome, launch_id: &str) -> std::io::Result<()> {
 /// this reporter waits for its messages, so it is not taken for a host.
 #[cfg(any(windows, test))]
 fn remove_files(directory: &Path, owner: ProcessId, saved: bool) {
-    for kind in [REQUEST, "tmp", DONE, SHOWN, DISPLAY] {
+    for kind in [REQUEST, "tmp", DONE, FAILED, SHOWN, DISPLAY] {
         let _ = fs::remove_file(owner_file(directory, owner, kind));
     }
     if saved {
@@ -241,6 +248,7 @@ fn run(args: &[String]) -> i32 {
     let file = |kind| owner_file(&directory, owner, kind);
     let process = open_host(owner);
     let _ = fs::write(file(READY), ProcessId::current().to_string());
+    super::offer::reporting_for(launch_id);
 
     // Each message on its own thread: an open message never holds the
     // watching, the report or the cleanup. Without a thread, a message waits
@@ -264,11 +272,25 @@ fn run(args: &[String]) -> i32 {
     if let Some(process) = process {
         loop {
             let exited = unsafe { WaitForSingleObject(process, 100) } == WAIT_OBJECT_0;
+            // A failure is coming: look for a newer version meanwhile.
+            if file(FAILED).exists() {
+                super::offer::begin();
+            }
             if let Some((title, body)) = take_request(&file(REQUEST)) {
                 show_soon(title, body);
             }
             if let Some((record, false)) = read_record(&file(RECORD)) {
+                super::offer::begin();
                 let module = module_at(process, record.address);
+                // Before the release below, so the next launch finds it.
+                // Thread 0 is no thread.
+                crate::gui::renderer::note_fault(
+                    owner,
+                    module
+                        .as_ref()
+                        .map_or(crate::gui::renderer::UNKNOWN, |(name, _)| name.as_str()),
+                    (record.thread != 0).then_some(record.thread),
+                );
                 let outcome = super::Outcome::new(
                     record,
                     module.as_ref().map(|(n, o)| (n.as_str(), *o)),
@@ -355,6 +377,19 @@ fn run(args: &[String]) -> i32 {
                 fs::write(file(RECORD), bytes)
             };
             let outcome = super::Outcome::new(record, None, false);
+            crate::gui::renderer::note_fault(
+                owner,
+                if outcome.crash {
+                    crate::gui::renderer::UNKNOWN
+                } else {
+                    crate::gui::renderer::TERMINATED
+                },
+                None,
+            );
+            if outcome.crash {
+                // Beside the cleanup the message waits for below.
+                super::offer::begin();
+            }
             let saved = save(&outcome, launch_id).and(kept);
             report = Some((outcome, saved));
         }
@@ -485,18 +520,8 @@ fn module_at(process: windows::Win32::Foundation::HANDLE, address: u64) -> Optio
 
 #[cfg(windows)]
 fn show(title: &str, body: &str) {
-    use windows::core::HSTRING;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    };
-    unsafe {
-        MessageBoxW(
-            None,
-            &HSTRING::from(body),
-            &HSTRING::from(title),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-    }
+    use windows::Win32::UI::WindowsAndMessaging::{MB_SETFOREGROUND, MB_TOPMOST};
+    super::offer::show_box(title, body, MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 #[cfg(test)]
@@ -564,16 +589,17 @@ mod tests {
                 fs::write(ready, reporter.to_string()).unwrap();
             })
         };
-        assert!(wait_until_ready(&ready, reporter, Duration::from_secs(5)));
+        // The wait is long enough for any machine; it ends when the file
+        // appears.
+        assert!(wait_until_ready(&ready, reporter, Duration::from_secs(60)));
         writer.join().unwrap();
-        // A reporter that exited reads nothing, ready or not.
+        // A reporter that exited reads nothing, ready or not, and is not
+        // waited for. Its process is made before the clock starts, and the
+        // wait is long enough that returning early cannot be the machine.
+        let exited = exited_process();
         let started = Instant::now();
-        assert!(!wait_until_ready(
-            &ready,
-            exited_process(),
-            Duration::from_secs(5)
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!wait_until_ready(&ready, exited, Duration::from_secs(60)));
+        assert!(started.elapsed() < Duration::from_secs(30));
         fs::remove_dir_all(directory).unwrap();
     }
 

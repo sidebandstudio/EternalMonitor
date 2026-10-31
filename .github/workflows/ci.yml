@@ -91,6 +91,9 @@ jobs:
       - name: Verify Setup repairs a preserved virtual display driver
         shell: powershell
         run: ./installer/tests/Test-VddDriverRepair.ps1
+      - name: Verify Setup hands its language to the app
+        shell: powershell
+        run: ./installer/tests/Test-InstallerLanguages.ps1
 
   rust-macos:
     name: Rust (macOS, full workspace + E2E)
@@ -109,8 +112,15 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
         run: cargo test --workspace --locked
-      - name: Retain GUI comparison images
+      - name: Check the host-gui-snapshots artifact for secret values
+        # Artifacts are public and not masked like the job log.
+        id: snapshot-scan
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/artifact_secrets.py scan --secrets GITHUB_TOKEN host/tests/snapshots/
+      - name: Retain GUI comparison images
+        if: always() && steps.snapshot-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: host-gui-snapshots
@@ -141,13 +151,20 @@ jobs:
           xcodebuild -version
           UDID=$(python3 scripts/ci_simulator.py citest "$DEVICE_TYPE" com.apple.CoreSimulator.SimRuntime.iOS-18-6)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Run iOS unit tests and connection/settings UI tests
+      - name: Run iOS unit tests and connection/settings/setup UI tests
         env:
           EM_SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests
-      - name: Retain iOS test evidence
+          scripts/test_ios.sh -only-testing:EternalMonitorTests -only-testing:EternalMonitorUITests/ConnectScreenTests -only-testing:EternalMonitorUITests/SetupTests
+      - name: Check the ios-test-evidence artifact for secret values
+        # Artifacts are public and not masked like the job log.
+        id: evidence-scan
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/artifact_secrets.py scan --secrets GITHUB_TOKEN build/ios-tests-*.log build/ios-tests-*.xcresult build/ios-ui-host-*.log build/ios-ui-usb-host-*.log build/ios-ui-pairing-host-*.log build/ios-usb-proxy-*.log build/screenshots/ui-*
+      - name: Retain iOS test evidence
+        if: always() && steps.evidence-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ios-test-evidence
@@ -174,7 +191,14 @@ jobs:
         run: |
           # Indexing the SDK and build output competes with both software codecs.
           # This is a disposable CI VM, never a developer's machine.
-          sudo mdutil -a -i off
+          # A freshly booted VM's Preboot volume can still be changing its
+          # indexing state ("kMDConfigSearchLevelTransitioning"), which fails
+          # the whole command. That settles, so ask again.
+          for attempt in 1 2 3 4 5; do
+            sudo mdutil -a -i off && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 5
+          done
           xcrun simctl list devices booted
           xcrun simctl shutdown all
       - name: Install XcodeGen and streaming SDK
@@ -233,8 +257,15 @@ jobs:
           vm_stat > build/e2e/vm-after.txt
           sysctl vm.swapusage >> build/e2e/vm-after.txt
           exit "$status"
-      - name: Retain streaming evidence
+      - name: Check the system-e2e-evidence artifact for secret values
+        # Artifacts are public and not masked like the job log.
+        id: evidence-scan
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/artifact_secrets.py scan --secrets GITHUB_TOKEN build/e2e-report.md build/e2e/ build/screenshots/e2e-*.png
+      - name: Retain streaming evidence
+        if: always() && steps.evidence-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: system-e2e-evidence

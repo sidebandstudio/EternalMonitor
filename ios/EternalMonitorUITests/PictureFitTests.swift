@@ -2,7 +2,7 @@ import XCTest
 
 /// The HUD's picture button switches the live stream between Fit and Fill,
 /// and the choice is still there after the app reopens.
-final class PictureFitTests: XCTestCase {
+final class PictureFitTests: UITestCase {
     func testHUDButtonSwitchesFitAndFillAndPersists() {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
@@ -15,7 +15,7 @@ final class PictureFitTests: XCTestCase {
         // what the button saved.
         app.launchArguments = arguments + ["-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
-        app.launch()
+        launchCleanly(app)
         defer { app.terminate() }
 
         let fill = button(app, "Fill the screen")
@@ -32,7 +32,7 @@ final class PictureFitTests: XCTestCase {
 
         app.terminate()
         app.launchArguments = arguments
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(button(app, "Show the whole picture").waitForExistence(timeout: 15), "Fill was not saved")
         XCTAssertTrue(waitForPicture(filled: true), "Fill was saved but not drawn after reopening")
 

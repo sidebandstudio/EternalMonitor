@@ -11,6 +11,7 @@ use super::{
 };
 use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
+use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
 
@@ -21,7 +22,7 @@ impl AnalyzerApp {
         snap: &StatsSnapshot,
         client: &ClientSnapshot,
     ) {
-        self.notices(ui, snap);
+        self.notices(ui, snap, client);
         self.ipad_update_notice(ui, client);
         self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
@@ -53,11 +54,13 @@ impl AnalyzerApp {
     }
 
     /// Update, restart and fault notices, most urgent first.
-    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
+    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
+        self.port_notice(ui);
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
             snap.apple_devices_installed,
+            client.on_usb(),
         ) {
             widgets::banner(ui, WARNING, Icon::Plug, title, body, 170.0, |ui| {
                 apple_devices_action(ui, snap.apple_devices_installed);
@@ -76,11 +79,7 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
-                if customized {
-                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
-                } else {
-                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
-                },
+                &software_fallback_body(customized, snap.nvidia_driver_outdated),
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
@@ -119,14 +118,23 @@ impl AnalyzerApp {
         if let Some((icon, title, body)) =
             capture_block_notice(capture_block, snap.pipeline_running)
         {
-            widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            if capture_block == Some(CaptureBlock::UnsupportedOnThisGpu) {
+                self.graphics_card_notice(ui, icon, title, body);
+            } else {
+                widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            }
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
         let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
-        if let Some(notice) = second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
+        if let Some(mut notice) =
+            second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
         {
+            add_later_retry(
+                &mut notice,
+                crate::capture::second_screen::retries_later(&self.control.shared),
+            );
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -160,6 +168,146 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
         }
         self.restart_notice(ui);
+    }
+
+    /// Windows won't share the screen from the card EternalMonitor runs on:
+    /// name the card the screen is connected to and offer to move the app
+    /// onto it, or, when that did not help, say what overrides it.
+    fn graphics_card_notice(&mut self, ui: &mut Ui, icon: Icon, title: &str, body: &str) {
+        let diagnosis = self.control.shared.gpu_diagnosis.lock().clone();
+        let record = self.control.shared.gpu_switch.lock().clone();
+        match gpu_notice(diagnosis.as_ref(), record.as_ref()) {
+            GpuNotice::Plain => widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {}),
+            GpuNotice::Choose { gpu } => widgets::banner(
+                ui,
+                WARNING,
+                icon,
+                title,
+                &gpu_choice_body(&gpu),
+                0.0,
+                |_| {},
+            ),
+            GpuNotice::Switch {
+                gpu,
+                app_gpu,
+                preference,
+            } => {
+                let label = gpu_switch_button(&gpu);
+                let mut clicked = false;
+                widgets::banner(
+                    ui,
+                    WARNING,
+                    icon,
+                    title,
+                    &gpu_switch_body(&gpu, &app_gpu),
+                    button_width(&label),
+                    |ui| {
+                        clicked = widgets::button(ui, Tone::Primary, None, &label).clicked();
+                    },
+                );
+                if clicked {
+                    self.switch_graphics_card(preference, &gpu);
+                }
+            }
+            GpuNotice::Overridden { gpu, app_gpu } => {
+                let (mut restart, mut undo) = (false, false);
+                widgets::banner(
+                    ui,
+                    WARNING,
+                    Icon::Warning,
+                    GPU_OVERRIDDEN_TITLE,
+                    &gpu_overridden_body(&gpu, app_gpu.as_deref()),
+                    330.0,
+                    |ui| {
+                        undo =
+                            widgets::button(ui, Tone::Secondary, None, "Undo the change").clicked();
+                        restart = widgets::button(
+                            ui,
+                            Tone::Primary,
+                            Some(Icon::Refresh),
+                            "Restart EternalMonitor",
+                        )
+                        .clicked();
+                    },
+                );
+                if undo {
+                    self.undo_graphics_switch();
+                } else if restart {
+                    // The user changed the card in another app.
+                    self.restart_now(crate::relaunch::Reason::Plain);
+                }
+            }
+        }
+        self.gpu_error_line(ui);
+    }
+
+    /// Why the graphics card setting wasn't saved, or its restart didn't
+    /// start, when it wasn't.
+    pub(super) fn gpu_error_line(&self, ui: &mut Ui) {
+        if let Some(error) = &self.gpu_error {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(gpu_error_text(error))
+                        .size(SMALL)
+                        .color(DANGER),
+                )
+                .wrap(),
+            );
+        }
+        if matches!(
+            self.restart_refused,
+            Some(crate::relaunch::Reason::GraphicsCard | crate::relaunch::Reason::Plain)
+        ) {
+            self.handoff_line(ui, crate::handoff::Handoff::Update);
+        }
+    }
+
+    /// Where the user asked for an update or a restart: why it waits for
+    /// `refused_by`, which hands over.
+    pub(super) fn handoff_line(&self, ui: &mut Ui, refused_by: crate::handoff::Handoff) {
+        ui.add(
+            egui::Label::new(
+                RichText::new(refused_by.refusal())
+                    .size(SMALL)
+                    .color(WARNING),
+            )
+            .wrap(),
+        );
+    }
+
+    /// "Restart EternalMonitor" on every page: while the new copy starts,
+    /// and, when it never said it runs, why this window stays, with Quit.
+    pub(super) fn restart_banner(&mut self, ui: &mut Ui) {
+        if self.restart.busy() {
+            widgets::banner(
+                ui,
+                ACCENT,
+                Icon::Refresh,
+                "Restarting EternalMonitor",
+                "EternalMonitor opens again in a moment.",
+                0.0,
+                |_| {},
+            );
+            return;
+        }
+        let Some(reason) = self.restart.failed() else {
+            return;
+        };
+        let mut quit = false;
+        widgets::banner(
+            ui,
+            DANGER,
+            Icon::Warning,
+            crate::relaunch::RESTART_FAILED_TITLE,
+            &crate::relaunch::restart_failed_body(reason),
+            button_width("Quit EternalMonitor"),
+            |ui| {
+                quit = widgets::button(ui, Tone::Primary, None, "Quit EternalMonitor").clicked();
+            },
+        );
+        if quit {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     pub(super) fn restart_notice(&mut self, ui: &mut Ui) {
@@ -196,11 +344,11 @@ impl AnalyzerApp {
             .unwrap_or_default();
         let (title, subtitle) = match state {
             StreamState::Off => (
-                "Streaming is off".to_string(),
-                "Click Start streaming so your iPad can connect.".to_string(),
+                tr("Streaming is off").to_string(),
+                tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
             StreamState::Ready => (
-                "Ready for your iPad".to_string(),
+                tr("Ready for your iPad").to_string(),
                 "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
                     .to_string(),
             ),
@@ -209,22 +357,30 @@ impl AnalyzerApp {
                 let mode = if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL
                     && *self.control.shared.vdd_status.lock() == VddStatus::Active
                 {
-                    CAPTURE_VIRTUAL_LABEL
+                    tr(CAPTURE_VIRTUAL_LABEL)
                 } else {
-                    "Mirroring"
+                    tr("Mirroring")
                 };
                 let mut parts = vec![client.link_name().to_string(), mode.to_string()];
                 if w > 0 && h > 0 {
                     parts.push(format!("{w} × {h}"));
                 }
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
-                (format!("Streaming to {device}"), parts.join("  ·  "))
+                (
+                    trf("Streaming to {device}", &[("device", &device)]),
+                    parts.join("  ·  "),
+                )
             }
             StreamState::Paused => (
-                format!("Streaming to {device} is paused"),
+                trf("Streaming to {device} is paused", &[("device", &device)]),
                 "Windows stopped screen capture. See the message above.".to_string(),
             ),
         };
+        // Off only until another program lets go of the stream port.
+        let waiting = crate::startup::port::held().is_some();
+        let (title, subtitle) =
+            super::port_notice::waiting_status(state == StreamState::Off, waiting)
+                .unwrap_or((title, subtitle));
 
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -261,39 +417,47 @@ impl AnalyzerApp {
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.add_space(3.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(title)
-                                        .family(semibold())
-                                        .size(18.0)
-                                        .color(TEXT),
-                                )
-                                .truncate(),
-                            );
-                            ui.add(egui::Label::new(muted(subtitle)).truncate());
+                            widgets::truncated(ui, &title, |text| {
+                                RichText::new(text)
+                                    .family(semibold())
+                                    .size(18.0)
+                                    .color(TEXT)
+                            });
+                            widgets::truncated(ui, &subtitle, muted);
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if snap.pipeline_running {
-                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), "Stop").clicked()
+                        if snap.pipeline_running || waiting {
+                            // While waiting for the port, Stop cancels the
+                            // start that would follow.
+                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), tr("Stop"))
+                                .clicked()
                             {
                                 action = Some(HeaderAction::Stop);
                             }
-                            if widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
-                                .on_hover_text(
-                                    "Restart capture and encoding. The iPad reconnects on its own.",
-                                )
-                                .clicked()
+                        }
+                        if snap.pipeline_running {
+                            if widgets::button(
+                                ui,
+                                Tone::Secondary,
+                                Some(Icon::Refresh),
+                                tr("Restart"),
+                            )
+                            .on_hover_text(
+                                "Restart capture and encoding. The iPad reconnects on its own.",
+                            )
+                            .clicked()
                             {
                                 action = Some(HeaderAction::Restart);
                             }
-                        } else if widgets::button(
-                            ui,
-                            Tone::Primary,
-                            Some(Icon::Play),
-                            "Start streaming",
-                        )
-                        .clicked()
+                        } else if !waiting
+                            && widgets::button(
+                                ui,
+                                Tone::Primary,
+                                Some(Icon::Play),
+                                tr("Start streaming"),
+                            )
+                            .clicked()
                         {
                             action = Some(HeaderAction::Start);
                         }
@@ -319,17 +483,18 @@ impl AnalyzerApp {
                 ui.columns(3, |cols| {
                     widgets::metric(
                         &mut cols[0],
-                        "Frame rate",
+                        tr("Frame rate"),
                         &format!("{:.0}", snap.capture_fps),
                         "fps",
                         22.0,
                     )
                     .on_hover_text("Pictures per second. 60 looks smooth.");
-                    widgets::metric(&mut cols[1], "Delay", &latency, "ms", 22.0)
+                    widgets::metric(&mut cols[1], tr("Delay"), &latency, "ms", 22.0)
                         .on_hover_text("Time from this PC's screen to the picture on the iPad.");
-                    widgets::metric(&mut cols[2], "Connection", quality, "", 22.0).on_hover_text(
-                        "How well the picture is getting through. Performance has the details.",
-                    );
+                    widgets::metric(&mut cols[2], tr("Connection"), tr(quality), "", 22.0)
+                        .on_hover_text(
+                            "How well the picture is getting through. Performance has the details.",
+                        );
                 });
             }
 
@@ -353,19 +518,20 @@ impl AnalyzerApp {
         let mut arrange = false;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(
-                RichText::new("Use the iPad as")
-                    .family(medium())
-                    .color(TEXT),
-            );
+            let label = tr("Use the iPad as");
+            let response = ui.label(RichText::new(label).family(medium()).color(TEXT));
+            widgets::automation_id(&response, label);
             // A particular monitor (chosen in Settings) is still a mirror.
             widgets::segmented(
                 ui,
                 &mut second,
-                &[(false, CAPTURE_AUTO_LABEL), (true, CAPTURE_VIRTUAL_LABEL)],
+                &[
+                    (false, tr(CAPTURE_AUTO_LABEL)),
+                    (true, tr(CAPTURE_VIRTUAL_LABEL)),
+                ],
             );
             if second && vdd == VddStatus::Active {
-                arrange = widgets::button(ui, Tone::Ghost, None, "Arrange screens")
+                arrange = widgets::button(ui, Tone::Ghost, None, tr("Arrange screens"))
                     .on_hover_text(
                         "Opens Windows Settings at Display, where you drag the screens into place.",
                     )
@@ -394,10 +560,16 @@ impl AnalyzerApp {
         // detect_local_ip() reports "unknown:<port>" when no LAN adapter is up.
         let online = !snap.listen_addr.is_empty() && !snap.listen_addr.starts_with("unknown");
         let mut open_qr = false;
-        widgets::card_header(ui, "Connect an iPad", |ui| {
-            open_qr =
-                widgets::button_ex(ui, Tone::Secondary, Some(Icon::Qr), "QR code", online, 0.0)
-                    .clicked();
+        widgets::card_header(ui, tr("Connect an iPad"), |ui| {
+            open_qr = widgets::button_ex(
+                ui,
+                Tone::Secondary,
+                Some(Icon::Qr),
+                tr("QR code"),
+                online,
+                0.0,
+            )
+            .clicked();
         });
         widgets::paragraph(
             ui,
@@ -405,25 +577,38 @@ impl AnalyzerApp {
         );
         ui.add_space(8.0);
 
-        let (code, pairing_required) = {
+        let (code, pairing_required, paused) = {
             let pairing = self.control.shared.pairing.lock();
-            (format!("{:06}", pairing.code()), pairing.required)
+            (
+                format!("{:06}", pairing.code()),
+                pairing.required,
+                pairing.code_pairing_paused(std::time::Instant::now()),
+            )
         };
         let code = format!("{} {}", &code[..3], &code[3..]);
         let mut copy = false;
         let mut rotate = false;
+        let mut resume = false;
         let copied = self.recently_copied(Copied::Address);
         if online {
-            value_block(ui, "Address", &snap.listen_addr, |ui| {
+            value_block(ui, tr("Address"), &snap.listen_addr, |ui| {
                 let (icon, tip) = if copied {
-                    (Icon::Check, "Copied")
+                    (Icon::Check, tr("Copied"))
                 } else {
-                    (Icon::Copy, "Copy address")
+                    (Icon::Copy, tr("Copy address"))
                 };
                 copy = widgets::icon_button(ui, icon, tip).clicked();
             });
+            if let Some(home) = home_address(&self.address_hint, &snap.listen_addr) {
+                widgets::paragraph(
+                    ui,
+                    muted(format!(
+                        "If that doesn't connect and your iPad is on the same network as this PC, use {home} as the PC address."
+                    )),
+                );
+            }
         } else {
-            ui.label(overline("Address"));
+            widgets::overline_label(ui, tr("Address"));
             widgets::paragraph(
                 ui,
                 RichText::new(
@@ -434,13 +619,25 @@ impl AnalyzerApp {
             );
         }
         ui.add_space(4.0);
-        if pairing_required {
-            value_block(ui, "Pairing code", &code, |ui| {
-                rotate = widgets::icon_button(ui, Icon::Refresh, "New code").clicked();
+        if let (true, Some(left)) = (pairing_required, paused) {
+            widgets::overline_label(ui, tr("Pairing code"));
+            widgets::paragraph(
+                ui,
+                RichText::new(code_pairing_paused_text(left))
+                    .size(SMALL)
+                    .color(WARNING),
+            );
+            resume =
+                widgets::button(ui, Tone::Secondary, None, tr("Resume code pairing")).clicked();
+        } else if pairing_required {
+            value_block(ui, tr("Pairing code"), &code, |ui| {
+                rotate = widgets::icon_button(ui, Icon::Refresh, tr("New code")).clicked();
             });
         } else {
-            ui.label(overline("Pairing code"));
-            ui.label(muted("Not needed while pairing is off."));
+            widgets::overline_label(ui, tr("Pairing code"));
+            let note = tr("Not needed while pairing is off.");
+            let response = ui.label(muted(note));
+            widgets::automation_id(&response, note);
         }
         if copy && online {
             self.copy(ui.ctx(), Copied::Address, snap.listen_addr.clone());
@@ -448,8 +645,11 @@ impl AnalyzerApp {
         if rotate {
             self.new_pairing_code();
         }
+        if resume {
+            self.resume_code_pairing();
+        }
         if open_qr {
-            self.open_qr(snap);
+            self.open_qr();
         }
         if let Some(error) = &self.settings_error {
             ui.add(egui::Label::new(RichText::new(error).size(SMALL).color(DANGER)).wrap());
@@ -467,7 +667,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Lock,
                 if required { ACCENT } else { TEXT_MUTED },
-                "Pairing",
+                tr("Pairing"),
                 if required {
                     "New iPads on Wi-Fi enter the pairing code once. USB needs no code."
                 } else {
@@ -497,7 +697,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Plug,
                 usb_color,
-                "USB connection",
+                tr("USB connection"),
                 &usb_text,
                 if snap.usb_service_reachable {
                     110.0
@@ -506,7 +706,7 @@ impl AnalyzerApp {
                 },
                 |ui| {
                     if snap.usb_service_reachable {
-                        widgets::badge(ui, usb_badge, usb_color);
+                        widgets::badge(ui, tr(usb_badge), usb_color);
                     } else {
                         apple_devices_action(ui, snap.apple_devices_installed);
                     }
@@ -526,7 +726,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Speaker,
                 audio_color,
-                "PC audio",
+                tr("PC audio"),
                 &audio_text,
                 64.0,
                 |ui| {
@@ -544,45 +744,50 @@ impl AnalyzerApp {
         let outputs = self.available_outputs.clone();
         let current = self.settings_capture_display.clone();
         let selected_text = if current.is_empty() {
-            CAPTURE_AUTO_LABEL.to_string()
+            tr(CAPTURE_AUTO_LABEL).to_string()
         } else if current == CAPTURE_VIRTUAL_SENTINEL {
-            CAPTURE_VIRTUAL_LABEL.to_string()
+            tr(CAPTURE_VIRTUAL_LABEL).to_string()
         } else if let Some(o) = outputs.iter().find(|o| o.device_name == current) {
             super::format_output_label(o)
         } else {
-            format!(
-                "{} (not connected)",
-                current.rsplit('\\').next().unwrap_or(&current)
+            trf(
+                "{display} (not connected)",
+                &[("display", current.rsplit('\\').next().unwrap_or(&current))],
             )
         };
         let mut choice = current.clone();
-        widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(ui, |ui| {
-            ui.set_min_width(width);
-            if ui
-                .selectable_label(choice.is_empty(), CAPTURE_AUTO_LABEL)
-                .clicked()
-            {
-                choice = String::new();
-            }
-            // Managed virtual display — created on demand, removed when not in use.
-            if ui
-                .selectable_label(choice == CAPTURE_VIRTUAL_SENTINEL, CAPTURE_VIRTUAL_LABEL)
-                .clicked()
-            {
-                choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
-            }
-            if !outputs.is_empty() {
-                ui.separator();
-            }
-            for o in &outputs {
-                if ui
-                    .selectable_label(choice == o.device_name, super::format_output_label(o))
-                    .clicked()
-                {
-                    choice = o.device_name.clone();
+        let combo = widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(
+            ui,
+            |ui| {
+                ui.set_min_width(width);
+                let auto = ui.selectable_label(choice.is_empty(), tr(CAPTURE_AUTO_LABEL));
+                widgets::automation_id(&auto, tr(CAPTURE_AUTO_LABEL));
+                if auto.clicked() {
+                    choice = String::new();
                 }
-            }
-        });
+                // Managed virtual display — created on demand, removed when not in use.
+                let virtual_display = ui.selectable_label(
+                    choice == CAPTURE_VIRTUAL_SENTINEL,
+                    tr(CAPTURE_VIRTUAL_LABEL),
+                );
+                widgets::automation_id(&virtual_display, tr(CAPTURE_VIRTUAL_LABEL));
+                if virtual_display.clicked() {
+                    choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
+                }
+                if !outputs.is_empty() {
+                    ui.separator();
+                }
+                for o in &outputs {
+                    if ui
+                        .selectable_label(choice == o.device_name, super::format_output_label(o))
+                        .clicked()
+                    {
+                        choice = o.device_name.clone();
+                    }
+                }
+            },
+        );
+        widgets::name_combo(ui, &combo.response, &selected_text);
         if choice != current {
             self.set_capture_display(choice);
         }
@@ -597,6 +802,22 @@ enum HeaderAction {
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
+
+/// What the CPU fallback notice says: undo custom settings first, say the
+/// NVIDIA driver is too old when that is what the graphics card refused, or
+/// suggest a driver update.
+pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
+    if customized {
+        "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
+    } else if nvidia_driver_outdated {
+        format!(
+            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
+            crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else {
+        "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
+    }
+}
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
@@ -616,9 +837,11 @@ fn simulate_problem(
     match name.as_str() {
         "secure-desktop" => *block = Some(CaptureBlock::SecureDesktop),
         "display-changing" => *block = Some(CaptureBlock::DisplayChanging),
+        "no-display" => *block = Some(CaptureBlock::NoDisplay),
         "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
         "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
         "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "graphics-driver-stuck" => *block = Some(CaptureBlock::DriverNotResponding),
         "driver-not-responding" => {
             (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
         }
@@ -716,6 +939,12 @@ pub(super) fn second_screen_notice(
             true,
             true,
         ),
+        // Nothing was tried: the update manifest names this PC's hardware.
+        (Failed, VddTaskHealth::Ok, None) if failure == Some("hardware_rule") => notice(
+            "On PCs like this one the second screen often doesn't start, so the iPad shows your main screen instead. Click Try again to use the second screen.",
+            true,
+            false,
+        ),
         // It attached, so it was not late: it showed no picture.
         (Failed, VddTaskHealth::Ok, None)
             if matches!(failure, Some("no_frames" | "duplication_failed")) =>
@@ -732,6 +961,122 @@ pub(super) fn second_screen_notice(
             false,
         ),
         _ => None,
+    }
+}
+
+/// Say that the host tries the second screen again by itself, after a
+/// failure it remembers for this PC.
+pub(super) fn add_later_retry(notice: &mut SecondScreenNotice, retries_later: bool) {
+    if retries_later && notice.retry {
+        notice
+            .body
+            .push_str(" EternalMonitor also tries again by itself later.");
+    }
+}
+
+/// What the notice says when Windows won't share the screen from the card
+/// EternalMonitor runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GpuNotice {
+    /// The card could not be found: the general Windows Settings steps.
+    Plain,
+    /// One click moves EternalMonitor onto the screen's card.
+    Switch {
+        gpu: String,
+        app_gpu: String,
+        preference: crate::gpu_preference::Preference,
+    },
+    /// No preference certainly selects the card: how to pick it by hand.
+    Choose { gpu: String },
+    /// EternalMonitor switched and Windows still refuses: another app picks
+    /// the card. Offered instead of the switch, so the app never reopens
+    /// in a loop.
+    Overridden {
+        gpu: String,
+        app_gpu: Option<String>,
+    },
+}
+
+pub(super) fn gpu_notice(
+    diagnosis: Option<&crate::gpu_preference::Diagnosis>,
+    record: Option<&crate::gpu_preference::SwitchRecord>,
+) -> GpuNotice {
+    if let Some(record) = record.filter(|record| record.failed) {
+        return GpuNotice::Overridden {
+            gpu: record.gpu.clone(),
+            app_gpu: diagnosis.map(|d| d.app_gpu.clone()),
+        };
+    }
+    match diagnosis {
+        Some(d) => match d.preference {
+            Some(preference) => GpuNotice::Switch {
+                gpu: d.screen_gpu.clone(),
+                app_gpu: d.app_gpu.clone(),
+                preference,
+            },
+            // Already on that card: switching can't help.
+            None if d.screen_gpu == d.app_gpu => GpuNotice::Plain,
+            None => GpuNotice::Choose {
+                gpu: d.screen_gpu.clone(),
+            },
+        },
+        None => GpuNotice::Plain,
+    }
+}
+
+pub(super) fn gpu_switch_button(gpu: &str) -> String {
+    format!(
+        "Use the {}",
+        super::page_troubleshooting::short_gpu_name(gpu)
+    )
+}
+
+/// Room for a button with `label` in a banner.
+fn button_width(label: &str) -> f32 {
+    (label.chars().count() as f32 * 7.5 + 40.0).clamp(140.0, 320.0)
+}
+
+pub(super) fn gpu_switch_body(gpu: &str, app_gpu: &str) -> String {
+    format!(
+        "Your screen is connected to the {gpu}, but EternalMonitor is running on the {app_gpu}. Click the button and EternalMonitor restarts on the right card. You can change this later in Settings > Troubleshooting."
+    )
+}
+
+/// A graphics card setting that couldn't be saved: nothing else changed.
+pub(super) fn gpu_error_text(error: &str) -> String {
+    if error == crate::gpu_preference::SETTINGS_NOT_SAVED {
+        return error.into();
+    }
+    format!("Couldn't save the graphics card setting ({error}). Nothing was changed.")
+}
+
+pub(super) fn gpu_choice_body(gpu: &str) -> String {
+    format!(
+        "Your screen is connected to the {gpu}. Open Windows Settings > System > Display > Graphics, choose EternalMonitor, and pick the {gpu}. Then quit EternalMonitor and open it again."
+    )
+}
+
+pub(super) const GPU_OVERRIDDEN_TITLE: &str =
+    "Another app is choosing EternalMonitor's graphics card";
+
+/// After a switch that did not help. `app_gpu` is the card EternalMonitor
+/// still runs on, which says whose control app is in the way.
+pub(super) fn gpu_overridden_body(gpu: &str, app_gpu: Option<&str>) -> String {
+    let nvidia = |name: &str| name.to_ascii_uppercase().contains("NVIDIA");
+    let setting = if nvidia(gpu) {
+        "\"High-performance NVIDIA processor\""
+    } else {
+        "\"Let Windows decide\" (or \"Auto-select\") or \"Integrated graphics\""
+    };
+    let other_is_nvidia = nvidia(gpu) || app_gpu.is_none_or(nvidia);
+    if other_is_nvidia {
+        format!(
+            "Your screen is connected to the {gpu}, but the NVIDIA app or NVIDIA Control Panel probably keeps EternalMonitor on another card. Open it, find EternalMonitor in the program settings, and set its graphics processor to {setting}. Then click Restart EternalMonitor."
+        )
+    } else {
+        format!(
+            "Your screen is connected to the {gpu}, but your graphics card's own app (such as AMD Software) probably keeps EternalMonitor on another card. Set EternalMonitor there to use the {gpu}, then click Restart EternalMonitor."
+        )
     }
 }
 
@@ -755,6 +1100,11 @@ pub(super) fn capture_block_notice(
             "Windows is changing the display",
             "This happens when the resolution changes or a full-screen game or app starts. The picture comes back by itself when it's done.",
         ),
+        CaptureBlock::NoDisplay => (
+            Icon::Display,
+            "No display is on",
+            "Open the laptop lid or turn a display on, and the picture comes back by itself. To keep streaming with the lid closed, choose Second screen.",
+        ),
         CaptureBlock::UnsupportedOnThisGpu => (
             Icon::Display,
             "Windows won't share this screen from the graphics card EternalMonitor uses",
@@ -769,6 +1119,11 @@ pub(super) fn capture_block_notice(
             Icon::Lock,
             "This Windows session is disconnected",
             "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+        CaptureBlock::DriverNotResponding => (
+            Icon::Warning,
+            "The graphics driver isn't responding",
+            "The iPad keeps the last picture, and EternalMonitor waits for the driver. The picture comes back by itself when it responds. If it doesn't, restart the PC.",
         ),
     })
 }
@@ -804,11 +1159,32 @@ pub(super) fn screen_mode_text(
     what + restart
 }
 
+/// The home network's address, without the port (the iPad has its own Port
+/// field), when the shown address is a VPN's or virtual switch's and the
+/// home network's is known.
+fn home_address(
+    hints: &crate::network::HintCache,
+    listen_addr: &str,
+) -> Option<std::net::Ipv4Addr> {
+    let (ip, _port) = listen_addr.rsplit_once(':')?;
+    hints.get(ip.parse().ok()?)
+}
+
+/// Why the code is gone from the Stream page, for how long, and what
+/// still works.
+pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
+    let minutes = left.as_secs().div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!(
+        "Too many wrong codes were typed, so code pairing is paused for {minutes} more {unit}. The QR code and USB still work. Resuming gives a new code."
+    )
+}
+
 /// Overline label, a large monospaced value and trailing controls.
 fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(overline(label));
+        widgets::overline_label(ui, label);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let max_text = (ui.available_width() - 40.0).max(60.0);
@@ -823,7 +1199,7 @@ fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut
 
 fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
     let link = client.link_name();
-    widgets::card_header(ui, "Connected iPad", |ui| {
+    widgets::card_header(ui, tr("Connected iPad"), |ui| {
         if client.info.is_some() {
             widgets::badge(ui, link, ACCENT);
         }
@@ -833,15 +1209,15 @@ fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "Waiting for an iPad",
+                tr("Waiting for an iPad"),
                 "It appears here as soon as it connects. If the iPad says this PC didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
             );
         } else {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "No iPad connected",
-                "Start streaming, then connect from your iPad.",
+                tr("No iPad connected"),
+                tr("Start streaming, then connect from your iPad."),
             );
         }
         return;
@@ -918,26 +1294,28 @@ pub(super) struct UsbSummary {
 /// Opens Apple Devices when it is installed, otherwise links to its Store page.
 fn apple_devices_action(ui: &mut Ui, installed: bool) {
     if installed {
-        if widgets::button(ui, Tone::Primary, None, "Open Apple Devices").clicked() {
+        if widgets::button(ui, Tone::Primary, None, tr("Open Apple Devices")).clicked() {
             crate::transport::apple_usb::open_apple_devices();
         }
     } else {
         widgets::link(
             ui,
-            "Get Apple Devices",
+            tr("Get Apple Devices"),
             crate::transport::apple_usb::APPLE_DEVICES_STORE_URL,
         );
     }
 }
 
 /// The Stream page notice for an iPad on the cable that Windows cannot reach
-/// because Apple Devices is not running or not installed.
+/// because Apple Devices is not running or not installed. A session streaming
+/// over USB proves the cable works, so it silences the notice.
 pub(super) fn usb_cable_notice(
     reachable: bool,
     cabled: usize,
     installed: bool,
+    streaming_over_usb: bool,
 ) -> Option<(&'static str, &'static str)> {
-    if reachable || cabled == 0 {
+    if reachable || cabled == 0 || streaming_over_usb {
         return None;
     }
     Some(if installed {

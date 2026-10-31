@@ -59,7 +59,7 @@ final class NoPictureTimeoutTests: XCTestCase {
         let timeout = logged(manager, "Session accepted by 127.0.0.1:") ?? ""
         XCTAssertTrue(timeout.contains("no video datagrams arrived. session_id=41 ms_since_start="), timeout)
         XCTAssertTrue(timeout.contains(" ms_since_accept="), timeout)
-        XCTAssertNotNil(logged(manager, "Disconnect state=connecting reason=error"))
+        XCTAssertNotNil(logged(manager, "Disconnect state=connecting reason=connectTimeout"))
         XCTAssertNil(logged(manager, "Disconnect state=connecting reason=userDisconnect"))
     }
 
@@ -139,5 +139,26 @@ final class NoPictureTimeoutTests: XCTestCase {
         manager.connect(host: "127.0.0.1", port: other.port)
         try await until("the other PC times out") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .noReply(usb: false))
+    }
+
+    /// The support log's "no datagrams came back" line is a warning at a PC
+    /// that never answered, and an error once that PC has answered here.
+    func testAnUnansweredHelloIsAWarningUntilThatPCAnswered() async throws {
+        UserDefaults.standard.set(false, forKey: "autoReconnect")
+        let host = FakeUDPHost()
+        let manager = ConnectionManager(timing: fast)
+        defer { manager.cancel() }
+        func unansweredLevel() async throws -> DiagnosticLevel? {
+            manager.connect(host: "127.0.0.1", port: host.port)
+            try await until("timed out") { manager.state == .disconnected }
+            _ = await Task.detached { host.goodbyes() }.value // drain the unanswered HELLO2s
+            return manager.diagnostics.first { $0.message.contains("but no datagrams came back") }?.level
+        }
+        let before = try await unansweredLevel()
+        XCTAssertEqual(before, .warning)
+        try await timedOutAttempt(manager, at: host)
+        _ = await Task.detached { host.goodbyes() }.value
+        let after = try await unansweredLevel()
+        XCTAssertEqual(after, .error)
     }
 }

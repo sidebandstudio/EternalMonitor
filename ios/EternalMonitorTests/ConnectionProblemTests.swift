@@ -219,7 +219,7 @@ final class ConnectionProblemTests: XCTestCase {
             }
         }
         XCTAssertEqual(ConnectionProblem.noReply(usb: false).actions, [.retry])
-        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings])
+        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings, .retry])
         XCTAssertEqual(ConnectionProblem.lost(.cableUnplugged).actions, [])
         XCTAssertTrue(ConnectionProblem.noReply(usb: false).detail.contains("Firewall"))
         XCTAssertTrue(ConnectionProblem.noReply(usb: true).detail.contains("Apple Devices"))
@@ -268,5 +268,19 @@ final class ConnectionProblemTests: XCTestCase {
         for status in ["USB: off", "USB: waiting for a cable", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
             XCTAssertFalse(USBStatusText.describe(status).hasPrefix("USB:"), status)
         }
+    }
+
+    /// A HELLO no one answered is a warning (a PC off, asleep or elsewhere)
+    /// unless that PC answered at this address earlier in this launch.
+    func testAnUnansweredHelloIsAnErrorOnlyWhereAPCAnsweredBefore() {
+        let unanswered = ConnectionDebugState(host: "192.168.1.20", port: 9876, listenerReadyPort: 9877, helloAttempts: 4)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .warning)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: true), .error)
+        // Every other timeout stays an error.
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: true, answeredHereBefore: false), .error)
+        XCTAssertEqual(ConnectionDebugState(listenerReadyPort: nil).timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
+        var answered = unanswered
+        answered.datagramsReceived = 3
+        XCTAssertEqual(answered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
     }
 }

@@ -38,6 +38,12 @@ mdns-sd = "0.13.11"
 parking_lot = "0.12"
 once_cell = "1"
 regex = "1"
+# Which characters an update note may hold (already used by egui)
+unicode-general-category = "1.1"
+# Arabic labels: the Unicode bidirectional algorithm, which egui lacks
+unicode-bidi = "0.3"
+# Picks the UI face out of a Windows font collection (already used by egui)
+skrifa = "0.44"
 
 # Socket options (send-buffer sizing) before handing the socket to tokio
 socket2 = "0.5"
@@ -46,11 +52,18 @@ socket2 = "0.5"
 # Lets a release build obey ETERNAL_SIMULATE_STARTUP_FAILURE, for native
 # failure-path checks. Debug builds always do; shipped builds never do.
 fault-injection = []
+# Lets a release build obey ETERNAL_USB_DIRECT, for the end-to-end scripts.
+# Debug builds always do; shipped builds never do.
+usb-direct = []
 
 [build-dependencies]
 winresource = "0.1"
 cc = "1"
 pkg-config = "0.3"
+
+[dev-dependencies]
+# Paused-clock simulations of the USB link.
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
@@ -72,19 +85,24 @@ features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
+    "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_Storage_FileSystem",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Graphics_DXCore",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
+    "Win32_Globalization",
     "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_IO",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Pointer",

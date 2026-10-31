@@ -38,16 +38,33 @@ These versions work together even when their version numbers differ.
    code-signed yet.
 4. Windows asks **Do you want to allow this app to make changes to your
    device?** Click **Yes**.
-5. Click through the installer. Leave **Create a desktop shortcut** ticked if
-   you want an icon on your desktop.
+5. The installer asks for a language, with your Windows language already
+   chosen. Click **OK**; EternalMonitor opens in the same language. Click
+   through the installer. Leave **Create a desktop shortcut** ticked if you
+   want an icon on your desktop.
 6. If Windows asks **Would you like to install this device software?**, click
    **Install**. This is the driver that lets the iPad be a second screen.
 7. On the last page, leave **Launch EternalMonitor now** ticked and click
    **Finish**.
 
-The EternalMonitor window opens and says **Ready for your iPad**. Keep this
-window open while you use the iPad. You can minimize it. Closing it stops
-streaming.
+The first time, the EternalMonitor window opens with a short setup:
+
+- **Welcome to EternalMonitor**: your language.
+- **Starting EternalMonitor**: whether to **Start with Windows**.
+- **How will your iPad connect?**: **Wi-Fi**, **USB** or **Both**. For USB it
+  checks for Apple's Apple Devices app and offers **Get Apple Devices** if it
+  is missing.
+- **What should the iPad show?**: **Mirror my screen** or **Second screen**,
+  and **Play PC audio**.
+- **Connect your iPad**: the QR code and pairing code you use in Step 3. Click
+  **Done**.
+
+Click **Next** to go on, or **Skip setup** to keep the usual settings. To see
+it again, click **Run setup again** in **Settings**. **Language** in
+**Settings** changes the language at any time.
+
+The window then says **Ready for your iPad**. Keep this window open while you
+use the iPad. You can minimize it. Closing it stops streaming.
 
 To open it later, use the desktop shortcut or search for **EternalMonitor** in
 the Start menu. To have it open whenever you sign in to Windows, go to
@@ -68,9 +85,13 @@ invite link.
 
 1. Make sure the PC and iPad are on the same network, and EternalMonitor is
    open on the PC.
-2. Open EternalMonitor on the iPad. The first time, the iPad asks whether
-   EternalMonitor can **find and connect to devices on your local network**.
-   Tap **Allow**. Without this, the iPad cannot see your PC.
+2. Open EternalMonitor on the iPad. The first time, a short setup asks for
+   your **Language**, then explains **Local network**: tap **Continue**, and
+   when iPadOS asks whether EternalMonitor can **find and connect to devices
+   on your local network**, tap **Allow**. Without this, the iPad cannot see
+   your PC. Its last step offers the ways to connect below. Any step can be
+   skipped, and **Run setup again** in the app's settings opens it later. The
+   language can also be changed under **Language** in the app's settings.
 3. Choose one of these ways to connect:
    - **Tap your PC.** The iPad looks for PCs by itself. Tap your PC under
      **Found on this network** and it connects. While it says **Finding…**,
@@ -231,7 +252,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | What the iPad says | What it means | What to do |
 | --- | --- | --- |
 | **No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.** | The iPad looked on its network and no PC with EternalMonitor open answered. | Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Tap **Search again**, or type the **Address** shown in the PC window. |
-| **EternalMonitor can't look for PCs** | The iPad isn't allowed to search your local network. | Tap **Open Settings** and turn on **Local Network**. |
+| **EternalMonitor can't look for PCs** | The iPad isn't allowed to search your local network. | Tap **Open Settings** and turn on **Local Network**, or go to **Settings > Privacy & Security > Local Network** and turn on **EternalMonitor**. Then tap **Search again**. A USB cable works without this setting. |
 | **Couldn't search for PCs** | The iPad's search for PCs failed for a reason other than Local Network access. | Tap **Search again**, or scan the QR code or type the **Address** shown in the PC window. If it keeps failing, turn on **Local Network** for EternalMonitor in the iPad's Settings. |
 | **Couldn't get its address. Type the Address shown on the PC.** under a found PC | The iPad saw the PC's name but not its address. | Type the **Address** shown in the PC window, then tap **Connect to PC**. |
 | **Your PC didn't answer** | Nothing came back from the PC. It may be closed, asleep, on another network, or blocked by a firewall. | Check that EternalMonitor is open on the PC and says **Ready for your iPad**, that the PC is awake, and that both are on the same Wi-Fi, not a guest network. If all of that is right, Windows Firewall or security software is probably blocking EternalMonitor: run EternalMonitor-Setup.exe again, or use a USB cable. Then tap **Try again**. |
@@ -241,12 +262,12 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **That looks like your router's address, not your PC's** | Nothing answered at an address ending in .1, which is usually the Wi-Fi router. | Type the **Address** shown in the PC window. |
 | **That address doesn't look right** | The iPad couldn't find anything by that name. | Type the **Address** exactly as the PC window shows it. |
 | **This iPad isn't connected to a network** | Wi-Fi is off on the iPad, or it hasn't joined a network. | Turn on Wi-Fi and join the same network as the PC, or use a USB cable. |
-| **EternalMonitor isn't allowed on your local network** | Local Network access is off for EternalMonitor on the iPad. | Tap **Open Settings** and turn on **Local Network**. |
+| **Local Network is turned off for EternalMonitor** | Local Network access is off for EternalMonitor on the iPad, so it can't reach the PC over Wi-Fi. | Tap **Open Settings** and turn on **Local Network**, or go to **Settings > Privacy & Security > Local Network** and turn on **EternalMonitor**. Then tap **Try again**. A USB cable works without this setting. |
 | **Couldn't connect to your PC** | The connection failed for another reason. | Check that both are on the same Wi-Fi and that EternalMonitor is open on the PC, then tap **Try again**. |
 | **This iPad couldn't start the connection** | Something on the iPad side didn't start. | Close EternalMonitor on the iPad and open it again. |
 | **Pair with your PC** | This is the first Wi-Fi connection to this PC. | Type the six-digit **Pairing code** from the PC window and tap **Pair iPad**. You only do this once. |
 | **That code didn’t match. Check the PC and try again.** | The code typed isn't the one the PC shows now. | Type the six digits currently shown on the PC. The code changes when someone clicks **New code** on the PC. |
-| **Too many attempts. Wait before trying again.** | The PC stops accepting codes for a minute after several wrong ones. | Wait until the button counts down, then enter the code again. |
+| **Too many attempts. Wait before trying again.** | The PC stops accepting codes from an iPad for a minute after five wrong ones. After ten wrong codes from any iPads in ten minutes, it pauses code pairing for ten minutes and changes the code. | Wait until the button counts down, then enter the code again. If the PC's Stream page says code pairing is paused, scan the QR code, use a USB cable, or click **Resume code pairing** on the PC and type the new code. |
 | **Lost the connection to your PC** | The PC stopped responding during the stream. | The PC may have gone to sleep, closed EternalMonitor, or lost its network. Wake it, check EternalMonitor is open, then tap **Try again**. |
 | **Reconnecting to your PC…** | The iPad is trying to get the stream back by itself. | Keep EternalMonitor open on the PC and wait. |
 | **Couldn't reconnect to your PC** | Every automatic attempt failed. | Check that the PC is awake and EternalMonitor is open, then tap **Try again**. |
@@ -274,7 +295,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **Your iPad is plugged in, but Apple Devices is not running** | Windows can only reach the iPad over the cable while Apple Devices is open. | Click **Open Apple Devices** and leave it open. It can stay minimized. |
 | **Your iPad is plugged in, but Apple Devices is not installed** | Apple's free Apple Devices app is missing. | Click **Get Apple Devices**, install it from the Microsoft Store, open it and leave it open. |
 | **Video is using the processor instead of the graphics card** | The graphics card couldn't encode the video, so the picture may lag and the PC may run hot. | If the message has **Use recommended settings**, click it. Otherwise update the graphics driver from NVIDIA, AMD or Intel, then click **Restart**. Some graphics cards can't encode video at all. |
-| **The second screen couldn't start, so your main screen is mirrored** | The iPad couldn't become a second screen, so it shows your main screen instead. The line below the title says why. | **Windows' display driver stopped responding. Restart the PC to use the second screen.** Restart Windows; this message has no button. **The second screen isn't installed…** or **Part of the EternalMonitor install is missing or blocked…** Click **Download installer**, run EternalMonitor-Setup.exe, then click **Try again**. **Windows didn't add the second screen in time…** Click **Try again**. If it keeps happening, run EternalMonitor-Setup.exe again. |
+| **The second screen couldn't start, so your main screen is mirrored** | The iPad couldn't become a second screen, so it shows your main screen instead. The line below the title says why. | **Windows' display driver stopped responding. Restart the PC to use the second screen.** Restart Windows; this message has no button. **The second screen isn't installed…** or **Part of the EternalMonitor install is missing or blocked…** Click **Download installer**, run EternalMonitor-Setup.exe, then click **Try again**. **Windows didn't add the second screen in time…** Click **Try again**. If it keeps happening, run EternalMonitor-Setup.exe again. When the line ends with **EternalMonitor also tries again by itself later.**, EternalMonitor remembers the failure on this PC, even after it closes, so iPads that connect get your main screen right away. It tries the second screen again by itself when an iPad connects after a wait of an hour at first, growing to a week if it keeps failing. After a graphics driver, Windows or EternalMonitor update, it tries again the next time it opens. Click **Try again** to try now. |
 | **Streaming to … is paused** | Your iPad is connected, but Windows stopped sharing the screen. The message above it on the Stream page says why. The iPad keeps the last picture. | Follow that message. The picture comes back by itself once Windows allows it. |
 | **Your PC is showing the lock screen or a permission prompt** | Windows hides the screen from apps while it's locked or asking for permission. The iPad keeps the last picture. | Unlock the PC or answer the prompt. The picture comes back by itself. |
 | **Windows is changing the display** | The resolution changed, or a full-screen game or app started. | Wait. The picture comes back by itself. |

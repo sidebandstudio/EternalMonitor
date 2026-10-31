@@ -326,8 +326,12 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
             return TaskOutcome::Failed(None);
         }
     };
-    // vdd_task.ps1 waits up to 10 s for an earlier instance and 15 s for its own.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let call = if task == TASK_ENABLE {
+        crate::stall::Call::VddEnable
+    } else {
+        crate::stall::Call::VddDisable
+    };
+    let deadline = Instant::now() + call.limits().limit;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -336,13 +340,18 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
                 std::thread::sleep(Duration::from_millis(50));
             }
             result => {
-                warn!(task, ?result, "VDD task runner failed or timed out");
+                if let Err(error) = result {
+                    warn!(task, %error, "VDD task runner failed");
+                } else {
+                    crate::stall::log_timed_out(call, call.limits(), started.elapsed());
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return TaskOutcome::TimedOut;
             }
         }
     }
+    crate::stall::note_finished(call, call.limits(), started.elapsed());
 
     match child.wait_with_output() {
         Ok(out) if out.status.success() => {
@@ -405,6 +414,20 @@ fn refused(health: VddTaskHealth) -> EnableReport {
         VddTaskHealth::NotResponding => "display task not responding",
         VddTaskHealth::Ok => "display task not run",
     })
+}
+
+/// Why an Enable failed, for its log line's `reason=`: `task_missing` (the
+/// installer's tasks are gone), `task_failed` (the task ran and failed; the
+/// device state it found, when it said, is in the report), `timeout` (it,
+/// or an earlier one still stuck, did not finish in time), or `other`.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+pub(crate) fn enable_failure_reason(report: EnableReport) -> &'static str {
+    match report {
+        Ok(_) | Err("display task failed") => "task_failed",
+        Err("display tasks missing") => "task_missing",
+        Err("display task timed out" | "display task not responding") => "timeout",
+        Err(_) => "other",
+    }
 }
 
 /// Turn the virtual display on. On failure, what the Enable task found
@@ -865,6 +888,30 @@ mod tests {
             Err("display task timed out")
         );
         assert_eq!(TaskOutcome::Missing.report(), Err("display tasks missing"));
+        // The log line's reason for each.
+        for (outcome, reason) in [
+            (
+                TaskOutcome::Failed(Some(DeviceState::Problem(43))),
+                "task_failed",
+            ),
+            (TaskOutcome::Failed(None), "task_failed"),
+            (TaskOutcome::TimedOut, "timeout"),
+            (TaskOutcome::Missing, "task_missing"),
+            (TaskOutcome::Done, "other"),
+        ] {
+            assert_eq!(
+                enable_failure_reason(outcome.report()),
+                reason,
+                "{outcome:?}"
+            );
+        }
+        for (health, reason) in [
+            (VddTaskHealth::TasksMissing, "task_missing"),
+            (VddTaskHealth::NotResponding, "timeout"),
+            (VddTaskHealth::Ok, "other"),
+        ] {
+            assert_eq!(enable_failure_reason(refused(health)), reason, "{health:?}");
+        }
         // The gate refused to run the task at all.
         assert_eq!(
             refused(VddTaskHealth::TasksMissing),

@@ -1,5 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -101,16 +102,23 @@ fn usb_row_says_to_open_or_install_apple_devices() {
 
 #[test]
 fn cable_notice_appears_only_for_a_plugged_in_ipad_without_the_service() {
-    assert_eq!(usb_cable_notice(true, 1, true), None);
-    assert_eq!(usb_cable_notice(false, 0, false), None);
+    assert_eq!(usb_cable_notice(true, 1, true, false), None);
+    assert_eq!(usb_cable_notice(false, 0, false, false), None);
 
-    let (title, body) = usb_cable_notice(false, 1, true).unwrap();
+    let (title, body) = usb_cable_notice(false, 1, true, false).unwrap();
     assert!(title.contains("Apple Devices is not running"), "{title}");
     assert!(body.contains("leave it running"), "{body}");
 
-    let (title, body) = usb_cable_notice(false, 2, false).unwrap();
+    let (title, body) = usb_cable_notice(false, 2, false, false).unwrap();
     assert!(title.contains("Apple Devices is not installed"), "{title}");
     assert!(body.contains("Microsoft Store"), "{body}");
+}
+
+#[test]
+fn cable_notice_stays_hidden_while_an_ipad_streams_over_usb() {
+    // A missed service poll during a USB session is not a broken cable.
+    assert_eq!(usb_cable_notice(false, 1, true, true), None);
+    assert_eq!(usb_cable_notice(false, 1, false, true), None);
 }
 
 #[test]
@@ -304,11 +312,36 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
     assert_eq!(CAPTURE_AUTO_LABEL, "Mirror my screen");
     assert_eq!(CAPTURE_VIRTUAL_LABEL, "Second screen");
     for (_, body) in [
-        usb_cable_notice(false, 1, true).unwrap(),
-        usb_cable_notice(false, 1, false).unwrap(),
+        usb_cable_notice(false, 1, true, false).unwrap(),
+        usb_cable_notice(false, 1, false, false).unwrap(),
     ] {
         assert!(body.contains("Wi-Fi") && !body.contains("WiFi"), "{body}");
     }
+}
+
+#[test]
+fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
+    let body = software_fallback_body(false, true);
+    assert!(
+        body.contains("NVIDIA driver to version 570 or newer"),
+        "{body}"
+    );
+    assert!(body.contains("Restart"), "{body}");
+    // Kepler cards (GTX 600/700) stop at driver 470 and can't install 570.
+    assert!(body.contains("if your graphics card supports it"), "{body}");
+    assert!(
+        body.contains("Older cards keep using the processor"),
+        "{body}"
+    );
+    for jargon in ["NVENC", "API", "libx264", "encoder", "http"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // Custom settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(true, true),
+        software_fallback_body(true, false)
+    );
+    assert!(!software_fallback_body(false, false).contains("570"));
 }
 
 #[test]
@@ -317,9 +350,11 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     let blocks = [
         CaptureBlock::SecureDesktop,
         CaptureBlock::DisplayChanging,
+        CaptureBlock::NoDisplay,
         CaptureBlock::UnsupportedOnThisGpu,
         CaptureBlock::TooManyCaptureApps,
         CaptureBlock::SessionDisconnected,
+        CaptureBlock::DriverNotResponding,
     ];
     assert!(capture_block_notice(None, true).is_none());
     let mut titles = Vec::new();
@@ -345,6 +380,21 @@ fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
     assert!(gpu.contains("open it again"), "{gpu}");
     let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
     assert!(lock.contains("lock screen"), "{lock}");
+    let (_, stuck, body) =
+        capture_block_notice(Some(CaptureBlock::DriverNotResponding), true).unwrap();
+    assert_eq!(stuck, "The graphics driver isn't responding");
+    assert!(body.contains("restart the PC"), "{body}");
+    // A closed lid is not a display change.
+    let (_, off, body) = capture_block_notice(Some(CaptureBlock::NoDisplay), true).unwrap();
+    assert_eq!(off, "No display is on");
+    assert!(
+        body.contains("laptop lid") && body.contains("Second screen"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("resolution") && !body.contains("game"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -628,4 +678,234 @@ fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
         quiet
     ));
     assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
+}
+
+/// A second screen failure remembered for this PC is tried again later by
+/// itself; the notice says so beside Try again.
+#[test]
+fn a_remembered_second_screen_failure_says_it_tries_again_later() {
+    use super::page_stream::add_later_retry;
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    for failure in ["attach_timeout", "no_frames", "hardware_rule"] {
+        let notice = || {
+            second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok, None, Some(failure)).unwrap()
+        };
+        let mut later = notice();
+        add_later_retry(&mut later, true);
+        assert!(later.body.starts_with(&notice().body), "{}", later.body);
+        assert!(later.body.ends_with("tries again by itself later."));
+        assert!(later.retry);
+        let mut now = notice();
+        add_later_retry(&mut now, false);
+        assert_eq!(now, notice());
+    }
+    // A manifest rule tried nothing: the notice doesn't say it failed.
+    let rule = second_screen_notice(
+        VddStatus::Failed,
+        VddTaskHealth::Ok,
+        None,
+        Some("hardware_rule"),
+    )
+    .unwrap();
+    assert!(
+        rule.body.starts_with("On PCs like this one"),
+        "{}",
+        rule.body
+    );
+    assert!(rule.retry && !rule.installer);
+    // A notice without Try again (restart the PC) is left alone.
+    let mut hung =
+        second_screen_notice(VddStatus::Failed, VddTaskHealth::NotResponding, None, None).unwrap();
+    add_later_retry(&mut hung, true);
+    assert!(!hung.body.contains("later"), "{}", hung.body);
+}
+
+#[test]
+fn the_hybrid_notice_names_the_card_and_never_loops() {
+    use super::page_stream::{
+        gpu_choice_body, gpu_notice, gpu_overridden_body, gpu_switch_body, gpu_switch_button,
+        GpuNotice,
+    };
+    use crate::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    let diagnosis = Diagnosis {
+        screen_gpu: "AMD Radeon 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    };
+    assert_eq!(
+        gpu_notice(Some(&diagnosis), None),
+        GpuNotice::Switch {
+            gpu: "AMD Radeon 780M Graphics".into(),
+            app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            preference: Preference::PowerSaving,
+        }
+    );
+    assert_eq!(
+        gpu_switch_button("AMD Radeon(TM) 780M Graphics"),
+        "Use the AMD Radeon 780M"
+    );
+    let body = gpu_switch_body(&diagnosis.screen_gpu, &diagnosis.app_gpu);
+    assert!(
+        body.contains("connected to the AMD Radeon 780M Graphics"),
+        "{body}"
+    );
+    assert!(body.contains("running on the NVIDIA"), "{body}");
+    assert!(body.contains("restarts"), "{body}");
+    assert!(body.contains("Settings > Troubleshooting"), "{body}");
+    // A switch that was made and did not help: no second switch, but what
+    // overrides it and an undo.
+    let mut record = SwitchRecord::new(None, None, Preference::PowerSaving, &diagnosis.screen_gpu);
+    record.checking = false;
+    record.failed = true;
+    let notice = gpu_notice(Some(&diagnosis), Some(&record));
+    assert!(matches!(notice, GpuNotice::Overridden { .. }), "{notice:?}");
+    let overridden = gpu_overridden_body("AMD Radeon 780M Graphics", Some(&diagnosis.app_gpu));
+    assert!(
+        overridden.contains("NVIDIA app or NVIDIA Control Panel"),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("\"Let Windows decide\""),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("\"Integrated graphics\""),
+        "{overridden}"
+    );
+    assert!(
+        overridden.contains("Restart EternalMonitor"),
+        "{overridden}"
+    );
+    // Needing the NVIDIA card: its own setting.
+    let to_nvidia = gpu_overridden_body("NVIDIA GeForce RTX 5080", Some("AMD Radeon(TM) Graphics"));
+    assert!(
+        to_nvidia.contains("High-performance NVIDIA processor"),
+        "{to_nvidia}"
+    );
+    // An AMD card in the way: AMD's app, not NVIDIA's.
+    let amd = gpu_overridden_body("Intel(R) Iris(R) Xe Graphics", Some("AMD Radeon RX 7600S"));
+    assert!(
+        amd.contains("AMD Software") && !amd.contains("NVIDIA"),
+        "{amd}"
+    );
+    // No certain preference: the card is named for Windows Settings.
+    let third = Diagnosis {
+        preference: None,
+        ..diagnosis.clone()
+    };
+    assert_eq!(
+        gpu_notice(Some(&third), None),
+        GpuNotice::Choose {
+            gpu: "AMD Radeon 780M Graphics".into()
+        }
+    );
+    assert!(
+        gpu_choice_body("AMD Radeon 780M Graphics").contains("pick the AMD Radeon 780M Graphics")
+    );
+    // Already on the screen's card, or no card found: the general steps.
+    let same = Diagnosis {
+        app_gpu: diagnosis.screen_gpu.clone(),
+        preference: None,
+        ..diagnosis
+    };
+    assert_eq!(gpu_notice(Some(&same), None), GpuNotice::Plain);
+    assert_eq!(gpu_notice(None, None), GpuNotice::Plain);
+    // A switch that worked leaves nothing to say.
+    record.failed = false;
+    assert_eq!(gpu_notice(None, Some(&record)), GpuNotice::Plain);
+}
+
+#[test]
+fn troubleshooting_names_each_cards_choice_in_plain_words() {
+    use super::page_troubleshooting::{
+        drawing_status_lines, gpu_option_label, graphics_card_description, short_gpu_name,
+        window_drawing_label, wiring_lines,
+    };
+    use crate::gpu_preference::{Adapter, GpuFacts, Preference};
+    use crate::troubleshooting::WindowDrawing;
+    let facts = GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: (0, 2),
+                name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            },
+            Adapter {
+                id: (0, 1),
+                name: "AMD Radeon(TM) 780M Graphics".into(),
+            },
+        ],
+        power_saving: Some((0, 1)),
+        high_performance: Some((0, 2)),
+        screens: vec![
+            (r"\\.\DISPLAY1".into(), (0, 1)),
+            (r"\\.\DISPLAY2".into(), (0, 2)),
+            (r"\\.\DISPLAY9".into(), (0, 7)),
+        ],
+    };
+    assert_eq!(
+        gpu_option_label(&facts, Preference::Automatic),
+        "Automatic (Windows decides)"
+    );
+    assert_eq!(
+        gpu_option_label(&facts, Preference::PowerSaving),
+        "Power saving (AMD Radeon 780M)"
+    );
+    assert_eq!(
+        gpu_option_label(&facts, Preference::HighPerformance),
+        "High performance (NVIDIA GeForce RTX 5060 Laptop)"
+    );
+    assert_eq!(
+        short_gpu_name("Intel(R) UHD Graphics 620"),
+        "Intel UHD Graphics 620"
+    );
+    assert_eq!(
+        wiring_lines(&facts),
+        [
+            "EternalMonitor runs on the NVIDIA GeForce RTX 5060 Laptop GPU now.",
+            "DISPLAY1 is connected to the AMD Radeon(TM) 780M Graphics.",
+            "DISPLAY2 is connected to the NVIDIA GeForce RTX 5060 Laptop GPU.",
+        ]
+    );
+    assert!(graphics_card_description(Some(&facts)).contains("On a laptop"));
+    let single = GpuFacts {
+        adapters: vec![facts.adapters[0].clone()],
+        power_saving: Some((0, 2)),
+        high_performance: Some((0, 2)),
+        screens: Vec::new(),
+    };
+    assert!(graphics_card_description(Some(&single)).contains("one graphics card"));
+    assert!(wiring_lines(&single).is_empty());
+    // Two cards whose ranks Windows can't settle: no choice offered, but the
+    // wiring still shows and the text points at Windows Settings.
+    let uncertain = GpuFacts {
+        power_saving: None,
+        high_performance: None,
+        ..facts.clone()
+    };
+    assert!(graphics_card_description(Some(&uncertain)).contains("Windows Settings"));
+    assert_eq!(wiring_lines(&uncertain).len(), 3);
+    for drawing in [
+        WindowDrawing::Automatic,
+        WindowDrawing::Dx12,
+        WindowDrawing::Vulkan,
+        WindowDrawing::Warp,
+    ] {
+        assert!(!window_drawing_label(drawing).contains("WGPU"));
+    }
+    let status = super::renderer::Status {
+        choice: WindowDrawing::Vulkan,
+        chosen_failed: true,
+        backend: Some("DirectX 12".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        drawing_status_lines(&status, WindowDrawing::Vulkan),
+        [
+            "Drawing with DirectX 12 now.",
+            "Vulkan didn't start last time, so EternalMonitor chose automatically."
+        ]
+    );
+    // A new choice made this run replaces the old one's story.
+    assert_eq!(drawing_status_lines(&status, WindowDrawing::Dx12).len(), 1);
 }

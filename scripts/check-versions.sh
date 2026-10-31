@@ -83,6 +83,17 @@ if not shown or shown[1] != f"v{ipad_version}, build {ipad.get('build')}":
     fail(f"iPad {ipad_version} build {ipad.get('build')}; docs/download.html says {shown and shown[1]!r}")
 if not re.fullmatch(r"[0-9a-f]{64}", windows["sha256"]):
     fail("SHA-256 must be 64 lowercase hex digits")
+
+# The optional fields both apps read (docs/remote-config.md), checked by the
+# same code latest_json.py uses. The apps fall back to their defaults on a
+# bad value; this check keeps one from being published at all.
+sys.path.insert(0, str(root / "scripts"))
+import manifest_fields
+
+try:
+    manifest_fields.check(windows, ipad)
+except ValueError as error:
+    fail(str(error))
 # The download page's script must take the release from latest.json, not a
 # tag of its own, or the page could offer another version than this check saw.
 script = (root / "docs/script.js").read_text()

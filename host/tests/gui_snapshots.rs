@@ -1,13 +1,13 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
+use egui_kittest::{kittest, kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
-use eternal_host::control::{GuiControl, SharedControl, VddStatus};
+use eternal_host::control::{GuiControl, SharedControl, SupervisorCommand, VddStatus};
 use eternal_host::gui::AnalyzerApp;
 use eternal_host::settings::SettingsFile;
 use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
@@ -36,6 +36,32 @@ impl ConfigSource for Fixture {
 }
 
 const POPUP_QUIET_MS: u64 = 3000;
+/// How far the popup's clock moves between frames.
+const FRAME_MS: u64 = 100;
+
+/// The popup's quiet period runs on a clock only these tests move, so how
+/// long a frame takes never decides whether the popup waited.
+static POPUP_CLOCK: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn start_popup_clock() {
+    let now = Instant::now();
+    *POPUP_CLOCK.lock().unwrap() = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
+
+fn popup_clock() -> Instant {
+    POPUP_CLOCK
+        .lock()
+        .unwrap()
+        .expect("the fixture starts the popup clock")
+}
+
+fn advance_popup_clock(millis: u64) {
+    let mut clock = POPUP_CLOCK.lock().unwrap();
+    let now = clock.expect("the fixture starts the popup clock") + Duration::from_millis(millis);
+    *clock = Some(now);
+    eternal_host::gui::set_popup_clock(Some(now));
+}
 
 fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
     harness
@@ -45,26 +71,46 @@ fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
 
 /// The popup opens once no iPad has been connected for the quiet period.
 fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
-    let deadline = Instant::now() + std::time::Duration::from_millis(POPUP_QUIET_MS + 7000);
+    let deadline = popup_clock() + Duration::from_millis(POPUP_QUIET_MS + 7000);
     while !popup_shown(harness) {
-        assert!(Instant::now() < deadline, "the popup never opened");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(popup_clock() < deadline, "the popup never opened");
+        advance_popup_clock(FRAME_MS);
         harness.run_steps(1);
     }
     harness.run_steps(4);
 }
 
-/// Draws frames for `millis` and checks the popup stays closed in each.
-fn no_popup_for(harness: &mut Harness<'_, AnalyzerApp>, millis: u64, why: &str) {
-    let end = Instant::now() + std::time::Duration::from_millis(millis);
+/// Draws a frame every [`FRAME_MS`] of the popup's clock for `millis` and
+/// checks the popup stays closed in each one within the quiet period after
+/// `seen`, when the app last saw an iPad (or launched). With `ipad`
+/// connected, every frame is checked, and each one moves `seen` on.
+/// Returns it.
+fn no_popup_for(
+    harness: &mut Harness<'_, AnalyzerApp>,
+    mut seen: Instant,
+    ipad: bool,
+    millis: u64,
+    why: &str,
+) -> Instant {
+    let quiet = Duration::from_millis(POPUP_QUIET_MS);
+    let end = popup_clock() + Duration::from_millis(millis);
+    let mut checked = 0;
     loop {
-        harness.run_steps(1);
-        assert!(!popup_shown(harness), "{why}");
-        if Instant::now() >= end {
-            return;
+        if ipad {
+            seen = popup_clock();
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        harness.run_steps(1);
+        if ipad || popup_clock() < seen + quiet {
+            assert!(!popup_shown(harness), "{why}");
+            checked += 1;
+        }
+        if popup_clock() >= end {
+            break;
+        }
+        advance_popup_clock(FRAME_MS);
     }
+    assert!(checked > 0, "no frame fell within the quiet period: {why}");
+    seen
 }
 
 fn snapshot(harness: &mut Harness<'_, AnalyzerApp>, shared: &SharedControl, name: &str) {
@@ -96,11 +142,13 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
     std::env::set_var("APPDATA", &dir);
     // The popup's quiet period after an iPad leaves, shortened from 20 s.
     std::env::set_var("ETERNAL_UPDATE_POPUP_QUIET_MS", POPUP_QUIET_MS.to_string());
+    start_popup_clock();
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let checked_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -276,6 +324,16 @@ fn harness(
     pixels_per_point: f32,
 ) -> Harness<'static, AnalyzerApp> {
     let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
+    harness_with(shared, size, pixels_per_point, supervisor_tx)
+}
+
+/// As [`harness`], sending the window's Start and Stop to `supervisor_tx`.
+fn harness_with(
+    shared: &SharedControl,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+    supervisor_tx: std::sync::mpsc::Sender<SupervisorCommand>,
+) -> Harness<'static, AnalyzerApp> {
     let control = GuiControl {
         shared: shared.clone(),
         supervisor_tx,
@@ -356,12 +414,17 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     snapshot(&mut harness, &shared, "performance");
 
     nav(&mut harness, "Settings");
-    harness.get_by_label("Encoder input");
-    harness.get_by_label("ADVANCED");
+    harness.get_by_label("TROUBLESHOOTING");
     harness.get_by_label("120").click();
     harness.run_steps(4);
     assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
-    // Encoder input sits under Advanced, below the fold.
+    // Encoder input sits under Troubleshooting, closed until clicked.
+    assert!(harness.query_by_label("Encoder input").is_none());
+    harness.get_by_label("Show options").scroll_to_me();
+    harness.run_steps(4);
+    harness.get_by_label("Show options").click();
+    harness.run_steps(4);
+    harness.get_by_label("Encoder input");
     harness.get_by_label("BGRA").scroll_to_me();
     harness.run_steps(4);
     harness.get_by_label("BGRA").click();
@@ -541,8 +604,602 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     disconnect_ipad(&shared);
     popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
+    troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
+    reset_keeps_environment_overrides(&shared, &dir, &mut results);
+    waiting_for_the_port_can_be_stopped(&shared, &mut results);
+    code_pairing_pause_says_why_and_resumes(&shared, &mut results);
+    setup_shows_the_code_pairing_pause(&shared, &mut results);
+    listen_on_is_chosen_and_reset(&shared, &dir, &mut results);
+    pairing_off_is_warned(&shared, &dir, &mut results);
+    a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// Too many wrong codes pause code pairing. The Stream page says why and
+/// what still works, and Resume code pairing gives a new code at once.
+fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut SnapshotResults) {
+    pause_code_pairing(shared);
+    let paused_code = shared.pairing.lock().code();
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    window.get_by_label(CODE_PAIRING_PAUSED);
+    assert!(window.query_by_label("New code").is_none());
+    window.snapshot("stream-code-pairing-paused");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Resume code pairing").click();
+    window.run_steps(4);
+    assert!(shared
+        .pairing
+        .lock()
+        .code_pairing_paused(Instant::now())
+        .is_none());
+    assert_ne!(shared.pairing.lock().code(), paused_code);
+    assert!(window.query_by_label("Resume code pairing").is_none());
+    window.get_by_label("New code");
+}
+
+/// Setup's Pair step says the same in place of the code, beside the QR
+/// code, and Resume code pairing shows a new code there.
+fn setup_shows_the_code_pairing_pause(shared: &SharedControl, results: &mut SnapshotResults) {
+    pause_code_pairing(shared);
+    let paused_code = shared.pairing.lock().code();
+    let mut window = harness(shared, egui::vec2(820.0, 560.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Run setup again").scroll_to_me();
+    window.run_steps(4);
+    nav(&mut window, "Run setup again");
+    for _ in 0..4 {
+        nav(&mut window, "Next");
+    }
+    // The Pair step looks up the LAN address, like the QR dialog. Put the
+    // fixed fixture back for a deterministic image.
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+    window.run_steps(4);
+    window.get_by_label("Connect your iPad");
+    window.get_by_label(CODE_PAIRING_PAUSED);
+    let shown = |code: u32| {
+        let code = format!("{code:06}");
+        format!("{} {}", &code[..3], &code[3..])
+    };
+    assert!(window.query_by_label(&shown(paused_code)).is_none());
+    window.snapshot("setup-pair-code-pairing-paused");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Resume code pairing").click();
+    window.run_steps(4);
+    assert!(shared
+        .pairing
+        .lock()
+        .code_pairing_paused(Instant::now())
+        .is_none());
+    let code = shared.pairing.lock().code();
+    assert_ne!(code, paused_code);
+    assert!(window.query_by_label("Resume code pairing").is_none());
+    window.get_by_label(&shown(code));
+    nav(&mut window, "Done");
+}
+
+const CODE_PAIRING_PAUSED: &str = "Too many wrong codes were typed, so code pairing is paused for 10 more minutes. The QR code and USB still work. Resuming gives a new code.";
+
+/// Too many wrong codes, as from iPads on the network, pause code pairing.
+fn pause_code_pairing(shared: &SharedControl) {
+    let now = Instant::now();
+    let mut pairing = shared.pairing.lock();
+    let wrong = pairing.code() % 999_999 + 1;
+    for n in 0..eternal_host::pairing::CODE_BUDGET as u32 {
+        let peer = PeerId::udp(std::net::SocketAddr::from((
+            [192, 0, 2, 100 + n as u8],
+            50000,
+        )));
+        let hello = Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 900 + n,
+            listen_port: 50000,
+            decoder_caps: 3,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 120,
+            device_name: "Unknown iPad".into(),
+            device_id: 99,
+            preferred_fps: 60,
+            auth_token: [0; 16],
+            pairing_code: wrong,
+        };
+        assert!(pairing.authorize(peer, &hello, now).is_err());
+    }
+    assert!(pairing.code_pairing_paused(now).is_some());
+}
+
+/// Turning pairing off in Settings says what that allows, until it is on
+/// again.
+fn pairing_off_is_warned(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let warning = "Pairing is off, so any iPad on your network can connect, and use this PC's mouse and keyboard, without a code. Turn it on unless every device on this network is yours.";
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let switch = || kittest::by().role(Role::CheckBox).label("Require pairing");
+    window.get(switch()).scroll_to_me();
+    window.run_steps(4);
+    assert!(window.query_by_label(warning).is_none());
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(!shared.pairing.lock().required);
+    assert!(!settings_file(dir).require_pairing);
+    window.get_by_label(warning).scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-pairing-off");
+    results.extend_harness(&mut window);
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(shared.pairing.lock().required);
+    assert!(window.query_by_label(warning).is_none());
+}
+
+/// Listen on offers each network with its address, and Tailscale. A choice
+/// moves the Address row to that network and asks for a restart, a network
+/// that isn't connected says so, and Reset puts All networks back.
+fn listen_on_is_chosen_and_reset(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind, ListenOn};
+    let adapter = |name: &str, kind, ip: [u8; 4]| Adapter {
+        name: name.into(),
+        kind,
+        up: true,
+        gateway: kind != Kind::Vpn,
+        ipv4: vec![ip.into()],
+    };
+    let wifi = adapter("Wi-Fi", Kind::Wifi, [192, 168, 1, 20]);
+    set_test_adapters(Some(vec![
+        wifi.clone(),
+        adapter("Tailscale", Kind::Vpn, [100, 80, 1, 2]),
+    ]));
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let toggle = |window: &mut Harness<'_, AnalyzerApp>, label: &str| {
+        window.get_by_label(label).scroll_to_me();
+        window.run_steps(4);
+        window.get_by_label(label).click();
+        window.run_steps(4);
+    };
+    toggle(&mut window, "Show options");
+    let listen = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
+    window
+        .get(listen("All networks (Automatic)"))
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get(listen("All networks (Automatic)")).click();
+    window.run_steps(4);
+    window.get_by_label("Wi-Fi (192.168.1.20)");
+    window.get_by_label("Tailscale only (100.80.1.2)").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::Tailscale);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::Tailscale);
+    assert_eq!(PIPELINE_STATS.lock().listen_addr, "100.80.1.2:9876");
+    window.get_by_label("Restart the stream to apply your changes");
+    assert!(window
+        .query_by_label_contains("isn't connected now")
+        .is_none());
+
+    // Tailscale goes away: the row says what still works.
+    set_test_adapters(Some(vec![wifi]));
+    toggle(&mut window, "Hide options");
+    toggle(&mut window, "Show options");
+    window.get(listen("Tailscale only (not connected)"));
+    window.get_by_label(
+        "That network isn't connected now. Until it is, iPads can connect over USB only.",
+    );
+    window
+        .get_by_label("Reset troubleshooting settings")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-listen-on");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::All);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::All);
+    set_test_adapters(None);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+}
+
+/// Tailscale owns the default route. The Address row, its Copy and the QR
+/// code keep the address they always had; one line adds the Wi-Fi's IP,
+/// without the port, for the iPad's PC address field.
+fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind};
+    let vpn = "100.80.1.2:9876";
+    let hint = "If that doesn't connect and your iPad is on the same network as this PC, use 192.168.1.20 as the PC address.";
+    PIPELINE_STATS.lock().listen_addr = vpn.into();
+    let adapter = |kind, ip: [u8; 4]| Adapter {
+        name: format!("{kind:?}"),
+        kind,
+        up: true,
+        gateway: true,
+        ipv4: vec![ip.into()],
+    };
+    set_test_adapters(Some(vec![
+        adapter(Kind::Vpn, [100, 80, 1, 2]),
+        adapter(Kind::Wifi, [192, 168, 1, 20]),
+    ]));
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    // The adapters are listed off the window's thread.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while window.query_by_label(hint).is_none() {
+        assert!(Instant::now() < deadline, "the hint never showed");
+        std::thread::sleep(Duration::from_millis(10));
+        window.run_steps(1);
+    }
+    // The iPad has a Port field of its own: the hint gives the IP alone.
+    assert!(window.query_by_label_contains("192.168.1.20:").is_none());
+    window.get_by_label(vpn);
+    window.get_by_label("Copy address").click();
+    window.step();
+    assert_eq!(copied_text(&window).as_deref(), Some(vpn));
+
+    // Opening the QR code resolves the address as it always has.
+    window
+        .get_by_role_and_label(Role::Button, "QR code")
+        .click();
+    window.run_steps(4);
+    assert_eq!(
+        PIPELINE_STATS.lock().listen_addr,
+        eternal_host::gui::detect_local_ip(9876)
+    );
+    // The code encodes the address under it, the shown one.
+    PIPELINE_STATS.lock().listen_addr = vpn.into();
+    window.run_steps(4);
+    window.get_by_label("Scan to connect");
+    assert_eq!(window.get_all_by_label(vpn).count(), 2);
+    window.get_by_label("Done").click();
+    window.run_steps(4);
+
+    // Shown on the Wi-Fi itself: nothing more.
+    PIPELINE_STATS.lock().listen_addr = "192.168.1.20:9876".into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while window
+        .query_by_label_contains("as the PC address")
+        .is_some()
+    {
+        assert!(Instant::now() < deadline, "the hint stayed");
+        std::thread::sleep(Duration::from_millis(10));
+        window.run_steps(1);
+    }
+    set_test_adapters(None);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
+}
+
+/// Another program holds the stream port: the Stream page says so and
+/// offers Stop, which cancels the start that would follow. Start streaming
+/// comes back once the port is free.
+fn waiting_for_the_port_can_be_stopped(shared: &SharedControl, results: &mut SnapshotResults) {
+    use eternal_host::startup::port;
+    let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let held = holder.local_addr().unwrap().port();
+    PIPELINE_STATS.lock().pipeline_running = false;
+    // As the supervisor checks before a start.
+    assert!(!port::check(held));
+    let (supervisor_tx, supervisor_rx) = std::sync::mpsc::channel();
+    let mut window = harness_with(shared, egui::vec2(1040.0, 900.0), 1.0, supervisor_tx);
+    window.get_by_label("Another program is using EternalMonitor's network port");
+    window.get_by_label("Waiting for the stream port…");
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Start streaming")
+        .is_none());
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Restart")
+        .is_none());
+    // The port is random; its text is masked after it is checked, out to
+    // the banner's edge whatever its width.
+    window.run_steps(4);
+    mask_pairing_code(&mut window, shared);
+    let body = format!("uses port {held}.");
+    let body = window.get_by_label_contains(&body).rect();
+    window.mask(body.with_max_x(990.0));
+    window.snapshot("stream-waiting-for-port");
+    results.extend_harness(&mut window);
+
+    window.get_by_role_and_label(Role::Button, "Stop").click();
+    window.run_steps(4);
+    assert_eq!(supervisor_rx.try_recv(), Ok(SupervisorCommand::Stop));
+
+    drop(holder);
+    assert!(port::check(held));
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("Another program is using EternalMonitor's network port")
+        .is_none());
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Stop")
+        .is_none());
+    window.get_by_role_and_label(Role::Button, "Start streaming");
+    PIPELINE_STATS.lock().pipeline_running = true;
+}
+
+/// A hybrid laptop: the panel on the Radeon iGPU, EternalMonitor on the
+/// NVIDIA card (the 0.3.3 field case).
+fn hybrid_laptop() -> eternal_host::gpu_preference::GpuFacts {
+    use eternal_host::gpu_preference::{Adapter, GpuFacts};
+    GpuFacts {
+        adapters: vec![
+            Adapter {
+                id: (0, 0x2222),
+                name: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+            },
+            Adapter {
+                id: (0, 0x1111),
+                name: "AMD Radeon(TM) 780M Graphics".into(),
+            },
+        ],
+        power_saving: Some((0, 0x1111)),
+        high_performance: Some((0, 0x2222)),
+        screens: vec![
+            (r"\\.\DISPLAY1".into(), (0, 0x1111)),
+            (r"\\.\DISPLAY2".into(), (0, 0x2222)),
+        ],
+    }
+}
+
+/// Settings > Troubleshooting on a hybrid laptop, and the Stream page
+/// notice that moves EternalMonitor onto the card its screen is wired to.
+/// Nothing here writes Windows settings: off Windows the graphics card
+/// setting can't be saved and a restart can't start, which the test checks.
+fn troubleshooting_and_hybrid_notice(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    for label in [
+        "Graphics card for EternalMonitor",
+        "Window drawing",
+        "Video encoder",
+        "Sharper video format (HEVC)",
+        "Smaller network packets",
+        "Reset troubleshooting settings",
+        "EternalMonitor runs on the NVIDIA GeForce RTX 5060 Laptop GPU now.",
+        "DISPLAY1 is connected to the AMD Radeon(TM) 780M Graphics.",
+    ] {
+        window.get_by_label(label);
+    }
+    // Every choice starts at Automatic.
+    let graphics_card = || {
+        kittest::by()
+            .role(Role::ComboBox)
+            .value("Automatic (Windows decides)")
+    };
+    window.get(graphics_card());
+    window
+        .get_by_label("Graphics card for EternalMonitor")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-troubleshooting");
+
+    // Picking a card waits for a restart, which Windows needs.
+    window.get(graphics_card()).click();
+    window.run_steps(4);
+    window
+        .get_by_label("Power saving (AMD Radeon 780M)")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Windows applies this when EternalMonitor starts again.");
+    window.get_by_label("Restart EternalMonitor").click();
+    window.run_steps(4);
+    // Saved before any restart; refused here, so nothing restarts.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
+    // Smaller packets is the VPN size; Reset puts it back.
+    window
+        .get_by_label("Use smaller network packets")
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Use smaller network packets").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1200);
+    assert_eq!(settings_file(dir).max_dgram, 1200);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1400);
+    assert_eq!(settings_file(dir).max_dgram, 1400);
+    assert_eq!(
+        settings_file(dir).window_drawing,
+        eternal_host::troubleshooting::WindowDrawing::Automatic
+    );
+    results.extend_harness(&mut window);
+
+    // Windows won't share the panel from the NVIDIA card.
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_diagnosis.lock() = Some(Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    });
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window
+        .get_by_label("Windows won't share this screen from the graphics card EternalMonitor uses");
+    window.get_by_label_contains("Your screen is connected to the AMD Radeon(TM) 780M Graphics");
+    snapshot(&mut window, shared, "stream-hybrid-switch");
+    window
+        .get_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .click();
+    window.run_steps(4);
+    // Off Windows the setting can't be saved: nothing restarts, and no
+    // switch is recorded.
+    window.get_by_label_contains("Couldn't save the graphics card setting");
+    assert!(window
+        .query_by_label("EternalMonitor couldn't restart by itself")
+        .is_none());
+    assert!(shared.gpu_switch.lock().is_none());
+    assert!(settings_file(dir).gpu_switch.is_none());
+    results.extend_harness(&mut window);
+
+    // After the restart Windows still refused: another app picks the card.
+    let mut record = SwitchRecord::new(
+        None,
+        None,
+        Preference::PowerSaving,
+        "AMD Radeon(TM) 780M Graphics",
+    );
+    record.checking = false;
+    record.failed = true;
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    // Capture records the outcome while the window is open.
+    *shared.gpu_switch.lock() = Some(record);
+    window.run_steps(4);
+    window.get_by_label("Another app is choosing EternalMonitor's graphics card");
+    window.get_by_role_and_label(Role::Button, "Undo the change");
+    window.get_by_role_and_label(Role::Button, "Restart EternalMonitor");
+    assert!(window
+        .query_by_role_and_label(Role::Button, "Use the AMD Radeon 780M")
+        .is_none());
+    snapshot(&mut window, shared, "stream-hybrid-overridden");
+    // The window saved the record capture changed.
+    assert!(settings_file(dir)
+        .gpu_switch
+        .is_some_and(|record| record.failed));
+    // While an update hands over, Restart and Undo wait for it, say so and
+    // change nothing.
+    shared
+        .handoff
+        .claim(eternal_host::handoff::Handoff::Update)
+        .unwrap();
+    let before = shared.gpu_switch.lock().clone();
+    for button in ["Restart EternalMonitor", "Undo the change"] {
+        window.get_by_role_and_label(Role::Button, button).click();
+        window.run_steps(4);
+        window.get_by_label("An update is installing; try again in a minute.");
+        assert!(window.query_by_label("Restarting EternalMonitor").is_none());
+        assert!(window
+            .query_by_label_contains("Couldn't save the graphics card setting")
+            .is_none());
+        assert_eq!(*shared.gpu_switch.lock(), before);
+    }
+    // The update went back to waiting: the line goes.
+    shared
+        .handoff
+        .release(eternal_host::handoff::Handoff::Update);
+    window.run_steps(4);
+    assert!(window
+        .query_by_label("An update is installing; try again in a minute.")
+        .is_none());
+    // The user changed the card in the NVIDIA app and restarts. Off Windows
+    // no copy starts: the window stays and says how to restart by hand.
+    window
+        .get_by_role_and_label(Role::Button, "Restart EternalMonitor")
+        .click();
+    for _ in 0..200 {
+        window.run_steps(1);
+        if window
+            .query_by_label("EternalMonitor couldn't restart by itself")
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    window.get_by_label("EternalMonitor couldn't restart by itself");
+    window.get_by_label("Quit EternalMonitor and open it again.");
+    window.get_by_role_and_label(Role::Button, "Quit EternalMonitor");
+    snapshot(&mut window, shared, "stream-restart-failed");
+    results.extend_harness(&mut window);
+
+    *shared.gpu_switch.lock() = None;
+    *shared.gpu_diagnosis.lock() = None;
+    *shared.capture_block.lock() = None;
+    *shared.gpu_facts.lock() = None;
+}
+
+/// Reset clears the saved Troubleshooting choices only: a value an
+/// environment variable sets stays in effect, and its row still says so.
+fn reset_keeps_environment_overrides(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::encoder::input::EncoderInput;
+    use eternal_host::troubleshooting::WindowDrawing;
+    let before = settings_file(dir);
+    SettingsFile {
+        encoder_override: Some("h264_qsv".into()),
+        encoder_input: EncoderInput::Bgra,
+        hevc_enabled: true,
+        max_dgram: 1200,
+        window_drawing: WindowDrawing::Vulkan,
+        ..before.clone()
+    }
+    .save()
+    .unwrap();
+    let vars = [
+        ("ETERNAL_ENCODER", "h264_amf"),
+        ("ETERNAL_INPUT", "bgra"),
+        ("ETERNAL_HEVC", "1"),
+        ("ETERNAL_MAX_DGRAM", "1000"),
+    ];
+    for (name, value) in vars {
+        std::env::set_var(name, value);
+    }
+    // As main applies them before the window opens.
+    shared.max_dgram.store(1000, Ordering::SeqCst);
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    window.get_by_label("Show options").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Show options").click();
+    window.run_steps(4);
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    // The saved choices are back to Automatic.
+    let saved = settings_file(dir);
+    assert_eq!(saved.encoder_override, None);
+    assert_eq!(saved.encoder_input, EncoderInput::default());
+    assert!(!saved.hevc_enabled);
+    assert_eq!(saved.max_dgram, 1400);
+    assert_eq!(saved.window_drawing, WindowDrawing::Automatic);
+    // What runs is still what the variables say.
+    assert_eq!(shared.max_dgram.load(Ordering::SeqCst), 1000);
+    assert_eq!(shared.encoder_override.lock().as_deref(), Some("h264_amf"));
+    assert_eq!(*shared.encoder_input.lock(), EncoderInput::Bgra);
+    assert!(shared.hevc_enabled.load(Ordering::SeqCst));
+    window.get_by_label_contains("Set by ETERNAL_MAX_DGRAM on this PC");
+    // Nothing the variables fix asks for a stream restart.
+    nav(&mut window, "Stream");
+    assert!(window
+        .query_by_label("Restart the stream to apply your changes")
+        .is_none());
+    results.extend_harness(&mut window);
+
+    for (name, _) in vars {
+        std::env::remove_var(name);
+    }
+    before.save().unwrap();
+    shared.max_dgram.store(1400, Ordering::SeqCst);
+    *shared.encoder_override.lock() = None;
+    *shared.encoder_input.lock() = EncoderInput::default();
+    shared.hevc_enabled.store(false, Ordering::SeqCst);
 }
 
 /// The session, not the pipeline, says whether an iPad is there: a capture
@@ -578,32 +1235,42 @@ fn popup_waits_while_the_ipad_has_a_session(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     connect_ipad(shared);
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, 200, "the iPad is streaming");
+    let mut seen = no_popup_for(&mut window, launched, true, 200, "the iPad is streaming");
 
     // The pipeline restarts; the session stays. Longer than the quiet period.
     PIPELINE_STATS.lock().pipeline_running = false;
-    no_popup_for(
+    seen = no_popup_for(
         &mut window,
+        seen,
+        true,
         POPUP_QUIET_MS + 1000,
         "the iPad is still connected while the stream restarts",
     );
     PIPELINE_STATS.lock().pipeline_running = true;
-    no_popup_for(&mut window, 200, "the stream is back");
+    seen = no_popup_for(&mut window, seen, true, 200, "the stream is back");
 
     // Three USB drops, each followed by the iPad reconnecting.
     for _ in 0..3 {
         shared.session.lock().link_lost(PeerId::usb(7).link);
-        no_popup_for(&mut window, 300, "the iPad is reconnecting");
+        no_popup_for(&mut window, seen, false, 300, "the iPad is reconnecting");
         connect_ipad(shared);
-        no_popup_for(&mut window, 100, "the iPad reconnected");
+        seen = no_popup_for(&mut window, seen, true, 100, "the iPad reconnected");
     }
     // It stays away this time: the popup opens after the quiet period.
     shared.session.lock().link_lost(PeerId::usb(7).link);
-    no_popup_for(&mut window, 500, "too soon after the iPad left");
+    no_popup_for(
+        &mut window,
+        seen,
+        false,
+        500,
+        "too soon after the iPad left",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
@@ -627,9 +1294,16 @@ fn popup_waits_after_launch(
     cached["popup"] = serde_json::Value::Null;
     cached["later"] = serde_json::Value::Null;
     std::fs::write(&state, cached.to_string()).unwrap();
+    let launched = popup_clock();
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     window.get_by_label("EternalMonitor 99.0.0 is available");
-    no_popup_for(&mut window, POPUP_QUIET_MS - 1000, "too soon after launch");
+    no_popup_for(
+        &mut window,
+        launched,
+        false,
+        POPUP_QUIET_MS - 1000,
+        "too soon after launch",
+    );
     wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
@@ -648,10 +1322,9 @@ fn update_arrives_while_feedback_is_open(
     results: &mut SnapshotResults,
 ) {
     use std::io::{BufRead, BufReader, Write};
-    // A site that answers the check only when told to.
+    // A site that answers the check at once.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (answer, answered) = std::sync::mpsc::channel::<()>();
     let manifest = serde_json::json!({
         "schema": 1,
         "windows": {
@@ -668,7 +1341,6 @@ fn update_arrives_while_feedback_is_open(
         while reader.read_line(&mut line).unwrap_or(0) > 2 {
             line.clear();
         }
-        let _ = answered.recv();
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
@@ -676,7 +1348,10 @@ fn update_arrives_while_feedback_is_open(
         );
     });
     // Never checked, so the window checks as it opens; already announced,
-    // so no notification.
+    // so no notification. The check waits until Send feedback is open:
+    // its request times out after 10 s, which drawing the panel on a
+    // loaded machine can take.
+    eternal_host::updates::hold_checks(true);
     std::fs::write(
         dir.join("EternalMonitor/update-state.json"),
         serde_json::json!({ "notified": "99.1.0" }).to_string(),
@@ -688,7 +1363,8 @@ fn update_arrives_while_feedback_is_open(
         star_clicked: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     std::env::set_var("ETERNAL_UPDATE_BASE", &base);
     let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
     std::env::remove_var("ETERNAL_UPDATE_BASE");
@@ -699,23 +1375,33 @@ fn update_arrives_while_feedback_is_open(
         .click();
     window.run_steps(4);
     window.get_by_label("Tell us how it's going");
-    answer.send(()).unwrap();
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    eternal_host::updates::hold_checks(false);
+    // Only a backstop for a check that never finishes.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while window
         .query_by_label("EternalMonitor 99.1.0 is available")
         .is_none()
     {
         assert!(Instant::now() < deadline, "the check never finished");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         window.run_steps(1);
     }
     window.run_steps(4);
-    assert!(
-        window
-            .query_by_role_and_label(Role::Dialog, "Update ready")
-            .is_none(),
-        "the popup must not open over Send feedback"
-    );
+    // Past the quiet period, so only the open panel keeps the popup away.
+    for frame in 0..(POPUP_QUIET_MS / FRAME_MS + 5) {
+        advance_popup_clock(FRAME_MS);
+        window.run_steps(1);
+        assert!(
+            window.query_by_label("Tell us how it's going").is_some(),
+            "Send feedback closed by itself after {frame} frames"
+        );
+        assert!(
+            window
+                .query_by_role_and_label(Role::Dialog, "Update ready")
+                .is_none(),
+            "the popup must not open over Send feedback (frame {frame})"
+        );
+    }
     window.get_by_label("Close").click();
     wait_for_popup(&mut window);
     window
@@ -839,6 +1525,18 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.run_steps(4);
     snapshot(&mut window, shared, "settings-about");
 
+    // The diagnostics line is in words, without field names or ids. Uploads
+    // are not configured in tests.
+    window
+        .get_by_role_and_label(Role::CheckBox, "Automatically share diagnostics")
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Sharing diagnostics isn't available in this build.");
+    assert!(window.query_by_label_contains("queue_dropped").is_none());
+    snapshot(&mut window, shared, "settings-diagnostics");
+    window.get_by_label("Source code").scroll_to_me();
+    window.run_steps(4);
+
     // The panel: kind, message, details and the ways to send.
     window
         .get_all_by_role_and_label(Role::Button, "Send feedback")
@@ -953,7 +1651,8 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
         feedback_sessions: 3,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     let streaming = harness(shared, size, 1.0);
     assert!(streaming
         .query_by_label("How's EternalMonitor working for you? :)")
@@ -1040,7 +1739,8 @@ fn review_screens() {
         capture_display: Some(eternal_host::control::CAPTURE_VIRTUAL_SENTINEL.into()),
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     *shared.vdd_status.lock() = VddStatus::WaitingForClient;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "extend-waiting");
@@ -1049,6 +1749,10 @@ fn review_screens() {
     PIPELINE_STATS.lock().using_software_fallback = true;
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
     save(&mut h, "problems-display-task-and-encoder");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problem-nvidia-driver-outdated");
+    PIPELINE_STATS.lock().nvidia_driver_outdated = false;
     *shared.vdd_status.lock() = VddStatus::Failed;
     PIPELINE_STATS.lock().using_software_fallback = false;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
@@ -1065,12 +1769,14 @@ fn review_screens() {
         check_for_updates: false,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
 
     // Windows keeping the screen from the app, in each way it can.
     for (name, block) in [
         ("secure-desktop", CaptureBlock::SecureDesktop),
         ("display-changing", CaptureBlock::DisplayChanging),
+        ("no-display", CaptureBlock::NoDisplay),
         ("unsupported-gpu", CaptureBlock::UnsupportedOnThisGpu),
         ("too-many-capture-apps", CaptureBlock::TooManyCaptureApps),
         ("session-disconnected", CaptureBlock::SessionDisconnected),
@@ -1079,6 +1785,15 @@ fn review_screens() {
         let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
         save(&mut h, &format!("problem-{name}"));
     }
+    *shared.gpu_diagnosis.lock() = Some(eternal_host::gpu_preference::Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(eternal_host::gpu_preference::Preference::PowerSaving),
+    });
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-unsupported-gpu-switch");
+    *shared.gpu_diagnosis.lock() = None;
     *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);
@@ -1094,6 +1809,12 @@ fn review_screens() {
     let mut tall = harness(&shared, egui::vec2(1040.0, 1720.0), 2.0);
     nav(&mut tall, "Settings");
     save(&mut tall, "settings-full");
+    *shared.gpu_facts.lock() = Some(hybrid_laptop());
+    let mut tall = harness(&shared, egui::vec2(1040.0, 2300.0), 2.0);
+    nav(&mut tall, "Settings");
+    tall.get_by_label("Show options").click();
+    save(&mut tall, "settings-troubleshooting-full");
+    *shared.gpu_facts.lock() = None;
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
 
@@ -1109,7 +1830,8 @@ fn review_screens() {
         check_for_updates: true,
         ..Default::default()
     }
-    .save();
+    .save()
+    .unwrap();
     disconnect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     wait_for_popup(&mut h);

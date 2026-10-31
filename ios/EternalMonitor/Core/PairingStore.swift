@@ -79,6 +79,11 @@ final class PairingStore: ObservableObject {
         (try? token(address: Self.address(host: host, port: port))) != nil
     }
 
+    /// Any PC paired with this iPad.
+    var hasPairings: Bool {
+        (try? storage.records())?.contains { Self.valid($0.token) } ?? false
+    }
+
     func save(token: Data, hostName: String, address: String) throws {
         guard Self.valid(token) else { return }
         let account = "\(hostName)|\(address)"

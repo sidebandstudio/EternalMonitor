@@ -3,6 +3,7 @@ import SwiftUI
 struct DisplayView: View {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var settings: AppSettings
+    @ObservedObject private var language = LanguageStore.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     @State private var showHUD = true
@@ -19,33 +20,40 @@ struct DisplayView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // Full-bleed video
-            if connectionManager.sessionWantsInput {
-                // Input relay active: every 1-2 finger gesture belongs to the
-                // PC; a three-finger tap (via the relay layer) drives the HUD.
-                MetalView()
-                    .ignoresSafeArea()
-                    .opacity(appeared ? 1 : 0)
-                TouchRelayView(keyboardVisible: $showKeyboard, active: !showSettings && !connectionManager.signalLost, onToggleHUD: { toggleHUD() })
-                    .ignoresSafeArea()
-            } else {
-                // One gesture, one meaning: tap toggles the HUD.
-                MetalView()
-                    .ignoresSafeArea()
-                    .opacity(appeared ? 1 : 0)
-                    .onTapGesture { toggleHUD() }
-            }
+            // Full-bleed video, left to right in every language.
+            ZStack {
+                if connectionManager.sessionWantsInput {
+                    // Input relay active: every 1-2 finger gesture belongs to the
+                    // PC; a three-finger tap (via the relay layer) drives the HUD.
+                    MetalView()
+                        .ignoresSafeArea()
+                        .opacity(appeared ? 1 : 0)
+                    TouchRelayView(keyboardVisible: $showKeyboard, active: !showSettings && !connectionManager.signalLost, onToggleHUD: { toggleHUD() })
+                        .ignoresSafeArea()
+                } else {
+                    // One gesture, one meaning: tap toggles the HUD.
+                    MetalView()
+                        .ignoresSafeArea()
+                        .opacity(appeared ? 1 : 0)
+                        .onTapGesture { toggleHUD() }
+                }
 
-            #if DEBUG
-            if UIPreview.showsBackdrop {
-                UIPreview.Backdrop()
-                    .onTapGesture { toggleHUD() }
+                #if DEBUG
+                if UIPreview.showsBackdrop {
+                    UIPreview.Backdrop()
+                        .onTapGesture { toggleHUD() }
+                }
+                #endif
             }
-            #endif
+            .streamSurfaceDirection()
 
             if connectionManager.signalLost {
                 reconnectingCard
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    .allowsHitTesting(false)
+            } else if connectionManager.pictureRestoring {
+                restoringPill
+                    .transition(.opacity)
                     .allowsHitTesting(false)
             }
 
@@ -60,7 +68,7 @@ struct DisplayView: View {
                                 .background(glass(Circle()))
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Show or hide drawing controls")
+                        .accessibilityLabel(L("Show or hide drawing controls"))
                         .accessibilityIdentifier("display.drawingControls")
                     }
                     // A hiding HUD slides out for a moment. Touches and
@@ -104,6 +112,7 @@ struct DisplayView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
             appeared = true
@@ -122,7 +131,7 @@ struct DisplayView: View {
             // screen dimming (or not) right now.
             UIApplication.shared.isIdleTimerDisabled = keepAwake
         }
-        .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showSettings) { SettingsView().appLanguage() }
         .onChange(of: showKeyboard) { _, presented in
             if presented { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
@@ -208,6 +217,9 @@ struct DisplayView: View {
         }
         .frame(height: 14)
         .animation(Motion.fade, value: bars)
+        // Bars rise left to right, and a number keeps its unit after it,
+        // in every language.
+        .environment(\.layoutDirection, .leftToRight)
     }
 
     private var qualityPopover: some View {
@@ -259,6 +271,7 @@ struct DisplayView: View {
                         .foregroundStyle(Theme.textMuted)
                 }
             }
+            .environment(\.layoutDirection, .leftToRight)
         }
     }
 
@@ -277,6 +290,7 @@ struct DisplayView: View {
         }
         // A one-digit value leaves the pill too narrow for "fps" otherwise.
         .fixedSize()
+        .environment(\.layoutDirection, .leftToRight)
     }
 
     private var separator: some View {
@@ -291,7 +305,7 @@ struct DisplayView: View {
         HStack(spacing: 8) {
             HStack(spacing: 10) {
                 StatusDot(color: connectionManager.signalLost ? Theme.warning : Theme.accent, size: 8, pulses: !connectionManager.signalLost)
-                Text(connectionManager.signalLost ? "Reconnecting" : "Live")
+                Text(connectionManager.signalLost ? L("Reconnecting") : L("Live"))
                     .font(.app(14, .semibold, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
                 if sizeClass != .compact {
@@ -304,7 +318,7 @@ struct DisplayView: View {
             .padding(.trailing, 6)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(
-                connectionManager.signalLost ? "Signal lost, reconnecting" : "On air"
+                connectionManager.signalLost ? L("Signal lost, reconnecting") : L("On air")
             )
             .accessibilityIdentifier("display.signal")
 
@@ -312,7 +326,7 @@ struct DisplayView: View {
 
             if connectionManager.sessionHasKeyboard {
                 Button { showKeyboard.toggle() } label: {
-                    toolbarLabel(showKeyboard ? "Hide keyboard" : "Keyboard", "keyboard")
+                    toolbarLabel(showKeyboard ? L("Hide keyboard") : L("Keyboard"), "keyboard")
                 }
                 .buttonStyle(PillButtonStyle(
                     foreground: showKeyboard ? Theme.onAccent : Theme.text,
@@ -331,7 +345,7 @@ struct DisplayView: View {
                     .frame(width: 40, height: 40)
             }
             .buttonStyle(PillButtonStyle())
-            .accessibilityLabel(settings.pictureFit == .fit ? "Fill the screen" : "Show the whole picture")
+            .accessibilityLabel(settings.pictureFit == .fit ? L("Fill the screen") : L("Show the whole picture"))
             .accessibilityIdentifier("display.pictureFit")
 
             Button { showSettings = true } label: {
@@ -340,16 +354,16 @@ struct DisplayView: View {
                     .frame(width: 40, height: 40)
             }
             .buttonStyle(PillButtonStyle())
-            .accessibilityLabel("Stream settings")
+            .accessibilityLabel(L("Stream settings"))
             .accessibilityIdentifier("display.settings")
 
             Button {
                 connectionManager.cancel()
             } label: {
-                toolbarLabel("Disconnect", "xmark")
+                toolbarLabel(L("Disconnect"), "xmark")
             }
             .buttonStyle(PillButtonStyle(foreground: Theme.danger, fill: Theme.danger.opacity(0.14)))
-            .accessibilityLabel("Disconnect")
+            .accessibilityLabel(L("Disconnect"))
             .accessibilityIdentifier("display.disconnect")
         }
         .padding(6)
@@ -383,6 +397,24 @@ struct DisplayView: View {
         .padding(.vertical, 24)
         .frame(maxWidth: 360)
         .background(glass(RoundedRectangle(cornerRadius: 22, style: .continuous)))
+    }
+
+    /// The PC is still connected but a lost frame left the picture waiting
+    /// for a fresh one; usually gone in well under a second.
+    private var restoringPill: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(Theme.text)
+            Text("Restoring the picture…")
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Restoring the picture")
+        .accessibilityIdentifier("display.restoringPicture")
     }
 
     private func glass<S: InsettableShape>(_ shape: S) -> some View {

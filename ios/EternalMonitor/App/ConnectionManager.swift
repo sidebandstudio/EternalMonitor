@@ -68,6 +68,14 @@ struct ConnectionDebugState {
         }
         return "Received \(decodedFrames) decoded frames, but the connection did not transition cleanly."
     }
+
+    /// The timeout line's level. A HELLO no one answered is a warning (a PC
+    /// that is off, asleep or elsewhere) unless the PC at this address
+    /// accepted a session earlier in this launch.
+    func timeoutLevel(handshakeDone: Bool, answeredHereBefore: Bool) -> DiagnosticLevel {
+        let unanswered = listenerReadyPort != nil && helloAttempts > 0 && datagramsReceived == 0 && !handshakeDone
+        return unanswered && !answeredHereBefore ? .warning : .error
+    }
 }
 
 @MainActor
@@ -100,6 +108,9 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var stats = StreamStats()
     /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
     @Published private(set) var signalLost = false
+    /// Frames still arrive, but the picture has been held for over a second
+    /// waiting for the keyframe that replaces a lost frame.
+    @Published var pictureRestoring = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -140,7 +151,7 @@ final class ConnectionManager: ObservableObject {
     private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
-    private var videoDecoder: VideoDecoder?
+    private(set) var videoDecoder: VideoDecoder?
     private var audioPlayer: AudioPlayer?
     private var audioPreference: Bool?
     private var timeoutTask: Task<Void, Never>?
@@ -149,17 +160,25 @@ final class ConnectionManager: ObservableObject {
     /// old per-datagram MainActor Task (~2 per datagram, ~2,800 hops/s at
     /// 1080p60) throttled the whole receive path.
     private let streamCounters = StreamCounters()
-    private var debugState = ConnectionDebugState()
+    private(set) var debugState = ConnectionDebugState()
     // Whether we've already granted the one-time timeout extension that fires when datagrams
     // start arriving (so a slow/jittery network gets a fresh window to finish reassembly+decode).
     private var didExtendTimeout = false
     /// No-picture timeouts in a row at one PC; at the limit, attempts that
     /// start by themselves stop.
     private var noPictureStreak = NoPictureStreak()
+    /// "host:port" of each PC that accepted a session in this launch.
+    private var acceptedAddresses = Set<String>()
     /// System uptime when the current attempt started, and when its PC
     /// accepted the session, for the support log's timings.
     private var attemptStartedAt: TimeInterval = 0
     private var sessionAcceptedAt: TimeInterval?
+    private var firstFrameAt: TimeInterval?
+    /// When the HELLO2 the next summary describes was started: the attempt's
+    /// start, or the latest pairing code's.
+    private var summaryStartedAt: TimeInterval = 0
+    /// The latest nonces that have their summary.
+    private var summarizedNonces: [UInt32] = []
 
     let frameSlot = FrameSlot()
     /// Lets hot-path closures reach the CURRENT control channel without
@@ -185,17 +204,24 @@ final class ConnectionManager: ObservableObject {
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
-    /// Connect and reconnect timing. The app uses the defaults; tests pass
-    /// shorter ones when they create the manager.
+    /// Connect and reconnect timing. The app uses the defaults, with the
+    /// first-picture wait the update manifest may set (10–20 s); tests pass
+    /// shorter ones when they create the manager, and may shorten them once
+    /// a session streams, so a slow machine's first connect isn't cut off.
     struct Timing {
-        var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
+        var connectTimeoutSeconds = Double(RemoteConfig.launch.firstFrameTimeoutSeconds
+            ?? Int(ConnectionManager.connectionTimeoutSeconds))
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
     }
-    private let timing: Timing
+    var timing: Timing
+    /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
+    /// to fail a lookup without asking DNS.
+    var makeUDPLink: (UInt16) -> any MediaLink
 
-    init(timing: Timing = Timing()) {
+    init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }) {
         self.timing = timing
+        self.makeUDPLink = udpReceiver
     }
 
     func refreshUSBAvailability() {
@@ -208,7 +234,7 @@ final class ConnectionManager: ObservableObject {
             return
         }
         guard usbListener == nil else { return }
-        let listener = USBListener()
+        let listener = USBListener(port: E2E.usbListenPort)
         usbListener = listener
         listener.onState = { [weak self, weak listener] state in
             Task { @MainActor in
@@ -237,7 +263,7 @@ final class ConnectionManager: ObservableObject {
         endReconnectCycle()
         if state != .disconnected {
             E2E.linkSwitch(from: "udp", to: "usb")
-            disconnect(reason: .superseded)
+            disconnect(.superseded)
         }
         connect(target: .usb(link))
     }
@@ -287,6 +313,10 @@ final class ConnectionManager: ObservableObject {
 
     func submitPairing() {
         guard awaitingPairing, let code = pairingPrompt?.submit() else { return }
+        // The code goes in a new HELLO2. The refused one ends here, as on the
+        // PC, which wrote a line for its nonce.
+        recordSummary(.retriedWithCode)
+        summaryStartedAt = ProcessInfo.processInfo.systemUptime
         controlChannel?.retryPairing(code: code)
     }
 
@@ -326,8 +356,9 @@ final class ConnectionManager: ObservableObject {
         case .udp(let host, let targetPort):
             normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedHost.isEmpty, targetPort != 0 else { return }
+            SupportDiagnostics.noteTypedAddress(normalizedHost)
             port = targetPort
-            receiver = UDPReceiver(port: port)
+            receiver = makeUDPLink(port)
             lastTarget = (normalizedHost, port)
         case .usb(let link):
             normalizedHost = "USB"
@@ -360,6 +391,8 @@ final class ConnectionManager: ObservableObject {
         didExtendTimeout = false
         attemptStartedAt = ProcessInfo.processInfo.systemUptime
         sessionAcceptedAt = nil
+        firstFrameAt = nil
+        summaryStartedAt = attemptStartedAt
         videoSize = .zero
         let drawing = DrawingProfile(enabled: UserDefaults.standard.bool(forKey: "drawingMode"), isUSB: isUSB)
         sessionDrawingMode = drawing.enabled
@@ -392,6 +425,12 @@ final class ConnectionManager: ObservableObject {
                 self.record(.warning, "assembly", message)
             }
         }
+        assembler.onInfo = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.info, "assembly", message)
+            }
+        }
 
         decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
@@ -407,6 +446,7 @@ final class ConnectionManager: ObservableObject {
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
+                    self.firstFrameAt = ProcessInfo.processInfo.systemUptime
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
                     self.timeoutTask?.cancel()
                     self.noPictureStreak = NoPictureStreak()
@@ -443,12 +483,9 @@ final class ConnectionManager: ObservableObject {
                 if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
                     self.videoSize = CGSize(width: frameWidth, height: frameHeight)
                 }
-                if ts > 0,
-                   let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }) {
-                    let nowUs = ControlChannel.clientNowUs()
-                    let captureClient = Int64(bitPattern: ts) - offset
-                    let latencyUs = Int64(bitPattern: nowUs) - captureClient
-                    self.lagMs = latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
+                if let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }),
+                   let lag = Self.latencyMs(captureUs: ts, offsetUs: offset, nowUs: ControlChannel.clientNowUs()) {
+                    self.lagMs = lag
                 }
             }
         }
@@ -459,6 +496,19 @@ final class ConnectionManager: ObservableObject {
                 streamEpoch: 0, lastCompleteSeq: 0, reason: .decodeError
             )
         }
+        // A picture held 2 s: the strongest request short of reconnecting.
+        decoder.onRestartStream = { [weak self, weak controlChannelBox] in
+            guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            controlChannelBox?.value?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .resume)
+        }
+        // Held 5 s: reconnect, as for a PC that stopped responding.
+        decoder.onStalled = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connected else { return }
+                self.record(.warning, "decode", "Picture held 5 s without a keyframe — reconnecting")
+                self.beginReconnect(.pcStoppedResponding, end: .pictureStalled)
+            }
+        }
 
         decoder.onEvent = { [weak self] message in
             Task { @MainActor in
@@ -466,8 +516,18 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "decode", message)
             }
         }
+        decoder.onFailure = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else {
+                    // A late failure of an ended attempt still reaches the support log.
+                    SupportDiagnostics.shared.record("error", "decode", message)
+                    return
+                }
+                self.record(.error, "decode", message)
+            }
+        }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
@@ -477,7 +537,9 @@ final class ConnectionManager: ObservableObject {
                 data: data,
                 width: 0,
                 height: 0,
-                isKeyframe: isKeyframe
+                isKeyframe: isKeyframe,
+                // The reassembler only accepts the current epoch's fragments.
+                streamEpoch: assembler?.counters.withLock { $0.streamEpoch } ?? 0
             ))
         }
 
@@ -515,14 +577,16 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "ctrl", message)
             }
         }
-        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler] info in
+        channel.onSessionEstablished = { [weak self, weak receiver, weak assembler, weak decoder] info in
             assembler?.repairEnabled = !isUSB && info.hostCaps & HelloAck.hostCapNack != 0
+            decoder?.setFrameSeqContiguous(info.hostCaps & HelloAck.hostCapContiguousFrameSeq != 0)
             assembler?.framePeriodUs = 1_000_000 / UInt64(max(1, info.streamConfig.fps))
             receiver?.setAcceptedSessionId(info.sessionId)
             let acceptedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.sessionAcceptedAt = acceptedAt
+                self.acceptedAddresses.insert("\(normalizedHost):\(port)")
                 self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
@@ -578,7 +642,7 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
-                self.disconnect()
+                self.disconnect(.pcRefused)
             }
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
@@ -593,7 +657,7 @@ final class ConnectionManager: ObservableObject {
                     self.versionMismatch = .pcLegacy
                     self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
-                    self.disconnect()
+                    self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
                 }
@@ -608,26 +672,26 @@ final class ConnectionManager: ObservableObject {
                     // Only Stop and update on the PC sends this. The PC comes
                     // back on the new version, so reconnect as for a restart.
                     if self.reconnectCycleID != nil {
-                        self.disconnect()
+                        self.disconnect(.pcGoodbye)
                         self.reconnectFailure = .pcUpdating(.reconnecting)
                         self.problem = .pcUpdating(.reconnecting)
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting))
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting), end: .pcGoodbye)
                     }
                 case .userDisconnect, .superseded:
                     // Disconnected from the PC, or another device took over:
                     // stay away until the user connects again.
                     self.endReconnectCycle()
-                    self.disconnect()
+                    self.disconnect(.pcGoodbye)
                     self.problem = .pcEndedSession
                 default:
                     // A PC that stops or restarts its stream may come back.
                     // A running cycle keeps going; otherwise start one.
                     if self.reconnectCycleID != nil {
-                        self.disconnect()
+                        self.disconnect(.pcGoodbye)
                         self.problem = .pcEndedSession
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession)
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession, end: .pcGoodbye)
                     }
                 }
             }
@@ -696,7 +760,10 @@ final class ConnectionManager: ObservableObject {
         receiver.onError = { [weak self] error in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
+                // A path that isn't ready yet (no network, Local Network off)
+                // is this iPad's situation, not a fault: a warning.
+                let waiting = error.kind == .pathUnavailable || error.kind == .localNetworkDenied
+                self.record(waiting ? .warning : .error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
                 let failure = ConnectionProblem.linkFailure(error, isUSB: isUSB, host: normalizedHost)
                 // A live stream rides out transient errors; a USB link that
                 // failed for good closes next, and that close reports this.
@@ -705,7 +772,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect()
+                    self.disconnect(.linkFailed)
                     self.problem = failure
                     return
                 }
@@ -740,7 +807,7 @@ final class ConnectionManager: ObservableObject {
         guard receiver.start(host: normalizedHost) else {
             connectionError = "Couldn't start streaming on this iPad. Try again."
             record(.error, "connection", "Receiver failed to start")
-            disconnect()
+            disconnect(.receiverFailed)
             return
         }
 
@@ -837,6 +904,9 @@ final class ConnectionManager: ObservableObject {
         }
         next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
         stats = next
+        let restoring = state == .connected
+            && (videoDecoder?.keyframeWaitUs ?? 0) >= VideoDecoder.showRestoringAfterUs
+        if restoring != pictureRestoring { pictureRestoring = restoring }
 
         // --- Liveness watchdog (host heartbeats stopped => stale picture) ---
         guard state == .connected else { return }
@@ -861,7 +931,10 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil) {
+    /// Ends the session that `reason` interrupted (`end` when it was not
+    /// the link: the PC said goodbye) and reconnects if that is on.
+    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil,
+                                end: AttemptEnd? = nil) {
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
         // Support logs keep the original wording so reports stay comparable.
@@ -872,7 +945,11 @@ final class ConnectionManager: ObservableObject {
         case .usbTurnedOff: logged = "USB connections turned off"
         }
         record(.warning, "ctrl", "Connection lost (\(logged))")
-        disconnect()
+        switch reason {
+        case .pcStoppedResponding: disconnect(end ?? .pcStoppedResponding)
+        case .cableUnplugged: disconnect(end ?? (failure == nil ? .cableUnplugged : .usbLinkFailed))
+        case .usbTurnedOff: disconnect(end ?? .usbTurnedOff)
+        }
         guard auto, let target else {
             problem = (failure ?? .lost(reason)).withoutReconnecting
             return
@@ -945,7 +1022,9 @@ final class ConnectionManager: ObservableObject {
                 let debug = self.debugState
                 let handshakeDone = self.hostInfo != nil
                 let isUSB = self.transportMode == "USB"
-                self.record(.error, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
+                let level = debug.timeoutLevel(handshakeDone: handshakeDone,
+                                               answeredHereBefore: self.acceptedAddresses.contains("\(debug.host):\(debug.port)"))
+                self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
                 self.problem = self.noPictureStreak.shown(.timeout(
@@ -953,7 +1032,7 @@ final class ConnectionManager: ObservableObject {
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
                 // The app gave up, not the user: the PC's log tells them apart.
-                self.disconnect(reason: .error)
+                self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
             }
         }
@@ -969,7 +1048,7 @@ final class ConnectionManager: ObservableObject {
         guard noPictureStreak.stopsReconnecting else { return false }
         let isUSB = transportMode == "USB"
         record(.warning, "ctrl", "Connection closed by the PC before a picture" + attemptTimings)
-        disconnect(reason: .error)
+        disconnect(.closedBeforePicture)
         problem = .noPicture
         stopAutomaticAttempts(isUSB: isUSB)
         return true
@@ -1086,7 +1165,7 @@ final class ConnectionManager: ObservableObject {
         resumeOnForeground = true
         record(.info, "ctrl", "App backgrounded — sending BYE and disconnecting")
         let goodbye = backgroundGoodbyeTask
-        disconnect(reason: .appBackground)
+        disconnect(.appBackground)
         if let cycleOutcome { problem = cycleOutcome }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, self.backgroundGoodbyeTask == goodbye else { return }
@@ -1123,10 +1202,13 @@ final class ConnectionManager: ObservableObject {
         )
     }
 
-    func disconnect(reason: ByeReason = .userDisconnect) {
+    /// Ends the attempt. `end` says why; only the user's own action is
+    /// `.userDisconnect`.
+    func disconnect(_ end: AttemptEnd = .userDisconnect) {
         if state != .disconnected {
-            recordStreamSummary(reason: "disconnect=\(reason)")
-            record(.info, "connection", "Disconnect state=\(state) reason=\(reason)")
+            recordStreamSummary(reason: "disconnect=\(end.name)")
+            record(.info, "connection", "Disconnect state=\(state) reason=\(end.name)")
+            recordSummary(end)
         }
         awaitingPairing = false
         pairingPrompt = nil
@@ -1139,7 +1221,7 @@ final class ConnectionManager: ObservableObject {
 
         // Say goodbye first (fire-and-forget), then stop the socket, then shut
         // the decoder down on its own queue (provably after any in-flight decode).
-        controlChannel?.sendBye(reason)
+        controlChannel?.sendBye(end.bye)
         controlChannel?.stop()
         mediaLink?.stop()
         videoDecoder?.shutdown()
@@ -1166,6 +1248,7 @@ final class ConnectionManager: ObservableObject {
         lagMs = 0
         stats = StreamStats()
         signalLost = false
+        pictureRestoring = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil
@@ -1173,10 +1256,43 @@ final class ConnectionManager: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
+    /// Records the summary of the HELLO2 that ends with `end`: one per nonce,
+    /// whichever paths reach it.
+    private func recordSummary(_ end: AttemptEnd) {
+        let summary = summary(end)
+        if summary.nonce != 0 {
+            guard !summarizedNonces.contains(summary.nonce) else { return }
+            summarizedNonces.append(summary.nonce)
+            if summarizedNonces.count > 32 { summarizedNonces.removeFirst() }
+        }
+        record(.info, "summary", summary.line)
+    }
+
+    /// The attempt's summary as it ends with `end`.
+    private func summary(_ end: AttemptEnd) -> SessionSummary {
+        let now = ProcessInfo.processInfo.systemUptime
+        return SessionSummary(
+            end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
+            nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
+            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            duration: now - summaryStartedAt)
+    }
+
+    /// Capture-to-decode latency of a frame stamped `captureUs` on the host
+    /// clock. Nil for an unstamped frame or a stamp too far from either clock
+    /// to subtract, which a broken or hostile host could send.
+    nonisolated static func latencyMs(captureUs: UInt64, offsetUs: Int64, nowUs: UInt64) -> Double? {
+        guard captureUs > 0 else { return nil }
+        let (captureClient, captureOverflow) = Int64(bitPattern: captureUs).subtractingReportingOverflow(offsetUs)
+        let (latencyUs, latencyOverflow) = Int64(bitPattern: nowUs).subtractingReportingOverflow(captureClient)
+        guard !captureOverflow, !latencyOverflow else { return nil }
+        return latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
+    }
+
     private func recordStreamSummary(reason: String) {
         let counters = frameAssembler?.counters.withLock { $0 } ?? .init()
         let clock = controlChannel?.clockSnapshot.withLock { $0 }
-        SupportDiagnostics.shared.record("info", "stream", "reason=\(reason) state=\(state) transport=\(transportMode) session_id=\(hostInfo?.sessionId ?? 0) decoded=\(debugState.decodedFrames) assembled=\(debugState.assembledFrames) datagrams=\(debugState.datagramsReceived) bytes=\(debugState.datagramBytesReceived) fps=\(fps) size=\(videoSize) depth=\(videoDecoder?.decodeDepth ?? 0) dropped=\(counters.framesDropped) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) rtt_us=\(clock?.rttUs ?? 0) e2e_ms=\(lagMs) audio=\(audioStats) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
+        SupportDiagnostics.shared.record("info", "stream", "reason=\(reason) state=\(state) transport=\(transportMode) session_id=\(hostInfo?.sessionId ?? 0) decoded=\(debugState.decodedFrames) assembled=\(debugState.assembledFrames) datagrams=\(debugState.datagramsReceived) bytes=\(debugState.datagramBytesReceived) fps=\(fps) size=\(videoSize) depth=\(videoDecoder?.decodeDepth ?? 0) dropped=\(counters.framesDropped) mismatched_count_frags=\(frameAssembler?.mismatchedCountFragments.withLock { $0 } ?? 0) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) rtt_us=\(clock?.rttUs ?? 0) e2e_ms=\(lagMs) audio=\(audioStats) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
     }
 
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {

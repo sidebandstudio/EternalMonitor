@@ -36,8 +36,10 @@ final class PairingTests: XCTestCase {
         try store.remove(address: "192.0.2.1:9876")
         XCTAssertNil(try store.token(address: "192.0.2.1:9876"))
         XCTAssertEqual(try store.token(address: "192.0.2.2:9876"), Data(17...32))
+        XCTAssertTrue(store.hasPairings)
         try store.forgetAll()
         XCTAssertTrue(backend.values.isEmpty)
+        XCTAssertFalse(store.hasPairings)
     }
 
     @MainActor func testMissingMalformedAndZeroTokensAreNotPairings() async throws {

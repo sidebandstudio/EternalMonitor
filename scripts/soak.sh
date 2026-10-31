@@ -20,13 +20,25 @@ REPORT="$ROOT/build/soak-report.md"
 HOST_STARTED=0
 PATTERN_STARTED=0
 mkdir -p "$OUT"
+# e2e_ios.sh stops the PC host before the app. Stop it here too if that never
+# ran, then copy its output and every rotated part of its session log.
+collect_host() {
+    local failed=0 part name
+    HOST_STARTED=0
+    "$ROOT/scripts/win/remote.sh" stop-host || failed=1
+    "$ROOT/scripts/win/remote.sh" log > "$OUT/host.log" || failed=1
+    mkdir -p "$OUT/host-session"
+    for part in 2 1 0; do
+        name=eternal-host-session.log
+        [ "$part" = 0 ] || name="$name.$part"
+        "$ROOT/scripts/win/remote.sh" session-log "$part" > "$OUT/host-session/$name" || failed=1
+    done
+    return "$failed"
+}
 cleanup() {
     status=$?
     trap - EXIT
-    if [ "$HOST_STARTED" = 1 ]; then
-        "$ROOT/scripts/win/remote.sh" log > "$OUT/host.log" || status=1
-        "$ROOT/scripts/win/remote.sh" stop-host || status=1
-    fi
+    if [ "$HOST_STARTED" = 1 ]; then collect_host || status=1; fi
     if [ "$PATTERN_STARTED" = 1 ]; then "$ROOT/scripts/win/remote.sh" pattern stop || status=1; fi
     exit "$status"
 }
@@ -40,14 +52,20 @@ if [ "$MODE" = real ]; then
         ETERNAL_HEVC=0 ETERNAL_FPS=60 ETERNAL_MAX_DGRAM=1200 ETERNAL_E2E_LOG=1 \
         ETERNAL_USB_DIRECT=127.0.0.1:0
     HOST_STARTED=1
-    export EM_REMOTE_HOST=100.81.59.48 EM_PORT=19876 EM_SIZE="${EM_SIZE:-1920x1080}"
+    export EM_REMOTE_HOST=100.81.59.48 EM_PORT=19876 EM_SIZE="${EM_SIZE:-1920x1080}" EM_STOP_REMOTE_HOST=1
 fi
 status=0
 EM_SOAK=1 EM_SCENARIO="soak-$MODE" EM_OUTPUT_DIR="$OUT" EM_SCREENSHOT="$OUT/simulator.png" \
     EM_DURATION="$DURATION" EM_TIMEOUT="$((DURATION+120))" \
     "$ROOT/scripts/e2e_ios.sh" > "$OUT/run.log" 2>&1 || status=$?
+# The simulator host's APPDATA is e2e_ios.sh's $OUT/state.
+HOST_SESSION_LOG="$OUT/state/EternalMonitor/logs/eternal-host-session.log"
+if [ "$MODE" = real ]; then
+    collect_host || status=1
+    HOST_SESSION_LOG="$OUT/host-session/eternal-host-session.log"
+fi
 python3 "$ROOT/scripts/soak_stats.py" "$OUT/resources.jsonl" --seconds "$DURATION" \
-    --stream-result "$OUT/result.json" --report "$REPORT" || status=1
+    --stream-result "$OUT/result.json" --host-log "$HOST_SESSION_LOG" --report "$REPORT" || status=1
 cp "$REPORT" "$OUT/report.md"
 cp "${REPORT%.md}.json" "$OUT/report.json"
 exit "$status"

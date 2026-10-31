@@ -22,8 +22,9 @@ before you publish details.
 Knowing these limits helps you judge whether a finding is new.
 
 - The stream is not encrypted. Video, audio and input cross the local network in
-  the clear, so anyone who can capture that traffic can see it. This is documented
-  and intended to change later; it does not need a report.
+  the clear. Until a future protocol version, someone who can watch the local
+  network can read the stream and the pairing token. This is documented and
+  intended to change; it does not need a report.
 - Pairing controls who may connect. A new iPad on Wi-Fi needs the host's six-digit
   code or its QR token. The host limits wrong guesses, and the iPad keeps the token
   in its Keychain. USB connections trust physical access and need no code.
@@ -49,6 +50,6 @@ Knowing these limits helps you judge whether a finding is new.
 Reports are welcome for anything that lets someone:
 
 - connect or inject input without pairing;
-- read or reuse a pairing token;
+- get a pairing token without watching the local network;
 - run code through the host, the installer or its scheduled tasks;
 - crash the host or the iPad app with crafted network traffic.

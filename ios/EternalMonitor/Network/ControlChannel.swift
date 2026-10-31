@@ -42,6 +42,8 @@ final class ControlChannel {
     private var hostCaps: UInt16 = 0
     private var msgSeq: UInt32 = 0
     private var clientNonce: UInt32 = 0
+    /// The latest HELLO2's nonce, kept after its answer.
+    private var lastHelloNonce: UInt32 = 0
     private var helloBytes = Data()
     private var helloTemplate: Hello2?
     private var helloAttempts = 0
@@ -90,6 +92,12 @@ final class ControlChannel {
         queue.sync { sessionId }
     }
 
+    /// The latest HELLO2's nonce, for the attempt's summary, after whatever
+    /// is already queued (a pairing retry mints a new one); 0 before one.
+    var helloNonce: UInt32 {
+        queue.sync { lastHelloNonce }
+    }
+
     // MARK: - Handshake
 
     struct ClientIdentity {
@@ -116,6 +124,7 @@ final class ControlChannel {
             msgSeq = 0
             helloAttempts = 0
             clientNonce = UInt32.random(in: 1...UInt32.max)
+            lastHelloNonce = clientNonce
             let hello = Hello2(
                 clientNonce: clientNonce,
                 listenPort: listenPort,
@@ -145,6 +154,7 @@ final class ControlChannel {
         queue.async { [self] in
             guard sessionId == 0, var hello = helloTemplate else { return }
             clientNonce = UInt32.random(in: 1...UInt32.max)
+            lastHelloNonce = clientNonce
             hello.clientNonce = clientNonce
             hello.authToken = Data(repeating: 0, count: 16)
             hello.pairingCode = code
@@ -240,6 +250,7 @@ final class ControlChannel {
 
         sessionId = ack.sessionId
         hostCaps = ack.hostCaps
+        SupportDiagnostics.notePCName(ack.hostName)
         onDiagnostic?("Session \(ack.sessionId) established with \(ack.hostName)")
         lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }
         startReportTimer(intervalMs: max(ack.reportIntervalMs, 100))

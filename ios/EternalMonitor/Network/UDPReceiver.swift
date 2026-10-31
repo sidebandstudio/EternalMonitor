@@ -32,6 +32,9 @@ final class UDPReceiver: MediaLink {
     var onListenerReady: ((UInt16) -> Void)?
 
     private var connection: NWConnection?
+    /// Network.framework can report waiting again while the path changes;
+    /// a connection reports it once.
+    private var reportedWaiting = false
     private var pendingWrites = DispatchGroup()
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
@@ -94,6 +97,7 @@ final class UDPReceiver: MediaLink {
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: remotePort)
 
         let connection = NWConnection(to: endpoint, using: params)
+        reportedWaiting = false
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection, self.connection === connection else { return }
             switch state {
@@ -106,7 +110,8 @@ final class UDPReceiver: MediaLink {
                 self.startRepairTimer()
                 self.receiveLoop()
             case .waiting(let error):
-                SupportDiagnostics.shared.record("warning", "udp", "Network.framework waiting: \(error)")
+                guard !self.reportedWaiting else { return }
+                self.reportedWaiting = true
                 let denied = connection.currentPath?.unsatisfiedReason == .localNetworkDenied
                 self.onError?(LinkError(denied ? .localNetworkDenied : .pathUnavailable,
                     "UDP path not ready: \(error.localizedDescription)", underlying: error))

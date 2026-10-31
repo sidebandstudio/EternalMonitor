@@ -20,14 +20,23 @@ private let verboseDecodeLogging = false
 final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
     var onEvent: ((String) -> Void)?
+    /// Failures, which the owner logs once as errors. Without an owner they
+    /// go to the support log directly. Both used to log each one, so every
+    /// failure appeared twice.
+    var onFailure: ((String) -> Void)?
 
     private func reportFailure(_ message: String) {
-        SupportDiagnostics.shared.record("error", "decode", message)
-        onEvent?(message)
+        if let onFailure { onFailure(message) } else { SupportDiagnostics.shared.record("error", "decode", message) }
     }
     /// The decoder cannot make progress until the next keyframe (session died, decode error).
     /// Protocol v2 turns this into a keyframe request to the host.
     var onNeedsKeyframe: (() -> Void)?
+    /// The picture has been held `restartStreamAfterUs` with no keyframe
+    /// decoded: ask the host to restart the stream. Repeats at each retry, as
+    /// a request can be lost or coalesced like any other.
+    var onRestartStream: (() -> Void)?
+    /// The picture has been held `reconnectAfterUs`: this session can't recover.
+    var onStalled: (() -> Void)?
 
     /// Which bitstream the host is sending. Sniffed from the NAL units
     /// themselves (an HEVC VPS or an H.264 SPS in a keyframe) because the
@@ -52,6 +61,77 @@ final class VideoDecoder {
     private var recoveryGeneration: UInt64 = 0
     private var isShutdown = false
     private var packetLogCounter: UInt64 = 0
+    /// When the decoder last asked for a keyframe while holding the picture.
+    private var lastKeyframeRequestUs: UInt64 = 0
+    /// The last clean picture stays on screen from `start` until a frame
+    /// decodes again. Only a frame submitted after the keyframe that ends the
+    /// hold (`resumeGeneration`) counts: one already in flight, or a keyframe
+    /// that fails to decode, is no progress. `nil` while decoding normally and
+    /// before the first keyframe of a session.
+    private struct Hold {
+        var start: UInt64
+        var resumeGeneration: UInt64?
+        var restartedStream = false
+        var reportedStall = false
+    }
+    private let hold = OSAllocatedUnfairLock<Hold?>(initialState: nil)
+    private var recoveryTimer: DispatchSourceTimer?
+    private let nowUs: () -> UInt64
+    /// Whether each picture follows a lost reference picture.
+    private var continuity = ReferenceContinuity()
+    /// Session creation attempts that failed since a session last opened.
+    private var failedSessionAttempts = 0
+    /// Access units dropped while no session is ready: the first is logged,
+    /// then a count at most every `notReadyLogIntervalUs`.
+    private var notReadyDrops = 0
+    private var lastNotReadyLogUs: UInt64?
+    static let notReadyLogIntervalUs: UInt64 = 5_000_000
+
+    typealias SessionFactory = (CMVideoFormatDescription, CFDictionary, CFDictionary) -> (OSStatus, VTDecompressionSession?)
+    private let makeSession: SessionFactory
+
+    /// While the picture is held: a request can be lost on Wi-Fi as easily as
+    /// the frame it replaces, so one is sent again this often, on a timer, as
+    /// the stream may also have gone silent. The host grants one request per
+    /// 500 ms (`KEYFRAME_REQUEST_MIN_INTERVAL`); the timer's 100 ms tick sends
+    /// the retry 600-700 ms after the last, so network jitter can't move one
+    /// inside that window.
+    static let keyframeRetryUs: UInt64 = 600_000
+    /// Then the decoder session is rebuilt and the host asked to restart.
+    static let restartStreamAfterUs: UInt64 = 2_000_000
+    /// Then the connection is rebuilt.
+    static let reconnectAfterUs: UInt64 = 5_000_000
+    /// A hold this long shows Restoring the picture and is logged.
+    static let showRestoringAfterUs: UInt64 = 1_000_000
+
+    /// `runsRecoveryTimer` false: tests drive the timer with `runRecoveryTick`.
+    init(nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs, makeSession: SessionFactory? = nil,
+         runsRecoveryTimer: Bool = true) {
+        self.nowUs = nowUs
+        self.makeSession = makeSession ?? { format, specification, attributes in
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                formatDescription: format,
+                decoderSpecification: specification,
+                imageBufferAttributes: attributes,
+                outputCallback: nil,
+                decompressionSessionOut: &session
+            )
+            return (status, session)
+        }
+        guard runsRecoveryTimer else { return }
+        let timer = DispatchSource.makeTimerSource(queue: decodeQueue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in self?.recoveryTick() }
+        timer.resume()
+        recoveryTimer = timer
+    }
+
+    /// How long the picture has been held waiting for a keyframe, if it is.
+    var keyframeWaitUs: UInt64? {
+        hold.withLock { $0 }.map { nowUs() &- $0.start }
+    }
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
     private let queued = OSAllocatedUnfairLock<Int>(initialState: 0)
@@ -59,6 +139,7 @@ final class VideoDecoder {
     var decodeDepth: UInt8 { UInt8(clamping: queued.withLock { $0 } + inFlight.withLock { $0 }) }
 
     deinit {
+        recoveryTimer?.cancel()
         // `shutdown()` is the proper teardown; this is the safety net if an owner
         // drops the decoder without calling it. No callbacks can be in flight at
         // deinit (the session retains its output handlers' captures weakly).
@@ -76,12 +157,89 @@ final class VideoDecoder {
         }
     }
 
+    /// The session's PC numbers sent frames contiguously per epoch.
+    func setFrameSeqContiguous(_ contiguous: Bool) {
+        decodeQueue.async { [weak self] in self?.continuity.frameSeqContiguous = contiguous }
+    }
+
+    private func beginWaitingForKeyframe() {
+        guard !waitingForSyncSample else { return }
+        waitingForSyncSample = true
+        let now = nowUs()
+        // A keyframe that failed to decode continues the same hold.
+        hold.withLock { current in
+            if current == nil { current = Hold(start: now) } else { current?.resumeGeneration = nil }
+        }
+    }
+
+    /// One timer tick, queued behind the frames already given to `decode`.
+    func runRecoveryTick(then done: @escaping () -> Void) {
+        decodeQueue.async { [weak self] in
+            self?.recoveryTick()
+            done()
+        }
+    }
+
+    /// Recovery while the picture is held, driven by time alone, so a silent
+    /// stream recovers too: ask again every `keyframeRetryUs`, rebuild at
+    /// `restartStreamAfterUs`, give the session up at `reconnectAfterUs`.
+    private func recoveryTick() {
+        guard !isShutdown, let current = hold.withLock({ $0 }) else { return }
+        let now = nowUs()
+        if now &- current.start >= Self.reconnectAfterUs {
+            guard !current.reportedStall else { return }
+            hold.withLock { $0?.reportedStall = true }
+            onStalled?()
+            return
+        }
+        rebuildIfHeldTooLong(at: now)
+        guard now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
+        requestKeyframe(at: now)
+    }
+
+    /// Ask (again) for a keyframe the host has not sent: a frame arrived that
+    /// cannot be decoded without one. At the start of a session this means
+    /// the host's first keyframe was lost.
+    private func requestKeyframeIfOverdue() {
+        let now = nowUs()
+        rebuildIfHeldTooLong(at: now)
+        guard lastKeyframeRequestUs == 0 || now &- lastKeyframeRequestUs >= Self.keyframeRetryUs else { return }
+        requestKeyframe(at: now)
+    }
+
+    /// Every keyframe request, from the timer, a held frame or a decode
+    /// error, takes its reason from the hold's age: from
+    /// `restartStreamAfterUs` it asks the host to restart the stream. Which
+    /// path happens to use a retry slot must not decide that.
+    private func requestKeyframe(at now: UInt64) {
+        lastKeyframeRequestUs = now
+        if let start = hold.withLock({ $0?.start }), now &- start >= Self.restartStreamAfterUs {
+            onRestartStream?()
+        } else {
+            onNeedsKeyframe?()
+        }
+    }
+
+    /// Once per hold, when it first reaches `restartStreamAfterUs`, whether
+    /// or not a request may go out yet: a fresh session from the next
+    /// keyframe's parameter sets, in case this one keeps rejecting them.
+    private func rebuildIfHeldTooLong(at now: UInt64) {
+        guard let current = hold.withLock({ $0 }), !current.restartedStream,
+              now &- current.start >= Self.restartStreamAfterUs else { return }
+        hold.withLock { $0?.restartedStream = true }
+        onEvent?("Picture held \((now &- current.start) / 1000) ms; rebuilding the decoder and asking the PC to restart the stream")
+        teardownSession(waitForFrames: false)
+        formatDescription = nil
+        waitingForSyncSample = true
+    }
+
     /// Tear down on the decode queue, provably after any in-flight decode call.
     /// Captures `self` strongly so the session cannot be freed under a live callback;
     /// `isShutdown` makes any decode enqueued after this a no-op.
     func shutdown(completion: (() -> Void)? = nil) {
         decodeQueue.async {
             self.isShutdown = true
+            self.recoveryTimer?.cancel()
             self.teardownSession(waitForFrames: true)
             self.formatDescription = nil
             self.codec = .h264
@@ -89,6 +247,8 @@ final class VideoDecoder {
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
+            self.hold.withLock { $0 = nil }
+            self.continuity = ReferenceContinuity()
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
             self.hasLoggedEmptyPayload = false
@@ -152,14 +312,18 @@ final class VideoDecoder {
             sps = nil
             pps = nil
             waitingForSyncSample = true
+            let contiguous = continuity.frameSeqContiguous
+            continuity = ReferenceContinuity()
+            continuity.frameSeqContiguous = contiguous
         }
         if codec == .hevc {
-            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs)
+            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs, seq: packet.seq, epoch: packet.streamEpoch)
             return
         }
 
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
+        var sawParameterSets = false
         var nalTypesInPacket: [UInt8] = []
         for nal in nalUnits {
             let nalType = nal[0] & 0x1F
@@ -173,17 +337,25 @@ final class VideoDecoder {
                 // re-creation. They carry no decode info.
                 continue
             case 7: // SPS
+                sawParameterSets = true
                 sps = nal
-                tryCreateFormatDescription()
             case 8: // PPS
+                sawParameterSets = true
                 pps = nal
-                tryCreateFormatDescription()
             case 1, 5: // Non-IDR slice, IDR slice
                 hasSliceNAL = true
                 accessUnitNALs.append(nal)
             default:
                 accessUnitNALs.append(nal)
             }
+        }
+
+        // Adopt the access unit's parameter sets together. One at a time, a
+        // new SPS met the old PPS first: a format that never existed, which
+        // could rebuild the session or be accepted by it in place.
+        if sawParameterSets {
+            tryCreateFormatDescription()
+            continuity.adoptH264(sps: sps)
         }
 
         if hasSliceNAL {
@@ -195,7 +367,8 @@ final class VideoDecoder {
                     "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
                 )
             }
-            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
+            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample,
+                             seq: packet.seq, epoch: packet.streamEpoch)
         }
     }
 
@@ -216,23 +389,24 @@ final class VideoDecoder {
         return nil
     }
 
-    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64) {
+    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64, seq: UInt32, epoch: UInt32) {
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
         var isSyncSample = false
+        var sawParameterSets = false
         for nal in nalUnits {
             guard let first = nal.first else { continue }
             let nalType = (first >> 1) & 0x3F
             switch nalType {
             case 32:
+                sawParameterSets = true
                 vps = nal
-                tryCreateHEVCFormatDescription()
             case 33:
+                sawParameterSets = true
                 sps = nal
-                tryCreateHEVCFormatDescription()
             case 34:
+                sawParameterSets = true
                 pps = nal
-                tryCreateHEVCFormatDescription()
             case 35, 39, 40:
                 // AUD and SEI — same VideoToolbox hygiene as the H.264 path.
                 continue
@@ -246,8 +420,13 @@ final class VideoDecoder {
                 accessUnitNALs.append(nal)
             }
         }
+        // VPS, SPS and PPS together, as for H.264.
+        if sawParameterSets {
+            tryCreateHEVCFormatDescription()
+            continuity.adoptHEVC(sps: sps, pps: pps)
+        }
         if hasSliceNAL {
-            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample)
+            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample, seq: seq, epoch: epoch)
         }
     }
 
@@ -424,23 +603,26 @@ final class VideoDecoder {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
 
-        var session: VTDecompressionSession?
-        let status = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            formatDescription: formatDescription,
-            decoderSpecification: [
+        let (status, created) = makeSession(
+            formatDescription,
+            [
                 // Enable (not Require): hardware on device, silent software fallback in
                 // the simulator — which is what makes the automated E2E possible at all.
                 kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true
             ] as CFDictionary,
-            imageBufferAttributes: outputAttributes as CFDictionary,
-            outputCallback: nil,
-            decompressionSessionOut: &session
+            outputAttributes as CFDictionary
         )
 
-        guard status == noErr, let session else {
-            print("[VideoDecoder] Failed to create decompression session: \(status)")
-            reportFailure("Failed to create VideoToolbox session status=\(status)")
+        guard status == noErr, let session = created else {
+            // Forget the format, so the next keyframe's parameter sets (and
+            // only those) try again instead of matching it and being ignored.
+            // Until then the last picture stays, with keyframe requests.
+            self.formatDescription = nil
+            beginWaitingForKeyframe()
+            failedSessionAttempts += 1
+            if failedSessionAttempts == 1 {
+                reportFailure("Failed to create VideoToolbox session status=\(status); retrying on the next keyframe")
+            }
             return
         }
 
@@ -458,9 +640,16 @@ final class VideoDecoder {
         let hardwareKind = hardwareStatus == noErr ? (hardware ? "hardware" : "software") : "unknown"
         decompressionSession = session
         recoveryGeneration &+= 1
-        waitingForSyncSample = true
+        beginWaitingForKeyframe()
+        if notReadyDrops > 0 {
+            onEvent?("Dropped \(notReadyDrops) more access units because decoder was not ready")
+        }
+        notReadyDrops = 0
+        lastNotReadyLogUs = nil
+        let retried = failedSessionAttempts > 0 ? " after \(failedSessionAttempts) failed attempts" : ""
+        failedSessionAttempts = 0
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
-        onEvent?("VideoToolbox session ready (\(hardwareKind) decoder) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
+        onEvent?("VideoToolbox session ready (\(hardwareKind) decoder)\(retried) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
         if E2E.enabled {
             E2E.emit("E2E_DECODER kind=\(hardwareStatus == noErr ? (hardware ? "hw" : "sw") : "unknown")")
         }
@@ -468,22 +657,43 @@ final class VideoDecoder {
 
     // MARK: - Decode an access unit
 
-    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool) {
+    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool, seq: UInt32, epoch: UInt32) {
         guard let session = decompressionSession, let formatDescription else {
-            let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
-            onEvent?(
-                "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
-            )
+            requestKeyframeIfOverdue()
+            let now = nowUs()
+            if lastNotReadyLogUs == nil {
+                lastNotReadyLogUs = now
+                let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
+                onEvent?(
+                    "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
+                )
+            } else if let last = lastNotReadyLogUs, now &- last >= Self.notReadyLogIntervalUs {
+                lastNotReadyLogUs = now
+                onEvent?("Dropped \(notReadyDrops + 1) more access units in \((now &- last) / 1_000_000) s because decoder is not ready")
+                notReadyDrops = 0
+            } else {
+                notReadyDrops += 1
+            }
             return
         }
 
         let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
         if waitingForSyncSample && !isSyncSample {
+            requestKeyframeIfOverdue()
+            return
+        }
+        if !admitted(nalUnits, isSyncSample: isSyncSample, seq: seq, epoch: epoch) {
+            // A reference picture before this one never arrived (lost whole,
+            // or dropped unfinished). Hold and ask for a keyframe now.
+            beginWaitingForKeyframe()
+            requestKeyframe(at: nowUs())
             return
         }
         if isSyncSample {
             recoveryGeneration &+= 1
             waitingForSyncSample = false
+            let resume = recoveryGeneration
+            hold.withLock { $0?.resumeGeneration = resume }
         }
         let generation = recoveryGeneration
 
@@ -603,6 +813,14 @@ final class VideoDecoder {
                 return
             }
             guard let pixelBuffer = imageBuffer else { return }
+            let ended = self.hold.withLock { current -> UInt64? in
+                guard let held = current, held.resumeGeneration == generation else { return nil }
+                current = nil
+                return held.start
+            }
+            if let start = ended, self.nowUs() &- start >= Self.showRestoringAfterUs {
+                self.onEvent?("Picture held \((self.nowUs() &- start) / 1000) ms waiting for a keyframe")
+            }
             self.onFrameDecoded?(pixelBuffer, timestampUs)
         }
 
@@ -612,13 +830,29 @@ final class VideoDecoder {
         }
     }
 
+    private func admitted(_ nalUnits: [Data], isSyncSample: Bool, seq: UInt32, epoch: UInt32) -> Bool {
+        switch codec {
+        case .h264:
+            guard let slice = nalUnits.first(where: { [1, 5].contains($0[$0.startIndex] & 0x1F) }) else { return true }
+            return continuity.admitH264(firstSlice: slice, isKeyframe: isSyncSample, seq: seq, epoch: epoch)
+        case .hevc:
+            guard let slice = nalUnits.first(where: { ($0[$0.startIndex] >> 1) & 0x3F <= 31 }) else { return true }
+            let wasReliable = !continuity.pocUnreliable
+            let admitted = continuity.admitHEVC(firstSlice: slice, isKeyframe: isSyncSample, seq: seq, epoch: epoch)
+            if wasReliable && continuity.pocUnreliable {
+                onEvent?("HEVC picture order is not constant on this stream; a frame lost whole is no longer detected until the stream restarts")
+            }
+            return admitted
+        }
+    }
+
     /// Both submission and asynchronous output errors arrive here on decodeQueue.
     /// Hold dependent frames until a replacement sync sample, and coalesce errors
     /// already in flight so one damaged frame cannot cause a request storm.
     private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String,
                                           onSyncSample: Bool) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
-        waitingForSyncSample = true
+        beginWaitingForKeyframe()
         reportFailure("\(source) status=\(status) codec=\(codec) depth=\(decodeDepth) generation=\(generation) sync=\(onSyncSample); waiting for a keyframe")
         if status == kVTInvalidSessionErr || onSyncSample {
             // The session died underneath us (typical after app backgrounding),
@@ -627,7 +861,7 @@ final class VideoDecoder {
             // rebuild a healthy session.
             createDecompressionSession()
         }
-        onNeedsKeyframe?()
+        requestKeyframe(at: nowUs())
     }
 
     private func isRandomAccessAccessUnit(_ nalUnits: [Data]) -> Bool {
@@ -773,7 +1007,8 @@ private enum H264SliceKind {
     }
 }
 
-private struct H264BitReader {
+/// Exp-Golomb bit reader for H.264 and HEVC headers (RBSP bytes).
+struct H264BitReader {
     let bytes: [UInt8]
     var bitOffset = 0
 
@@ -812,6 +1047,19 @@ private struct H264BitReader {
         }
 
         return ((UInt32(1) << UInt32(leadingZeroBits)) - 1) + suffix
+    }
+
+    mutating func readSE() -> Int32? {
+        guard let code = readUE() else { return nil }
+        let magnitude = Int32(bitPattern: (code &+ 1) / 2)
+        return code % 2 == 1 ? magnitude : -magnitude
+    }
+
+    /// Skips `count` bits; false if fewer remain.
+    mutating func skip(_ count: Int) -> Bool {
+        guard bitOffset + count <= bytes.count * 8 else { return false }
+        bitOffset += count
+        return true
     }
 }
 
