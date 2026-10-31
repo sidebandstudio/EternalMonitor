@@ -82,6 +82,23 @@ stop_app() {
     fi
     bounded 15 xcrun simctl terminate "$UDID" com.eternal.monitor 2>/dev/null || true
 }
+# Stop the host before the app. An app that goes first leaves the host to
+# expire the client's liveness instead of ending the session at shutdown.
+# EM_STOP_REMOTE_HOST=1 does the same for a host started by remote.sh.
+stop_host() {
+    if [ -n "$HOST_PID" ]; then
+        kill -TERM "$HOST_PID" 2>/dev/null || true
+        for _ in $(seq 40); do
+            kill -0 "$HOST_PID" 2>/dev/null || break
+            sleep 0.25
+        done
+        if kill -0 "$HOST_PID" 2>/dev/null; then kill -KILL "$HOST_PID" 2>/dev/null || true; fi
+        wait "$HOST_PID" 2>/dev/null || true
+    fi
+    if [ "${EM_STOP_REMOTE_HOST:-0}" = 1 ]; then
+        "$ROOT/scripts/win/remote.sh" stop-host || return 1
+    fi
+}
 cleanup() {
     status=$?
     trap - EXIT
@@ -94,13 +111,13 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && wait "$MONITOR_PID" 2>/dev/null || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
+    stop_host || status=1
     [ -n "$UDID" ] && stop_app
     # The live log is a hard link into the app container. Detach the retained
     # copy before another test launch truncates the simulator's log in place.
     if [ -f "$APP_LOG" ]; then
         cp "$APP_LOG" "$APP_LOG.snapshot" && mv "$APP_LOG.snapshot" "$APP_LOG" || status=1
     fi
-    [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null || true
     [ -n "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
     if [ "$status" -ne 0 ]; then
         python3 - "$OUT/result.json" "$SCENARIO" "$((SECONDS - STARTED))" <<'PY'
