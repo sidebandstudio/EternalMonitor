@@ -11,7 +11,7 @@ published automatically.
 | [good-first-issues.md](good-first-issues.md) | Five small, real issues to paste into GitHub with the `good first issue` label before the posts go out, so new visitors have somewhere to start. |
 | [discord-share-your-setup.md](discord-share-your-setup.md) | A Discord post asking people to share setups and drawings, with permission asked before featuring anything. |
 | [v0.3.3-release-body.md](v0.3.3-release-body.md) | What the release workflow now publishes for a stable tag, shown for v0.3.3: install steps, the installer's SHA-256, then that version's notes from RELEASE_NOTES.md. A reference only; the published v0.3.3 release is unchanged. |
-| Launch film | Placeholder: a HyperFrames launch film will be added here by a later unit. |
+| Launch film | A 35 s, 1920 x 1080 film for the posts (posts.md, post 1) and for X and Discord: the site's hero over Wi-Fi then USB, the second-screen and Apple Pencil films, hardware encoding on NVIDIA, AMD and Intel graphics, then free and open source and the name with eternalmonitor.dev and the GitHub address. Silent. Its source is `site-demos/launch-film.html`; render it with `LAUNCH_FILM_DIR=<folder> site-demos/render.sh launch-film` (HyperFrames 0.8.220, Node and ffmpeg), which writes `launch-film.mp4` (H.264, about 13 MB), a poster PNG and six stills to that folder, by default `site-demos/renders/launch-film/`. The video stays out of git; attach the MP4 directly. |
 
 ## Before you post
 
