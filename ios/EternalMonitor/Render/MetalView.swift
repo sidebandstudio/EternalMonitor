@@ -135,6 +135,23 @@ private struct FrameTextures {
     let matrixIndex: UInt32
 }
 
+/// One draw's textures, held by its command buffer's completion handler
+/// together with the texture cache that made them. A CVMetalTexture doesn't
+/// keep its cache alive, and CoreVideo crashes if the cache is destroyed
+/// while a completion handler is still releasing its textures, as when the
+/// picture closes with GPU work outstanding. So the textures go first.
+private final class InFlightFrame {
+    private var frame: FrameTextures?
+    private let cache: CVMetalTextureCache?
+
+    init(_ frame: FrameTextures, cache: CVMetalTextureCache?) {
+        self.frame = frame
+        self.cache = cache
+    }
+
+    deinit { frame = nil }
+}
+
 private struct DisplayUniforms {
     var scale: SIMD2<Float>
     var matrixIndex: UInt32
@@ -146,10 +163,15 @@ final class MetalRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
-    private var textureCache: CVMetalTextureCache?
+    private(set) var textureCache: CVMetalTextureCache?
     private var currentFrame: FrameTextures?
     /// Read on the main thread, where the paused MTKView draws.
     var pictureFit: PictureFit = .fit
+    #if DEBUG
+    /// Tests: runs at the start of each later draw's completion handler, on
+    /// Metal's thread, to hold the handler past the renderer's teardown.
+    var completedHandlerGate: (() -> Void)?
+    #endif
 
     init(device: MTLDevice, view: MTKView) {
         self.device = device
@@ -183,6 +205,9 @@ final class MetalRenderer {
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
         textureCache = cache
     }
+
+    // The held frame's textures go before the cache that made them.
+    deinit { currentFrame = nil }
 
     func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?) {
         if let pixelBuffer, let frame = makeFrameTextures(from: pixelBuffer) {
@@ -221,9 +246,16 @@ final class MetalRenderer {
         encoder.endEncoding()
 
         // Keep the pixel buffer + texture wrappers alive until the GPU is done
-        // sampling them.
+        // sampling them, and their cache alive until they are released.
+        let inFlight = InFlightFrame(frame, cache: textureCache)
+        #if DEBUG
+        let gate = completedHandlerGate
+        #endif
         commandBuffer.addCompletedHandler { _ in
-            _ = frame
+            #if DEBUG
+            gate?()
+            #endif
+            _ = inFlight
         }
 
         commandBuffer.present(drawable)

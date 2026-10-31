@@ -61,6 +61,43 @@ final class RendererMathTests: XCTestCase {
         XCTAssertTrue(renderer.holdsFrame)
     }
 
+    /// The picture closes while a draw's command buffer is still finishing.
+    /// Its completion handler must release that draw's textures before their
+    /// cache goes: CoreVideo crashed when the main thread destroyed the cache
+    /// while the handler was releasing them.
+    func testTexturesAreReleasedBeforeTheirCacheWhenThePictureCloses() throws {
+        try closeWithADrawOutstanding(afterMemoryWarning: true)
+        try closeWithADrawOutstanding(afterMemoryWarning: false)
+    }
+
+    private func closeWithADrawOutstanding(afterMemoryWarning: Bool) throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        weak var cache: CVMetalTextureCache?
+        var completed = false
+        try autoreleasepool {
+            let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+            let view = MTKView(frame: CGRect(x: 0, y: 0, width: 64, height: 64), device: device)
+            view.colorPixelFormat = .bgra8Unorm
+            let renderer = MetalRenderer(device: device, view: view)
+            renderer.completedHandlerGate = { entered.signal(); release.wait() }
+            renderer.draw(in: view, pixelBuffer: try XCTUnwrap(makeBuffer()))
+            cache = renderer.textureCache
+            completed = entered.wait(timeout: .now() + 10) == .success
+            if afterMemoryWarning { renderer.releaseCachedFrame() }
+        }
+        guard completed else { return XCTFail("the draw's command buffer never completed") }
+        // The renderer is gone and the held handler still has the textures.
+        XCTAssertNotNil(cache, "the texture cache went before its textures (memory warning first: \(afterMemoryWarning))")
+        release.signal()
+        // Once the handler lets them go, the cache goes too.
+        let deadline = Date().addingTimeInterval(10)
+        while cache != nil, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertNil(cache, "the texture cache must not outlive its textures")
+    }
+
     private func makeBuffer() -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, [
