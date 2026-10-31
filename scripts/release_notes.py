@@ -87,8 +87,11 @@ def notes_for(tag, notes_text, strict):
     """(Markdown for {{NOTES}}, warning or None)."""
     version = tag[1:] if re.fullmatch(r"v\d+\.\d+\.\d+\S*", tag) else None
     text = section(notes_text, version) if version else None
-    if text is None:
-        problem = f"RELEASE_NOTES.md has no '## EternalMonitor {tag}' section"
+    if not text:
+        # A heading with nothing under it is no notes either.
+        problem = f"RELEASE_NOTES.md has no '## EternalMonitor {tag}' section" if text is None else (
+            f"RELEASE_NOTES.md's '## EternalMonitor {tag}' section is empty"
+        )
         if strict:
             raise NotesError(problem)
         return "", f"::warning::{problem}; the release body links to RELEASE_NOTES.md only."
