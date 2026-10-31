@@ -67,7 +67,7 @@ USB를 사용하려면 Apple의 무료 [Apple Devices](https://apps.microsoft.co
 
 v0.3.3은 일부 PC, 특히 Intel과 NVIDIA 그래픽을 함께 사용하는 노트북에서 **두 번째 화면** (Second screen)이 시작되지 않던 문제를 해결합니다. 두 번째 화면이 시작되는 동안 iPad에 PC의 기본 화면이 표시되며 PC 화면이 반복해서 깜박이지 않습니다. Windows 0.3.3에 맞춰 iPad를 TestFlight v0.3.3, build 364로 업데이트하세요.
 
-Windows와 iPad 진단에는 기기 정보, 앱 오류와 스트림 통계가 포함됩니다. 보고서에는 PC와 iPad 이름, 오디오 기기 이름과 네트워크 주소가 포함되지만 화면 내용, 오디오와 페어링 자격 증명은 제외됩니다. 설정에서 자동 공유를 끌 수 있습니다. 진단 정보는 최대 30일 동안 보관되며 더 일찍 삭제될 수 있습니다. 삭제되거나 만료된 진단 정보는 일일 백업에 최대 7일 더 남을 수 있습니다. [자동 진단](../SETUP.md#automatic-diagnostics)과 [개인정보 처리방침](https://eternalmonitor.dev/privacy.html)을 참조하세요. iPad에서 **설정** (Settings) > **지원** (Support) > **진단** (Diagnostics)을 열어 보고서를 복사하거나 내보내세요.
+Windows와 iPad 진단에는 기기 정보, 앱 오류와 스트림 통계가 포함됩니다. 보고서에는 그래픽 카드와 디스플레이 이름 및 네트워크 주소가 포함되지만 화면 내용, 오디오와 페어링 자격 증명은 제외됩니다. 0.3.4부터 Windows가 전송하는 데이터에서는 PC 이름, 사용자 이름, 사용자 폴더, iPad 이름과 오디오 기기 이름이 제거되고 각 오디오 기기의 종류만 남습니다. iPad가 전송하는 데이터에서는 PC 이름이 제거됩니다. 설정에서 자동 공유를 끌 수 있습니다. 진단 정보는 최대 30일 동안 보관되며 더 일찍 삭제될 수 있습니다. 삭제되거나 만료된 진단 정보는 일일 백업에 최대 7일 더 남을 수 있습니다. [자동 진단](../SETUP.md#automatic-diagnostics)과 [개인정보 처리방침](https://eternalmonitor.dev/privacy.html)을 참조하세요. iPad에서 **설정** (Settings) > **지원** (Support) > **진단** (Diagnostics)을 열어 보고서를 복사하거나 내보내세요.
 
 Windows, macOS 및 iPad 시뮬레이터에서 릴리스 검사를 통과했습니다. 확인된 문제는 [알려진 문제](https://eternalmonitor.dev/known-issues.html) 페이지에 있으며, 이전 실물 기기 결과는 [docs/hardware-verification.md](../docs/hardware-verification.md)에 남아 있습니다.
 

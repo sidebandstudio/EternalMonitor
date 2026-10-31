@@ -14,11 +14,14 @@ has finished.
 latest.json may not name a version newer than the tag. It normally names the
 previous release here: it carries this installer's SHA-256, so it is updated
 only after this workflow publishes and Apple approves the matching iPad build.
---strict (final tags) exits 1 on a problem; otherwise each problem is printed
-as a GitHub Actions warning and the step passes.
+--strict (final tags) also refuses RELEASE_NOTES.md while its newest section
+still reads "Released [date set at release].", and exits 1 on a problem;
+otherwise each problem is printed as a GitHub Actions warning and the step
+passes.
 """
 import argparse
 import json
+import pathlib
 import re
 import sys
 import time
@@ -26,6 +29,8 @@ import urllib.error
 import urllib.request
 
 SITE = "https://eternalmonitor.dev"
+NOTES = pathlib.Path(__file__).resolve().parents[1] / "RELEASE_NOTES.md"
+DATE_PLACEHOLDER = "[date set at release]"
 WAITS = (0, 15, 30, 60, 90, 120, 150, 150)  # seconds before each try: 615 s in all
 
 
@@ -84,12 +89,22 @@ def problems(tag, site=SITE, get=fetch, sleep=time.sleep, waits=WAITS):
     return found
 
 
-def main(argv=None, get=fetch, sleep=time.sleep):
+def notes_problems(text):
+    """The newest release-notes section must carry its real date."""
+    newest = re.search(r"(?ms)^## (EternalMonitor v\S+)\s*\n(.*?)(?=^## |\Z)", text)
+    if newest and DATE_PLACEHOLDER in newest[2]:
+        return [f"RELEASE_NOTES.md: {newest[1]} still says {DATE_PLACEHOLDER}; set the release date"]
+    return []
+
+
+def main(argv=None, get=fetch, sleep=time.sleep, notes=NOTES):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", required=True, help="the tag or ref name being built")
     parser.add_argument("--strict", action="store_true", help="fail instead of warning")
     args = parser.parse_args(argv)
     found = problems(args.tag, get=get, sleep=sleep)
+    if args.strict:
+        found += notes_problems(pathlib.Path(notes).read_text(encoding="utf-8"))
     for problem in found:
         print(f"::{'error' if args.strict else 'warning'}::{problem}")
     if found and args.strict:

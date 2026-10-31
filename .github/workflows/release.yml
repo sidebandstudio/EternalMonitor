@@ -51,7 +51,8 @@ jobs:
       # The installed Quick Start links to eternalmonitor.dev/known-issues.html
       # and both apps read latest.json. Pages publishes them from main, so a
       # final tag waits for that deploy and fails without it. Pre-release tags
-      # and dry runs only warn.
+      # and dry runs only warn. A final tag also fails while RELEASE_NOTES.md
+      # has no release date.
       - name: Check the website serves this release's pages
         shell: bash
         run: |

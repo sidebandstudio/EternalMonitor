@@ -67,7 +67,7 @@ EternalMonitor 将 Windows 桌面串流到 iPad，并将你的输入传回电脑
 
 v0.3.3 修复了部分电脑上**第二屏幕** (Second screen) 无法启动的问题，这种情况最常见于配备 Intel 和 NVIDIA 显卡的笔记本电脑。第二屏幕启动时，iPad 会显示电脑的主屏幕，电脑屏幕也不再反复闪烁。请将 iPad 更新到 TestFlight v0.3.3，build 364，以配合 Windows 0.3.3 使用。
 
-Windows 和 iPad 的诊断信息包括设备详情、应用错误和串流统计数据。报告包含电脑和 iPad 名称、音频设备名称及网络地址，但不包含屏幕内容、音频或配对凭据。可在**设置** (Settings) 中关闭自动共享。诊断信息最多保留 30 天，也可能提前删除。已删除或过期的诊断信息可能在每日备份中再保留最多 7 天。参见[自动诊断](../SETUP.md#automatic-diagnostics)和[隐私声明](https://eternalmonitor.dev/privacy.html)。在 iPad 上，打开**设置** (Settings) > **支持** (Support) > **诊断** (Diagnostics) 以复制或导出报告。
+Windows 和 iPad 的诊断信息包括设备详情、应用错误和串流统计数据。报告包含显卡和显示器名称及网络地址，但不包含屏幕内容、音频或配对凭据。从 0.3.4 起，Windows 上传的数据会移除电脑名称、用户名、用户文件夹、iPad 名称和音频设备名称，仅保留每个音频设备的类型；iPad 上传的数据会移除电脑名称。可在**设置** (Settings) 中关闭自动共享。诊断信息最多保留 30 天，也可能提前删除。已删除或过期的诊断信息可能在每日备份中再保留最多 7 天。参见[自动诊断](../SETUP.md#automatic-diagnostics)和[隐私声明](https://eternalmonitor.dev/privacy.html)。在 iPad 上，打开**设置** (Settings) > **支持** (Support) > **诊断** (Diagnostics) 以复制或导出报告。
 
 发行检查已在 Windows、macOS 和 iPad 模拟器上通过。已知问题列在[已知问题](https://eternalmonitor.dev/known-issues.html)页面，之前的实体设备测试结果仍保存在 [docs/hardware-verification.md](../docs/hardware-verification.md) 中。
 
