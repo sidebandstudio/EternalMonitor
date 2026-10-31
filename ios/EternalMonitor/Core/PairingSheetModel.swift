@@ -8,7 +8,8 @@ final class PairingSheetModel: ObservableObject, Identifiable {
     @Published private(set) var error: String?
     @Published private(set) var submitting = false
     @Published private(set) var blockedUntil: Date?
-    private var complete = false
+    /// The last code sent to the PC.
+    private var attempted: String?
 
     func reject(_ status: HelloStatus, now: Date = Date()) {
         if status == .rateLimited {
@@ -32,17 +33,16 @@ final class PairingSheetModel: ObservableObject, Identifiable {
         }
         error = nil
         submitting = true
+        attempted = code
         return number
     }
 
-    /// Called after each edit of the code. On iPadOS 27 the number pad opens
-    /// over the Pair button, so the edit that completes six digits pairs.
-    /// A code left in the field after a refusal doesn't go again, and none
-    /// goes while one is being checked or during the wait.
-    func editCompletesCode(now: Date = Date()) -> Bool {
-        let wasComplete = complete
-        complete = code.count == 6
-        return complete && !wasComplete && !submitting && remaining(at: now) == 0
+    /// Checked after each edit, after each check of a code ends and when the
+    /// wait ends. On iPadOS 27 the number pad opens over the Pair button, so
+    /// a complete code pairs by itself unless it was already sent. None goes
+    /// while one is being checked or during the wait.
+    func codeIsDue(now: Date = Date()) -> Bool {
+        code.count == 6 && code != attempted && !submitting && remaining(at: now) == 0
     }
 
     func timedOut() {
