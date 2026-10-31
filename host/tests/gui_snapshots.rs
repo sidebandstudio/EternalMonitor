@@ -607,9 +607,166 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     troubleshooting_and_hybrid_notice(&shared, &dir, &mut results);
     reset_keeps_environment_overrides(&shared, &dir, &mut results);
     waiting_for_the_port_can_be_stopped(&shared, &mut results);
+    code_pairing_pause_says_why_and_resumes(&shared, &mut results);
+    listen_on_is_chosen_and_reset(&shared, &dir, &mut results);
+    pairing_off_is_warned(&shared, &dir, &mut results);
     a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// Too many wrong codes pause code pairing. The Stream page says why and
+/// what still works, and Resume code pairing gives a new code at once.
+fn code_pairing_pause_says_why_and_resumes(shared: &SharedControl, results: &mut SnapshotResults) {
+    let now = Instant::now();
+    {
+        let mut pairing = shared.pairing.lock();
+        let wrong = pairing.code() % 999_999 + 1;
+        for n in 0..eternal_host::pairing::CODE_BUDGET as u32 {
+            let peer = PeerId::udp(std::net::SocketAddr::from((
+                [192, 0, 2, 100 + n as u8],
+                50000,
+            )));
+            let hello = Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 900 + n,
+                listen_port: 50000,
+                decoder_caps: 3,
+                feature_caps: 0,
+                screen_px_w: 2420,
+                screen_px_h: 1668,
+                screen_pt_w: 1210,
+                screen_pt_h: 834,
+                refresh_hz: 120,
+                device_name: "Unknown iPad".into(),
+                device_id: 99,
+                preferred_fps: 60,
+                auth_token: [0; 16],
+                pairing_code: wrong,
+            };
+            assert!(pairing.authorize(peer, &hello, now).is_err());
+        }
+        assert!(pairing.code_pairing_paused(now).is_some());
+    }
+    let paused_code = shared.pairing.lock().code();
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    window.get_by_label("Too many wrong codes were typed, so code pairing is paused for 10 more minutes. The QR code and USB still work. Resuming gives a new code.");
+    assert!(window.query_by_label("New code").is_none());
+    window.snapshot("stream-code-pairing-paused");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Resume code pairing").click();
+    window.run_steps(4);
+    assert!(shared
+        .pairing
+        .lock()
+        .code_pairing_paused(Instant::now())
+        .is_none());
+    assert_ne!(shared.pairing.lock().code(), paused_code);
+    assert!(window.query_by_label("Resume code pairing").is_none());
+    window.get_by_label("New code");
+}
+
+/// Turning pairing off in Settings says what that allows, until it is on
+/// again.
+fn pairing_off_is_warned(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let warning = "Pairing is off, so any iPad on your network can connect, and use this PC's mouse and keyboard, without a code. Turn it on unless every device on this network is yours.";
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let switch = || kittest::by().role(Role::CheckBox).label("Require pairing");
+    window.get(switch()).scroll_to_me();
+    window.run_steps(4);
+    assert!(window.query_by_label(warning).is_none());
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(!shared.pairing.lock().required);
+    assert!(!settings_file(dir).require_pairing);
+    window.get_by_label(warning).scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-pairing-off");
+    results.extend_harness(&mut window);
+    window.get(switch()).click();
+    window.run_steps(4);
+    assert!(shared.pairing.lock().required);
+    assert!(window.query_by_label(warning).is_none());
+}
+
+/// Listen on offers each network with its address, and Tailscale. A choice
+/// moves the Address row to that network and asks for a restart, a network
+/// that isn't connected says so, and Reset puts All networks back.
+fn listen_on_is_chosen_and_reset(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind, ListenOn};
+    let adapter = |name: &str, kind, ip: [u8; 4]| Adapter {
+        name: name.into(),
+        kind,
+        up: true,
+        gateway: kind != Kind::Vpn,
+        ipv4: vec![ip.into()],
+    };
+    let wifi = adapter("Wi-Fi", Kind::Wifi, [192, 168, 1, 20]);
+    set_test_adapters(Some(vec![
+        wifi.clone(),
+        adapter("Tailscale", Kind::Vpn, [100, 80, 1, 2]),
+    ]));
+    let mut window = harness(shared, egui::vec2(1040.0, 900.0), 1.0);
+    nav(&mut window, "Settings");
+    let toggle = |window: &mut Harness<'_, AnalyzerApp>, label: &str| {
+        window.get_by_label(label).scroll_to_me();
+        window.run_steps(4);
+        window.get_by_label(label).click();
+        window.run_steps(4);
+    };
+    toggle(&mut window, "Show options");
+    let listen = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
+    window
+        .get(listen("All networks (Automatic)"))
+        .scroll_to_me();
+    window.run_steps(4);
+    window.get(listen("All networks (Automatic)")).click();
+    window.run_steps(4);
+    window.get_by_label("Wi-Fi (192.168.1.20)");
+    window.get_by_label("Tailscale only (100.80.1.2)").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::Tailscale);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::Tailscale);
+    assert_eq!(PIPELINE_STATS.lock().listen_addr, "100.80.1.2:9876");
+    window.get_by_label("Restart the stream to apply your changes");
+    assert!(window
+        .query_by_label_contains("isn't connected now")
+        .is_none());
+
+    // Tailscale goes away: the row says what still works.
+    set_test_adapters(Some(vec![wifi]));
+    toggle(&mut window, "Hide options");
+    toggle(&mut window, "Show options");
+    window.get(listen("Tailscale only (not connected)"));
+    window.get_by_label(
+        "That network isn't connected now. Until it is, iPads can connect over USB only.",
+    );
+    window
+        .get_by_label("Reset troubleshooting settings")
+        .scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-listen-on");
+    results.extend_harness(&mut window);
+
+    window.get_by_label("Reset").scroll_to_me();
+    window.run_steps(4);
+    window.get_by_label("Reset").click();
+    window.run_steps(4);
+    assert_eq!(*shared.listen_on.lock(), ListenOn::All);
+    assert_eq!(settings_file(dir).listen_on, ListenOn::All);
+    set_test_adapters(None);
+    PIPELINE_STATS.lock().listen_addr = "192.0.2.10:9876".into();
 }
 
 /// Tailscale owns the default route. The Address row, its Copy and the QR
@@ -621,6 +778,7 @@ fn a_vpn_address_gets_a_home_network_hint(shared: &SharedControl) {
     let hint = "If that doesn't connect and your iPad is on the same network as this PC, use 192.168.1.20 as the PC address.";
     PIPELINE_STATS.lock().listen_addr = vpn.into();
     let adapter = |kind, ip: [u8; 4]| Adapter {
+        name: format!("{kind:?}"),
         kind,
         up: true,
         gateway: true,

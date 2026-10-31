@@ -36,6 +36,9 @@ pub struct SettingsFile {
     pub require_pairing: bool,
     #[serde(default)]
     pub auth_token_hex: String,
+    /// Troubleshooting: which network the stream listens on.
+    #[serde(default)]
+    pub listen_on: crate::network::ListenOn,
     /// Ask the virtual display driver to offer the connected iPad's native
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
@@ -89,6 +92,7 @@ impl Default for SettingsFile {
             stream_audio: true,
             require_pairing: true,
             auth_token_hex: String::new(),
+            listen_on: Default::default(),
             vdd_match_resolution: true,
             start_on_boot: false,
             feedback_sessions: 0,

@@ -118,7 +118,15 @@ pub async fn start_sender(
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
+    let listen_on = shared.listen_on.lock().clone();
+    let bind_ip = crate::network::listen_ip_now(&listen_on);
+    if bind_ip.is_loopback() {
+        warn!(
+            listen_on = listen_on.label(),
+            "The chosen network isn't connected: listening on this PC only until it is (USB still works)"
+        );
+    }
+    let bind_addr = SocketAddr::from((bind_ip, listen_port));
     let socket = {
         let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
         // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
@@ -165,6 +173,11 @@ pub async fn start_sender(
 
     let local_addr = socket.local_addr()?;
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
+    // The Address row and QR code follow every bind, so a chosen network
+    // that came back shows its address. Resolved before locking: the stats
+    // lock is shared with every pipeline thread.
+    let shown = crate::gui::shown_address(bind_ip, listen_port);
+    PIPELINE_STATS.lock().set_listen_addr(shown);
     PIPELINE_STATS
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
@@ -225,6 +238,10 @@ pub async fn start_sender(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A chosen network can connect, or get a new address, after the stream
+    // starts. It is looked at again while nobody streams.
+    let mut network_check = tokio::time::interval(Duration::from_secs(10));
+    network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
     pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pen_spacing = Deadline::new("pen-spacing")?;
@@ -261,6 +278,15 @@ pub async fn start_sender(
                 if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
+            _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+                if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
+                    info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
+                    shared.stop();
+                    if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
+                    }
+                }
+            }
             _ = liveness_tick.tick() => {
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
@@ -288,9 +314,9 @@ pub async fn start_sender(
                                             eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
                                             _ => None,
                                         };
-                                        let mut actions = shared.session.lock().handle_control(
+                                        let mut actions = shared.session.lock().handle_datagram(
                                             src,
-                                            header.session_id,
+                                            &header,
                                             message,
                                             &config,
                                             Instant::now(),
@@ -668,7 +694,7 @@ async fn repair_while_pacing(
                 let Ok((len, peer)) = received else { break; };
                 if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
                     let count = nack.frag_count;
-                    let actions = shared.session.lock().handle_control(PeerId::udp(peer), header.session_id,
+                    let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
                         ControlMessage::Nack(nack), config, Instant::now());
                     if let Some((epoch, seq, missing)) = actions.retransmit {
                         send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;

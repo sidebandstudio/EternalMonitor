@@ -200,11 +200,11 @@ Name: "{group}\Uninstall EternalMonitor";  Filename: "{uninstallexe}"
 Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.exe"; Tasks: desktopicon
 
 [Run]
-; Replace only this product's named rules so upgrades remain idempotent.
+; Replace only this product's named rules so upgrades remain idempotent. The host
+; listens only on UDP; the TCP rule older versions added is removed and not re-added.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=domain,private,public enable=yes"; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host TCP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=TCP profile=domain,private,public enable=yes"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
 ; The vendor setup prompts to uninstall an existing installation even with silent
 ; switches. Preserve an existing driver and install only when it is absent.

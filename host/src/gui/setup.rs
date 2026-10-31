@@ -128,7 +128,7 @@ impl AnalyzerApp {
             Some(Footer::Next) if setup.step + 1 < STEPS.len() => {
                 setup.step += 1;
                 if STEPS[setup.step] == Step::Pair {
-                    super::refresh_listen_addr(snap);
+                    self.refresh_listen_addr();
                 }
             }
             Some(Footer::Next) => {

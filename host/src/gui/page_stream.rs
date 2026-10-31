@@ -577,13 +577,18 @@ impl AnalyzerApp {
         );
         ui.add_space(8.0);
 
-        let (code, pairing_required) = {
+        let (code, pairing_required, paused) = {
             let pairing = self.control.shared.pairing.lock();
-            (format!("{:06}", pairing.code()), pairing.required)
+            (
+                format!("{:06}", pairing.code()),
+                pairing.required,
+                pairing.code_pairing_paused(std::time::Instant::now()),
+            )
         };
         let code = format!("{} {}", &code[..3], &code[3..]);
         let mut copy = false;
         let mut rotate = false;
+        let mut resume = false;
         let copied = self.recently_copied(Copied::Address);
         if online {
             value_block(ui, tr("Address"), &snap.listen_addr, |ui| {
@@ -614,7 +619,17 @@ impl AnalyzerApp {
             );
         }
         ui.add_space(4.0);
-        if pairing_required {
+        if let (true, Some(left)) = (pairing_required, paused) {
+            widgets::overline_label(ui, tr("Pairing code"));
+            widgets::paragraph(
+                ui,
+                RichText::new(code_pairing_paused_text(left))
+                    .size(SMALL)
+                    .color(WARNING),
+            );
+            resume =
+                widgets::button(ui, Tone::Secondary, None, tr("Resume code pairing")).clicked();
+        } else if pairing_required {
             value_block(ui, tr("Pairing code"), &code, |ui| {
                 rotate = widgets::icon_button(ui, Icon::Refresh, tr("New code")).clicked();
             });
@@ -630,8 +645,11 @@ impl AnalyzerApp {
         if rotate {
             self.new_pairing_code();
         }
+        if resume {
+            self.resume_code_pairing();
+        }
         if open_qr {
-            self.open_qr(snap);
+            self.open_qr();
         }
         if let Some(error) = &self.settings_error {
             ui.add(egui::Label::new(RichText::new(error).size(SMALL).color(DANGER)).wrap());
@@ -1153,6 +1171,16 @@ fn home_address(
 }
 
 /// Overline label, a large monospaced value and trailing controls.
+/// Why the code is gone from the Stream page, for how long, and what
+/// still works.
+pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
+    let minutes = left.as_secs().div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!(
+        "Too many wrong codes were typed, so code pairing is paused for {minutes} more {unit}. The QR code and USB still work. Resuming gives a new code."
+    )
+}
+
 fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;

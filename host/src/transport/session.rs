@@ -13,8 +13,8 @@ use super::link::{LinkId, PeerId};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, Nack,
-    ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
+    ByeReason, ControlHeader, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest,
+    Nack, ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
 };
 use tracing::{info, warn};
 
@@ -136,6 +136,62 @@ struct ActiveSession {
     frames_received: bool,
     /// A Wi-Fi goodbye while the cable takes over.
     bye: Option<ByeReason>,
+    /// The msg_seq of input packets taken in this session.
+    input_seqs: SeqWindow,
+}
+
+/// How far behind the newest input msg_seq a late packet may arrive.
+const SEQ_WINDOW: u32 = 1024;
+
+/// The msg_seq values of the last [`SEQ_WINDOW`] input packets. The iPad
+/// numbers every control packet, each copy of a press or release too, so
+/// a value seen before is a repeat. Wrapping u32 order, as the iPad's
+/// counter wraps.
+#[derive(Default)]
+struct SeqWindow {
+    highest: Option<u32>,
+    /// Bit `seq % SEQ_WINDOW` is set when `seq` was taken.
+    seen: [u64; (SEQ_WINDOW / 64) as usize],
+}
+
+impl SeqWindow {
+    /// True when `seq` is new and inside the window; it is then marked.
+    fn accept(&mut self, seq: u32) -> bool {
+        if let Some(highest) = self.highest {
+            let ahead = seq.wrapping_sub(highest);
+            if ahead == 0 || ahead > u32::MAX / 2 {
+                if highest.wrapping_sub(seq) >= SEQ_WINDOW || self.taken(seq) {
+                    return false;
+                }
+                self.mark(seq);
+                return true;
+            }
+            if ahead >= SEQ_WINDOW {
+                self.seen = Default::default();
+            } else {
+                for step in 1..=ahead {
+                    let (word, bit) = Self::slot(highest.wrapping_add(step));
+                    self.seen[word] &= !bit;
+                }
+            }
+        }
+        self.highest = Some(seq);
+        self.mark(seq);
+        true
+    }
+
+    fn slot(seq: u32) -> (usize, u64) {
+        let index = seq % SEQ_WINDOW;
+        ((index / 64) as usize, 1 << (index % 64))
+    }
+    fn taken(&self, seq: u32) -> bool {
+        let (word, bit) = Self::slot(seq);
+        self.seen[word] & bit != 0
+    }
+    fn mark(&mut self, seq: u32) {
+        let (word, bit) = Self::slot(seq);
+        self.seen[word] |= bit;
+    }
 }
 
 /// Provides the current stream parameters for HELLO_ACK/heartbeats.
@@ -328,13 +384,48 @@ impl Session {
         }
     }
 
+    /// Feed one control datagram off a link, with its header. Input whose
+    /// msg_seq this session took already, or that is too old, is dropped.
+    pub fn handle_datagram(
+        &mut self,
+        source: PeerId,
+        header: &ControlHeader,
+        message: ControlMessage,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        self.handle(
+            source,
+            header.session_id,
+            Some(header.msg_seq),
+            message,
+            config,
+            now,
+        )
+    }
+
     /// Feed one inbound control message. `header_session_id` is the id the
     /// datagram claims; every message except HELLO2 must match the live
     /// session's. `now` is injected for testability.
+    ///
+    /// Without a msg_seq, input skips the repeat check of
+    /// [`Self::handle_datagram`].
     pub fn handle_control(
         &mut self,
         source: PeerId,
         header_session_id: u32,
+        message: ControlMessage,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        self.handle(source, header_session_id, None, message, config, now)
+    }
+
+    fn handle(
+        &mut self,
+        source: PeerId,
+        header_session_id: u32,
+        msg_seq: Option<u32>,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
@@ -360,7 +451,7 @@ impl Session {
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
-            ControlMessage::InputEvent(event) => self.handle_input(source, event, now),
+            ControlMessage::InputEvent(event) => self.handle_input(source, event, msg_seq, now),
             ControlMessage::Nack(nack) => self.handle_nack(source, nack, now),
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
@@ -380,7 +471,13 @@ impl Session {
         self.handle_control(source, id, message, config, now)
     }
 
-    fn handle_input(&mut self, source: PeerId, event: InputEvent, now: Instant) -> Actions {
+    fn handle_input(
+        &mut self,
+        source: PeerId,
+        event: InputEvent,
+        msg_seq: Option<u32>,
+        now: Instant,
+    ) -> Actions {
         let mut actions = Actions::default();
         let Some(session) = self.active.as_mut() else {
             return actions;
@@ -391,6 +488,11 @@ impl Session {
         // Only relay input the client declared it wants to send — a session
         // that connected view-only stays view-only until it re-handshakes.
         if session.info.feature_caps & FEATURE_WANTS_INPUT == 0 {
+            return actions;
+        }
+        // Each copy of a press or release has its own msg_seq, so this drops
+        // only repeats; the event_id deduper still sorts out the copies.
+        if msg_seq.is_some_and(|seq| !session.input_seqs.accept(seq)) {
             return actions;
         }
         // A stream of touches is proof of life as good as any report.
@@ -464,6 +566,7 @@ impl Session {
             None => crate::pairing::Grant {
                 token: [0; 16],
                 used_code: false,
+                new_pairing: false,
             },
         };
 
@@ -547,14 +650,21 @@ impl Session {
             first_video_at: None,
             frames_received: false,
             bye: None,
+            input_seqs: SeqWindow::default(),
         });
 
+        // Only a new pairing carries the token. iPads keep the token they
+        // have when an ACK carries none.
         let ack = self.make_ack_with_token(
             HelloStatus::Ok,
             hello.client_nonce,
             session_id,
             config,
-            grant.token,
+            if grant.new_pairing {
+                grant.token
+            } else {
+                [0; 16]
+            },
         );
         self.active.as_mut().unwrap().ack = ack.clone();
         actions.replies.push((source, ack));
@@ -1616,6 +1726,136 @@ mod tests {
     }
 
     #[test]
+    fn the_seq_window_takes_each_number_once_within_1024() {
+        let mut window = SeqWindow::default();
+        assert!(window.accept(5000));
+        assert!(!window.accept(5000));
+        // A gap, then a late arrival inside the window, once.
+        assert!(window.accept(5003));
+        assert!(window.accept(5001));
+        assert!(!window.accept(5001));
+        assert!(window.accept(5002));
+        // 1,024 wide: highest - 1023 is the oldest number still taken.
+        assert!(window.accept(6026));
+        assert!(!window.accept(5003));
+        assert!(window.accept(5004));
+        assert!(!window.accept(5002));
+        // A jump past the whole window forgets everything older.
+        assert!(window.accept(9000));
+        assert!(!window.accept(6026));
+        assert!(window.accept(8000));
+        assert!(!window.accept(8000));
+    }
+
+    #[test]
+    fn the_seq_window_follows_the_counter_through_its_wrap() {
+        let mut window = SeqWindow::default();
+        for seq in (u32::MAX - 10..=u32::MAX).chain(0..10) {
+            assert!(window.accept(seq), "{seq}");
+        }
+        assert!(!window.accept(u32::MAX));
+        assert!(!window.accept(3));
+        assert!(window.accept(u32::MAX - 20));
+        assert!(!window.accept(u32::MAX - 1100));
+    }
+
+    /// Taps as the iPad sends them over Wi-Fi: each press and release twice
+    /// with one event_id, every packet with its own msg_seq. Reordered,
+    /// with packets repeated, the first copy of one release lost and its
+    /// second copy late, every press and release lands exactly once. A press
+    /// that arrives again after the event_id deduper forgot it doesn't land
+    /// again.
+    #[test]
+    fn reordered_and_repeated_input_lands_each_press_and_release_once() {
+        use crate::input::{EventDeduper, PHASE_BEGAN, PHASE_ENDED, PHASE_MOVED};
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let ControlMessage::Hello2(mut wants) = hello(1, 50000) else {
+            unreachable!()
+        };
+        wants.feature_caps = FEATURE_WANTS_INPUT;
+        session.handle_control(peer, 0, ControlMessage::Hello2(wants), &TestConfig, now);
+        let session_id = session.session_id().unwrap();
+
+        let event = |event_id, phase| {
+            let ControlMessage::InputEvent(mut event) = input_event(event_id) else {
+                unreachable!()
+            };
+            event.phase = phase;
+            event
+        };
+        let mut sent = Vec::new();
+        for tap in 0..40 {
+            let (press, release) = (tap * 2 + 1, tap * 2 + 2);
+            for (event_id, phase) in [
+                (press, PHASE_BEGAN),
+                (press, PHASE_BEGAN),
+                (0, PHASE_MOVED),
+                (release, PHASE_ENDED),
+                (release, PHASE_ENDED),
+            ] {
+                // The iPad's counter starts at 1 and also numbers its
+                // reports and pings, so input numbers have gaps.
+                let msg_seq = sent.len() as u32 * 2 + 1;
+                sent.push((msg_seq, event(event_id, phase)));
+            }
+        }
+        // Tap 3's release: the first copy is lost and the second is late.
+        let late = sent.remove(19);
+        let lost = sent.remove(18);
+        for (_, copy) in [&late, &lost] {
+            assert_eq!((copy.event_id, copy.phase), (8, PHASE_ENDED));
+        }
+        let mut delivered = Vec::new();
+        for (n, chunk) in sent.chunks(7).enumerate() {
+            let mut chunk = chunk.to_vec();
+            if n % 2 == 1 {
+                chunk.reverse();
+            }
+            // Every third chunk arrives twice over.
+            if n % 3 == 0 {
+                chunk.extend(chunk.clone());
+            }
+            delivered.extend(chunk);
+        }
+        delivered.push(late);
+
+        let mut deduper = EventDeduper::default();
+        let mut deliver = |session: &mut Session, msg_seq, event| {
+            let header = ControlHeader {
+                packet_type: eternal_wire::v2::PacketType::InputEvent,
+                session_id,
+                msg_seq,
+            };
+            let message = ControlMessage::InputEvent(event);
+            let actions = session.handle_datagram(peer, &header, message, &TestConfig, now);
+            actions
+                .input
+                .map(|(_, event)| event)
+                .filter(|event| deduper.accept(event))
+        };
+        let mut landed = std::collections::HashMap::<(u32, u8), u32>::new();
+        for (msg_seq, event) in delivered {
+            if let Some(event) = deliver(&mut session, msg_seq, event) {
+                if event.phase != PHASE_MOVED {
+                    *landed.entry((event.event_id, event.phase)).or_default() += 1;
+                }
+            }
+        }
+        for tap in 0..40 {
+            assert_eq!(landed.get(&(tap * 2 + 1, PHASE_BEGAN)), Some(&1), "{tap}");
+            assert_eq!(landed.get(&(tap * 2 + 2, PHASE_ENDED)), Some(&1), "{tap}");
+        }
+        assert_eq!(landed.len(), 80);
+
+        // The first press, once more: its event_id left the deduper long ago.
+        let first = event(1, PHASE_BEGAN);
+        assert!(EventDeduper::default().accept(&first));
+        assert!(deliver(&mut session, 1, first).is_none());
+    }
+
+    #[test]
     fn control_messages_need_the_negotiated_session_id() {
         let mut session = Session::new(1234);
         let now = Instant::now();
@@ -1831,6 +2071,7 @@ mod tests {
         hello.pairing_code = 0;
         let reconnected = pair_send(&mut session, &config, peer, hello.clone(), now);
         assert_eq!(pair_ack(&reconnected).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&reconnected).auth_token, [0; 16]);
         assert_ne!(pair_ack(&reconnected).session_id, ack.session_id);
         config.0.lock().regenerate_token().unwrap();
         let stale = pair_send(&mut session, &config, peer, hello, now);
@@ -1909,10 +2150,9 @@ mod tests {
             HelloStatus::RateLimited
         );
         hello.auth_token = [7; 16];
-        assert_eq!(
-            pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now)).status,
-            HelloStatus::Ok
-        );
+        let paired = pair_ack(&pair_send(&mut session, &config, peer, hello.clone(), now));
+        assert_eq!(paired.status, HelloStatus::Ok);
+        assert_eq!(paired.auth_token, [0; 16]);
         hello.auth_token = [0; 16];
         hello.client_nonce += 1;
         assert_eq!(
@@ -1926,6 +2166,52 @@ mod tests {
             .status,
             HelloStatus::Ok
         );
+    }
+
+    #[test]
+    fn only_a_new_pairing_gets_the_token() {
+        let config = pair_config(true);
+        let now = Instant::now();
+        let wifi = addr([192, 0, 2, 1], 50000);
+        let usb = PeerId {
+            link: LinkId::Usb { device_id: 1 },
+            addr: None,
+        };
+        let mut session = Session::new(10);
+        let mut send = |peer, nonce, token: [u8; 16], code| {
+            let mut hello = pair_hello(nonce);
+            hello.auth_token = token;
+            hello.pairing_code = code;
+            pair_send(&mut session, &config, peer, hello, now)
+        };
+
+        // The code pairs, and a retransmit of that HELLO, after a lost ACK,
+        // gets the same ACK with the token.
+        let code = config.0.lock().code();
+        let paired = send(wifi, 1, [0; 16], code);
+        assert_eq!(pair_ack(&paired).status, HelloStatus::Ok);
+        assert_eq!(pair_ack(&paired).auth_token, [7; 16]);
+        assert_eq!(send(wifi, 1, [0; 16], code).replies, paired.replies);
+
+        // Reconnects with the token, over Wi-Fi or USB, don't get it again.
+        for (peer, nonce) in [(wifi, 2), (usb, 3)] {
+            let ack = pair_ack(&send(peer, nonce, [7; 16], 0));
+            assert_eq!(ack.status, HelloStatus::Ok);
+            assert_eq!(ack.auth_token, [0; 16]);
+        }
+
+        // USB pairs an iPad without the token, or with an old one.
+        for (nonce, token) in [(4, [0; 16]), (5, [9; 16])] {
+            let ack = pair_ack(&send(usb, nonce, token, 0));
+            assert_eq!(ack.status, HelloStatus::Ok);
+            assert_eq!(ack.auth_token, [7; 16]);
+        }
+
+        // With pairing off there is no token to give.
+        config.0.lock().required = false;
+        let ack = pair_ack(&send(usb, 6, [0; 16], 0));
+        assert_eq!(ack.status, HelloStatus::Ok);
+        assert_eq!(ack.auth_token, [0; 16]);
     }
 
     fn ended(actions: &Actions) -> SessionEnd {

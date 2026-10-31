@@ -1,5 +1,5 @@
 //! Pairing credentials and bounded, clock-injected failed-attempt accounting.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,10 @@ use crate::transport::link::{LinkId, PeerId};
 
 const WINDOW: Duration = Duration::from_secs(60);
 const MAX_IPS: usize = 64;
+/// Wrong codes the host takes, from every address together, per
+/// [`BUDGET_WINDOW`]. One more pauses code pairing for the window.
+pub const CODE_BUDGET: usize = 10;
+pub const BUDGET_WINDOW: Duration = Duration::from_secs(600);
 
 pub fn new_token() -> Result<[u8; 16], getrandom::Error> {
     loop {
@@ -58,11 +62,15 @@ pub struct Pairing {
     token: [u8; 16],
     code: u32,
     limiter: RateLimiter,
+    budget: CodeBudget,
 }
 
 pub struct Grant {
     pub token: [u8; 16],
     pub used_code: bool,
+    /// The iPad paired just now, with the code or over USB, and gets the
+    /// token in the ACK. An iPad that presented the token already has it.
+    pub new_pairing: bool,
 }
 
 impl Pairing {
@@ -73,6 +81,7 @@ impl Pairing {
             token,
             code: random_code(0)?,
             limiter: RateLimiter::default(),
+            budget: CodeBudget::default(),
         })
     }
 
@@ -96,6 +105,13 @@ impl Pairing {
         }
     }
 
+    /// Said at startup and whenever pairing is turned off.
+    pub fn warn_if_off(&self) {
+        if !self.required {
+            warn!("Pairing is off: any iPad on the network can connect without a code");
+        }
+    }
+
     pub fn log_code(&self) {
         info!(pairing_code = %format_args!("{:06}", self.code), "Pairing code ready");
     }
@@ -103,6 +119,25 @@ impl Pairing {
     pub fn rotate_code(&mut self) -> Result<(), getrandom::Error> {
         self.code = random_code(self.code)?;
         self.log_code();
+        Ok(())
+    }
+
+    /// How much longer code pairing stays paused after too many wrong
+    /// codes. QR codes, USB and paired iPads work meanwhile.
+    pub fn code_pairing_paused(&self, now: Instant) -> Option<Duration> {
+        self.budget
+            .paused_until
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Resumes code pairing from the PC, with a full budget, no address
+    /// limits and a new code.
+    pub fn resume_code_pairing(&mut self) -> Result<(), getrandom::Error> {
+        self.rotate_code()?;
+        self.budget = CodeBudget::default();
+        self.limiter = RateLimiter::default();
+        info!("Code pairing resumed from the PC");
         Ok(())
     }
 
@@ -123,12 +158,14 @@ impl Pairing {
             return Ok(Grant {
                 token: [0; 16],
                 used_code: false,
+                new_pairing: false,
             });
         }
         if bool::from(hello.auth_token.ct_eq(&self.token)) {
             return Ok(Grant {
                 token: self.token,
                 used_code: false,
+                new_pairing: false,
             });
         }
         let usb = matches!(peer.link, LinkId::Usb { .. });
@@ -139,28 +176,90 @@ impl Pairing {
         {
             return Err(HelloStatus::RateLimited);
         }
+        if !usb && hello.pairing_code != 0 && self.budget.paused(now) {
+            return Err(HelloStatus::RateLimited);
+        }
         if hello.pairing_code != 0 && bool::from(hello.pairing_code.ct_eq(&self.code)) {
             return Ok(Grant {
                 token: self.token,
                 used_code: true,
+                new_pairing: true,
             });
         }
         if usb {
             return Ok(Grant {
                 token: self.token,
                 used_code: false,
+                new_pairing: true,
             });
         }
+        let mut limited = false;
         if let Some(addr) = peer.addr {
             if self
                 .limiter
                 .fail(addr.ip(), FailedRequest::from(hello), now)
             {
                 warn!(ip = %addr.ip(), "Pairing rate limited for 60 seconds");
-                return Err(HelloStatus::RateLimited);
+                limited = true;
             }
         }
+        if hello.pairing_code != 0 && self.budget.spend(FailedRequest::from(hello), now) {
+            warn!(
+                wrong_codes = CODE_BUDGET,
+                minutes = BUDGET_WINDOW.as_secs() / 60,
+                "Too many wrong pairing codes: code pairing paused, with a new code"
+            );
+            if let Err(error) = self.rotate_code() {
+                warn!(%error, "Pairing code rotation failed");
+            }
+            limited = true;
+        }
+        if limited {
+            return Err(HelloStatus::RateLimited);
+        }
         Err(HelloStatus::Unauthorized)
+    }
+}
+
+/// Wrong codes from every address together, beside the limit per address.
+#[derive(Default)]
+struct CodeBudget {
+    /// Wrong codes in the last [`BUDGET_WINDOW`], oldest first.
+    spent: VecDeque<(Instant, FailedRequest)>,
+    paused_until: Option<Instant>,
+}
+
+impl CodeBudget {
+    fn paused(&mut self, now: Instant) -> bool {
+        if self.paused_until.is_some_and(|until| now >= until) {
+            *self = Self::default();
+        }
+        self.paused_until.is_some()
+    }
+
+    /// Counts one wrong code. True when it spends the budget and pauses
+    /// code pairing.
+    fn spend(&mut self, request: FailedRequest, now: Instant) -> bool {
+        if self.paused(now) {
+            return false;
+        }
+        while self
+            .spent
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= BUDGET_WINDOW)
+        {
+            self.spent.pop_front();
+        }
+        // A retransmitted HELLO is the same guess.
+        if self.spent.iter().any(|(_, spent)| *spent == request) {
+            return false;
+        }
+        self.spent.push_back((now, request));
+        if self.spent.len() < CODE_BUDGET {
+            return false;
+        }
+        self.paused_until = Some(now + BUDGET_WINDOW);
+        true
     }
 }
 
@@ -262,6 +361,154 @@ mod tests {
             code: 0,
             token: [0; 16],
         }
+    }
+
+    fn hello(nonce: u32, token: [u8; 16], code: u32) -> Hello2 {
+        Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: nonce,
+            listen_port: 50000,
+            decoder_caps: 0,
+            feature_caps: 0,
+            screen_px_w: 0,
+            screen_px_h: 0,
+            screen_pt_w: 0,
+            screen_pt_h: 0,
+            refresh_hz: 60,
+            device_name: String::new(),
+            device_id: 1,
+            preferred_fps: 0,
+            auth_token: token,
+            pairing_code: code,
+        }
+    }
+
+    /// A different address for every guess, so the per-address limit never
+    /// applies.
+    fn wifi(n: u32) -> PeerId {
+        PeerId::udp(std::net::SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::from(0xC000_0200 + n)),
+            50000,
+        ))
+    }
+
+    fn wrong_code(pairing: &Pairing) -> u32 {
+        pairing.code() % 999_999 + 1
+    }
+
+    #[test]
+    fn wrong_codes_from_any_address_pause_code_pairing_with_a_new_code() {
+        let token = [7; 16];
+        let mut pairing = Pairing::new(true, token).unwrap();
+        let start = Instant::now();
+        let first_code = pairing.code();
+        for n in 1..CODE_BUDGET as u32 {
+            let wrong = wrong_code(&pairing);
+            let status = pairing.authorize(wifi(n), &hello(n, [0; 16], wrong), start);
+            assert_eq!(status.err(), Some(HelloStatus::Unauthorized));
+            // A retransmit is the same guess, and HELLOs without a code
+            // aren't guesses.
+            let again = pairing.authorize(wifi(n), &hello(n, [0; 16], wrong), start);
+            assert_eq!(again.err(), Some(HelloStatus::Unauthorized));
+            let no_code = pairing.authorize(wifi(n), &hello(n + 100, [0; 16], 0), start);
+            assert_eq!(no_code.err(), Some(HelloStatus::Unauthorized));
+        }
+        assert_eq!(pairing.code(), first_code);
+        assert_eq!(pairing.code_pairing_paused(start), None);
+        let last = pairing.authorize(wifi(99), &hello(99, [0; 16], wrong_code(&pairing)), start);
+        assert_eq!(last.err(), Some(HelloStatus::RateLimited));
+        assert_ne!(pairing.code(), first_code);
+        assert_eq!(pairing.code_pairing_paused(start), Some(BUDGET_WINDOW));
+
+        // Paused: even the right code is turned away. Paired iPads, a QR
+        // token and USB still connect, and a HELLO without a code still
+        // asks for one.
+        let later = start + BUDGET_WINDOW - Duration::from_secs(1);
+        let code = pairing.code();
+        let right = pairing.authorize(wifi(200), &hello(200, [0; 16], code), later);
+        assert_eq!(right.err(), Some(HelloStatus::RateLimited));
+        assert!(pairing
+            .authorize(wifi(201), &hello(201, token, 0), later)
+            .is_ok());
+        let usb = pairing.authorize(PeerId::usb(1), &hello(202, [0; 16], 0), later);
+        assert!(usb.is_ok_and(|grant| grant.new_pairing));
+        let ask = pairing.authorize(wifi(203), &hello(203, [0; 16], 0), later);
+        assert_eq!(ask.err(), Some(HelloStatus::Unauthorized));
+        assert_eq!(pairing.code(), code);
+
+        // The window refills the whole budget, and the new code works.
+        let refilled = start + BUDGET_WINDOW;
+        assert_eq!(pairing.code_pairing_paused(refilled), None);
+        let grant = pairing.authorize(wifi(300), &hello(300, [0; 16], code), refilled);
+        assert!(grant.is_ok_and(|grant| grant.used_code && grant.new_pairing));
+    }
+
+    #[test]
+    fn resuming_from_the_pc_refills_the_budget_with_a_new_code() {
+        let mut pairing = Pairing::new(true, [7; 16]).unwrap();
+        let now = Instant::now();
+        for n in 0..CODE_BUDGET as u32 {
+            let _ = pairing.authorize(wifi(n), &hello(n, [0; 16], wrong_code(&pairing)), now);
+        }
+        assert!(pairing.code_pairing_paused(now).is_some());
+        let paused_code = pairing.code();
+        pairing.resume_code_pairing().unwrap();
+        assert_eq!(pairing.code_pairing_paused(now), None);
+        assert_ne!(pairing.code(), paused_code);
+        for n in 0..CODE_BUDGET as u32 - 1 {
+            let wrong = wrong_code(&pairing);
+            let status = pairing.authorize(wifi(n), &hello(100 + n, [0; 16], wrong), now);
+            assert_eq!(status.err(), Some(HelloStatus::Unauthorized));
+        }
+        let code = pairing.code();
+        assert!(pairing
+            .authorize(wifi(500), &hello(500, [0; 16], code), now)
+            .is_ok());
+    }
+
+    #[test]
+    fn resuming_from_the_pc_lifts_address_limits_so_the_new_code_pairs_at_once() {
+        let mut pairing = Pairing::new(true, [7; 16]).unwrap();
+        let now = Instant::now();
+        let user = wifi(1);
+        for n in 0..5 {
+            let _ = pairing.authorize(user, &hello(n, [0; 16], wrong_code(&pairing)), now);
+        }
+        for n in 5..10 {
+            let _ = pairing.authorize(wifi(n), &hello(n, [0; 16], wrong_code(&pairing)), now);
+        }
+        assert!(pairing.code_pairing_paused(now).is_some());
+        pairing.resume_code_pairing().unwrap();
+        let code = pairing.code();
+        let grant = pairing.authorize(user, &hello(100, [0; 16], code), now);
+        assert!(grant.is_ok_and(|grant| grant.used_code && grant.new_pairing));
+    }
+
+    #[test]
+    fn wrong_codes_older_than_the_window_leave_the_budget() {
+        let mut pairing = Pairing::new(true, [7; 16]).unwrap();
+        let start = Instant::now();
+        let guess = |pairing: &mut Pairing, n: u32, at: Instant| {
+            let wrong = wrong_code(pairing);
+            pairing.authorize(wifi(n), &hello(n, [0; 16], wrong), at)
+        };
+        for n in 0..CODE_BUDGET as u32 - 1 {
+            assert!(guess(&mut pairing, n, start).is_err());
+        }
+        // A window later the first nine have aged out.
+        let later = start + BUDGET_WINDOW;
+        for n in 0..CODE_BUDGET as u32 - 1 {
+            assert_eq!(
+                guess(&mut pairing, 100 + n, later).err(),
+                Some(HelloStatus::Unauthorized)
+            );
+        }
+        assert_eq!(pairing.code_pairing_paused(later), None);
+        assert_eq!(
+            guess(&mut pairing, 200, later).err(),
+            Some(HelloStatus::RateLimited)
+        );
     }
 
     #[test]
