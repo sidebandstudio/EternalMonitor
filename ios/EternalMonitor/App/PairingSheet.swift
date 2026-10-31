@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PairingSheet: View {
     @ObservedObject var model: PairingSheetModel
+    @ObservedObject private var language = LanguageStore.shared
     let submit: () -> Void
     let cancel: () -> Void
     @FocusState private var focused: Bool
@@ -28,10 +29,10 @@ struct PairingSheet: View {
                         .accessibilityHidden(true)
 
                     VStack(spacing: 8) {
-                        Text("Pair with your PC")
+                        Text(L("Pair with your PC"))
                             .font(.app(24, .semibold, relativeTo: .title2))
                             .foregroundStyle(Theme.text)
-                        Text("Enter the 6-digit code shown in EternalMonitor on your PC. You only need to do this once.")
+                        Text(L("Enter the 6-digit code shown in EternalMonitor on your PC. You only need to do this once."))
                             .font(.app(15, relativeTo: .body))
                             .foregroundStyle(Theme.textMuted)
                             .multilineTextAlignment(.center)
@@ -64,7 +65,7 @@ struct PairingSheet: View {
                             let digits = String(code.filter(\.isNumber).prefix(6))
                             if digits != code { model.code = digits }
                         }
-                        .accessibilityLabel("Pairing code")
+                        .accessibilityLabel(L("Pairing code"))
                         .accessibilityIdentifier("pairing.code")
 
                     if let error = model.error {
@@ -88,7 +89,7 @@ struct PairingSheet: View {
                                 if model.submitting {
                                     ProgressView().tint(Theme.onAccent)
                                 }
-                                Text(remaining > 0 ? "Try again in \(remaining) s" : "Pair iPad")
+                                Text(remaining > 0 ? L("Try again in \(remaining) s") : L("Pair iPad"))
                             }
                         }
                         .buttonStyle(PrimaryButtonStyle())
@@ -115,11 +116,11 @@ struct PairingSheet: View {
                 }
             }
             .background(Theme.canvas.ignoresSafeArea())
-            .navigationTitle("Pair with PC")
+            .navigationTitle(L("Pair with PC"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: cancel)
+                    Button(L("Cancel"), action: cancel)
                         .foregroundStyle(Theme.text)
                         .accessibilityIdentifier("pairing.cancel")
                 }

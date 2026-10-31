@@ -15,6 +15,7 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
     override var canBecomeFirstResponder: Bool { true }
     override var inputAccessoryView: UIView? { accessory }
     private var modifierButtons: [UInt16: UIButton] = [:]
+    private weak var doneButton: UIButton?
 
     override func resignFirstResponder() -> Bool {
         let wasFirstResponder = isFirstResponder
@@ -39,25 +40,41 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
     func updateSticky(_ held: Set<UInt16>) {
         for (usage, button) in modifierButtons {
             button.isSelected = held.contains(usage)
-            button.accessibilityValue = held.contains(usage) ? "On" : "Off"
+            button.accessibilityValue = held.contains(usage) ? L("On") : L("Off")
             button.configuration?.baseBackgroundColor = held.contains(usage) ? UIColor(Theme.accent) : .secondarySystemFill
             button.configuration?.baseForegroundColor = held.contains(usage) ? .black : .label
         }
     }
 
+    /// Done and the key toggles' On and Off in the app's language, after a
+    /// switch in Settings.
+    func updateLanguage() {
+        doneButton?.configuration?.title = L("Done")
+        for button in modifierButtons.values {
+            button.accessibilityValue = button.isSelected ? L("On") : L("Off")
+        }
+    }
+
+    // The bar copies a PC keyboard's keys, so it stays left to right in
+    // every language: UIKit would mirror it on an iPad set to Arabic, which
+    // the stream's SwiftUI pin doesn't reach.
     private lazy var accessory: UIInputView = {
         let view = UIInputView(frame: CGRect(x: 0, y: 0, width: 700, height: 52), inputViewStyle: .keyboard)
+        view.semanticContentAttribute = .forceLeftToRight
         let scroll = UIScrollView()
+        scroll.semanticContentAttribute = .forceLeftToRight
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.showsHorizontalScrollIndicator = false
         view.addSubview(scroll)
         let done = UIButton(type: .system)
         var doneConfiguration = UIButton.Configuration.plain()
-        doneConfiguration.title = "Done"
+        doneConfiguration.title = L("Done")
         doneConfiguration.baseForegroundColor = UIColor(Theme.accent)
         doneConfiguration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8)
         done.configuration = doneConfiguration
         done.accessibilityIdentifier = "keyboard.done"
+        done.semanticContentAttribute = .forceLeftToRight
+        doneButton = done
         done.translatesAutoresizingMaskIntoConstraints = false
         done.addAction(UIAction { [weak self] _ in self?.onDismiss?() }, for: .touchUpInside)
         view.addSubview(done)
@@ -74,6 +91,7 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
         let stack = UIStackView()
         stack.axis = .horizontal
         stack.spacing = 4
+        stack.semanticContentAttribute = .forceLeftToRight
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -99,6 +117,7 @@ final class RelayKeyboardInputView: UIView, UIKeyInput {
             button.configuration = configuration
             button.accessibilityLabel = label
             button.accessibilityIdentifier = "keyboard.key.\(usage)"
+            button.semanticContentAttribute = .forceLeftToRight
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
             if KeyboardRelayMachine.modifierBit(usage) != 0 { modifierButtons[usage] = button }
             button.addAction(UIAction { [weak self] _ in

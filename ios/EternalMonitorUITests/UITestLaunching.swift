@@ -31,7 +31,12 @@ extension XCTestCase {
     /// XCTest still misses an exit, that one failure is expected and the app
     /// is launched once more. A crash of the app reports a different issue,
     /// so it, any other launch failure and a second miss fail the test.
+    /// The app follows the device's language unless the test chooses one:
+    /// a test that failed after choosing one in the app leaves it saved.
     func launchCleanly(_ app: XCUIApplication) {
+        if !app.launchArguments.contains("-appLanguage") {
+            app.launchArguments += ["-appLanguage", ""]
+        }
         stopIfRunning(app)
         if expectingMissedExit({ app.launch() }) {
             print("runner failed to terminate app; relaunching")

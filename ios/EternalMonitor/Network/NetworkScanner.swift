@@ -33,9 +33,29 @@ struct DiscoveredHost: Identifiable, Equatable {
 final class NetworkScanner: NSObject, ObservableObject {
     @Published var hosts: [DiscoveredHost] = []
     @Published var isScanning = false
-    @Published var statusMessage: String = ""
+    /// What the search is doing; `statusMessage` words it.
+    @Published private(set) var status: Status = .idle
     /// Why Bonjour couldn't search, or nil while it can.
     @Published var searchProblem: SearchProblem?
+
+    enum Status: Equatable {
+        case idle, looking, foundOne, stillLooking, noneFound
+        case found(Int)
+    }
+
+    /// The status in the app's language, read when drawn so a language
+    /// change shows at once. Empty before the first search.
+    var statusMessage: String {
+        switch status {
+        case .idle: ""
+        case .looking: L("Looking for PCs…")
+        case .foundOne: L("Found a PC…")
+        case .stillLooking: L("Still looking…")
+        case .noneFound: L("No PCs found.")
+        case .found(1): L("Found 1 PC")
+        case .found(let count): L("Found \(count) PCs")
+        }
+    }
 
     enum SearchProblem: Equatable {
         /// Local Network access is off for EternalMonitor.
@@ -84,7 +104,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         hosts = []
         resolvingServices.removeAll()
         ipv4Lookups.removeAll()
-        statusMessage = "Looking for PCs…"
+        status = .looking
 
         #if DEBUG
         if let code = UIPreview.searchErrorCode {
@@ -123,7 +143,7 @@ final class NetworkScanner: NSObject, ObservableObject {
                 // auto-retry once after 2s. Bonjour browse occasionally
                 // misses the first multicast burst.
                 didAutoRetry = true
-                statusMessage = "Still looking…"
+                status = .stillLooking
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     if self.hosts.isEmpty && !self.isScanning {
@@ -131,10 +151,10 @@ final class NetworkScanner: NSObject, ObservableObject {
                     }
                 }
             } else {
-                statusMessage = "No PCs found."
+                status = .noneFound
             }
         } else {
-            statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
+            status = .found(hosts.count)
         }
     }
 }
@@ -154,7 +174,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             service.resolve(withTimeout: 4)
 
             if !moreComing {
-                statusMessage = "Found a PC…"
+                status = .foundOne
             }
         }
     }
@@ -175,9 +195,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             hosts.removeAll { $0.name == service.name }
 
             if !moreComing {
-                statusMessage = hosts.isEmpty
-                    ? "No PCs found."
-                    : "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
+                status = hosts.isEmpty ? .noneFound : .found(hosts.count)
             }
         }
     }
@@ -229,7 +247,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         // getifaddrs() for every comparison, a syscall storm on the MainActor.
         let subnet = Self.primaryIPv4Subnet()
         hosts.sort { Self.hostQualityCompare($0, $1, ourSubnet: subnet) }
-        statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
+        status = .found(hosts.count)
     }
 
     func lookUpIPv4(hostName: String, service: DiscoveredHost) {
@@ -325,7 +343,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             resolvingServices.removeValue(forKey: Self.serviceKey(sender))
             resolveEnded(name: sender.name)
             if hosts.isEmpty {
-                statusMessage = "Found a PC…"
+                status = .foundOne
             }
         }
     }

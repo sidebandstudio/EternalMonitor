@@ -7,6 +7,13 @@ struct EternalMonitorApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        #if DEBUG
+        // UI tests: EM_FRESH_INSTALL=1 starts with nothing saved, as a new
+        // install does. Pairings are in the Keychain and stay.
+        if ProcessInfo.processInfo.environment["EM_FRESH_INSTALL"] == "1", let id = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: id)
+        }
+        #endif
         FontRegistry.shared.registerBundledFonts()
         SupportDiagnostics.shared.recordDeviceSnapshot()
         SupportDiagnostics.shared.record("info", "update",

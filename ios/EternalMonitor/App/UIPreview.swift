@@ -4,7 +4,10 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|error-local-network|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked`.
+/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|error-local-network|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked|setup|setup-blocked`.
+/// `setup` opens first-run setup whatever the saved state (launch with
+/// `-didSeeOnboarding NO`); `setup-blocked` also fails its search as if
+/// Local Network were off.
 /// Launch with `-feedbackLongSessions 3` to show the one-time feedback card.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
@@ -16,6 +19,7 @@ enum UIPreview {
     static var scrollsToAbout: Bool { mode == "settings-about" }
     /// Taps Send feedback. Simulators have no Mail, so this shows the copy sheet.
     static var opensFeedback: Bool { mode == "feedback" }
+    static var opensSetup: Bool { mode == "setup" || mode == "setup-blocked" }
     /// `EM_FEEDBACK_PREPARE_MS` stretches the wait before the feedback sheet,
     /// as collecting diagnostics for Mail can on a real iPad.
     static func feedbackPreparation() async {
@@ -27,7 +31,7 @@ enum UIPreview {
     static var searchErrorCode: Int? {
         switch mode {
         case "searchFailed": return -72000
-        case "searchBlocked": return -65570
+        case "searchBlocked", "setup-blocked": return -65570
         default: return nil
         }
     }
