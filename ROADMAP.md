@@ -35,6 +35,6 @@ Version 0.3.4 is in testing. It brings:
 
 ## Help build it
 
-For anything on this page, read
-[CONTRIBUTING.md](CONTRIBUTING.md) and talk it through on the
-[Sideband Discord](https://discord.gg/Xc7NykBZ6z) first.
+Pull requests for anything on this page are welcome, and so are new ideas.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to send one. To talk something
+through first, ask on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).

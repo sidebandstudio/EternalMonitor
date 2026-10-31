@@ -276,10 +276,11 @@ streaming system test on every pull request.
 
 ## Contributing
 
-Contributions are welcome, from transport and encoders to rendering and docs.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; it lists
-good first contributions, and [ROADMAP.md](ROADMAP.md) shows the larger work ahead. To
-talk an idea through first, ask on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
+Contributions of every kind are welcome: issues, ideas, fixes, docs, translations
+and new features. Pull requests are welcome, big or small.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to send one and lists good first
+contributions, and [ROADMAP.md](ROADMAP.md) shows the larger work ahead. Questions
+and ideas are welcome on the [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
 
 ## Contact
 

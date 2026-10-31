@@ -1,4 +1,4 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
   - name: Setup help
     url: https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
