@@ -199,7 +199,7 @@ Cada linha verifica a taxa de quadros decodificados (pelo menos 55 fps), perdas,
 
 ## Contribuindo
 
-Contribuições são bem-vindas em transporte, codificadores, renderização e documentação. Leia [CONTRIBUTING.md](../CONTRIBUTING.md) antes de abrir um pull request; ele lista boas primeiras contribuições, e [ROADMAP.md](../ROADMAP.md) mostra o trabalho maior pela frente. Para discutir uma ideia primeiro, pergunte no [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
+Todo tipo de contribuição é bem-vindo: issues, ideias, correções, documentação, traduções e novos recursos. Pull requests são bem-vindos, grandes ou pequenos. [CONTRIBUTING.md](../CONTRIBUTING.md) explica como enviar um e lista boas primeiras contribuições, e [ROADMAP.md](../ROADMAP.md) mostra o trabalho maior pela frente. Dúvidas e ideias são bem-vindas no [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
 
 ## Contato
 

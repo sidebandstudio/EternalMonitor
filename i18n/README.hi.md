@@ -199,7 +199,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## योगदान
 
-ट्रांसपोर्ट और एनकोडर से लेकर रेंडरिंग और दस्तावेज़ तक, योगदान का स्वागत है। pull request खोलने से पहले [CONTRIBUTING.md](../CONTRIBUTING.md) पढ़ें; उसमें शुरू करने के लिए अच्छे योगदान हैं और [ROADMAP.md](../ROADMAP.md) आगे का बड़ा काम बताता है। पहले किसी विचार पर बात करने के लिए [Sideband Discord](https://discord.gg/Xc7NykBZ6z) पर पूछें।
+हर तरह के योगदान का स्वागत है: issue, विचार, सुधार, दस्तावेज़, अनुवाद और नए फ़ीचर। छोटे हों या बड़े, pull request का स्वागत है। [CONTRIBUTING.md](../CONTRIBUTING.md) बताता है कि pull request कैसे भेजें और शुरुआत के लिए अच्छे योगदान कौन से हैं। [ROADMAP.md](../ROADMAP.md) आगे के बड़े काम दिखाता है। [Sideband Discord](https://discord.gg/Xc7NykBZ6z) पर सवालों और विचारों का स्वागत है।
 
 ## संपर्क
 

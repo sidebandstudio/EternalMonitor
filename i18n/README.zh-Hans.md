@@ -199,7 +199,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## 参与贡献
 
-欢迎贡献，包括传输、编码器、渲染和文档等方面。提交 pull request 前请阅读 [CONTRIBUTING.md](../CONTRIBUTING.md)，其中列出了适合初次贡献的任务；[ROADMAP.md](../ROADMAP.md) 则展示了更大的后续工作。如果想先讨论想法，请在 [Sideband Discord](https://discord.gg/Xc7NykBZ6z) 提问。
+欢迎各种贡献：issue、想法、修复、文档、翻译和新功能。无论大小，都欢迎提交 pull request。[CONTRIBUTING.md](../CONTRIBUTING.md) 介绍了如何提交，并列出了适合初次贡献的任务；[ROADMAP.md](../ROADMAP.md) 展示了更大的后续工作。也欢迎在 [Sideband Discord](https://discord.gg/Xc7NykBZ6z) 提问和分享想法。
 
 ## 联系方式
 

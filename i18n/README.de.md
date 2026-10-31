@@ -199,7 +199,7 @@ Jede Zeile prüft die dekodierte Bildrate (mindestens 55 fps), Verluste, Reparat
 
 ## Mitwirken
 
-Beiträge sind willkommen, von Transport und Encodern bis zu Rendering und Dokumentation. Lies [CONTRIBUTING.md](../CONTRIBUTING.md), bevor du einen Pull Request öffnest; dort stehen gute erste Beiträge, und [ROADMAP.md](../ROADMAP.md) zeigt die größeren anstehenden Arbeiten. Um eine Idee zuerst zu besprechen, frage auf dem [Sideband Discord](https://discord.gg/Xc7NykBZ6z).
+Beiträge jeder Art sind willkommen: Issues, Ideen, Fehlerbehebungen, Dokumentation, Übersetzungen und neue Funktionen. Pull Requests sind willkommen, ob groß oder klein. [CONTRIBUTING.md](../CONTRIBUTING.md) erklärt, wie du einen einreichst, und nennt gute erste Beiträge. [ROADMAP.md](../ROADMAP.md) zeigt die größeren anstehenden Arbeiten. Fragen und Ideen sind auf dem [Sideband Discord](https://discord.gg/Xc7NykBZ6z) willkommen.
 
 ## Kontakt
 

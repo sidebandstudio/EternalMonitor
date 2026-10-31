@@ -199,7 +199,7 @@ Chaque ligne vérifie la fréquence d'images décodées (au moins 55 fps), les p
 
 ## Contribuer
 
-Les contributions sont bienvenues, du transport et des encodeurs au rendu et à la documentation. Lisez [CONTRIBUTING.md](../CONTRIBUTING.md) avant d'ouvrir une pull request ; il indique de bonnes premières contributions, et [ROADMAP.md](../ROADMAP.md) présente les travaux plus importants à venir. Pour discuter d'abord d'une idée, posez votre question sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
+Toutes les contributions sont les bienvenues : issues, idées, corrections, documentation, traductions et nouvelles fonctionnalités. Les pull requests sont bienvenues, petites ou grandes. [CONTRIBUTING.md](../CONTRIBUTING.md) explique comment en envoyer une et propose de bonnes premières contributions, et [ROADMAP.md](../ROADMAP.md) présente les travaux plus importants à venir. Vos questions et idées sont les bienvenues sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
 
 ## Contact
 

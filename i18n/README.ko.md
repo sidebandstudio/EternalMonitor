@@ -199,7 +199,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## 기여
 
-전송과 인코더부터 렌더링과 문서까지 기여를 환영합니다. 풀 리퀘스트를 열기 전에 [CONTRIBUTING.md](../CONTRIBUTING.md)를 읽어 주세요. 처음 기여하기 좋은 작업이 나와 있으며 [ROADMAP.md](../ROADMAP.md)는 앞으로의 큰 작업을 보여줍니다. 아이디어를 먼저 논의하려면 [Sideband Discord](https://discord.gg/Xc7NykBZ6z)에 질문하세요.
+이슈, 아이디어, 수정, 문서, 번역, 새 기능 등 모든 기여를 환영합니다. 크고 작은 풀 리퀘스트도 환영합니다. [CONTRIBUTING.md](../CONTRIBUTING.md)에서 풀 리퀘스트를 보내는 방법과 처음 기여하기 좋은 작업을 안내하며, [ROADMAP.md](../ROADMAP.md)에서 앞으로의 큰 작업을 볼 수 있습니다. 질문과 아이디어도 [Sideband Discord](https://discord.gg/Xc7NykBZ6z)에서 편하게 나눠 주세요.
 
 ## 연락처
 

@@ -199,7 +199,7 @@ Cada fila comprueba la velocidad de fotogramas decodificados (al menos 55 fps), 
 
 ## Contribuir
 
-Se aceptan contribuciones, desde transporte y codificadores hasta renderizado y documentación. Lee [CONTRIBUTING.md](../CONTRIBUTING.md) antes de abrir un pull request; enumera buenas primeras contribuciones, y [ROADMAP.md](../ROADMAP.md) muestra el trabajo más amplio que queda por hacer. Para conversar primero sobre una idea, pregunta en el [Discord de Sideband](https://discord.gg/Xc7NykBZ6z).
+Todas las contribuciones son bienvenidas: issues, ideas, correcciones, documentación, traducciones y nuevas funciones. Los pull requests son bienvenidos, grandes o pequeños. [CONTRIBUTING.md](../CONTRIBUTING.md) explica cómo enviar uno y enumera buenas primeras contribuciones, y [ROADMAP.md](../ROADMAP.md) muestra el trabajo más amplio que queda por hacer. Las preguntas e ideas son bienvenidas en el [Discord de Sideband](https://discord.gg/Xc7NykBZ6z).
 
 ## Contacto
 

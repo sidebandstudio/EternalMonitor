@@ -199,7 +199,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## 貢献
 
-転送、エンコーダー、描画、ドキュメントなどへの貢献を歓迎します。プルリクエストを開く前に [CONTRIBUTING.md](../CONTRIBUTING.md) を読んでください。最初に取り組みやすい貢献が記載されており、[ROADMAP.md](../ROADMAP.md) には今後の大きな作業が示されています。まずアイデアについて相談したい場合は、[Sideband Discord](https://discord.gg/Xc7NykBZ6z) でお尋ねください。
+issue、アイデア、修正、ドキュメント、翻訳、新機能など、あらゆる貢献を歓迎します。大小を問わず、プルリクエストも歓迎します。[CONTRIBUTING.md](../CONTRIBUTING.md) ではプルリクエストの送り方と、最初に取り組みやすい貢献を紹介しています。[ROADMAP.md](../ROADMAP.md) には今後の大きな作業が示されています。質問やアイデアも [Sideband Discord](https://discord.gg/Xc7NykBZ6z) へお気軽にお寄せください。
 
 ## お問い合わせ
 

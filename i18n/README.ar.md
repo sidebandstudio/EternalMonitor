@@ -199,7 +199,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## المساهمة
 
-نرحب بالمساهمات، من النقل والمرمّزات إلى العرض والوثائق. اقرأ [CONTRIBUTING.md](../CONTRIBUTING.md) قبل فتح طلب سحب؛ فهو يسرد مساهمات مناسبة للبدء، ويوضح [ROADMAP.md](../ROADMAP.md) الأعمال الأكبر القادمة. لمناقشة فكرة أولًا، اسأل على [خادم Sideband في Discord](https://discord.gg/Xc7NykBZ6z).
+نرحب بكل أنواع المساهمات: بلاغات المشكلات والأفكار والإصلاحات والوثائق والترجمات والميزات الجديدة. نرحب بطلبات السحب، كبيرة كانت أم صغيرة. يشرح [CONTRIBUTING.md](../CONTRIBUTING.md) كيفية إرسال طلب ويسرد مساهمات مناسبة للبدء، ويوضح [ROADMAP.md](../ROADMAP.md) الأعمال الأكبر القادمة. نرحب بالأسئلة والأفكار على [خادم Sideband في Discord](https://discord.gg/Xc7NykBZ6z).
 
 ## الاتصال
 
