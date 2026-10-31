@@ -14,6 +14,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything below creates the settings folder or a file in it: a
+    // folder that held nothing means a fresh install, which opens first-run
+    // setup. Upgrades never see it.
+    eternal_host::settings::note_launch();
     // Helper modes are dispatched first, before logging and before the
     // single-instance check below: a `--failure-reporter` copy outlives the
     // host it watches and must never be turned away as a second instance,

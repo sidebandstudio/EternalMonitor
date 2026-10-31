@@ -11,6 +11,7 @@ use super::{
 };
 use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
+use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
 
@@ -343,11 +344,11 @@ impl AnalyzerApp {
             .unwrap_or_default();
         let (title, subtitle) = match state {
             StreamState::Off => (
-                "Streaming is off".to_string(),
-                "Click Start streaming so your iPad can connect.".to_string(),
+                tr("Streaming is off").to_string(),
+                tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
             StreamState::Ready => (
-                "Ready for your iPad".to_string(),
+                tr("Ready for your iPad").to_string(),
                 "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
                     .to_string(),
             ),
@@ -356,19 +357,22 @@ impl AnalyzerApp {
                 let mode = if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL
                     && *self.control.shared.vdd_status.lock() == VddStatus::Active
                 {
-                    CAPTURE_VIRTUAL_LABEL
+                    tr(CAPTURE_VIRTUAL_LABEL)
                 } else {
-                    "Mirroring"
+                    tr("Mirroring")
                 };
                 let mut parts = vec![client.link_name().to_string(), mode.to_string()];
                 if w > 0 && h > 0 {
                     parts.push(format!("{w} × {h}"));
                 }
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
-                (format!("Streaming to {device}"), parts.join("  ·  "))
+                (
+                    trf("Streaming to {device}", &[("device", &device)]),
+                    parts.join("  ·  "),
+                )
             }
             StreamState::Paused => (
-                format!("Streaming to {device} is paused"),
+                trf("Streaming to {device} is paused", &[("device", &device)]),
                 "Windows stopped screen capture. See the message above.".to_string(),
             ),
         };
@@ -413,33 +417,36 @@ impl AnalyzerApp {
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.add_space(3.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(title)
-                                        .family(semibold())
-                                        .size(18.0)
-                                        .color(TEXT),
-                                )
-                                .truncate(),
-                            );
-                            ui.add(egui::Label::new(muted(subtitle)).truncate());
+                            widgets::truncated(ui, &title, |text| {
+                                RichText::new(text)
+                                    .family(semibold())
+                                    .size(18.0)
+                                    .color(TEXT)
+                            });
+                            widgets::truncated(ui, &subtitle, muted);
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if snap.pipeline_running || waiting {
                             // While waiting for the port, Stop cancels the
                             // start that would follow.
-                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), "Stop").clicked()
+                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), tr("Stop"))
+                                .clicked()
                             {
                                 action = Some(HeaderAction::Stop);
                             }
                         }
                         if snap.pipeline_running {
-                            if widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
-                                .on_hover_text(
-                                    "Restart capture and encoding. The iPad reconnects on its own.",
-                                )
-                                .clicked()
+                            if widgets::button(
+                                ui,
+                                Tone::Secondary,
+                                Some(Icon::Refresh),
+                                tr("Restart"),
+                            )
+                            .on_hover_text(
+                                "Restart capture and encoding. The iPad reconnects on its own.",
+                            )
+                            .clicked()
                             {
                                 action = Some(HeaderAction::Restart);
                             }
@@ -448,7 +455,7 @@ impl AnalyzerApp {
                                 ui,
                                 Tone::Primary,
                                 Some(Icon::Play),
-                                "Start streaming",
+                                tr("Start streaming"),
                             )
                             .clicked()
                         {
@@ -476,17 +483,18 @@ impl AnalyzerApp {
                 ui.columns(3, |cols| {
                     widgets::metric(
                         &mut cols[0],
-                        "Frame rate",
+                        tr("Frame rate"),
                         &format!("{:.0}", snap.capture_fps),
                         "fps",
                         22.0,
                     )
                     .on_hover_text("Pictures per second. 60 looks smooth.");
-                    widgets::metric(&mut cols[1], "Delay", &latency, "ms", 22.0)
+                    widgets::metric(&mut cols[1], tr("Delay"), &latency, "ms", 22.0)
                         .on_hover_text("Time from this PC's screen to the picture on the iPad.");
-                    widgets::metric(&mut cols[2], "Connection", quality, "", 22.0).on_hover_text(
-                        "How well the picture is getting through. Performance has the details.",
-                    );
+                    widgets::metric(&mut cols[2], tr("Connection"), tr(quality), "", 22.0)
+                        .on_hover_text(
+                            "How well the picture is getting through. Performance has the details.",
+                        );
                 });
             }
 
@@ -510,19 +518,20 @@ impl AnalyzerApp {
         let mut arrange = false;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(
-                RichText::new("Use the iPad as")
-                    .family(medium())
-                    .color(TEXT),
-            );
+            let label = tr("Use the iPad as");
+            let response = ui.label(RichText::new(label).family(medium()).color(TEXT));
+            widgets::automation_id(&response, label);
             // A particular monitor (chosen in Settings) is still a mirror.
             widgets::segmented(
                 ui,
                 &mut second,
-                &[(false, CAPTURE_AUTO_LABEL), (true, CAPTURE_VIRTUAL_LABEL)],
+                &[
+                    (false, tr(CAPTURE_AUTO_LABEL)),
+                    (true, tr(CAPTURE_VIRTUAL_LABEL)),
+                ],
             );
             if second && vdd == VddStatus::Active {
-                arrange = widgets::button(ui, Tone::Ghost, None, "Arrange screens")
+                arrange = widgets::button(ui, Tone::Ghost, None, tr("Arrange screens"))
                     .on_hover_text(
                         "Opens Windows Settings at Display, where you drag the screens into place.",
                     )
@@ -551,10 +560,16 @@ impl AnalyzerApp {
         // detect_local_ip() reports "unknown:<port>" when no LAN adapter is up.
         let online = !snap.listen_addr.is_empty() && !snap.listen_addr.starts_with("unknown");
         let mut open_qr = false;
-        widgets::card_header(ui, "Connect an iPad", |ui| {
-            open_qr =
-                widgets::button_ex(ui, Tone::Secondary, Some(Icon::Qr), "QR code", online, 0.0)
-                    .clicked();
+        widgets::card_header(ui, tr("Connect an iPad"), |ui| {
+            open_qr = widgets::button_ex(
+                ui,
+                Tone::Secondary,
+                Some(Icon::Qr),
+                tr("QR code"),
+                online,
+                0.0,
+            )
+            .clicked();
         });
         widgets::paragraph(
             ui,
@@ -576,11 +591,11 @@ impl AnalyzerApp {
         let mut resume = false;
         let copied = self.recently_copied(Copied::Address);
         if online {
-            value_block(ui, "Address", &snap.listen_addr, |ui| {
+            value_block(ui, tr("Address"), &snap.listen_addr, |ui| {
                 let (icon, tip) = if copied {
-                    (Icon::Check, "Copied")
+                    (Icon::Check, tr("Copied"))
                 } else {
-                    (Icon::Copy, "Copy address")
+                    (Icon::Copy, tr("Copy address"))
                 };
                 copy = widgets::icon_button(ui, icon, tip).clicked();
             });
@@ -593,7 +608,7 @@ impl AnalyzerApp {
                 );
             }
         } else {
-            ui.label(overline("Address"));
+            widgets::overline_label(ui, tr("Address"));
             widgets::paragraph(
                 ui,
                 RichText::new(
@@ -605,21 +620,24 @@ impl AnalyzerApp {
         }
         ui.add_space(4.0);
         if let (true, Some(left)) = (pairing_required, paused) {
-            ui.label(overline("Pairing code"));
+            widgets::overline_label(ui, tr("Pairing code"));
             widgets::paragraph(
                 ui,
                 RichText::new(code_pairing_paused_text(left))
                     .size(SMALL)
                     .color(WARNING),
             );
-            resume = widgets::button(ui, Tone::Secondary, None, "Resume code pairing").clicked();
+            resume =
+                widgets::button(ui, Tone::Secondary, None, tr("Resume code pairing")).clicked();
         } else if pairing_required {
-            value_block(ui, "Pairing code", &code, |ui| {
-                rotate = widgets::icon_button(ui, Icon::Refresh, "New code").clicked();
+            value_block(ui, tr("Pairing code"), &code, |ui| {
+                rotate = widgets::icon_button(ui, Icon::Refresh, tr("New code")).clicked();
             });
         } else {
-            ui.label(overline("Pairing code"));
-            ui.label(muted("Not needed while pairing is off."));
+            widgets::overline_label(ui, tr("Pairing code"));
+            let note = tr("Not needed while pairing is off.");
+            let response = ui.label(muted(note));
+            widgets::automation_id(&response, note);
         }
         if copy && online {
             self.copy(ui.ctx(), Copied::Address, snap.listen_addr.clone());
@@ -649,7 +667,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Lock,
                 if required { ACCENT } else { TEXT_MUTED },
-                "Pairing",
+                tr("Pairing"),
                 if required {
                     "New iPads on Wi-Fi enter the pairing code once. USB needs no code."
                 } else {
@@ -679,7 +697,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Plug,
                 usb_color,
-                "USB connection",
+                tr("USB connection"),
                 &usb_text,
                 if snap.usb_service_reachable {
                     110.0
@@ -688,7 +706,7 @@ impl AnalyzerApp {
                 },
                 |ui| {
                     if snap.usb_service_reachable {
-                        widgets::badge(ui, usb_badge, usb_color);
+                        widgets::badge(ui, tr(usb_badge), usb_color);
                     } else {
                         apple_devices_action(ui, snap.apple_devices_installed);
                     }
@@ -708,7 +726,7 @@ impl AnalyzerApp {
                 ui,
                 Icon::Speaker,
                 audio_color,
-                "PC audio",
+                tr("PC audio"),
                 &audio_text,
                 64.0,
                 |ui| {
@@ -726,45 +744,50 @@ impl AnalyzerApp {
         let outputs = self.available_outputs.clone();
         let current = self.settings_capture_display.clone();
         let selected_text = if current.is_empty() {
-            CAPTURE_AUTO_LABEL.to_string()
+            tr(CAPTURE_AUTO_LABEL).to_string()
         } else if current == CAPTURE_VIRTUAL_SENTINEL {
-            CAPTURE_VIRTUAL_LABEL.to_string()
+            tr(CAPTURE_VIRTUAL_LABEL).to_string()
         } else if let Some(o) = outputs.iter().find(|o| o.device_name == current) {
             super::format_output_label(o)
         } else {
-            format!(
-                "{} (not connected)",
-                current.rsplit('\\').next().unwrap_or(&current)
+            trf(
+                "{display} (not connected)",
+                &[("display", current.rsplit('\\').next().unwrap_or(&current))],
             )
         };
         let mut choice = current.clone();
-        widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(ui, |ui| {
-            ui.set_min_width(width);
-            if ui
-                .selectable_label(choice.is_empty(), CAPTURE_AUTO_LABEL)
-                .clicked()
-            {
-                choice = String::new();
-            }
-            // Managed virtual display — created on demand, removed when not in use.
-            if ui
-                .selectable_label(choice == CAPTURE_VIRTUAL_SENTINEL, CAPTURE_VIRTUAL_LABEL)
-                .clicked()
-            {
-                choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
-            }
-            if !outputs.is_empty() {
-                ui.separator();
-            }
-            for o in &outputs {
-                if ui
-                    .selectable_label(choice == o.device_name, super::format_output_label(o))
-                    .clicked()
-                {
-                    choice = o.device_name.clone();
+        let combo = widgets::combo(ui.id().with("capture-display"), &selected_text, width).show_ui(
+            ui,
+            |ui| {
+                ui.set_min_width(width);
+                let auto = ui.selectable_label(choice.is_empty(), tr(CAPTURE_AUTO_LABEL));
+                widgets::automation_id(&auto, tr(CAPTURE_AUTO_LABEL));
+                if auto.clicked() {
+                    choice = String::new();
                 }
-            }
-        });
+                // Managed virtual display — created on demand, removed when not in use.
+                let virtual_display = ui.selectable_label(
+                    choice == CAPTURE_VIRTUAL_SENTINEL,
+                    tr(CAPTURE_VIRTUAL_LABEL),
+                );
+                widgets::automation_id(&virtual_display, tr(CAPTURE_VIRTUAL_LABEL));
+                if virtual_display.clicked() {
+                    choice = CAPTURE_VIRTUAL_SENTINEL.to_string();
+                }
+                if !outputs.is_empty() {
+                    ui.separator();
+                }
+                for o in &outputs {
+                    if ui
+                        .selectable_label(choice == o.device_name, super::format_output_label(o))
+                        .clicked()
+                    {
+                        choice = o.device_name.clone();
+                    }
+                }
+            },
+        );
+        widgets::name_combo(ui, &combo.response, &selected_text);
         if choice != current {
             self.set_capture_display(choice);
         }
@@ -1147,7 +1170,6 @@ fn home_address(
     hints.get(ip.parse().ok()?)
 }
 
-/// Overline label, a large monospaced value and trailing controls.
 /// Why the code is gone from the Stream page, for how long, and what
 /// still works.
 pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
@@ -1158,10 +1180,11 @@ pub(super) fn code_pairing_paused_text(left: std::time::Duration) -> String {
     )
 }
 
+/// Overline label, a large monospaced value and trailing controls.
 fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(overline(label));
+        widgets::overline_label(ui, label);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let max_text = (ui.available_width() - 40.0).max(60.0);
@@ -1176,7 +1199,7 @@ fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut
 
 fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
     let link = client.link_name();
-    widgets::card_header(ui, "Connected iPad", |ui| {
+    widgets::card_header(ui, tr("Connected iPad"), |ui| {
         if client.info.is_some() {
             widgets::badge(ui, link, ACCENT);
         }
@@ -1186,15 +1209,15 @@ fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "Waiting for an iPad",
+                tr("Waiting for an iPad"),
                 "It appears here as soon as it connects. If the iPad says this PC didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
             );
         } else {
             widgets::empty_state(
                 ui,
                 Icon::Tablet,
-                "No iPad connected",
-                "Start streaming, then connect from your iPad.",
+                tr("No iPad connected"),
+                tr("Start streaming, then connect from your iPad."),
             );
         }
         return;
@@ -1271,13 +1294,13 @@ pub(super) struct UsbSummary {
 /// Opens Apple Devices when it is installed, otherwise links to its Store page.
 fn apple_devices_action(ui: &mut Ui, installed: bool) {
     if installed {
-        if widgets::button(ui, Tone::Primary, None, "Open Apple Devices").clicked() {
+        if widgets::button(ui, Tone::Primary, None, tr("Open Apple Devices")).clicked() {
             crate::transport::apple_usb::open_apple_devices();
         }
     } else {
         widgets::link(
             ui,
-            "Get Apple Devices",
+            tr("Get Apple Devices"),
             crate::transport::apple_usb::APPLE_DEVICES_STORE_URL,
         );
     }

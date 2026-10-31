@@ -1,14 +1,18 @@
 //! Components for the host window. Every interactive piece reports a role
 //! and label through AccessKit, so UI Automation and the snapshot harness
-//! address them by their visible text.
+//! address them by their visible text. Whatever shows translated text also
+//! carries its English text as its AutomationId ([`automation_id`]), the
+//! same in every language.
 
 use std::ops::RangeInclusive;
 
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Align, Color32, CursorIcon, FontFamily, FontId, Frame, Key,
-    Label, Layout, Margin, Mesh, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
-    TextFormat, Ui, WidgetInfo, WidgetType,
+    self, pos2, text::LayoutJob, vec2, Align, Color32, CursorIcon, FontFamily, FontId,
+    FontSelection, Frame, Key, Label, Layout, Margin, Mesh, Pos2, Rect, Response, RichText, Sense,
+    Shape, Stroke, StrokeKind, TextFormat, TextWrapMode, Ui, WidgetInfo, WidgetText, WidgetType,
 };
+
+use crate::i18n;
 
 use super::icons::{self, Icon};
 use super::theme::*;
@@ -59,7 +63,8 @@ pub fn card_header(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
         vec2(width, BUTTON_HEIGHT),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.label(heading(title));
+            let response = ui.label(heading(title));
+            automation_id(&response, title);
             ui.with_layout(Layout::right_to_left(Align::Center), right);
         },
     );
@@ -74,13 +79,132 @@ pub fn divider(ui: &mut Ui) {
 
 pub fn section_label(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
-    ui.add(Label::new(overline(text)));
+    overline_label(ui, text);
     ui.add_space(2.0);
+}
+
+/// An [`overline`], in capitals as it reads, its English id too.
+pub fn overline_label(ui: &mut Ui, text: &str) -> Response {
+    let response = ui.add(Label::new(overline(text)));
+    if let Some(names) = i18n::automation(text) {
+        set_automation(
+            &response,
+            &names.id.to_uppercase(),
+            &names.name.to_uppercase(),
+        );
+    }
+    response
 }
 
 /// Wrapped text that fills the available width.
 pub fn paragraph(ui: &mut Ui, text: RichText) -> Response {
     ui.add(Label::new(text).wrap())
+}
+
+/// Gives a widget that shows `shown`, a translation, its English text as
+/// its AutomationId (AccessKit `author_id`), and as its name the text in
+/// reading order: Arabic is drawn reordered (see `i18n::bidi`), a screen
+/// reader needs it as written. Call it after egui has described the widget
+/// (`Response::widget_info`, or adding an egui widget), which would replace
+/// the name again. Never for a text field: what someone typed is theirs.
+pub fn automation_id(response: &Response, shown: &str) {
+    if let Some(names) = i18n::automation(shown) {
+        set_automation(response, &names.id, &names.name);
+    }
+}
+
+/// The node's AutomationId `id`, and `name` where egui put its text: a
+/// label's or a combo box's value, any other widget's label.
+fn set_automation(response: &Response, id: &str, name: &str) {
+    use egui::accesskit::Role;
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_author_id(id);
+        match node.role() {
+            Role::Label | Role::ComboBox => node.set_value(name),
+            _ => node.set_label(name),
+        }
+    });
+}
+
+/// `shown` in `style`, wrapped to the available width. Arabic is broken into
+/// lines in reading order before each line is reordered for drawing (see
+/// `i18n::bidi`); egui would otherwise wrap the reordered text.
+pub fn wrapped(ui: &mut Ui, shown: &str, style: impl Fn(String) -> RichText) -> Response {
+    let Some(logical) = i18n::logical(shown) else {
+        let response = ui.add(Label::new(style(shown.to_string())).wrap());
+        automation_id(&response, shown);
+        return response;
+    };
+    let width = ui.available_width() - 1.0;
+    let lines = i18n::bidi::wrap(logical, width, |line| {
+        WidgetText::from(style(line.to_string()))
+            .into_galley(
+                ui,
+                Some(TextWrapMode::Extend),
+                f32::INFINITY,
+                FontSelection::Default,
+            )
+            .size()
+            .x
+    });
+    let response = ui.add(Label::new(style(lines)).extend());
+    automation_id(&response, shown);
+    response
+}
+
+/// `shown` in `style` on one line, cut short with "…" where it does not fit.
+/// Arabic is cut at the end of its sentence before it is reordered (see
+/// [`fit_line`]); egui would cut the drawn right end, its start.
+pub fn truncated(ui: &mut Ui, shown: &str, style: impl Fn(String) -> RichText) -> Response {
+    let text = fit_line(ui, shown, ui.available_width() - 1.0, &style);
+    let response = ui.add(Label::new(style(text)).truncate());
+    automation_id(&response, shown);
+    response
+}
+
+/// `shown` cut to `width` at the end of its sentence where it holds
+/// right-to-left text drawn reordered: a translation, or a status line of
+/// parts joined with " · " left to right, which keeps the parts that fit and
+/// cuts the first that does not. Other text is left for egui to cut.
+pub(super) fn fit_line(
+    ui: &Ui,
+    shown: &str,
+    width: f32,
+    style: &impl Fn(String) -> RichText,
+) -> String {
+    let measure = |text: &str| {
+        WidgetText::from(style(text.to_string()))
+            .into_galley(
+                ui,
+                Some(TextWrapMode::Extend),
+                f32::INFINITY,
+                FontSelection::Default,
+            )
+            .size()
+            .x
+    };
+    if !i18n::is_rtl() || measure(shown) <= width {
+        return shown.to_string();
+    }
+    if let Some(logical) = i18n::reading_order(shown) {
+        return i18n::bidi::truncate(&logical, width, measure);
+    }
+    let mut kept = String::new();
+    for part in shown.split_inclusive('·') {
+        let joined = format!("{kept}{part}");
+        if measure(&joined) <= width {
+            kept = joined;
+            continue;
+        }
+        let core = part.trim_end_matches('·').trim();
+        let Some(logical) = i18n::reading_order(core) else {
+            return joined;
+        };
+        let before = format!("{kept}{}", &part[..part.find(core).unwrap_or(0)]);
+        let rest = i18n::bidi::truncate(&logical, width - measure(&before), measure);
+        return before + &rest;
+    }
+    kept
 }
 
 // ── Buttons ─────────────────────────────────────────────────────────────────
@@ -121,6 +245,7 @@ pub fn button_ex(
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    automation_id(&response, label);
 
     if ui.is_rect_visible(rect) {
         let hovered = enabled && response.hovered();
@@ -205,6 +330,7 @@ pub fn button_ex(
 pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    automation_id(&response, label);
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let pressed = response.is_pointer_button_down_on();
@@ -254,6 +380,7 @@ fn link_like(ui: &mut Ui, label: &str, icon: Icon, role: WidgetType) -> Response
     let size = galley.size() + vec2(16.0 + 5.0, 0.0);
     let (rect, response) = ui.allocate_exact_size(vec2(size.x, size.y.max(20.0)), Sense::click());
     response.widget_info(|| WidgetInfo::labeled(role, true, label));
+    automation_id(&response, label);
     if ui.is_rect_visible(rect) {
         let hover =
             ui.ctx()
@@ -289,7 +416,10 @@ fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: f32) {
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
-/// On/off switch. `label` is the accessible name (the row shows the title).
+/// On/off switch. `label` is its accessible name in English. In a row
+/// whose title is translated it is named by that title as a screen reader
+/// reads it, so a switch reads in the same language as its row. Its
+/// AutomationId is its row's title in English, or `label` outside a row.
 pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::click());
     if response.clicked() {
@@ -299,6 +429,14 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let value = *on;
     let enabled = ui.is_enabled();
     response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, value, label));
+    let title = row_title(ui);
+    match title.as_deref().and_then(i18n::automation) {
+        Some(names) if i18n::active() != i18n::Lang::En => {
+            set_automation(&response, &names.id, &names.name)
+        }
+        Some(names) => set_automation(&response, &names.id, label),
+        None => set_automation(&response, title.as_deref().unwrap_or(label), label),
+    }
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_with_time(response.id, value, 0.12);
         let hovered = response.hovered();
@@ -396,8 +534,9 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
     {
         let selected = *value == *option;
         response.widget_info(|| {
-            WidgetInfo::selected(WidgetType::SelectableLabel, enabled, selected, *label)
+            WidgetInfo::selected(WidgetType::SelectableLabel, enabled, selected, label)
         });
+        automation_id(&response, label);
         let hover = ui.ctx().animate_bool_with_time(
             response.id.with("hover"),
             response.hovered() && !selected,
@@ -570,9 +709,9 @@ fn row_with_leading(
             .allocate_ui_with_layout(vec2(text_width, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(text_width);
                 ui.spacing_mut().item_spacing.y = 3.0;
-                ui.add(Label::new(strong(title)).wrap());
+                wrapped(ui, title, strong);
                 if !description.is_empty() {
-                    ui.add(Label::new(muted(description)).wrap());
+                    wrapped(ui, description, muted);
                 }
             })
             .response;
@@ -600,13 +739,26 @@ fn row_with_leading(
             );
         }
         ui.add_space(gap);
+        // The control's [`toggle`] is named by the title.
+        ui.data_mut(|d| d.insert_temp(row_title_id(), title.to_string()));
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), height),
             Layout::right_to_left(Align::Center),
             control,
         );
+        ui.data_mut(|d| d.remove::<String>(row_title_id()));
     });
     ui.add_space(14.0);
+}
+
+/// Where a row keeps its title while its control draws.
+fn row_title_id() -> egui::Id {
+    egui::Id::new("setting row title")
+}
+
+/// The title of the row whose control is drawing, as shown.
+fn row_title(ui: &Ui) -> Option<String> {
+    ui.data(|d| d.get_temp::<String>(row_title_id()))
 }
 
 /// Label on the left, value on the right, one line.
@@ -616,7 +768,8 @@ pub fn stat_line(ui: &mut Ui, label: &str, value: &str) {
         vec2(width, 26.0),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.label(RichText::new(label).size(SMALL).color(TEXT_MUTED));
+            let response = ui.label(RichText::new(label).size(SMALL).color(TEXT_MUTED));
+            automation_id(&response, label);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
                     Label::new(
@@ -636,8 +789,12 @@ pub fn stat_line(ui: &mut Ui, label: &str, value: &str) {
 pub fn metric(ui: &mut Ui, label: &str, value: &str, unit: &str, value_size: f32) -> Response {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(RichText::new(label).size(SMALL).color(TEXT_MUTED));
-        ui.label(value_with_unit(value, unit, value_size));
+        let response = ui.label(RichText::new(label).size(SMALL).color(TEXT_MUTED));
+        automation_id(&response, label);
+        let response = ui.label(value_with_unit(value, unit, value_size));
+        if unit.is_empty() {
+            automation_id(&response, value);
+        }
     })
     .response
 }
@@ -709,6 +866,7 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let size = galley.size() + vec2(18.0, 8.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    automation_id(&response, text);
     ui.painter().rect(
         rect,
         size.y / 2.0,
@@ -817,8 +975,8 @@ pub fn empty_state(ui: &mut Ui, icon: Icon, title: &str, hint: &str) {
             TEXT_MUTED,
         );
         ui.add_space(4.0);
-        ui.label(strong(title));
-        ui.add(Label::new(muted(hint)).wrap());
+        wrapped(ui, title, strong);
+        wrapped(ui, hint, muted);
         ui.add_space(6.0);
     });
 }
@@ -959,8 +1117,17 @@ pub fn combo(
     selected: &str,
     width: f32,
 ) -> egui::ComboBox {
+    combo_rich(id, RichText::new(selected), width)
+}
+
+/// [`combo`] showing `selected` in its own font, e.g. a language's name.
+pub fn combo_rich(
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected: RichText,
+    width: f32,
+) -> egui::ComboBox {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(RichText::new(selected).size(13.0).color(TEXT))
+        .selected_text(selected.size(13.0).color(TEXT))
         .width(width)
         .height(360.0)
         .icon(|ui, rect, _visuals, open| {
@@ -972,6 +1139,28 @@ pub fn combo(
                 color,
             );
         })
+}
+
+/// Names a [`combo`] in a row by the row's title as a screen reader reads
+/// it, in English too, with the title's English as its AutomationId, and
+/// gives it the choice it shows, in reading order, as its value. Call it
+/// after `show_ui`, which describes the combo box.
+pub fn name_combo(ui: &Ui, response: &Response, shown: &str) {
+    let value = i18n::automation(shown).map_or_else(|| shown.to_string(), |names| names.name);
+    let title = row_title(ui).as_deref().and_then(i18n::automation);
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_value(value);
+        if let Some(title) = title {
+            node.set_author_id(title.id);
+            node.set_label(title.name);
+        }
+    });
+}
+
+/// [`automation_id`] with a given id: a language's own name.
+pub fn automation_id_as(response: &Response, id: &str, shown: &str) {
+    let name = i18n::automation(shown).map_or_else(|| shown.to_string(), |names| names.name);
+    set_automation(response, id, &name);
 }
 
 /// Two cards side by side, stretched to the taller one's height.
@@ -1007,4 +1196,117 @@ pub fn card_pair(
     }
     a.end(left_ui);
     b.end(right_ui);
+}
+
+// ── Choices ─────────────────────────────────────────────────────────────────
+
+/// One of a few options, as a card: a radio mark, a title and a line under
+/// it. Setup's choices.
+pub fn choice_card(
+    ui: &mut Ui,
+    selected: bool,
+    title: &str,
+    description: &str,
+    size: egui::Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, selected, title));
+    automation_id(&response, title);
+    if ui.is_rect_visible(rect) {
+        let hover =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+        let chosen = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("selected"), selected, 0.14);
+        ui.painter().rect(
+            rect,
+            10.0,
+            SURFACE
+                .lerp_to_gamma(SURFACE_RAISED, hover)
+                .lerp_to_gamma(mix(SURFACE, ACCENT, 7), chosen),
+            Stroke::new(1.0, BORDER_STRONG.lerp_to_gamma(ACCENT, chosen)),
+            StrokeKind::Inside,
+        );
+        focus_ring(ui, &response, rect, 10.0);
+        // The radio mark.
+        let mark = pos2(rect.left() + 22.0, rect.top() + 22.0);
+        ui.painter().circle_stroke(
+            mark,
+            7.0,
+            Stroke::new(1.5, TEXT_FAINT.lerp_to_gamma(ACCENT, chosen)),
+        );
+        if chosen > 0.0 {
+            ui.painter()
+                .circle_filled(mark, 3.5 * chosen, ACCENT.gamma_multiply(chosen));
+        }
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 42.0, rect.top() + 13.0),
+            pos2(rect.right() - 14.0, rect.bottom() - 10.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        child.spacing_mut().item_spacing.y = 2.0;
+        wrapped(&mut child, title, strong);
+        if !description.is_empty() {
+            wrapped(&mut child, description, muted);
+        }
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A compact option showing `text` in its own font: a language in setup.
+/// `id` is its AutomationId, its name in English.
+pub fn choice_tile(
+    ui: &mut Ui,
+    selected: bool,
+    text: RichText,
+    id: &str,
+    size: egui::Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, selected, text.text()));
+    automation_id_as(&response, id, text.text());
+    if ui.is_rect_visible(rect) {
+        let hover =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+        let chosen = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("selected"), selected, 0.14);
+        ui.painter().rect(
+            rect,
+            9.0,
+            SURFACE
+                .lerp_to_gamma(SURFACE_RAISED, hover)
+                .lerp_to_gamma(mix(SURFACE, ACCENT, 7), chosen),
+            Stroke::new(1.0, BORDER_STRONG.lerp_to_gamma(ACCENT, chosen)),
+            StrokeKind::Inside,
+        );
+        focus_ring(ui, &response, rect, 9.0);
+        let galley = WidgetText::from(text.size(13.5).color(TEXT)).into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            rect.width() - 44.0,
+            FontSelection::Default,
+        );
+        let pos = pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(pos, galley, TEXT);
+        if chosen > 0.0 {
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    pos2(rect.right() - 18.0, rect.center().y),
+                    vec2(14.0, 14.0),
+                ),
+                Icon::Check,
+                ACCENT.gamma_multiply(chosen),
+            );
+        }
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }

@@ -38,16 +38,33 @@ These versions work together even when their version numbers differ.
    code-signed yet.
 4. Windows asks **Do you want to allow this app to make changes to your
    device?** Click **Yes**.
-5. Click through the installer. Leave **Create a desktop shortcut** ticked if
-   you want an icon on your desktop.
+5. The installer asks for a language, with your Windows language already
+   chosen. Click **OK**; EternalMonitor opens in the same language. Click
+   through the installer. Leave **Create a desktop shortcut** ticked if you
+   want an icon on your desktop.
 6. If Windows asks **Would you like to install this device software?**, click
    **Install**. This is the driver that lets the iPad be a second screen.
 7. On the last page, leave **Launch EternalMonitor now** ticked and click
    **Finish**.
 
-The EternalMonitor window opens and says **Ready for your iPad**. Keep this
-window open while you use the iPad. You can minimize it. Closing it stops
-streaming.
+The first time, the EternalMonitor window opens with a short setup:
+
+- **Welcome to EternalMonitor**: your language.
+- **Starting EternalMonitor**: whether to **Start with Windows**.
+- **How will your iPad connect?**: **Wi-Fi**, **USB** or **Both**. For USB it
+  checks for Apple's Apple Devices app and offers **Get Apple Devices** if it
+  is missing.
+- **What should the iPad show?**: **Mirror my screen** or **Second screen**,
+  and **Play PC audio**.
+- **Connect your iPad**: the QR code and pairing code you use in Step 3. Click
+  **Done**.
+
+Click **Next** to go on, or **Skip setup** to keep the usual settings. To see
+it again, click **Run setup again** in **Settings**. **Language** in
+**Settings** changes the language at any time.
+
+The window then says **Ready for your iPad**. Keep this window open while you
+use the iPad. You can minimize it. Closing it stops streaming.
 
 To open it later, use the desktop shortcut or search for **EternalMonitor** in
 the Start menu. To have it open whenever you sign in to Windows, go to

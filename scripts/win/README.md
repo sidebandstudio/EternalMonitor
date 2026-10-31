@@ -78,7 +78,9 @@ activation click there. The checker separates that click from relayed test
 input and rejects events sent before the probe reports `Armed`.
 
 `gui Stream|Settings|QR <name>` uses UI Automation on the tracked host window
-and saves a cropped screenshot plus its accessible labels. `vdd-state`
+and saves a cropped screenshot plus its accessible labels and AutomationIds. It
+finds controls by AutomationId, the English name a translated control keeps,
+then by name, so it works in any window language. `vdd-state`
 reports the driver state and mode XML. The VDD row verifies both client
 disconnect and host exit while streaming, then verifies the display is
 disabled. `vdd-disable` runs the installed cleanup task when needed.
