@@ -67,7 +67,7 @@ USB には Apple の無料アプリ [Apple Devices](https://apps.microsoft.com/d
 
 v0.3.3 では、**セカンドスクリーン** (Second screen) が起動しなかった PC、特に Intel と NVIDIA のグラフィックスを搭載したノート PC での問題を修正しました。セカンドスクリーンの起動中は iPad に PC のメイン画面が表示され、PC の画面が繰り返し点滅することもなくなりました。Windows 0.3.3 に合わせて iPad を TestFlight v0.3.3, build 364 に更新してください。
 
-Windows と iPad の診断情報には、デバイスの詳細、アプリのエラー、配信の統計が含まれます。レポートには PC と iPad の名前、オーディオデバイス名、ネットワークアドレスが含まれますが、画面の内容、音声、ペアリングの認証情報は含まれません。自動共有は **設定** (Settings) で無効にできます。診断情報は最大 30 日間保存され、それより早く削除される場合もあります。削除済みまたは期限切れの診断情報は、日次バックアップにさらに最大 7 日間残る場合があります。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)を参照してください。iPad では **設定** (Settings) > **サポート** (Support) > **診断** (Diagnostics) を開き、レポートをコピーまたは書き出せます。
+Windows と iPad の診断情報には、デバイスの詳細、アプリのエラー、配信の統計が含まれます。レポートには グラフィックカードとディスプレイの名前、ネットワークアドレスが含まれますが、画面の内容、音声、ペアリングの認証情報は含まれません。0.3.4 から、Windows の送信データから PC の名前、ユーザー名、ユーザーフォルダー、iPad の名前、オーディオデバイス名が取り除かれ、各オーディオデバイスの種類だけが残ります。iPad の送信データからは PC の名前が取り除かれます。自動共有は **設定** (Settings) で無効にできます。診断情報は最大 30 日間保存され、それより早く削除される場合もあります。削除済みまたは期限切れの診断情報は、日次バックアップにさらに最大 7 日間残る場合があります。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)を参照してください。iPad では **設定** (Settings) > **サポート** (Support) > **診断** (Diagnostics) を開き、レポートをコピーまたは書き出せます。
 
 リリースチェックは Windows、macOS、iPad シミュレーターで合格しました。把握している問題は[既知の問題](https://eternalmonitor.dev/known-issues.html)に掲載しています。以前の実機での結果は [docs/hardware-verification.md](../docs/hardware-verification.md) に残っています。
 
