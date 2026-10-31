@@ -5,6 +5,18 @@ anything bigger than a small fix, open an issue or ask on the
 [Sideband Discord](https://discord.gg/Xc7NykBZ6z) first, so we can agree on the
 approach before you write the code.
 
+## Good first contributions
+
+- Issues labelled
+  [good first issue](https://github.com/sidebandstudio/EternalMonitor/labels/good%20first%20issue)
+  are small and self-contained, and a good way to learn the code.
+- [ROADMAP.md](ROADMAP.md) lists the larger work that is coming. Pick something
+  there and ask on Discord before you start.
+- A [compatibility report](https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml)
+  needs no code. Tell us how EternalMonitor runs on your PC and iPad, and with
+  your permission it goes on the
+  [compatibility page](https://eternalmonitor.dev/compatibility.html).
+
 ## Fork the repository
 
 Anyone with a GitHub account can contribute. [Fork EternalMonitor](https://github.com/sidebandstudio/EternalMonitor/fork)
