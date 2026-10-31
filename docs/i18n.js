@@ -18,7 +18,7 @@
 
    In the HTML, data-i18n="key" replaces an element's text and
    data-i18n-<attribute>="key" an attribute (alt, aria-label, placeholder,
-   content). In a string, <0>text</0> is the element's first child element
+   content, title). In a string, <0>text</0> is the element's first child element
    (icons not counted) with new text, and <0/> keeps that child as it is, so
    links, versions and code stay in the HTML. The page's English is kept the
    first time an element is translated and put back from there, so English
@@ -118,7 +118,7 @@
     el.appendChild(frag);
   };
 
-  var ATTRS = ['alt', 'aria-label', 'placeholder', 'content'];
+  var ATTRS = ['alt', 'aria-label', 'placeholder', 'content', 'title'];
   var translate = function (scope, dict) {
     Array.prototype.forEach.call(scope.querySelectorAll('[data-i18n]'), function (el) {
       var text = dict[el.getAttribute('data-i18n')];

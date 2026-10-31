@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="UTF-8">
+  <script>document.documentElement.className = 'js';</script>
+  <script>if (/Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1 && sessionStorage.getItem('mac-notice') !== 'off') document.documentElement.classList.add('mac');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    /* The language, before anything shows. English needs nothing more; another
+       language starts loading here and the page waits for it, at most 3 s.
+       docs/i18n.js explains; every page has this same script. */
+    (function () {
+      var root = document.documentElement;
+      var match = function (tag) {
+        var p = String(tag || '').toLowerCase().split(/[-_]/);
+        // Traditional Chinese has no translation: null means English.
+        if (p[0] === 'zh') return p.indexOf('hans') < 0 && (p.indexOf('hant') > 0 || /^(tw|hk|mo)$/.test(p[1] || '')) ? null : 'zh-Hans';
+        if (p[0] === 'pt') return 'pt-BR';
+        return /^(en|es|ar|hi|ru|ja|fr|de|ko)$/.test(p[0]) ? p[0] : '';
+      };
+      var lang = match(new URLSearchParams(location.search).get('lang'));
+      try {
+        if (lang) localStorage.setItem('em-lang', lang);
+        else lang = match(localStorage.getItem('em-lang'));
+      } catch (e) {}
+      var list = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+      for (var i = 0; !lang && i < list.length; i++) {
+        lang = match(list[i]);
+        if (lang === null) lang = 'en';
+      }
+      var boot = window.emLang = { lang: lang || 'en', translated: document.currentScript.hasAttribute('data-translated') };
+      if (boot.lang === 'en') return;
+      root.classList.add('not-english', 'i18n-wait');
+      if (boot.translated) { root.lang = boot.lang; root.dir = boot.lang === 'ar' ? 'rtl' : 'ltr'; }
+      // Too slow or no strings: English (docs/i18n.js does it once it runs).
+      var english = function () {
+        // Once only: a download that fails after the timeout must not undo a
+        // language the visitor has chosen since.
+        if (boot.done) return;
+        boot.done = true;
+        clearTimeout(boot.timer);
+        if (boot.fail) return boot.fail();
+        boot.lang = 'en';
+        boot.strings = null;
+        root.classList.remove('not-english', 'i18n-wait');
+        root.lang = 'en';
+        root.dir = 'ltr';
+      };
+      boot.timer = setTimeout(english, 3000);
+      boot.strings = fetch('i18n/' + boot.lang + '.json').then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+      boot.strings.catch(english);
+    })();
+  </script>
+  <script src="i18n.js" async></script>
+  <title>How to use an iPad as a second monitor for Windows | EternalMonitor</title>
+  <meta name="description" content="Use an iPad as a second monitor for a Windows PC with EternalMonitor, free and open source: what you need, setup, Wi-Fi or USB, extend or mirror, Apple Pencil and fixes.">
+  <link rel="canonical" href="https://eternalmonitor.dev/ipad-second-monitor-windows.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="EternalMonitor">
+  <meta property="og:title" content="How to use an iPad as a second monitor for Windows | EternalMonitor">
+  <meta property="og:description" content="Use an iPad as a second monitor for a Windows PC with EternalMonitor, free and open source: what you need, setup, Wi-Fi or USB, extend or mirror, Apple Pencil and fixes.">
+  <meta property="og:url" content="https://eternalmonitor.dev/ipad-second-monitor-windows.html">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="How to use an iPad as a second monitor for Windows | EternalMonitor">
+  <meta name="twitter:description" content="Use an iPad as a second monitor for a Windows PC with EternalMonitor, free and open source: what you need, setup, Wi-Fi or USB, extend or mirror, Apple Pencil and fixes.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/og.png">
+  <meta name="author" content="Sideband Studio">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
+  <link rel="preload" href="assets/fonts/Geist-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/Geist-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "url": "https://eternalmonitor.dev/ipad-second-monitor-windows.html",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Is EternalMonitor free?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. It is free and open source under the MIT license, with no account."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can Windows use an iPad as a monitor on its own?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No, Windows needs an app for it. EternalMonitor has a Windows app and its own iPad app, which decodes the video in hardware and sends Apple Pencil pressure and tilt back to Windows as Windows Ink."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Wi-Fi or USB?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Both. Start on Wi-Fi. A cable gives a steadier picture, takes over a running Wi-Fi session when you plug it in, and can charge the iPad from a USB-C port."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Does Apple Pencil pressure work?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. Windows receives pressure and tilt as Windows Ink, and Drawing mode ignores your palm on the canvas. Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How smooth is the picture?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The PC streams at 30, 60, 90 or 120 fps, encoded on supported NVIDIA, AMD or Intel graphics. 120 is for iPads with ProMotion; the lower of the PC's and the iPad's rate wins."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Which iPads work?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Any iPad with iPadOS 17 or later."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Is there a Mac version?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Mac support is coming soon, for iPad and iPhone Duo."
+        }
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <nav class="container nav-inner" aria-label="Main">
+      <a href="./" class="brand" aria-label="EternalMonitor home">
+        <img src="assets/icon.png" alt="" width="26" height="26">
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="./#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm">Updates</a>
+        <a href="download.html#feedback" class="nav-link hide-sm">Feedback</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener" title="Star on GitHub">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span aria-hidden="true">GitHub</span>
+          <span class="visually-hidden">Star on GitHub</span>
+          <span class="count" data-stars></span>
+        </a>
+        <a href="https://discord.gg/Xc7NykBZ6z" class="nav-link" target="_blank" rel="noopener" aria-label="Sideband Studio on Discord">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>
+          <span>Discord</span>
+        </a>
+        <div class="lang" data-lang>
+          <button type="button" class="nav-link lang-button" aria-expanded="false" aria-controls="lang-menu">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.7 1.8 2.5 3.9 2.5 6.4S9.7 12.6 8 14.4M8 1.6C6.3 3.4 5.5 5.5 5.5 8s.8 4.6 2.5 6.4"/></svg>
+            <span class="visually-hidden" data-i18n="lang.label">Language</span>
+            <span class="lang-name" data-lang-name>English</span>
+          </button>
+          <ul class="lang-menu" id="lang-menu" hidden></ul>
+        </div>
+        <a href="?lang=en" class="nav-link lang-english" lang="en" hreflang="en" data-lang-english hidden>English</a>
+        <a href="download.html" class="btn btn-primary btn-sm"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v10M5.5 8.5 10 13l4.5-4.5M3.5 16.5h13"/></svg><span>Download</span></a>
+      </div>
+    </nav>
+  </header>
+
+  <aside class="mac-notice" aria-label="Note for Mac visitors">
+    <div class="container mac-notice-inner">
+      <p><strong>On a Mac?</strong>Mac support is <a href="index.html#coming">coming soon</a>, for iPad and iPhone Duo. Until then, EternalMonitor streams from Windows PCs, and Apple's <a href="https://support.apple.com/en-us/102597" target="_blank" rel="noopener">Sidecar</a> works with an iPad.</p>
+      <button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <section class="page-head">
+      <div class="container">
+        <h1>Use an iPad as a second monitor for Windows</h1>
+        <p class="lead">To use an iPad as a screen, Windows needs an app. This guide uses EternalMonitor, which is free and open source, with a Windows app and its own iPad app. Setup takes about 10 minutes.</p>
+      </div>
+    </section>
+
+    <section class="container posts policy">
+      <article class="post" id="what-you-need" aria-labelledby="what-you-need-title">
+        <h2 id="what-you-need-title">What you need</h2>
+        <ul class="post-list">
+          <li>A 64-bit PC with Windows 10 version 1809 or later, or Windows 11.</li>
+          <li>NVIDIA, AMD or Intel graphics. Without a graphics card that can encode video, the processor does it and the picture may lag.</li>
+          <li>An iPad with iPadOS 17 or later.</li>
+          <li>For Wi-Fi, the PC and the iPad on the same home or office network. Guest networks usually keep devices apart.</li>
+          <li>For a USB cable, one that carries data, and Apple's free <a href="https://apps.microsoft.com/detail/9np83lwlpz9k" target="_blank" rel="noopener">Apple Devices</a> app on the PC. Apple Devices needs Windows 10 version 22H2 (build 19045) or Windows 11.</li>
+        </ul>
+        <p>The <a href="compatibility.html">compatibility page</a> lists the PCs and iPads it has been tested on.</p>
+      </article>
+
+      <article class="post" id="setup" aria-labelledby="setup-title">
+        <h2 id="setup-title">Set it up</h2>
+        <div class="post-update">
+          <h3>1. Install EternalMonitor on the PC</h3>
+          <p>On the <a href="download.html">download page</a>, click <strong>Download for Windows</strong> and open <strong>EternalMonitor-Setup.exe</strong>. If Windows shows <strong>Windows protected your PC</strong>, click <strong>More info</strong>, then <strong>Run anyway</strong>. If Windows asks <strong>Would you like to install this device software?</strong>, click <strong>Install</strong>. That driver is what lets the iPad be a second screen.</p>
+        </div>
+        <div class="post-update">
+          <h3>2. Install the iPad app</h3>
+          <p>Anyone can install the iPad app through Apple's TestFlight. Install <strong>TestFlight</strong> from the App Store, open the <a href="https://testflight.apple.com/join/ppc9QfXc" target="_blank" rel="noopener">EternalMonitor invite</a> on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</p>
+        </div>
+        <div class="post-update">
+          <h3>3. Connect</h3>
+          <p>Keep EternalMonitor open on the PC; it says <strong>Ready for your iPad</strong>. Open the app on the iPad and tap <strong>Allow</strong> when it asks to find devices on your local network. Then tap your PC under <strong>Found on this network</strong>, scan the QR code from the PC window, or type the <strong>Address</strong> the PC shows.</p>
+        </div>
+        <div class="post-update">
+          <h3>4. Pair once</h3>
+          <p>The first time on Wi-Fi, type the six-digit <strong>Pairing code</strong> from the PC window and tap <strong>Pair iPad</strong>. Scanning the QR code skips this. After that the iPad remembers your PC.</p>
+        </div>
+        <p>The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> has every step with the exact wording on screen.</p>
+      </article>
+    </section>
+
+    <section class="container">
+      <figure class="clip guide-clip">
+        <div class="tablet">
+          <div class="screen">
+            <video id="clip" controls muted playsinline loop preload="none"
+                   poster="assets/connect-clip-poster.jpg" width="1210" height="834">
+              <source src="assets/connect-clip.mp4" type="video/mp4">
+              <source src="assets/connect-clip.webm" type="video/webm">
+              <a href="assets/connect-clip.mp4">Download the clip (MP4)</a>
+            </video>
+          </div>
+        </div>
+        <div class="clip-controls">
+          <button type="button" class="btn btn-secondary" id="clip-play" aria-pressed="false">
+            <svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+            <svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
+            <span class="label">Play</span>
+          </button>
+        </div>
+      </figure>
+    </section>
+
+    <section class="container posts policy">
+      <article class="post" id="extend-or-mirror" aria-labelledby="extend-or-mirror-title">
+        <h2 id="extend-or-mirror-title">Extend or mirror</h2>
+        <p>At first the iPad mirrors your main screen. To make it a second screen, go to the <strong>Stream</strong> page in the PC window and, next to <strong>Use the iPad as</strong>, click <strong>Second screen</strong>. The iPad reconnects by itself. Drag a window past the edge of your main screen and it moves onto the iPad.</p>
+        <p><strong>Arrange screens</strong>, next to that choice, opens Windows' Display settings, where you drag the iPad to the side of your monitor it sits on. The second screen exists only while the iPad is connected.</p>
+        <p>To mirror again, click <strong>Mirror my screen</strong>. With more than one monitor, pick the one to mirror in <strong>Settings</strong>, under <strong>How the iPad shows your PC</strong>. On the iPad, choose <strong>Picture: Fill</strong> in Settings to fill the screen and trim the edges, or <strong>Fit</strong> to see all of it with bars.</p>
+      </article>
+    </section>
+
+    <section class="container guide-films">
+      <div class="bento">
+        <article class="demo demo-w4" aria-labelledby="d-second-screen">
+          <div class="demo-media">
+            <picture class="demo-poster">
+              <source media="(max-width: 600px)" srcset="assets/demos/second-screen-m.webp" width="728" height="1040">
+              <img src="assets/demos/second-screen.webp" width="1480" height="1040" alt="" loading="lazy" decoding="async">
+            </picture>
+            <video class="demo-film" muted loop playsinline preload="none" width="1480" height="1040" aria-label="Film: in the Windows app, the pointer picks Second screen. The iPad in front of the monitor stops mirroring and becomes a second display, and a reference sheet of night paintings is dragged off the monitor onto it, where it stays.">
+              <source media="(max-width: 600px)" src="assets/demos/second-screen-m.webm" type='video/webm; codecs="vp9"'>
+              <source media="(max-width: 600px)" src="assets/demos/second-screen-m.mp4" type="video/mp4">
+              <source src="assets/demos/second-screen.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/second-screen.mp4" type="video/mp4">
+            </video>
+          </div>
+          <div class="demo-foot">
+            <h3 id="d-second-screen">Extend your desktop</h3>
+            <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#step-5-use-the-ipad-as-a-second-screen-optional" aria-label="Explore the second screen" target="_blank" rel="noopener">Explore <span class="demo-arrow" aria-hidden="true"></span></a>
+          </div>
+        </article>
+        <article class="demo demo-w2" aria-labelledby="d-pair">
+          <div class="demo-media">
+            <picture class="demo-poster">
+              <img src="assets/demos/pair.webp" width="728" height="1040" alt="" loading="lazy" decoding="async">
+            </picture>
+            <video class="demo-film" muted loop playsinline preload="none" width="728" height="1040" aria-label="Film: in the Windows app, the pointer clicks QR code and the Scan to connect dialog opens. On the iPad, a finger taps Scan QR code, the camera finds the code on the PC's screen, and the iPad starts showing the PC while the Windows app says it is streaming to the iPad Pro over Wi-Fi.">
+              <source src="assets/demos/pair.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/pair.mp4" type="video/mp4">
+            </video>
+          </div>
+          <div class="demo-foot">
+            <h3 id="d-pair">Pair with a QR code</h3>
+            <a class="demo-more" href="#setup" aria-label="Explore pairing">Explore <span class="demo-arrow" aria-hidden="true"></span></a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="container posts policy">
+      <article class="post" id="wifi-or-usb" aria-labelledby="wifi-or-usb-title">
+        <h2 id="wifi-or-usb-title">Wi-Fi or USB</h2>
+        <p>Start with Wi-Fi. A cable gives a steadier picture and can charge the iPad from a USB-C port.</p>
+        <p>For USB, open <strong>Apple Devices</strong> on the PC and leave it open; it can stay minimized. Plug in the iPad, unlock it, and tap <strong>Trust</strong> the first time. Open EternalMonitor on the iPad and it connects over the cable. USB needs no pairing code. If you start on Wi-Fi and plug in the cable, the app can switch to it.</p>
+        <p>On the test PC, a 30-minute second screen over USB dropped no frames, and a 30-minute mirror over Wi-Fi dropped 19 of 105,600. A USB-C to USB-C cable charged the iPad while it streamed. The <a href="compatibility.html#tested">compatibility page</a> has the conditions.</p>
+        <p>Pairing keeps other devices out. Stream over your home Wi-Fi or another network you trust, or over the cable, where nothing goes over the network.</p>
+      </article>
+
+      <article class="post" id="apple-pencil" aria-labelledby="apple-pencil-title">
+        <h2 id="apple-pencil-title">Draw with Apple Pencil</h2>
+        <p>Apple Pencil works as a Windows pen, with pressure and tilt.</p>
+        <ul class="post-list">
+          <li>In the iPad app's settings, turn on <strong>Drawing mode</strong>, then reconnect. It ignores your palm and fingers on the canvas and mutes PC audio. A USB cable gives the smoothest strokes.</li>
+          <li>In your drawing app, pick the Windows pen setting. In Clip Studio Paint, choose <strong>Preferences</strong>, then <strong>Tablet</strong>, then <strong>Tablet PC</strong>.</li>
+          <li>Open the drawing app normally, not with <strong>Run as administrator</strong>, or Windows blocks the pen.</li>
+          <li>Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro.</li>
+        </ul>
+        <p>The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" target="_blank" rel="noopener">drawing guide</a> has the details.</p>
+      </article>
+    </section>
+
+    <section class="container guide-films">
+      <div class="bento">
+        <article class="demo demo-w3" aria-labelledby="d-pencil">
+          <div class="demo-media">
+            <picture class="demo-poster">
+              <source media="(max-width: 600px)" srcset="assets/demos/pencil-m.webp" width="728" height="1040">
+              <img src="assets/demos/pencil.webp" width="1104" height="1040" alt="" loading="lazy" decoding="async">
+            </picture>
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="1040" aria-label="Film: the iPad app shows the PC's painting full screen. An Apple Pencil paints blades of grass that swell where it presses and thin where it lifts, then tilts over to shade moonlight on the water.">
+              <source media="(max-width: 600px)" src="assets/demos/pencil-m.webm" type='video/webm; codecs="vp9"'>
+              <source media="(max-width: 600px)" src="assets/demos/pencil-m.mp4" type="video/mp4">
+              <source src="assets/demos/pencil.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/pencil.mp4" type="video/mp4">
+            </video>
+          </div>
+          <div class="demo-foot">
+            <h3 id="d-pencil">Apple Pencil, with pressure and tilt</h3>
+            <a class="demo-more" href="https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/pencil-drawing.md" aria-label="Explore Apple Pencil drawing" target="_blank" rel="noopener">Explore <span class="demo-arrow" aria-hidden="true"></span></a>
+          </div>
+        </article>
+        <article class="demo demo-w3" aria-labelledby="d-feedback">
+          <div class="demo-media">
+            <picture class="demo-poster">
+              <source media="(max-width: 600px)" srcset="assets/demos/feedback-m.webp" width="728" height="1040">
+              <img src="assets/demos/feedback.webp" width="1104" height="1040" alt="" loading="lazy" decoding="async">
+            </picture>
+            <video class="demo-film" muted loop playsinline preload="none" width="1104" height="1040" aria-label="Film: in the Windows app, Send feedback opens a panel, Something I like is picked and a short note is typed, then Open in my email app is clicked and the app says the email app should open with the message ready.">
+              <source media="(max-width: 600px)" src="assets/demos/feedback-m.webm" type='video/webm; codecs="vp9"'>
+              <source media="(max-width: 600px)" src="assets/demos/feedback-m.mp4" type="video/mp4">
+              <source src="assets/demos/feedback.webm" type='video/webm; codecs="vp9"'>
+              <source src="assets/demos/feedback.mp4" type="video/mp4">
+            </video>
+          </div>
+          <div class="demo-foot">
+            <h3 id="d-feedback">Send feedback from the app</h3>
+            <a class="demo-more" href="download.html#feedback" aria-label="Explore sending feedback">Explore <span class="demo-arrow" aria-hidden="true"></span></a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="container posts policy">
+      <article class="post" id="tips" aria-labelledby="tips-title">
+        <h2 id="tips-title">Tips</h2>
+        <ul class="post-list">
+          <li><strong>To find the PC,</strong> keep EternalMonitor open on it and put both on the same Wi-Fi, not a guest network. You can also scan its QR code or type its <strong>Address</strong>. If the PC runs a VPN, tap it under <strong>Found on this network</strong>, which finds <a href="known-issues.html#wrong-address">the right address</a> by itself.</li>
+          <li><strong>For USB,</strong> keep Apple Devices open, tap <strong>Trust</strong> on the iPad the first time, and use a cable that carries data. Apple Devices needs <a href="known-issues.html#usb-windows-version">Windows 10 version 22H2 or Windows 11</a>.</li>
+          <li><strong>For the smoothest Wi-Fi,</strong> use a 5 GHz network and stay close to the router, or connect the PC to the router with a network cable.</li>
+          <li><strong>For pressure in Clip Studio Paint,</strong> choose the <a href="known-issues.html#clip-studio-paint">Tablet PC setting</a>.</li>
+        </ul>
+        <p>The setup guide's <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#if-something-goes-wrong" target="_blank" rel="noopener">message tables</a> list every message the apps show, with what to do.</p>
+      </article>
+
+      <article class="post" id="faq" aria-labelledby="faq-title">
+        <h2 id="faq-title">Questions</h2>
+        <div class="faq">
+          <details>
+            <summary>Is EternalMonitor free?</summary>
+            <div><p>Yes. It is free and open source under the MIT license, with no account.</p></div>
+          </details>
+          <details>
+            <summary>Can Windows use an iPad as a monitor on its own?</summary>
+            <div><p>No, Windows needs an app for it. EternalMonitor has a Windows app and its own iPad app, which decodes the video in hardware and sends Apple Pencil pressure and tilt back to Windows as Windows Ink.</p></div>
+          </details>
+          <details>
+            <summary>Wi-Fi or USB?</summary>
+            <div><p>Both. Start on Wi-Fi. A cable gives a steadier picture, takes over a running Wi-Fi session when you plug it in, and can charge the iPad from a USB-C port.</p></div>
+          </details>
+          <details>
+            <summary>Does Apple Pencil pressure work?</summary>
+            <div><p>Yes. Windows receives pressure and tilt as Windows Ink, and Drawing mode ignores your palm on the canvas. Pressure works with Apple Pencil (1st or 2nd generation) and Apple Pencil Pro.</p></div>
+          </details>
+          <details>
+            <summary>How smooth is the picture?</summary>
+            <div><p>The PC streams at 30, 60, 90 or 120 fps, encoded on supported NVIDIA, AMD or Intel graphics. 120 is for iPads with ProMotion; the lower of the PC's and the iPad's rate wins.</p></div>
+          </details>
+          <details>
+            <summary>Which iPads work?</summary>
+            <div><p>Any iPad with iPadOS 17 or later.</p></div>
+          </details>
+          <details>
+            <summary>Is there a Mac version?</summary>
+            <div><p>Mac support is coming soon, for iPad and iPhone Duo.</p></div>
+          </details>
+        </div>
+      </article>
+
+      <article class="post" id="next" aria-labelledby="next-title">
+        <h2 id="next-title">Next</h2>
+        <p><a href="download.html">Download EternalMonitor</a>, see <a href="compatibility.html">what it has been tested on</a>, or <a href="alternatives.html">compare the other apps</a> that do this.</p>
+        <div class="studio-actions">
+          <a href="download.html" class="btn btn-primary">Download</a>
+          <a href="https://github.com/sidebandstudio/EternalMonitor" class="btn btn-secondary" target="_blank" rel="noopener">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>
+            Star on GitHub <span class="count" data-stars></span>
+          </a>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <p class="footer-copy">Built by <a href="https://sideband.studio" target="_blank" rel="noopener">Sideband Studio</a>. Open source under MIT.</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="./">Home</a>
+        <a href="download.html">Download</a>
+        <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
+        <a href="ipad-second-monitor-windows.html" aria-current="page">Second monitor guide</a>
+        <a href="compatibility.html">Compatibility</a>
+        <a href="alternatives.html">Alternatives</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/Xc7NykBZ6z" target="_blank" rel="noopener">Discord</a>
+        <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>
