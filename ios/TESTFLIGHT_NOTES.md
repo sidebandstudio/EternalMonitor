@@ -18,7 +18,7 @@ going when links, disks or drivers are slow.
   change. Quality steps down instead.
 - After a lost frame on Wi-Fi, the iPad keeps the last clear picture instead
   of smeared blocks or error -12909, and says **Restoring the picture…** if
-  that takes over a second.
+  it takes over a second.
 - If EternalMonitor can't start and a newer version is out, it offers the
   download page. When an update doesn't finish, the PC says why.
 - If another program holds the stream port (9876), the Stream page names it.
@@ -30,14 +30,14 @@ going when links, disks or drivers are slow.
 
 ### Settings
 
-- Both apps come in 11 languages, picked in first-run setup or in Settings.
-  Buttons, settings and setup are translated; messages and diagnostics stay
-  in English.
+- Both apps come in 11 languages, picked in setup or Settings. Buttons,
+  settings and setup are translated; messages and diagnostics stay in
+  English.
 - A new **Troubleshooting** section replaces settings support had you make by
   hand: graphics card, how the window draws, video encoder and smaller
   packets for VPNs.
-- Pairing and input handling are stricter. To let iPads connect over one
-  network only, pick it in **Listen on** under Troubleshooting.
+- Pairing and input handling are stricter. To limit iPads to one network,
+  pick it in **Listen on** under Troubleshooting.
 
 ### Reliability
 
@@ -53,8 +53,9 @@ going when links, disks or drivers are slow.
   desktop flashes less and short PC stalls end without an extra freeze.
 - When iPadOS blocks Local Network access, the iPad offers **Open Settings**
   and says USB works without it.
+- Pulling the USB cable no longer leaves a key or mouse button held down.
 - PC audio comes back by itself after iPadOS resets its media services.
-- The pairing code goes as soon as you type the sixth digit.
+- The pairing code goes once you type the sixth digit.
 - With the on-screen keyboard up, a hardware keyboard no longer drops keys.
 - A rare iPad crash when the picture closes is fixed.
 
@@ -63,15 +64,15 @@ going when links, disks or drivers are slow.
 - Diagnostics now remove your PC's and iPad's names, Windows user name and
   user folder. Audio devices are sent only by kind, such as headphones.
   **Copy logs** and the iPad's Copy and Export keep the names.
-- If you share diagnostics, the iPad app reports crashes, hangs and
-  unexpected exits: app and system details only.
+- If you share diagnostics, the iPad reports crashes, hangs and unexpected
+  exits: app and system details only.
 - Settings says whether sharing is on and when diagnostics were last sent.
 
 ### What to test
 
 Over Wi-Fi far from the router, move windows on the PC: the picture should
-never smear and should recover after **Restoring the picture…**. A busy PC
-may pause it, but not for long.
+never smear and recover after **Restoring the picture…**. A busy PC may
+pause it briefly.
 
 Turn off EternalMonitor in iPad Settings > Privacy & Security > Local
 Network: the iPad should offer **Open Settings**, and USB should still
