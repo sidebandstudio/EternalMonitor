@@ -166,7 +166,7 @@ Chaque ligne vérifie la fréquence d'images décodées (au moins 55 fps), les p
 | `ETERNAL_ENCODER` | Forcer un encodeur (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` ou `0` remplace la préférence HEVC |
 | `ETERNAL_FPS` | Remplacer la fréquence d'images de l'hôte ; la préférence de l'iPad reste la limite |
-| `ETERNAL_INPUT` | Entrée de l'encodeur : `yuv420` (par défaut), `auto` ou `bgra` |
+| `ETERNAL_INPUT` | Entrée de l'encodeur : `automatic` (par défaut : BGRA pour NVIDIA, YUV420 pour les autres), `yuv420`, `auto` ou `bgra` |
 | `ETERNAL_MAX_DGRAM` | Taille des datagrammes média, de 576 à 1400 octets |
 | `ETERNAL_CAPTURE` | `synthetic` remplace DXGI par une mire générée |
 | `ETERNAL_AUDIO` | `synthetic` sélectionne la source audio de test déterministe |

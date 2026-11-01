@@ -286,6 +286,31 @@ Auto and BGRA remain opt-in because the required native BGRA gate did not
 pass on both GPUs. Private campaign evidence is in
 `EternalMonitor-Handoff/evidence/windows-colors-a0823cc/`.
 
+### Give NVIDIA's encoders BGRA by default
+
+NVIDIA's encoders take BGRA under Encoder input's new Automatic. With
+YUV420P input, the Windows host copied every captured frame and converted it
+with single-threaded swscale before NVENC. At an iPad Pro 12.9-inch's
+2732x2048 Second screen that took about 10 ms of each 16.7 ms frame on the
+development Mac, and about 9% of captured frames never reached the encoder
+on the reference PC. With BGRA, NVENC converts on the graphics card. NVIDIA
+BGRA already passed the 2026-09-23 comparison above. AMD, Quick Sync and x264
+keep YUV420P (NV12 on Quick Sync), because AMD's encoder takes no BGRA in the
+pinned SDK. A BGRA open that fails opens YUV420P at once. YUV420, Auto and
+BGRA stay available, and a picked one wins.
+
+Automatic applies to fresh settings and to a pick. Every earlier version saved
+yuv420 whether or not anyone picked it, so a saved yuv420 can't tell a
+default from a choice made to fix wrong colours. Working PCs keep today's
+behaviour, so settings from an earlier version keep the input they name, and
+Troubleshooting says Automatic is faster on NVIDIA. Automatic is saved as
+`yuv420` with `encoder_input_automatic`. After a downgrade, 0.3.2 to 0.3.4
+ignore the marker and stream their default YUV420, instead of resetting every
+setting or reading Auto, which gives BGRA to any encoder that advertises it,
+Quick Sync HEVC included, with no fallback. Their save drops the marker, so
+the PC stays on YUV420 after the next upgrade. A picked Auto is saved as plain
+`auto`.
+
 ### Gate streaming FPS on reference hardware, not hosted VMs
 
 GitHub's free three-vCPU macOS VM cannot run the software x264/x265 encoder and

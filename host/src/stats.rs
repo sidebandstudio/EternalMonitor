@@ -28,6 +28,9 @@ pub struct PipelineStats {
     // Encoder
     pub encode_fps: f64,
     pub encode_time_us: u128,
+    /// The last frame's conversion from capture's BGRA to the encoder's
+    /// input (or its copy into a BGRA frame), before `encode_time_us` starts.
+    pub convert_time_us: u128,
     pub encode_frame_count: u64,
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
@@ -96,6 +99,7 @@ impl PipelineStats {
 
             encode_fps: 0.0,
             encode_time_us: 0,
+            convert_time_us: 0,
             encode_frame_count: 0,
             nal_bytes_last: 0,
             bitrate_bps: 0,
@@ -206,6 +210,10 @@ impl PipelineStats {
         self.capture_resolution = (width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
+    }
+
+    pub fn record_convert(&mut self, convert_us: u128) {
+        self.convert_time_us = convert_us;
     }
 
     pub fn record_encode(&mut self, encode_us: u128, nal_bytes: usize, bitrate_bps: u32) {

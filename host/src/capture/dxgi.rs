@@ -16,10 +16,10 @@ use super::recovery::{
     LossStep, OpenStep, LOSS_GIVE_UP,
 };
 use super::{
-    client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
+    client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
     keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
     resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
-    FPS_WINDOW,
+    FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -296,7 +296,7 @@ pub fn run_capture_loop(
     let mut spare: Option<Arc<Vec<u8>>> = None;
     // The last published frame, shared for keepalive resends without a copy.
     // Starts as a black frame so a static screen still yields a startup IDR.
-    let mut last_frame: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_bytes]);
+    let mut last_frame: Arc<Vec<u8>> = Arc::new(frame_buffer(frame_bytes));
 
     // --- Capture loop state ---
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
@@ -457,11 +457,13 @@ pub fn run_capture_loop(
                                     dupl.ReleaseFrame()?;
                                 }
 
-                                let mut pixel_buf =
-                                    match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
-                                        Some(buf) if buf.len() == frame_bytes => buf,
-                                        _ => vec![0u8; frame_bytes],
-                                    };
+                                let mut pixel_buf = match spare
+                                    .take()
+                                    .and_then(|arc| Arc::try_unwrap(arc).ok())
+                                {
+                                    Some(buf) if buf.len() == frame_bytes + FRAME_PADDING => buf,
+                                    _ => frame_buffer(frame_bytes),
+                                };
 
                                 // Map staging texture for CPU read
                                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -733,7 +735,7 @@ pub fn run_capture_loop(
                     row_bytes = (tex_width * 4) as usize;
                     frame_bytes = row_bytes * tex_height as usize;
                     spare = None;
-                    last_frame = Arc::new(vec![0u8; frame_bytes]);
+                    last_frame = Arc::new(frame_buffer(frame_bytes));
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(

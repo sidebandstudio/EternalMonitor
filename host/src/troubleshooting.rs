@@ -266,7 +266,7 @@ mod tests {
     fn all_automatic_is_todays_behaviour_and_logs_nothing() {
         let overrides = Overrides::resolve(&SettingsFile::default(), env(&[])).unwrap();
         assert_eq!(overrides.encoder.value, None);
-        assert_eq!(overrides.encoder_input.value, EncoderInput::Yuv420);
+        assert_eq!(overrides.encoder_input.value, EncoderInput::Automatic);
         assert!(!overrides.hevc.value);
         assert_eq!(overrides.max_dgram.value, 1400);
         assert_eq!(overrides.target_fps.value, 60);

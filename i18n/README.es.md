@@ -166,7 +166,7 @@ Cada fila comprueba la velocidad de fotogramas decodificados (al menos 55 fps), 
 | `ETERNAL_ENCODER` | Fuerza un codificador (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` o `0` anula la preferencia de HEVC |
 | `ETERNAL_FPS` | Anula la velocidad de fotogramas del host; la preferencia del iPad sigue limitándola |
-| `ETERNAL_INPUT` | Entrada del codificador: `yuv420` (predeterminada), `auto` o `bgra` |
+| `ETERNAL_INPUT` | Entrada del codificador: `automatic` (predeterminada: BGRA para NVIDIA, YUV420 para los demás), `yuv420`, `auto` o `bgra` |
 | `ETERNAL_MAX_DGRAM` | Tamaño del datagrama multimedia, de 576 a 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` sustituye DXGI por un patrón de prueba generado |
 | `ETERNAL_AUDIO` | `synthetic` selecciona la fuente determinista de audio de prueba |
