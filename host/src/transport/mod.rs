@@ -301,8 +301,8 @@ pub async fn start_sender(
             result = receive_control(&mut links, &mut deferred_control) => {
                 match result {
                     Ok(LinkEvent::Closed(id)) => {
-                        let actions = shared.session.lock().link_lost(id);
-                        execute_actions(actions, &links, &shared, &supervisor_tx).await;
+                        close_link(id, &mut retransmit_ring, &mut fault, &mut input_relay,
+                            &links, &shared, &supervisor_tx).await;
                     }
                     Ok(LinkEvent::Datagram(src, datagram)) => {
                         let datagram = datagram.as_slice();
@@ -707,6 +707,26 @@ async fn repair_while_pacing(
     }
 }
 
+/// A closed link, such as a pulled USB cable, ends its session, and the
+/// input held for it goes up as at every other end of a session.
+async fn close_link(
+    id: LinkId,
+    retransmit_ring: &mut RetransmitRing,
+    fault: &mut FaultInjector,
+    input_relay: &mut crate::input::InputRelay,
+    links: &TransportLinks,
+    shared: &SharedControl,
+    supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
+) {
+    let actions = shared.session.lock().link_lost(id);
+    if actions.client_lost {
+        retransmit_ring.clear();
+        fault.clear();
+        input_relay.reset();
+    }
+    execute_actions(actions, links, shared, supervisor_tx).await;
+}
+
 async fn execute_actions(
     mut actions: Actions,
     links: &TransportLinks,
@@ -935,6 +955,116 @@ mod tests {
             summaries[0]
         );
         crate::diagnostics::tests::assert_contract(&summaries[0]);
+    }
+
+    /// A cable pulled while a key and a mouse button are down ends the USB
+    /// session, and both go up, as at every other end of a session.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_usb_session_ended_by_its_cable_releases_held_input() {
+        use crate::input::{
+            recorder, CaptureGeometry, Injection, InputRelay, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
+        };
+        use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+        shared.pairing.lock().required = false;
+        let geometry = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+        };
+        let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+        let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+        let mut retransmit_ring = RetransmitRing::default();
+        let mut fault = FaultInjector::new(0.0, 0.0, Duration::ZERO);
+        let mut input_relay = InputRelay::default();
+        let cable = PeerId::usb(5);
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_WANTS_INPUT,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "cable test".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let accepted =
+            shared
+                .session
+                .lock()
+                .handle_control(cable, 0, hello, &config, Instant::now());
+        execute_actions(accepted, &links, &shared, &supervisor_tx).await;
+        let session_id = shared.session.lock().session_id().unwrap();
+        let press = |event_id, kind, keycode| {
+            ControlMessage::InputEvent(InputEvent {
+                input_ver: 1,
+                kind,
+                phase: PHASE_BEGAN,
+                buttons: 0,
+                event_id,
+                x_norm: 32768,
+                y_norm: 32768,
+                pressure_x1000: 0,
+                scroll_dx: 0,
+                scroll_dy: 0,
+                keycode,
+                modifiers: 0,
+                client_time_us: 0,
+                tilt_x: 0,
+                tilt_y: 0,
+            })
+        };
+        for event in [press(1, KIND_KEY, 0x04), press(2, KIND_MOUSE_ABS, 0)] {
+            let mut pressed = shared.session.lock().handle_control(
+                cable,
+                session_id,
+                event,
+                &config,
+                Instant::now(),
+            );
+            let (session_id, event) = pressed.input.take().unwrap();
+            input_relay.relay(session_id, &event, geometry);
+        }
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [
+                Injection::KeyDown { .. },
+                Injection::MoveAbs { .. },
+                Injection::LeftDown { .. }
+            ]
+        ));
+
+        close_link(
+            cable.link,
+            &mut retransmit_ring,
+            &mut fault,
+            &mut input_relay,
+            &links,
+            &shared,
+            &supervisor_tx,
+        )
+        .await;
+        assert!(shared.session.lock().session_id().is_none());
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::KeyUp { .. }, Injection::LeftUp { .. }]
+        ));
     }
 
     #[tokio::test]
