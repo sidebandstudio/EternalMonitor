@@ -305,6 +305,57 @@ keychain. Build numbers increase with workflow runs; tags must match the marketi
 version. External-group setup, Beta App Review and the public link remain manual
 App Store Connect steps. A dry archive is not an installable TestFlight build.
 
+## v0.3.5 decisions
+
+### Hold a silent client's session, and say goodbye when the host ends it
+
+A Wi-Fi uplink can stall for seconds while the downlink still works: the iPad
+keeps decoding, but the PC hears nothing from it. Ending the session 3 s into
+such a silence cut the picture of an iPad that was fine, and because the host
+said nothing, the iPad only reconnected once its own check gave up, about 8 s
+later.
+
+After 3 s of silence (`LIVENESS_TIMEOUT`), a client that had a picture now
+keeps its session and its stream: video, audio and heartbeats go on. Its held
+keys, mouse buttons and pen are released then, and another iPad may take the
+slot, as when the session ended. Anything from the client before 10 s
+(`HOLD_LIMIT`) carries the session on, with one IDR under the usual keyframe
+limit. At 10 s, or when another iPad takes the slot, the session ends with
+`end=liveness` and the host sends `BYE(error)`. Late packets of that session get
+it again, at most once a second for a minute. Every 0.3.x iPad reconnects at
+once on `error`, and ignores a BYE for a session id that isn't its own.
+
+- HELLO_ACK still advertises 3000 ms. Every iPad's own check of the PC runs on
+  it, so a larger value would slow down noticing a PC that is really gone.
+- A client that never counted a frame still ends at 3 s, so startup failures
+  keep their `no_video` diagnostics.
+- The second screen counts a held session as gone, so the virtual display still
+  goes 13 s after the iPad's last packet.
+- The stream goes on during the hold rather than pausing, because a pause would
+  freeze an iPad whose downlink is fine. For an iPad that is really gone, that
+  costs up to 7 s of video sent to nowhere.
+- Input that waited in a stalled uplink is dropped rather than landing seconds
+  late, perhaps in another window. Every 0.3.x iPad stamps input and pings with
+  one monotonic clock (`client_time_us`, `t1_us`). The session keeps the
+  smallest difference between host time and that stamp: the clocks' offset plus
+  the quickest trip, allowed to rise 1 ms a second so a slow iPad clock never
+  looks late. Input over 1 s (`INPUT_LATE`) past it is late. The relay drops it,
+  except a release of a key, button or Pencil contact the PC still holds, which
+  lands where the PC last saw it. A dropped press also drops its release, and a
+  Pencil stroke whose start was dropped is dropped to its end. Unstamped input
+  is never late.
+- Logs: `Client silent — holding the session` (WARN), `Client heard again —
+  session kept` (INFO, with `silent_ms`, `held_ms` and `heard`), and `Dropped
+  input that arrived late` (INFO, `late_input` and `max_late_ms`, a second after
+  a burst of late input ends). The expiry WARN adds `silent_ms`, `held_ms`,
+  `last_heard` and the session's `late_input`. The `session_summary` line is
+  unchanged.
+- With auto-reconnect off, an iPad whose session ends this way says the PC
+  ended the session, and its own summary says `end=goodbye`.
+
+Rejected: a longer liveness timeout, because held input and the device slot
+would wait for it too, and pausing the stream during the hold.
+
 ## Deferred
 
 - Physical iPad and full reference-PC campaign results: tracked in the hardware runbook.

@@ -73,13 +73,16 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 | PING / PONG | Min-RTT clock estimate for end-to-end latency |
 | INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
 | Audio | Sequenced Opus packets with discontinuity and capture timing |
-| BYE | User, background or shutdown teardown |
+| BYE | User, background or shutdown teardown; the host ending a silent session |
 
 One session owns the active link. Another device receives Busy; a reconnect from
 the same device supersedes its prior session. Duplicate accepted nonces replay
 the same ACK. All established-session traffic is session-id gated. Reports/input
-maintain liveness; expiry removes the client, and 10 s later its managed
-virtual display unless the iPad has come back.
+maintain liveness. After 3 s of silence a client that had a picture is held:
+its input is released and another device may connect, but the stream goes on.
+Anything from it resumes the session; at 10 s the host ends it with a BYE. A
+client that never had a picture ends at 3 s. The managed virtual display goes
+10 s after the silence reaches 3 s unless the iPad has come back.
 
 UDP carries video, audio and control on the same socket. The iPad's established
 Network.framework backend remains the default. A selectable BSD backend uses a

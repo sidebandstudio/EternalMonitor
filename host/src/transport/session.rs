@@ -4,8 +4,8 @@
 //! control messages and time ticks; it returns actions (reply datagrams,
 //! shared-state changes) for the transport to execute. This keeps every
 //! rule (busy rejection, supersede-in-place, duplicate-ACK idempotency,
-//! liveness expiry, keyframe-request rate limiting) unit-testable without
-//! sockets.
+//! liveness hold and expiry, keyframe-request rate limiting) unit-testable
+//! without sockets.
 
 use std::net::SocketAddr;
 
@@ -22,7 +22,28 @@ use tracing::{info, warn};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 pub const REPORT_INTERVAL_MS: u16 = 500;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
+/// How long after its last packet a client that had a picture keeps its
+/// session. Host-only: iPads get [`LIVENESS_TIMEOUT`], which drives their
+/// own check. Past that window the session is on hold: held input is
+/// released and another iPad may take the slot, but video and heartbeats go
+/// on, so an iPad whose uplink stalls while it still decodes never notices.
+/// 10 s is longer than an iPad waits for a silent PC (3 s, then 5 s more)
+/// and than the uplink stalls of a congested Wi-Fi channel.
+pub const HOLD_LIMIT: Duration = Duration::from_secs(10);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the late packets of a session ended for liveness get its
+/// goodbye again, at most one copy per [`ENDED_REPLY_GAP`].
+const ENDED_REPLY_FOR: Duration = Duration::from_secs(60);
+const ENDED_REPLY_GAP: Duration = Duration::from_secs(1);
+/// Input that reaches the host this much later than the quickest packet of
+/// its session, by the iPad's own clock, waited in a stalled uplink. The
+/// relay drops it: a click or key that lands seconds later can land in
+/// another window. The Pencil's own staleness limit is the same.
+pub const INPUT_LATE: Duration = Duration::from_secs(1);
+/// How fast the session lets the iPad's clock run slow against the host's,
+/// in microseconds per second: far more than any clock drifts, and far less
+/// than [`INPUT_LATE`] over a stall.
+const CLOCK_DRIFT_US_PER_S: u64 = 1000;
 /// Refused nonces remembered, and for how long: far past an iPad's 2 s of
 /// HELLO2 retransmits.
 const REFUSED_KEPT: usize = 64;
@@ -50,22 +71,30 @@ pub struct Actions {
     /// The media target changed (new session or takeover): update
     /// `SharedControl::target_addr` and reset connection stats.
     pub new_target: Option<PeerId>,
-    /// Ask the encoder for an IDR (new/superseded session, keyframe request).
+    /// Ask the encoder for an IDR (new/superseded session, keyframe request,
+    /// a client heard again after a hold).
     pub force_idr: bool,
     /// The client is gone (BYE or liveness expiry): stop sending media and, if
     /// the virtual display is in use, restart the pipeline so it tears down.
     pub client_lost: bool,
+    /// The client went silent and its session is on hold: release held keys,
+    /// mouse buttons and the pen, as for a lost client, but keep streaming.
+    pub release_input: bool,
     /// A fresh receiver report arrived (feeds the ABR controller).
     pub report: Option<ReceiverReport>,
     /// A validated `(session_id, event)` from the connected client (only
     /// produced when that client's HELLO2 asked for input relay). The
     /// transport dedupes per session and injects.
     pub input: Option<(u32, InputEvent)>,
+    /// That input arrived over [`INPUT_LATE`] late: the relay drops it,
+    /// except a release of what the PC still holds.
+    pub input_late: bool,
     /// Negotiated and session-gated request; the transport checks frag_count
     /// against its stored datagrams before sending anything.
-    pub retransmit: Option<(u32, u32, Vec<u16>)>,
-    /// An update stopped this client's stream: tell it, making sure the
-    /// message leaves (see [`Session::begin_update`]).
+    pub retransmit: Option<Nack>,
+    /// The host ended this client's session (an update stopped it, or it
+    /// went silent): tell it, making sure the message leaves (see
+    /// [`Session::begin_update`]).
     pub goodbye: Option<(PeerId, Vec<u8>)>,
     /// A session, or a HELLO2 the host turned down, ended: its summary line
     /// is due (`crate::diagnostics::log_session_end`).
@@ -126,6 +155,15 @@ struct ActiveSession {
     peer: PeerId,
     info: ClientInfo,
     liveness_deadline: Instant,
+    /// When the client was last heard, and what it sent.
+    heard: (Instant, Heard),
+    /// When the session went on hold (see [`HOLD_LIMIT`]).
+    held_since: Option<Instant>,
+    /// The quickest packet's one-way offset, in microseconds of host time
+    /// since the session started less the iPad's timestamp, and when it was
+    /// last updated (see [`ActiveSession::lateness`]).
+    client_clock: Option<(i64, Instant)>,
+    late_input: LateInput,
     awaiting_takeover: bool,
     last_keyframe_grant: Option<Instant>,
     last_report: Option<ReceiverReport>,
@@ -138,6 +176,51 @@ struct ActiveSession {
     bye: Option<ByeReason>,
     /// The msg_seq of input packets taken in this session.
     input_seqs: SeqWindow,
+}
+
+/// What a client sent last, for the liveness log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    Hello,
+    Report,
+    Nack,
+    Ping,
+    Input,
+    Keyframe,
+}
+
+impl Heard {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::Report => "report",
+            Self::Nack => "nack",
+            Self::Ping => "ping",
+            Self::Input => "input",
+            Self::Keyframe => "keyframe",
+        }
+    }
+}
+
+/// Input that arrived over [`INPUT_LATE`] late, counted for the log.
+#[derive(Debug, Default)]
+struct LateInput {
+    /// Since the last count logged.
+    pending: u32,
+    max_late: Duration,
+    last_at: Option<Instant>,
+    /// In the whole session.
+    total: u32,
+}
+
+/// The last session the host ended for liveness, whose late packets get its
+/// goodbye again: the iPad may have missed the first copies.
+struct EndedSession {
+    session_id: u32,
+    peer: PeerId,
+    goodbye: Vec<u8>,
+    ended_at: Instant,
+    last_sent: Instant,
 }
 
 /// How far behind the newest input msg_seq a late packet may arrive.
@@ -219,6 +302,8 @@ pub struct Session {
     goodbye: Option<(PeerId, Vec<u8>)>,
     /// That stream's end, reported by the next tick or [`Self::shut_down`].
     stopped: Option<SessionEnd>,
+    /// The last session ended for liveness (see [`Self::answer_ended`]).
+    ended_for_liveness: Option<EndedSession>,
     /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
     refused: std::collections::VecDeque<(u32, Instant)>,
     refusal_minute: Option<RefusalMinute>,
@@ -236,6 +321,7 @@ impl Session {
             updating: false,
             goodbye: None,
             stopped: None,
+            ended_for_liveness: None,
             refused: std::collections::VecDeque::new(),
             refusal_minute: None,
             next_session_id: session_id_seed.max(1),
@@ -245,6 +331,14 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// The client went silent and its session is on hold (see
+    /// [`HOLD_LIMIT`]).
+    pub fn on_hold(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|session| session.held_since.is_some())
     }
 
     /// The id of the last session that ended, and why it ended.
@@ -442,7 +536,8 @@ impl Session {
             match self.active.as_ref() {
                 Some(session)
                     if session.session_id == header_session_id && !session.awaiting_takeover => {}
-                _ => return Actions::default(),
+                _ if matches!(message, ControlMessage::Bye(_)) => return Actions::default(),
+                _ => return self.answer_ended(source, header_session_id, now),
             }
         }
         match message {
@@ -496,7 +591,10 @@ impl Session {
             return actions;
         }
         // A stream of touches is proof of life as good as any report.
-        session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        actions.force_idr = session.heard(Heard::Input, now);
+        actions.input_late = session
+            .lateness(event.client_time_us, now)
+            .is_some_and(|late| session.late_input.note(late, now));
         actions.input = Some((session.session_id, event));
         actions
     }
@@ -513,8 +611,8 @@ impl Session {
         {
             return actions;
         }
-        session.liveness_deadline = now + LIVENESS_TIMEOUT;
-        actions.retransmit = Some((nack.stream_epoch, nack.frame_seq, nack.missing));
+        actions.force_idr = session.heard(Heard::Nack, now);
+        actions.retransmit = Some(nack);
         actions
     }
 
@@ -593,6 +691,9 @@ impl Session {
                 }
                 // Same device, new connect attempt: supersede in place.
                 info!(peer = %source, "Client reconnected — superseding session in place");
+            } else if session.held_since.is_some() {
+                // The session's own client went silent: the slot is free.
+                info!(peer = %source, "Another client takes over a silent session");
             } else {
                 // A different device while one is streaming: reject.
                 info!(peer = %source, "Second client rejected while a session is active");
@@ -611,7 +712,17 @@ impl Session {
             }
         }
 
-        actions.ended = self.end(EndReason::Superseded, now);
+        let silent_taken_over = self
+            .active
+            .as_ref()
+            .is_some_and(|session| !session.same_device(source, hello.device_id));
+        if silent_taken_over {
+            let (ended, goodbye) = self.expire(now);
+            actions.ended = ended;
+            actions.goodbye = goodbye;
+        } else {
+            actions.ended = self.end(EndReason::Superseded, now);
+        }
         let session_id = self.allocate_session_id();
         crate::telemetry::note_client_device(&hello.device_name);
         info!(
@@ -643,6 +754,10 @@ impl Session {
                 connected_at: now,
             },
             liveness_deadline: now + LIVENESS_TIMEOUT,
+            heard: (now, Heard::Hello),
+            held_since: None,
+            client_clock: None,
+            late_input: LateInput::default(),
             awaiting_takeover: false,
             last_keyframe_grant: None,
             last_report: None,
@@ -713,15 +828,10 @@ impl Session {
         if !session_peer_matches(session, source) {
             return actions;
         }
-        session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        actions.force_idr = session.heard(Heard::Keyframe, now);
         info!(reason = ?request.reason, "Keyframe request received");
 
-        let granted = !matches!(
-            session.last_keyframe_grant,
-            Some(last) if now.duration_since(last) < KEYFRAME_REQUEST_MIN_INTERVAL
-        );
-        if granted {
-            session.last_keyframe_grant = Some(now);
+        if session.grant_keyframe(now) {
             info!(reason = ?request.reason, "Keyframe requested by client — forcing IDR");
             actions.force_idr = true;
         }
@@ -732,7 +842,7 @@ impl Session {
         let mut actions = Actions::default();
         if let Some(session) = self.active.as_mut() {
             if session_peer_matches(session, source) {
-                session.liveness_deadline = now + LIVENESS_TIMEOUT;
+                actions.force_idr = session.heard(Heard::Report, now);
                 session.last_report = Some(report);
                 session.frames_received |= report.frames_complete > 0;
                 actions.report = Some(report);
@@ -754,7 +864,8 @@ impl Session {
         if !session_peer_matches(session, source) {
             return actions;
         }
-        session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        actions.force_idr = session.heard(Heard::Ping, now);
+        session.lateness(ping.t1_us, now);
 
         let t2 = crate::clock::host_now_us();
         let session_id = session.session_id;
@@ -813,17 +924,39 @@ impl Session {
         }
 
         if now >= session.liveness_deadline {
-            warn!(
-                peer = %session.peer,
-                device = %session.info.device_name,
-                "Client liveness expired — tearing session down"
-            );
-            let reason = session.bye.map_or(EndReason::Liveness, EndReason::Goodbye);
-            actions.ended = self.end(reason, now);
-            actions.client_lost = true;
-            return actions;
+            // A client that had a picture may only have lost its uplink: it
+            // keeps the session, on hold, until the hold limit. One that
+            // never had a picture, or said goodbye, ends now.
+            let holds = session.frames_received && !session.awaiting_takeover;
+            if !holds || now >= session.liveness_deadline + (HOLD_LIMIT - LIVENESS_TIMEOUT) {
+                if let Some(bye) = session.bye {
+                    session.log_expiry(now);
+                    actions.ended = self.end(EndReason::Goodbye(bye), now);
+                } else {
+                    (actions.ended, actions.goodbye) = self.expire(now);
+                }
+                actions.client_lost = true;
+                return actions;
+            }
+            if session.held_since.is_none() {
+                let (heard_at, heard) = session.heard;
+                warn!(
+                    session_id = session.session_id,
+                    silent_ms = now.saturating_duration_since(heard_at).as_millis() as u64,
+                    last_heard = heard.as_str(),
+                    "Client silent — holding the session"
+                );
+                if let Some(session) = self.active.as_mut() {
+                    session.held_since = Some(now);
+                }
+                actions.release_input = true;
+            }
         }
 
+        let Some(session) = self.active.as_mut() else {
+            return actions;
+        };
+        session.late_input.log(session.session_id, now);
         if send_heartbeat {
             let peer = session.peer;
             let session_id = session.session_id;
@@ -837,6 +970,54 @@ impl Session {
                 eternal_wire::v2::control::encode_control(session_id, msg_seq, &heartbeat),
             ));
         }
+        actions
+    }
+
+    /// Ends the active session for liveness, with the goodbye that tells its
+    /// client to connect again: `error`, which every 0.3.x iPad answers with
+    /// a reconnect. Late packets of the session get it again
+    /// ([`Self::answer_ended`]).
+    fn expire(&mut self, now: Instant) -> (Option<SessionEnd>, Option<(PeerId, Vec<u8>)>) {
+        let Some(session) = self.active.as_ref() else {
+            return (None, None);
+        };
+        session.log_expiry(now);
+        let (peer, session_id) = (session.peer, session.session_id);
+        let msg_seq = self.next_msg_seq();
+        let goodbye = eternal_wire::v2::control::encode_control(
+            session_id,
+            msg_seq,
+            &ControlMessage::Bye(ByeReason::Error),
+        );
+        self.ended_for_liveness = Some(EndedSession {
+            session_id,
+            peer,
+            goodbye: goodbye.clone(),
+            ended_at: now,
+            last_sent: now,
+        });
+        (self.end(EndReason::Liveness, now), Some((peer, goodbye)))
+    }
+
+    /// A packet for no live session. One for the session last ended for
+    /// liveness, from its client, means the goodbye was lost or overtaken:
+    /// it goes again, once a second at most, for a minute.
+    fn answer_ended(&mut self, source: PeerId, session_id: u32, now: Instant) -> Actions {
+        let mut actions = Actions::default();
+        let Some(ended) = self.ended_for_liveness.as_mut() else {
+            return actions;
+        };
+        let from_client = ended.session_id == session_id
+            && ended.peer.link == source.link
+            && ended.peer.addr.map(|a| a.ip()) == source.addr.map(|a| a.ip());
+        if !from_client
+            || now.saturating_duration_since(ended.ended_at) >= ENDED_REPLY_FOR
+            || now.saturating_duration_since(ended.last_sent) < ENDED_REPLY_GAP
+        {
+            return actions;
+        }
+        ended.last_sent = now;
+        actions.replies.push((source, ended.goodbye.clone()));
         actions
     }
 
@@ -986,7 +1167,118 @@ impl Session {
     }
 }
 
+impl LateInput {
+    /// Counts an input event `late` behind its session's quickest packet;
+    /// returns whether it is past [`INPUT_LATE`].
+    fn note(&mut self, late: Duration, now: Instant) -> bool {
+        if late <= INPUT_LATE {
+            return false;
+        }
+        self.pending += 1;
+        self.total += 1;
+        self.max_late = self.max_late.max(late);
+        self.last_at = Some(now);
+        true
+    }
+
+    /// One line for a burst of late input, once a second has passed
+    /// without more.
+    fn log(&mut self, session_id: u32, now: Instant) {
+        let done = self
+            .last_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(1));
+        if self.pending == 0 || !done {
+            return;
+        }
+        info!(
+            session_id,
+            late_input = self.pending,
+            max_late_ms = self.max_late.as_millis() as u64,
+            "Dropped input that arrived late"
+        );
+        self.pending = 0;
+        self.max_late = Duration::ZERO;
+    }
+}
+
 impl ActiveSession {
+    /// How much later than the session's quickest packet one stamped
+    /// `client_us` on the iPad's clock arrived; `None` without a stamp. The
+    /// iPad stamps input and pings with one monotonic clock, so the smallest
+    /// difference between host time and that stamp is the clocks' offset
+    /// plus the quickest trip. The offset may rise by
+    /// [`CLOCK_DRIFT_US_PER_S`], so an iPad clock that runs a little slow
+    /// never makes input look late.
+    fn lateness(&mut self, client_us: u64, now: Instant) -> Option<Duration> {
+        if client_us == 0 {
+            return None;
+        }
+        let host_us = now
+            .saturating_duration_since(self.info.connected_at)
+            .as_micros() as i64;
+        let offset = host_us - client_us as i64;
+        let quickest = self.client_clock.map(|(quickest, at)| {
+            let drift =
+                now.saturating_duration_since(at).as_millis() as u64 * CLOCK_DRIFT_US_PER_S / 1000;
+            quickest.saturating_add(drift as i64)
+        });
+        self.client_clock = Some((
+            quickest.map_or(offset, |quickest| quickest.min(offset)),
+            now,
+        ));
+        let late = quickest.map_or(0, |quickest| offset.saturating_sub(quickest));
+        Some(Duration::from_micros(late.max(0) as u64))
+    }
+
+    /// The client was heard: it gets a full liveness window again, and a
+    /// session on hold carries on. Returns whether to force an IDR: reports
+    /// and keyframe requests sent during the silence may not have arrived.
+    fn heard(&mut self, kind: Heard, now: Instant) -> bool {
+        let silent = now.saturating_duration_since(self.heard.0);
+        self.heard = (now, kind);
+        self.liveness_deadline = now + LIVENESS_TIMEOUT;
+        let Some(since) = self.held_since.take() else {
+            return false;
+        };
+        info!(
+            session_id = self.session_id,
+            silent_ms = silent.as_millis() as u64,
+            held_ms = now.saturating_duration_since(since).as_millis() as u64,
+            heard = kind.as_str(),
+            "Client heard again — session kept"
+        );
+        self.grant_keyframe(now)
+    }
+
+    /// Whether an IDR may be forced now: one per
+    /// [`KEYFRAME_REQUEST_MIN_INTERVAL`].
+    fn grant_keyframe(&mut self, now: Instant) -> bool {
+        let granted = !matches!(
+            self.last_keyframe_grant,
+            Some(last) if now.duration_since(last) < KEYFRAME_REQUEST_MIN_INTERVAL
+        );
+        if granted {
+            self.last_keyframe_grant = Some(now);
+        }
+        granted
+    }
+
+    /// `device=` stays last: uploads cut the iPad's name at the line's end.
+    fn log_expiry(&self, now: Instant) {
+        let (heard_at, heard) = self.heard;
+        warn!(
+            peer = %self.peer,
+            silent_ms = now.saturating_duration_since(heard_at).as_millis() as u64,
+            held_ms = self
+                .held_since
+                .map_or(0, |since| now.saturating_duration_since(since).as_millis() as u64),
+            last_heard = heard.as_str(),
+            late_input = self.late_input.total,
+            device = %self.info.device_name,
+            "Client liveness expired — tearing session down"
+        );
+    }
+
     fn end(&self, reason: EndReason, now: Instant) -> SessionEnd {
         let start = self.info.connected_at;
         SessionEnd {
@@ -1350,7 +1642,12 @@ mod tests {
             session
                 .handle_control(peer, id, nack, &TestConfig, later)
                 .retransmit,
-            Some((7, 42, vec![0, 8]))
+            Some(Nack {
+                stream_epoch: 7,
+                frame_seq: 42,
+                frag_count: 9,
+                missing: vec![0, 8],
+            })
         );
         assert!(
             !session
@@ -1536,13 +1833,16 @@ mod tests {
             Some((first, EndReason::Goodbye(ByeReason::UserDisconnect)))
         );
 
-        // Re-establish, then let liveness lapse.
+        assert!(bye.goodbye.is_none(), "the client said goodbye itself");
+
+        // Re-establish, then let liveness lapse: the iPad is told.
         session.handle_control_authed(peer, hello(2, 50000), &TestConfig, now);
         let second = session.session_id().unwrap();
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
         assert_eq!(session.last_end(), Some((second, EndReason::Liveness)));
+        assert_eq!(goodbye_of(&expired), (peer, second, ByeReason::Error));
     }
 
     #[test]
@@ -1580,13 +1880,15 @@ mod tests {
             later,
         );
 
-        // Would have expired at now+3s without the report.
+        // Would have been held at now+3s without the report.
         let ticked = session.tick(&TestConfig, false, now + Duration::from_millis(4000));
-        assert!(!ticked.client_lost);
+        assert!(!ticked.client_lost && !ticked.release_input);
         assert_eq!(session.last_report().unwrap().frames_complete, 99);
 
-        // Expires 3s after the report.
-        let expired = session.tick(&TestConfig, false, later + LIVENESS_TIMEOUT);
+        // Held 3s after the report, and ended at the hold limit.
+        let held = session.tick(&TestConfig, false, later + LIVENESS_TIMEOUT);
+        assert!(held.release_input && !held.client_lost);
+        let expired = session.tick(&TestConfig, false, later + HOLD_LIMIT);
         assert!(expired.client_lost);
     }
 
@@ -2284,6 +2586,7 @@ mod tests {
         );
         assert_eq!(lapsed.duration, LIVENESS_TIMEOUT);
         assert!(!lapsed.frames_received);
+        assert_eq!(goodbye_of(&expired).1, second);
         assert_eq!(
             session
                 .tick(&TestConfig, false, now + LIVENESS_TIMEOUT)
@@ -2509,5 +2812,504 @@ mod tests {
             (revoked.client_nonce, revoked.reason),
             (20, EndReason::Revoked)
         );
+    }
+
+    /// The goodbye's destination, session id and reason.
+    fn goodbye_of(actions: &Actions) -> (PeerId, u32, ByeReason) {
+        let (to, bytes) = actions.goodbye.clone().expect("a goodbye");
+        let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();
+        let ControlMessage::Bye(reason) = message else {
+            panic!("expected a goodbye, got {message:?}")
+        };
+        (to, header.session_id, reason)
+    }
+
+    fn report(frames_complete: u32) -> ControlMessage {
+        ControlMessage::ReceiverReport(ReceiverReport {
+            frames_complete,
+            ..ReceiverReport::default()
+        })
+    }
+
+    /// A streaming session whose client counted frames at `now`: it has a
+    /// picture, so a silence holds it.
+    fn picture_session(peer: PeerId, device_id: u64, now: Instant) -> (Session, u32) {
+        let mut session = Session::new(700);
+        let ControlMessage::Hello2(mut hello) = identified_hello(1, device_id) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_WANTS_INPUT;
+        session.handle_control(peer, 0, ControlMessage::Hello2(hello), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.handle_control(peer, id, report(30), &TestConfig, now);
+        (session, id)
+    }
+
+    fn at(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    /// A client that had a picture and goes quiet keeps its session for the
+    /// hold limit: at the liveness timeout its input is released once and
+    /// another iPad may take the slot, but heartbeats go on under the same
+    /// session id. At the hold limit it ends, and the iPad is told.
+    #[test]
+    fn a_silent_client_with_a_picture_is_held_then_told_goodbye() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+
+        let quiet = session.tick(&TestConfig, true, at(start, 2_900));
+        assert!(!quiet.release_input && !session.on_hold());
+
+        let held = session.tick(&TestConfig, true, at(start, 3_000));
+        assert!(held.release_input);
+        assert!(!held.client_lost && held.ended.is_none() && held.goodbye.is_none());
+        assert!(session.on_hold());
+        assert_eq!(session.session_id(), Some(id));
+        assert_eq!(held.replies.len(), 1, "heartbeats go on");
+        let (header, heartbeat) =
+            eternal_wire::v2::control::parse_control(&held.replies[0].1).unwrap();
+        assert!(matches!(heartbeat, ControlMessage::Heartbeat(_)));
+        assert_eq!(header.session_id, id);
+
+        let still = session.tick(&TestConfig, true, at(start, 9_900));
+        assert!(!still.release_input, "input is released once");
+        assert!(!still.client_lost && still.ended.is_none());
+        assert_eq!(still.replies.len(), 1);
+
+        let expired = session.tick(&TestConfig, true, at(start, 10_000));
+        assert!(expired.client_lost && expired.replies.is_empty());
+        let end = ended(&expired);
+        assert_eq!(
+            (
+                end.session_id,
+                end.reason,
+                end.duration,
+                end.frames_received
+            ),
+            (Some(id), EndReason::Liveness, HOLD_LIMIT, true)
+        );
+        assert_eq!(goodbye_of(&expired), (peer, id, ByeReason::Error));
+        assert!(!session.is_active());
+    }
+
+    /// Anything from the client during the hold carries the session on: no
+    /// new session, one IDR under the usual limit, and a full liveness
+    /// window from that packet. A later silence holds it again.
+    #[test]
+    fn a_client_heard_during_the_hold_carries_on() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let request = ControlMessage::KeyframeRequest(KeyframeRequest {
+            stream_epoch: 7,
+            last_complete_seq: 10,
+            reason: KeyframeReason::GapLoss,
+        });
+        let ping = ControlMessage::Ping(eternal_wire::v2::control::Ping { t1_us: 1 });
+        let nack = ControlMessage::Nack(Nack {
+            stream_epoch: 7,
+            frame_seq: 42,
+            frag_count: 2,
+            missing: vec![1],
+        });
+        for first in [report(31), request.clone(), ping, nack, input_event(9)] {
+            let (mut session, id) = picture_session(peer, 77, start);
+            assert!(
+                session
+                    .tick(&TestConfig, false, at(start, 3_000))
+                    .release_input
+            );
+            let resumed =
+                session.handle_control(peer, id, first.clone(), &TestConfig, at(start, 7_200));
+            assert!(resumed.force_idr, "{first:?}");
+            assert!(resumed.new_target.is_none() && resumed.ended.is_none());
+            assert!(!session.on_hold());
+            // The client's own keyframe request in the same burst is coalesced.
+            let burst =
+                session.handle_control(peer, id, request.clone(), &TestConfig, at(start, 7_250));
+            assert!(!burst.force_idr);
+            for millis in [9_900, 10_000, 10_200] {
+                let ticked = session.tick(&TestConfig, false, at(start, millis));
+                assert!(!ticked.release_input && !ticked.client_lost, "{millis}");
+            }
+            assert!(
+                session
+                    .tick(&TestConfig, false, at(start, 10_250))
+                    .release_input,
+                "held again one window after the last packet"
+            );
+            assert_eq!(session.session_id(), Some(id));
+            assert_eq!(session.last_end(), None);
+        }
+    }
+
+    /// A client that never had a picture has nothing to keep: its session
+    /// ends at the liveness timeout, as before, and the iPad is told.
+    #[test]
+    fn a_client_without_a_picture_ends_at_the_liveness_timeout_with_a_goodbye() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(700);
+        session.handle_control(peer, 0, identified_hello(1, 77), &TestConfig, start);
+        let id = session.session_id().unwrap();
+        session.handle_control(peer, id, report(0), &TestConfig, start);
+        let expired = session.tick(&TestConfig, false, start + LIVENESS_TIMEOUT);
+        assert!(expired.client_lost && !expired.release_input);
+        assert_eq!(ended(&expired).reason, EndReason::Liveness);
+        assert!(!ended(&expired).frames_received);
+        assert_eq!(goodbye_of(&expired), (peer, id, ByeReason::Error));
+    }
+
+    /// Late packets of a session ended for liveness, from its client, get its
+    /// goodbye again, once a second at most, for a minute. Nobody else gets
+    /// it, and nothing answers a client's own goodbye.
+    #[test]
+    fn late_packets_of_a_session_ended_for_liveness_get_its_goodbye() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(700);
+        session.handle_control(peer, 0, identified_hello(1, 77), &TestConfig, start);
+        let id = session.session_id().unwrap();
+        let expired = session.tick(&TestConfig, false, start + LIVENESS_TIMEOUT);
+        let (_, goodbye) = expired.goodbye.clone().unwrap();
+        let ended_at = start + LIVENESS_TIMEOUT;
+        let late = |session: &mut Session, source, session_id, message, millis| {
+            session
+                .handle_control(
+                    source,
+                    session_id,
+                    message,
+                    &TestConfig,
+                    at(ended_at, millis),
+                )
+                .replies
+        };
+        // The burst just went.
+        assert!(late(&mut session, peer, id, report(1), 500).is_empty());
+        let answer = late(&mut session, peer, id, report(1), 1_000);
+        assert_eq!(answer, vec![(peer, goodbye.clone())]);
+        assert!(late(&mut session, peer, id, report(1), 1_900).is_empty());
+        // Another port on the same iPad is the same client.
+        let other_port = addr([10, 0, 0, 5], 50001);
+        let ping = ControlMessage::Ping(eternal_wire::v2::control::Ping { t1_us: 1 });
+        assert_eq!(
+            late(&mut session, other_port, id, ping.clone(), 2_000),
+            vec![(other_port, goodbye.clone())]
+        );
+        // Another address, another session id, or the client's own goodbye.
+        assert!(late(
+            &mut session,
+            addr([10, 0, 0, 6], 50000),
+            id,
+            report(1),
+            4_000
+        )
+        .is_empty());
+        assert!(late(&mut session, peer, id + 1, report(1), 4_000).is_empty());
+        assert!(late(&mut session, PeerId::usb(17), id, report(1), 4_000).is_empty());
+        assert!(late(
+            &mut session,
+            peer,
+            id,
+            ControlMessage::Bye(ByeReason::UserDisconnect),
+            4_000
+        )
+        .is_empty());
+        assert_eq!(late(&mut session, peer, id, ping.clone(), 4_000).len(), 1);
+        // A new session doesn't change what the old one's packets get; the
+        // iPad drops a goodbye for a session id that isn't its own.
+        session.handle_control(
+            peer,
+            0,
+            identified_hello(2, 77),
+            &TestConfig,
+            at(ended_at, 5_000),
+        );
+        assert!(session.is_active());
+        assert_eq!(late(&mut session, peer, id, report(1), 5_000).len(), 1);
+        assert!(late(&mut session, peer, id, report(1), 59_999).len() == 1);
+        assert!(late(&mut session, peer, id, report(1), 61_000).is_empty());
+    }
+
+    /// Ends the host didn't decide on silence send no goodbye of their own:
+    /// the client's goodbye, a cable pulled, a Wi-Fi goodbye whose cable
+    /// takeover never came, and an update (which has its own).
+    #[test]
+    fn only_a_silence_sends_the_liveness_goodbye() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+        let bye = session.handle_control(
+            peer,
+            id,
+            ControlMessage::Bye(ByeReason::UserDisconnect),
+            &TestConfig,
+            start,
+        );
+        assert!(bye.client_lost && bye.goodbye.is_none());
+        assert!(session
+            .handle_control(peer, id, report(1), &TestConfig, at(start, 2_000))
+            .replies
+            .is_empty());
+
+        let usb = PeerId::usb(17);
+        let (mut session, _) = picture_session(usb, 77, start);
+        let pulled = session.link_lost(usb.link);
+        assert!(pulled.client_lost && pulled.goodbye.is_none());
+
+        let (mut session, id) = picture_session(peer, 77, start);
+        session.handle_control(
+            peer,
+            id,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &TestConfig,
+            start,
+        );
+        let no_cable = session.tick(&TestConfig, false, start + USB_TAKEOVER_TIMEOUT);
+        assert!(no_cable.client_lost && no_cable.goodbye.is_none());
+        assert_eq!(
+            ended(&no_cable).reason,
+            EndReason::Goodbye(ByeReason::Superseded)
+        );
+
+        let (mut session, id) = picture_session(peer, 77, start);
+        assert!(session.begin_update(true));
+        let stopped = session.tick(&TestConfig, false, start);
+        assert_eq!(
+            goodbye_of(&stopped),
+            (peer, id, ByeReason::HostShuttingDown)
+        );
+        assert!(session
+            .tick(&TestConfig, false, start + HOLD_LIMIT)
+            .goodbye
+            .is_none());
+    }
+
+    /// Another iPad gets Busy while the session's client is heard, and the
+    /// slot once its session is on hold, as it did once the session expired.
+    /// The silent session ends for liveness, with its goodbye.
+    #[test]
+    fn another_ipad_takes_the_slot_of_a_held_session() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let other = addr([10, 0, 0, 6], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+        let busy = session.handle_control(
+            other,
+            0,
+            identified_hello(5, 88),
+            &TestConfig,
+            at(start, 2_900),
+        );
+        assert_eq!(parse_ack(&busy.replies[0].1).status, HelloStatus::Busy);
+        assert!(
+            session
+                .tick(&TestConfig, false, at(start, 3_000))
+                .release_input
+        );
+        let taken = session.handle_control(
+            other,
+            0,
+            identified_hello(6, 88),
+            &TestConfig,
+            at(start, 3_500),
+        );
+        assert_eq!(parse_ack(&taken.replies[0].1).status, HelloStatus::Ok);
+        assert_eq!(taken.new_target, Some(other));
+        assert!(taken.force_idr && !taken.client_lost);
+        let end = ended(&taken);
+        assert_eq!(
+            (end.session_id, end.reason),
+            (Some(id), EndReason::Liveness)
+        );
+        assert_eq!(goodbye_of(&taken), (peer, id, ByeReason::Error));
+        assert_ne!(session.session_id(), Some(id));
+        assert!(!session.on_hold());
+        // The silent iPad's late packets learn the same.
+        assert_eq!(
+            session
+                .handle_control(peer, id, report(1), &TestConfig, at(start, 4_600))
+                .replies
+                .len(),
+            1
+        );
+    }
+
+    /// The same iPad connecting again during a hold supersedes its session,
+    /// as at any other time: no goodbye, a new session at once.
+    #[test]
+    fn the_same_ipad_reconnecting_during_a_hold_supersedes_it() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+        session.tick(&TestConfig, false, at(start, 3_000));
+        assert!(session.on_hold());
+        let again = session.handle_control(
+            peer,
+            0,
+            identified_hello(2, 77),
+            &TestConfig,
+            at(start, 4_000),
+        );
+        assert_eq!(again.new_target, Some(peer));
+        assert!(again.goodbye.is_none());
+        let end = ended(&again);
+        assert_eq!(
+            (end.session_id, end.reason),
+            (Some(id), EndReason::Superseded)
+        );
+        assert!(!session.on_hold());
+    }
+
+    /// A cable pulled during a hold ends the session at once, as at any
+    /// other time.
+    #[test]
+    fn a_cable_pulled_during_a_hold_ends_the_session_at_once() {
+        let start = Instant::now();
+        let usb = PeerId::usb(17);
+        let (mut session, id) = picture_session(usb, 77, start);
+        session.tick(&TestConfig, false, at(start, 3_000));
+        assert!(session.on_hold());
+        let pulled = session.link_lost(usb.link);
+        assert!(pulled.client_lost && pulled.goodbye.is_none());
+        assert_eq!(session.last_end(), Some((id, EndReason::LinkLost)));
+    }
+
+    /// The handshake keeps advertising 3000 ms: every iPad's own check of
+    /// the PC runs on it.
+    #[test]
+    fn the_hold_limit_is_host_only() {
+        let mut session = Session::new(700);
+        let ack = session.handle_control(
+            addr([10, 0, 0, 5], 50000),
+            0,
+            identified_hello(1, 77),
+            &TestConfig,
+            Instant::now(),
+        );
+        assert_eq!(parse_ack(&ack.replies[0].1).liveness_timeout_ms, 3000);
+        assert!(HOLD_LIMIT > LIVENESS_TIMEOUT + Duration::from_millis(5_200));
+    }
+
+    /// The goodbye has the layout of the `bye_background` golden vector,
+    /// which the 0.3.2 and 0.3.3 iPad test suites parse from this same
+    /// file, with reason 3: `.error` in every shipped iPad, which reconnects
+    /// at once on it.
+    #[test]
+    fn the_liveness_goodbye_is_the_bye_shipped_ipads_parse() {
+        let vectors = include_str!("../../../proto/testdata/v2_vectors.txt");
+        let golden = vectors
+            .lines()
+            .find_map(|line| line.strip_prefix("bye_background "))
+            .expect("the golden goodbye");
+        let golden: Vec<u8> = (0..golden.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&golden[i..i + 2], 16).unwrap())
+            .collect();
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+        let expired = session.tick(&TestConfig, false, start + HOLD_LIMIT);
+        let (_, goodbye) = expired.goodbye.unwrap();
+        assert_eq!(goodbye.len(), golden.len());
+        // Magic, version, type, flags and length; then the session id.
+        assert_eq!(goodbye[..8], golden[..8]);
+        assert_eq!(goodbye[8..12], id.to_le_bytes());
+        assert_eq!(*golden.last().unwrap(), ByeReason::AppBackground as u8);
+        assert_eq!(*goodbye.last().unwrap(), 3);
+    }
+
+    /// An input event stamped `client_us` on the iPad's clock.
+    fn stamped_key(event_id: u32, client_us: u64) -> ControlMessage {
+        let ControlMessage::InputEvent(mut event) = input_event(event_id) else {
+            unreachable!()
+        };
+        event.client_time_us = client_us;
+        ControlMessage::InputEvent(event)
+    }
+
+    /// The iPad's clock: its own epoch, far from the host's.
+    const IPAD_EPOCH_US: u64 = 987_654_321_000;
+
+    /// Input the iPad sent during a 5.2 s uplink stall reaches the PC when
+    /// the stall ends, seconds late by the iPad's own clock against its
+    /// pings: it is marked late, and counted. Input sent once the uplink
+    /// works is not, nor input without a stamp.
+    #[test]
+    fn input_that_waited_in_a_stalled_uplink_is_late() {
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = picture_session(peer, 77, start);
+        let ipad = |millis: u64| IPAD_EPOCH_US + millis * 1000;
+        let mut send = |message, arrives: u64| {
+            session.handle_control(peer, id, message, &TestConfig, at(start, arrives))
+        };
+        // Pings every 2 s and a key, each 3 ms on the way.
+        for millis in [0, 2_000] {
+            let ping = ControlMessage::Ping(eternal_wire::v2::control::Ping {
+                t1_us: ipad(millis),
+            });
+            assert!(!send(ping, millis + 3).input_late);
+        }
+        assert!(!send(stamped_key(1, ipad(3_000)), 3_003).input_late);
+        // The stall: sent from 4.0 s, all delivered at 9.2 s.
+        let stalled = [(2, 4_100), (3, 5_000), (4, 8_150), (5, 9_150)];
+        let late: Vec<bool> = stalled
+            .iter()
+            .map(|&(event_id, sent)| send(stamped_key(event_id, ipad(sent)), 9_200).input_late)
+            .collect();
+        assert_eq!(late, [true, true, true, false]);
+        assert!(!send(stamped_key(6, ipad(9_300)), 9_304).input_late);
+        assert!(!send(stamped_key(7, 0), 9_400).input_late, "no stamp");
+        let late_input = &session.active.as_ref().unwrap().late_input;
+        assert_eq!((late_input.total, late_input.pending), (3, 3));
+        // 5.1 s on the way less the quickest trip, 3 ms, and the 6.2 ms the
+        // iPad's clock may have drifted since that trip.
+        assert_eq!(
+            late_input.max_late,
+            Duration::from_micros(5_097_000 - 6_197)
+        );
+        session.tick(&TestConfig, false, at(start, 10_150));
+        assert_eq!(session.active.as_ref().unwrap().late_input.pending, 3);
+        session.tick(&TestConfig, false, at(start, 10_200));
+        let late_input = &session.active.as_ref().unwrap().late_input;
+        assert_eq!((late_input.total, late_input.pending), (3, 0), "logged");
+    }
+
+    /// Two hours of input every 100 ms and pings every 2 s, each up to
+    /// 600 ms on the way but delivered in order, with the iPad's clock
+    /// running 200 ppm fast or slow: nothing is late.
+    #[test]
+    fn input_with_ordinary_jitter_and_drift_is_never_late() {
+        for ppm in [-200i64, 0, 200] {
+            let start = Instant::now();
+            let peer = addr([10, 0, 0, 5], 50000);
+            let (mut session, id) = picture_session(peer, 77, start);
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let mut jitter_ms = move || {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % 600
+            };
+            let mut arrived = 0;
+            let mut late = 0;
+            for step in 0..72_000u64 {
+                let sent = step * 100;
+                arrived = (sent + jitter_ms()).max(arrived);
+                let client_us =
+                    (IPAD_EPOCH_US as i64 + sent as i64 * 1000 + sent as i64 * ppm / 1000) as u64;
+                let message = if step % 20 == 0 {
+                    ControlMessage::Ping(eternal_wire::v2::control::Ping { t1_us: client_us })
+                } else {
+                    stamped_key(step as u32, client_us)
+                };
+                let actions =
+                    session.handle_control(peer, id, message, &TestConfig, at(start, arrived));
+                late += usize::from(actions.input_late);
+            }
+            assert_eq!(late, 0, "{ppm} ppm");
+        }
     }
 }
