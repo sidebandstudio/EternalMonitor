@@ -64,6 +64,17 @@ struct PairingSheet: View {
                             // Digits only, at most six.
                             let digits = String(code.filter(\.isNumber).prefix(6))
                             if digits != code { model.code = digits }
+                            else if model.codeIsDue() { submit() }
+                        }
+                        // A code completed while another was checked, or
+                        // during the wait, goes when that ends.
+                        .onChange(of: model.submitting) { _, submitting in
+                            if !submitting && model.codeIsDue() { submit() }
+                        }
+                        .task(id: model.blockedUntil) {
+                            guard let blockedUntil = model.blockedUntil else { return }
+                            try? await Task.sleep(for: .seconds(max(0, blockedUntil.timeIntervalSinceNow)))
+                            if !Task.isCancelled && model.codeIsDue() { submit() }
                         }
                         .accessibilityLabel(L("Pairing code"))
                         .accessibilityIdentifier("pairing.code")

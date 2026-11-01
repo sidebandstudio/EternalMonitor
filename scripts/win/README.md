@@ -46,6 +46,9 @@ in `D:\AgentWork\em-v030\state`, preserving the installed app's preferences.
 path, then closes the GUI or delivers Ctrl+C from the same console session.
 It reports a failed graceful exit even if forced cleanup succeeds.
 `stop-host --kill` is reserved for the reconnect test and failed cleanup.
+`session-log 0` prints the host's session log from that state folder, and
+`session-log 1` and `2` the older parts the host rotated away. `soak.sh --real`
+stops the host before the simulator app, then collects all three.
 `pattern stop` and `probe stop`
 close the test windows using their flag files. Check task output if a window
 does not appear; an SSH process cannot capture the interactive desktop.
