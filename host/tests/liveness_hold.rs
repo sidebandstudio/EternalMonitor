@@ -8,6 +8,10 @@
 //! released in order, as a congested Wi-Fi queue does. The tokio clock only
 //! moves when every task waits, and nothing waits while a datagram is on
 //! the loopback, so a busy machine cannot change the result.
+//!
+//! The fake input sink is the off-Windows recorder; Windows injects for
+//! real, so these run everywhere else.
+#![cfg(not(windows))]
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
