@@ -63,8 +63,8 @@ jobs:
           python scripts/check_published_site.py --tag "$GITHUB_REF_NAME" "${strict[@]}"
 
       # A final tag's release carries its section of RELEASE_NOTES.md, so a
-      # missing section fails here, before the build. Pre-release tags and dry
-      # runs only warn and link to RELEASE_NOTES.md.
+      # missing or undated section fails here, before the build. Pre-release
+      # tags and dry runs only warn.
       - name: Check this release's notes
         shell: bash
         run: |

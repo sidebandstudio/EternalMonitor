@@ -76,8 +76,10 @@ class Body(unittest.TestCase):
         versions = re.findall(r"(?m)^## EternalMonitor v(\S+)", NOTES)
         self.assertIn("0.3.3", versions)
         for version in versions:
-            body, warning = rn.body(f"v{version}", SHA, TEMPLATE, NOTES, strict=True)
-            self.assertIsNone(warning)
+            # The next release's section stays undated until release day.
+            dated = rn.DATE_PLACEHOLDER not in rn.section(NOTES, version)
+            body, warning = rn.body(f"v{version}", SHA, TEMPLATE, NOTES, strict=dated)
+            self.assertEqual(warning is None, dated, version)
             self.assertEqual(rn.published_sha256(body), SHA.lower(), version)
             self.assertIn(f"## What's new in v{version}\n\n", body)
             self.assertIn("[RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md)", body)
@@ -152,6 +154,35 @@ class Missing(unittest.TestCase):
             self.assertEqual(rn.published_sha256(body), SHA.lower())
 
 
+class Undated(unittest.TestCase):
+    NOTES = "## EternalMonitor v1.2.0\n\nReleased [date set at release].\n\n- Fixed a thing.\n"
+
+    def test_shares_the_site_checks_placeholder(self):
+        import check_published_site
+
+        self.assertEqual(rn.DATE_PLACEHOLDER, check_published_site.DATE_PLACEHOLDER)
+
+    def test_a_final_tag_without_a_date_fails(self):
+        with self.assertRaisesRegex(
+            rn.NotesError,
+            re.escape("RELEASE_NOTES.md: EternalMonitor v1.2.0 still says [date set at release]; set the release date"),
+        ):
+            rn.body("v1.2.0", SHA, TEMPLATE, self.NOTES, strict=True)
+        with self.assertRaises(rn.NotesError):
+            rn.notes_for("v1.2.0", self.NOTES, strict=True)
+
+    def test_otherwise_it_warns_and_keeps_the_notes(self):
+        body, warning = rn.body("v1.2.0", SHA, TEMPLATE, self.NOTES, strict=False)
+        self.assertTrue(warning.startswith("::warning::RELEASE_NOTES.md: EternalMonitor v1.2.0 still says"))
+        self.assertIn("## What's new in v1.2.0\n\nReleased [date set at release].\n\n- Fixed a thing.", body)
+        self.assertEqual(rn.published_sha256(body), SHA.lower())
+
+    def test_a_dated_section_passes(self):
+        notes = self.NOTES.replace(rn.DATE_PLACEHOLDER, "November 1, 2026")
+        _, warning = rn.body("v1.2.0", SHA, TEMPLATE, notes, strict=True)
+        self.assertIsNone(warning)
+
+
 class Cli(unittest.TestCase):
     def run_main(self, *argv):
         out = io.StringIO()
@@ -177,6 +208,17 @@ class Cli(unittest.TestCase):
         code, out = self.run_main("--tag", "v9.9.9")
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("::warning::"))
+
+    def test_undated_notes_exit_1_only_when_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = pathlib.Path(tmp) / "RELEASE_NOTES.md"
+            notes.write_text(Undated.NOTES, encoding="utf-8")
+            code, out = self.run_main("--tag", "v1.2.0", "--notes", str(notes), "--strict")
+            self.assertEqual(code, 1)
+            self.assertTrue(out.startswith("::error::RELEASE_NOTES.md: EternalMonitor v1.2.0 still says"))
+            code, out = self.run_main("--tag", "v1.2.0", "--notes", str(notes))
+            self.assertEqual(code, 0)
+            self.assertTrue(out.startswith("::warning::"))
 
 
 if __name__ == "__main__":
