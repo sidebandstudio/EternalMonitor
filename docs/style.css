@@ -957,6 +957,9 @@ html.js.channel-beta .beta-hint.reveal { opacity: 0; visibility: hidden; transit
   html.js.channel-beta .beta-hint.reveal { display: none; }
 }
 .dl-all { margin-top: 20px; }
+/* One line asking for a star, then the button, under the downloads. */
+.dl-star { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 20px; }
+.dl-star p { color: var(--muted); font-size: 0.9375rem; }
 /* Mac and iPhone Duo, not out yet: quieter than the download cards, with no
    button. Also under the two apps on the home page, one heading level down.
    On the download page their tiles turn to night on Beta like the iPad card's. */
@@ -1545,6 +1548,19 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 .policy .post-list { margin-top: 16px; }
 .policy .post-update { margin-top: 20px; }
 .policy .post-update dl { margin-top: 0; }
+
+/* --- Guide, compatibility and alternatives ----------------------------------------
+   The privacy page's parts, plus a title in the boxed cards, wider labels in the
+   comparison cards, and the films between the guide's sections. */
+
+.policy .post-update h3 + dl, .policy .post-update h3 + p { margin-top: 12px; }
+.policy .post-update p { color: var(--muted); }
+.policy .faq { margin-top: 20px; }
+@media (min-width: 561px) {
+  .compare .post-update dl > div { grid-template-columns: 132px 1fr; }
+}
+.guide-clip { max-width: 760px; }
+.guide-films { padding-bottom: clamp(16px, 3vw, 32px); }
 
 /* --- Discord link and the "Built by engineers from" strip ------------------------
    Kept in one block at the end of the file. The Discord link reuses .nav-link. The

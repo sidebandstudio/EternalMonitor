@@ -1,0 +1,6 @@
+/* The README's demo: the second-screen film, then the pencil film, over one
+   background, in a 1280 x 720 frame that README pages show about 860 px wide. */
+.bg { background-image: url('art/dunes.webp'); background-position: 46% 66%; }
+.scene { position: absolute; inset: 0; }
+#chipB { left: 40px; top: 36px; }
+#seam { position: absolute; inset: 0; background: #0a0a0b; }

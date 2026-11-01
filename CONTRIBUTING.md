@@ -1,9 +1,26 @@
 # Contributing to EternalMonitor
 
-Thanks for helping. Bug fixes, tests, docs and new ideas are all welcome. For
-anything bigger than a small fix, open an issue or ask on the
-[Sideband Discord](https://discord.gg/Xc7NykBZ6z) first, so we can agree on the
-approach before you write the code.
+Thanks for helping. Every kind of contribution is welcome: bug reports, feature
+requests, questions, docs, translations, tests, fixes and new features. Pull
+requests are welcome, big or small, and you don't need permission to start one.
+For a large change, a short note in an issue or on the
+[Sideband Discord](https://discord.gg/Xc7NykBZ6z) helps us agree on the approach
+early.
+
+## Good first contributions
+
+- Issues labelled
+  [good first issue](https://github.com/sidebandstudio/EternalMonitor/labels/good%20first%20issue)
+  are small and self-contained, and a good way to learn the code.
+- [ROADMAP.md](ROADMAP.md) lists the larger work that is coming. A pull request
+  for anything there is welcome.
+- An [issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)
+  for a bug, an idea or a feature you would like. Anything goes, from a typo to a
+  new feature.
+- A [compatibility report](https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml)
+  needs no code. Tell us how EternalMonitor runs on your PC and iPad, and with
+  your permission it goes on the
+  [compatibility page](https://eternalmonitor.dev/compatibility.html).
 
 ## Fork the repository
 
@@ -70,7 +87,7 @@ or screenshots of someone's desktop. The host log records the current pairing co
 
 Describe what changed and why, and how you tested it: the commands you ran and,
 for hardware changes, the GPU, Windows version and iPad model. Screenshots help for
-UI changes.
+UI changes. Draft pull requests are welcome if you'd like feedback early.
 
 ## Maintainer review
 

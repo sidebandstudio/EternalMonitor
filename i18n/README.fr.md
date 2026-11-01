@@ -8,76 +8,77 @@
 
 # EternalMonitor
 
-Affichez votre bureau Windows sur un iPad en mode recopie ou écran étendu via Wi-Fi ou USB,<br>
-et contrôlez le PC au toucher, avec un clavier ou avec Apple Pencil.
+Un second écran gratuit et open source pour Windows.<br>
+Connectez votre iPad par Wi-Fi ou USB, avec prise en charge du toucher et d'Apple Pencil.
 
 [![Release](https://img.shields.io/github/v/release/sidebandstudio/EternalMonitor?label=release&labelColor=111&color=e8ff47)](https://github.com/sidebandstudio/EternalMonitor/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/sidebandstudio/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e8ff47?labelColor=111)](../LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#télécharger)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
 [![Discord](https://img.shields.io/badge/discord-Sideband-e8ff47?labelColor=111&logo=discord&logoColor=white)](https://discord.gg/Xc7NykBZ6z)
 
-[Télécharger](#télécharger) · [Guide de configuration](../SETUP.md) · [Problèmes connus](https://eternalmonitor.dev/known-issues.html) · [Site web](https://eternalmonitor.dev) · [Notes de version](../RELEASE_NOTES.md) · [Discord](https://discord.gg/Xc7NykBZ6z)
+[Télécharger](#download) · [Guide de configuration](../SETUP.md) · [Site web](https://eternalmonitor.dev) · [Feuille de route](../ROADMAP.md) · [Notes de version](../RELEASE_NOTES.md) · [Discord](https://discord.gg/Xc7NykBZ6z)
 
 </div>
 
 <p align="center">
-  <img src="../docs/assets/og.png" width="860" alt="L'application Windows EternalMonitor diffuse l'image du PC sur un iPad">
+  <img src="../docs/assets/readme-demo.webp" width="860" alt="Un PC Windows et un iPad. Sur le PC, la fenêtre EternalMonitor passe l'iPad en Second écran, puis une fenêtre est glissée du moniteur vers l'iPad. Un Apple Pencil dessine ensuite des brins d'herbe sur une peinture sur l'iPad, avec des traits épais à la pression et fins au relâchement.">
 </p>
 
-EternalMonitor diffuse votre bureau Windows sur un iPad et renvoie vos actions au PC. Une petite application Windows capture l'écran et l'encode sur votre carte graphique. L'application iPad décode la vidéo matériellement et l'affiche avec Metal ; chaque toucher, frappe et trait de Pencil est renvoyé au PC. Le logiciel est gratuit, open source sous MIT License et ne nécessite aucun compte.
+EternalMonitor transforme un iPad en écran pour votre PC Windows. Il est gratuit, open source sous licence MIT et ne nécessite aucun compte. Le PC diffuse jusqu'à 120 fps, avec encodage matériel sur les cartes graphiques compatibles et décodage matériel sur l'iPad. Chaque toucher, frappe et trait de Pencil est renvoyé au PC.
+
+<a id="download"></a>
+
+## Démarrage rapide
+
+[![Télécharger pour Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Obtenir l'application iPad sur TestFlight](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
+
+1. **Installez l'application Windows.** Exécutez [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) sur Windows 10 (version 1809 ou ultérieure) ou Windows 11, 64 bits, avec une carte graphique NVIDIA, AMD ou Intel. Si Windows SmartScreen vous le demande, choisissez **Informations complémentaires**, puis **Exécuter quand même**. La [page de la version](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) indique le SHA-256 du fichier.
+2. **Installez l'application iPad.** Sur un iPad avec iPadOS 17 ou ultérieur, installez **TestFlight** depuis l'App Store, puis ouvrez le [lien TestFlight d'EternalMonitor](https://testflight.apple.com/join/ppc9QfXc) sur l'iPad et touchez **Installer**.
+3. **Connectez-vous.** Les deux applications ouvertes sur le même réseau, touchez votre PC sur l'iPad ou scannez le code QR affiché par le PC. Pour USB sous Windows 10 22H2 ou Windows 11, branchez le câble et gardez ouverte sur le PC l'application gratuite [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) d'Apple.
+
+Le [guide de configuration](../SETUP.md) décrit chaque étape avec les noms exacts des boutons. La [page de téléchargement](https://eternalmonitor.dev/download.html) indique les versions Windows et iPad compatibles entre elles.
+
+Si EternalMonitor vous est utile, une étoile aide d'autres personnes à le trouver.
 
 ## Fonctionnalités
 
 <img src="../docs/assets/ipad-app.webp" align="right" width="270" alt="L'écran de connexion de l'application iPad avec Connecter, Scanner le code QR et Rechercher des PC">
 
-- **Étendre ou recopier.** Ajoutez l'iPad comme écran supplémentaire à côté de votre moniteur ou recopiez n'importe quel écran. L'écran supplémentaire disparaît 10 secondes après la déconnexion de l'iPad : une reconnexion rapide le réutilise et Windows ne conserve pas de moniteur fantôme.
-- **Wi-Fi ou USB.** Diffusez sur votre réseau domestique ou branchez un câble pour une image plus stable et pour charger l'iPad. Le câble prend le relais d'une session Wi-Fi en cours ; si vous le débranchez, la connexion revient au Wi-Fi.
-- **Toucher, clavier et pointeur.** Touchez pour cliquer, faites glisser, faites défiler à deux doigts et maintenez pour un clic droit. Les claviers physiques, pavés tactiles et souris fonctionnent aussi, avec les touches de modification rémanentes et le clic central.
+- **Étendre ou recopier.** Ajoutez l'iPad comme second écran à côté de votre moniteur ou recopiez n'importe quel écran. Le second écran reste 10 secondes après la déconnexion de l'iPad : une reconnexion rapide le réutilise et Windows ne conserve pas de moniteur fantôme.
+- **Wi-Fi ou USB.** Diffusez sur votre réseau domestique ou branchez un câble pour une image plus stable, qui peut aussi charger l'iPad depuis un port USB-C. Le câble prend le relais d'une session Wi-Fi en cours ; si vous le débranchez, la connexion revient au Wi-Fi.
 - **Apple Pencil comme un vrai stylet.** Windows reçoit la pression et l'inclinaison via Windows Ink, et le trait apparaît sous la pointe quelle que soit la disposition des écrans. Le **Mode dessin** (Drawing mode) ignore la paume sur la zone de dessin, et Clip Studio Paint fonctionne avec son réglage Tablet PC.
+- **Toucher, clavier et pointeur.** Touchez pour cliquer, faites glisser, faites défiler à deux doigts et maintenez pour un clic droit. Les claviers physiques, pavés tactiles et souris fonctionnent aussi, avec les touches de modification rémanentes et le clic central.
+- **Encodage matériel.** Les cartes graphiques NVIDIA, AMD et Intel compatibles encodent la diffusion à 30, 60, 90 ou 120 fps.
+- **Réparation des pertes sur Wi-Fi.** Si un paquet manque, l'iPad le redemande immédiatement ; la perte d'un paquet coûte donc rarement une image. Le débit s'adapte à votre réseau.
+- **Son du PC.** Le son est lu sur l'iPad et vous pouvez le couper sans arrêter la vidéo.
 - **Ajuster ou remplir.** **Ajuster** (Fit) montre toute l'image du PC avec des bandes si les proportions diffèrent. **Remplir** (Fill) utilise tout l'écran de l'iPad et coupe les bords qui dépassent.
-- **Son du PC.** Le son est lu sur l'iPad en Opus, avec un tampon de gigue et une dissimulation des pertes. Vous pouvez le couper sans arrêter la vidéo.
-- **Réparation des pertes sur Wi-Fi.** Si un paquet manque, l'iPad redemande immédiatement ce fragment ; la perte d'un paquet coûte donc rarement une image. Le débit s'adapte entre 4 et 50 Mbps.
-- **Votre GPU travaille.** NVIDIA NVENC, AMD AMF ou Intel Quick Sync encodent en H.264 par défaut ou en HEVC si vous le préférez, à 30, 60, 90 ou 120 fps.
 - **Jumelage.** La première connexion Wi-Fi demande un code à six chiffres ou la lecture d'un code QR. L'iPad mémorise ensuite le PC. USB ne nécessite pas de code.
-- **Récupération et explications.** L'image revient automatiquement après l'écran de verrouillage, un changement d'affichage ou un redémarrage de la diffusion. En cas de problème, les deux applications expliquent ce qui s'est passé et quoi faire ; **Envoyer un avis** (Send feedback) prépare un e-mail au studio avec votre configuration préremplie.
-- **Mises à jour en un clic.** Une fenêtre annonce les nouvelles versions. Sur Windows, **Mettre à jour** (Update now) vérifie le téléchargement et l'installe avec une seule invite Windows ; l'application iPad ouvre TestFlight. L'application Windows fonctionne sans fenêtre de console.
+- **Récupération et explications.** L'image revient automatiquement après l'écran de verrouillage, un changement d'affichage ou un redémarrage de la diffusion. Les deux applications expliquent ce qui s'est passé et quoi faire ; **Envoyer un avis** (Send feedback) prépare un e-mail au studio avec votre configuration préremplie.
+- **Mises à jour en un clic.** Une fenêtre annonce les nouvelles versions. Sur Windows, **Mettre à jour** (Update now) vérifie le téléchargement et l'installe avec une seule invite Windows ; sur l'iPad, il ouvre TestFlight. L'application Windows fonctionne sans fenêtre de console.
+
+Ce README et le [site web](https://eternalmonitor.dev) sont disponibles en 11 langues.
 
 <br clear="right">
 
-## Télécharger
+## En savoir plus
 
-| | Configuration requise | Obtenir |
-| --- | --- | --- |
-| **Windows** | Windows 10 version 1809 ou ultérieure, ou Windows 11, 64 bits, avec carte graphique NVIDIA, AMD ou Intel | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) (v0.3.3, version stable actuelle) |
-| **iPad** | iPadOS 17 ou ultérieur | [TestFlight v0.3.3, build 364](https://testflight.apple.com/join/ppc9QfXc). La bêta publique est ouverte : installez TestFlight, puis ouvrez le lien sur votre iPad. |
+- [Utiliser un iPad comme second écran pour Windows](https://eternalmonitor.dev/ipad-second-monitor-windows.html) : le guide complet.
+- [Compatibilité](https://eternalmonitor.dev/compatibility.html) : les PC et iPad utilisés avec EternalMonitor.
+- [Alternatives](https://eternalmonitor.dev/alternatives.html) : comparaison d'EternalMonitor avec d'autres façons d'utiliser un iPad comme écran.
+- [Feuille de route](../ROADMAP.md) : les prochaines étapes.
 
-Installez les versions Windows et iPad indiquées sur eternalmonitor.dev/download.html. Elles fonctionnent ensemble même si leurs numéros de version diffèrent. Les anciennes versions v0.1 utilisent un autre protocole et ne peuvent pas se connecter à l'application iPad v0.3.
-
-Vous testez l'application ? Signalez les bugs et envoyez vos remarques par le [formulaire de la page de téléchargement](https://eternalmonitor.dev/download.html#feedback), qui envoie un e-mail à hello@sideband.studio, ouvrez une [issue GitHub](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose) ou écrivez-nous sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
-
-Le programme d'installation n'est pas encore signé : Windows SmartScreen demande donc confirmation avant son exécution. Choisissez **Informations complémentaires** (More info), puis **Exécuter quand même** (Run anyway), uniquement après avoir vérifié que le SHA-256 du fichier correspond à celui de la [page des versions](https://github.com/sidebandstudio/EternalMonitor/releases).
-
-Pour USB, il vous faut aussi l'application gratuite [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) d'Apple, ouverte pendant la diffusion. Windows ne peut accéder à un iPad par câble que par son intermédiaire ; EternalMonitor vous indique si elle est fermée ou absente. Apple Devices nécessite Windows 10 version 22H2 (build 19045) ou Windows 11 : sur une version antérieure de Windows 10, connectez-vous par Wi-Fi.
-
-**Suivez ensuite le [guide de configuration](../SETUP.md).** Il décrit l'installation des deux applications, le jumelage, USB, l'écran étendu et le dessin, avec les noms exacts des boutons affichés.
+**Partagez votre configuration.** Indiquez-nous quels PC et iPad vous utilisez dans le [rapport de compatibilité](https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml), ou publiez-les sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z). Avec votre permission, ils figureront sur la page de compatibilité.
 
 ## État
 
-v0.3.3 corrige **Second écran** (Second screen) sur les PC où il ne démarrait pas, le plus souvent des ordinateurs portables avec cartes graphiques Intel et NVIDIA. L'iPad affiche l'écran principal du PC pendant le démarrage du second écran et l'écran du PC ne clignote plus en boucle. Mettez l'iPad à jour vers TestFlight v0.3.3, build 364, pour l'utiliser avec Windows 0.3.3.
+La version actuelle est v0.3.3 pour Windows et v0.3.3 (build 364) pour iPad. Elle apporte **Second écran** (Second screen) à davantage de portables avec cartes graphiques Intel et NVIDIA : l'iPad affiche immédiatement l'écran principal du PC, puis passe au second écran lorsque Windows l'ajoute. [RELEASE_NOTES.md](../RELEASE_NOTES.md) couvre chaque version et [ROADMAP.md](../ROADMAP.md) les prochaines étapes.
 
-Les diagnostics Windows et iPad comprennent des informations sur les appareils, les erreurs des applications et les statistiques de diffusion. Les rapports contiennent les noms du PC, de l'iPad et des périphériques audio ainsi que les adresses réseau, mais excluent le contenu de l'écran, l'audio et les identifiants de jumelage. Désactivez le partage automatique dans **Paramètres** (Settings). Les diagnostics sont conservés jusqu'à 30 jours et peuvent être supprimés plus tôt. Les diagnostics supprimés ou expirés peuvent rester dans les sauvegardes quotidiennes jusqu'à 7 jours supplémentaires. Consultez [Diagnostics automatiques](../SETUP.md#automatic-diagnostics) et l'[avis de confidentialité](https://eternalmonitor.dev/privacy.html). Sur iPad, ouvrez **Paramètres** (Settings) > **Assistance** (Support) > **Diagnostics** pour copier ou exporter un rapport.
+Les vérifications de la version v0.3.3 ont réussi sur Windows, macOS et les simulateurs iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) consigne les résultats des tests pratiques sur un vrai PC et un vrai iPad depuis v0.3.0.
 
-Les vérifications de version ont réussi sur Windows, macOS et les simulateurs iPad. Les problèmes connus figurent sur la page [Problèmes connus](https://eternalmonitor.dev/known-issues.html), et les résultats antérieurs sur appareils physiques restent dans [docs/hardware-verification.md](../docs/hardware-verification.md).
-
-Limites connues :
-
-- La diffusion n'est pas chiffrée. Le jumelage empêche les autres appareils de se connecter ; utilisez donc un réseau de confiance, comme votre Wi-Fi domestique.
-- L'application Windows est le seul hôte. L'hôte se compile sur macOS pour le développement, mais y diffuse une mire de test au lieu de votre écran.
-- Apple Pencil (USB-C) ne possède pas de capteur de pression ; ses traits gardent donc une largeur constante.
-
-[Problèmes connus](https://eternalmonitor.dev/known-issues.html) répertorie tous les problèmes connus et indique quoi faire pour chacun.
+Les deux applications partagent des diagnostics pour trouver et corriger les problèmes : informations sur les appareils, erreurs des applications et statistiques de diffusion, notamment les noms du PC, de l'iPad et des périphériques audio ainsi que les adresses réseau. Les diagnostics ne contiennent jamais le contenu de l'écran, l'audio ni les identifiants de jumelage. Désactivez le partage dans Paramètres. [Diagnostics automatiques](../SETUP.md#automatic-diagnostics) et l'[avis de confidentialité](https://eternalmonitor.dev/privacy.html) précisent ce qui est envoyé et la durée de conservation. Sur iPad, ouvrez Paramètres > Assistance > Diagnostics pour copier ou exporter un rapport.
 
 ## Fonctionnement
 
@@ -86,7 +87,7 @@ Limites connues :
   <img src="../docs/assets/readme/how-it-works-light.svg" width="1120" alt="Le PC Windows capture le bureau, encode la vidéo sur le GPU et l'envoie par Wi-Fi ou USB. L'iPad reconstitue la vidéo, redemande les fragments manquants sur Wi-Fi, la décode avec VideoToolbox et l'affiche avec Metal. Le son du PC est capturé avec WASAPI, encodé en Opus et lu sur l'iPad. Les actions au toucher, au Pencil, au clavier et au pavé tactile sont renvoyées au PC qui les injecte.">
 </picture>
 
-L'hôte Windows est écrit en Rust. Il capture le bureau avec DXGI, encode sur le GPU via FFmpeg et envoie chaque image sous forme de fragments UDP numérotés. Sur USB, les mêmes messages passent par un tunnel à trames fourni par le service d'appareils d'Apple. L'application iPad est native en Swift. Elle reconstitue les fragments, décode avec VideoToolbox et affiche avec Metal. Sur Wi-Fi, elle redemande aussi les fragments manquants. Le son du PC est capturé avec WASAPI et envoyé en Opus ; l'iPad masque les pertes audio au lieu de les redemander. Les actions et les rapports du récepteur reviennent par la même session et l'hôte utilise ces rapports pour adapter le débit.
+L'hôte Windows est écrit en Rust. Il capture le bureau avec DXGI, encode via FFmpeg avec NVIDIA NVENC, AMD AMF ou Intel Quick Sync sur les cartes graphiques compatibles (H.264 par défaut, ou HEVC) et envoie chaque image sous forme de fragments UDP numérotés. Sur USB, les mêmes messages passent par un tunnel à trames fourni par le service d'appareils d'Apple. L'application iPad est native en Swift. Elle reconstitue les fragments, décode avec VideoToolbox et affiche avec Metal. Sur Wi-Fi, elle redemande aussi les fragments manquants. Le son du PC est capturé avec WASAPI et envoyé en Opus ; l'iPad le lit via un tampon de gigue et masque les pertes audio au lieu de les redemander. Les actions et les rapports du récepteur reviennent par la même session et l'hôte utilise ces rapports pour adapter le débit entre 4 et 50 Mbps.
 
 [ARCHITECTURE.md](../ARCHITECTURE.md) décrit la chaîne et le protocole v2 ; [docs/decisions.md](../docs/decisions.md) explique les choix de fonctionnement de chaque partie.
 
@@ -181,8 +182,6 @@ Chaque ligne vérifie la fréquence d'images décodées (au moins 55 fps), les p
 
 ## Documentation
 
-Ces documents sont en anglais.
-
 | Document | Contenu |
 | --- | --- |
 | [SETUP.md](../SETUP.md) | Configuration pas à pas pour tous, y compris USB et le dessin |
@@ -193,19 +192,20 @@ Ces documents sont en anglais.
 | [docs/pencil-drawing.md](../docs/pencil-drawing.md) | Apple Pencil, Windows Ink et Clip Studio Paint |
 | [docs/pairing.md](../docs/pairing.md), [docs/keyboard-input.md](../docs/keyboard-input.md), [docs/host-settings.md](../docs/host-settings.md), [docs/audio-codec.md](../docs/audio-codec.md) | Détails des fonctionnalités |
 | [docs/hardware-verification.md](../docs/hardware-verification.md) | Résultats des tests de version et liste de vérification pratique |
-| [docs/beta-testing.md](../docs/beta-testing.md) | Tester une bêta : TestFlight, signature et éléments à tester |
+| [Tests de version](../docs/beta-testing.md) | Publier une build via TestFlight : signature et éléments à tester |
 | [docs/design.md](../docs/design.md) | Apparence commune des applications et du site |
 | [RELEASE_NOTES.md](../RELEASE_NOTES.md) | Modifications de chaque version |
+| [ROADMAP.md](../ROADMAP.md) | Les prochaines étapes |
 
 ## Contribuer
 
-Les contributions sont bienvenues, du transport et des encodeurs au rendu et à la documentation. Lisez [CONTRIBUTING.md](../CONTRIBUTING.md) avant d'ouvrir une pull request. Pour discuter d'abord d'une idée, posez votre question sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
+Toutes les contributions sont les bienvenues : issues, idées, corrections, documentation, traductions et nouvelles fonctionnalités. Les pull requests sont bienvenues, petites ou grandes. [CONTRIBUTING.md](../CONTRIBUTING.md) explique comment en envoyer une et propose de bonnes premières contributions, et [ROADMAP.md](../ROADMAP.md) présente les travaux plus importants à venir. Vos questions et idées sont les bienvenues sur le [Discord Sideband](https://discord.gg/Xc7NykBZ6z).
 
 ## Contact
 
 Le [Discord Sideband](https://discord.gg/Xc7NykBZ6z) est destiné aux questions, à l'aide à la configuration et aux idées. Vous pouvez aussi écrire à [hello@sideband.studio](mailto:hello@sideband.studio).
 
-Vous avez trouvé un bug ? [Ouvrez une issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose) en indiquant les versions des deux applications et le journal de l'hôte. Signalez les problèmes de sécurité en privé comme indiqué dans [SECURITY.md](../SECURITY.md), pas sur Discord ni dans une issue.
+Vous avez trouvé un bug ? [Ouvrez une issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose) en indiquant les versions des deux applications et le journal de l'hôte, ou utilisez le [formulaire de retour sur la page de téléchargement](https://eternalmonitor.dev/download.html#feedback), qui envoie un e-mail au studio. Signalez les problèmes de sécurité en privé comme indiqué dans [SECURITY.md](../SECURITY.md), pas sur Discord ni dans une issue.
 
 ## Licence
 
