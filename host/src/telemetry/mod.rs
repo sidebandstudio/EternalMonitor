@@ -182,7 +182,7 @@ fn plain_summary(
         },
     };
     if enabled && dropped > 0 && !matches!(sharing, Sharing::Unavailable) {
-        text.push_str(" Some diagnostics were dropped while offline.");
+        text.push_str(" Some diagnostics could not be saved or sent.");
     }
     if save_failed {
         text.push_str(" This setting could not be saved.");
@@ -1604,7 +1604,7 @@ mod tests {
             (
                 plain_summary(Sharing::Retrying, true, minutes(1), 3, false),
                 "Sharing diagnostics: on. Waiting for a connection. \
-                 Some diagnostics were dropped while offline.",
+                 Some diagnostics could not be saved or sent.",
             ),
             (
                 plain_summary(Sharing::Ready, false, minutes(1), 3, false),

@@ -73,7 +73,7 @@ struct DiagnosticsView: View {
                 .accessibilityIdentifier("diagnostics.copy")
                 if let error { Text("Could not export diagnostics: \(error)") }
             } footer: {
-                Text("Reports include local network addresses and PC names. Pairing codes and tokens are removed.")
+                Text("Reports include the name and address of the PC you connect to. Pairing codes and tokens are removed.")
             }
             .listRowBackground(Theme.surfaceRaised)
 
@@ -86,7 +86,7 @@ struct DiagnosticsView: View {
                     .onChange(of: uploadEnabled) { _, enabled in DiagnosticsUpload.shared.setEnabled(enabled) }
                 Text(uploadStatus).font(.footnote)
             } footer: {
-                Text("Device details, app errors and stream statistics are sent to EternalMonitor support while the app runs. Offline events retry automatically. Reports include PC names and network addresses. Screen content, audio and pairing credentials are excluded.")
+                Text("Device details, app errors and stream statistics are sent to EternalMonitor support while the app runs. Offline events retry automatically. Reports include the PC address you connect to. Screen content, audio and pairing credentials are excluded.")
             }
             .listRowBackground(Theme.surfaceRaised)
         }

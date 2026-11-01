@@ -13,13 +13,17 @@ in the body, and refuse an installer that differs. So the notes go after the
 hash's code block, notes containing a 64-digit hex string are refused, and
 the finished body is parsed the same way before it is written.
 
---strict (final tags) exits 1 when the tag has no section. Otherwise that is a
-GitHub Actions warning and the body keeps only the link to RELEASE_NOTES.md.
+--strict (final tags) exits 1 when the tag has no section, or its section
+still reads "Released [date set at release].". Otherwise a missing section is a
+GitHub Actions warning and the body keeps only the link to RELEASE_NOTES.md,
+and an undated one is a warning with the notes kept.
 """
 import argparse
 import pathlib
 import re
 import sys
+
+from check_published_site import DATE_PLACEHOLDER
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / ".github" / "release-body.md"
@@ -98,7 +102,13 @@ def notes_for(tag, notes_text, strict):
     if HEX64.search(text):
         # The hash parsers must never meet another 64-digit hex string.
         raise NotesError(f"the {tag} notes contain a 64-digit hex string; take it out")
-    return f"## What's new in {tag}\n\n{unwrap(text)}\n", None
+    notes = f"## What's new in {tag}\n\n{unwrap(text)}\n"
+    if DATE_PLACEHOLDER in text:
+        problem = f"RELEASE_NOTES.md: EternalMonitor {tag} still says {DATE_PLACEHOLDER}; set the release date"
+        if strict:
+            raise NotesError(problem)
+        return notes, f"::warning::{problem}."
+    return notes, None
 
 
 def body(tag, sha256, template, notes_text, strict):
@@ -117,7 +127,7 @@ def main(argv=None):
     parser.add_argument("--tag", required=True)
     parser.add_argument("--sha256", help="write the body for this installer hash")
     parser.add_argument("--out", help="file for the body (default: standard output)")
-    parser.add_argument("--strict", action="store_true", help="fail when the tag has no section")
+    parser.add_argument("--strict", action="store_true", help="fail when the tag has no dated section")
     parser.add_argument("--notes", default=str(NOTES))
     parser.add_argument("--template", default=str(TEMPLATE))
     args = parser.parse_args(argv)
