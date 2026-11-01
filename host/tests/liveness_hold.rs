@@ -6,7 +6,8 @@
 //! Paused-clock simulations of the real transport loop, with a fake encoder
 //! and fake iPads on loopback whose packets to the PC can be held back and
 //! released in order, as a congested Wi-Fi queue does. The tokio clock only
-//! moves when every task waits, so a busy machine cannot change the result.
+//! moves when every task waits, and nothing waits while a datagram is on
+//! the loopback, so a busy machine cannot change the result.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -19,6 +20,7 @@ use eternal_host::input::{
     recorder, CaptureGeometry, Injection, KIND_KEY, PHASE_BEGAN, PHASE_ENDED,
 };
 use eternal_host::transport;
+use eternal_host::transport::probe;
 use eternal_host::transport::session::{EndReason, HOLD_LIMIT, LIVENESS_TIMEOUT};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloStatus, InputEvent,
@@ -42,6 +44,23 @@ const STEP: Duration = Duration::from_millis(10);
 const KEY_A: u16 = 0x04;
 /// A stall that outlasts every test: the iPad is gone.
 const FOREVER: Duration = Duration::from_secs(3600);
+/// Real time a datagram may take across the loopback before a test fails.
+const LOOPBACK_LIMIT: Duration = Duration::from_secs(10);
+
+/// Waits until `done`, without moving the paused clock: a yielding task
+/// keeps the runtime busy, so tokio polls the sockets but advances no time.
+/// macOS delivers loopback datagrams on a kernel thread, a little after the
+/// send returns, and later still on a loaded machine.
+async fn settle(what: &str, mut done: impl FnMut() -> bool) {
+    let limit = std::time::Instant::now() + LOOPBACK_LIMIT;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < limit,
+            "{what} still in flight after {LOOPBACK_LIMIT:?}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
 
 fn secs(seconds: f64) -> Duration {
     Duration::from_secs_f64(seconds)
@@ -72,6 +91,9 @@ struct Ipad {
     frames: Vec<(u32, u32, Duration)>,
     /// When each packet reached the PC's socket.
     delivered: Arc<Mutex<Vec<Duration>>>,
+    /// What the transport counted for this iPad's address before the test.
+    sent_before: u64,
+    taken_before: u64,
     uplink: mpsc::UnboundedSender<Vec<u8>>,
     stall: Arc<Mutex<Option<(Duration, Duration)>>>,
     next_report: Duration,
@@ -87,6 +109,9 @@ impl Ipad {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         let socket = Arc::new(socket);
+        let address = socket.local_addr().unwrap();
+        // A port an earlier test used may come round again.
+        let (sent_before, taken_before) = (probe::sent_to(address), probe::taken_from(address));
         let received = Arc::new(Mutex::new(Vec::new()));
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let stall = Arc::new(Mutex::new(None::<(Duration, Duration)>));
@@ -104,6 +129,10 @@ impl Ipad {
                     }
                     socket.send_to(&bytes, host).unwrap();
                     delivered.lock().push(start.elapsed());
+                    // The PC hears it now, not whenever the kernel and the
+                    // runtime get round to it.
+                    let sent = taken_before + delivered.lock().len() as u64;
+                    settle("a packet to the PC", || probe::taken_from(address) >= sent).await;
                 }
             });
         }
@@ -117,6 +146,8 @@ impl Ipad {
             received,
             frames: Vec::new(),
             delivered,
+            sent_before,
+            taken_before,
             uplink,
             stall,
             next_report: Duration::MAX,
@@ -143,6 +174,16 @@ impl Ipad {
     async fn send_now(&mut self, session_id: u32, message: &ControlMessage) {
         let bytes = self.encode(session_id, message);
         self.socket.send_to(&bytes, self.host).unwrap();
+        self.delivered.lock().push(self.start.elapsed());
+        let (address, sent) = (
+            self.address(),
+            self.taken_before + self.delivered.lock().len() as u64,
+        );
+        settle("a packet to the PC", || probe::taken_from(address) >= sent).await;
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.socket.local_addr().unwrap()
     }
 
     fn hello_message(&mut self) -> ControlMessage {
@@ -235,6 +276,17 @@ impl Ipad {
         }
     }
 
+    /// Takes everything the PC has sent so far, as received `now`.
+    async fn drain_all(&mut self, now: Duration) {
+        let address = self.address();
+        let sent_before = self.sent_before;
+        settle("a packet to the iPad", || {
+            self.drain(now);
+            self.received.lock().len() as u64 >= probe::sent_to(address) - sent_before
+        })
+        .await;
+    }
+
     fn step(&mut self, now: Duration) {
         self.drain(now);
         let received = self.received();
@@ -293,7 +345,7 @@ struct Sim {
     start: Instant,
     shared: SharedControl,
     host: SocketAddr,
-    transport: tokio::task::JoinHandle<()>,
+    transport: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     encoder: tokio::task::JoinHandle<()>,
     /// When the encoder found an IDR asked for.
     forced: Arc<Mutex<Vec<Duration>>>,
@@ -304,29 +356,44 @@ struct Sim {
 impl Sim {
     async fn start() -> Self {
         let start = Instant::now();
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .map(|a| a.port())
-            .unwrap();
-        let shared = SharedControl::new(port, 10_000_000);
-        shared.pairing.lock().required = false;
-        shared.running.store(true, Ordering::SeqCst);
-        *shared.capture_geometry.lock() = Some(CaptureGeometry {
-            left: 0,
-            top: 0,
-            width: 1280,
-            height: 720,
-        });
-        let (nal_tx, nal_rx) = mpsc::channel(4);
-        let (audio_tx, audio_rx) = mpsc::channel(4);
-        let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
-        let control = shared.clone();
-        let transport = tokio::spawn(async move {
-            let _audio = audio_tx;
-            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx)
-                .await
-                .unwrap()
-        });
+        // Another process can take the free port before the transport binds it.
+        let (port, shared, nal_tx, transport) = loop {
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .map(|a| a.port())
+                .unwrap();
+            let shared = SharedControl::new(port, 10_000_000);
+            shared.pairing.lock().required = false;
+            shared.running.store(true, Ordering::SeqCst);
+            *shared.capture_geometry.lock() = Some(CaptureGeometry {
+                left: 0,
+                top: 0,
+                width: 1280,
+                height: 720,
+            });
+            let (nal_tx, nal_rx) = mpsc::channel(4);
+            let (audio_tx, audio_rx) = mpsc::channel(4);
+            let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
+            let control = shared.clone();
+            let transport = tokio::spawn(async move {
+                let _audio = audio_tx;
+                transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx).await
+            });
+            // The transport binds before its first wait.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if !transport.is_finished() {
+                break (port, shared, nal_tx, transport);
+            }
+            let error = transport.await.unwrap().unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
+                "{error}"
+            );
+        };
         let forced = Arc::new(Mutex::new(Vec::new()));
         let encoder = {
             let (force, forced) = (shared.force_next_idr.clone(), forced.clone());
@@ -378,13 +445,9 @@ impl Sim {
                 ipad.step(now);
             }
             tokio::time::sleep(STEP).await;
-            // macOS delivers loopback datagrams on a kernel thread, a little
-            // after the send returns. A paused clock would run on through
-            // many steps meanwhile, so each step waits a moment of real time.
-            std::thread::sleep(Duration::from_micros(300));
             let now = self.start.elapsed();
             for ipad in &mut self.ipads {
-                ipad.drain(now);
+                ipad.drain_all(now).await;
             }
             self.injected.extend(
                 recorder::take()
@@ -423,6 +486,7 @@ impl Sim {
         tokio::time::timeout(Duration::from_secs(5), self.transport)
             .await
             .expect("the transport stops")
+            .unwrap()
             .unwrap();
         self.encoder.abort();
     }
@@ -638,13 +702,13 @@ fn a_gone_ipad_is_held_then_told_goodbye_at_the_hold_limit() {
         sim.run_until(secs(16.2)).await;
         assert_eq!(byes(&sim.ipads[ipad].received()).len(), 4);
         let hello = sim.ipads[ipad].hello_message();
+        let before = sim.ipads[ipad].received().len();
         sim.ipads[ipad].send_now(0, &hello).await;
         sim.run_until(secs(16.3)).await;
-        let acks: Vec<_> = sim.ipads[ipad]
-            .received()
-            .into_iter()
-            .filter_map(|(at, heard)| match heard {
-                Heard::Ack(status, new_id) if at > secs(16.2) => Some((status, new_id)),
+        let acks: Vec<_> = sim.ipads[ipad].received()[before..]
+            .iter()
+            .filter_map(|(_, heard)| match heard {
+                Heard::Ack(status, new_id) => Some((*status, *new_id)),
                 _ => None,
             })
             .collect();

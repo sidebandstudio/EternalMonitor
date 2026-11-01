@@ -91,7 +91,7 @@ pub struct Actions {
     pub input_late: bool,
     /// Negotiated and session-gated request; the transport checks frag_count
     /// against its stored datagrams before sending anything.
-    pub retransmit: Option<(u32, u32, Vec<u16>)>,
+    pub retransmit: Option<Nack>,
     /// The host ended this client's session (an update stopped it, or it
     /// went silent): tell it, making sure the message leaves (see
     /// [`Session::begin_update`]).
@@ -612,7 +612,7 @@ impl Session {
             return actions;
         }
         actions.force_idr = session.heard(Heard::Nack, now);
-        actions.retransmit = Some((nack.stream_epoch, nack.frame_seq, nack.missing));
+        actions.retransmit = Some(nack);
         actions
     }
 
@@ -1642,7 +1642,12 @@ mod tests {
             session
                 .handle_control(peer, id, nack, &TestConfig, later)
                 .retransmit,
-            Some((7, 42, vec![0, 8]))
+            Some(Nack {
+                stream_epoch: 7,
+                frame_seq: 42,
+                frag_count: 9,
+                missing: vec![0, 8],
+            })
         );
         assert!(
             !session
