@@ -7,8 +7,11 @@
 // its displays, and coming back mirrored.
 //
 // The root's width picks the framing, so second-screen-m.html shares this.
+// readme-demo.html and launch-film.html play it as one scene: there it leaves
+// the background to the host and hands its timeline over in window.__films.
 (function () {
   const root = document.getElementById('root');
+  const hosted = !!document.querySelector('[data-film="second-screen"]');
   const ID = root.dataset.compositionId;
   const W = +root.dataset.width, H = +root.dataset.height;
   const tl = gsap.timeline({ paused: true });
@@ -36,11 +39,25 @@
       close: { x: 300, y: 186, s: 2.1 },
       carry: { x: 1130, y: 360, s: 0.86 },
     },
+    1280: {
+      rest: { x: 768, y: 466, s: 0.73 },
+      settle: { x: 760, y: 466, s: 0.71 },
+      close: { x: 300, y: 190, s: 2.2 },
+      carry: { x: 1000, y: 400, s: 1.0 },
+    },
+    1920: {
+      rest: { x: 768, y: 350, s: 0.8 },
+      settle: { x: 760, y: 350, s: 0.775 },
+      close: { x: 294, y: 160, s: 2.6 },
+      carry: { x: 1000, y: 300, s: 1.1 },
+    },
   }[W];
   const cam = (p) => ({ x: W / 2 - p.x * p.s, y: H / 2 - p.y * p.s, scale: p.s });
 
-  tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
-  tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+  if (!hosted) {
+    tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: 4, ease: 'sine.inOut' }, 0);
+    tl.to('#bg', { scale: 1.06, x: 0, duration: 4, ease: 'sine.inOut' }, 4);
+  }
 
   // Camera: in on the app's switch, out to follow the sheet, then the desk.
   tl.set('#world', { ...cam(POSES.rest), transformOrigin: '0 0' }, 0);
@@ -94,5 +111,6 @@
   tl.to(['#ptrA', '#ptrB'], { x: '+=120', y: '+=170', duration: 0.7, ease: 'power2.inOut' }, 4.3);
   tl.to(['#ptrA', '#ptrB'], { opacity: 0, duration: 0.3 }, 4.75);
 
-  window.__timelines[ID] = tl;
+  if (hosted) (window.__films = window.__films || {})['second-screen'] = tl;
+  else window.__timelines[ID] = tl;
 })();
