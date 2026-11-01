@@ -121,9 +121,21 @@ pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
 pub struct RawFrame {
     pub frame_number: u64,
     pub timestamp: Instant,
+    /// `height` rows of `width * 4` bytes, then [`FRAME_PADDING`] more when
+    /// made by [`frame_buffer`], as capture's are.
     pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+}
+
+/// Readable bytes after a frame's last row: FFmpeg's
+/// `AV_INPUT_BUFFER_PADDING_SIZE`. swscale can read that far past the end
+/// of the capture buffer it converts in place.
+pub const FRAME_PADDING: usize = 64;
+
+/// A zeroed buffer for `frame_bytes` of pixels and [`FRAME_PADDING`].
+pub fn frame_buffer(frame_bytes: usize) -> Vec<u8> {
+    vec![0u8; frame_bytes + FRAME_PADDING]
 }
 
 /// Latest-wins handoff from capture to encoder: a 1-deep mailbox. Publishing

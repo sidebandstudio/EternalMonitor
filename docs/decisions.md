@@ -288,7 +288,7 @@ pass on both GPUs. Private campaign evidence is in
 
 ### Give NVIDIA's encoders BGRA by default
 
-NVIDIA's encoders take BGRA when nothing is picked under Encoder input. With
+NVIDIA's encoders take BGRA under Encoder input's new Automatic. With
 YUV420P input, the Windows host copied every captured frame and converted it
 with single-threaded swscale before NVENC. At an iPad Pro 12.9-inch's
 2732x2048 Second screen that took about 10 ms of each 16.7 ms frame on the
@@ -298,6 +298,14 @@ BGRA already passed the 2026-09-23 comparison above. AMD, Quick Sync and x264
 keep YUV420P (NV12 on Quick Sync), because AMD's encoder takes no BGRA in the
 pinned SDK. A BGRA open that fails opens YUV420P at once. YUV420, Auto and
 BGRA stay available, and a picked one wins.
+
+Automatic applies to fresh settings and to a pick. Every earlier version saved
+yuv420 whether or not anyone picked it, so a saved yuv420 can't tell a
+default from a choice made to fix wrong colours. Working PCs keep today's
+behaviour, so settings from an earlier version keep the input they name, and
+Troubleshooting says Automatic is faster on NVIDIA. Automatic is saved as
+`auto` with `encoder_input_automatic`: 0.3.2 to 0.3.4 read that as Auto,
+BGRA for any encoder that advertises it, instead of resetting every setting.
 
 ### Gate streaming FPS on reference hardware, not hosted VMs
 

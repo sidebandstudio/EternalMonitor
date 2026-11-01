@@ -32,11 +32,12 @@ when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on
-macOS and in tests. By default NVIDIA's encoders take BGRA and convert it on
-the graphics card, and every other encoder takes YUV420P (NV12 on Quick Sync).
+macOS and in tests. On fresh settings NVIDIA's encoders take BGRA and convert
+it on the graphics card, and every other encoder takes YUV420P (NV12 on Quick
+Sync); settings from earlier versions keep the input they saved.
 BGRA and Auto check the selected codec's advertised formats; software x264
 stays YUV. Windows converts with swscale, which reads the capture buffer
-directly; the macOS development path uses a tested Accelerate conversion with a
+directly (capture pads it by FFmpeg's 64 bytes); the macOS development path uses a tested Accelerate conversion with a
 swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a

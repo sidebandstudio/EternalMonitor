@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eternal_host::capture::synthetic::{decode_frame_counter_from_luma, render_synthetic_frame};
-use eternal_host::capture::{frame_slot, RawFrame};
+use eternal_host::capture::{frame_buffer, frame_slot, RawFrame};
 use eternal_host::control::SharedControl;
 use eternal_host::encoder::{run_encode_stage, NALUnit, NAL_CHANNEL_CAPACITY};
 use eternal_host::gpu::GpuInfo;
@@ -148,7 +148,7 @@ fn run_stage(
             shared.force_next_idr.store(true, Ordering::SeqCst);
         }
         let (width, height) = size_of(number);
-        let mut data = vec![0u8; (width * height * 4) as usize];
+        let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
         producer.publish(RawFrame {
             frame_number: number,

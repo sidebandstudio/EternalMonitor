@@ -1,5 +1,7 @@
 use ffmpeg_next::format::Pixel;
 
+use crate::capture::FRAME_PADDING;
+
 /// Troubleshooting's encoder input. Saved through `settings::saved_input`,
 /// which keeps it readable by older versions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,6 +100,11 @@ pub(super) fn conversion_context(
 /// swscale reads the capture buffer itself, with no copy into a BGRA frame
 /// first. The call returns when the conversion is done, so the buffer can
 /// go back to capture straight after.
+///
+/// swscale can read up to [`FRAME_PADDING`] bytes past the last row, so
+/// `rows` without that many after the picture, as capture's
+/// [`frame_buffer`](crate::capture::frame_buffer) has, are copied into a
+/// frame FFmpeg allocated first.
 pub(super) fn convert_packed_bgra(
     scaler: &mut ffmpeg_next::software::scaling::Context,
     rows: &[u8],
@@ -105,7 +112,8 @@ pub(super) fn convert_packed_bgra(
 ) -> Result<(), ffmpeg_next::Error> {
     let input = *scaler.input();
     let row_bytes = input.width as usize * 4;
-    if input.format != Pixel::BGRA || rows.len() < row_bytes * input.height as usize {
+    let frame_bytes = row_bytes * input.height as usize;
+    if input.format != Pixel::BGRA || rows.len() < frame_bytes {
         return Err(ffmpeg_next::Error::InputChanged);
     }
     let wanted = scaler.output();
@@ -115,6 +123,14 @@ pub(super) fn convert_packed_bgra(
     {
         return Err(ffmpeg_next::Error::OutputChanged);
     }
+    if rows.len() < frame_bytes + FRAME_PADDING {
+        let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, input.width, input.height);
+        let stride = copied.stride(0);
+        for (y, row) in rows[..frame_bytes].chunks_exact(row_bytes).enumerate() {
+            copied.data_mut(0)[y * stride..y * stride + row_bytes].copy_from_slice(row);
+        }
+        return scaler.run(&copied, output);
+    }
     let planes = [
         rows.as_ptr(),
         std::ptr::null(),
@@ -122,8 +138,9 @@ pub(super) fn convert_packed_bgra(
         std::ptr::null(),
     ];
     let strides = [row_bytes as libc::c_int, 0, 0, 0];
-    // swscale reads `input.height` rows of `row_bytes` from `rows`, checked
-    // above, and writes the planes `output` allocated at the output size.
+    // swscale reads `input.height` rows of `row_bytes` from `rows`, and at
+    // most FRAME_PADDING more, checked above, and writes the planes `output`
+    // allocated at the output size.
     let result = unsafe {
         ffmpeg_next::ffi::sws_scale(
             scaler.as_mut_ptr(),
@@ -278,7 +295,55 @@ mod tests {
         assert!(select_input(EncoderInput::Yuv420, "unknown", &[Pixel::QSV]).is_err());
     }
 
-    /// swscale reading capture's packed rows gives the same picture as the
+    fn fill_pattern(rows: &mut [u8], row_bytes: usize) {
+        for (i, byte) in rows.iter_mut().enumerate() {
+            *byte = (i * 7 + i / row_bytes * 13) as u8;
+        }
+    }
+
+    /// What the copy into an aligned BGRA frame gives.
+    fn converted_from_copy(
+        scaler: &mut ffmpeg_next::software::scaling::Context,
+        format: Pixel,
+        rows: &[u8],
+        width: u32,
+        height: u32,
+    ) -> ffmpeg_next::frame::Video {
+        let row_bytes = width as usize * 4;
+        let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
+        let stride = copied.stride(0);
+        for y in 0..height as usize {
+            copied.data_mut(0)[y * stride..y * stride + row_bytes]
+                .copy_from_slice(&rows[y * row_bytes..(y + 1) * row_bytes]);
+        }
+        let mut converted = ffmpeg_next::frame::Video::new(format, width, height);
+        scaler.run(&copied, &mut converted).unwrap();
+        converted
+    }
+
+    fn assert_same_picture(
+        before: &ffmpeg_next::frame::Video,
+        after: &ffmpeg_next::frame::Video,
+        label: &str,
+    ) {
+        for plane in 0..before.planes() {
+            let visible = before.plane_width(plane) as usize
+                * if before.format() == Pixel::NV12 && plane == 1 {
+                    2
+                } else {
+                    1
+                };
+            for y in 0..before.plane_height(plane) as usize {
+                let at = |frame: &ffmpeg_next::frame::Video| {
+                    let start = y * frame.stride(plane);
+                    frame.data(plane)[start..start + visible].to_vec()
+                };
+                assert_eq!(at(before), at(after), "{label} plane {plane} row {y}");
+            }
+        }
+    }
+
+    /// swscale reading a padded capture buffer gives the same picture as the
     /// copy into an aligned BGRA frame it replaced, at widths whose rows are
     /// and aren't 64-byte multiples.
     #[test]
@@ -286,43 +351,18 @@ mod tests {
         ffmpeg_next::init().unwrap();
         for (width, height) in [(2732u32, 64u32), (96, 64), (1366, 32), (102, 18)] {
             let row_bytes = width as usize * 4;
-            let rows: Vec<u8> = (0..row_bytes * height as usize)
-                .map(|i| (i * 7 + i / row_bytes * 13) as u8)
-                .collect();
+            let frame_bytes = row_bytes * height as usize;
+            let mut rows = crate::capture::frame_buffer(frame_bytes);
+            fill_pattern(&mut rows[..frame_bytes], row_bytes);
             for format in [Pixel::YUV420P, Pixel::NV12] {
                 let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
-                let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
-                let stride = copied.stride(0);
-                for y in 0..height as usize {
-                    copied.data_mut(0)[y * stride..y * stride + row_bytes]
-                        .copy_from_slice(&rows[y * row_bytes..(y + 1) * row_bytes]);
-                }
-                let mut before = ffmpeg_next::frame::Video::new(format, width, height);
-                scaler.run(&copied, &mut before).unwrap();
+                let before = converted_from_copy(&mut scaler, format, &rows, width, height);
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
                 convert_packed_bgra(&mut scaler, &rows, &mut after).unwrap();
-                for plane in 0..before.planes() {
-                    let visible = before.plane_width(plane) as usize
-                        * if format == Pixel::NV12 && plane == 1 {
-                            2
-                        } else {
-                            1
-                        };
-                    for y in 0..before.plane_height(plane) as usize {
-                        let at = |frame: &ffmpeg_next::frame::Video| {
-                            let start = y * frame.stride(plane);
-                            frame.data(plane)[start..start + visible].to_vec()
-                        };
-                        assert_eq!(
-                            at(&before),
-                            at(&after),
-                            "{width}x{height} {format:?} {plane} {y}"
-                        );
-                    }
-                }
+                assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
                 // A short buffer or another size is refused, never read past.
                 assert_eq!(
-                    convert_packed_bgra(&mut scaler, &rows[..rows.len() - 1], &mut after),
+                    convert_packed_bgra(&mut scaler, &rows[..frame_bytes - 1], &mut after),
                     Err(ffmpeg_next::Error::InputChanged)
                 );
                 let mut other = ffmpeg_next::frame::Video::new(format, width + 2, height);
@@ -330,6 +370,57 @@ mod tests {
                     convert_packed_bgra(&mut scaler, &rows, &mut other),
                     Err(ffmpeg_next::Error::OutputChanged)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn capture_padding_is_ffmpegs() {
+        assert_eq!(
+            FRAME_PADDING,
+            ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize
+        );
+    }
+
+    /// Rows with no readable bytes after them, ending where an unreadable
+    /// page starts, convert to the same picture without a crash: swscale
+    /// can read past the last row, so they take the copy.
+    #[cfg(unix)]
+    #[test]
+    fn rows_without_padding_are_never_read_past() {
+        ffmpeg_next::init().unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for (width, height) in [(2733u32, 2048u32), (1365, 32), (17, 3)] {
+            let row_bytes = width as usize * 4;
+            let frame_bytes = row_bytes * height as usize;
+            let readable = frame_bytes.div_ceil(page) * page;
+            // SAFETY: a fresh private mapping, `readable` bytes then one
+            // page that faults on any access; unmapped below.
+            let rows = unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    readable + page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                assert_ne!(base, libc::MAP_FAILED);
+                let guard = base.cast::<u8>().add(readable);
+                assert_eq!(libc::mprotect(guard.cast(), page, libc::PROT_NONE), 0);
+                std::slice::from_raw_parts_mut(guard.sub(frame_bytes), frame_bytes)
+            };
+            fill_pattern(rows, row_bytes);
+            for format in [Pixel::YUV420P, Pixel::NV12] {
+                let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
+                let mut after = ffmpeg_next::frame::Video::new(format, width, height);
+                convert_packed_bgra(&mut scaler, rows, &mut after).unwrap();
+                let before = converted_from_copy(&mut scaler, format, rows, width, height);
+                assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
+            }
+            unsafe {
+                let base = rows.as_mut_ptr().add(frame_bytes).sub(readable);
+                assert_eq!(libc::munmap(base.cast(), readable + page), 0);
             }
         }
     }

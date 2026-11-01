@@ -4090,7 +4090,7 @@ mod tests {
         }
 
         fn publish(&mut self) {
-            let mut data = vec![0u8; 1280 * 720 * 4];
+            let mut data = crate::capture::frame_buffer(1280 * 720 * 4);
             crate::capture::synthetic::render_synthetic_frame(&mut data, 1280, 720, self.number);
             self.producer.publish(crate::capture::RawFrame {
                 frame_number: self.number,

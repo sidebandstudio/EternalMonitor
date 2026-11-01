@@ -338,7 +338,7 @@ impl AnalyzerApp {
             "Encoder input",
             &env_or(
                 input_env,
-                "Automatic suits most PCs: BGRA on NVIDIA graphics cards, YUV420 on others. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
+                "Automatic is faster on NVIDIA graphics cards: BGRA there, YUV420 on others. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
             ),
             if inputs.len() > 3 { 360.0 } else { 270.0 },
             |ui| {
