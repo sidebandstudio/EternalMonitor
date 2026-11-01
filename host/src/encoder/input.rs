@@ -124,11 +124,7 @@ pub(super) fn convert_packed_bgra(
         return Err(ffmpeg_next::Error::OutputChanged);
     }
     if rows.len() < frame_bytes + FRAME_PADDING {
-        let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, input.width, input.height);
-        let stride = copied.stride(0);
-        for (y, row) in rows[..frame_bytes].chunks_exact(row_bytes).enumerate() {
-            copied.data_mut(0)[y * stride..y * stride + row_bytes].copy_from_slice(row);
-        }
+        let copied = copied_frame(&rows[..frame_bytes], input.width, input.height);
         return scaler.run(&copied, output);
     }
     let planes = [
@@ -156,6 +152,24 @@ pub(super) fn convert_packed_bgra(
         return Err(ffmpeg_next::Error::from(result));
     }
     Ok(())
+}
+
+/// `rows` copied into a BGRA frame FFmpeg allocated. At odd widths swscale
+/// reads one pixel past each row for the last chroma sample, which lands in
+/// the frame's unset stride padding, so each row's last pixel is repeated
+/// there.
+fn copied_frame(rows: &[u8], width: u32, height: u32) -> ffmpeg_next::frame::Video {
+    let row_bytes = width as usize * 4;
+    let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
+    let stride = copied.stride(0);
+    for (y, row) in rows.chunks_exact(row_bytes).enumerate() {
+        let line = &mut copied.data_mut(0)[y * stride..(y + 1) * stride];
+        line[..row_bytes].copy_from_slice(row);
+        if let Some(next) = line.get_mut(row_bytes..row_bytes + 4) {
+            next.copy_from_slice(&row[row_bytes - 4..]);
+        }
+    }
+    copied
 }
 
 #[cfg(test)]
@@ -309,13 +323,8 @@ mod tests {
         width: u32,
         height: u32,
     ) -> ffmpeg_next::frame::Video {
-        let row_bytes = width as usize * 4;
-        let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
-        let stride = copied.stride(0);
-        for y in 0..height as usize {
-            copied.data_mut(0)[y * stride..y * stride + row_bytes]
-                .copy_from_slice(&rows[y * row_bytes..(y + 1) * row_bytes]);
-        }
+        let frame_bytes = width as usize * 4 * height as usize;
+        let copied = copied_frame(&rows[..frame_bytes], width, height);
         let mut converted = ffmpeg_next::frame::Video::new(format, width, height);
         scaler.run(&copied, &mut converted).unwrap();
         converted
@@ -411,6 +420,13 @@ mod tests {
                 std::slice::from_raw_parts_mut(guard.sub(frame_bytes), frame_bytes)
             };
             fill_pattern(rows, row_bytes);
+            // The pixel swscale reads after each odd-width row is set.
+            let copied = copied_frame(rows, width, height);
+            let stride = copied.stride(0);
+            for y in 0..height as usize {
+                let line = &copied.data(0)[y * stride..y * stride + row_bytes + 4];
+                assert_eq!(line[row_bytes..], line[row_bytes - 4..row_bytes]);
+            }
             for format in [Pixel::YUV420P, Pixel::NV12] {
                 let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
