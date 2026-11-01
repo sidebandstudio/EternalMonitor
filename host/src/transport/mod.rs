@@ -40,6 +40,13 @@ use usb::{LinkEvent, TransportLinks};
 /// restart (seq reset to ~1) reliably instead of inferring it from a sequence-number gap.
 static STREAM_EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The clock the transport gives the session and the second screen: the
+/// system's, except in a test runtime with its clock paused, where it is
+/// that runtime's, so a simulation can run through seconds of silence.
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 /// Stream parameters advertised in HELLO_ACK and heartbeats.
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
@@ -231,7 +238,7 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    shared.session.lock().transport_resumed(Instant::now());
+    shared.session.lock().transport_resumed(now());
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -274,8 +281,9 @@ pub async fn start_sender(
                 }
             }
             _ = heartbeat.tick() => {
-                let actions = shared.session.lock().tick(&config, true, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
+                let actions = shared.session.lock().tick(&config, true, now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                if actions.client_lost || actions.release_input { input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
             _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
@@ -293,8 +301,9 @@ pub async fn start_sender(
                     info!("Transport loop stopping on running=false");
                     break;
                 }
-                let actions = shared.session.lock().tick(&config, false, Instant::now());
-                if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
+                let actions = shared.session.lock().tick(&config, false, now());
+                if actions.client_lost { retransmit_ring.clear(); fault.clear(); }
+                if actions.client_lost || actions.release_input { input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
             }
 
@@ -319,7 +328,7 @@ pub async fn start_sender(
                                             &header,
                                             message,
                                             &config,
-                                            Instant::now(),
+                                            now(),
                                         );
                                         if actions.new_target.is_some() || actions.client_lost {
                                             input_relay.reset();
@@ -335,7 +344,11 @@ pub async fn start_sender(
                                         if let Some((session_id, event)) = actions.input.take() {
                                             if let Some(geometry) = *shared.capture_geometry.lock()
                                             {
-                                                input_relay.relay(session_id, &event, geometry);
+                                                if actions.input_late {
+                                                    input_relay.relay_late(session_id, &event, geometry);
+                                                } else {
+                                                    input_relay.relay(session_id, &event, geometry);
+                                                }
                                             }
                                         }
                                         if let Some(report) = actions.report.take() {
@@ -428,7 +441,7 @@ pub async fn start_sender(
                     match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
                         FirstFrame::Send => {
                             awaiting_keyframe = false;
-                            shared.session.lock().note_video_sent(session_id, Instant::now());
+                            shared.session.lock().note_video_sent(session_id, now());
                         }
                         FirstFrame::Skip => continue, // the forced IDR is coming
                         FirstFrame::SkipAndRequestKeyframe => {
@@ -601,8 +614,8 @@ const GOODBYE_FLUSH: Duration = Duration::from_millis(250);
 const GOODBYE_COPIES: usize = 3;
 const GOODBYE_GAP: Duration = Duration::from_millis(5);
 
-/// Tells the iPad that an update stopped its stream, and returns once the
-/// message has left. Over UDP that is a short burst, all sent before this
+/// Tells the iPad that the host ended its stream (an update stopped it, or
+/// it went silent), and returns once the message has left. Over UDP that is a short burst, all sent before this
 /// returns and the socket closes; the iPad acts on the first. Over USB one
 /// copy is queued for the link's writer, which dropping the link would abort,
 /// so wait for it to be written.
@@ -623,8 +636,8 @@ async fn say_goodbye(links: &TransportLinks, (peer, datagram): (PeerId, Vec<u8>)
         }
     };
     match sent {
-        Ok(()) => info!(%peer, "Told the iPad the stream stopped for an update"),
-        Err(error) => warn!(%peer, %error, "Could not tell the iPad the stream stopped"),
+        Ok(()) => info!(%peer, "Told the iPad its stream ended"),
+        Err(error) => warn!(%peer, %error, "Could not tell the iPad its stream ended"),
     }
 }
 
@@ -695,7 +708,7 @@ async fn repair_while_pacing(
                 if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
                     let count = nack.frag_count;
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
-                        ControlMessage::Nack(nack), config, Instant::now());
+                        ControlMessage::Nack(nack), config, now());
                     if let Some((epoch, seq, missing)) = actions.retransmit {
                         send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
                     }
@@ -747,7 +760,7 @@ async fn execute_actions(
             stats.reset_connection_stats();
         }
         if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
-            second_screen::note_connected(shared, Instant::now());
+            second_screen::note_connected(shared, now());
         }
     }
 
@@ -788,7 +801,7 @@ async fn execute_actions(
         }
     }
 
-    let restart = match second_screen::next_step(shared, Instant::now()) {
+    let restart = match second_screen::next_step(shared, now()) {
         second_screen::Step::Nothing => false,
         second_screen::Step::Attach => {
             info!(

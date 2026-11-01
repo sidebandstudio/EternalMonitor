@@ -29,12 +29,15 @@ def host_run_log(path):
 
 def assess_host_log(text):
     """A clean soak is one session the host ends at shutdown, without a reconnect
-    or a liveness expiry."""
+    or a liveness expiry. Sessions held through a silence and kept are counted,
+    not failed: the iPad never noticed them."""
     if text is None:
         return dict(errors=["The host session log is missing, or the part with the host's start rotated away"])
     lines = text.splitlines()
     reconnects = sum("Client reconnected" in line for line in lines)
     expiries = sum("Client liveness expired" in line for line in lines)
+    holds = sum("Client silent — holding the session" in line for line in lines)
+    holds_kept = sum("Client heard again — session kept" in line for line in lines)
     summaries = [line for line in lines if "session_summary v=1 role=pc " in line]
     errors = []
     if reconnects:
@@ -43,7 +46,8 @@ def assess_host_log(text):
         errors.append(f"The host logged {expiries} client liveness expiries")
     if len(summaries) != 1 or " end=shutdown " not in summaries[0] + " ":
         errors.append(f"The host logged {len(summaries)} session summaries; a clean soak has one, ending at shutdown")
-    return dict(errors=errors, reconnects=reconnects, liveness_expiries=expiries, session_summaries=len(summaries))
+    return dict(errors=errors, reconnects=reconnects, liveness_expiries=expiries, holds=holds,
+                holds_kept=holds_kept, session_summaries=len(summaries))
 
 
 def assess(samples, seconds, processes=("host", "app")):
@@ -125,6 +129,7 @@ def main():
     if "session_summaries" in result.get("host_log", {}):
         host = result["host_log"]
         lines += ["", f"Host log: {host['reconnects']} reconnects, {host['liveness_expiries']} liveness expiries, "
+                  f"{host['holds']} silent-client holds ({host['holds_kept']} kept), "
                   f"{host['session_summaries']} session summaries."]
     lines += ["", f"Samples: {args.samples.resolve()}", f"Video evidence: {args.stream_result.resolve()}", ""]
     lines += ["- " + error for error in result["errors"]]

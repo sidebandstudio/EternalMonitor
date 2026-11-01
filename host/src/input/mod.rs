@@ -482,6 +482,7 @@ fn log_injections(injections: &[Injection]) {
 pub struct InputRelay {
     session: Option<(u32, EventDeduper)>,
     held: HeldInputs,
+    dropped: DroppedPresses,
     pen_sequence: Option<u32>,
     last_pen_input: Option<std::time::Instant>,
     /// The capture rect the last batch was mapped onto.
@@ -499,7 +500,112 @@ struct HeldInputs {
     pen: Option<PenSample>,
 }
 
+/// Presses dropped because they arrived late, whose releases are dropped
+/// too: the PC never saw them go down.
+#[derive(Debug, Default)]
+struct DroppedPresses {
+    keys: std::collections::BTreeSet<(u16, bool)>,
+    buttons: u8,
+    /// A Pencil stroke whose start was dropped, to its end.
+    pen: bool,
+}
+
+/// The [`HeldInputs`] bit of a mouse button injection, and whether it is
+/// the press.
+fn button_edge(injection: &Injection) -> Option<(u8, bool)> {
+    Some(match injection {
+        Injection::LeftDown { .. } => (1, true),
+        Injection::LeftUp { .. } => (1, false),
+        Injection::RightDown { .. } => (2, true),
+        Injection::RightUp { .. } => (2, false),
+        Injection::MiddleDown { .. } => (4, true),
+        Injection::MiddleUp { .. } => (4, false),
+        _ => return None,
+    })
+}
+
 impl HeldInputs {
+    /// Keeps of `injections` what may land: all of fresh input but the
+    /// release of a press dropped before, and of late input only what
+    /// releases a key, button or Pencil contact the PC holds, where it was
+    /// last seen. Nothing is left held that the iPad has released.
+    fn drop_late(&self, dropped: &mut DroppedPresses, injections: &mut Vec<Injection>, late: bool) {
+        let pen_contact = self
+            .pen
+            .is_some_and(|pen| matches!(pen.phase, PenPhase::Down | PenPhase::Move));
+        injections.retain_mut(|injection| {
+            if let Some((bit, press)) = button_edge(injection) {
+                let held = self.buttons & bit != 0;
+                if press {
+                    if late && !held {
+                        dropped.buttons |= bit;
+                    } else if !late {
+                        dropped.buttons &= !bit;
+                    }
+                    return !late;
+                }
+                let pressed_late = dropped.buttons & bit != 0;
+                dropped.buttons &= !bit;
+                if held && late {
+                    let (x, y) = self.pointer;
+                    match injection {
+                        Injection::LeftUp { x: at_x, y: at_y }
+                        | Injection::RightUp { x: at_x, y: at_y }
+                        | Injection::MiddleUp { x: at_x, y: at_y } => (*at_x, *at_y) = (x, y),
+                        _ => {}
+                    }
+                }
+                return held || (!late && !pressed_late);
+            }
+            match injection {
+                Injection::KeyDown { scan, extended } => {
+                    let key = (*scan, *extended);
+                    if !late {
+                        dropped.keys.remove(&key);
+                    } else if !self.keys.contains(&key) {
+                        dropped.keys.insert(key);
+                    }
+                    !late
+                }
+                Injection::KeyUp { scan, extended } => {
+                    let key = (*scan, *extended);
+                    let pressed_late = dropped.keys.remove(&key);
+                    self.keys.contains(&key) || (!late && !pressed_late)
+                }
+                Injection::Pen(sample) => match sample.phase {
+                    PenPhase::Down => {
+                        if !late {
+                            dropped.pen = false;
+                        } else if !pen_contact {
+                            dropped.pen = true;
+                        }
+                        !late
+                    }
+                    PenPhase::Move => !late && !(dropped.pen && !pen_contact),
+                    PenPhase::Hover => {
+                        if !late {
+                            dropped.pen = false;
+                        }
+                        !late
+                    }
+                    PenPhase::Up | PenPhase::Cancel | PenPhase::Leave => {
+                        let stroke_dropped = std::mem::take(&mut dropped.pen);
+                        match self.pen {
+                            Some(held) if late => {
+                                (sample.x, sample.y) = (held.x, held.y);
+                                (sample.x_norm, sample.y_norm) = (held.x_norm, held.y_norm);
+                                true
+                            }
+                            Some(_) => true,
+                            None => !late && !stroke_dropped,
+                        }
+                    }
+                },
+                _ => !late,
+            }
+        });
+    }
+
     fn record(&mut self, injections: &[Injection]) {
         for injection in injections {
             match *injection {
@@ -644,6 +750,7 @@ impl InputRelay {
                 .collect()
         };
         self.inject(&releases);
+        self.dropped = DroppedPresses::default();
         self.session = None;
         self.pen_sequence = None;
         self.last_pen_input = None;
@@ -733,6 +840,23 @@ impl InputRelay {
 
     /// Dedupe, map, and inject one session-validated event.
     pub fn relay(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
+        self.relay_event(session_id, event, output, false);
+    }
+
+    /// [`Self::relay`] for an event that arrived late (see
+    /// `transport::session::INPUT_LATE`): only a release of what the PC holds
+    /// lands.
+    pub fn relay_late(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
+        self.relay_event(session_id, event, output, true);
+    }
+
+    fn relay_event(
+        &mut self,
+        session_id: u32,
+        event: &InputEvent,
+        output: CaptureGeometry,
+        late: bool,
+    ) {
         match &self.session {
             Some((id, _)) if *id == session_id => {}
             _ => {
@@ -762,6 +886,12 @@ impl InputRelay {
         self.log_mapping(session_id, output, screen);
         self.output = Some(output);
         let mut injections = resolve(event, output, screen);
+        let resolved = injections.len();
+        self.held
+            .drop_late(&mut self.dropped, &mut injections, late);
+        if resolved > 0 && injections.is_empty() {
+            return;
+        }
         if let Some(Injection::Pen(sample)) = injections.first().copied() {
             let held = self
                 .held
@@ -1017,6 +1147,114 @@ mod tests {
             ),
             (-2560, -200)
         );
+    }
+
+    /// Input that arrived late never presses anything, and the release of
+    /// a press it dropped is dropped too, fresh or late; a late release of
+    /// what the PC holds still lands, where the PC last saw it. Keys, the
+    /// mouse and the Pencil alike, and nothing is left held.
+    #[cfg(not(windows))]
+    #[test]
+    fn late_input_never_leaves_a_press_held() {
+        let mut relay = InputRelay::default();
+        let mut next_id = 0;
+        let mut send = |relay: &mut InputRelay, mut event: InputEvent, late: bool| {
+            next_id += 1;
+            event.event_id = next_id;
+            if late {
+                relay.relay_late(7, &event, OUTPUT);
+            } else {
+                relay.relay(7, &event, OUTPUT);
+            }
+            recorder::take()
+        };
+        let key = |keycode, phase| InputEvent {
+            keycode,
+            ..event(KIND_KEY, phase, 0, 0)
+        };
+        let a = Injection::KeyDown {
+            scan: hid_to_scancode(0x04).unwrap().0,
+            extended: false,
+        };
+        let Injection::KeyDown { scan: a_scan, .. } = a else {
+            unreachable!()
+        };
+
+        // A late press, then its release fresh or late: nothing lands.
+        for late_release in [false, true] {
+            assert!(send(&mut relay, key(0x04, PHASE_BEGAN), true).is_empty());
+            assert!(send(&mut relay, key(0x04, PHASE_ENDED), late_release).is_empty());
+        }
+        // A fresh press lands, and its late release releases it.
+        assert_eq!(send(&mut relay, key(0x04, PHASE_BEGAN), false), [a]);
+        assert_eq!(
+            send(&mut relay, key(0x04, PHASE_ENDED), true),
+            [Injection::KeyUp {
+                scan: a_scan,
+                extended: false
+            }]
+        );
+        // A release with no press dropped lands as before.
+        assert_eq!(send(&mut relay, key(0x05, PHASE_ENDED), false).len(), 1);
+
+        // A late touch: no button goes down, a fresh drag only moves the
+        // pointer, and its fresh release lands nothing.
+        assert!(send(&mut relay, event(KIND_TOUCH, PHASE_BEGAN, 10, 10), true).is_empty());
+        let moved = send(&mut relay, event(KIND_TOUCH, PHASE_MOVED, 20, 20), false);
+        assert!(matches!(moved.as_slice(), [Injection::MoveAbs { .. }]));
+        let ended = send(&mut relay, event(KIND_TOUCH, PHASE_ENDED, 30, 30), false);
+        assert!(ended.iter().all(|i| button_edge(i).is_none()), "{ended:?}");
+        // A fresh press, then late moves and a late release far away: the
+        // button comes up where the PC last saw the pointer.
+        let pressed = send(&mut relay, event(KIND_TOUCH, PHASE_BEGAN, 100, 100), false);
+        let Some(&Injection::MoveAbs { x, y }) = pressed.first() else {
+            panic!("{pressed:?}")
+        };
+        assert!(send(
+            &mut relay,
+            event(KIND_TOUCH, PHASE_MOVED, 60_000, 60_000),
+            true
+        )
+        .is_empty());
+        assert_eq!(
+            send(
+                &mut relay,
+                event(KIND_TOUCH, PHASE_ENDED, 60_000, 60_000),
+                true
+            ),
+            [Injection::LeftUp { x, y }]
+        );
+
+        // A Pencil stroke that started late is dropped to its end.
+        let pen = |phase, x| InputEvent {
+            input_ver: 2,
+            pressure_x1000: 500,
+            ..event(KIND_PENCIL, phase, x, 100)
+        };
+        assert!(send(&mut relay, pen(PHASE_BEGAN, 100), true).is_empty());
+        for x in [200, 300] {
+            assert!(send(&mut relay, pen(PHASE_MOVED, x), false).is_empty());
+        }
+        assert!(send(&mut relay, pen(PHASE_ENDED, 300), false).is_empty());
+        // A fresh stroke lands; late samples don't, and its late end lifts
+        // the tip where it last was.
+        let down = send(&mut relay, pen(PHASE_BEGAN, 400), false);
+        let [Injection::Pen(down)] = down.as_slice() else {
+            panic!("{down:?}")
+        };
+        assert!(send(&mut relay, pen(PHASE_MOVED, 900), true).is_empty());
+        let up = send(&mut relay, pen(PHASE_ENDED, 900), true);
+        let [Injection::Pen(up)] = up.as_slice() else {
+            panic!("{up:?}")
+        };
+        assert_eq!(
+            (up.phase, up.x, up.y, up.x_norm),
+            (PenPhase::Up, down.x, down.y, down.x_norm)
+        );
+
+        // Nothing is held: dropping the relay releases nothing.
+        drop(relay);
+        assert!(recorder::take().is_empty());
     }
 
     #[cfg(not(windows))]

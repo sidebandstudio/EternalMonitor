@@ -11,6 +11,9 @@ SCRIPTS = Path(__file__).parent
 START = "2026-10-31T04:40:00Z  INFO Session log file initialized path=eternal-host-session.log\n"
 SUMMARY = "2026-10-31T05:40:00Z  INFO session_summary v=1 role=pc session_id=7 nonce=00000000e2e00001 transport=wifi end={}\n"
 EXPIRED = "2026-10-31T05:20:00Z  WARN Client liveness expired — tearing session down\n"
+HELD = "2026-10-31T05:21:00Z  WARN Client silent — holding the session session_id=7 silent_ms=3000 last_heard=ping\n"
+KEPT = ("2026-10-31T05:21:02Z  INFO Client heard again — session kept session_id=7 silent_ms=5200 held_ms=2200 "
+        "heard=report\n")
 
 
 def trace():
@@ -96,6 +99,14 @@ class HostSessionLog(unittest.TestCase):
         for text in (clean + EXPIRED, clean + "WARN Client reconnected — superseding session in place\n",
                      clean + SUMMARY.format("shutdown"), START + SUMMARY.format("liveness"), START):
             self.assertTrue(assess_host_log(text)["errors"], text)
+
+    def test_a_hold_that_was_kept_is_counted_but_does_not_fail(self):
+        result = assess_host_log(START + HELD + KEPT + SUMMARY.format("shutdown"))
+        self.assertEqual(result["errors"], [])
+        self.assertEqual((result["holds"], result["holds_kept"], result["liveness_expiries"]), (1, 1, 0))
+        ended = assess_host_log(START + HELD + EXPIRED + SUMMARY.format("liveness"))
+        self.assertEqual((ended["holds"], ended["holds_kept"], ended["liveness_expiries"]), (1, 0, 1))
+        self.assertTrue(ended["errors"])
 
     def test_a_start_rotated_away_or_a_missing_log_fails(self):
         self.assertTrue(assess_host_log(host_run_log(self.write({".2": EXPIRED, ".1": EXPIRED,

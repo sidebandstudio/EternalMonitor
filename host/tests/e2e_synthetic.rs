@@ -3280,7 +3280,8 @@ fn quiet_clients_keep_their_session_until_they_go_silent() {
         }
     }
 
-    // Silence: the session ends one liveness window later, as in 0.3.1.
+    // Silence: the session ends one liveness window later, as in 0.3.1. It
+    // never counted a frame, so the host has no picture to hold it for.
     while shared.client_connected() && last_message.elapsed() < LIVENESS_TIMEOUT * 2 {
         drain_until(&receiver, Instant::now() + Duration::from_millis(20));
     }
