@@ -80,8 +80,8 @@ fn default_true() -> bool {
 /// every setting, the pairing too, as after a downgrade. A file from before
 /// Automatic keeps the input it names, yuv420 for nearly every PC, so an
 /// upgrade changes nothing that works. Automatic, given to fresh settings
-/// or picked, is saved as auto with `encoder_input_automatic`, which older
-/// versions ignore, reading Auto.
+/// or picked, is saved as yuv420 with `encoder_input_automatic`, which older
+/// versions ignore, reading their default YUV420.
 mod saved_input {
     use crate::encoder::input::EncoderInput;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -107,7 +107,7 @@ mod saved_input {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         let (encoder_input, encoder_input_automatic) = match input {
-            EncoderInput::Automatic => (Saved::Auto, true),
+            EncoderInput::Automatic => (Saved::Yuv420, true),
             EncoderInput::Auto => (Saved::Auto, false),
             EncoderInput::Bgra => (Saved::Bgra, false),
             EncoderInput::Yuv420 => (Saved::Yuv420, false),
@@ -125,7 +125,7 @@ mod saved_input {
         let fields = Fields::deserialize(deserializer)?;
         Ok(match fields.encoder_input {
             None => EncoderInput::Automatic,
-            Some(Saved::Auto) if fields.encoder_input_automatic => EncoderInput::Automatic,
+            Some(Saved::Yuv420) if fields.encoder_input_automatic => EncoderInput::Automatic,
             Some(Saved::Auto) => EncoderInput::Auto,
             Some(Saved::Bgra) => EncoderInput::Bgra,
             Some(Saved::Yuv420) => EncoderInput::Yuv420,
@@ -380,36 +380,43 @@ mod tests {
         );
     }
 
+    /// How 0.3.2 to 0.3.4 read and save the file: unknown fields are
+    /// dropped, an unknown input fails the whole file.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Before {
+        Auto,
+        Bgra,
+        Yuv420,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OlderVersion {
+        bitrate_mbps: f32,
+        target_fps: u32,
+        start_on_boot: bool,
+        #[serde(default = "before_default")]
+        encoder_input: Before,
+        #[serde(default)]
+        auth_token_hex: String,
+    }
+
+    fn before_default() -> Before {
+        Before::Yuv420
+    }
+
     /// Every input survives a save, Automatic included, and what is saved
     /// stays readable by 0.3.2 to 0.3.4, which reset every setting, the
-    /// pairing too, on an input they don't know.
+    /// pairing too, on an input they don't know. Automatic is saved as
+    /// yuv420, what those versions choose by default.
     #[test]
     fn encoder_input_round_trips_and_stays_readable_by_older_versions() {
         use crate::encoder::input::EncoderInput;
-        // How a version before Automatic reads the file: unknown fields are
-        // ignored, an unknown input fails the whole file.
-        #[derive(Debug, PartialEq, serde::Deserialize)]
-        #[serde(rename_all = "lowercase")]
-        enum Before {
-            Auto,
-            Bgra,
-            Yuv420,
-        }
-        #[derive(serde::Deserialize)]
-        struct OlderVersion {
-            #[serde(default = "before_default")]
-            encoder_input: Before,
-            #[serde(default)]
-            auth_token_hex: String,
-        }
-        fn before_default() -> Before {
-            Before::Yuv420
-        }
-        for (input, saved, before) in [
-            (EncoderInput::Automatic, "auto", Before::Auto),
-            (EncoderInput::Auto, "auto", Before::Auto),
-            (EncoderInput::Bgra, "bgra", Before::Bgra),
-            (EncoderInput::Yuv420, "yuv420", Before::Yuv420),
+        for (input, saved, marked, before) in [
+            (EncoderInput::Automatic, "yuv420", true, Before::Yuv420),
+            (EncoderInput::Auto, "auto", false, Before::Auto),
+            (EncoderInput::Bgra, "bgra", false, Before::Bgra),
+            (EncoderInput::Yuv420, "yuv420", false, Before::Yuv420),
         ] {
             let settings = SettingsFile {
                 encoder_input: input,
@@ -419,6 +426,11 @@ mod tests {
             let json = serde_json::to_string_pretty(&settings).unwrap();
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(value["encoder_input"], saved, "{json}");
+            assert_eq!(
+                value.get("encoder_input_automatic").is_some(),
+                marked,
+                "{json}"
+            );
             let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.encoder_input, input, "{json}");
             assert_eq!(parsed.auth_token_hex, settings.auth_token_hex);
@@ -427,6 +439,36 @@ mod tests {
             assert_eq!(older.encoder_input, before, "{json}");
             assert_eq!(older.auth_token_hex, settings.auth_token_hex);
         }
+    }
+
+    /// Automatic, downgraded to 0.3.4 and saved there, then upgraded again:
+    /// 0.3.4 streams its default YUV420, its save drops the marker, and
+    /// the upgrade keeps YUV420 like any file from before Automatic. The
+    /// pairing survives every step.
+    #[test]
+    fn automatic_downgrades_to_yuv420_and_keeps_it_on_upgrade() {
+        use crate::encoder::input::EncoderInput;
+        let token = "0123456789abcdef0123456789abcdef";
+        let automatic = SettingsFile {
+            auth_token_hex: token.into(),
+            ..Default::default()
+        };
+        assert_eq!(automatic.encoder_input, EncoderInput::Automatic);
+        let written = serde_json::to_string_pretty(&automatic).unwrap();
+
+        let downgraded = serde_json::from_str::<OlderVersion>(&written).unwrap();
+        assert_eq!(downgraded.encoder_input, Before::Yuv420, "{written}");
+        assert_eq!(downgraded.auth_token_hex, token);
+        let resaved = serde_json::to_string_pretty(&downgraded).unwrap();
+        assert!(!resaved.contains("encoder_input_automatic"), "{resaved}");
+
+        let upgraded: SettingsFile = serde_json::from_str(&resaved).unwrap();
+        assert_eq!(upgraded.encoder_input, EncoderInput::Yuv420, "{resaved}");
+        assert_eq!(upgraded.auth_token_hex, token);
+        let saved_again = serde_json::to_string_pretty(&upgraded).unwrap();
+        let again: SettingsFile = serde_json::from_str(&saved_again).unwrap();
+        assert_eq!(again.encoder_input, EncoderInput::Yuv420, "{saved_again}");
+        assert_eq!(again.auth_token_hex, token);
     }
 
     #[test]
