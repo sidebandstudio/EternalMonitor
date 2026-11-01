@@ -32,10 +32,12 @@ when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on
-macOS and in tests. YUV420P is the encoder-input default. The optional Auto/BGRA
-path checks the selected codec's advertised formats; software x264 stays YUV.
-Windows converts with swscale; the macOS development path uses a tested
-Accelerate conversion with a swscale fallback.
+macOS and in tests. By default NVIDIA's encoders take BGRA and convert it on
+the graphics card, and every other encoder takes YUV420P (NV12 on Quick Sync).
+BGRA and Auto check the selected codec's advertised formats; software x264
+stays YUV. Windows converts with swscale, which reads the capture buffer
+directly; the macOS development path uses a tested Accelerate conversion with a
+swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
 restart-storm brake. Driver calls that can block for good (D3D11 device creation,

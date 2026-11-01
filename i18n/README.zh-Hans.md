@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | 强制使用指定编码器（`h264_nvenc`、`h264_amf`、`h264_qsv`、`libx264`） |
 | `ETERNAL_HEVC` | `1` 或 `0` 覆盖 HEVC 首选项 |
 | `ETERNAL_FPS` | 覆盖主机帧率；iPad 的首选项仍限制其上限 |
-| `ETERNAL_INPUT` | 编码器输入：`yuv420`（默认）、`auto` 或 `bgra` |
+| `ETERNAL_INPUT` | 编码器输入：`automatic`（默认：NVIDIA 用 BGRA，其他用 YUV420）、`yuv420`、`auto` 或 `bgra` |
 | `ETERNAL_MAX_DGRAM` | 媒体数据报大小，576 到 1400 字节 |
 | `ETERNAL_CAPTURE` | `synthetic` 用生成的测试图案代替 DXGI |
 | `ETERNAL_AUDIO` | `synthetic` 选择确定性音频测试源 |

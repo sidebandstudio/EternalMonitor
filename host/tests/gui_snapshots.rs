@@ -540,7 +540,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     harness.run_steps(4);
     assert_eq!(
         *shared.encoder_input.lock(),
-        eternal_host::encoder::input::EncoderInput::Yuv420
+        eternal_host::encoder::input::EncoderInput::Automatic
     );
 
     // Windows keeping the screen from the app is explained until frames

@@ -74,17 +74,10 @@ fn run_encode_loop(
         let override_name = shared.encoder_override.lock().clone();
         match override_name {
             Some(name) if ffmpeg_next::encoder::find_by_name(&name).is_some() => {
-                let display = match name.as_str() {
-                    "h264_nvenc" => "H.264 (NVENC)",
-                    "h264_amf" => "H.264 (AMF)",
-                    "h264_qsv" => "H.264 (QSV)",
-                    "libx264" => "H.264 (x264)",
-                    other => {
-                        warn!(encoder = %other, "Unknown encoder override label");
-                        other
-                    }
-                };
-                let display = display.to_string();
+                let display = codec_display_name_for(&name).to_string();
+                if display == name {
+                    warn!(encoder = %name, "Unknown encoder override label");
+                }
                 info!(encoder = %name, "Encoder override honoured");
                 (name, display)
             }
@@ -114,7 +107,9 @@ fn run_encode_loop(
     }
 
     let mut encoder_state: Option<EncoderState> = None;
-    let input_mode = *shared.encoder_input.lock();
+    // Automatic's BGRA can give way to YUV420 for the rest of the pipeline
+    // (see `open_at_input`).
+    let mut input_mode = *shared.encoder_input.lock();
     let mut frames_since_last_idr: u64 = 0;
     let test_idr_period = std::env::var("ETERNAL_FORCE_IDR_PERIOD")
         .ok()
@@ -199,7 +194,7 @@ fn run_encode_loop(
             hevc_open_failed = false;
         }
         let preferred: String = if hevc_wanted && !hevc_open_failed {
-            match hevc_variant_of(&encoder_name) {
+            match hevc_encoder_for(&encoder_name) {
                 Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => {
                     hevc.to_string()
                 }
@@ -267,7 +262,7 @@ fn run_encode_loop(
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
-                input_mode,
+                &mut input_mode,
                 first_open(&desired_encoder),
                 &mut opening,
             ) {
@@ -310,7 +305,7 @@ fn run_encode_loop(
                                 raw_frame.height,
                                 desired_bitrate,
                                 target_fps,
-                                input_mode,
+                                &mut input_mode,
                                 first_open(name),
                                 &mut opening,
                             )
@@ -366,7 +361,7 @@ fn run_encode_loop(
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
-                input_mode,
+                &mut input_mode,
                 // The old session cannot take a frame of the new size.
                 if size_changed {
                     Opening::First
@@ -454,6 +449,7 @@ fn run_encode_loop(
         let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
 
         let src_row_bytes = (raw_frame.width * 4) as usize;
+        let convert_start = Instant::now();
         #[cfg(target_os = "macos")]
         let converted = match encoder.native_converter.as_ref().map(|converter| {
             converter.convert(
@@ -475,22 +471,27 @@ fn run_encode_loop(
         #[cfg(not(target_os = "macos"))]
         let converted = false;
         if !converted {
-            let input_frame = encoder.bgra_frame.as_mut().unwrap_or(&mut encoder.frame);
-            let stride = input_frame.stride(0);
-            let bgra_plane = input_frame.data_mut(0);
-            for y in 0..raw_frame.height as usize {
-                let src_offset = y * src_row_bytes;
-                let dst_offset = y * stride;
-                bgra_plane[dst_offset..dst_offset + src_row_bytes]
-                    .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
-            }
-            if let (Some(scaler), Some(bgra)) = (&mut encoder.scaler, &encoder.bgra_frame) {
-                scaler.run(bgra, &mut encoder.frame)?;
+            if let Some(scaler) = encoder.scaler.as_mut() {
+                input::convert_packed_bgra(scaler, &raw_frame.data, &mut encoder.frame)?;
+            } else {
+                // BGRA input: the encoder converts. Its frame takes a copy,
+                // so capture's buffer is free before the encoder can block.
+                let stride = encoder.frame.stride(0);
+                let bgra_plane = encoder.frame.data_mut(0);
+                for y in 0..raw_frame.height as usize {
+                    let src_offset = y * src_row_bytes;
+                    let dst_offset = y * stride;
+                    bgra_plane[dst_offset..dst_offset + src_row_bytes]
+                        .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
+                }
             }
         }
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
+        PIPELINE_STATS
+            .lock()
+            .record_convert(convert_start.elapsed().as_micros());
         let pts = encoder.next_pts(raw_frame.timestamp, raw_frame.frame_number);
         encoder.frame.set_pts(Some(pts));
         let force_idr = take_keyframe_request(
@@ -629,8 +630,8 @@ struct EncoderState {
     #[cfg(target_os = "macos")]
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
+    /// BGRA to the encoder's YUV input, reading capture's buffer directly.
     scaler: Option<ffmpeg_next::software::scaling::Context>,
-    bgra_frame: Option<ffmpeg_next::frame::Video>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -700,13 +701,12 @@ impl EncoderState {
         height: u32,
         bitrate_bps: u32,
         target_fps: u32,
-        input_mode: EncoderInput,
+        input_mode: &mut EncoderInput,
         opening: Opening,
         progress: &mut dyn FnMut(),
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
-        let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
         // AVCodec owns this terminated static list. A null list means that
@@ -721,7 +721,32 @@ impl EncoderState {
             formats
         };
         info!(encoder = encoder_name, advertised_formats = ?supported, input = ?input_mode, "Encoder advertised input formats");
-        let pixel_format = select_input(input_mode, encoder_name, &supported)?;
+        open_at_input(input_mode, encoder_name, &supported, |pixel_format| {
+            Self::open_at(
+                codec,
+                encoder_name,
+                (width, height),
+                bitrate_bps,
+                target_fps,
+                pixel_format,
+                opening,
+                &mut *progress,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_at(
+        codec: ffmpeg_next::Codec,
+        encoder_name: &str,
+        (width, height): (u32, u32),
+        bitrate_bps: u32,
+        target_fps: u32,
+        pixel_format: ffmpeg_next::format::Pixel,
+        opening: Opening,
+        progress: &mut dyn FnMut(),
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
 
@@ -775,7 +800,6 @@ impl EncoderState {
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
         let scaler = input::conversion_context(pixel_format, width, height)?;
-        let needs_conversion = scaler.is_some();
         if scaler.is_some() {
             info!(output = ?pixel_format, "swscale BGRA conversion context created");
         }
@@ -798,9 +822,6 @@ impl EncoderState {
             },
             encoder,
             scaler,
-            bgra_frame: needs_conversion.then(|| {
-                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height)
-            }),
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
             packet: ffmpeg_next::Packet::empty(),
             h264,
@@ -1154,6 +1175,36 @@ fn is_open_stall(error: &(dyn std::error::Error + Send + Sync + 'static)) -> boo
     error.downcast_ref::<OpenStalled>().is_some()
 }
 
+/// Opens at the pixel format `input` picks from `supported`. When nothing
+/// was picked and an NVIDIA encoder's BGRA open fails, YUV420 is tried at
+/// once, and `input` keeps it for this pipeline's later opens, as a failed
+/// encoder stays failed. A stalled open is not a failure of BGRA, and is
+/// not tried again here.
+fn open_at_input<T>(
+    input: &mut EncoderInput,
+    encoder_name: &str,
+    supported: &[ffmpeg_next::format::Pixel],
+    mut open: impl FnMut(
+        ffmpeg_next::format::Pixel,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    let pixel_format = select_input(*input, encoder_name, supported)?;
+    match open(pixel_format) {
+        Err(error)
+            if input::retries_as_yuv(*input, pixel_format) && !is_open_stall(error.as_ref()) =>
+        {
+            warn!(
+                encoder = encoder_name,
+                %error,
+                "Encoder did not open with BGRA input; using YUV420 for this stream"
+            );
+            *input = EncoderInput::Yuv420;
+            open(select_input(*input, encoder_name, supported)?)
+        }
+        result => result,
+    }
+}
+
 /// How long after a stalled open each new try of the preferred encoder
 /// waits, at the earliest: at most three tries a pipeline generation.
 const STALL_RETRY_WAITS: [Duration; 3] = [
@@ -1451,6 +1502,17 @@ pub fn hevc_variant_of(h264_name: &str) -> Option<&'static str> {
 
 pub fn is_hevc_encoder(encoder_name: &str) -> bool {
     encoder_name.starts_with("hevc_") || encoder_name == "libx265"
+}
+
+/// The H.265 encoder to stream when HEVC is wanted: an H.265 encoder
+/// itself (an override such as ETERNAL_ENCODER=hevc_nvenc), else the H.265
+/// sibling of an H.264 one.
+fn hevc_encoder_for(encoder_name: &str) -> Option<&str> {
+    if is_hevc_encoder(encoder_name) {
+        Some(encoder_name)
+    } else {
+        hevc_variant_of(encoder_name)
+    }
 }
 
 /// True for encoders that cannot be asked for a keyframe on a given frame.
@@ -2125,7 +2187,7 @@ mod tests {
                 360,
                 8_000_000,
                 60,
-                EncoderInput::Yuv420,
+                &mut EncoderInput::Yuv420,
                 Opening::First,
                 &mut || {},
             )
@@ -2252,7 +2314,7 @@ mod tests {
                 720,
                 8_000_000,
                 60,
-                EncoderInput::Yuv420,
+                &mut EncoderInput::Yuv420,
                 Opening::First,
                 &mut || {},
             ) else {
@@ -2878,7 +2940,7 @@ mod tests {
                 self.hevc_open_failed = false;
             }
             let preferred = if hevc_wanted && !self.hevc_open_failed {
-                hevc_variant_of(&self.encoder_name).unwrap().to_string()
+                hevc_encoder_for(&self.encoder_name).unwrap().to_string()
             } else {
                 self.encoder_name.clone()
             };
@@ -3126,7 +3188,7 @@ mod tests {
             0,
             8_000_000,
             60,
-            EncoderInput::Yuv420,
+            &mut EncoderInput::Yuv420,
             Opening::First,
             &mut || {},
         )
@@ -3640,7 +3702,7 @@ mod tests {
             360,
             8_000_000,
             60,
-            EncoderInput::Yuv420,
+            &mut EncoderInput::Yuv420,
             Opening::First,
             &mut || {},
         )
@@ -3726,6 +3788,107 @@ mod tests {
         );
         assert_eq!(hevc_variant_of("libx264"), Some("libx265"));
         assert_eq!(hevc_variant_of("mystery_codec"), None);
+    }
+
+    /// Automatic's BGRA open failing on NVENC opens YUV420P at once and keeps
+    /// it for later opens; a picked input, a stall, or a YUV420P open that
+    /// fails is not tried again.
+    #[test]
+    fn a_failed_automatic_bgra_open_falls_back_to_yuv420_and_stays_there() {
+        use ffmpeg_next::format::Pixel;
+        let nvenc = [Pixel::YUV420P, Pixel::NV12, Pixel::BGRZ, Pixel::BGRA];
+        type Opened = Result<Pixel, Box<dyn std::error::Error + Send + Sync>>;
+        let refuse_bgra = |tried: &mut Vec<Pixel>, format: Pixel| -> Opened {
+            tried.push(format);
+            if format == Pixel::BGRA {
+                Err("h264_nvenc open failed: FFmpeg code=-22".into())
+            } else {
+                Ok(format)
+            }
+        };
+
+        let mut input = EncoderInput::Automatic;
+        let mut tried = Vec::new();
+        let opened = open_at_input(&mut input, "h264_nvenc", &nvenc, |format| {
+            refuse_bgra(&mut tried, format)
+        });
+        assert_eq!(opened.unwrap(), Pixel::YUV420P);
+        assert_eq!(tried, [Pixel::BGRA, Pixel::YUV420P]);
+        assert_eq!(input, EncoderInput::Yuv420);
+        // A reopen (bitrate, HEVC) goes straight to YUV420P.
+        tried.clear();
+        let opened = open_at_input(&mut input, "hevc_nvenc", &nvenc, |format| {
+            refuse_bgra(&mut tried, format)
+        });
+        assert_eq!(opened.unwrap(), Pixel::YUV420P);
+        assert_eq!(tried, [Pixel::YUV420P]);
+
+        // A BGRA that opens stays.
+        let mut input = EncoderInput::Automatic;
+        let opened = open_at_input(&mut input, "h264_nvenc", &nvenc, Ok);
+        assert_eq!(opened.unwrap(), Pixel::BGRA);
+        assert_eq!(input, EncoderInput::Automatic);
+
+        // A picked BGRA fails as before: the next encoder is tried instead.
+        let mut input = EncoderInput::Bgra;
+        tried.clear();
+        assert!(open_at_input(&mut input, "h264_nvenc", &nvenc, |format| {
+            refuse_bgra(&mut tried, format)
+        })
+        .is_err());
+        assert_eq!(tried, [Pixel::BGRA]);
+        assert_eq!(input, EncoderInput::Bgra);
+
+        // A stall says nothing about BGRA, and holds FFmpeg's lock.
+        let mut input = EncoderInput::Automatic;
+        let mut tries = 0;
+        let stalled = open_at_input(&mut input, "h264_nvenc", &nvenc, |_| -> Opened {
+            tries += 1;
+            Err(Box::new(OpenStalled(
+                "h264_nvenc open failed: stalled".into(),
+            )))
+        });
+        assert!(is_open_stall(stalled.unwrap_err().as_ref()));
+        assert_eq!(tries, 1);
+        assert_eq!(input, EncoderInput::Automatic);
+
+        // Other encoders never had BGRA, so their failure is theirs.
+        let mut input = EncoderInput::Automatic;
+        let mut tried = Vec::new();
+        assert!(open_at_input(
+            &mut input,
+            "h264_amf",
+            &[Pixel::NV12, Pixel::YUV420P],
+            |format| -> Opened {
+                tried.push(format);
+                Err("h264_amf open failed".into())
+            }
+        )
+        .is_err());
+        assert_eq!(tried, [Pixel::YUV420P]);
+        assert_eq!(input, EncoderInput::Automatic);
+    }
+
+    /// ETERNAL_ENCODER=hevc_nvenc streams HEVC: its label says so, and HEVC
+    /// stays on it instead of looking for an H.265 sibling it doesn't have.
+    #[test]
+    fn an_hevc_override_is_labelled_and_streamed_as_hevc() {
+        for (name, label) in [
+            ("hevc_nvenc", "HEVC (NVENC)"),
+            ("hevc_amf", "HEVC (AMF)"),
+            ("hevc_qsv", "HEVC (QSV)"),
+            ("libx265", "HEVC (x265)"),
+        ] {
+            assert_eq!(codec_display_name_for(name), label);
+            assert_eq!(hevc_encoder_for(name), Some(name));
+        }
+        for name in ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"] {
+            assert!(codec_display_name_for(name).starts_with("H.264 ("));
+            assert_eq!(hevc_encoder_for(name), hevc_variant_of(name));
+        }
+        // Still unknown, so still warned about.
+        assert_eq!(codec_display_name_for("mystery_codec"), "mystery_codec");
+        assert_eq!(hevc_encoder_for("mystery_codec"), None);
     }
 
     #[test]

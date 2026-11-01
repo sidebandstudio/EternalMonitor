@@ -323,25 +323,27 @@ impl AnalyzerApp {
             Some(_) => self.overrides.encoder_input.value,
             None => self.settings_encoder_input,
         };
+        let mut inputs = vec![
+            (EncoderInput::Automatic, "Automatic"),
+            (EncoderInput::Bgra, "BGRA"),
+            (EncoderInput::Yuv420, "YUV420"),
+        ];
+        // Auto, BGRA whenever the encoder takes it, is still shown to
+        // whoever picked it.
+        if input == EncoderInput::Auto {
+            inputs.insert(1, (EncoderInput::Auto, "Auto"));
+        }
         widgets::setting_row(
             ui,
             "Encoder input",
             &env_or(
                 input_env,
-                "YUV420, the default, suits most PCs. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
+                "Automatic suits most PCs: BGRA on NVIDIA graphics cards, YUV420 on others. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
             ),
-            230.0,
+            if inputs.len() > 3 { 360.0 } else { 270.0 },
             |ui| {
                 ui.add_enabled_ui(input_env.is_none(), |ui| {
-                    widgets::segmented(
-                        ui,
-                        &mut input,
-                        &[
-                            (EncoderInput::Auto, "Auto"),
-                            (EncoderInput::Bgra, "BGRA"),
-                            (EncoderInput::Yuv420, "YUV420"),
-                        ],
-                    );
+                    widgets::segmented(ui, &mut input, &inputs);
                 });
             },
         );

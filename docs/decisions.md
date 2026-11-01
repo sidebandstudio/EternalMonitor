@@ -286,6 +286,19 @@ Auto and BGRA remain opt-in because the required native BGRA gate did not
 pass on both GPUs. Private campaign evidence is in
 `EternalMonitor-Handoff/evidence/windows-colors-a0823cc/`.
 
+### Give NVIDIA's encoders BGRA by default
+
+NVIDIA's encoders take BGRA when nothing is picked under Encoder input. With
+YUV420P input, the Windows host copied every captured frame and converted it
+with single-threaded swscale before NVENC. At an iPad Pro 12.9-inch's
+2732x2048 Second screen that took about 10 ms of each 16.7 ms frame on the
+development Mac, and about 9% of captured frames never reached the encoder
+on the reference PC. With BGRA, NVENC converts on the graphics card. NVIDIA
+BGRA already passed the 2026-09-23 comparison above. AMD, Quick Sync and x264
+keep YUV420P (NV12 on Quick Sync), because AMD's encoder takes no BGRA in the
+pinned SDK. A BGRA open that fails opens YUV420P at once. YUV420, Auto and
+BGRA stay available, and a picked one wins.
+
 ### Gate streaming FPS on reference hardware, not hosted VMs
 
 GitHub's free three-vCPU macOS VM cannot run the software x264/x265 encoder and

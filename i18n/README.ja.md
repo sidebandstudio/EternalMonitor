@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | エンコーダーを指定します（`h264_nvenc`、`h264_amf`、`h264_qsv`、`libx264`） |
 | `ETERNAL_HEVC` | `1` または `0` で HEVC の設定を上書きします |
 | `ETERNAL_FPS` | ホストのフレームレートを変更します。iPad の設定が上限になります |
-| `ETERNAL_INPUT` | エンコーダー入力: `yuv420`（既定）、`auto`、`bgra` |
+| `ETERNAL_INPUT` | エンコーダー入力: `automatic`（既定。NVIDIA は BGRA、その他は YUV420）、`yuv420`、`auto`、`bgra` |
 | `ETERNAL_MAX_DGRAM` | メディアデータグラムのサイズ、576〜1400 バイト |
 | `ETERNAL_CAPTURE` | `synthetic` で DXGI の代わりに生成されたテストパターンを使用します |
 | `ETERNAL_AUDIO` | `synthetic` で再現可能な音声テストソースを選択します |
