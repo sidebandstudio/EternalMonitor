@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1280, height=720">
+  <title>EternalMonitor: a second screen, then Apple Pencil</title>
+  <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="second-screen.css">
+  <link rel="stylesheet" href="pencil.css">
+  <link rel="stylesheet" href="readme-demo.css">
+  <script src="vendor/gsap.min.js"></script>
+  <script src="vendor/perfect-freehand.js"></script>
+</head>
+<body>
+  <div id="root" data-composition-id="readme-demo" data-start="0" data-width="1280" data-height="720" data-duration="13">
+    <div class="bg" id="bg"></div>
+    <div class="bg-dim"></div>
+
+    <!-- The Extend your desktop film (second-screen.html), unchanged. -->
+    <div class="scene" id="sceneA" data-film="second-screen">
+      <div id="world">
+        <div id="neck"></div><div id="foot"></div>
+        <div id="mon">
+          <div class="screen">
+            <div class="desk" id="deskA" data-layout-ignore>
+              <img class="wall" src="art/wallpaper.webp" alt="">
+              <div class="win appwin">
+                <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                <div class="win-view"><video id="appA" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+              </div>
+              <div class="doc" id="docA"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+              <div class="ptr" id="ptrA"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+            </div>
+            <div class="dark" id="monDark"></div>
+          </div>
+        </div>
+  
+        <div id="pad">
+          <div class="screen">
+            <!-- Mirror my screen: the monitor's desktop again, whole, with bars. -->
+            <div class="layer" id="mirror">
+              <div class="desk" id="deskM" data-layout-ignore>
+                <img class="wall" src="art/wallpaper.webp" alt="">
+                <div class="win appwin">
+                  <div class="win-bar"><span class="t"><img src="ui/icon.png" alt="">EternalMonitor</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div>
+                  <div class="win-view"><video id="appM" src="footage/host-second-screen.mp4" data-start="0" data-duration="8" muted playsinline></video></div>
+                </div>
+                <div class="doc" id="docM"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+              </div>
+            </div>
+            <!-- Second screen: the iPad's own display, right of the monitor. -->
+            <div class="layer" id="extend">
+              <div class="desk2" id="deskB" data-layout-ignore>
+                <img class="wall" src="art/wallpaper.webp" alt="">
+                <div class="doc" id="docB"><div class="bar"><span>Night coast references</span><span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span></div><img src="footage/doc.png" alt=""></div>
+                <div class="ptr" id="ptrB"><svg viewBox="0 0 20 30"><path d="M1 1 L1 23 L6.4 18 L10 26.6 L13.6 25.1 L10.1 16.8 L17 16.8 Z" fill="#fff" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+              </div>
+            </div>
+            <div class="dark" id="padDark"></div>
+          </div>
+        </div>
+      </div>
+  
+      <div class="chip" id="chip"><span class="dot"></span><span class="say"><span id="say-mirror">Mirror my screen</span><span id="say-second">Second screen</span></span></div>
+    </div>
+
+    <!-- The Apple Pencil film (pencil.html). Its footage starts with the
+         film's own clock, 5 s into this one (PENCIL_AT in the script below). -->
+    <div class="scene" id="sceneB" data-film="pencil">
+      <div id="cam">
+        <div class="ipad" id="tab">
+          <div class="ipad-screen">
+            <video id="sheet" src="footage/ipad-pencil.mp4" data-start="5" data-duration="8" muted playsinline></video>
+            <canvas id="ink" width="2420" height="1668"></canvas>
+          </div>
+        </div>
+      </div>
+      <div id="shadow" data-layout-allow-overflow><div id="pencil"><img src="art/stylus.webp" alt=""></div></div>
+      <div class="chip" id="chipB"><span class="dot"></span><span>Apple Pencil</span></div>
+      <div id="dip"></div>
+    </div>
+
+    <div id="seam"></div>
+  </div>
+  <script src="second-screen.js"></script>
+  <script src="pencil.js"></script>
+  <script>
+    // The README's demo: a window moves from the PC onto the iPad as a second
+    // screen, then Apple Pencil draws on the iPad. It plays the two home page
+    // films as they are (second-screen.js and pencil.js hand over their
+    // timelines) and cuts them to one 13 s loop:
+    //
+    // - 0 to 6.2 s: the second-screen film from its start, through the sheet
+    //   landing on the iPad, cross-fading out while the camera eases toward it.
+    // - 5.6 to 13 s: the pencil film from 0.6 s, where it holds on the whole
+    //   iPad, to its dip to black, which meets the dark first frame of the loop.
+    (function () {
+      const PENCIL_AT = 5;            // where the pencil film's own 0 s falls
+      const CUT = 5.6, FADE = 0.6;    // the cross-fade between the two
+      const END = 13;
+      const tl = gsap.timeline({ paused: true });
+
+      tl.add(window.__films['second-screen'].paused(false), 0);
+      tl.add(window.__films.pencil.paused(false), PENCIL_AT);
+
+      tl.fromTo('#bg', { scale: 1.06, x: 0 }, { scale: 1, x: -16, duration: END / 2, ease: 'sine.inOut' }, 0);
+      tl.to('#bg', { scale: 1.06, x: 0, duration: END / 2, ease: 'sine.inOut' }, END / 2);
+
+      // The loop starts dark, where the pencil film's dip ends.
+      tl.fromTo('#seam', { opacity: 1 }, { opacity: 0, duration: 0.4, ease: 'power1.out', immediateRender: true }, 0);
+
+      // Cross-fade: the desk pushes toward the iPad as the pencil film's iPad
+      // settles in from slightly smaller.
+      tl.set('#sceneB', { opacity: 0 }, 0);
+      tl.fromTo('#sceneA', { opacity: 1, scale: 1 }, { opacity: 0, scale: 1.06, transformOrigin: '86% 82%', duration: FADE, ease: 'power2.in', immediateRender: false }, CUT);
+      tl.fromTo('#sceneB', { opacity: 0, scale: 0.965 }, { opacity: 1, scale: 1, transformOrigin: '50% 50%', duration: FADE + 0.3, ease: 'power2.out', immediateRender: false }, CUT);
+
+      // One chip at a time: the film's own chip leaves before the cut, the
+      // pencil's arrives once its iPad has settled.
+      tl.to('#chip', { opacity: 0, duration: 0.2, ease: 'power1.in' }, CUT - 0.15);
+      tl.fromTo('#chipB', { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.35, ease: 'power3.out', immediateRender: true }, CUT + 0.45);
+
+      window.__timelines['readme-demo'] = tl;
+    })();
+  </script>
+</body>
+</html>

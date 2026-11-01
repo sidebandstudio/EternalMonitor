@@ -6,9 +6,11 @@
 
 You can also download the installer from the [download page](https://eternalmonitor.dev/download.html).
 
-**What's new:** see [RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md).
-
 **EternalMonitor-Setup.exe SHA-256:**
 ```
 {{SHA256}}
 ```
+
+{{NOTES}}
+
+Notes for every version are in [RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md).

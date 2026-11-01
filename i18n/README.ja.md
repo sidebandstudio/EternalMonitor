@@ -8,76 +8,77 @@
 
 # EternalMonitor
 
-Windows デスクトップを Wi-Fi または USB 経由で iPad にミラーリングまたは拡張し、<br>
-タッチ、キーボード、Apple Pencil で PC を操作できます。
+Windows 用の無料オープンソースのセカンドモニター。<br>
+iPad を Wi-Fi または USB で接続し、タッチと Apple Pencil を使えます。
 
 [![Release](https://img.shields.io/github/v/release/sidebandstudio/EternalMonitor?label=release&labelColor=111&color=e8ff47)](https://github.com/sidebandstudio/EternalMonitor/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/sidebandstudio/EternalMonitor/ci.yml?branch=main&label=CI&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e8ff47?labelColor=111)](../LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#ダウンロード)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
 [![Discord](https://img.shields.io/badge/discord-Sideband-e8ff47?labelColor=111&logo=discord&logoColor=white)](https://discord.gg/Xc7NykBZ6z)
 
-[ダウンロード](#ダウンロード) · [セットアップガイド](../SETUP.md) · [既知の問題](https://eternalmonitor.dev/known-issues.html) · [ウェブサイト](https://eternalmonitor.dev) · [リリースノート](../RELEASE_NOTES.md) · [Discord](https://discord.gg/Xc7NykBZ6z)
+[ダウンロード](#download) · [セットアップガイド](../SETUP.md) · [ウェブサイト](https://eternalmonitor.dev) · [ロードマップ](../ROADMAP.md) · [リリースノート](../RELEASE_NOTES.md) · [Discord](https://discord.gg/Xc7NykBZ6z)
 
 </div>
 
 <p align="center">
-  <img src="../docs/assets/og.png" width="860" alt="Windows の EternalMonitor アプリが iPad に配信し、iPad に PC の画面が表示されている様子">
+  <img src="../docs/assets/readme-demo.webp" width="860" alt="Windows PC と iPad。PC の EternalMonitor ウィンドウで iPad をセカンドスクリーンに切り替え、ウィンドウをモニターから iPad にドラッグします。次に Apple Pencil で iPad の絵に草を描きます。押すと線が太くなり、浮かせると細くなります。">
 </p>
 
-EternalMonitor は Windows デスクトップを iPad に配信し、入力を PC に送り返します。小さな Windows アプリが画面をキャプチャし、グラフィックスカードでエンコードします。iPad アプリは動画をハードウェアでデコードして Metal で描画し、タップ、キー入力、Pencil のストロークを PC に送ります。無料で、MIT License のオープンソースです。アカウントは必要ありません。
+EternalMonitor は iPad を Windows PC のモニターにします。無料で、MIT ライセンスのオープンソースです。アカウントは必要ありません。PC は最大 120 fps で配信し、対応するグラフィックスカードでハードウェアエンコード、iPad でハードウェアデコードを行います。タップ、キー入力、Pencil のストロークはすべて PC に戻ります。
+
+<a id="download"></a>
+
+## クイックスタート
+
+[![Windows 版をダウンロード](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![TestFlight で iPad アプリを入手](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
+
+1. **Windows アプリをインストール。** NVIDIA、AMD、Intel のグラフィックスを搭載した 64 ビットの Windows 10（バージョン 1809 以降）または Windows 11 で [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) を実行します。Windows SmartScreen が表示されたら、**詳細情報**、**実行**の順に選びます。ファイルの SHA-256 は[リリースページ](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)に記載されています。
+2. **iPad アプリをインストール。** iPadOS 17 以降の iPad に App Store から **TestFlight** をインストールします。iPad で [EternalMonitor の TestFlight リンク](https://testflight.apple.com/join/ppc9QfXc)を開き、**インストール**をタップします。
+3. **接続。** 両アプリを同じネットワークで開き、iPad で PC をタップするか、PC に表示された QR コードをスキャンします。Windows 10 22H2 または Windows 11 で USB を使う場合はケーブルを接続し、Apple の無料アプリ [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) を PC で開いたままにします。
+
+[セットアップガイド](../SETUP.md)では正確なボタン名を使って各手順を説明しています。[ダウンロードページ](https://eternalmonitor.dev/download.html)には組み合わせて使う Windows 版と iPad 版が掲載されています。
+
+EternalMonitor が役に立ったら、スターを付けると他の人が見つけやすくなります。
 
 ## 機能
 
 <img src="../docs/assets/ipad-app.webp" align="right" width="270" alt="接続、QRコードをスキャン、PCを検索が表示された iPad アプリの接続画面">
 
-- **拡張またはミラーリング。** iPad をモニターの隣に追加ディスプレイとして使うことも、既存の画面をミラーリングすることもできます。追加ディスプレイは iPad の切断から 10 秒後に消えるため、すぐに再接続すれば再利用でき、Windows に不要なモニターが残りません。
-- **Wi-Fi または USB。** 自宅のネットワーク経由で配信するか、ケーブルを接続してより安定した映像を受信しながら iPad を充電できます。実行中の Wi-Fi セッションはケーブル接続に切り替わり、ケーブルを抜くと Wi-Fi に戻ります。
-- **タッチ、キーボード、ポインター。** タップでクリック、ドラッグ、2 本指でスクロール、長押しで右クリックできます。ハードウェアキーボード、トラックパッド、マウスも使え、修飾キーの固定や中クリックにも対応します。
+- **拡張またはミラーリング。** iPad をモニターの隣にセカンドディスプレイとして使うことも、既存の画面をミラーリングすることもできます。セカンドディスプレイは iPad の切断後 10 秒間残るため、すぐに再接続すれば再利用でき、Windows に不要なモニターが残りません。
+- **Wi-Fi または USB。** 自宅のネットワーク経由で配信するか、ケーブルを接続してより安定した映像を受信できます。USB-C ポートから iPad を充電することもできます。実行中の Wi-Fi セッションはケーブル接続に切り替わり、ケーブルを抜くと Wi-Fi に戻ります。
 - **Apple Pencil をペンとして使用。** Windows は Windows Ink の筆圧と傾きを受け取り、どのモニター配置でもペン先の位置に描画します。**描画モード** (Drawing mode) はキャンバス上の手のひらを無視します。Clip Studio Paint では Tablet PC 設定で動作します。
+- **タッチ、キーボード、ポインター。** タップでクリック、ドラッグ、2 本指でスクロール、長押しで右クリックできます。ハードウェアキーボード、トラックパッド、マウスも使え、修飾キーの固定や中クリックにも対応します。
+- **ハードウェアエンコード。** 対応する NVIDIA、AMD、Intel のグラフィックスが 30、60、90、120 fps で配信をエンコードします。
+- **Wi-Fi の損失を修復。** パケットが失われると iPad がすぐに再要求するため、1 パケットの損失でフレームが失われることはまれです。ビットレートはネットワークに合わせて調整されます。
+- **PC の音声。** 音声は iPad で再生され、映像を止めずに消音できます。
 - **全体を表示または画面いっぱい。** **全体を表示** (Fit) は PC の画面全体を表示し、縦横比の違いによる余白に帯を表示します。**画面いっぱい** (Fill) は iPad の画面全体を使い、収まらない端を切り取ります。
-- **PC の音声。** 音声は Opus として iPad で再生され、ジッターバッファと損失補間を使用します。映像を止めずに消音できます。
-- **Wi-Fi の損失を修復。** パケットが失われると iPad がすぐにその断片を再要求するため、1 パケットの損失でフレームが失われることはまれです。ビットレートは 4〜50 Mbps の間で調整されます。
-- **GPU でエンコード。** NVIDIA NVENC、AMD AMF、Intel Quick Sync が、標準では H.264、選択すれば HEVC で、30、60、90、120 fps のいずれかでエンコードします。
 - **ペアリング。** 最初の Wi-Fi 接続時に 6 桁のコードか QR スキャンが必要です。その後は iPad が PC を記憶します。USB ではコードは不要です。
-- **自動復帰と問題の説明。** ロック画面、ディスプレイの変更、配信の再起動後に映像が自動で戻ります。問題が起きた場合は両アプリが状況と対処法を表示し、**フィードバックを送信** (Send feedback) で環境情報を入力済みのメールをスタジオ宛てに作成します。
-- **ワンクリックで更新。** 新しいバージョンが出るとポップアップで通知します。Windows では **今すぐアップデート** (Update now) でダウンロードを検証し、Windows の確認画面 1 回でインストールします。iPad アプリでは TestFlight が開きます。Windows アプリはコンソールウィンドウなしで実行されます。
+- **自動復帰と問題の説明。** ロック画面、ディスプレイの変更、配信の再起動後に映像が自動で戻ります。両アプリが状況と対処法を表示し、**フィードバックを送信** (Send feedback) で環境情報を入力済みのメールをスタジオ宛てに作成します。
+- **ワンクリックで更新。** 新しいバージョンが出るとポップアップで通知します。Windows では **今すぐアップデート** (Update now) でダウンロードを検証し、Windows の確認画面 1 回でインストールします。iPad では TestFlight が開きます。Windows アプリはコンソールウィンドウなしで実行されます。
+
+この README と[ウェブサイト](https://eternalmonitor.dev)は 11 言語で利用できます。
 
 <br clear="right">
 
-## ダウンロード
+## 詳しくはこちら
 
-| | 動作要件 | 入手先 |
-| --- | --- | --- |
-| **Windows** | Windows 10 バージョン 1809 以降または Windows 11、64 ビット、NVIDIA、AMD、Intel のいずれかのグラフィックス | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)（v0.3.3 が現在の安定版） |
-| **iPad** | iPadOS 17 以降 | [TestFlight v0.3.3, build 364](https://testflight.apple.com/join/ppc9QfXc)。公開ベータに参加できます。TestFlight をインストールし、iPad でリンクを開いてください。 |
+- [iPad を Windows のセカンドモニターとして使う](https://eternalmonitor.dev/ipad-second-monitor-windows.html): 完全ガイド。
+- [互換性](https://eternalmonitor.dev/compatibility.html): EternalMonitor が使われている PC と iPad。
+- [代替手段](https://eternalmonitor.dev/alternatives.html): iPad を画面として使う他の方法との比較。
+- [ロードマップ](../ROADMAP.md): 今後の予定。
 
-eternalmonitor.dev/download.html に掲載されている Windows 版と iPad 版をインストールしてください。バージョン番号が異なっていても、この組み合わせで動作します。古い v0.1 リリースは別のプロトコルを使うため、v0.3 の iPad アプリには接続できません。
-
-テスト中に見つけた不具合やフィードバックは、hello@sideband.studio にメールが届く[ダウンロードページのフォーム](https://eternalmonitor.dev/download.html#feedback)、[GitHub issue](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)、または [Sideband Discord](https://discord.gg/Xc7NykBZ6z) からお知らせください。
-
-インストーラーはまだコード署名されていないため、実行前に Windows SmartScreen の確認が表示されます。ファイルの SHA-256 が[リリースページ](https://github.com/sidebandstudio/EternalMonitor/releases)の値と一致することを確認したうえで、**詳細情報** (More info)、**実行** (Run anyway) の順に選択してください。
-
-USB には Apple の無料アプリ [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) も必要です。配信中はこのアプリを開いてください。Windows がケーブル経由で iPad に接続するにはこのアプリが必要で、閉じているかインストールされていない場合は EternalMonitor が通知します。Apple Devices には Windows 10 バージョン 22H2 (build 19045) または Windows 11 が必要です。それより古い Windows 10 では Wi-Fi で接続してください。
-
-**次に、[セットアップガイド](../SETUP.md)に従ってください。** 両アプリのインストール、ペアリング、USB、拡張ディスプレイ、描画について、実際に表示されるボタン名を使って説明しています。
+**環境を共有。** お使いの PC と iPad を[互換性レポート](https://github.com/sidebandstudio/EternalMonitor/issues/new?template=compatibility.yml)で知らせるか、[Sideband Discord](https://discord.gg/Xc7NykBZ6z) に投稿してください。許可をいただければ、互換性ページに掲載します。
 
 ## 状況
 
-v0.3.3 では、**セカンドスクリーン** (Second screen) が起動しなかった PC、特に Intel と NVIDIA のグラフィックスを搭載したノート PC での問題を修正しました。セカンドスクリーンの起動中は iPad に PC のメイン画面が表示され、PC の画面が繰り返し点滅することもなくなりました。Windows 0.3.3 に合わせて iPad を TestFlight v0.3.3, build 364 に更新してください。
+現在のリリースは Windows 版 v0.3.3 と iPad 版 v0.3.3 (build 364) です。Intel と NVIDIA のグラフィックスを搭載したより多くのノート PC で **セカンドスクリーン** (Second screen) が使えます。iPad はまず PC のメイン画面を表示し、Windows がセカンドスクリーンを追加すると切り替わります。[RELEASE_NOTES.md](../RELEASE_NOTES.md) は各バージョンを、[ROADMAP.md](../ROADMAP.md) は今後の予定を説明します。
+
+v0.3.3 のリリースチェックは Windows、macOS、iPad シミュレーターで合格しました。[docs/hardware-verification.md](../docs/hardware-verification.md) には v0.3.0 からの実際の PC と iPad での検証結果を記録しています。
 
 Windows と iPad の診断情報には、デバイスの詳細、アプリのエラー、配信の統計が含まれます。レポートにはグラフィックカードとディスプレイの名前、ネットワークアドレスが含まれますが、画面の内容、音声、ペアリングの認証情報は含まれません。0.3.4 から、Windows の送信データから PC の名前、ユーザー名、ユーザーフォルダー、iPad の名前、オーディオデバイス名が取り除かれ、各オーディオデバイスの種類だけが残ります。iPad の送信データからは PC の名前が取り除かれます。自動共有は **設定** (Settings) で無効にできます。診断情報は最大 30 日間保存され、それより早く削除される場合もあります。削除済みまたは期限切れの診断情報は、日次バックアップにさらに最大 7 日間残る場合があります。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)を参照してください。iPad では **設定** (Settings) > **サポート** (Support) > **診断** (Diagnostics) を開き、レポートをコピーまたは書き出せます。
-
-リリースチェックは Windows、macOS、iPad シミュレーターで合格しました。把握している問題は[既知の問題](https://eternalmonitor.dev/known-issues.html)に掲載しています。以前の実機での結果は [docs/hardware-verification.md](../docs/hardware-verification.md) に残っています。
-
-既知の制限:
-
-- 配信は暗号化されません。ペアリングによって他のデバイスの接続は防がれますが、自宅の Wi-Fi など信頼できるネットワークを使用してください。
-- ホストとして使えるのは Windows アプリだけです。ホストは開発用に macOS でもビルドできますが、画面の代わりにテストパターンを配信します。
-- Apple Pencil (USB-C) には筆圧センサーがないため、ストロークの幅は一定です。
-
-[既知の問題](https://eternalmonitor.dev/known-issues.html)には、把握しているすべての問題と、それぞれの対処法を掲載しています。
 
 ## 仕組み
 
@@ -86,7 +87,7 @@ Windows と iPad の診断情報には、デバイスの詳細、アプリのエ
   <img src="../docs/assets/readme/how-it-works-light.svg" width="1120" alt="Windows PC がデスクトップをキャプチャし、GPU で映像をエンコードして Wi-Fi または USB で送信します。iPad は映像を再構成し、Wi-Fi では欠けた断片を要求して、VideoToolbox でデコードし Metal で表示します。PC の音声は WASAPI でキャプチャされ、Opus にエンコードされて iPad で再生されます。タッチ、Pencil、キーボード、トラックパッドの入力は PC に送り返され、PC に入力されます。">
 </picture>
 
-Windows ホストは Rust で書かれています。DXGI でデスクトップをキャプチャし、FFmpeg を通して GPU でエンコードして、各フレームを番号付きの UDP 断片として送信します。USB では同じメッセージを Apple のデバイスサービスが提供するフレーム化されたトンネルで送ります。iPad アプリはネイティブの Swift 製です。断片を再構成し、VideoToolbox でデコードして Metal で描画します。Wi-Fi では欠けた断片も要求します。PC の音声は WASAPI でキャプチャして Opus で送信し、iPad は失われた音声を再要求せずに補間します。入力と受信側のレポートは同じセッションで送り返され、ホストはレポートを使ってビットレートを調整します。
+Windows ホストは Rust で書かれています。DXGI でデスクトップをキャプチャし、対応するグラフィックスハードウェア上で FFmpeg と NVIDIA NVENC、AMD AMF または Intel Quick Sync を使ってエンコードし（標準では H.264、または HEVC）、各フレームを番号付きの UDP 断片として送信します。USB では同じメッセージを Apple のデバイスサービスが提供するフレーム化されたトンネルで送ります。iPad アプリはネイティブの Swift 製です。断片を再構成し、VideoToolbox でデコードして Metal で描画します。Wi-Fi では欠けた断片も要求します。PC の音声は WASAPI でキャプチャして Opus で送信し、iPad はジッターバッファを通して再生し、失われた音声を再要求せずに補間します。入力と受信側のレポートは同じセッションで送り返され、ホストはレポートを使ってビットレートを 4〜50 Mbps の間で調整します。
 
 [ARCHITECTURE.md](../ARCHITECTURE.md) ではパイプラインとプロトコル v2 を説明し、[docs/decisions.md](../docs/decisions.md) では各部分の仕組みを選んだ理由を説明しています。
 
@@ -181,8 +182,6 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 
 ## ドキュメント
 
-以下のドキュメントは英語です。
-
 | ドキュメント | 内容 |
 | --- | --- |
 | [SETUP.md](../SETUP.md) | USB と描画を含む、誰でも使える手順ごとのセットアップ |
@@ -193,19 +192,20 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | [docs/pencil-drawing.md](../docs/pencil-drawing.md) | Apple Pencil、Windows Ink、Clip Studio Paint |
 | [docs/pairing.md](../docs/pairing.md), [docs/keyboard-input.md](../docs/keyboard-input.md), [docs/host-settings.md](../docs/host-settings.md), [docs/audio-codec.md](../docs/audio-codec.md) | 機能の詳細 |
 | [docs/hardware-verification.md](../docs/hardware-verification.md) | リリーステストの記録と実機確認リスト |
-| [docs/beta-testing.md](../docs/beta-testing.md) | ベータテストの実施方法: TestFlight、署名、テスト内容 |
+| [リリーステスト](../docs/beta-testing.md) | TestFlight でビルドを公開する方法: 署名とテスト内容 |
 | [docs/design.md](../docs/design.md) | アプリとウェブサイトに共通するデザイン |
 | [RELEASE_NOTES.md](../RELEASE_NOTES.md) | 各バージョンの変更内容 |
+| [ROADMAP.md](../ROADMAP.md) | 今後の予定 |
 
 ## 貢献
 
-転送、エンコーダー、描画、ドキュメントなどへの貢献を歓迎します。プルリクエストを開く前に [CONTRIBUTING.md](../CONTRIBUTING.md) を読んでください。まずアイデアについて相談したい場合は、[Sideband Discord](https://discord.gg/Xc7NykBZ6z) でお尋ねください。
+issue、アイデア、修正、ドキュメント、翻訳、新機能など、あらゆる貢献を歓迎します。大小を問わず、プルリクエストも歓迎します。[CONTRIBUTING.md](../CONTRIBUTING.md) ではプルリクエストの送り方と、最初に取り組みやすい貢献を紹介しています。[ROADMAP.md](../ROADMAP.md) には今後の大きな作業が示されています。質問やアイデアも [Sideband Discord](https://discord.gg/Xc7NykBZ6z) へお気軽にお寄せください。
 
 ## お問い合わせ
 
 質問、セットアップの相談、アイデアは [Sideband Discord](https://discord.gg/Xc7NykBZ6z) へお寄せください。[hello@sideband.studio](mailto:hello@sideband.studio) にメールを送ることもできます。
 
-不具合を見つけた場合は、両アプリのバージョンとホストのログを添えて [issue を作成](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)してください。セキュリティの問題は Discord や issue ではなく、[SECURITY.md](../SECURITY.md) の説明に従って非公開で報告してください。
+不具合を見つけた場合は、両アプリのバージョンとホストのログを添えて [issue を作成](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)するか、スタジオにメールを送る[ダウンロードページのフィードバックフォーム](https://eternalmonitor.dev/download.html#feedback)を使ってください。セキュリティの問題は Discord や issue ではなく、[SECURITY.md](../SECURITY.md) の説明に従って非公開で報告してください。
 
 ## ライセンス
 

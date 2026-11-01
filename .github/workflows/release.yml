@@ -62,6 +62,18 @@ jobs:
           fi
           python scripts/check_published_site.py --tag "$GITHUB_REF_NAME" "${strict[@]}"
 
+      # A final tag's release carries its section of RELEASE_NOTES.md, so a
+      # missing section fails here, before the build. Pre-release tags and dry
+      # runs only warn and link to RELEASE_NOTES.md.
+      - name: Check this release's notes
+        shell: bash
+        run: |
+          strict=()
+          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REF_NAME" != *-* ]]; then
+            strict=(--strict)
+          fi
+          python scripts/release_notes.py --tag "$GITHUB_REF_NAME" "${strict[@]}"
+
       - name: Cache FFmpeg 7.1.1 shared SDK
         id: ffmpeg-cache
         uses: actions/cache@v4
@@ -242,16 +254,19 @@ jobs:
           # /releases/latest — which the website reads — keeps pointing at the
           # newest stable build instead of advertising an RC to everyone.
           $isPrerelease = $tag -match "-"
-          # The body is .github/release-body.md with the hash filled in. The
-          # in-app updater (host/src/updates.rs) reads the hash after its
-          # "SHA-256" label and refuses an installer that differs; its tests
-          # parse that file, so keep the label and the code block.
-          $body = (Get-Content -Raw ".github\release-body.md").Replace("`r`n", "`n").Replace("{{SHA256}}", $sha)
-          if ($sha -notmatch '^[0-9A-Fa-f]{64}$' -or $body -notmatch $sha) {
-              throw "The release body is missing the installer's SHA-256."
-          }
+          # The body is .github/release-body.md with the hash and this tag's
+          # section of RELEASE_NOTES.md filled in. The in-app updater
+          # (host/src/updates.rs) reads the hash after its "SHA-256" label and
+          # refuses an installer that differs; its tests parse that file, so
+          # keep the label and the code block. release_notes.py puts the notes
+          # after the hash and checks the updater still reads this one.
           $notes = "build\out\release-body.md"
-          Set-Content -Path $notes -Value $body -NoNewline -Encoding utf8NoBOM
+          $strict = @()
+          if (!$isPrerelease) { $strict += "--strict" }
+          python scripts/release_notes.py --tag $tag --sha256 $sha --out $notes $strict
+          if ($LASTEXITCODE -ne 0) {
+              throw "Could not write the release body."
+          }
           # NOT $args — that is a PowerShell automatic variable.
           $releaseArgs = @(
               $tag,
