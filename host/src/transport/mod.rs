@@ -1139,12 +1139,14 @@ mod tests {
         }
     }
 
-    /// A cable pulled while a key is down ends the USB session, and the key
-    /// goes up, as at every other end of a session.
+    /// A cable pulled while a key and a mouse button are down ends the USB
+    /// session, and both go up, as at every other end of a session.
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn a_usb_session_ended_by_its_cable_releases_held_keys() {
-        use crate::input::{recorder, CaptureGeometry, Injection, KIND_KEY, PHASE_BEGAN};
+    async fn a_usb_session_ended_by_its_cable_releases_held_input() {
+        use crate::input::{
+            recorder, CaptureGeometry, Injection, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
+        };
         use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
@@ -1196,39 +1198,48 @@ mod tests {
         )
         .await;
         let session_id = shared.session.lock().session_id().unwrap();
-        let key = ControlMessage::InputEvent(InputEvent {
-            input_ver: 1,
-            kind: KIND_KEY,
-            phase: PHASE_BEGAN,
-            buttons: 0,
-            event_id: 1,
-            x_norm: 0,
-            y_norm: 0,
-            pressure_x1000: 0,
-            scroll_dx: 0,
-            scroll_dy: 0,
-            keycode: 0x04,
-            modifiers: 0,
-            client_time_us: 0,
-            tilt_x: 0,
-            tilt_y: 0,
-        });
-        let pressed = shared
-            .session
-            .lock()
-            .handle_control(cable, session_id, key, &config, now());
-        act(
-            pressed,
-            &mut state,
-            &links,
-            &shared,
-            &config,
-            &supervisor_tx,
-        )
-        .await;
+        let press = |event_id, kind, keycode| {
+            ControlMessage::InputEvent(InputEvent {
+                input_ver: 1,
+                kind,
+                phase: PHASE_BEGAN,
+                buttons: 0,
+                event_id,
+                x_norm: 32768,
+                y_norm: 32768,
+                pressure_x1000: 0,
+                scroll_dx: 0,
+                scroll_dy: 0,
+                keycode,
+                modifiers: 0,
+                client_time_us: 0,
+                tilt_x: 0,
+                tilt_y: 0,
+            })
+        };
+        for event in [press(1, KIND_KEY, 0x04), press(2, KIND_MOUSE_ABS, 0)] {
+            let pressed =
+                shared
+                    .session
+                    .lock()
+                    .handle_control(cable, session_id, event, &config, now());
+            act(
+                pressed,
+                &mut state,
+                &links,
+                &shared,
+                &config,
+                &supervisor_tx,
+            )
+            .await;
+        }
         assert!(matches!(
             recorder::take().as_slice(),
-            [Injection::KeyDown { .. }]
+            [
+                Injection::KeyDown { .. },
+                Injection::MoveAbs { .. },
+                Injection::LeftDown { .. }
+            ]
         ));
 
         let unplugged = shared.session.lock().link_lost(cable.link);
@@ -1242,9 +1253,10 @@ mod tests {
             &supervisor_tx,
         )
         .await;
+        assert!(shared.session.lock().session_id().is_none());
         assert!(matches!(
             recorder::take().as_slice(),
-            [Injection::KeyUp { .. }]
+            [Injection::KeyUp { .. }, Injection::LeftUp { .. }]
         ));
     }
 
