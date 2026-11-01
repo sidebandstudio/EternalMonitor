@@ -52,7 +52,7 @@ def pull(remote, destination):
 
 def main(args):
     if not args:
-        raise ValueError("Usage: remote.sh idle|sync|build|run-host|stop-host|shot|log|probe-log|pattern|probe|tone|firewall")
+        raise ValueError("Usage: remote.sh idle|sync|build|run-host|stop-host|shot|log|session-log|probe-log|pattern|probe|tone|firewall")
     action, *args = args
     print("Windows: " + action + " " + " ".join(args), file=sys.stderr, flush=True)
     if action == "idle" and not args:
@@ -144,6 +144,11 @@ def main(args):
         pull(remote, EVIDENCE / "windows" / (args[0] + ".png"))
     elif action == "log" and (not args or (len(args) == 2 and args[0] == "-n" and args[1].isdigit())):
         ps("Get-Content " + quote(ROOT + r"\host.log") + " -Encoding UTF8" + (" -Tail " + args[1] if args else ""))
+    elif action == "session-log" and args in (["0"], ["1"], ["2"]):
+        # The host's own log under the fixture APPDATA; 1 and 2 are the parts
+        # host/src/logging.rs rotated away. A missing part prints nothing.
+        path = ROOT + r"\state\EternalMonitor\logs\eternal-host-session.log" + ("." + args[0] if args[0] != "0" else "")
+        ps("if (Test-Path " + quote(path) + ") { Get-Content " + quote(path) + " -Encoding UTF8 }")
     elif action == "stderr" and not args:
         ps("Get-Content " + quote(ROOT + r"\host.stderr.log") + " -Encoding UTF8")
     elif action == "gui" and len(args) in (2, 3) and args[0] in ("Stream", "Settings", "QR"):

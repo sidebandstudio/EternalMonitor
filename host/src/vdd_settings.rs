@@ -499,6 +499,11 @@ fn marker_matches(marker: &str, location: &str, version: &str) -> bool {
     marker.to_lowercase() == expected.to_lowercase()
 }
 
+/// The virtual display driver's version, as its own setup registered it.
+pub fn driver_version() -> Option<String> {
+    driver_registration().map(|(_, version)| version)
+}
+
 /// Where the driver's own setup registered it, and its version, as the
 /// scripts read it: the first uninstall entry with both.
 #[cfg(windows)]

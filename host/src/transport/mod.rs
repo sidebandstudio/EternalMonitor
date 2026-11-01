@@ -30,7 +30,7 @@ use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::{FramePacer, PacingClock};
+use pacer::{Deadline, FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -78,12 +78,15 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn host_caps(&self) -> u16 {
+        // `start_sender` numbers sent frames contiguously per epoch.
+        let numbering = eternal_wire::v2::control::HOSTCAP_CONTIGUOUS_FRAME_SEQ;
         let usb = if PIPELINE_STATS.lock().usb_service_reachable {
             eternal_wire::v2::control::HOSTCAP_USB
         } else {
             0
         };
-        eternal_wire::v2::control::HOSTCAP_KEYBOARD
+        numbering
+            | eternal_wire::v2::control::HOSTCAP_KEYBOARD
             | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
@@ -115,7 +118,15 @@ pub async fn start_sender(
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
+    let listen_on = shared.listen_on.lock().clone();
+    let bind_ip = crate::network::listen_ip_now(&listen_on);
+    if bind_ip.is_loopback() {
+        warn!(
+            listen_on = listen_on.label(),
+            "The chosen network isn't connected: listening on this PC only until it is (USB still works)"
+        );
+    }
+    let bind_addr = SocketAddr::from((bind_ip, listen_port));
     let socket = {
         let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
         // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
@@ -162,6 +173,11 @@ pub async fn start_sender(
 
     let local_addr = socket.local_addr()?;
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
+    // The Address row and QR code follow every bind, so a chosen network
+    // that came back shows its address. Resolved before locking: the stats
+    // lock is shared with every pipeline thread.
+    let shown = crate::gui::shown_address(bind_ip, listen_port);
+    PIPELINE_STATS.lock().set_listen_addr(shown);
     PIPELINE_STATS
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
@@ -205,6 +221,10 @@ pub async fn start_sender(
     // pre-IDR leftovers; a new session must begin with a keyframe.
     let mut last_session_id: Option<u32> = None;
     let mut awaiting_keyframe = true;
+    // The wire numbers access units contiguously per epoch, as proto says.
+    // Capture numbers skip the frames the encoder never took, and the iPad
+    // held the frame after each skip waiting for one that never existed.
+    let mut frame_seq: u32 = 0;
 
     let mut retransmit_ring = RetransmitRing::default();
     let mut audio_sender = audio::AudioSender::default();
@@ -218,16 +238,33 @@ pub async fn start_sender(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A chosen network can connect, or get a new address, after the stream
+    // starts. It is looked at again while nobody streams.
+    let mut network_check = tokio::time::interval(Duration::from_secs(10));
+    network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
     pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pen_spacing = Deadline::new("pen-spacing")?;
 
     loop {
+        // A pen backlog sends one bounded chunk at the top of every pass,
+        // whatever the select below keeps ready, so the loop serves one
+        // branch between chunks and the backlog never waits behind them.
+        if input_relay
+            .pen_spaced_until()
+            .is_some_and(|at| at <= Instant::now())
+        {
+            input_relay.keep_pen_alive(*shared.capture_geometry.lock());
+        }
+        pen_spacing.arm(input_relay.pen_spaced_until());
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
+            // Not while a backlog is held: its chunk went at the top of
+            // this pass, and a second one would leave nothing between them.
+            _ = pen_tick.tick(), if input_relay.pen_tick_needed() && input_relay.pen_spaced_until().is_none() => {
                 input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
@@ -240,6 +277,15 @@ pub async fn start_sender(
                 let actions = shared.session.lock().tick(&config, true, Instant::now());
                 if actions.client_lost { retransmit_ring.clear(); fault.clear(); input_relay.reset(); }
                 execute_actions(actions, &links, &shared, &supervisor_tx).await;
+            }
+            _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+                if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
+                    info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
+                    shared.stop();
+                    if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
+                    }
+                }
             }
             _ = liveness_tick.tick() => {
                 links.update_stats();
@@ -255,8 +301,8 @@ pub async fn start_sender(
             result = receive_control(&mut links, &mut deferred_control) => {
                 match result {
                     Ok(LinkEvent::Closed(id)) => {
-                        let actions = shared.session.lock().link_lost(id);
-                        execute_actions(actions, &links, &shared, &supervisor_tx).await;
+                        close_link(id, &mut retransmit_ring, &mut fault, &mut input_relay,
+                            &links, &shared, &supervisor_tx).await;
                     }
                     Ok(LinkEvent::Datagram(src, datagram)) => {
                         let datagram = datagram.as_slice();
@@ -268,9 +314,9 @@ pub async fn start_sender(
                                             eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
                                             _ => None,
                                         };
-                                        let mut actions = shared.session.lock().handle_control(
+                                        let mut actions = shared.session.lock().handle_datagram(
                                             src,
-                                            header.session_id,
+                                            &header,
                                             message,
                                             &config,
                                             Instant::now(),
@@ -301,6 +347,11 @@ pub async fn start_sender(
                                                 decode_fps_x10 = report.decode_fps_x10,
                                                 decode_depth = report.decode_depth,
                                                 retransmits,
+                                                frags_received = report.frags_received,
+                                                frags_lost = report.frags_lost,
+                                                rtt_ms_x10 = report.rtt_ms_x10,
+                                                latency_ms_x10 = report.e2e_latency_ms_x10,
+                                                audio_lost = report.audio_packets_lost,
                                                 "Receiver report");
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
@@ -310,8 +361,10 @@ pub async fn start_sender(
                                             // down changes the label and nothing
                                             // else for the life of the pipeline.
                                             let clamped = abr.set_ceiling(ceiling);
+                                            let tunnel_drops = (shared.target_addr.lock().link != LinkId::Udp)
+                                                .then(link::tunnel_congestion_drops);
                                             let reported =
-                                                abr.on_report(&report, Instant::now());
+                                                abr.on_report(&report, tunnel_drops, Instant::now());
                                             let decision = abr::AbrDecision {
                                                 target_bps: reported.target_bps,
                                                 changed: clamped.changed || reported.changed,
@@ -373,7 +426,10 @@ pub async fn start_sender(
                 if awaiting_keyframe {
                     let started = shared.session.lock().client_info().map(|info| info.connected_at);
                     match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
-                        FirstFrame::Send => awaiting_keyframe = false,
+                        FirstFrame::Send => {
+                            awaiting_keyframe = false;
+                            shared.session.lock().note_video_sent(session_id, Instant::now());
+                        }
                         FirstFrame::Skip => continue, // the forced IDR is coming
                         FirstFrame::SkipAndRequestKeyframe => {
                             shared.force_next_idr.store(true, Ordering::SeqCst);
@@ -382,6 +438,7 @@ pub async fn start_sender(
                     }
                 }
 
+                frame_seq = frame_seq.wrapping_add(1);
                 let send_start = Instant::now();
                 let payload = &nal.data;
                 let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
@@ -404,7 +461,7 @@ pub async fn start_sender(
                     let header = MediaHeader {
                         session_id,
                         stream_epoch,
-                        frame_seq: nal.sequence as u32,
+                        frame_seq,
                         frag_index: index as u16,
                         frag_count,
                         is_keyframe: nal.is_keyframe,
@@ -422,11 +479,11 @@ pub async fn start_sender(
                 // are still paced. Make this frame repairable before sending
                 // its first batch, so a delayed pacing timer cannot hold NACKs.
                 if keep_for_repair {
-                    retransmit_ring.insert(stream_epoch, nal.sequence as u32, stored.clone());
+                    retransmit_ring.insert(stream_epoch, frame_seq, stored.clone());
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
-                for (index, datagram) in stored.iter().enumerate() {
+                for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
                     // Keep serving audio even when there are no more pauses;
                     // otherwise a large IDR can fill its 60 ms capture queue.
@@ -435,14 +492,14 @@ pub async fn start_sender(
                         for due in fault.push(datagram, Instant::now()) {
                             if let Err(e) = links.send_to(&due, target_addr).await {
                                 if !send_failed {
-                                    warn!(seq = nal.sequence, error = %e, "UDP send failed");
+                                    log_send_failed(target_addr.link, &e);
                                     send_failed = true;
                                 }
                             }
                         }
                     } else if let Err(e) = links.send_to(datagram, target_addr).await {
                         if !send_failed {
-                            warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
+                            log_send_failed(target_addr.link, &e);
                             send_failed = true;
                         }
                     }
@@ -475,7 +532,8 @@ pub async fn start_sender(
                 );
 
                 debug!(
-                    seq = nal.sequence,
+                    seq = frame_seq,
+                    capture_seq = nal.sequence,
                     fragments = frag_count,
                     total_bytes,
                     keyframe = nal.is_keyframe,
@@ -483,6 +541,10 @@ pub async fn start_sender(
                     "Frame sent"
                 );
             }
+            // Only wakes an otherwise idle loop for the next chunk, which
+            // goes at the top of the pass. Last, because any branch ready
+            // before it starts that pass anyway.
+            _ = pen_spacing.wait(), if pen_spacing.armed() => {}
         }
     }
 
@@ -501,6 +563,16 @@ pub(crate) enum FirstFrame {
     Send,
     Skip,
     SkipAndRequestKeyframe,
+}
+
+/// Says which link failed but not which frame or fragment, so a failing link
+/// repeats one identical line that the log collapser can fold.
+fn log_send_failed(link: LinkId, error: &std::io::Error) {
+    let link = match link {
+        LinkId::Udp => "wifi",
+        LinkId::Usb { .. } => "usb",
+    };
+    warn!(link = %link, error = %error, "UDP send failed");
 }
 
 /// A session's first frame must be a keyframe captured after it started. An
@@ -622,7 +694,7 @@ async fn repair_while_pacing(
                 let Ok((len, peer)) = received else { break; };
                 if let Ok((header, ControlMessage::Nack(nack))) = parse_control(&bytes[..len]) {
                     let count = nack.frag_count;
-                    let actions = shared.session.lock().handle_control(PeerId::udp(peer), header.session_id,
+                    let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
                         ControlMessage::Nack(nack), config, Instant::now());
                     if let Some((epoch, seq, missing)) = actions.retransmit {
                         send_repairs(socket, ring, shared, epoch, seq, count, &missing).await;
@@ -635,12 +707,44 @@ async fn repair_while_pacing(
     }
 }
 
-async fn execute_actions(
-    actions: Actions,
+/// A closed link, such as a pulled USB cable, ends its session, and the
+/// input held for it goes up as at every other end of a session.
+async fn close_link(
+    id: LinkId,
+    retransmit_ring: &mut RetransmitRing,
+    fault: &mut FaultInjector,
+    input_relay: &mut crate::input::InputRelay,
     links: &TransportLinks,
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
+    let actions = shared.session.lock().link_lost(id);
+    if actions.client_lost {
+        retransmit_ring.clear();
+        fault.clear();
+        input_relay.reset();
+    }
+    execute_actions(actions, links, shared, supervisor_tx).await;
+}
+
+async fn execute_actions(
+    mut actions: Actions,
+    links: &TransportLinks,
+    shared: &SharedControl,
+    supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
+) {
+    // An ended session's summary waits for this pass's second screen step,
+    // which can give the second screen up for it, unless a new session
+    // starts now: second screen news from here on is the new one's.
+    let mut ended = actions.ended.take();
+    if actions.new_target.is_some() {
+        if let Some(end) = ended.take() {
+            crate::diagnostics::log_session_end(&end, shared);
+        }
+        if let Some(session_id) = shared.session.lock().session_id() {
+            crate::diagnostics::note_session_start(session_id, shared);
+        }
+    }
     for (destination, datagram) in &actions.replies {
         if let Err(e) = links.send_to(datagram, *destination).await {
             warn!(peer = %destination, error = %e, "Failed to send control reply");
@@ -663,13 +767,7 @@ async fn execute_actions(
             stats.reset_connection_stats();
         }
         if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
-            if let Some(reason) = second_screen::remembered_failure(shared) {
-                info!(
-                    second_screen_fallback = reason,
-                    "Client connected, but the second screen failed to start earlier — \
-                     mirroring the primary display until the user clicks Try again"
-                );
-            }
+            second_screen::note_connected(shared, Instant::now());
         }
     }
 
@@ -739,6 +837,9 @@ async fn execute_actions(
             true
         }
     };
+    if let Some(end) = ended {
+        crate::diagnostics::log_session_end(&end, shared);
+    }
     if restart {
         shared.stop();
         if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
@@ -773,6 +874,198 @@ mod tests {
         encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,
         FEATURE_SUPPORTS_NACK,
     };
+
+    /// The second screen gives up for a session in the same pass that ends
+    /// it: the session's summary names that fallback.
+    #[test]
+    fn a_session_ended_with_a_fallback_in_one_pass_names_it() {
+        use tracing_subscriber::prelude::*;
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
+        let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(crate::diagnostics::FallbackWatch)
+                .with(crate::diagnostics::tests::SummaryCapture(summaries.clone())),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+            shared.pairing.lock().required = false;
+            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+            // Streaming the virtual display already, so the session's pass has
+            // nothing to start.
+            *shared.vdd_status.lock() = VddStatus::Active;
+            let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let config = SharedConfigSource {
+                shared: &shared,
+                stream_epoch: 1,
+                pen_available: false,
+            };
+            let peer = PeerId::udp("127.0.0.1:19893".parse().unwrap());
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 0xFA11,
+                listen_port: 19893,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps: 0,
+                screen_px_w: 1920,
+                screen_px_h: 1080,
+                screen_pt_w: 960,
+                screen_pt_h: 540,
+                refresh_hz: 60,
+                device_name: "fallback test".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            let now = Instant::now();
+            let accepted = shared
+                .session
+                .lock()
+                .handle_control(peer, 0, hello, &config, now);
+            execute_actions(accepted, &links, &shared, &supervisor_tx).await;
+            // The virtual display attached and has shown no picture for too long.
+            second_screen::note_attached(&shared, "virtual".into());
+            second_screen::start_proving(&shared, 1, now - second_screen::PROVE_TIMEOUT);
+            let session_id = shared.session.lock().session_id().unwrap();
+            let bye = shared.session.lock().handle_control(
+                peer,
+                session_id,
+                ControlMessage::Bye(eternal_wire::v2::control::ByeReason::UserDisconnect),
+                &config,
+                Instant::now(),
+            );
+            assert!(bye.ended.is_some());
+            execute_actions(bye, &links, &shared, &supervisor_tx).await;
+        });
+        let summaries = summaries.lock();
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert!(
+            summaries[0].contains(" nonce=000000000000fa11 ")
+                && summaries[0].contains(" mode=second_screen ")
+                && summaries[0].contains(" fallback=no_frames "),
+            "{}",
+            summaries[0]
+        );
+        crate::diagnostics::tests::assert_contract(&summaries[0]);
+    }
+
+    /// A cable pulled while a key and a mouse button are down ends the USB
+    /// session, and both go up, as at every other end of a session.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_usb_session_ended_by_its_cable_releases_held_input() {
+        use crate::input::{
+            recorder, CaptureGeometry, Injection, InputRelay, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
+        };
+        use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+        shared.pairing.lock().required = false;
+        let geometry = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+        };
+        let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+        let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+        let mut retransmit_ring = RetransmitRing::default();
+        let mut fault = FaultInjector::new(0.0, 0.0, Duration::ZERO);
+        let mut input_relay = InputRelay::default();
+        let cable = PeerId::usb(5);
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_WANTS_INPUT,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "cable test".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let accepted =
+            shared
+                .session
+                .lock()
+                .handle_control(cable, 0, hello, &config, Instant::now());
+        execute_actions(accepted, &links, &shared, &supervisor_tx).await;
+        let session_id = shared.session.lock().session_id().unwrap();
+        let press = |event_id, kind, keycode| {
+            ControlMessage::InputEvent(InputEvent {
+                input_ver: 1,
+                kind,
+                phase: PHASE_BEGAN,
+                buttons: 0,
+                event_id,
+                x_norm: 32768,
+                y_norm: 32768,
+                pressure_x1000: 0,
+                scroll_dx: 0,
+                scroll_dy: 0,
+                keycode,
+                modifiers: 0,
+                client_time_us: 0,
+                tilt_x: 0,
+                tilt_y: 0,
+            })
+        };
+        for event in [press(1, KIND_KEY, 0x04), press(2, KIND_MOUSE_ABS, 0)] {
+            let mut pressed = shared.session.lock().handle_control(
+                cable,
+                session_id,
+                event,
+                &config,
+                Instant::now(),
+            );
+            let (session_id, event) = pressed.input.take().unwrap();
+            input_relay.relay(session_id, &event, geometry);
+        }
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [
+                Injection::KeyDown { .. },
+                Injection::MoveAbs { .. },
+                Injection::LeftDown { .. }
+            ]
+        ));
+
+        close_link(
+            cable.link,
+            &mut retransmit_ring,
+            &mut fault,
+            &mut input_relay,
+            &links,
+            &shared,
+            &supervisor_tx,
+        )
+        .await;
+        assert!(shared.session.lock().session_id().is_none());
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::KeyUp { .. }, Injection::LeftUp { .. }]
+        ));
+    }
 
     #[tokio::test]
     async fn repairs_current_and_previous_frames_before_the_pacing_wait_ends() {
@@ -895,5 +1188,143 @@ mod tests {
             assert_eq!(source, PeerId::udp(peer));
             assert_eq!(parse_control(&bytes).unwrap().1, expected);
         }
+    }
+
+    /// `start_sender` itself, with a native pen device that takes every
+    /// frame (Windows' own off Windows). A stall delivers 64 samples at
+    /// once while the encoder always has a frame ready, which the loop takes
+    /// in a branch ahead of the pen's wake-up. The spacing holds back all
+    /// but the first burst, and the loop sends the rest within a few times
+    /// the spacing, one chunk at the top of each pass.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_loop_sends_a_held_pen_backlog_while_video_is_always_ready() {
+        use crate::input::{native_pen, CaptureGeometry, PenPhase, PenSample};
+        const SAMPLES: usize = 64;
+        const VIDEO_QUEUE: usize = 1 << 16;
+        let output = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let taken = native_pen::install();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (delivered, queued) = runtime.block_on(async {
+            let shared = SharedControl::new(0, 15_000_000);
+            shared.running.store(true, Ordering::SeqCst);
+            *shared.capture_geometry.lock() = Some(output);
+            let (nal_tx, nal_rx) = mpsc::channel(VIDEO_QUEUE);
+            let (_audio_tx, audio_rx) = mpsc::channel(1);
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let frame = |sequence| NALUnit {
+                data: vec![0, 0, 0, 1, 0x41],
+                sequence,
+                timestamp: Instant::now(),
+                encode_duration_us: 0,
+                is_keyframe: false,
+            };
+            // A full queue, kept full until the loop stops and drops it.
+            let mut sequence = 0;
+            while nal_tx.try_send(frame(sequence)).is_ok() {
+                sequence += 1;
+            }
+            let video = std::thread::spawn(move || {
+                while nal_tx.blocking_send(frame(sequence)).is_ok() {
+                    sequence += 1;
+                }
+                sequence
+            });
+            let delivered = Instant::now();
+            native_pen::with(|device| {
+                for x in 0..SAMPLES as u16 {
+                    let sample = PenSample {
+                        phase: if x == 0 {
+                            PenPhase::Down
+                        } else {
+                            PenPhase::Move
+                        },
+                        x: i32::from(x),
+                        y: 10,
+                        x_norm: x,
+                        y_norm: 10,
+                        pressure: 512,
+                        tilt_x: 0,
+                        tilt_y: 0,
+                    };
+                    device.deliver(sample, native_pen::SCREEN, Some(output), Instant::now());
+                }
+            });
+            assert!(
+                taken.borrow().len() < SAMPLES / 2,
+                "the spacing must hold the backlog back"
+            );
+            let stop = shared.clone();
+            let watch = async {
+                while taken.borrow().len() < SAMPLES && delivered.elapsed() < Duration::from_secs(2)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                stop.stop();
+            };
+            let (sent, ()) = tokio::join!(
+                start_sender(nal_rx, audio_rx, 0, shared, supervisor_tx),
+                watch
+            );
+            sent.unwrap();
+            (delivered, video.join().unwrap())
+        });
+        let taken = taken.borrow();
+        let order: Vec<_> = taken.iter().map(|(frame, _)| frame.x_norm).collect();
+        assert_eq!(order, (0..SAMPLES as u16).collect::<Vec<_>>());
+        let drained = taken.last().unwrap().1 - delivered;
+        // 58 held frames 250 µs apart take 15 ms; the 50 ms tick alone
+        // would take 500 ms.
+        assert!(drained < Duration::from_millis(250), "{drained:?}");
+        // The loop kept taking video.
+        assert!(queued > (VIDEO_QUEUE + SAMPLES) as u64, "{queued}");
+    }
+
+    #[test]
+    fn a_failed_send_names_the_link_and_repeats_identically() {
+        let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = std::sync::Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
+            .finish();
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        tracing::subscriber::with_default(subscriber, || {
+            log_send_failed(LinkId::Usb { device_id: 3 }, &error);
+            log_send_failed(LinkId::Usb { device_id: 3 }, &error);
+            log_send_failed(LinkId::Udp, &error);
+        });
+        let text = String::from_utf8(out.lock().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0], lines[1], "the collapser needs identical lines");
+        assert_eq!(
+            lines[0].trim(),
+            "WARN UDP send failed link=usb error=connection reset"
+        );
+        assert_eq!(
+            lines[2].trim(),
+            "WARN UDP send failed link=wifi error=connection reset"
+        );
     }
 }

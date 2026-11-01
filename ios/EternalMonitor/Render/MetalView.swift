@@ -61,6 +61,7 @@ struct MetalView: UIViewRepresentable {
         var frameSlot: FrameSlot?
 
         private weak var view: MTKView?
+        private var memoryWarning: NSObjectProtocol?
         /// Coalesces redraw requests: many decoded frames between two main-loop
         /// turns become one setNeedsDisplay.
         private let redrawPending = OSAllocatedUnfairLock(initialState: false)
@@ -70,11 +71,21 @@ struct MetalView: UIViewRepresentable {
             frameSlot?.onFrameStored = { [weak self] in
                 self?.scheduleRedraw()
             }
+            // The next decoded frame redraws within a frame period, or the
+            // PC's idle keepalive; the screen keeps showing the last one.
+            memoryWarning = NotificationCenter.default.addObserver(
+                // UIKit posts this on the main thread, where draws run.
+                forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.renderer?.releaseCachedFrame()
+            }
         }
 
         func detach() {
             frameSlot?.onFrameStored = nil
             view = nil
+            if let memoryWarning { NotificationCenter.default.removeObserver(memoryWarning) }
+            memoryWarning = nil
         }
 
         /// Called from the VideoToolbox callback thread on every stored frame.
@@ -124,6 +135,23 @@ private struct FrameTextures {
     let matrixIndex: UInt32
 }
 
+/// One draw's textures, held by its command buffer's completion handler
+/// together with the texture cache that made them. A CVMetalTexture doesn't
+/// keep its cache alive, and CoreVideo crashes if the cache is destroyed
+/// while a completion handler is still releasing its textures, as when the
+/// picture closes with GPU work outstanding. So the textures go first.
+private final class InFlightFrame {
+    private var frame: FrameTextures?
+    private let cache: CVMetalTextureCache?
+
+    init(_ frame: FrameTextures, cache: CVMetalTextureCache?) {
+        self.frame = frame
+        self.cache = cache
+    }
+
+    deinit { frame = nil }
+}
+
 private struct DisplayUniforms {
     var scale: SIMD2<Float>
     var matrixIndex: UInt32
@@ -135,10 +163,15 @@ final class MetalRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
-    private var textureCache: CVMetalTextureCache?
+    private(set) var textureCache: CVMetalTextureCache?
     private var currentFrame: FrameTextures?
     /// Read on the main thread, where the paused MTKView draws.
     var pictureFit: PictureFit = .fit
+    #if DEBUG
+    /// Tests: runs at the start of each later draw's completion handler, on
+    /// Metal's thread, to hold the handler past the renderer's teardown.
+    var completedHandlerGate: (() -> Void)?
+    #endif
 
     init(device: MTLDevice, view: MTKView) {
         self.device = device
@@ -172,6 +205,9 @@ final class MetalRenderer {
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
         textureCache = cache
     }
+
+    // The held frame's textures go before the cache that made them.
+    deinit { currentFrame = nil }
 
     func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?) {
         if let pixelBuffer, let frame = makeFrameTextures(from: pixelBuffer) {
@@ -210,13 +246,32 @@ final class MetalRenderer {
         encoder.endEncoding()
 
         // Keep the pixel buffer + texture wrappers alive until the GPU is done
-        // sampling them.
+        // sampling them, and their cache alive until they are released.
+        let inFlight = InFlightFrame(frame, cache: textureCache)
+        #if DEBUG
+        let gate = completedHandlerGate
+        #endif
         commandBuffer.addCompletedHandler { _ in
-            _ = frame
+            #if DEBUG
+            gate?()
+            #endif
+            _ = inFlight
         }
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    /// Whether a decoded frame is held for redraws (resize, rotation).
+    var holdsFrame: Bool { currentFrame != nil }
+
+    /// Memory warning: drop the held frame and the texture cache's recycled
+    /// textures. At 1440p and up each held frame is several megabytes.
+    func releaseCachedFrame() {
+        currentFrame = nil
+        if let cache = textureCache {
+            CVMetalTextureCacheFlush(cache, 0)
+        }
     }
 
     /// Scale that fits `video` inside `drawable` preserving aspect ratio

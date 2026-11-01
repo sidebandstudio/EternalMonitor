@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 
 /// Identical lines within this window of the first one are counted, not written.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(30);
-/// Distinct repeating messages tracked at once; the oldest is summarized first.
+/// Distinct repeating messages tracked at once; the least recently seen is
+/// summarized first, so a message that keeps repeating keeps its run.
 const MAX_RUNS: usize = 32;
 
 struct Run {
     /// Line without its timestamp: level, message and fields.
     key: String,
     started: Instant,
+    last_seen: Instant,
     first_stamp: String,
     last_stamp: String,
     suppressed: u64,
@@ -38,7 +40,7 @@ pub struct RepeatCollapser {
 
 /// `2026-10-21T03:10:19.347613Z  WARN message` splits into the timestamp and
 /// the rest. Continuation lines (no leading timestamp) are never collapsed.
-fn split_stamp(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_stamp(line: &str) -> Option<(&str, &str)> {
     let end = line.find(' ')?;
     let (stamp, rest) = line.split_at(end);
     let looks_like_stamp = stamp.len() >= 20
@@ -62,16 +64,20 @@ impl RepeatCollapser {
         };
         if let Some(run) = self.runs.iter_mut().find(|run| run.key == rest) {
             run.suppressed += 1;
+            run.last_seen = now;
             run.last_stamp = stamp.to_owned();
             return out;
         }
         if self.runs.len() >= MAX_RUNS {
-            let oldest = self.runs.remove(0);
-            out.extend(oldest.summary());
+            let stalest = (0..self.runs.len())
+                .min_by_key(|&i| self.runs[i].last_seen)
+                .expect("the run table is full");
+            out.extend(self.runs.remove(stalest).summary());
         }
         self.runs.push(Run {
             key: rest.to_owned(),
             started: now,
+            last_seen: now,
             first_stamp: stamp.to_owned(),
             last_stamp: stamp.to_owned(),
             suppressed: 0,
@@ -189,5 +195,30 @@ mod tests {
         let written = collapser.push(&line(3, "overflow"), now);
         assert_eq!(written.len(), 2, "oldest burst summarized to make room");
         assert!(written[0].contains("m0 [repeated 1 more times"));
+    }
+
+    #[test]
+    fn a_line_that_keeps_repeating_outlives_one_off_lines() {
+        let mut collapser = RepeatCollapser::default();
+        let start = Instant::now();
+        let mut written = Vec::new();
+        let others = 2 * MAX_RUNS as u64;
+        for i in 0..others {
+            let at = |offset| start + Duration::from_millis(2 * i + offset);
+            written.extend(collapser.push(&line(1, "send to closed tunnel"), at(0)));
+            written.extend(collapser.push(&line(1, &format!("once {i}")), at(1)));
+        }
+        written.extend(collapser.flush_all());
+        let busy: Vec<_> = written
+            .iter()
+            .filter(|line| line.contains("send to closed tunnel"))
+            .collect();
+        assert_eq!(busy.len(), 2, "first line and one summary: {busy:?}");
+        assert_eq!(*busy[0], line(1, "send to closed tunnel"));
+        assert!(
+            busy[1].contains(&format!("[repeated {} more times", others - 1)),
+            "{}",
+            busy[1]
+        );
     }
 }

@@ -34,7 +34,7 @@ NEED_PAIRING=0
 SELECTED=0
 for argument in "$@"; do
     case "$argument" in
-        -only-testing:EternalMonitorTests*|-only-testing:EternalMonitorUITests/ConnectScreenTests*|-only-testing:EternalMonitorUITests/UpdateBannerTests*) SELECTED=1 ;;
+        -only-testing:EternalMonitorTests*|-only-testing:EternalMonitorUITests/ConnectScreenTests*|-only-testing:EternalMonitorUITests/SetupTests*|-only-testing:EternalMonitorUITests/UpdateBannerTests*|-only-testing:EternalMonitorUITests/DisplayStateTests*) SELECTED=1 ;;
         -only-testing:EternalMonitorUITests/StreamLifecycleTests*) SELECTED=1; NEED_STREAM=1; NEED_LIFECYCLE=1 ;;
         -only-testing:EternalMonitorUITests/PairingFlowTests*) SELECTED=1; NEED_PAIRING=1 ;;
         -only-testing:EternalMonitorUITests/USBStreamTests*) SELECTED=1; NEED_STREAM=1; NEED_USB=1 ;;
@@ -60,7 +60,8 @@ if ! xcodebuild build-for-testing -project "$ROOT/ios/EternalMonitor.xcodeproj" 
 fi
 if [ "$NEED_STREAM" = 1 ] || [ "$NEED_PAIRING" = 1 ]; then
     export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig}"
-    (cd "$ROOT" && cargo build -q --release -p eternal-host --locked)
+    # usb-direct: the USB tests point the host at usb_proxy.py.
+    (cd "$ROOT" && cargo build -q --release -p eternal-host --features usb-direct --locked)
     python3 - "$ROOT" <<'PYSETTINGS'
 import json,pathlib,sys
 for name in ['ui-state', 'ui-usb-state']:

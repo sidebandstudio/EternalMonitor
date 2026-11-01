@@ -7,6 +7,7 @@ import UIKit
 struct TouchRelayView: UIViewRepresentable {
     @EnvironmentObject var connectionManager: ConnectionManager
     @EnvironmentObject var settings: AppSettings
+    @ObservedObject private var language = LanguageStore.shared
     @Binding var keyboardVisible: Bool
     var active: Bool
     var onToggleHUD: () -> Void
@@ -32,6 +33,7 @@ struct TouchRelayView: UIViewRepresentable {
         view.active = active
         view.keyboardVisible = keyboardVisible
         view.updateKeyboardPresentation()
+        view.updateLanguage()
     }
 }
 
@@ -79,6 +81,17 @@ final class RelayTouchUIView: UIView {
     private var holdTimer: DispatchWorkItem?
     private var hudTapFired = false
     private var softwareKeyboardPresented = false
+    /// When the last hardware key press arrived, until it explains a collapse.
+    private var hardwareKeyUptime: TimeInterval?
+    /// A collapse waiting to finish Hide Keyboard unless a key explains it.
+    private var pendingHide: DispatchWorkItem?
+    /// How long after a hardware key its collapse can come. The iOS 18.6 and
+    /// 27.0 simulators took 5 to 18 ms, apart from 333 and 379 ms on an
+    /// overloaded host.
+    private static let keyBeforeCollapse: TimeInterval = 0.3
+    /// How long after a collapse its key can reach the app. The simulators
+    /// took 2 to 6 ms. Hide Keyboard finishes this much later.
+    private static let collapseBeforeKey: TimeInterval = 0.1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -186,24 +199,47 @@ final class RelayTouchUIView: UIView {
 
     @objc private func resumeInput() { updateKeyboardPresentation() }
 
+    func updateLanguage() { keyboardInput.updateLanguage() }
+
     @objc private func keyboardFrameChanged(_ notification: Notification) {
         guard keyboardVisible, keyboardInput.isFirstResponder, let window,
               let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
         let visible = window.bounds.intersection(window.screen.coordinateSpace.convert(frame, to: window))
         let accessoryHeight = keyboardInput.inputAccessoryView?.bounds.height ?? 0
         if !visible.isNull && visible.height > accessoryHeight + window.safeAreaInsets.bottom + 1 {
+            if !softwareKeyboardPresented { hardwareKeyUptime = nil }
+            // Shown again: a Hide still waiting belongs to the old keyboard.
+            pendingHide?.cancel()
+            pendingHide = nil
             softwareKeyboardPresented = true
         } else if softwareKeyboardPresented {
             // The system Hide Keyboard key leaves an accessory-only responder.
             // Finish that dismissal, while still permitting an accessory bar
             // when a physical keyboard was attached from the start.
             softwareKeyboardPresented = false
-            keyboardVisible = false
-            DispatchQueue.main.async { [weak self] in self?.keyboardInput.resignFirstResponder() }
+            // A hardware keyboard's first key shrinks the software keyboard
+            // the same way. Keep the bar then, or the keys typed next are lost.
+            // The key can arrive just before the collapse or just after it.
+            if let hardwareKeyUptime, ProcessInfo.processInfo.systemUptime - hardwareKeyUptime < Self.keyBeforeCollapse {
+                self.hardwareKeyUptime = nil
+                return
+            }
+            let hide = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                pendingHide = nil
+                keyboardVisible = false
+                keyboardInput.resignFirstResponder()
+            }
+            // Only the newest collapse can finish Hide Keyboard.
+            pendingHide?.cancel()
+            pendingHide = hide
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.collapseBeforeKey, execute: hide)
         }
     }
 
     func keyboardDidResign() {
+        pendingHide?.cancel()
+        pendingHide = nil
         keyboardVisible = false
         softwareKeyboardPresented = false
         onEvents?(keyboard.cancel())
@@ -245,12 +281,27 @@ final class RelayTouchUIView: UIView {
         })
     }
 
+    private static let modifierUsages: Set<UIKeyboardHIDUsage> = [
+        .keyboardCapsLock, .keyboardLeftControl, .keyboardLeftShift, .keyboardLeftAlt, .keyboardLeftGUI,
+        .keyboardRightControl, .keyboardRightShift, .keyboardRightAlt, .keyboardRightGUI,
+    ]
+
     private func modifierBits(_ flags: UIKeyModifierFlags) -> UInt8 {
         (flags.contains(.shift) ? 1 : 0) | (flags.contains(.control) ? 2 : 0)
             | (flags.contains(.alternate) ? 4 : 0) | (flags.contains(.command) ? 8 : 0)
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Only a key that types counts, so a modifier held near Hide Keyboard
+        // doesn't stop it.
+        if presses.contains(where: { $0.key.map { !Self.modifierUsages.contains($0.keyCode) } ?? false }) {
+            if let pendingHide {
+                pendingHide.cancel()
+                self.pendingHide = nil
+            } else {
+                hardwareKeyUptime = ProcessInfo.processInfo.systemUptime
+            }
+        }
         guard active, keyboardSupported else { return super.pressesBegan(presses, with: event) }
         for press in presses {
             guard let key = press.key else { continue }

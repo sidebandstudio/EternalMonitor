@@ -25,8 +25,10 @@ Capture, encode and audio have dedicated threads. Capture publishes the latest
 raw frame; a slow encoder skips obsolete raw frames. The encoder copies into its
 own input buffer and releases capture's reference for reuse. Encoded access
 units use a bounded channel: silently dropping an arbitrary encoded P-frame
-would corrupt the GOP. The USB sender instead drops whole queued access units
-when necessary and requests an IDR, keeping its queue bounded.
+would corrupt the GOP. The USB sender instead drops whole access units, the
+newest first, and requests an IDR with backoff, keeping its queue bounded. It
+finishes the frame it is writing, and a keyframe replaces queued frames only
+when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on
@@ -36,7 +38,14 @@ Windows converts with swscale; the macOS development path uses a tested
 Accelerate conversion with a swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
-restart-storm brake. The client session outlives an encoder/capture restart. A new
+restart-storm brake. Driver calls that can block for good (D3D11 device creation,
+DuplicateOutput, NVENC/AMF/QSV, libx265 and libopus opens, the VDD tasks, the graphics card
+read behind the second screen's decisions) run under limits in
+`stall.rs`: a call past its limit takes that call's error path, is logged once as
+`stall=<call>`, and its thread is abandoned; its late result is released there.
+The transport never waits for that graphics card read: it decides from a snapshot
+refreshed on its own thread, and a missing, stale or timed-out one counts as no evidence.
+The client session outlives an encoder/capture restart. A new
 stream epoch resets assembly and requests a fresh keyframe. The iPad keeps one
 VideoToolbox session per format, sniffs the bitstream codec, and renders NV12 with
 Metal using aspect-fit geometry.
@@ -141,10 +150,12 @@ AVOption. Quiet periods use explicitly reset, compact Opus silence packets.
 Pairing is required by default. A random 128-bit host token authenticates known
 iPads; a six-digit code authorizes first contact and rotates after success. Five
 failed attempts per source IP in a minute trigger the cooldown; the tracking map
-is bounded. QR links include the token. The iPad stores learned credentials in
-Keychain, clears rejected stale tokens, and offers Forget paired hosts. USB trusts
-physical access. This is access control over an unencrypted local connection;
-video, audio, input and pairing credentials are not confidential on the network.
+is bounded. Ten wrong codes from all addresses in ten minutes pause code pairing
+and change the code. Only a new pairing's ACK carries the token. QR links include
+the token. The iPad stores learned credentials in Keychain, clears rejected stale
+tokens, and offers Forget paired hosts. USB trusts physical access. This is
+access control over an unencrypted local connection; video, audio, input and
+pairing credentials are not confidential on the network.
 
 Touch coordinates are normalized within the displayed video, excluding letterbox
 bars. The host maps them through the captured output rectangle onto the Windows
@@ -176,7 +187,7 @@ an opt-in Win mapping; iPadOS retains its reserved shortcuts.
 The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
 Users read/execute permission. The host starts a virtual display only for a
 connected client, writes the requested mode first in VDD XML, and reports actual
-task failures. It also ships TCP/UDP firewall rules. Runtime upgrade, task-ACL and
+task failures. It also ships a UDP firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
 mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,

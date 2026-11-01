@@ -143,7 +143,7 @@ struct FeedbackCopySheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
+                    Button(L("Done")) { dismiss() }
                         .font(.app(16, .semibold, relativeTo: .body))
                         .foregroundStyle(Theme.accent)
                         .accessibilityIdentifier("feedback.done")

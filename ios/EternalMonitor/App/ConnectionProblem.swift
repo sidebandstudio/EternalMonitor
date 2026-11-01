@@ -64,7 +64,7 @@ enum ConnectionProblem: Equatable {
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
         case .noNetwork: return "This iPad isn't connected to a network"
-        case .localNetworkBlocked: return "EternalMonitor isn't allowed on your local network"
+        case .localNetworkBlocked: return "Local Network is turned off for EternalMonitor"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
         case .lost(.pcStoppedResponding): return "Lost the connection to your PC"
@@ -103,7 +103,8 @@ enum ConnectionProblem: Equatable {
         case .noNetwork:
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
-            return "Open Settings and turn on Local Network for EternalMonitor, then try again."
+            return "iPadOS is stopping this app from reaching your PC over Wi-Fi. "
+                + Self.localNetworkSteps(then: "Try again") + " A USB cable works without this setting."
         case .couldNotConnect:
             return "Check that this iPad and your PC are on the same Wi-Fi and that EternalMonitor is open on the PC, then try again."
         case .usbFailed:
@@ -131,6 +132,14 @@ enum ConnectionProblem: Equatable {
         }
     }
 
+    /// Where Local Network is turned on, then the button to tap. The
+    /// switch is on the app's own Settings page (Open Settings) once iPadOS
+    /// has asked for it, and always in Privacy & Security.
+    static func localNetworkSteps(then button: String) -> String {
+        "Tap Open Settings and turn on Local Network, or go to Settings > Privacy & Security > Local Network "
+            + "and turn on EternalMonitor. Then tap \(button)."
+    }
+
     /// Whether the card offers Report this problem. Not on cards that only
     /// say what is happening or what the user did: a reconnect or an update
     /// still under way, the cable pulled out, USB turned off, the PC busy
@@ -147,7 +156,7 @@ enum ConnectionProblem: Equatable {
 
     var actions: [Action] {
         switch self {
-        case .localNetworkBlocked: return [.openSettings]
+        case .localNetworkBlocked: return [.openSettings, .retry]
         case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
         default: return [.retry]
         }
@@ -322,14 +331,16 @@ struct NoPictureStreak: Equatable {
 enum USBStatusText {
     static func describe(_ status: String) -> String {
         switch status {
-        case "USB: off": return "Off. Turn on to connect with a cable."
-        case "USB: waiting for a cable": return "Plug this iPad into your PC. Keep Apple Devices open on the PC."
-        case "USB: disconnected": return "Paused. Tap Connect USB to use the cable again."
-        case "USB: connecting": return "Connecting over the cable…"
+        case "USB: off": return L("Off. Turn on to connect with a cable.")
+        case "USB: waiting for a cable": return L("Plug this iPad into your PC. Keep Apple Devices open on the PC.")
+        case "USB: disconnected": return L("Paused. Tap Connect USB to use the cable again.")
+        case "USB: connecting": return L("Connecting over the cable…")
+        // A problem: stays English, like the other problem text.
         case "USB: unavailable": return "The cable can't be used right now. Wi-Fi still works."
         default:
             if status.hasPrefix("USB: connected to ") {
-                return "Connected to \(status.dropFirst("USB: connected to ".count)) over the cable."
+                let name = String(status.dropFirst("USB: connected to ".count))
+                return L("Connected to \(name) over the cable.")
             }
             return status
         }

@@ -392,6 +392,81 @@ pub mod recorder {
     }
 }
 
+/// Off Windows, a test can give every relay on its thread a native pen
+/// device that accepts every frame on the real clock, so the transport loop
+/// spaces and flushes pen frames as it does on Windows.
+#[cfg(all(test, not(windows)))]
+pub(crate) mod native_pen {
+    use super::pen_contact::{Outcome, PointerKind};
+    use super::pen_device::{PenApi, PenDevice};
+    use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    pub(crate) const SCREEN: VirtualScreen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    };
+
+    /// Frames Windows took, with when.
+    pub(crate) type Taken = Rc<RefCell<Vec<(PenSample, Instant)>>>;
+
+    #[derive(Debug)]
+    pub(crate) struct Windows(Taken);
+
+    impl PenApi for Windows {
+        type Handle = ();
+        type Error = &'static str;
+        fn create(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn destroy(&mut self, _: ()) {}
+        fn screen(&self) -> VirtualScreen {
+            SCREEN
+        }
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn inject(
+            &mut self,
+            _: (),
+            frame: PenSample,
+            _: PointerKind,
+            _: VirtualScreen,
+            _: Option<CaptureGeometry>,
+        ) -> Outcome {
+            self.0.borrow_mut().push((frame, Instant::now()));
+            Outcome::Injected
+        }
+        fn send_mouse(&mut self, inputs: &[Injection]) -> usize {
+            inputs.len()
+        }
+        fn owe_release(&mut self, _: (i32, i32)) {}
+        fn take_owed_release(&mut self) -> Option<(i32, i32)> {
+            None
+        }
+    }
+
+    thread_local! {
+        static DEVICE: RefCell<Option<PenDevice<Windows>>> = const { RefCell::new(None) };
+    }
+
+    /// Give this thread's relays a device, and return what Windows takes.
+    pub(crate) fn install() -> Taken {
+        let taken = Taken::default();
+        DEVICE.set(Some(PenDevice::new(Windows(Rc::clone(&taken)))));
+        taken
+    }
+
+    /// The installed device, if any.
+    pub(crate) fn with<R>(f: impl FnOnce(&mut PenDevice<Windows>) -> R) -> Option<R> {
+        DEVICE.with_borrow_mut(|device| device.as_mut().map(f))
+    }
+}
+
 fn log_injections(injections: &[Injection]) {
     if std::env::var("ETERNAL_INPUT_RECORDER_LOG").is_ok_and(|value| value == "1") {
         for injection in injections {
@@ -504,9 +579,31 @@ impl InputRelay {
         {
             self.pen_device.available() || self.pen_device.mouse_waiting()
         }
-        #[cfg(not(windows))]
+        #[cfg(all(test, not(windows)))]
+        {
+            native_pen::with(|device| device.available() || device.mouse_waiting()).unwrap_or(false)
+        }
+        #[cfg(all(not(test), not(windows)))]
         {
             false
+        }
+    }
+
+    /// When the transport should call `keep_pen_alive` for a pen frame held
+    /// back to keep frames `FRAME_SPACING` apart, which a backlog of samples
+    /// needs. Waiting for it never blocks the transport.
+    pub fn pen_spaced_until(&self) -> Option<std::time::Instant> {
+        #[cfg(windows)]
+        {
+            self.pen_device.spaced_until()
+        }
+        #[cfg(all(test, not(windows)))]
+        {
+            native_pen::with(|device| device.spaced_until()).flatten()
+        }
+        #[cfg(all(not(test), not(windows)))]
+        {
+            None
         }
     }
 
@@ -591,11 +688,14 @@ impl InputRelay {
     /// Windows expires stationary synthetic contacts unless they are refreshed.
     /// Real samples always win; never keep a released or disconnected tip down.
     /// `output` is the current capture rect: a held contact follows it if the
-    /// display moved or changed mode since the Pencil last moved.
+    /// display moved or changed mode since the Pencil last moved. Also sends
+    /// frames held back for their spacing.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
         self.pen_device
             .flush(output.or(self.output), std::time::Instant::now());
+        #[cfg(all(test, not(windows)))]
+        native_pen::with(|device| device.flush(output.or(self.output), std::time::Instant::now()));
         let Some(output) = output else {
             return;
         };
@@ -1545,9 +1645,23 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    thread_local! {
+        /// The time for every `RecordingTarget`, so frames stay spaced
+        /// across batches.
+        static CLOCK: std::cell::Cell<std::time::Instant> =
+            std::cell::Cell::new(std::time::Instant::now());
+    }
+
+    #[cfg(not(windows))]
     impl pen_contact::PenTarget for RecordingTarget {
         fn screen(&self) -> VirtualScreen {
             self.screen
+        }
+
+        /// Frames here are never close enough to be held back for their
+        /// spacing: each takes `FRAME_SPACING`.
+        fn now(&self) -> std::time::Instant {
+            CLOCK.get()
         }
 
         fn inject(
@@ -1555,6 +1669,7 @@ mod tests {
             frame: PenSample,
             _: pen_contact::PointerKind,
         ) -> pen_contact::Outcome {
+            CLOCK.set(CLOCK.get() + pen_contact::FRAME_SPACING);
             self.frames
                 .push(pen_contact::PointerFrame::new(frame, self.screen));
             self.outcome

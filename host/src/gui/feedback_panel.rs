@@ -413,6 +413,7 @@ fn open_email(ctx: &egui::Context, url: &str) {
 pub(super) fn sidebar_action(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    super::widgets::automation_id(&response, label);
     let hover =
         ui.ctx()
             .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);

@@ -40,6 +40,10 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: "$(ETERNAL_PROFILE_SPECIFIER)"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # Resources/Localizable.xcstrings holds only the translated basics.
+        # Off, so a build never adds the English-only strings (errors,
+        # troubleshooting, support) to it.
+        SWIFT_EMIT_LOC_STRINGS: NO
       configs:
         # Shader source and Metal debug info belong in local builds only —
         # under `base` this shipped inside every TestFlight/App Store build.

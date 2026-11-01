@@ -149,6 +149,22 @@ shell. Neither path switches the developer account used by this workspace.
 
 ### Then, in App Store Connect
 
+A tag or manual run of `.github/workflows/testflight.yml` does steps 1, 3 and
+4 itself in its **External TestFlight review** job, with
+`scripts/testflight_review.py`: it waits up to 30 minutes for processing, sets
+the en-US "What to Test" from `ios/TESTFLIGHT_NOTES.md`, adds the build to
+every external group of the newest approved build and submits it for Beta App
+Review. If that build is in no external group, the new build joins none and
+is not submitted; `review.json` then says `NO_EXTERNAL_GROUP`. The job's
+`EternalMonitor-iPad-review-*` artifact holds `review.json`. Pull request runs
+skip the job.
+
+If only the review failed, choose **Re-run failed jobs** on the run, or re-run
+just the **External TestFlight review** job. That retries the review alone, and
+finished steps pass. Do not re-run all jobs or the archive job: it would upload
+the same build number again, which App Store Connect refuses. By hand, or for
+a first build:
+
 1. TestFlight tab, wait for the build to finish processing (usually a few
    minutes; you get an email).
 2. Check the build's export-compliance status. The app declares
@@ -173,14 +189,31 @@ that publishes the matching downloads on `docs/download.html`, and only after
 Apple approves the TestFlight build. Bumping it earlier makes every PC ask to
 update before the matching iPad build can be installed.
 
-1. Copy the Windows version, installer URL and SHA-256 from the GitHub release,
-   and the TestFlight build number, into both `docs/download.html` and
-   `docs/latest.json`.
-2. Run `scripts/check-versions.sh`. It fails when the two files disagree, and CI
-   runs it on every pull request.
+1. Run `python3 scripts/latest_json.py publish --windows 0.3.4 --ipad 0.3.4
+   --build 401`, with an optional `--note` (one line, at most 200
+   characters) and `--not-recommended`. It reads the SHA-256 from the GitHub
+   release and checks it against the asset's digest, checks in App Store
+   Connect that Apple approved the build (set `ASC_KEY_ID`, `ASC_ISSUER_ID`
+   and `ASC_KEY_PATH`), and writes both `docs/download.html` and
+   `docs/latest.json`. Either platform can go alone.
+   It also reads https://eternalmonitor.dev/latest.json and refuses anything
+   older than what is live there, since this checkout's copy may be behind;
+   `--skip-live-check` goes ahead when the site cannot be read.
+2. It runs `scripts/check-versions.sh`, which fails when the two files
+   disagree (CI runs it on every pull request), and prints the git commands
+   for the pull request.
 3. After the merge, Windows hosts see the update within a day and iPads within
    four hours. A host refuses to install when `latest.json` and the release body
    disagree on the SHA-256, so keep the release body as the workflow wrote it.
+
+### Roll back a bad release
+
+`python3 scripts/latest_json.py rollback --windows 0.3.2 --ipad 0.3.2` points
+both files at an earlier published release: the Windows SHA-256 from its
+GitHub release, the iPad build from the history of `docs/latest.json`.
+Nobody already on the bad release is prompted, since the apps only offer a
+newer version; it stops new prompts for the bad one. The iPad may not lead
+Windows, so roll back both when both moved. Merge the printed pull request.
 
 Internal testers skip review entirely and get builds immediately, but they
 must be users on your App Store Connect team, so that route only makes sense
@@ -308,7 +341,7 @@ posting evidence publicly. Keep screenshots of a tester's desktop private.
 
 ## Troubleshooting and known limits
 
-The v0.3 installer creates TCP and UDP firewall rules. For an older install or
+The installer creates a UDP firewall rule (v0.3.3 and older also created a TCP rule). For an older install or
 another security product, check the host's allowed-app rule and network profile.
 Guest networks and subnet boundaries can block discovery; try a reachable manual
 LAN address. Use the packet/repair, encoder and decoder diagnostics to distinguish

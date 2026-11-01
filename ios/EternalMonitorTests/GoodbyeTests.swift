@@ -1,3 +1,4 @@
+import Combine
 import Darwin
 import XCTest
 @testable import EternalMonitor
@@ -12,9 +13,7 @@ final class GoodbyeTests: XCTestCase {
         manager.connect(host: "127.0.0.1", port: host.port)
         let accepted = await Task.detached { host.acceptSession() }.value
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
-        for _ in 0..<200 where manager.hostInfo == nil {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await until("handshake") { manager.hostInfo != nil }
         XCTAssertEqual(manager.hostInfo?.sessionId, 41)
         return manager
     }
@@ -51,9 +50,7 @@ final class GoodbyeTests: XCTestCase {
             XCTAssertEqual(manager.state, .connecting, "cycle \(cycle) must resume")
             let accepted = await Task.detached { host.acceptSession() }.value
             XCTAssertTrue(accepted, "cycle \(cycle) never sent HELLO2")
-            for _ in 0..<200 where manager.hostInfo == nil {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
+            try await until("cycle \(cycle) handshake") { manager.hostInfo != nil }
             XCTAssertEqual(manager.hostInfo?.sessionId, 41, "cycle \(cycle)")
         }
     }
@@ -70,19 +67,26 @@ final class GoodbyeTests: XCTestCase {
 
     // MARK: Goodbyes from the PC
 
-    private func until(_ description: String, seconds: Double = 10, _ condition: () -> Bool) async throws {
+    /// Waits for `condition`. The deadline only stops a hung test; a loaded
+    /// machine can take seconds for any step.
+    private func until(_ description: String, seconds: Double = 60, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(condition(), description)
     }
+
+    /// Reconnect timing for these tests. The connect timeout is long enough
+    /// that no attempt the fake PC answers runs out on a loaded machine; a
+    /// test of attempts nobody answers shortens it once the session streams.
+    private static let quickReconnects = ConnectionManager.Timing(
+        connectTimeoutSeconds: 60, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 })
 
     /// A streaming session on `host`, with automatic reconnecting on.
     private func streaming(_ host: FakeUDPHost) async throws -> ConnectionManager {
         let previous = UserDefaults.standard.object(forKey: "autoReconnect")
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
-        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
-            connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 }))
+        let manager = try await connectedManager(host, timing: Self.quickReconnects)
         host.sendKeyframe(try FakeUDPHost.keyframe())
         try await until("streaming") { manager.state == .connected }
         return manager
@@ -111,10 +115,12 @@ final class GoodbyeTests: XCTestCase {
         let host = FakeUDPHost()
         let manager = try await streaming(host)
         defer { manager.cancel() }
+        // Each turned-away attempt waits out its window before the next.
+        manager.timing.connectTimeoutSeconds = 1
         host.sendBye(.hostShuttingDown)
         let answered = await Task.detached { (0..<6).filter { _ in host.acceptSession(status: .busy) }.count }.value
         XCTAssertGreaterThan(answered, 0, "the iPad never tried the PC again")
-        try await until("gave up", seconds: 20) { manager.reconnectAttempt == 0 && manager.state == .disconnected }
+        try await until("gave up") { manager.reconnectAttempt == 0 && manager.state == .disconnected }
         // Every attempt ran out: no promise that it reconnects by itself.
         XCTAssertEqual(manager.problem?.title, "Your PC hasn't come back from its update yet")
         XCTAssertFalse(manager.problem?.detail.contains("reconnects") ?? true)
@@ -145,24 +151,38 @@ final class GoodbyeTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
         let host = FakeUDPHost()
-        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
-            connectTimeoutSeconds: 0.5, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.4 }))
+        var timing = Self.quickReconnects
+        timing.reconnectBackoffSeconds = { _ in 0.4 }
+        let manager = try await connectedManager(host, timing: timing)
         defer { manager.cancel() }
         host.sendKeyframe(try FakeUDPHost.keyframe())
         try await until("streaming") { manager.state == .connected }
         XCTAssertFalse(manager.isIdleOnConnect)
 
-        // The PC goes away; nothing answers the reconnect attempts.
+        // The PC goes away; nothing answers the reconnect attempts, which
+        // run out quickly from here on.
+        manager.timing.connectTimeoutSeconds = 0.5
+        // Each wait between attempts is checked once the change that
+        // started it is done, as the screen sees it. Sampling on a timer
+        // could miss every wait on a loaded machine.
+        let betweenAttempts = Counter()
+        let waits = manager.$state.sink { state in
+            guard state == .disconnected else { return }
+            Task { @MainActor in
+                guard manager.reconnectAttempt > 0, manager.state == .disconnected else { return }
+                betweenAttempts.value += 1
+                XCTAssertFalse(manager.isIdleOnConnect, "idle between attempts, at \(manager.reconnectAttempt)")
+            }
+        }
+        defer { waits.cancel() }
         host.sendBye(.hostShuttingDown)
-        var betweenAttempts = 0
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = Date().addingTimeInterval(60)
         try await until("reconnecting") { manager.reconnectAttempt > 0 }
         while manager.reconnectAttempt > 0, Date() < deadline {
-            if manager.state == .disconnected { betweenAttempts += 1 }
             XCTAssertFalse(manager.isIdleOnConnect, "idle during attempt \(manager.reconnectAttempt)")
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertGreaterThan(betweenAttempts, 0, "the cycle never waited between attempts")
+        XCTAssertGreaterThan(betweenAttempts.value, 0, "the cycle never waited between attempts")
         XCTAssertEqual(manager.reconnectAttempt, 0, "the cycle never ended")
         // It ends on a problem card: still not idle.
         XCTAssertNotNil(manager.problem)
@@ -214,4 +234,9 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(attempts, 0, "no automatic reconnecting after a disconnect from the PC")
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
+}
+
+/// A count the main actor keeps.
+@MainActor private final class Counter {
+    var value = 0
 }

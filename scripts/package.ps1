@@ -43,6 +43,7 @@ Copy-Item "README.md" "$distDir\"
 Copy-Item "LICENSE" "$distDir\"
 Copy-Item "scripts\QUICKSTART.txt" "$distDir\"
 Copy-Item "host\assets\fonts\OFL.txt" "$distDir\Geist-OFL.txt"
+Copy-Item "host\assets\fonts\Noto-OFL.txt" "$distDir\Noto-OFL.txt"
 
 Write-Host "[4/5] Zipping..."
 Compress-Archive -Path "$distDir\*" -DestinationPath $zipName -Force

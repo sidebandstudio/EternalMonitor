@@ -115,3 +115,17 @@ fn hostname() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service pins no address: mdns-sd advertises every interface's,
+    /// Wi-Fi and Tailscale alike. The Address row's ranking never reaches it.
+    #[test]
+    fn every_address_is_advertised() {
+        let info = build_service_info(9876, "PC.local.", "EternalMonitor (PC)").unwrap();
+        assert!(info.is_addr_auto());
+        assert!(info.get_addresses().is_empty());
+    }
+}

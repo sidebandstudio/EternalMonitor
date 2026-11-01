@@ -209,6 +209,10 @@ class LiteralFormsTest(unittest.TestCase):
         self.assertEqual(rust('format!(\n    // keeps "Windows 10"\n    "build={}.{}",\n    a, b)'),
                          {"build=….…"})
 
+    def test_rust_translated_text_with_placeholders(self):
+        self.assertEqual(rust('let t = trf("Streaming to {device} is paused", &[("device", d)]);'),
+                         {"Streaming to … is paused", "device"})
+
     def test_rust_raw_format_string(self):
         self.assertEqual(rust('let s = format!(r#"Reaching {host}"#);'), {"Reaching …"})
 

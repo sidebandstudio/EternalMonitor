@@ -1,6 +1,6 @@
 import XCTest
 
-final class PairingFlowTests: XCTestCase {
+final class PairingFlowTests: UITestCase {
     func testPairingFlow() throws {
         continueAfterFailure = false
         let environment = ProcessInfo.processInfo.environment
@@ -11,13 +11,14 @@ final class PairingFlowTests: XCTestCase {
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = host
         app.launchEnvironment["EM_E2E_LOG"] = "1"
-        app.launch()
+        launchCleanly(app)
         let input = app.textFields["pairing.code"]
         XCTAssertTrue(input.waitForExistence(timeout: 10))
         input.tap()
         let wrongCode = code == "000000" ? "000001" : "000000"
+        // The sixth digit pairs. On iPadOS 27 the number pad opens over the
+        // Pair button, so typing the code must be the only step.
         input.typeText(wrongCode)
-        app.buttons["pairing.submit"].tap()
         let error = app.staticTexts["pairing.error"]
         XCTAssertTrue(error.waitForExistence(timeout: 5))
         XCTAssertTrue(error.label.contains("didn’t match"))
@@ -25,15 +26,17 @@ final class PairingFlowTests: XCTestCase {
         capture("pairing-wrong-code", app: app)
         input.tap()
         input.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 6) + code)
-        app.buttons["pairing.submit"].tap()
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
-        XCTAssertFalse(input.exists)
+        // The stream can start while the code sheet is still closing; wait
+        // for the sheet to go. The timeout is only a backstop.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: input)
+        waitForExpectations(timeout: 30)
         capture("pairing-connected", app: app)
         disconnect(app)
         XCTAssertTrue(app.images["recent.paired"].firstMatch.exists)
         app.terminate()
         // A new process must obtain its token from Keychain and skip the sheet.
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         XCTAssertFalse(input.exists)
         capture("pairing-token-reconnect", app: app)
@@ -44,7 +47,7 @@ final class PairingFlowTests: XCTestCase {
         app.buttons["settings.done"].tap()
         disconnect(app)
         app.terminate()
-        app.launch()
+        launchCleanly(app)
         XCTAssertTrue(input.waitForExistence(timeout: 10), "Forget paired hosts must require a code again")
         app.buttons["pairing.cancel"].tap()
         app.terminate()

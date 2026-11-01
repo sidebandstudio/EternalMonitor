@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -35,6 +36,9 @@ pub struct SettingsFile {
     pub require_pairing: bool,
     #[serde(default)]
     pub auth_token_hex: String,
+    /// Troubleshooting: which network the stream listens on.
+    #[serde(default)]
+    pub listen_on: crate::network::ListenOn,
     /// Ask the virtual display driver to offer the connected iPad's native
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
@@ -51,6 +55,18 @@ pub struct SettingsFile {
     /// The sidebar's GitHub star card was clicked; it says thank you since.
     #[serde(default)]
     pub star_clicked: bool,
+    /// Troubleshooting: how the window is drawn, from the next start.
+    #[serde(default)]
+    pub window_drawing: crate::troubleshooting::WindowDrawing,
+    /// A graphics card switch made from the Stream page, for its outcome
+    /// after the relaunch and for Undo.
+    #[serde(default)]
+    pub gpu_switch: Option<crate::gpu_preference::SwitchRecord>,
+    /// The window's language: a code such as `de`, `system` for the
+    /// Windows display language, or none until one is picked in the app,
+    /// when the installer's choice applies (see `i18n::resolve`).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -76,11 +92,15 @@ impl Default for SettingsFile {
             stream_audio: true,
             require_pairing: true,
             auth_token_hex: String::new(),
+            listen_on: Default::default(),
             vdd_match_resolution: true,
             start_on_boot: false,
             feedback_sessions: 0,
             feedback_ask_done: false,
             star_clicked: false,
+            window_drawing: Default::default(),
+            gpu_switch: None,
+            language: None,
         }
     }
 }
@@ -94,7 +114,7 @@ impl SettingsFile {
         }
         let token = crate::pairing::new_token()?;
         self.auth_token_hex = crate::pairing::token_hex(&token);
-        self.save();
+        let _ = self.save();
         Ok(token)
     }
 
@@ -123,9 +143,12 @@ impl SettingsFile {
         }
     }
 
-    pub fn save(&self) {
+    /// Writes settings.json atomically. Failures are logged here too;
+    /// callers that can go on without the file ignore the error.
+    pub fn save(&self) -> Result<(), String> {
         let Some(path) = settings_path() else {
-            return;
+            warn!("Failed to save settings: no folder for settings (APPDATA and HOME unset)");
+            return Err("no folder for settings".into());
         };
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
@@ -134,7 +157,7 @@ impl SettingsFile {
                     error = %error,
                     "Failed to create settings directory"
                 );
-                return;
+                return Err(error.to_string());
             }
         }
         match serde_json::to_string_pretty(self) {
@@ -150,10 +173,13 @@ impl SettingsFile {
                         error = %error,
                         "Failed to write settings.json"
                     );
+                    return Err(error.to_string());
                 }
+                Ok(())
             }
             Err(error) => {
                 warn!(error = %error, "Failed to serialize settings");
+                Err(error.to_string())
             }
         }
     }
@@ -179,6 +205,33 @@ pub fn app_data_dir() -> Option<PathBuf> {
 
 fn settings_path() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+}
+
+static FRESH_INSTALL: AtomicBool = AtomicBool::new(false);
+
+/// Notes whether this is a fresh install, when the window opens first-run
+/// setup. Call first thing at launch: the single-instance check, the
+/// session log and diagnostics create the settings folder and files in it.
+pub fn note_launch() {
+    let fresh = app_data_dir().is_some_and(|dir| holds_nothing(&dir));
+    FRESH_INSTALL.store(fresh, Ordering::SeqCst);
+}
+
+/// See [`note_launch`]. False when it was never called (tests).
+pub fn fresh_install() -> bool {
+    FRESH_INSTALL.load(Ordering::SeqCst)
+}
+
+/// A fresh install has no settings folder yet, or an empty one. Anything in
+/// it is from an earlier run, so this is an upgrade, with or without
+/// settings.json: versions before 0.3.0 saved it only once a setting
+/// changed, but every version since 0.1.2 keeps its session log in `logs`
+/// there. A folder that cannot be read counts as an upgrade too.
+fn holds_nothing(dir: &Path) -> bool {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +275,49 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    #[test]
+    fn language_defaults_to_unset_and_round_trips() {
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.language, None);
+        let settings = SettingsFile {
+            language: Some("pt-BR".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("pt-BR"));
+    }
+
+    #[test]
+    fn only_a_missing_or_empty_settings_folder_is_a_fresh_install() {
+        let root = std::env::temp_dir().join(format!("eternal-fresh-{}", std::process::id()));
+        let dir = root.join(APP_FOLDER);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(holds_nothing(&dir), "no folder");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(holds_nothing(&dir), "an empty folder");
+
+        // Only a session log, as an older version that never saved settings
+        // leaves it.
+        fs::create_dir_all(dir.join("logs")).unwrap();
+        fs::write(dir.join("logs").join("session.log"), "earlier run\n").unwrap();
+        assert!(!holds_nothing(&dir), "logs only");
+        fs::remove_dir_all(dir.join("logs")).unwrap();
+
+        fs::write(dir.join(SETTINGS_FILE_NAME), "{ not json").unwrap();
+        assert!(!holds_nothing(&dir), "malformed settings.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(!holds_nothing(&dir), "a folder that cannot be read");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
