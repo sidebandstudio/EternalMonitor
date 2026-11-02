@@ -166,7 +166,7 @@ Cada linha verifica a taxa de quadros decodificados (pelo menos 55 fps), perdas,
 | `ETERNAL_ENCODER` | Força um codificador (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` ou `0` substitui a preferência por HEVC |
 | `ETERNAL_FPS` | Substitui a taxa de quadros do host; a preferência do iPad ainda define o limite |
-| `ETERNAL_INPUT` | Entrada do codificador: `yuv420` (padrão), `auto` ou `bgra` |
+| `ETERNAL_INPUT` | Entrada do codificador: `automatic` (padrão: BGRA para NVIDIA, YUV420 para os demais), `yuv420`, `auto` ou `bgra` |
 | `ETERNAL_MAX_DGRAM` | Tamanho do datagrama de mídia, de 576 a 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` substitui DXGI por um padrão de teste gerado |
 | `ETERNAL_AUDIO` | `synthetic` seleciona a fonte de teste de áudio determinística |

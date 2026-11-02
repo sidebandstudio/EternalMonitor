@@ -243,7 +243,7 @@ streaming system test on every pull request.
 | `ETERNAL_ENCODER` | Force an encoder (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` or `0` overrides the HEVC preference |
 | `ETERNAL_FPS` | Override the host frame rate; the iPad's preference still caps it |
-| `ETERNAL_INPUT` | Encoder input: `yuv420` (default), `auto` or `bgra` |
+| `ETERNAL_INPUT` | Encoder input: `automatic` (default: BGRA for NVIDIA, YUV420 for others), `yuv420`, `auto` or `bgra` |
 | `ETERNAL_MAX_DGRAM` | Media datagram size, 576 to 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` swaps DXGI for a generated test pattern |
 | `ETERNAL_AUDIO` | `synthetic` selects the deterministic audio test source |

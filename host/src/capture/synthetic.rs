@@ -64,12 +64,7 @@ pub fn run_capture_loop(
         super::second_screen::fake::mirror(&shared)?;
     }
     let (width, height) = synthetic_size();
-    let row_bytes = (width * 4) as usize;
-    let frame_bytes = row_bytes * height as usize;
-    // The encoder and latest-frame slot can each retain one buffer. Keep three
-    // allocations so a delayed consumer never discards a busy spare and causes
-    // a fresh full-frame allocation on the next tick.
-    let mut buffers = std::array::from_fn(|_| Arc::new(vec![0u8; frame_bytes]));
+    let mut buffers = capture_buffers(width, height);
 
     info!(width, height, "Synthetic capture source active");
     *shared.capture_geometry.lock() = Some(crate::input::CaptureGeometry {
@@ -126,6 +121,14 @@ pub fn run_capture_loop(
     }
 
     Ok(())
+}
+
+/// The encoder and latest-frame slot can each retain one buffer. Keep three
+/// allocations so a delayed consumer never discards a busy spare and causes
+/// a fresh full-frame allocation on the next tick.
+fn capture_buffers(width: u32, height: u32) -> [Arc<Vec<u8>>; 3] {
+    let frame_bytes = (width * 4) as usize * height as usize;
+    std::array::from_fn(|_| Arc::new(super::frame_buffer(frame_bytes)))
 }
 
 fn render_next_frame(
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn delayed_consumer_reuses_buffers_without_overwriting_held_frames() {
         let (width, height) = (640, 360);
-        let mut buffers = std::array::from_fn(|_| Arc::new(vec![0; (width * height * 4) as usize]));
+        let mut buffers = capture_buffers(width, height);
         let addresses: Vec<_> = buffers.iter().map(|b| b.as_ptr()).collect();
         let mut held = render_next_frame(&mut buffers, width, height, 1);
         let mut held_number = 1;
@@ -282,6 +285,20 @@ mod tests {
                 held_number = number - 1;
             }
             pending = next;
+        }
+    }
+
+    /// swscale reads capture buffers in place, so each keeps FFmpeg's
+    /// padding readable after its last row.
+    #[test]
+    fn capture_buffers_keep_padding_after_the_last_row() {
+        for (width, height) in [(2733u32, 2048u32), (17, 3)] {
+            for buffer in capture_buffers(width, height) {
+                assert_eq!(
+                    buffer.len(),
+                    (width * height * 4) as usize + crate::capture::FRAME_PADDING
+                );
+            }
         }
     }
 

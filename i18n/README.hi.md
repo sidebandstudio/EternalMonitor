@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | एनकोडर तय करें (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` या `0` HEVC प्राथमिकता बदलता है |
 | `ETERNAL_FPS` | होस्ट फ़्रेम रेट बदलें; iPad की प्राथमिकता अब भी अधिकतम सीमा तय करती है |
-| `ETERNAL_INPUT` | एनकोडर इनपुट: `yuv420` (डिफ़ॉल्ट), `auto` या `bgra` |
+| `ETERNAL_INPUT` | एनकोडर इनपुट: `automatic` (डिफ़ॉल्ट: NVIDIA के लिए BGRA, बाकी के लिए YUV420), `yuv420`, `auto` या `bgra` |
 | `ETERNAL_MAX_DGRAM` | मीडिया datagram का आकार, 576 से 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` DXGI की जगह बनाया हुआ परीक्षण पैटर्न इस्तेमाल करता है |
 | `ETERNAL_AUDIO` | `synthetic` निश्चित ऑडियो परीक्षण स्रोत चुनता है |

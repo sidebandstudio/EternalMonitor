@@ -166,7 +166,7 @@ Jede Zeile prüft die dekodierte Bildrate (mindestens 55 fps), Verluste, Reparat
 | `ETERNAL_ENCODER` | Encoder erzwingen (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` oder `0` überschreibt die HEVC-Einstellung |
 | `ETERNAL_FPS` | Bildrate des Hosts überschreiben; die iPad-Einstellung begrenzt sie weiterhin |
-| `ETERNAL_INPUT` | Encoder-Eingabe: `yuv420` (Standard), `auto` oder `bgra` |
+| `ETERNAL_INPUT` | Encoder-Eingabe: `automatic` (Standard: BGRA für NVIDIA, YUV420 für andere), `yuv420`, `auto` oder `bgra` |
 | `ETERNAL_MAX_DGRAM` | Größe der Mediendatagramme, 576 bis 1400 Byte |
 | `ETERNAL_CAPTURE` | `synthetic` ersetzt DXGI durch ein erzeugtes Testbild |
 | `ETERNAL_AUDIO` | `synthetic` wählt die deterministische Audio-Testquelle |

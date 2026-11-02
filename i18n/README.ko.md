@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | 인코더 강제 지정 (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` 또는 `0`으로 HEVC 설정을 덮어씀 |
 | `ETERNAL_FPS` | 호스트 프레임 레이트를 덮어쓰며 iPad 설정이 상한을 정함 |
-| `ETERNAL_INPUT` | 인코더 입력: `yuv420` (기본값), `auto` 또는 `bgra` |
+| `ETERNAL_INPUT` | 인코더 입력: `automatic` (기본값: NVIDIA는 BGRA, 그 외는 YUV420), `yuv420`, `auto` 또는 `bgra` |
 | `ETERNAL_MAX_DGRAM` | 미디어 데이터그램 크기, 576~1400바이트 |
 | `ETERNAL_CAPTURE` | `synthetic`은 DXGI 대신 생성된 테스트 패턴 사용 |
 | `ETERNAL_AUDIO` | `synthetic`은 결정적 오디오 테스트 소스 선택 |
