@@ -13,5 +13,8 @@ struct ContentView: View {
             }
         }
         .appLanguage()
+        #if DEBUG
+        .overlay(alignment: .topLeading) { UITestProbe.Element() }
+        #endif
     }
 }

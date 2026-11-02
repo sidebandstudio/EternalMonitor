@@ -920,6 +920,9 @@ final class ConnectionManager: ObservableObject {
         if sinceUs > livenessTimeoutUs {
             if !signalLost {
                 signalLost = true
+                #if DEBUG
+                UITestProbe.shared.signalLost()
+                #endif
                 degradedSinceUs = ControlChannel.clientNowUs()
                 record(.warning, "ctrl", "Host heartbeats stopped — signal lost")
             } else if let since = degradedSinceUs,

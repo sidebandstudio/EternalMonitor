@@ -27,17 +27,21 @@ final class RightToLeftInputTests: UITestCase {
         let height = Double(environment["EM_INPUT_HEIGHT"] ?? "360") ?? 360
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-pictureFit", "fit"] + language
+                               "-playPCaudio", "NO", "-pictureFit", "fit", "-uiTestProbe", "YES"] + language
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         launchCleanly(app)
 
         // The controls are Arabic and mirrored: Disconnect, last in the bar,
         // sits at its left end.
-        let disconnect = app.buttons["display.disconnect"]
         let keyboard = app.buttons["display.keyboard"]
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
+        // The HUD can come and go while a starved runner waits for the app
+        // to idle; the probe still shows that it appeared.
+        app.waitForDisplayAndHUD()
+        let controls = app.hudControls(["display.disconnect", "display.keyboard"], reveal: .threeFingersTogether)
+        let disconnect = try XCTUnwrap(controls["display.disconnect"])
         XCTAssertEqual(disconnect.label, "قطع الاتصال")
-        XCTAssertLessThan(disconnect.frame.midX, keyboard.frame.midX, "the controls did not mirror")
+        XCTAssertLessThan(disconnect.frame.midX, try XCTUnwrap(controls["display.keyboard"]).frame.midX,
+                          "the controls did not mirror")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = name
         shot.lifetime = .keepAlways

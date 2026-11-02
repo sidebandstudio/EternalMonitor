@@ -141,6 +141,11 @@ struct DisplayView: View {
             else { scheduleHUDDismiss() }
         }
         .onChange(of: voiceOverEnabled) { _, _ in scheduleHUDDismiss() }
+        #if DEBUG
+        // The controls leave accessibility as the HUD starts to hide, before
+        // its slide ends.
+        .onChange(of: showHUD) { _, shown in if !shown { UITestProbe.shared.keyboardButtonDisappeared() } }
+        #endif
         .onChange(of: connectionManager.signalLost) { _, lost in
             if lost { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
@@ -334,6 +339,12 @@ struct DisplayView: View {
                 ))
                 .animation(Motion.fade, value: showKeyboard)
                 .accessibilityIdentifier("display.keyboard")
+                #if DEBUG
+                .onAppear {
+                    if showHUD && connectionManager.state == .connected { UITestProbe.shared.keyboardButtonAppeared() }
+                }
+                .onDisappear { UITestProbe.shared.keyboardButtonDisappeared() }
+                #endif
             }
 
             Button {

@@ -10,13 +10,15 @@ final class InputGestureTests: UITestCase {
         let width = Double(environment["EM_INPUT_WIDTH"] ?? "640") ?? 640
         let height = Double(environment["EM_INPUT_HEIGHT"] ?? "360") ?? 360
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit", "-uiTestProbe", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
+        // The HUD can come and go while a starved runner waits for the app
+        // to idle; the probe still shows that it appeared.
+        app.waitForDisplayAndHUD()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
         let relay = app.otherElements["display.relay"]
@@ -51,8 +53,8 @@ final class InputGestureTests: UITestCase {
         capture("input-gestures", app: app)
         app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-        keyboard.tap()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        // The HUD can hide again before the tap on a starved runner.
+        app.tapHUDControl("display.keyboard", until: app.keyboards.firstMatch, reveal: .threeFingerTap)
         app.typeText("Hi!\n")
         let relayed = NSPredicate { _, _ in
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count >= before else { return false }
@@ -74,8 +76,7 @@ final class InputGestureTests: UITestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         app.buttons["keyboard.done"].tap()
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"], reveal: .threeFingersTogether)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {
