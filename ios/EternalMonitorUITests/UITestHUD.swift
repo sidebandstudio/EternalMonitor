@@ -21,6 +21,12 @@ extension XCUIApplication {
     /// position at once, and reveals it and tries again if that touch missed.
     func tapHUDControl(_ identifier: String, until result: XCUIElement, reveal: HUDReveal = .tap,
                        file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(triedHUDControl(identifier, until: result, reveal: reveal),
+                      "\(identifier) did not open \(result)", file: file, line: line)
+    }
+
+    /// `tapHUDControl` without the failure: whether `result` appeared.
+    func triedHUDControl(_ identifier: String, until result: XCUIElement, reveal: HUDReveal = .tap) -> Bool {
         let control = buttons[identifier]
         for _ in 0..<3 where !result.exists {
             if !control.exists { revealHUD(reveal) }
@@ -29,9 +35,9 @@ extension XCUIApplication {
             guard Self.appears(control, within: 5), let frame = try? control.snapshot().frame else { continue }
             coordinate(withNormalizedOffset: .zero)
                 .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
-            if Self.appears(result, within: 5) { return }
+            if Self.appears(result, within: 5) { return true }
         }
-        XCTAssertTrue(result.exists, "\(identifier) did not open \(result)", file: file, line: line)
+        return result.exists
     }
 
     /// The HUD controls `identifiers`, read from one accessibility snapshot.
@@ -43,6 +49,15 @@ extension XCUIApplication {
     /// reads again.
     func hudControls(_ identifiers: [String], reveal: HUDReveal = .tap,
                      file: StaticString = #filePath, line: UInt = #line) -> [String: XCUIElementSnapshot] {
+        let found = triedHUDControls(identifiers, reveal: reveal)
+        if found.count < identifiers.count {
+            XCTFail("The HUD never showed all of \(identifiers): \(found.keys.sorted())", file: file, line: line)
+        }
+        return found
+    }
+
+    /// `hudControls` without the failure: the controls it found.
+    func triedHUDControls(_ identifiers: [String], reveal: HUDReveal = .tap) -> [String: XCUIElementSnapshot] {
         var found: [String: XCUIElementSnapshot] = [:]
         for _ in 0..<3 {
             found = [:]
@@ -52,8 +67,33 @@ extension XCUIApplication {
             if found.isEmpty { revealHUD(reveal) }
             _ = Self.appears(descendants(matching: .any)[identifiers[0]].firstMatch, within: 5)
         }
-        XCTFail("The HUD never showed all of \(identifiers): \(found.keys.sorted())", file: file, line: line)
         return found
+    }
+
+    /// What the app counted for a UI test launched with `-uiTestProbe YES`
+    /// (debug builds): how often the HUD's bar appeared, and how often the
+    /// signal was lost. A starved runner can miss either while it lasts.
+    /// Nil while no display is up.
+    func probe() -> (hud: Int, signalLosses: Int)? {
+        guard let value = (try? descendants(matching: .any)["debug.probe"].firstMatch.snapshot())?.value as? String
+        else { return nil }
+        let counts = value.split(separator: " ").compactMap { $0.split(separator: "=").last.flatMap { Int($0) } }
+        return counts.count == 2 ? (counts[0], counts[1]) : nil
+    }
+
+    /// Waits for the display and proves its HUD appeared on its own. A
+    /// starved runner can wait out the HUD's five seconds before it looks
+    /// (#161), so this reads the probe instead of the HUD.
+    func waitForDisplayAndHUD(file: StaticString = #filePath, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(15)
+        var shown: (hud: Int, signalLosses: Int)?
+        while Date() < deadline {
+            shown = probe()
+            if let shown, shown.hud > 0 { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTFail(shown == nil ? "The display never showed" : "The HUD did not show when the stream started",
+                file: file, line: line)
     }
 
     func revealHUD(_ reveal: HUDReveal) {

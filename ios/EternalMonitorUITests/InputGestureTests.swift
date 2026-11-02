@@ -10,15 +10,15 @@ final class InputGestureTests: UITestCase {
         let width = Double(environment["EM_INPUT_WIDTH"] ?? "640") ?? 640
         let height = Double(environment["EM_INPUT_HEIGHT"] ?? "360") ?? 360
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit", "-uiTestProbe", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
         // The HUD can come and go while a starved runner waits for the app
-        // to idle. Wait for the display, then read or reveal the HUD.
-        XCTAssertTrue(app.otherElements["display.relay"].waitForExistence(timeout: 15))
+        // to idle; the probe still shows that it appeared.
+        app.waitForDisplayAndHUD()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
         let relay = app.otherElements["display.relay"]

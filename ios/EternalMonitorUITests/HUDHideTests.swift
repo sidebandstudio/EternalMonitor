@@ -11,14 +11,15 @@ final class HUDHideTests: UITestCase {
         let app = XCUIApplication()
         // A ten-second slide keeps the HUD leaving while every tap lands.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit"]
+                               "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit",
+                               "-uiTestProbe", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
         // The HUD can come and go while a starved runner waits for the app
-        // to idle. Wait for the display, then read or reveal the HUD.
-        XCTAssertTrue(app.otherElements["display.relay"].waitForExistence(timeout: 15))
+        // to idle; the probe still shows that it appeared.
+        app.waitForDisplayAndHUD()
         let shown = app.hudControls(["display.keyboard", "display.disconnect"], reveal: .threeFingersTogether)
         let keyboardFrame = try XCTUnwrap(shown["display.keyboard"]).frame
         let disconnectFrame = try XCTUnwrap(shown["display.disconnect"]).frame

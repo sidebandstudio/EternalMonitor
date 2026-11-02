@@ -40,7 +40,14 @@ for name in ['keyboard-relay','keyboard-dismissed']:
         result=subprocess.run([str(root/'scripts/pixels.sh'),str(out/(name+'.png')),'--assert-pattern'],capture_output=True,text=True)
         (out/(name+'-pixels.log')).write_text(result.stdout+result.stderr)
         if result.returncode: errors.append('Pixel assertion failed: '+name)
-log=(out/'host.log').read_text() if (out/'host.log').exists() else ''
+# The test starts again in a fresh app when the signal is lost (see
+# KeyboardRelayTests); check the PC's commands from its clean run.
+start=0
+for test in manifest:
+    for item in test.get('attachments',[]):
+        if item.get('suggestedHumanReadableName','').startswith('keyboard-host-log-start_'):
+            start=int((shots/item['exportedFileName']).read_text())
+log=(out/'host.log').read_bytes()[start:].decode(errors='replace') if (out/'host.log').exists() else ''
 log=re.sub(r'\x1b\[[0-9;]*m','',log)
 commands=re.findall(r'Input injection command=(.+)',log)
 expected=['Unicode(72)','Unicode(105)','Unicode(33)',

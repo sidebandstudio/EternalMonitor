@@ -108,6 +108,11 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var stats = StreamStats()
     /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
     @Published private(set) var signalLost = false
+    #if DEBUG
+    /// How often the signal was lost, for UI tests: a loss can start and end
+    /// while a starved test runner isn't looking.
+    @Published private(set) var signalLossCount = 0
+    #endif
     /// Frames still arrive, but the picture has been held for over a second
     /// waiting for the keyframe that replaces a lost frame.
     @Published var pictureRestoring = false
@@ -916,6 +921,9 @@ final class ConnectionManager: ObservableObject {
         if sinceUs > livenessTimeoutUs {
             if !signalLost {
                 signalLost = true
+                #if DEBUG
+                signalLossCount += 1
+                #endif
                 degradedSinceUs = ControlChannel.clientNowUs()
                 record(.warning, "ctrl", "Host heartbeats stopped — signal lost")
             } else if let since = degradedSinceUs,
