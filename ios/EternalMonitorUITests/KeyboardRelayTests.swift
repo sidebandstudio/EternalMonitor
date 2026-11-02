@@ -81,9 +81,9 @@ final class KeyboardRelayTests: UITestCase {
                     "Hi! and Enter did not reach the PC") else { return nil }
         shots.append(("keyboard-relay", app.screenshot()))
         let control = app.buttons["keyboard.key.224"]
-        guard check(tap(control, app: app) && becomes(control, "On"),
+        guard check(app.tapKeyboardKey(control, until: "On", hostLog: path) == "On",
                     "Ctrl did not turn on: \(value(of: control))") else { return nil }
-        guard check(tap(app.buttons["keyboard.key.80"], app: app) && becomes(control, "Off"),
+        guard check(app.tapKeyboardKey(app.buttons["keyboard.key.80"], until: "Off", on: control, hostLog: path) == "Off",
                     "← did not release Ctrl: \(value(of: control))") else { return nil }
         guard check(tap(app.keyboards.buttons["Hide keyboard"], app: app) && closes(app.keyboards.firstMatch),
                     "Hide keyboard did not close the keyboard") else { return nil }
@@ -135,18 +135,12 @@ final class KeyboardRelayTests: UITestCase {
         return true
     }
 
-    // A waiter can time out without looking again when the runner stalls
-    // past its deadline, so these look once more before giving up.
-    private func becomes(_ key: XCUIElement, _ value: String) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND value == %@", value), object: key)
-        return XCTWaiter().wait(for: [expectation], timeout: 5) == .completed || self.value(of: key) == value
-    }
-
     private func value(of key: XCUIElement) -> String {
         (try? key.snapshot())?.value as? String ?? "gone"
     }
 
+    // A waiter can time out without looking again when the runner stalls
+    // past its deadline, so this looks once more before giving up.
     private func closes(_ element: XCUIElement, within timeout: TimeInterval = 5) -> Bool {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: element)
         return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed || !element.exists
