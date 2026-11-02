@@ -54,7 +54,7 @@ final class VideoDecoderTests: XCTestCase {
         var format: OSType = 0
         var width = 0
         var height = 0
-        decoder.onFrameDecoded = { pixelBuffer, _ in
+        decoder.onFrameDecoded = { pixelBuffer, _, _ in
             format = CVPixelBufferGetPixelFormatType(pixelBuffer)
             width = CVPixelBufferGetWidth(pixelBuffer)
             height = CVPixelBufferGetHeight(pixelBuffer)
@@ -88,7 +88,7 @@ final class VideoDecoderTests: XCTestCase {
         }
         let decodedAll = expectation(description: "frames decoded")
         decodedAll.expectedFulfillmentCount = 5
-        decoder.onFrameDecoded = { _, _ in decodedAll.fulfill() }
+        decoder.onFrameDecoded = { _, _, _ in decodedAll.fulfill() }
 
         for seq in 1...5 {
             decoder.decode(packet: packet(seq: UInt32(seq), data: data, keyframe: true))
@@ -128,7 +128,7 @@ final class VideoDecoderTests: XCTestCase {
                 sessionEvents.withLock { $0 += 1 }
             }
         }
-        decoder.onFrameDecoded = { _, timestamp in
+        decoder.onFrameDecoded = { _, timestamp, _ in
             if timestamp == 16_667 { first.fulfill() }
             if timestamp == 20 * 16_667 { recovered.fulfill() }
         }
@@ -171,7 +171,7 @@ final class VideoDecoderTests: XCTestCase {
                 sessionEvents.withLock { $0 += 1 }
             }
         }
-        decoder.onFrameDecoded = { _, timestamp in
+        decoder.onFrameDecoded = { _, timestamp, _ in
             if timestamp == 16_667 { first.fulfill() }
             if timestamp == 20 * 16_667 { recovered.fulfill() }
         }
@@ -198,7 +198,7 @@ final class VideoDecoderTests: XCTestCase {
         defer { decoder.shutdown() }
         let frames = expectation(description: "keyframe and P-frame decoded")
         frames.expectedFulfillmentCount = 2
-        decoder.onFrameDecoded = { _, _ in frames.fulfill() }
+        decoder.onFrameDecoded = { _, _, _ in frames.fulfill() }
         decoder.decode(packet: packet(seq: 1, data: gop.idr, keyframe: true))
         decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
         wait(for: [frames], timeout: 10)
@@ -222,7 +222,7 @@ final class VideoDecoderTests: XCTestCase {
         decoder.onEvent = { message in events.withLock { $0.append(message) } }
         let firstFrame = expectation(description: "first size")
         let secondFrame = expectation(description: "second size")
-        decoder.onFrameDecoded = { buffer, timestamp in
+        decoder.onFrameDecoded = { buffer, timestamp, _ in
             if timestamp == 16_667 { firstFrame.fulfill() }
             if timestamp == 2 * 16_667, CVPixelBufferGetWidth(buffer) == 96 { secondFrame.fulfill() }
         }
@@ -260,7 +260,7 @@ final class VideoDecoderTests: XCTestCase {
             asked.fulfill()
         }
         let shown = expectation(description: "keyframe decoded")
-        decoder.onFrameDecoded = { _, timestamp in if timestamp == 3 * 16_667 { shown.fulfill() } }
+        decoder.onFrameDecoded = { _, timestamp, _ in if timestamp == 3 * 16_667 { shown.fulfill() } }
         decoder.decode(packet: packet(seq: 1, data: gop.p, keyframe: false))
         decoder.decode(packet: packet(seq: 2, data: gop.p, keyframe: false))
         decoder.decode(packet: packet(seq: 3, data: gop.idr, keyframe: true))
@@ -295,7 +295,10 @@ final class VideoDecoderTests: XCTestCase {
     }
 
     private struct Run {
-        var shown: [UInt32] = []
+        /// Output seqs ranked by submission: callback order has no promise,
+        /// and `FrameSlot` shows a frame only after the frames submitted before it.
+        var shown: [UInt32] { output.sorted { $0.sequence < $1.sequence }.map(\.seq) }
+        var output: [(sequence: UInt64, seq: UInt32)] = []
         var requests = 0
         var errors = 0
         /// Events and failures, in order.
@@ -314,7 +317,9 @@ final class VideoDecoderTests: XCTestCase {
     private func run(_ ext: String, _ frames: [(UInt32, Int, UInt32)], decoder: VideoDecoder = VideoDecoder()) throws -> (Run, VideoDecoder) {
         let units = try twoGOPs(ext)
         let state = OSAllocatedUnfairLock(initialState: Run())
-        decoder.onFrameDecoded = { _, timestamp in state.withLock { $0.shown.append(UInt32(timestamp / 16_667)) } }
+        decoder.onFrameDecoded = { _, timestamp, sequence in
+            state.withLock { $0.output.append((sequence, UInt32(timestamp / 16_667))) }
+        }
         decoder.onNeedsKeyframe = { state.withLock { $0.requests += 1 } }
         decoder.onEvent = { message in state.withLock { $0.events.append(message); $0.plainEvents.append(message) } }
         decoder.onFailure = { message in
@@ -383,6 +388,41 @@ final class VideoDecoderTests: XCTestCase {
         }
     }
 
+    func testOldStreamFrameOutputAfterTheNewStreamsIsNotShown() throws {
+        // VideoToolbox promises no output order: on CI (run 41371109729) the
+        // restarted stream's keyframe came out before the old stream's last
+        // frame. Here frame 8's output waits until the new stream's are out.
+        for ext in ["h264", "h265"] {
+            let units = try twoGOPs(ext)
+            let decoder = VideoDecoder()
+            let slot = FrameSlot()
+            let late = OSAllocatedUnfairLock<(() -> Void)?>(initialState: nil)
+            decoder.outputGate = { timestamp, output in
+                switch timestamp / 16_667 {
+                case 8: late.withLock { $0 = output }
+                case 4:
+                    output()
+                    late.withLock { $0 }?()
+                default: output()
+                }
+            }
+            let result = OSAllocatedUnfairLock(initialState: (shown: [UInt32](), refused: [UInt32]()))
+            // The same hand-off as ConnectionManager's.
+            decoder.onFrameDecoded = { buffer, timestamp, sequence in
+                let stored = slot.set(buffer, sequence: sequence)
+                result.withLock { stored ? $0.shown.append(UInt32(timestamp / 16_667)) : $0.refused.append(UInt32(timestamp / 16_667)) }
+            }
+            for (seq, index) in [(7, 0), (8, 1), (1, 1), (2, 2), (3, 4), (4, 5)] as [(UInt32, Int)] {
+                decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
+            }
+            let drained = expectation(description: "decode queue drained")
+            decoder.shutdown { drained.fulfill() }
+            wait(for: [drained], timeout: 10)
+            XCTAssertEqual(result.withLock { $0.shown }, [7, 3, 4], ext)
+            XCTAssertEqual(result.withLock { $0.refused }, [8], ext)
+        }
+    }
+
     func testRecoveredPictureIsNotHeldByALossCountedLater() throws {
         // Sol's sequence: keyframe 1, frame 2 arrives partly, the replacement
         // keyframe 3, then frame 4. Without repair (USB, older PCs) the
@@ -393,8 +433,8 @@ final class VideoDecoderTests: XCTestCase {
             let units = try twoGOPs(ext)
             let assembler = FrameAssembler()
             let decoder = VideoDecoder()
-            let shown = OSAllocatedUnfairLock(initialState: [UInt32]())
-            decoder.onFrameDecoded = { _, timestamp in shown.withLock { $0.append(UInt32(timestamp / 16_667)) } }
+            let shown = OSAllocatedUnfairLock(initialState: [(sequence: UInt64, seq: UInt32)]())
+            decoder.onFrameDecoded = { _, timestamp, sequence in shown.withLock { $0.append((sequence, UInt32(timestamp / 16_667))) } }
             // The same hand-off as ConnectionManager's.
             assembler.onFrameAssembled = { data, seq, _, isKeyframe in
                 decoder.decode(packet: self.packet(seq: seq, data: data, keyframe: isKeyframe))
@@ -416,7 +456,7 @@ final class VideoDecoderTests: XCTestCase {
             decoder.shutdown { drained.fulfill() }
             wait(for: [drained], timeout: 10)
             XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1, ext)
-            XCTAssertEqual(shown.withLock { $0 }, [1, 3, 4], ext)
+            XCTAssertEqual(shown.withLock { $0 }.sorted { $0.sequence < $1.sequence }.map(\.seq), [1, 3, 4], ext)
         }
     }
 
@@ -460,7 +500,7 @@ final class VideoDecoderTests: XCTestCase {
         decoder.onStalled = { calls.withLock { $0.stalls += 1 } }
         decoder.onEvent = { message in calls.withLock { $0.events.append(message) } }
         let restored = expectation(description: "keyframe after the stall")
-        decoder.onFrameDecoded = { _, timestamp in if timestamp == 20 * 16_667 { restored.fulfill() } }
+        decoder.onFrameDecoded = { _, timestamp, _ in if timestamp == 20 * 16_667 { restored.fulfill() } }
         func at(_ seconds: Double) { clock.withLock { $0 = 5_000_000 + UInt64(seconds * 1_000_000) } }
         func until(_ condition: @escaping (Calls) -> Bool) {
             let met = expectation(for: NSPredicate { _, _ in calls.withLock { condition($0) } }, evaluatedWith: nil)
@@ -641,7 +681,7 @@ final class VideoDecoderTests: XCTestCase {
         decoder.onNeedsKeyframe = { requests.withLock { $0 += 1 } }
         let shown = expectation(description: "first picture")
         let resized = expectation(description: "picture after the retry")
-        decoder.onFrameDecoded = { buffer, timestamp in
+        decoder.onFrameDecoded = { buffer, timestamp, _ in
             if timestamp == 16_667 { shown.fulfill() }
             if timestamp == 9 * 16_667, CVPixelBufferGetWidth(buffer) == 96 { resized.fulfill() }
         }

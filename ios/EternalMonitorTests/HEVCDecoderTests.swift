@@ -42,7 +42,7 @@ final class HEVCDecoderTests: XCTestCase {
         var format: OSType = 0
         var width = 0
         var height = 0
-        decoder.onFrameDecoded = { pixelBuffer, _ in
+        decoder.onFrameDecoded = { pixelBuffer, _, _ in
             format = CVPixelBufferGetPixelFormatType(pixelBuffer)
             width = CVPixelBufferGetWidth(pixelBuffer)
             height = CVPixelBufferGetHeight(pixelBuffer)
@@ -73,7 +73,7 @@ final class HEVCDecoderTests: XCTestCase {
 
         let decodedAll = expectation(description: "all three frames decoded")
         decodedAll.expectedFulfillmentCount = 3
-        decoder.onFrameDecoded = { _, _ in decodedAll.fulfill() }
+        decoder.onFrameDecoded = { _, _, _ in decodedAll.fulfill() }
 
         decoder.decode(packet: packet(seq: 1, data: h264))
         decoder.decode(packet: packet(seq: 2, data: hevc))

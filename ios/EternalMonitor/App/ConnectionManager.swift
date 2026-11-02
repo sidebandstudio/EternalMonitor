@@ -432,10 +432,11 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
+        decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs, sequence in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-            // Store frame in lock-protected slot (no Sendable boundary crossed)
-            self.frameSlot.set(pixelBuffer)
+            // Store frame in lock-protected slot (no Sendable boundary crossed).
+            // A frame that came out after a newer one is never shown.
+            guard self.frameSlot.set(pixelBuffer, sequence: sequence) else { return }
             // Capture only the scalars we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
             metrics.recordDecoded(at: ControlChannel.clientNowUs(), captureUs: ts)
@@ -1388,7 +1389,13 @@ final class PixelBufferBox: @unchecked Sendable {
 }
 
 final class FrameSlot: @unchecked Sendable {
-    private let lock = os.OSAllocatedUnfairLock<PixelBufferBox?>(initialState: nil)
+    /// The frame waiting to be drawn, and the newest decode sequence ever
+    /// accepted, which `take()` keeps.
+    private struct Slot {
+        var frame: PixelBufferBox?
+        var newestSequence: UInt64 = 0
+    }
+    private let lock = os.OSAllocatedUnfairLock<Slot>(initialState: Slot())
 
     /// Holder so the redraw callback can be swapped under a lock. The Metal
     /// view attaches and detaches it on the MainActor while the VideoToolbox
@@ -1408,20 +1415,33 @@ final class FrameSlot: @unchecked Sendable {
         set { stored.withLock { $0.callback = newValue } }
     }
 
-    func set(_ buffer: CVPixelBuffer) {
+    /// Stores the frame unless a frame submitted after it was already stored:
+    /// decoder output can arrive out of order, and after a stream restart or
+    /// a session rebuild the late frame is the old picture. The check and the
+    /// store are one step under the lock, so two outputs can't both pass it.
+    /// Returns whether the frame was stored.
+    @discardableResult
+    func set(_ buffer: CVPixelBuffer, sequence: UInt64) -> Bool {
         let box = PixelBufferBox(buffer)
-        lock.withLock { $0 = box }
+        let accepted = lock.withLock { slot in
+            guard sequence >= slot.newestSequence else { return false }
+            slot.newestSequence = sequence
+            slot.frame = box
+            return true
+        }
+        guard accepted else { return false }
         // Copy the closure out under the lock, then call it outside: holding
         // the lock across arbitrary caller code invites deadlock, and a local
         // strong reference keeps a concurrent detach from freeing it mid-call.
         let callback = stored.withLock { $0.callback }
         callback?()
+        return true
     }
 
     func take() -> CVPixelBuffer? {
-        lock.withLock { current in
-            let wrapped = current
-            current = nil
+        lock.withLock { slot in
+            let wrapped = slot.frame
+            slot.frame = nil
             return wrapped?.buffer
         }
     }
