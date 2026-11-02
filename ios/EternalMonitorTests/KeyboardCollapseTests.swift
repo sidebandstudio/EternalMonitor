@@ -77,10 +77,23 @@ final class KeyboardCollapseTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
     }
 
+    /// Waits until a Hide deferred by a collapse posted before now has run,
+    /// and the dismissal it queues on the main queue with it. A wall-clock
+    /// spin can end between the two on a loaded runner. The marker is due
+    /// after the relay's 0.1 s deferral with a margin, so it runs after the
+    /// Hide; its own async then runs after the dismissal queued by the Hide.
+    private func settle() {
+        let settled = expectation(description: "a deferred Hide and its dismissal ran")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            DispatchQueue.main.async { settled.fulfill() }
+        }
+        wait(for: [settled], timeout: 5)
+    }
+
     func testHideKeyboardKeyStillCloses() {
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertFalse(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 1)
@@ -90,7 +103,7 @@ final class KeyboardCollapseTests: XCTestCase {
         keyboardFrame(height: 400)
         relay.pressesBegan([HardwarePress()], with: nil)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertTrue(input.isFirstResponder, "The bar must stay, as with a keyboard attached from the start")
         XCTAssertTrue(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 0)
@@ -101,7 +114,7 @@ final class KeyboardCollapseTests: XCTestCase {
         // The user brings the software keyboard back, then hides it.
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertEqual(dismissals, 1)
     }
@@ -111,7 +124,7 @@ final class KeyboardCollapseTests: XCTestCase {
         relay.pressesBegan([HardwarePress()], with: nil)
         spin(1.2)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertEqual(dismissals, 1)
     }
@@ -124,7 +137,7 @@ final class KeyboardCollapseTests: XCTestCase {
         XCTAssertEqual(shift.key?.keyCode, .keyboardLeftShift)
         relay.pressesBegan([shift], with: nil)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertFalse(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 1)
@@ -137,7 +150,7 @@ final class KeyboardCollapseTests: XCTestCase {
         relay.pressesBegan([HardwarePress(.keyboardA)], with: nil)
         spin(0.5)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertFalse(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 1)
@@ -149,14 +162,14 @@ final class KeyboardCollapseTests: XCTestCase {
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
         relay.pressesBegan([HardwarePress(.keyboardA)], with: nil)
-        spin(0.3)
+        settle()
         XCTAssertTrue(input.isFirstResponder)
         XCTAssertTrue(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 0)
 
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
-        spin(0.3)
+        settle()
         XCTAssertFalse(input.isFirstResponder)
         XCTAssertEqual(dismissals, 1)
     }
@@ -167,7 +180,7 @@ final class KeyboardCollapseTests: XCTestCase {
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
         keyboardFrame(height: 400)
-        spin(0.3)
+        settle()
         XCTAssertTrue(input.isFirstResponder)
         XCTAssertTrue(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 0)
@@ -181,7 +194,7 @@ final class KeyboardCollapseTests: XCTestCase {
         keyboardFrame(height: 400)
         keyboardFrame(height: barHeight)
         relay.pressesBegan([HardwarePress(.keyboardA)], with: nil)
-        spin(0.3)
+        settle()
         XCTAssertTrue(input.isFirstResponder)
         XCTAssertTrue(relay.keyboardVisible)
         XCTAssertEqual(dismissals, 0)
