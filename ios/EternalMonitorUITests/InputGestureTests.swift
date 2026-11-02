@@ -16,7 +16,9 @@ final class InputGestureTests: UITestCase {
         launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
+        // The HUD can come and go while a starved runner waits for the app
+        // to idle. Wait for the display, then read or reveal the HUD.
+        XCTAssertTrue(app.otherElements["display.relay"].waitForExistence(timeout: 15))
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
         let relay = app.otherElements["display.relay"]
@@ -51,8 +53,8 @@ final class InputGestureTests: UITestCase {
         capture("input-gestures", app: app)
         app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
-        keyboard.tap()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        // The HUD can hide again before the tap on a starved runner.
+        app.tapHUDControl("display.keyboard", until: app.keyboards.firstMatch, reveal: .threeFingerTap)
         app.typeText("Hi!\n")
         let relayed = NSPredicate { _, _ in
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count >= before else { return false }
@@ -74,8 +76,7 @@ final class InputGestureTests: UITestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         app.buttons["keyboard.done"].tap()
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"], reveal: .threeFingersTogether)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

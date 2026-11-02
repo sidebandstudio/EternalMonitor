@@ -34,6 +34,28 @@ extension XCUIApplication {
         XCTAssertTrue(result.exists, "\(identifier) did not open \(result)", file: file, line: line)
     }
 
+    /// The HUD controls `identifiers`, read from one accessibility snapshot.
+    ///
+    /// The HUD hides five seconds after it was last shown. On a starved
+    /// runner launch and idle alone can take that long (7.9 s on #161), so a
+    /// control one query found was gone when the next read its label. This
+    /// reads every control at once, and if the HUD has hidden, reveals it and
+    /// reads again.
+    func hudControls(_ identifiers: [String], reveal: HUDReveal = .tap,
+                     file: StaticString = #filePath, line: UInt = #line) -> [String: XCUIElementSnapshot] {
+        var found: [String: XCUIElementSnapshot] = [:]
+        for _ in 0..<3 {
+            found = [:]
+            if let tree = try? snapshot() { Self.collect(identifiers, in: tree, into: &found) }
+            if found.count == identifiers.count { return found }
+            // A reveal toggles the HUD, so only reveal it once it is gone.
+            if found.isEmpty { revealHUD(reveal) }
+            _ = Self.appears(descendants(matching: .any)[identifiers[0]].firstMatch, within: 5)
+        }
+        XCTFail("The HUD never showed all of \(identifiers): \(found.keys.sorted())", file: file, line: line)
+        return found
+    }
+
     func revealHUD(_ reveal: HUDReveal) {
         switch reveal {
         case .tap: coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
@@ -46,6 +68,12 @@ extension XCUIApplication {
             }
             _ = XCTWaiter().wait(for: [tapped], timeout: 10)
         }
+    }
+
+    private static func collect(_ identifiers: [String], in element: XCUIElementSnapshot,
+                                into found: inout [String: XCUIElementSnapshot]) {
+        if identifiers.contains(element.identifier) { found[element.identifier] = element }
+        for child in element.children { collect(identifiers, in: child, into: &found) }
     }
 
     private static func appears(_ element: XCUIElement, within timeout: TimeInterval) -> Bool {

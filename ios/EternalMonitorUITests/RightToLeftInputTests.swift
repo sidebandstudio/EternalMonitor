@@ -33,11 +33,15 @@ final class RightToLeftInputTests: UITestCase {
 
         // The controls are Arabic and mirrored: Disconnect, last in the bar,
         // sits at its left end.
-        let disconnect = app.buttons["display.disconnect"]
         let keyboard = app.buttons["display.keyboard"]
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
+        // The HUD can come and go while a starved runner waits for the app
+        // to idle. Wait for the display, then read or reveal the HUD.
+        XCTAssertTrue(app.otherElements["display.relay"].waitForExistence(timeout: 15))
+        let controls = app.hudControls(["display.disconnect", "display.keyboard"], reveal: .threeFingersTogether)
+        let disconnect = try XCTUnwrap(controls["display.disconnect"])
         XCTAssertEqual(disconnect.label, "قطع الاتصال")
-        XCTAssertLessThan(disconnect.frame.midX, keyboard.frame.midX, "the controls did not mirror")
+        XCTAssertLessThan(disconnect.frame.midX, try XCTUnwrap(controls["display.keyboard"]).frame.midX,
+                          "the controls did not mirror")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = name
         shot.lifetime = .keepAlways
