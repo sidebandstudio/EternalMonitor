@@ -380,7 +380,7 @@ mod tests {
         );
     }
 
-    /// How 0.3.2 to 0.3.4 read and save the file: unknown fields are
+    /// How 0.3.2 and 0.3.3 read and save the file: unknown fields are
     /// dropped, an unknown input fails the whole file.
     #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -406,7 +406,7 @@ mod tests {
     }
 
     /// Every input survives a save, Automatic included, and what is saved
-    /// stays readable by 0.3.2 to 0.3.4, which reset every setting, the
+    /// stays readable by 0.3.2 and 0.3.3, which reset every setting, the
     /// pairing too, on an input they don't know. Automatic is saved as
     /// yuv420, what those versions choose by default.
     #[test]
@@ -441,8 +441,8 @@ mod tests {
         }
     }
 
-    /// Automatic, downgraded to 0.3.4 and saved there, then upgraded again:
-    /// 0.3.4 streams its default YUV420, its save drops the marker, and
+    /// Automatic, downgraded to 0.3.3 and saved there, then upgraded again:
+    /// 0.3.3 streams its default YUV420, its save drops the marker, and
     /// the upgrade keeps YUV420 like any file from before Automatic. The
     /// pairing survives every step.
     #[test]

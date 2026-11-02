@@ -304,7 +304,7 @@ yuv420 whether or not anyone picked it, so a saved yuv420 can't tell a
 default from a choice made to fix wrong colours. Working PCs keep today's
 behaviour, so settings from an earlier version keep the input they name, and
 Troubleshooting says Automatic is faster on NVIDIA. Automatic is saved as
-`yuv420` with `encoder_input_automatic`. After a downgrade, 0.3.2 to 0.3.4
+`yuv420` with `encoder_input_automatic`. After a downgrade, 0.3.2 and 0.3.3
 ignore the marker and stream their default YUV420, instead of resetting every
 setting or reading Auto, which gives BGRA to any encoder that advertises it,
 Quick Sync HEVC included, with no fallback. Their save drops the marker, so
