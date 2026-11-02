@@ -2037,7 +2037,7 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "EternalMonitor はローカルネットワークで PC を探し、画面を表示します。次に iPadOS が許可を求めたら、「許可」をタップしてください。"
+            "value" : "EternalMonitor はローカルネットワークで PC を探し、画面を表示します。\n次に iPadOS が許可を求めたら、「許可」をタップしてください。"
           }
         },
         "ko" : {
