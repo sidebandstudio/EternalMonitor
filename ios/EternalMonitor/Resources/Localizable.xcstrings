@@ -2037,7 +2037,7 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "EternalMonitor はローカルネットワークで PC を見つけ、その画面を受信します。次に iPadOS が許可を求めるので、「許可」をタップしてください。"
+            "value" : "EternalMonitor はローカルネットワークで PC を探し、画面を表示します。次に iPadOS が許可を求めたら、「許可」をタップしてください。"
           }
         },
         "ko" : {
@@ -4698,6 +4698,77 @@
         }
       }
     },
+    "Remote control surface. Touches control the PC." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "سطح التحكم عن بُعد. تتحكم اللمسات في الكمبيوتر."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fernsteuerungsfläche. Berührungen steuern den PC."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote control surface. Touches control the PC."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Superficie de control remoto. Los toques controlan el PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Surface de contrôle à distance. Les touchers contrôlent le PC."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "रिमोट कंट्रोल क्षेत्र। स्पर्श से PC नियंत्रित होता है।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモート操作画面。タッチでPCを操作します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "원격 제어 영역. 터치하여 PC를 제어합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Área de controle remoto. Toques controlam o PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Область удалённого управления. Касания управляют ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "远程控制区域。触摸可控制电脑。"
+          }
+        }
+      }
+    },
     "Pair with PC" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4775,7 +4846,7 @@
         "ar" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "الاقتران بالكمبيوتر"
+            "value" : "الاقتران بكمبيوترك"
           }
         },
         "de" : {
