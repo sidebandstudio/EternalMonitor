@@ -234,6 +234,25 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(attempts, 0, "no automatic reconnecting after a disconnect from the PC")
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
+
+    /// The PC stopped hearing this iPad (a Wi-Fi stall) and ended the session
+    /// with an error. With Auto-reconnect off the card says the connection
+    /// dropped, not that someone stopped the stream on the PC.
+    func testAnErrorGoodbyeWithAutoReconnectOffSaysTheConnectionDropped() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        UserDefaults.standard.set(false, forKey: "autoReconnect")
+        host.sendBye(.error)
+        try await until("disconnected") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcEndedSessionOnError)
+        XCTAssertEqual(manager.problem?.title, "Your PC ended the session")
+        XCTAssertTrue(manager.problem?.detail.hasPrefix("The connection to your PC dropped") == true,
+                      manager.problem?.detail ?? "")
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        let attempts = await Task.detached { host.helloAttempts(within: 1.5) }.value
+        XCTAssertEqual(attempts, 0)
+    }
 }
 
 /// A count the main actor keeps.

@@ -28,6 +28,9 @@ enum ConnectionProblem: Equatable {
     case reconnecting(attempt: Int, of: Int)
     case reconnectFailed
     case pcEndedSession
+    /// The PC ended the session on an error: it stopped hearing this iPad (a
+    /// Wi-Fi stall) or hit a problem of its own. Nobody stopped the stream.
+    case pcEndedSessionOnError
     /// The PC is streaming to another device, or still to this iPad's cable.
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
@@ -72,7 +75,7 @@ enum ConnectionProblem: Equatable {
         case .lost(.usbTurnedOff): return "USB connections were turned off"
         case .reconnecting: return "Reconnecting to your PC…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
-        case .pcEndedSession: return "Your PC ended the session"
+        case .pcEndedSession, .pcEndedSessionOnError: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
@@ -121,6 +124,8 @@ enum ConnectionProblem: Equatable {
             return "Check that the PC is awake and EternalMonitor is open on it, then try again."
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
+        case .pcEndedSessionOnError:
+            return "The connection to your PC dropped, or the PC ran into a problem. Tap Try again to reconnect."
         case .pcUpdating(.reconnecting):
             return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcUpdating(.manual):
@@ -194,7 +199,8 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession, .pcUpdating:
+        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
+             .pcEndedSessionOnError, .pcUpdating:
             return lastAttempt ?? .reconnectFailed
         default:
             return .reconnectFailed
@@ -205,10 +211,21 @@ enum ConnectionProblem: Equatable {
     /// PC updates it turns sessions away (Busy), then stops answering until
     /// the new version starts; neither replaces the update as the reason.
     static func kept(_ kept: ConnectionProblem?, after attempt: ConnectionProblem?) -> ConnectionProblem? {
-        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
+        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession, .pcEndedSessionOnError].contains(attempt) {
             return kept
         }
         return afterReconnecting(lastAttempt: attempt) != .reconnectFailed ? attempt : kept
+    }
+
+    /// The problem a goodbye from the PC leaves. Only an update sends
+    /// `hostShuttingDown`; the PC sends `error` when it stopped hearing this
+    /// iPad, so that one must not say someone stopped the stream.
+    static func pcGoodbye(_ reason: ByeReason) -> ConnectionProblem {
+        switch reason {
+        case .hostShuttingDown: return .pcUpdating(.reconnecting)
+        case .error: return .pcEndedSessionOnError
+        case .userDisconnect, .superseded, .appBackground: return .pcEndedSession
+        }
     }
 
     /// The problem to show when no automatic attempt will run (Auto-reconnect
