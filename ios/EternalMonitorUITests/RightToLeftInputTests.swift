@@ -89,11 +89,10 @@ final class RightToLeftInputTests: UITestCase {
         XCTAssertLessThan(app.buttons["keyboard.key.41"].frame.midX, arrows[0], "Esc is not left of the arrows")
         XCTAssertGreaterThan(done.frame.midX, app.buttons["keyboard.key.76"].frame.maxX, "Done is not at the right end")
         XCTAssertEqual(done.label, "تم")
+        // One tap turns Ctrl on, the next turns it off.
         let control = app.buttons["keyboard.key.224"]
-        control.tap()
-        XCTAssertEqual(control.value as? String, "قيد التشغيل")
-        control.tap()
-        XCTAssertEqual(control.value as? String, "متوقف")
+        XCTAssertEqual(app.tapKeyboardKey(control, until: "قيد التشغيل", hostLog: path), "قيد التشغيل")
+        XCTAssertEqual(app.tapKeyboardKey(control, until: "متوقف", hostLog: path), "متوقف")
         let bar = XCTAttachment(screenshot: app.screenshot())
         bar.name = "\(name)-keyboard"
         bar.lifetime = .keepAlways
