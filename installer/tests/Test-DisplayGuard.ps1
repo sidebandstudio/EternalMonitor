@@ -26,6 +26,8 @@ function Reset-Fixture([object[]]$Reads) {
     $global:EMGuard = @{
         Reads = [Collections.Generic.Queue[object]]::new(); Last = $null; Count = 0
         Reapplied = $null; Internal = $null; RefuseReapply = $false; RefuseInternal = $false
+        # What reads return after a refused call: Windows changed the screens meanwhile.
+        AfterRefused = $null
         ReapplyCalls = @(); InternalCalls = 0; Waited = 0; Throw = $false
     }
     foreach ($read in $Reads) { $global:EMGuard.Reads.Enqueue($read) }
@@ -41,7 +43,10 @@ function Read-Screens {
 }
 function Set-SavedLayout($Saved) {
     $global:EMGuard.ReapplyCalls += [int]$Saved.Paths[0]
-    if ($global:EMGuard.RefuseReapply) { return 87 }
+    if ($global:EMGuard.RefuseReapply) {
+        if ($null -ne $global:EMGuard.AfterRefused) { $global:EMGuard.Reads.Clear(); $global:EMGuard.Last = $global:EMGuard.AfterRefused }
+        return 87
+    }
     if ($null -ne $global:EMGuard.Reapplied) { $global:EMGuard.Reads.Clear(); $global:EMGuard.Last = $global:EMGuard.Reapplied }
     0
 }
@@ -108,6 +113,18 @@ try {
     $global:EMGuard.RefuseReapply = $true
     Expect 'panel off' (Invoke-Setup) 'outcome=restore_failed reason=saved_layout_refused code=87 paths=0 [] vdd=0' @(1) 0
 
+    # Before "PC screen only" the screens are read again. Windows put both back during the
+    # refused call: nothing more changes, so the monitor stays on.
+    Reset-Fixture @((Layout panel, monitor), (Layout))
+    $global:EMGuard.RefuseReapply = $true; $global:EMGuard.Internal = Layout panel
+    $global:EMGuard.AfterRefused = Layout panel, monitor
+    Expect 'recovered during the call' (Invoke-Setup) "screens came back without a change outcome=restored applied=none $both vdd=0" @(1) 0
+    # They can't be read then: stop.
+    Reset-Fixture @((Layout panel), (Layout))
+    $global:EMGuard.RefuseReapply = $true; $global:EMGuard.Internal = Layout panel
+    $global:EMGuard.AfterRefused = 'unknown'
+    Expect 'unknown during the call' (Invoke-Setup) 'outcome=restore_failed reason=saved_layout_refused code=87 reason=screens_unknown paths=unknown' @(1) 0
+
     # One attempt: both refused, each tried once, and a second check tries nothing.
     Reset-Fixture @((Layout panel), (Layout))
     $global:EMGuard.RefuseReapply = $true; $global:EMGuard.RefuseInternal = $true
@@ -173,7 +190,7 @@ try {
     if ($readme.Count -ne 1 -or $readme[0] -notmatch 'QUICKSTART\.txt') { $failures += "isreadme is on: $readme" }
 
     if ($failures) { throw "Display guard checks failed:`n  " + ($failures -join "`n  ") }
-    Write-Output 'PASS: healthy, monitor unplugged, other screen, all lost, virtual only, back by itself, refused with panel on, taken with no screen, panel off, one attempt, unknown, failing call, never fails as run by Setup, Setup wiring, readme'
+    Write-Output 'PASS: healthy, monitor unplugged, other screen, all lost, virtual only, back by itself, refused with panel on, taken with no screen, panel off, recovered or unknown before the fallback, one attempt, unknown, failing call, never fails as run by Setup, Setup wiring, readme'
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

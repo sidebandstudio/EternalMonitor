@@ -220,31 +220,41 @@ function Invoke-Check([string]$Path) {
     if ($plan -eq 'leave') { return }
     Write-Output "Display guard: the PC lost every screen it had before the display driver steps; restoring them. Before: $(Format-Screens $saved)"
     $tried = @()
-    $now = $after
     $code = Set-SavedLayout $saved
     if ($code -eq 0) {
         $now = Wait-Screens $saved.Screens
-        if ((Get-RealScreens $now.Screens).Count -eq 0) { $tried += 'reason=saved_layout_no_screen' }
+        if ((Get-RealScreens $now.Screens).Count -gt 0) {
+            Write-Output "Display guard: screens restored outcome=restored applied=saved_layout $(Format-Screens $now)"
+            return
+        }
+        $tried += 'reason=saved_layout_no_screen'
     } else {
         $tried += "reason=saved_layout_refused code=$code"
     }
-    $applied = 'saved_layout'
-    if ((Get-RealScreens $now.Screens).Count -eq 0 -and $plan -eq 'restore-internal') {
-        $applied = 'internal'
+    # Windows may have changed the screens during that call. Look again right before changing anything
+    # more: a screen that came back stays as Windows set it.
+    $now = Read-Screens
+    if ($null -ne $now -and (Get-RealScreens $now.Screens).Count -gt 0) {
+        Write-Output "Display guard: screens came back without a change outcome=restored applied=none $(Format-Screens $now)"
+        return
+    }
+    if ($null -eq $now) {
+        $tried += 'reason=screens_unknown'
+    } elseif ($plan -eq 'restore-internal') {
         $code = Set-PcScreenOnly
         if ($code -eq 0) {
             $now = Wait-Screens $saved.Screens
-            if ((Get-RealScreens $now.Screens).Count -eq 0) { $tried += 'reason=internal_no_screen' }
+            if ((Get-RealScreens $now.Screens).Count -gt 0) {
+                Write-Output "Display guard: screens restored outcome=restored applied=internal $(Format-Screens $now)"
+                return
+            }
+            $tried += 'reason=internal_no_screen'
         } else {
             $tried += "reason=internal_refused code=$code"
         }
     }
-    if ((Get-RealScreens $now.Screens).Count -gt 0) {
-        Write-Output "Display guard: screens restored outcome=restored applied=$applied $(Format-Screens $now)"
-    } else {
-        $reasons = if ($tried) { ($tried -join ' ') + ' ' } else { '' }
-        Write-Output "Display guard: could not restore the screens outcome=restore_failed $reasons$(Format-Screens $now)"
-    }
+    $reasons = if ($tried) { ($tried -join ' ') + ' ' } else { '' }
+    Write-Output "Display guard: could not restore the screens outcome=restore_failed $reasons$(Format-Screens $now)"
 }
 
 function Invoke-DisplayGuard([string]$Action, [string]$Path) {
