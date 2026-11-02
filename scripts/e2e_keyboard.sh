@@ -41,23 +41,34 @@ for name in ['keyboard-relay','keyboard-dismissed']:
         (out/(name+'-pixels.log')).write_text(result.stdout+result.stderr)
         if result.returncode: errors.append('Pixel assertion failed: '+name)
 # The test starts again in a fresh app when the signal is lost (see
-# KeyboardRelayTests); check the PC's commands from its clean run.
-start=0
+# KeyboardRelayTests). It names the clean run and where its commands began;
+# a lost run's screenshots are named lost-signal-run<n>-..., so they never
+# match above. A lost run can still release its held keys late, so after a
+# retry key releases before the clean run's first command are dropped.
+run,start=1,0
 for test in manifest:
     for item in test.get('attachments',[]):
-        if item.get('suggestedHumanReadableName','').startswith('keyboard-host-log-start_'):
-            start=int((shots/item['exportedFileName']).read_text())
+        if item.get('suggestedHumanReadableName','').startswith('keyboard-clean-run_'):
+            fields=dict(f.split('=',1) for f in (shots/item['exportedFileName']).read_text().split())
+            run,start=int(fields['run']),int(fields['offset'])
+retries=run-1
 log=(out/'host.log').read_bytes()[start:].decode(errors='replace') if (out/'host.log').exists() else ''
 log=re.sub(r'\x1b\[[0-9;]*m','',log)
 commands=re.findall(r'Input injection command=(.+)',log)
+late=0
+while retries and late<len(commands) and commands[late].startswith('KeyUp '): late+=1
+late_releases,commands=commands[:late],commands[late:]
 expected=['Unicode(72)','Unicode(105)','Unicode(33)',
     'KeyDown { scan: 28, extended: false }','KeyUp { scan: 28, extended: false }',
     'KeyDown { scan: 29, extended: false }','KeyDown { scan: 75, extended: true }',
     'KeyUp { scan: 75, extended: true }','KeyUp { scan: 29, extended: false }']
 if commands!=expected: errors.append('Unexpected injection sequence: '+repr(commands))
 report=dict(scenario=sys.argv[4],status='FAIL' if errors else 'PASS',elapsed=int(sys.argv[6]),
-    tests_passed=summary.get('passedTests',0),screenshot=str(out/'keyboard-relay.png'),commands=commands,errors=errors)
+    tests_passed=summary.get('passedTests',0),retries=retries,late_releases=late_releases,
+    screenshot=str(out/'keyboard-relay.png'),commands=commands,errors=errors)
 (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
+if retries:
+    print(f'::warning title=keyboard row retried::KeyboardRelayTests lost the signal and passed on run {run} after {retries} lost run(s); {len(late_releases)} late key release(s) dropped')
 if errors: sys.exit('; '.join(errors))
 print('PASS: Hi! and Enter, Ctrl+Left, duplicate suppression and keyboard dismissal')
 print('Evidence: '+str(out))

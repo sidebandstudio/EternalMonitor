@@ -11,10 +11,6 @@ struct DisplayView: View {
     @State private var showQualityPopover = false
     @State private var showSettings = false
     @State private var showKeyboard = false
-    #if DEBUG
-    /// How often the bottom bar appeared, for UI tests (see `testProbe`).
-    @State private var hudShownCount = 0
-    #endif
     // The picture fades in once the view is on screen.
     @State private var appeared = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -23,9 +19,6 @@ struct DisplayView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            #if DEBUG
-            testProbe
-            #endif
 
             // Full-bleed video, left to right in every language.
             ZStack {
@@ -110,9 +103,6 @@ struct DisplayView: View {
                             .padding(.horizontal, 16)
                             .padding(.bottom, 12)
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
-                            #if DEBUG
-                            .onAppear { hudShownCount += 1 }
-                            #endif
                     }
                 }
                 .allowsHitTesting(showHUD)
@@ -151,6 +141,11 @@ struct DisplayView: View {
             else { scheduleHUDDismiss() }
         }
         .onChange(of: voiceOverEnabled) { _, _ in scheduleHUDDismiss() }
+        #if DEBUG
+        // The controls leave accessibility as the HUD starts to hide, before
+        // its slide ends.
+        .onChange(of: showHUD) { _, shown in if !shown { UITestProbe.shared.keyboardButtonDisappeared() } }
+        #endif
         .onChange(of: connectionManager.signalLost) { _, lost in
             if lost { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
@@ -344,6 +339,12 @@ struct DisplayView: View {
                 ))
                 .animation(Motion.fade, value: showKeyboard)
                 .accessibilityIdentifier("display.keyboard")
+                #if DEBUG
+                .onAppear {
+                    if showHUD && connectionManager.state == .connected { UITestProbe.shared.keyboardButtonAppeared() }
+                }
+                .onDisappear { UITestProbe.shared.keyboardButtonDisappeared() }
+                #endif
             }
 
             Button {
@@ -468,22 +469,6 @@ struct DisplayView: View {
         #endif
         return voiceOverEnabled
     }
-
-    #if DEBUG
-    /// With `-uiTestProbe YES`, an invisible element whose value counts what
-    /// a starved test runner can miss while it lasts: the HUD appearing on
-    /// its own, and a lost signal that has already come back.
-    @ViewBuilder private var testProbe: some View {
-        if UserDefaults.standard.bool(forKey: "uiTestProbe") {
-            Color.clear
-                .frame(width: 1, height: 1)
-                .accessibilityElement()
-                .accessibilityIdentifier("debug.probe")
-                .accessibilityValue("hud=\(hudShownCount) signalLosses=\(connectionManager.signalLossCount)")
-                .allowsHitTesting(false)
-        }
-    }
-    #endif
 
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()

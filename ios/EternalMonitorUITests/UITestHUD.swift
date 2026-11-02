@@ -70,30 +70,54 @@ extension XCUIApplication {
         return found
     }
 
-    /// What the app counted for a UI test launched with `-uiTestProbe YES`
-    /// (debug builds): how often the HUD's bar appeared, and how often the
-    /// signal was lost. A starved runner can miss either while it lasts.
-    /// Nil while no display is up.
-    func probe() -> (hud: Int, signalLosses: Int)? {
+    /// What the app reports to a UI test launched with `-uiTestProbe YES`
+    /// (debug builds): the HUD's Keyboard button the first time it showed
+    /// while connected ("never", "shown", or the seconds it stayed), and how
+    /// often the signal was lost. A starved runner can miss either while it
+    /// lasts. Nil if the app isn't running.
+    func probe() -> (keyboardButton: String, signalLosses: Int)? {
         guard let value = (try? descendants(matching: .any)["debug.probe"].firstMatch.snapshot())?.value as? String
         else { return nil }
-        let counts = value.split(separator: " ").compactMap { $0.split(separator: "=").last.flatMap { Int($0) } }
-        return counts.count == 2 ? (counts[0], counts[1]) : nil
+        let fields = Dictionary(value.split(separator: " ").compactMap { field -> (String, String)? in
+            let parts = field.split(separator: "=", maxSplits: 1)
+            return parts.count == 2 ? (String(parts[0]), String(parts[1])) : nil
+        }, uniquingKeysWith: { $1 })
+        guard let button = fields["keyboardButton"], let losses = fields["signalLosses"].flatMap({ Int($0) })
+        else { return nil }
+        return (button, losses)
     }
 
-    /// Waits for the display and proves its HUD appeared on its own. A
-    /// starved runner can wait out the HUD's five seconds before it looks
-    /// (#161), so this reads the probe instead of the HUD.
+    /// Waits for the display, and proves its HUD showed the Keyboard button
+    /// on its own and kept it for the HUD's time. The app reports how long
+    /// the button first stayed; under 4 s fails (the HUD hides 5 s after it
+    /// appears). While the app reports it showing, the button must be in
+    /// the accessibility tree: two reports of "shown" around a check that
+    /// misses it fail. A starved runner can wait out those 5 s before it
+    /// looks (#161), so the app's report is what counts, and this returns
+    /// once the HUD has hidden again.
     func waitForDisplayAndHUD(file: StaticString = #filePath, line: UInt = #line) {
-        let deadline = Date().addingTimeInterval(15)
-        var shown: (hud: Int, signalLosses: Int)?
+        if let problem = displayAndHUDProblem() { XCTFail(problem, file: file, line: line) }
+    }
+
+    /// `waitForDisplayAndHUD` without the failure: what went wrong, if
+    /// anything.
+    func displayAndHUDProblem() -> String? {
+        let deadline = Date().addingTimeInterval(30)
+        var last = "never"
         while Date() < deadline {
-            shown = probe()
-            if let shown, shown.hud > 0 { return }
+            if let before = probe()?.keyboardButton {
+                last = before
+                if before == "shown" {
+                    if !buttons["display.keyboard"].exists, probe()?.keyboardButton == "shown" {
+                        return "The HUD showed the Keyboard button, but not to accessibility"
+                    }
+                } else if let seconds = Double(before) {
+                    return seconds >= 4 ? nil : "The HUD hid \(seconds) s after the stream started"
+                }
+            }
             Thread.sleep(forTimeInterval: 0.25)
         }
-        XCTFail(shown == nil ? "The display never showed" : "The HUD did not show when the stream started",
-                file: file, line: line)
+        return last == "never" ? "The HUD did not show when the stream started" : "The HUD was still showing after 30 s"
     }
 
     func revealHUD(_ reveal: HUDReveal) {
