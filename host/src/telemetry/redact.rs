@@ -134,6 +134,13 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "remote_config",
     "rollout",
     "ss_rule",
+    // A silent client's session held, kept or ended.
+    "silent_ms",
+    "held_ms",
+    "last_heard",
+    "heard",
+    "late_input",
+    "max_late_ms",
     // renderer_rule.
     "applied",
     "rule",
@@ -1258,6 +1265,12 @@ mod tests {
                 "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
                  device=<device-name> [repeated 1 more times from 1 to 2]",
             ),
+            (
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 silent_ms=10000 held_ms=7000 last_heard=report late_input=2 device=Maria's iPad",
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 silent_ms=10000 held_ms=7000 last_heard=report late_input=2 device=<device-name>",
+            ),
         ] {
             assert_eq!(redact(text, &names), uploaded, "{text}");
         }
@@ -1935,6 +1948,19 @@ mod tests {
             ("Dx12", "INFO Window renderer instance backends=DX12 choice=Some(Dx12) chosen_failed=false"),
             ("dx12", "INFO renderer_rule applied=intel:31.0.101.2111->dx12"),
             ("set_aside", "INFO renderer_rule ignored reason=set_aside rule=nvidia:32.0.15.9186->vulkan"),
+            (
+                "report",
+                "WARN Client silent — holding the session session_id=7 silent_ms=3000 last_heard=report",
+            ),
+            (
+                "keyframe",
+                "INFO Client heard again — session kept session_id=7 silent_ms=5200 held_ms=2200 heard=keyframe",
+            ),
+            (
+                "input",
+                "WARN Client liveness expired — tearing session down peer=192.0.2.7:50000 silent_ms=10000 \
+                 held_ms=7000 last_heard=input late_input=0 device=iPad",
+            ),
         ];
         for (name, message) in cases {
             let line = format!("{STAMP}  {message}");

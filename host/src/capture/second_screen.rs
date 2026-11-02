@@ -408,7 +408,7 @@ impl State {
 /// every caller locks them in.
 pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
     let selected = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
-    let connected = shared.client_connected();
+    let connected = shared.client_heard();
     let blocked = mirror_blocked_now(shared, |status, state| {
         state.decides_on_mirror(selected, status, connected, now)
     });
@@ -2026,6 +2026,74 @@ mod tests {
             Step::Nothing,
             "one release"
         );
+    }
+
+    /// An iPad that had a picture and goes silent keeps its session, on
+    /// hold, for longer than the liveness timeout, but the display it
+    /// watched still goes one grace period after the hold starts: 13 s
+    /// after its last packet, as when the session ended at the timeout. A
+    /// packet during the hold starts the count again.
+    #[test]
+    fn a_held_session_releases_the_display_13_s_after_its_last_packet() {
+        use crate::transport::session::{ConfigSource, LIVENESS_TIMEOUT};
+        use eternal_wire::v2::control::{ControlMessage, ReceiverReport, StreamConfig};
+        struct Config;
+        impl ConfigSource for Config {
+            fn stream_config(&self) -> StreamConfig {
+                StreamConfig {
+                    stream_epoch: 1,
+                    width: 640,
+                    height: 360,
+                    fps: 60,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 15_000_000,
+                }
+            }
+            fn host_name(&self) -> String {
+                "TEST".into()
+            }
+        }
+        let report = ControlMessage::ReceiverReport(ReceiverReport {
+            frames_complete: 30,
+            ..ReceiverReport::default()
+        });
+        for heard_at in [None, Some(secs(7.0))] {
+            let shared = second_screen_selected();
+            *shared.vdd_status.lock() = VddStatus::Active;
+            connect_viewer(&shared);
+            let (id, peer) = {
+                let session = shared.session.lock();
+                (session.session_id().unwrap(), session.peer().unwrap())
+            };
+            let start = Instant::now();
+            let hear = |at| {
+                shared
+                    .session
+                    .lock()
+                    .handle_control(peer, id, report.clone(), &Config, at);
+            };
+            hear(start);
+            let mut released = Vec::new();
+            let mut elapsed = Duration::ZERO;
+            while elapsed <= secs(30.0) {
+                let now = start + elapsed;
+                if heard_at == Some(elapsed) {
+                    hear(now);
+                }
+                shared.session.lock().tick(&Config, false, now);
+                if next_step(&shared, now) == Step::Release {
+                    released.push(elapsed);
+                }
+                elapsed += secs(0.25);
+            }
+            let last_packet = heard_at.unwrap_or_default();
+            assert_eq!(
+                released,
+                [last_packet + LIVENESS_TIMEOUT + RELEASE_GRACE],
+                "{heard_at:?}"
+            );
+        }
     }
 
     #[test]
