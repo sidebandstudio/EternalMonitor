@@ -193,7 +193,11 @@ an opt-in Win mapping; iPadOS retains its reserved shortcuts.
 The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
 Users read/execute permission. The host starts a virtual display only for a
 connected client, writes the requested mode first in VDD XML, and reports actual
-task failures. It also ships a UDP firewall rule. Runtime upgrade, task-ACL and
+task failures. Setup and the host log the active display paths around every
+driver change; when a change leaves the PC without any real screen it had, they
+re-apply the saved layout once, else switch to "PC screen only" if the built-in
+panel was on (`display_guard.rs`, `display-guard.ps1`). It also ships a UDP
+firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
 mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,
