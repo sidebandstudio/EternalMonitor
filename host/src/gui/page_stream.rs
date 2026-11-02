@@ -405,12 +405,33 @@ impl AnalyzerApp {
                     );
                     widgets::status_dot(ui, glyph.center(), color, 6.0, state.dot());
 
-                    let buttons_width = if state == StreamState::Off {
+                    // Room for the buttons drawn below, as wide as their
+                    // labels in this language, and never less than before.
+                    let spacing = ui.spacing().item_spacing.x;
+                    let buttons = [
+                        (snap.pipeline_running || waiting, Icon::Stop, tr("Stop")),
+                        (snap.pipeline_running, Icon::Refresh, tr("Restart")),
+                        (
+                            !snap.pipeline_running && !waiting,
+                            Icon::Play,
+                            tr("Start streaming"),
+                        ),
+                    ];
+                    let measured: f32 = buttons
+                        .into_iter()
+                        .filter(|&(shown, _, _)| shown)
+                        .map(|(_, icon, label)| {
+                            widgets::button_width(ui, Some(icon), label) + spacing
+                        })
+                        .sum();
+                    let buttons_width = measured.max(if state == StreamState::Off {
                         170.0
                     } else {
                         210.0
-                    };
-                    let text_width = (ui.available_width() - buttons_width).max(160.0);
+                    });
+                    // A narrow window cuts the text short, never under the
+                    // buttons: Russian at the minimum size leaves about 130.
+                    let text_width = (ui.available_width() - buttons_width).max(0.0);
                     ui.allocate_ui_with_layout(
                         vec2(text_width, 48.0),
                         Layout::top_down(Align::Min),

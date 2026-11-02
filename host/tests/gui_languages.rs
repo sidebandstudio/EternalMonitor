@@ -106,6 +106,7 @@ fn languages_settings_and_setup() {
     let mut results = SnapshotResults::new();
     settings_and_setup_in_each_language(&shared, &mut results);
     paused_card_and_pairing_off_in_long_languages(&shared, &mut results);
+    stream_header_text_ends_before_its_buttons(&shared);
     upgrades_never_open_setup(&dir, &shared);
     a_fresh_install_opens_setup_and_a_language_applies_at_once(&dir, &shared);
     every_translation_keeps_an_english_id(&shared);
@@ -257,6 +258,59 @@ fn paused_card_and_pairing_off_in_long_languages(
         click(&mut h, Role::CheckBox, "Require pairing");
         assert!(shared.pairing.lock().required, "{code}");
     }
+}
+
+/// The Stream page's header, at the window's minimum size, in every
+/// language, with the stream on and off: its title and description end the
+/// header's spacing before its first button, whose width is its translated
+/// label's. macOS's Arabic stand-in font is narrower than Segoe UI, so in
+/// Arabic the buttons took that spacing here where they covered the text
+/// on Windows.
+fn stream_header_text_ends_before_its_buttons(shared: &SharedControl) {
+    const HEADER_SPACING: f32 = 14.0;
+    let size = egui::vec2(820.0, 560.0);
+    let mut under = Vec::new();
+    for running in [true, false] {
+        PIPELINE_STATS.lock().pipeline_running = running;
+        let (title, description) = if running {
+            (
+                "Ready for your iPad",
+                "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable.",
+            )
+        } else {
+            (
+                "Streaming is off",
+                "Click Start streaming so your iPad can connect.",
+            )
+        };
+        for lang in eternal_host::i18n::Lang::ALL {
+            let code = lang.code();
+            save_language(Some(code));
+            let mut h = harness(shared, size);
+            h.run_steps(4);
+            let first = ["Start streaming", "Restart", "Stop"]
+                .into_iter()
+                .filter_map(|label| h.query(id(label).role(Role::Button)))
+                .map(|button| button.rect())
+                .min_by(|a, b| a.left().total_cmp(&b.left()))
+                .unwrap_or_else(|| panic!("{code} running={running}: no header button"));
+            for text in [title, description] {
+                // "Streaming is off" is in the sidebar too, left of the page.
+                let rect = h
+                    .get_all(id(text))
+                    .map(|node| node.rect())
+                    .max_by(|a, b| a.left().total_cmp(&b.left()))
+                    .unwrap();
+                if rect.right() + HEADER_SPACING > first.left() {
+                    under.push(format!(
+                        "{code} running={running}: {text:?} {rect:?} is under or within 14 px of {first:?}"
+                    ));
+                }
+            }
+        }
+    }
+    PIPELINE_STATS.lock().pipeline_running = true;
+    assert!(under.is_empty(), "{}", under.join("\n"));
 }
 
 /// A menu in a Settings row: named by the row's title as a screen reader
