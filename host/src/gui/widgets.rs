@@ -221,6 +221,23 @@ pub fn button(ui: &mut Ui, tone: Tone, icon: Option<Icon>, label: &str) -> Respo
     button_ex(ui, tone, icon, label, true, 0.0)
 }
 
+/// The width [`button`] gives `label`, with `icon`, in the language shown.
+pub fn button_width(ui: &Ui, icon: Option<Icon>, label: &str) -> f32 {
+    let (galley, icon_width) = button_content(ui, icon, label);
+    icon_width + galley.size().x + 28.0
+}
+
+/// A button's label laid out, and the room its icon takes.
+fn button_content(ui: &Ui, icon: Option<Icon>, label: &str) -> (std::sync::Arc<egui::Galley>, f32) {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(13.0, medium()),
+        Color32::PLACEHOLDER,
+    );
+    let icon_width = if icon.is_some() { 16.0 + 7.0 } else { 0.0 };
+    (galley, icon_width)
+}
+
 /// `min_width` > 0 stretches the button, e.g. to fill a dialog.
 pub fn button_ex(
     ui: &mut Ui,
@@ -230,12 +247,7 @@ pub fn button_ex(
     enabled: bool,
     min_width: f32,
 ) -> Response {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        FontId::new(13.0, medium()),
-        Color32::PLACEHOLDER,
-    );
-    let icon_width = if icon.is_some() { 16.0 + 7.0 } else { 0.0 };
+    let (galley, icon_width) = button_content(ui, icon, label);
     let content_width = icon_width + galley.size().x;
     let size = vec2((content_width + 28.0).max(min_width), BUTTON_HEIGHT);
     let sense = if enabled {
