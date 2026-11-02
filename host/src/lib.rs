@@ -9,6 +9,7 @@ pub mod console;
 pub mod control;
 pub mod diagnostics;
 pub mod discovery;
+pub mod display_guard;
 pub mod encoder;
 pub mod feedback;
 pub mod gpu_preference;

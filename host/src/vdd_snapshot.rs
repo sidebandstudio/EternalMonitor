@@ -44,8 +44,13 @@ pub struct Target {
 
 impl Target {
     fn is_vdd(&self) -> bool {
-        self.monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
+        is_vdd_monitor(&self.monitor_path)
     }
+}
+
+/// Whether a monitor device path is the virtual display's.
+pub fn is_vdd_monitor(monitor_path: &str) -> bool {
+    monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
 }
 
 /// The adapters the driver can be pinned to, in DXGI order, without the
@@ -252,7 +257,7 @@ pub fn render_card_now(before: &[u64]) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{adapters, targets};
+pub use windows_impl::{adapters, display_config, monitor_path, targets, value as luid_value};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -262,14 +267,15 @@ mod windows_impl {
         DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
         DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_MODE_INFO,
         DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ALL_PATHS,
+        QUERY_DISPLAY_CONFIG_FLAGS,
     };
-    use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
 
     /// `DISPLAYCONFIG_PATH_ACTIVE`.
     const PATH_ACTIVE: u32 = 1;
 
-    fn value(luid: LUID) -> u64 {
+    pub fn value(luid: LUID) -> u64 {
         ((luid.HighPart as u32 as u64) << 32) | luid.LowPart as u64
     }
 
@@ -313,41 +319,60 @@ mod windows_impl {
             .collect()
     }
 
+    /// The paths and modes `QueryDisplayConfig` reports for `flags`: sized,
+    /// then read, and read again if the configuration changed in between.
+    pub fn display_config(
+        flags: QUERY_DISPLAY_CONFIG_FLAGS,
+    ) -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
+        crate::gpu_preference::read_display_config(|| {
+            use crate::gpu_preference::ConfigRead;
+            let (mut paths, mut modes) = (0u32, 0u32);
+            if unsafe { GetDisplayConfigBufferSizes(flags, &mut paths, &mut modes) }
+                != ERROR_SUCCESS
+            {
+                return Err(ConfigRead::Failed);
+            }
+            let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+            let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+            match unsafe {
+                QueryDisplayConfig(
+                    flags,
+                    &mut paths,
+                    path_info.as_mut_ptr(),
+                    &mut modes,
+                    mode_info.as_mut_ptr(),
+                    None,
+                )
+            } {
+                ERROR_SUCCESS => {
+                    path_info.truncate(paths as usize);
+                    mode_info.truncate(modes as usize);
+                    Ok((path_info, mode_info))
+                }
+                ERROR_INSUFFICIENT_BUFFER => Err(ConfigRead::Changed),
+                _ => Err(ConfigRead::Failed),
+            }
+        })
+    }
+
+    /// The device path of the monitor on a path's target, or empty.
+    pub fn monitor_path(path: &DISPLAYCONFIG_PATH_INFO) -> String {
+        let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+        name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+        name.header.adapterId = path.targetInfo.adapterId;
+        name.header.id = path.targetInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0 {
+            text(&name.monitorDevicePath)
+        } else {
+            String::new()
+        }
+    }
+
     /// Every active path, then each available target no active path uses.
     pub fn targets() -> Vec<Target> {
-        let (mut paths, mut modes) = (0u32, 0u32);
-        if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut paths, &mut modes) }
-            != ERROR_SUCCESS
-        {
+        let Some((path_info, _)) = display_config(QDC_ALL_PATHS) else {
             return Vec::new();
-        }
-        let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
-        let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
-        if unsafe {
-            QueryDisplayConfig(
-                QDC_ALL_PATHS,
-                &mut paths,
-                path_info.as_mut_ptr(),
-                &mut modes,
-                mode_info.as_mut_ptr(),
-                None,
-            )
-        } != ERROR_SUCCESS
-        {
-            return Vec::new();
-        }
-        path_info.truncate(paths as usize);
-        let monitor_path = |path: &DISPLAYCONFIG_PATH_INFO| {
-            let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-            name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-            name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-            name.header.adapterId = path.targetInfo.adapterId;
-            name.header.id = path.targetInfo.id;
-            if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0 {
-                text(&name.monitorDevicePath)
-            } else {
-                String::new()
-            }
         };
         let mut targets: Vec<Target> = Vec::new();
         let (active, inactive): (Vec<&DISPLAYCONFIG_PATH_INFO>, Vec<_>) = path_info

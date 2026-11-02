@@ -463,7 +463,9 @@ fn request_on_turn(
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed(None);
             crate::startup::display::change(enabled, progress, |progress| {
-                outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
+                outcome = crate::display_guard::around(enabled, log_screens, || {
+                    run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+                });
                 outcome == TaskOutcome::Done
             });
             *ran = Some(outcome);
@@ -520,8 +522,22 @@ pub(crate) fn disable_for_ended(
     crate::startup::display::disable_for_ended(
         host,
         || crate::startup::display::other_host(host, reporters),
-        || run_task(TASK_DISABLE, &mut || {}) == TaskOutcome::Done,
+        || {
+            crate::display_guard::around(false, crate::startup::reporter_log, || {
+                run_task(TASK_DISABLE, &mut || {})
+            }) == TaskOutcome::Done
+        },
     )
+}
+
+/// The display guard's lines in this host's log.
+#[cfg(windows)]
+fn log_screens(warn: bool, text: &str) {
+    if warn {
+        warn!("{text}");
+    } else {
+        info!("{text}");
+    }
 }
 
 #[cfg(test)]
