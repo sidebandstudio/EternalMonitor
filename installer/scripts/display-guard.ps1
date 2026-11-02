@@ -136,7 +136,9 @@ function Set-SavedLayout($Saved) {
 function Set-PcScreenOnly { Use-Native; [EternalMonitor.DisplayGuard]::InternalOnly() }
 function Wait-Display([int]$Milliseconds) { Start-Sleep -Milliseconds $Milliseconds }
 
-function Get-RealScreens($Screens) { @($Screens | Where-Object { $_ -and !$_.Virtual }) }
+# Always an array, even of one: PowerShell unrolls a function's output, and Windows PowerShell 5.1
+# gives a lone [pscustomobject] (a saved screen) no .Count.
+function Get-RealScreens($Screens) { ,@($Screens | Where-Object { $_ -and !$_.Virtual }) }
 
 # The screens as one log value, as the app writes it: the count of real screens, each one's kind,
 # target and mode, and the count of virtual ones.

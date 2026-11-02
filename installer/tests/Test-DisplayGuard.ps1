@@ -64,6 +64,11 @@ function Expect([string]$Case, [string]$Output, [string]$Want, [int[]]$Reapply, 
 }
 $both = 'paths=2 [internal tgt=d2c1/4352 1920x1200@165Hz | external tgt=d2c1/4353 2560x1440@59.94Hz]'
 try {
+    # One screen is still a list of one on every PowerShell: 5.1 has no .Count on a lone saved screen.
+    $one = Get-RealScreens (Layout panel)
+    if ($one -isnot [array] -or $one.Count -ne 1 -or (Get-RealScreens (Layout vdd)).Count -ne 0) {
+        $failures += "Get-RealScreens does not return a list: $($one.GetType().FullName)"
+    }
     # Healthy: no SetDisplayConfig call and no wait.
     Reset-Fixture @((Layout panel, monitor), (Layout panel, monitor))
     $out = Invoke-Setup
