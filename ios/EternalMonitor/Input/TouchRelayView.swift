@@ -199,7 +199,10 @@ final class RelayTouchUIView: UIView {
 
     @objc private func resumeInput() { updateKeyboardPresentation() }
 
-    func updateLanguage() { keyboardInput.updateLanguage() }
+    func updateLanguage() {
+        accessibilityLabel = L("Remote control surface. Touches control the PC.")
+        keyboardInput.updateLanguage()
+    }
 
     @objc private func keyboardFrameChanged(_ notification: Notification) {
         guard keyboardVisible, keyboardInput.isFirstResponder, let window,
