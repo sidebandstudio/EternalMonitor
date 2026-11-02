@@ -55,6 +55,9 @@ fault-injection = []
 # Lets a release build obey ETERNAL_USB_DIRECT, for the end-to-end scripts.
 # Debug builds always do; shipped builds never do.
 usb-direct = []
+# Counts the transport's UDP datagrams per address, for the paused-clock
+# simulations in tests/. Only the tests turn it on.
+test-hooks = []
 
 [build-dependencies]
 winresource = "0.1"
@@ -64,6 +67,7 @@ pkg-config = "0.3"
 [dev-dependencies]
 # Paused-clock simulations of the USB link.
 tokio = { version = "1", features = ["test-util"] }
+eternal-host = { path = ".", features = ["test-hooks"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }

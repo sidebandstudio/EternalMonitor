@@ -32,10 +32,13 @@ when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on
-macOS and in tests. YUV420P is the encoder-input default. The optional Auto/BGRA
-path checks the selected codec's advertised formats; software x264 stays YUV.
-Windows converts with swscale; the macOS development path uses a tested
-Accelerate conversion with a swscale fallback.
+macOS and in tests. On fresh settings NVIDIA's encoders take BGRA and convert
+it on the graphics card, and every other encoder takes YUV420P (NV12 on Quick
+Sync); settings from earlier versions keep the input they saved.
+BGRA and Auto check the selected codec's advertised formats; software x264
+stays YUV. Windows converts with swscale, which reads the capture buffer
+directly (capture pads it by FFmpeg's 64 bytes); the macOS development path uses a tested Accelerate conversion with a
+swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
 restart-storm brake. Driver calls that can block for good (D3D11 device creation,
@@ -73,13 +76,16 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 | PING / PONG | Min-RTT clock estimate for end-to-end latency |
 | INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
 | Audio | Sequenced Opus packets with discontinuity and capture timing |
-| BYE | User, background or shutdown teardown |
+| BYE | User, background or shutdown teardown; the host ending a silent session |
 
 One session owns the active link. Another device receives Busy; a reconnect from
 the same device supersedes its prior session. Duplicate accepted nonces replay
 the same ACK. All established-session traffic is session-id gated. Reports/input
-maintain liveness; expiry removes the client, and 10 s later its managed
-virtual display unless the iPad has come back.
+maintain liveness. After 3 s of silence a client that had a picture is held:
+its input is released and another device may connect, but the stream goes on.
+Anything from it resumes the session; at 10 s the host ends it with a BYE. A
+client that never had a picture ends at 3 s. The managed virtual display goes
+10 s after the silence reaches 3 s unless the iPad has come back.
 
 UDP carries video, audio and control on the same socket. The iPad's established
 Network.framework backend remains the default. A selectable BSD backend uses a
@@ -187,7 +193,11 @@ an opt-in Win mapping; iPadOS retains its reserved shortcuts.
 The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
 Users read/execute permission. The host starts a virtual display only for a
 connected client, writes the requested mode first in VDD XML, and reports actual
-task failures. It also ships a UDP firewall rule. Runtime upgrade, task-ACL and
+task failures. Setup and the host log the active display paths around every
+driver change; when a change leaves the PC without any real screen it had, they
+re-apply the saved layout once, else switch to "PC screen only" if the built-in
+panel was on (`display_guard.rs`, `display-guard.ps1`). It also ships a UDP
+firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
 mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,

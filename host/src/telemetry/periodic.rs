@@ -101,6 +101,7 @@ const KINDS: [Kind; 3] = [
             ("encode_fps", Gauge),
             ("send_fps", Gauge),
             ("encode_us", Gauge),
+            ("convert_us", Gauge),
             ("codec", Last),
             ("cpu_fallback", Last),
             ("resolution", Last),
@@ -449,11 +450,13 @@ mod tests {
         format!(
             "{}  INFO Support stream summary session_id=Some({session}) running=true \
              captured=100 encoded=98 sent=0 capture_fps=59.94 encode_fps=59.9 send_fps=59.9 \
-             encode_us=2100 codec=H.264 (NVENC) cpu_fallback=false resolution=(2560, 1600) \
+             encode_us=2100 convert_us={} codec=H.264 (NVENC) cpu_fallback=false \
+             resolution=(2560, 1600) \
              bitrate=15000000 target_fps=60 max_dgram=1400 input=Yuv420 hevc=false \
              retransmits=0 usb_drops=0 usb_state=Waiting for an iPad usb_devices=0 \
              capture_heartbeat_age_ms=16 encode_heartbeat_age_ms=17",
-            stamp(second)
+            stamp(second),
+            900 + second * 100,
         )
     }
 
@@ -543,6 +546,32 @@ mod tests {
             "{line}"
         );
         assert!(periodic.flush().is_empty(), "the window was closed");
+    }
+
+    /// The conversion before the encoder is summarized beside the encode
+    /// time it is not part of. A line without it, as hosts before it log,
+    /// still folds, without the field.
+    #[test]
+    fn conversion_time_is_summarized_beside_encode_time() {
+        let mut periodic = Periodic::default();
+        let start = Instant::now();
+        for second in [0, 10, 20] {
+            periodic.push(&summary(7, second), start + Duration::from_secs(second));
+        }
+        let line = periodic.flush_due(start + WINDOW).remove(0);
+        assert!(
+            line.contains(" stream_encode_us=2100/2100/2100 stream_convert_us=900/1900/2900 "),
+            "{line}"
+        );
+
+        let older = summary(7, 0).replace(" convert_us=900", "");
+        periodic.push(&older, start);
+        let line = periodic.flush().remove(0);
+        assert!(!line.contains("convert_us"), "{line}");
+        assert!(
+            line.contains(" stream_encode_us=2100/2100/2100 stream_codec=H.264 (NVENC) "),
+            "{line}"
+        );
     }
 
     #[test]

@@ -394,6 +394,18 @@ fn info_line(text: &str) -> String {
     timestamped(" INFO", text)
 }
 
+/// A line from the failure reporter, which has no tracing subscriber, in
+/// the session log. For the display guard around its turn off.
+#[cfg(windows)]
+pub(crate) fn reporter_log(warn: bool, text: &str) {
+    let line = if warn {
+        timestamped(" WARN", text)
+    } else {
+        info_line(text)
+    };
+    let _ = crate::logging::append_now(&line);
+}
+
 fn timestamped(level: &str, text: &str) -> String {
     use tracing_subscriber::fmt::time::FormatTime;
     let mut time = String::new();

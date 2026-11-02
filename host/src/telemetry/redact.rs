@@ -134,6 +134,13 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "remote_config",
     "rollout",
     "ss_rule",
+    // A silent client's session held, kept or ended.
+    "silent_ms",
+    "held_ms",
+    "last_heard",
+    "heard",
+    "late_input",
+    "max_late_ms",
     // renderer_rule.
     "applied",
     "rule",
@@ -1258,6 +1265,12 @@ mod tests {
                 "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
                  device=<device-name> [repeated 1 more times from 1 to 2]",
             ),
+            (
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 silent_ms=10000 held_ms=7000 last_heard=report late_input=2 device=Maria's iPad",
+                "Client liveness expired — tearing session down peer=192.0.2.7:50000 \
+                 silent_ms=10000 held_ms=7000 last_heard=report late_input=2 device=<device-name>",
+            ),
         ] {
             assert_eq!(redact(text, &names), uploaded, "{text}");
         }
@@ -1899,6 +1912,22 @@ mod tests {
                 r#"WARN Virtual display failure snapshot adapters=[d2c1 "Intel(R) Iris(R) Xe" 8086:46a6 driver=32.0.101.7092 outputs=1 | 10000e5f0 "GeForce3050" 10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 tech=5 vdd=yes]"#,
             ),
             ("yes", "WARN Virtual display failure snapshot paths=[active src=d2c1/0 tgt=d2c1/4352 tech=5 vdd=yes]"),
+            // The display guard (display_guard.rs) uses only these fields.
+            (
+                "internal",
+                "INFO Screens before the virtual display turns on: paths=2 [internal tgt=d2c1/4352 \
+                 1920x1200@165Hz | external tgt=d2c1/4353 2560x1440@59.94Hz] vdd=0",
+            ),
+            (
+                "saved_layout",
+                "INFO Screens restored outcome=restored applied=saved_layout paths=1 [internal \
+                 tgt=d2c1/4352 1920x1200@165Hz] vdd=0",
+            ),
+            (
+                "restore_failed",
+                "WARN Could not restore the screens outcome=restore_failed \
+                 reason=saved_layout_refused code=87 reason=internal_refused code=31 paths=0 [] vdd=0",
+            ),
             (
                 "hevc_nvenc",
                 "INFO Staying on the encoder that streams for this pipeline from=hevc_nvenc to=h264_nvenc",
@@ -1935,6 +1964,19 @@ mod tests {
             ("Dx12", "INFO Window renderer instance backends=DX12 choice=Some(Dx12) chosen_failed=false"),
             ("dx12", "INFO renderer_rule applied=intel:31.0.101.2111->dx12"),
             ("set_aside", "INFO renderer_rule ignored reason=set_aside rule=nvidia:32.0.15.9186->vulkan"),
+            (
+                "report",
+                "WARN Client silent — holding the session session_id=7 silent_ms=3000 last_heard=report",
+            ),
+            (
+                "keyframe",
+                "INFO Client heard again — session kept session_id=7 silent_ms=5200 held_ms=2200 heard=keyframe",
+            ),
+            (
+                "input",
+                "WARN Client liveness expired — tearing session down peer=192.0.2.7:50000 silent_ms=10000 \
+                 held_ms=7000 last_heard=input late_input=0 device=iPad",
+            ),
         ];
         for (name, message) in cases {
             let line = format!("{STAMP}  {message}");

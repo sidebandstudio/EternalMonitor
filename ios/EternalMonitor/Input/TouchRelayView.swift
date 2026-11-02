@@ -100,7 +100,7 @@ final class RelayTouchUIView: UIView {
         // VoiceOver: this surface IS the remote pointer — pass touches
         // straight through instead of narrating them.
         isAccessibilityElement = true
-        accessibilityLabel = "Remote control surface. Touches control the PC."
+        accessibilityLabel = L("Remote control surface. Touches control the PC.")
         accessibilityTraits = .allowsDirectInteraction
         accessibilityIdentifier = "display.relay"
         let scroll = UIPanGestureRecognizer(target: self, action: #selector(pointerScrolled(_:)))
@@ -199,7 +199,10 @@ final class RelayTouchUIView: UIView {
 
     @objc private func resumeInput() { updateKeyboardPresentation() }
 
-    func updateLanguage() { keyboardInput.updateLanguage() }
+    func updateLanguage() {
+        accessibilityLabel = L("Remote control surface. Touches control the PC.")
+        keyboardInput.updateLanguage()
+    }
 
     @objc private func keyboardFrameChanged(_ notification: Notification) {
         guard keyboardVisible, keyboardInput.isFirstResponder, let window,

@@ -225,6 +225,14 @@ impl SharedControl {
         self.session.lock().is_active()
     }
 
+    /// A client is connected and heard from: one whose session is on hold
+    /// after a silence counts as gone for the second screen, so its display
+    /// still goes the same time after the iPad's last packet.
+    pub(crate) fn client_heard(&self) -> bool {
+        let session = self.session.lock();
+        session.is_active() && !session.on_hold()
+    }
+
     /// The user asked to try again: a second screen that failed to start is
     /// tried once more at the next connection.
     pub(crate) fn retry_second_screen(&self) {

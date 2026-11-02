@@ -4,21 +4,25 @@ import XCTest
 /// a tap anywhere along its way out must reach the stream, so the
 /// three-finger reveal works there instead of pressing a HUD button.
 final class HUDHideTests: UITestCase {
-    func testLeavingHUDPassesTapsToTheStream() {
+    func testLeavingHUDPassesTapsToTheStream() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         let environment = ProcessInfo.processInfo.environment
         let app = XCUIApplication()
         // A ten-second slide keeps the HUD leaving while every tap lands.
         app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
-                               "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit"]
+                               "-playPCaudio", "NO", "-hudHideSeconds", "10", "-pictureFit", "fit",
+                               "-uiTestProbe", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         launchCleanly(app)
         defer { app.terminate() }
         let keyboard = app.buttons["display.keyboard"]
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
-        let keyboardFrame = keyboard.frame
-        let disconnectFrame = app.buttons["display.disconnect"].frame
+        // The HUD can come and go while a starved runner waits for the app
+        // to idle; the probe still shows that it appeared.
+        app.waitForDisplayAndHUD()
+        let shown = app.hudControls(["display.keyboard", "display.disconnect"], reveal: .threeFingersTogether)
+        let keyboardFrame = try XCTUnwrap(shown["display.keyboard"]).frame
+        let disconnectFrame = try XCTUnwrap(shown["display.disconnect"]).frame
         let middle = center(app.frame)
         let bottom = app.frame.maxY - 5
         // An expectation polls about once a second; this loop sees the HUD
@@ -42,9 +46,9 @@ final class HUDHideTests: UITestCase {
             XCTFail(app.textFields["connect.host"].exists ? "A tap pressed Disconnect"
                 : "The three-finger tap did not bring the HUD back")
         }
-        XCTAssertEqual(keyboard.label, "Keyboard", "A tap pressed the Keyboard button")
+        let back = app.hudControls(["display.keyboard", "display.disconnect"], reveal: .threeFingersTogether)
+        XCTAssertEqual(back["display.keyboard"]?.label, "Keyboard", "A tap pressed the Keyboard button")
         XCTAssertFalse(app.keyboards.firstMatch.exists)
-        XCTAssertTrue(app.buttons["display.disconnect"].exists)
     }
 
     /// A VoiceOver user reads the HUD at their own pace: it must not hide

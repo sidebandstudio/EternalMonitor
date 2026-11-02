@@ -1174,6 +1174,7 @@ dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "eternal-host",
  "eternal-updater",
  "eternal-wire",
  "ffmpeg-next",

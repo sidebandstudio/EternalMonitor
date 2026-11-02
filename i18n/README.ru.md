@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | Принудительно выбрать кодировщик (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` или `0` переопределяет настройку HEVC |
 | `ETERNAL_FPS` | Переопределить частоту кадров хоста; настройка iPad по-прежнему ограничивает её |
-| `ETERNAL_INPUT` | Вход кодировщика: `yuv420` (по умолчанию), `auto` или `bgra` |
+| `ETERNAL_INPUT` | Вход кодировщика: `automatic` (по умолчанию: BGRA для NVIDIA, YUV420 для остальных), `yuv420`, `auto` или `bgra` |
 | `ETERNAL_MAX_DGRAM` | Размер медиадатаграммы, от 576 до 1400 байт |
 | `ETERNAL_CAPTURE` | `synthetic` заменяет DXGI сгенерированным тестовым изображением |
 | `ETERNAL_AUDIO` | `synthetic` выбирает детерминированный тестовый источник звука |

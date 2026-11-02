@@ -103,7 +103,10 @@ impl Link for UdpLink {
             return Err(invalid("UDP destination"));
         };
         check_length(datagram.len())?;
-        self.socket.send_to(datagram, addr).await.map(|_| ())
+        self.socket.send_to(datagram, addr).await?;
+        #[cfg(feature = "test-hooks")]
+        super::probe::sent(addr);
+        Ok(())
     }
 }
 

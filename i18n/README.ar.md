@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | فرض مرمّز (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | تتجاوز `1` أو `0` تفضيل HEVC |
 | `ETERNAL_FPS` | تجاوز معدل إطارات المضيف؛ يظل تفضيل iPad حدًا أقصى له |
-| `ETERNAL_INPUT` | مدخل المرمّز: `yuv420` (الافتراضي) أو `auto` أو `bgra` |
+| `ETERNAL_INPUT` | مدخل المرمّز: `automatic` (الافتراضي: BGRA لـ NVIDIA وYUV420 للبقية) أو `yuv420` أو `auto` أو `bgra` |
 | `ETERNAL_MAX_DGRAM` | حجم مخطط بيانات الوسائط، من 576 إلى 1400 بايت |
 | `ETERNAL_CAPTURE` | يستبدل `synthetic` ‏DXGI بنمط اختبار مولّد |
 | `ETERNAL_AUDIO` | يختار `synthetic` مصدر اختبار صوت حتميًا |
