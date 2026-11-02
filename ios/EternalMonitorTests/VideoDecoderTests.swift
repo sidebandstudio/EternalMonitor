@@ -295,9 +295,10 @@ final class VideoDecoderTests: XCTestCase {
     }
 
     private struct Run {
-        /// Output seqs ranked by submission: callback order has no promise,
-        /// and `FrameSlot` shows a frame only after the frames submitted before it.
-        var shown: [UInt32] { output.sorted { $0.sequence < $1.sequence }.map(\.seq) }
+        /// Every decoded frame's seq, ranked by submission. Callback order has
+        /// no promise, so this says nothing about display order, which
+        /// `FrameSlotTests` and the output gate test cover.
+        var decodedInSubmissionOrder: [UInt32] { output.sorted { $0.sequence < $1.sequence }.map(\.seq) }
         var output: [(sequence: UInt64, seq: UInt32)] = []
         var requests = 0
         var errors = 0
@@ -308,7 +309,7 @@ final class VideoDecoderTests: XCTestCase {
         var plainEvents: [String] = []
     }
 
-    /// Decodes (seq, access unit index) pairs and reports which seqs were shown.
+    /// Decodes (seq, access unit index) pairs and reports which seqs were decoded.
     private func run(_ ext: String, _ frames: [(UInt32, Int)], decoder: VideoDecoder = VideoDecoder()) throws -> (Run, VideoDecoder) {
         try run(ext, frames.map { ($0.0, $0.1, 0) }, decoder: decoder)
     }
@@ -344,7 +345,7 @@ final class VideoDecoderTests: XCTestCase {
         // the wrong reference: smeared blocks or -12909.
         for ext in ["h264", "h265"] {
             let (result, _) = try run(ext, [(1, 0), (2, 1), (4, 3), (5, 4), (6, 5)])
-            XCTAssertEqual(result.shown, [1, 2, 5, 6], ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, [1, 2, 5, 6], ext)
             XCTAssertEqual(result.requests, 1, "\(ext): a lost frame asks for a keyframe at once")
             XCTAssertEqual(result.errors, 0, ext)
         }
@@ -355,7 +356,7 @@ final class VideoDecoderTests: XCTestCase {
         // encoder had no time for, so frame_seq skips with nothing lost.
         for ext in ["h264", "h265"] {
             let (result, decoder) = try run(ext, [(1, 0), (2, 1), (5, 2), (9, 3), (10, 4), (14, 5), (15, 6)])
-            XCTAssertEqual(result.shown, [1, 2, 5, 9, 10, 14, 15], ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, [1, 2, 5, 9, 10, 14, 15], ext)
             XCTAssertEqual(result.requests, 0, ext)
             XCTAssertNil(decoder.keyframeWaitUs, ext)
         }
@@ -365,7 +366,7 @@ final class VideoDecoderTests: XCTestCase {
         // USB is a TCP tunnel: every frame arrives, in order.
         for ext in ["h264", "h265"] {
             let (result, _) = try run(ext, (0..<8).map { (UInt32($0 + 1), $0) })
-            XCTAssertEqual(result.shown, Array(1...8), ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, Array(1...8), ext)
             XCTAssertEqual(result.requests, 0, ext)
         }
     }
@@ -375,7 +376,7 @@ final class VideoDecoderTests: XCTestCase {
         // depends on it, not on seq 2.
         for ext in ["h264", "h265"] {
             let (result, _) = try run(ext, [(1, 0), (2, 1), (4, 5), (5, 6), (6, 4), (7, 5)])
-            XCTAssertEqual(result.shown, [1, 2, 6, 7], ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, [1, 2, 6, 7], ext)
             XCTAssertEqual(result.errors, 0, ext)
         }
     }
@@ -384,27 +385,25 @@ final class VideoDecoderTests: XCTestCase {
         // A new stream epoch numbers from 1 again; its first keyframe was lost.
         for ext in ["h264", "h265"] {
             let (result, _) = try run(ext, [(7, 0), (8, 1), (1, 1), (2, 2), (3, 4), (4, 5)])
-            XCTAssertEqual(result.shown, [7, 8, 3, 4], ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, [7, 8, 3, 4], ext)
         }
     }
 
     func testOldStreamFrameOutputAfterTheNewStreamsIsNotShown() throws {
         // VideoToolbox promises no output order: on CI (run 41371109729) the
         // restarted stream's keyframe came out before the old stream's last
-        // frame. Here frame 8's output waits until the new stream's are out.
+        // frame. Here every output is held, then released in a fixed order
+        // with frame 8's last, whatever order VideoToolbox returned them in.
         for ext in ["h264", "h265"] {
             let units = try twoGOPs(ext)
             let decoder = VideoDecoder()
             let slot = FrameSlot()
-            let late = OSAllocatedUnfairLock<(() -> Void)?>(initialState: nil)
+            let held = OSAllocatedUnfairLock(initialState: [UInt32: () -> Void]())
+            let allHeld = expectation(description: "all four outputs held")
+            allHeld.expectedFulfillmentCount = 4
             decoder.outputGate = { timestamp, output in
-                switch timestamp / 16_667 {
-                case 8: late.withLock { $0 = output }
-                case 4:
-                    output()
-                    late.withLock { $0 }?()
-                default: output()
-                }
+                held.withLock { $0[UInt32(timestamp / 16_667)] = output }
+                allHeld.fulfill()
             }
             let result = OSAllocatedUnfairLock(initialState: (shown: [UInt32](), refused: [UInt32]()))
             // The same hand-off as ConnectionManager's.
@@ -415,6 +414,10 @@ final class VideoDecoderTests: XCTestCase {
             for (seq, index) in [(7, 0), (8, 1), (1, 1), (2, 2), (3, 4), (4, 5)] as [(UInt32, Int)] {
                 decoder.decode(packet: packet(seq: seq, data: units[index], keyframe: index % 4 == 0))
             }
+            wait(for: [allHeld], timeout: 10)
+            let outputs = held.withLock { $0 }
+            XCTAssertEqual(Set(outputs.keys), [7, 8, 3, 4], ext)
+            for frame in [7, 3, 4, 8] as [UInt32] { outputs[frame]?() }
             let drained = expectation(description: "decode queue drained")
             decoder.shutdown { drained.fulfill() }
             wait(for: [drained], timeout: 10)
@@ -433,8 +436,8 @@ final class VideoDecoderTests: XCTestCase {
             let units = try twoGOPs(ext)
             let assembler = FrameAssembler()
             let decoder = VideoDecoder()
-            let shown = OSAllocatedUnfairLock(initialState: [(sequence: UInt64, seq: UInt32)]())
-            decoder.onFrameDecoded = { _, timestamp, sequence in shown.withLock { $0.append((sequence, UInt32(timestamp / 16_667))) } }
+            let decoded = OSAllocatedUnfairLock(initialState: [(sequence: UInt64, seq: UInt32)]())
+            decoder.onFrameDecoded = { _, timestamp, sequence in decoded.withLock { $0.append((sequence, UInt32(timestamp / 16_667))) } }
             // The same hand-off as ConnectionManager's.
             assembler.onFrameAssembled = { data, seq, _, isKeyframe in
                 decoder.decode(packet: self.packet(seq: seq, data: data, keyframe: isKeyframe))
@@ -456,7 +459,7 @@ final class VideoDecoderTests: XCTestCase {
             decoder.shutdown { drained.fulfill() }
             wait(for: [drained], timeout: 10)
             XCTAssertEqual(assembler.counters.withLock { $0.framesDropped }, 1, ext)
-            XCTAssertEqual(shown.withLock { $0 }.sorted { $0.sequence < $1.sequence }.map(\.seq), [1, 3, 4], ext)
+            XCTAssertEqual(decoded.withLock { $0 }.sorted { $0.sequence < $1.sequence }.map(\.seq), [1, 3, 4], ext)
         }
     }
 
@@ -467,7 +470,7 @@ final class VideoDecoderTests: XCTestCase {
         // new stream the iPad never had.
         for ext in ["h264", "h265"] {
             let (result, _) = try run(ext, [(1, 0, 1), (2, 5, 2), (3, 4, 2), (4, 5, 2)])
-            XCTAssertEqual(result.shown, [1, 3, 4], ext)
+            XCTAssertEqual(result.decodedInSubmissionOrder, [1, 3, 4], ext)
             XCTAssertEqual(result.requests, 1, ext)
         }
     }
@@ -479,10 +482,10 @@ final class VideoDecoderTests: XCTestCase {
         let numbered = VideoDecoder()
         numbered.setFrameSeqContiguous(true)
         let (held, _) = try run("h264", [(1, 0), (3, 5), (4, 4), (5, 5)], decoder: numbered)
-        XCTAssertEqual(held.shown, [1, 4, 5])
+        XCTAssertEqual(held.decodedInSubmissionOrder, [1, 4, 5])
         XCTAssertEqual(held.requests, 1)
-        let (shown, _) = try run("h264", [(1, 0), (3, 5), (4, 4), (5, 5)])
-        XCTAssertEqual(shown.shown, [1, 3, 4, 5], "a 0.3.1 PC's numbers skip on their own")
+        let (unflagged, _) = try run("h264", [(1, 0), (3, 5), (4, 4), (5, 5)])
+        XCTAssertEqual(unflagged.decodedInSubmissionOrder, [1, 3, 4, 5], "a 0.3.1 PC's numbers skip on their own")
     }
 
     func testSilentStreamStillRetriesThenRestartsThenReconnects() throws {
@@ -624,7 +627,7 @@ final class VideoDecoderTests: XCTestCase {
         let (result, _) = try run("h264", [(1, 0), (2, 1), (3, 4), (4, 0), (5, 4), (6, 5)],
                                   decoder: VideoDecoder(makeSession: factory))
         XCTAssertEqual(attempts.withLock { $0 }, 4, "one attempt per keyframe, none per dependent frame")
-        XCTAssertEqual(result.shown, [5, 6])
+        XCTAssertEqual(result.decodedInSubmissionOrder, [5, 6])
         XCTAssertEqual(result.events.filter { $0.hasPrefix("Failed to create VideoToolbox session") }.count, 1,
                        "the outage is logged once")
         XCTAssertTrue(result.events.contains { $0.contains("after 3 failed attempts") })

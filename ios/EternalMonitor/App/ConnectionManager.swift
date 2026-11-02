@@ -436,7 +436,10 @@ final class ConnectionManager: ObservableObject {
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
             // Store frame in lock-protected slot (no Sendable boundary crossed).
             // A frame that came out after a newer one is never shown.
-            guard self.frameSlot.set(pixelBuffer, sequence: sequence) else { return }
+            guard self.frameSlot.set(pixelBuffer, sequence: sequence) else {
+                Logger(subsystem: "com.eternal.monitor", category: "decode").debug("Refused frame \(sequence) output after a newer one")
+                return
+            }
             // Capture only the scalars we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
             metrics.recordDecoded(at: ControlChannel.clientNowUs(), captureUs: ts)
