@@ -18,7 +18,16 @@ private let verboseDecodeLogging = false
 /// hammer") is gone — the host prepends fresh SPS/PPS on every IDR, so the format-change
 /// path covers resync without rebuilding the hardware decoder twice a second.
 final class VideoDecoder {
-    var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
+    /// `sequence` numbers the frame's submission: later submissions, in this
+    /// or any later decoder, have higher numbers. Asynchronous output carries
+    /// no promised order, so output can arrive after a newer frame's;
+    /// `FrameSlot` refuses it.
+    var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64, _ sequence: UInt64) -> Void)?
+    #if DEBUG
+    /// Tests: given each frame's timestamp and output, which it must call
+    /// exactly once, from any thread, to delay output as VideoToolbox may.
+    var outputGate: ((_ timestampUs: UInt64, _ output: @escaping () -> Void) -> Void)?
+    #endif
     var onEvent: ((String) -> Void)?
     /// Failures, which the owner logs once as errors. Without an owner they
     /// go to the support log directly. Both used to log each one, so every
@@ -134,6 +143,9 @@ final class VideoDecoder {
     }
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
+    /// The last submission's `sequence`, shared by every decoder so a new
+    /// connection's frames rank after the old one's.
+    private static let submissions = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     private let queued = OSAllocatedUnfairLock<Int>(initialState: 0)
     private let inFlight = OSAllocatedUnfairLock<Int>(initialState: 0)
     var decodeDepth: UInt8 { UInt8(clamping: queued.withLock { $0 } + inFlight.withLock { $0 }) }
@@ -793,6 +805,10 @@ final class VideoDecoder {
             }
             if first { self?.inFlight.withLock { $0 -= 1 } }
         }
+        let sequence = Self.submissions.withLock { last in
+            last &+= 1
+            return last
+        }
         let status = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
@@ -821,7 +837,13 @@ final class VideoDecoder {
             if let start = ended, self.nowUs() &- start >= Self.showRestoringAfterUs {
                 self.onEvent?("Picture held \((self.nowUs() &- start) / 1000) ms waiting for a keyframe")
             }
-            self.onFrameDecoded?(pixelBuffer, timestampUs)
+            #if DEBUG
+            if let outputGate = self.outputGate {
+                outputGate(timestampUs) { self.onFrameDecoded?(pixelBuffer, timestampUs, sequence) }
+                return
+            }
+            #endif
+            self.onFrameDecoded?(pixelBuffer, timestampUs, sequence)
         }
 
         if status != noErr || infoFlags.contains(.frameDropped) { finish() }
