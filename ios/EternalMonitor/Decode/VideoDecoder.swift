@@ -583,6 +583,8 @@ final class VideoDecoder {
            VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: newFormat) {
             onEvent?("Format change accepted by the live session — no rebuild needed")
         } else {
+            // The old session's frames come before the new session's.
+            if let session = decompressionSession { VTDecompressionSessionWaitForAsynchronousFrames(session) }
             createDecompressionSession()
         }
     }
@@ -690,6 +692,12 @@ final class VideoDecoder {
             return
         }
         if isSyncSample {
+            // Asynchronous output has no promised order, and a keyframe
+            // depends on no frame still in flight: once on CI it came out
+            // before the frame ahead of it, which the frame slot then showed
+            // over it. After a stream restart that is the old stream's picture
+            // over the new one. Let the earlier frames out first.
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
             recoveryGeneration &+= 1
             waitingForSyncSample = false
             let resume = recoveryGeneration
