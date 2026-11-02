@@ -9,9 +9,12 @@ final class NoPictureTimeoutTests: XCTestCase {
     /// The timeout under test: attempts that end without a picture end quickly.
     private let fast = ConnectionManager.Timing(connectTimeoutSeconds: 0.5, reconnectGraceSeconds: 0.1,
         reconnectBackoffSeconds: { _ in 0.05 })
-    /// For an attempt that has to stream: long enough that the fake PC's
-    /// handshake and picture never run out on a loaded machine. A test of
-    /// the timeout shortens it once the session streams.
+    /// The wait for the timeout under test: its 0.5 s on a main actor
+    /// stalled for seconds, and short of a watchdog that takes 5 s.
+    nonisolated private static let timeoutWaitSeconds = 4.0
+    /// For an attempt that has to stream, and the waits for it: long enough
+    /// that the fake PC's handshake and picture never run out on a loaded
+    /// machine. A test of the timeout shortens it once the session streams.
     private static let streamingTimeoutSeconds = 60.0
 
     override func setUp() async throws {
@@ -20,7 +23,7 @@ final class NoPictureTimeoutTests: XCTestCase {
         addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
     }
 
-    private func until(_ description: String, seconds: Double = 60, _ condition: () -> Bool) async throws {
+    private func until(_ description: String, seconds: Double = NoPictureTimeoutTests.timeoutWaitSeconds, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(condition(), description)
@@ -43,9 +46,9 @@ final class NoPictureTimeoutTests: XCTestCase {
         manager.connect(host: "127.0.0.1", port: host.port)
         let accepted = await Task.detached { host.acceptSession() }.value
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
-        try await until("handshake") { manager.hostInfo != nil }
+        try await until("handshake", seconds: Self.streamingTimeoutSeconds) { manager.hostInfo != nil }
         host.sendKeyframe(try FakeUDPHost.keyframe())
-        try await until("streaming") { manager.state == .connected }
+        try await until("streaming", seconds: Self.streamingTimeoutSeconds) { manager.state == .connected }
         return manager
     }
 
@@ -87,9 +90,14 @@ final class NoPictureTimeoutTests: XCTestCase {
         let manager = try await streaming(host)
         defer { manager.cancel() }
         manager.timing.connectTimeoutSeconds = fast.connectTimeoutSeconds
+        // The cycle's attempt numbers as they change: a poll can miss the
+        // first on a loaded machine once the cycle has moved on.
+        var attempts: [Int] = []
+        let cycle = manager.$reconnectAttempt.sink { attempts.append($0) }
+        defer { cycle.cancel() }
         host.sendBye(.error)
-        try await until("reconnecting") { manager.reconnectAttempt == 1 }
         let answered = await Task.detached { (0..<NoPictureStreak.limit).filter { _ in host.acceptSession() }.count }.value
+        XCTAssertTrue(attempts.contains(1), "reconnecting")
         XCTAssertEqual(answered, NoPictureStreak.limit)
         try await until("stopped") { manager.reconnectAttempt == 0 && manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .noPicture)
@@ -129,14 +137,17 @@ final class NoPictureTimeoutTests: XCTestCase {
         host.sendBye(.error)
         let accepted = await Task.detached { host.acceptSession() }.value
         XCTAssertTrue(accepted)
+        let answered = Date()
         let again = await Task.detached { host.acceptSession() }.value
         XCTAssertTrue(again, "the cycle never tried again")
+        let untilTheNextAttempt = Date().timeIntervalSince(answered)
+        XCTAssertLessThan(untilTheNextAttempt, Self.timeoutWaitSeconds, "the first attempt took \(untilTheNextAttempt) s to time out")
         XCTAssertNotNil(leftByTheFirst, "the cycle goes on")
         XCTAssertEqual(leftByTheFirst?.state, .disconnected, "the first attempt times out")
         XCTAssertEqual(leftByTheFirst?.problem, .noPicture, "the first attempt times out")
-        try await until("handshake") { manager.hostInfo != nil }
+        try await until("handshake", seconds: Self.streamingTimeoutSeconds) { manager.hostInfo != nil }
         host.sendKeyframe(try FakeUDPHost.keyframe())
-        try await until("streaming again") { manager.state == .connected }
+        try await until("streaming again", seconds: Self.streamingTimeoutSeconds) { manager.state == .connected }
         XCTAssertNil(manager.problem)
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
