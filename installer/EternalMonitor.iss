@@ -175,9 +175,10 @@ Source: "{#StagingDir}\EternalMonitor-host.exe"; DestDir: "{app}"; Flags: ignore
 Source: "{#StagingDir}\EternalMonitor-updater.exe"; DestDir: "{app}"; Flags: ignoreversion sign
 Source: "{#StagingDir}\*.dll";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
+Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\LICENSE";                 DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#StagingDir}\QUICKSTART.txt";          DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; The Finish page's "View README" opens this: a stock PC has nothing that opens .md files.
+Source: "{#StagingDir}\QUICKSTART.txt";          DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
 Source: "{#StagingDir}\Geist-OFL.txt";           DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\Noto-OFL.txt";            DestDir: "{app}"; Flags: ignoreversion
 #ifdef IncludeDriver
@@ -191,6 +192,7 @@ Source: "scripts\vdd-driver-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignore
 Source: "scripts\vdd-driver-verify.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-driver-repair.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-toggle.ps1";       DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\display-guard.ps1";    DestDir: "{app}\scripts"; Flags: ignoreversion
 #endif
 
 [Icons]
@@ -206,6 +208,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=domain,private,public enable=yes"; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
+; Save the screens before the driver steps: starting the virtual display can leave a PC with no
+; screen at all. The check after them puts the saved screens back only then. Both always exit 0.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action save -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 ; The vendor setup prompts to uninstall an existing installation even with silent
 ; switches. Preserve an existing driver and install only when it is absent.
 Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; StatusMsg: "{cm:DriverStatus}"; Flags: waituntilterminated; Check: NeedsVddInstall; AfterInstall: RecordVddOwnership
@@ -213,6 +218,8 @@ Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMS
 ; EternalMonitor turns it on only while streaming to it, so there's no phantom monitor.
 ; A preserved driver whose device was removed or broke is repaired first.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated; Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver
+; After the Disable above, and also when a failed driver step skipped it.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action check -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 #endif
 ; Launch the app at the end.
 Filename: "{app}\EternalMonitor-host.exe"; Description: "{cm:LaunchNow}"; Flags: nowait postinstall skipifsilent; Check: VddInstallSucceeded
