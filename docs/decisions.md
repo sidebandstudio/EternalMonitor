@@ -305,7 +305,7 @@ keychain. Build numbers increase with workflow runs; tags must match the marketi
 version. External-group setup, Beta App Review and the public link remain manual
 App Store Connect steps. A dry archive is not an installable TestFlight build.
 
-## v0.3.5 decisions
+## v0.3.4 decisions
 
 ### Hold a silent client's session, and say goodbye when the host ends it
 
