@@ -12,7 +12,9 @@ extension XCUIApplication {
     /// where it is, and touches it once more only if the toggle doesn't read
     /// `value` and the PC's input log at `path` shows nothing since the
     /// touch. A tap that reached the PC is never repeated, so a toggle that
-    /// flips twice, or not at all, still fails.
+    /// flips twice, or stays put although the PC got the key, still fails.
+    /// A toggle that stays put and sends nothing looks like a lost touch and
+    /// gets the second tap.
     func tapKeyboardKey(_ key: XCUIElement, until value: String, on toggle: XCUIElement? = nil,
                         hostLog path: String) -> String? {
         let toggle = toggle ?? key
