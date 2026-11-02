@@ -141,6 +141,7 @@ fn run_encode_loop(
     let mut stall_recovery = StallRecovery::default();
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
+    let mut bitrate_pacer = BitratePacer::default();
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -241,6 +242,19 @@ fn run_encode_loop(
                 failed_reopen = None;
             }
         }
+        // A bitrate change alone reopens at the pacer's pace; anything else
+        // that reopens takes the newest target with it.
+        let wanted_bitrate = encoder_state.as_ref().map_or(desired_bitrate, |state| {
+            bitrate_pacer.wanted(
+                (
+                    &state.opened_encoder,
+                    state.opened_bitrate,
+                    state.opened_fps,
+                ),
+                (&desired_encoder, desired_bitrate, target_fps),
+                Instant::now(),
+            )
+        });
 
         // Capture rebuilds at the new size after a display mode change (Radeon
         // Super Resolution, VSR, GPU scaling, a resized virtual display). The
@@ -273,6 +287,7 @@ fn run_encode_loop(
             ) {
                 Ok(state) => {
                     encoder_state = Some(state);
+                    bitrate_pacer.opened(Instant::now());
                     if stall_recovery.opened(&desired_encoder, &preferred)
                         && desired_encoder != "libx265"
                     {
@@ -323,6 +338,7 @@ fn run_encode_loop(
                     }
                     stall_recovery.opened(name, &preferred);
                     encoder_state = Some(state);
+                    bitrate_pacer.opened(Instant::now());
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(name == "libx264");
@@ -338,7 +354,7 @@ fn run_encode_loop(
                         state.opened_bitrate,
                         state.opened_fps,
                     ),
-                    (&desired_encoder, desired_bitrate, target_fps),
+                    (&desired_encoder, wanted_bitrate, target_fps),
                     keyframe_reopen,
                     failed_reopen.as_ref(),
                     lane_clear,
@@ -352,12 +368,25 @@ fn run_encode_loop(
             // context, so each means a session reopen (~50-200ms hiccup, no
             // transport teardown, same stream epoch) followed by a forced IDR.
             // So does a try of the preferred encoder after a stalled open.
+            // Every reopen takes the newest bitrate target, paced or not.
             if keyframe_reopen {
                 last_keyframe_reopen = Some(Instant::now());
             }
-            let (previous, current_encoder) = encoder_state
+            let (previous, current_encoder, reason) = encoder_state
                 .as_ref()
-                .map(|s| (s.opened_bitrate, s.opened_encoder.clone()))
+                .map(|s| {
+                    let reason = reopen_reason(
+                        (&s.opened_encoder, s.opened_fps),
+                        (&desired_encoder, target_fps),
+                        size_changed,
+                        keyframe_reopen,
+                        stall_recovery
+                            .owed
+                            .as_ref()
+                            .is_some_and(|owed| owed.preferred == desired_encoder),
+                    );
+                    (s.opened_bitrate, s.opened_encoder.clone(), reason)
+                })
                 .unwrap_or_default();
             stall_recovery.starting(&desired_encoder);
             match EncoderState::new(
@@ -384,9 +413,11 @@ fn run_encode_loop(
                         height = raw_frame.height,
                         size_changed,
                         keyframe = keyframe_reopen,
+                        reason,
                         "Reopened encoder session"
                     );
                     encoder_state = Some(state);
+                    bitrate_pacer.opened(Instant::now());
                     failed_reopen = None;
                     pending_keyframe = true;
                     // Back from libx264 to hardware (libx265 only replaces a
@@ -1326,6 +1357,94 @@ fn reopen_needed(
         || (opened != wanted
             && failed_reopen
                 .is_none_or(|(encoder, bitrate, fps)| (encoder.as_str(), *bitrate, *fps) != wanted))
+}
+
+/// How long after the session opened a bitrate decrease may wait, so that a
+/// burst of decreases (slider moves, a ceiling clamp then an ABR step, an
+/// ABR step just after an AMF keyframe reopen) reopens once.
+const BITRATE_DECREASE_GAP: Duration = Duration::from_secs(1);
+/// How long the target must stay above the session's bitrate before an
+/// increase reopens. ABR steps up only after 15 s without loss, and on a
+/// busy Wi-Fi link a third of those steps were undone within 20 s.
+const BITRATE_INCREASE_HOLD: Duration = Duration::from_secs(20);
+
+/// Paces reopens for a bitrate change alone. Hardware encoders (and
+/// libx265) take a new bitrate only by reopening, and each reopen costs an
+/// IDR and a visible stutter: an hour's Wi-Fi soak reopened NVENC 172 times.
+/// A decrease takes effect at once, or 1 s after the session opened if
+/// that is later, so the stream never overruns a congested link more than
+/// 1 s longer than before. An increase waits until the target has stayed
+/// above the session's bitrate for 20 s; a step back down before then
+/// costs no reopen. Codec, frame rate, size, keyframe and recovery reopens
+/// are not paced, and every reopen opens at the newest target.
+#[derive(Default)]
+struct BitratePacer {
+    /// When the open session opened, for any reason.
+    opened_at: Option<Instant>,
+    /// Since when the target has been above the session's bitrate.
+    raised_since: Option<Instant>,
+}
+
+impl BitratePacer {
+    /// The bitrate this frame wants. `opened` and `wanted` are encoder,
+    /// bitrate and frame rate. The newest target, unless only the bitrate
+    /// differs and its time has not come: then the session's own.
+    fn wanted(&mut self, opened: (&str, u32, u32), wanted: (&str, u32, u32), now: Instant) -> u32 {
+        let (opened_bitrate, bitrate) = (opened.1, wanted.1);
+        if bitrate <= opened_bitrate {
+            self.raised_since = None;
+        }
+        if (opened.0, opened.2) != (wanted.0, wanted.2) {
+            return bitrate;
+        }
+        let due = match bitrate.cmp(&opened_bitrate) {
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Less => self
+                .opened_at
+                .is_none_or(|at| now.duration_since(at) >= BITRATE_DECREASE_GAP),
+            std::cmp::Ordering::Greater => {
+                now.duration_since(*self.raised_since.get_or_insert(now)) >= BITRATE_INCREASE_HOLD
+            }
+        };
+        if due {
+            bitrate
+        } else {
+            opened_bitrate
+        }
+    }
+
+    /// A session opened, at the newest target.
+    fn opened(&mut self, now: Instant) {
+        self.opened_at = Some(now);
+        self.raised_since = None;
+    }
+}
+
+/// Why the open session reopens, for its log line: the first of these that
+/// holds. `opened` and `wanted` are encoder and frame rate; `owed_try` is a
+/// try of the encoder a stalled open left owed.
+fn reopen_reason(
+    opened: (&str, u32),
+    wanted: (&str, u32),
+    size_changed: bool,
+    keyframe: bool,
+    owed_try: bool,
+) -> &'static str {
+    if size_changed {
+        "size"
+    } else if opened.0 != wanted.0 {
+        if owed_try || is_hevc_encoder(opened.0) == is_hevc_encoder(wanted.0) {
+            "recovery"
+        } else {
+            "codec"
+        }
+    } else if opened.1 != wanted.1 {
+        "fps"
+    } else if keyframe {
+        "keyframe"
+    } else {
+        "bitrate"
+    }
 }
 
 /// The first wait before an H.264 reopen that failed is tried again for a
@@ -2838,6 +2957,9 @@ mod tests {
         client_hevc: bool,
         /// Encoder, bitrate and frame rate of the open session.
         opened: (String, u32, u32),
+        pacer: BitratePacer,
+        /// Bitrate changes the open libx264 session took in place.
+        in_place: usize,
         /// The user's preference.
         hevc_wanted: bool,
         bitrate: u32,
@@ -2848,8 +2970,9 @@ mod tests {
     }
 
     impl Pipeline {
-        /// `opened` streams at 8 Mbps and 60 fps, and `encoder_name` is the
-        /// H.264 encoder. HEVC is wanted if `opened` is HEVC.
+        /// `opened` streams at 15 Mbps (where ABR starts) and 60 fps, and
+        /// `encoder_name` is the H.264 encoder. HEVC is wanted if `opened`
+        /// is HEVC.
         fn new(encoder_name: &str, opened: &str, now: Instant) -> Self {
             Self {
                 recovery: StallRecovery::default(),
@@ -2860,9 +2983,11 @@ mod tests {
                 undecodable_retry: UndecodableRetry::default(),
                 session: Some(1),
                 client_hevc: true,
-                opened: (opened.to_string(), 8_000_000, 60),
+                opened: (opened.to_string(), 15_000_000, 60),
+                pacer: BitratePacer::default(),
+                in_place: 0,
                 hevc_wanted: is_hevc_encoder(opened),
-                bitrate: 8_000_000,
+                bitrate: 15_000_000,
                 fps: 60,
                 keyframe: false,
                 lane_clear: true,
@@ -2895,10 +3020,22 @@ mod tests {
                 self.session.is_some() && !client_hevc && is_hevc_encoder(&self.opened.0);
             self.undecodable_retry
                 .frame(undecodable, &mut self.failed_reopen, self.now);
+            // As `update_bitrate_without_reopening`.
+            if (self.opened.0.as_str(), self.opened.2) == ("libx264", self.fps)
+                && desired == "libx264"
+                && self.opened.1 != self.bitrate
+            {
+                self.opened.1 = self.bitrate;
+                self.failed_reopen = None;
+                self.in_place += 1;
+            }
             let opened = (self.opened.0.as_str(), self.opened.1, self.opened.2);
+            let wanted = self
+                .pacer
+                .wanted(opened, (&desired, self.bitrate, self.fps), self.now);
             if !reopen_needed(
                 opened,
-                (&desired, self.bitrate, self.fps),
+                (&desired, wanted, self.fps),
                 self.keyframe,
                 self.failed_reopen.as_ref(),
                 self.lane_clear,
@@ -2908,6 +3045,7 @@ mod tests {
             self.recovery.starting(&desired);
             if reopen == Reopen::Opens {
                 self.opened = (desired.clone(), self.bitrate, self.fps);
+                self.pacer.opened(self.now);
                 self.failed_reopen = None;
                 self.keyframe = false;
                 self.recovery.opened(&desired, &preferred);
@@ -3326,7 +3464,7 @@ mod tests {
         }
         p.later(16);
         assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
-        assert_eq!(p.opened, ("h264_nvenc".to_string(), 8_000_000, 60));
+        assert_eq!(p.opened, ("h264_nvenc".to_string(), 15_000_000, 60));
         for _ in 0..1_000 {
             p.later(16);
             assert_eq!(p.frame(Reopen::Opens), None);
@@ -3455,6 +3593,272 @@ mod tests {
         p.lane_clear = true;
         assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_amf"));
         assert!(p.recovery.owed.is_none());
+    }
+
+    /// Plays `steps` through the pipeline, a frame every 16 ms from its
+    /// clock, until `end_ms`: at each offset in ms, a new ABR target, or
+    /// `None` for an AMF keyframe reopen. The reopens, as (ms, bitrate).
+    fn play(p: &mut Pipeline, steps: &[(u64, Option<u32>)], end_ms: u64) -> Vec<(u64, u32)> {
+        let start = p.now;
+        let mut steps = steps.iter().peekable();
+        let mut reopens = Vec::new();
+        for ms in (0..=end_ms).step_by(16) {
+            p.now = start + Duration::from_millis(ms);
+            while let Some((_, step)) = steps.next_if(|(at, _)| *at <= ms) {
+                match step {
+                    Some(bitrate) => p.bitrate = *bitrate,
+                    None => p.keyframe = true,
+                }
+            }
+            if p.frame(Reopen::Opens).is_some() {
+                reopens.push((ms, p.opened.1));
+            }
+        }
+        reopens
+    }
+
+    #[test]
+    fn the_amd_laptops_last_50_seconds_reopen_amf_five_times_instead_of_seven() {
+        // The gaming laptop's h264_amf host log from 11-01 23:03:53.22Z,
+        // the 50 s before its display froze, in ms from an AMF keyframe
+        // reopen at 10 Mbps. ABR stepped 10 -> 8 -> 4 -> 6 -> 8 Mbps and
+        // the iPad asked for two more keyframes. Each of the 7 reopened AMF
+        // on the candidate, at 0, 0.4, 14.4, 14.4, 29.9, 42.7 and 45.4 s.
+        let mut p = Pipeline::new("h264_amf", "h264_amf", Instant::now());
+        p.opened.1 = 10_000_000;
+        p.bitrate = 10_000_000;
+        let steps = [
+            (0, None),
+            (422, Some(8_000_000)),
+            (14_360, None),
+            (14_409, Some(4_000_000)),
+            (29_929, Some(6_000_000)),
+            (42_663, None),
+            (45_417, Some(8_000_000)),
+        ];
+        let reopens = play(&mut p, &steps, 51_622);
+        // Each drop waits for the 1 s after the keyframe reopen before it.
+        // The rise to 6 Mbps rides on the next keyframe reopen, and the
+        // rise to 8 Mbps is still held when the session ends.
+        assert_eq!(
+            reopens,
+            [
+                (0, 10_000_000),
+                (1_008, 8_000_000),
+                (14_368, 8_000_000),
+                (15_376, 4_000_000),
+                (42_672, 6_000_000),
+            ]
+        );
+        // Had it gone on, 8 Mbps would have opened 20 s after the rise.
+        assert_eq!(play(&mut p, &[], 20_000), [(13_808, 8_000_000)]);
+
+        // ABR's steps alone, as on a PC whose encoder takes keyframe
+        // requests: 4 bitrate reopens on the candidate, 3 now. The drops go
+        // at once; the two rises 15 s apart open as one, 20 s after the
+        // first.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.opened.1 = 10_000_000;
+        p.bitrate = 10_000_000;
+        let steps: Vec<_> = steps.into_iter().filter(|(_, s)| s.is_some()).collect();
+        assert_eq!(
+            play(&mut p, &steps, 51_622),
+            [(432, 8_000_000), (14_416, 4_000_000), (49_936, 8_000_000)]
+        );
+    }
+
+    #[test]
+    fn a_drop_reopens_at_once_or_within_a_second_of_the_last_open() {
+        for name in [
+            "h264_nvenc",
+            "h264_amf",
+            "h264_qsv",
+            "hevc_nvenc",
+            "libx265",
+        ] {
+            let h264 = match name {
+                "hevc_nvenc" => "h264_nvenc",
+                "libx265" => "libx264",
+                other => other,
+            };
+            // Nothing opened in the last second: the same frame.
+            let mut p = Pipeline::new(h264, name, Instant::now());
+            assert_eq!(
+                play(&mut p, &[(0, Some(10_000_000))], 5_000),
+                [(0, 10_000_000)],
+                "{name}"
+            );
+            // 100 ms after a frame rate reopen: 1 s after that reopen.
+            let mut p = Pipeline::new(h264, name, Instant::now());
+            p.fps = 30;
+            let reopens = play(&mut p, &[(112, Some(10_000_000))], 5_000);
+            assert_eq!(reopens, [(0, 15_000_000), (1_008, 10_000_000)], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_burst_of_drops_reopens_once_at_the_newest_target() {
+        // An AMF keyframe reopen, then three drops within the second.
+        let mut p = Pipeline::new("h264_amf", "h264_amf", Instant::now());
+        let steps = [
+            (0, None),
+            (200, Some(12_000_000)),
+            (500, Some(10_000_000)),
+            (800, Some(8_000_000)),
+        ];
+        assert_eq!(
+            play(&mut p, &steps, 30_000),
+            [(0, 15_000_000), (1_008, 8_000_000)]
+        );
+        // With no open just before it, the first drop goes at once and the
+        // rest of the burst follows as one.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        let steps = [
+            (0, Some(12_000_000)),
+            (300, Some(10_000_000)),
+            (600, Some(8_000_000)),
+        ];
+        assert_eq!(
+            play(&mut p, &steps, 30_000),
+            [(0, 12_000_000), (1_008, 8_000_000)]
+        );
+    }
+
+    #[test]
+    fn a_rise_waits_until_the_target_has_held_for_20_seconds() {
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.opened.1 = 8_000_000;
+        p.bitrate = 8_000_000;
+        // ABR steps up twice, 15 s apart: one reopen, at the newest target,
+        // 20 s after the first step.
+        let steps = [(0, Some(10_000_000)), (15_000, Some(12_000_000))];
+        assert_eq!(play(&mut p, &steps, 60_000), [(20_000, 12_000_000)]);
+        // A step up undone within 20 s costs nothing; a new step up waits
+        // its own 20 s.
+        let mut p = Pipeline::new("h264_amf", "hevc_amf", Instant::now());
+        p.opened.1 = 12_000_000;
+        p.bitrate = 12_000_000;
+        let steps = [
+            (0, Some(15_000_000)),
+            (10_000, Some(12_000_000)),
+            (12_000, Some(15_000_000)),
+        ];
+        assert_eq!(play(&mut p, &steps, 60_000), [(32_000, 15_000_000)]);
+    }
+
+    #[test]
+    fn codec_and_frame_rate_changes_still_reopen_at_once_at_the_newest_target() {
+        // A frame rate reopen, then a new target that waits: a rise, or a
+        // drop within the second after that reopen. 100 ms later a frame
+        // rate change, an HEVC toggle or an AMF keyframe reopens on the
+        // frame it arrives, at the waiting target.
+        for target in [20_000_000, 10_000_000] {
+            for change in ["fps", "codec", "keyframe"] {
+                let name = if change == "keyframe" {
+                    "h264_amf"
+                } else {
+                    "h264_nvenc"
+                };
+                let mut p = Pipeline::new(name, name, Instant::now());
+                p.fps = 30;
+                assert_eq!(p.frame(Reopen::Opens).as_deref(), Some(name));
+                p.bitrate = target;
+                assert_eq!(play(&mut p, &[], 96), [], "{change} {target}");
+                p.later(16);
+                match change {
+                    "fps" => p.fps = 60,
+                    "codec" => p.hevc_wanted = true,
+                    _ => p.keyframe = true,
+                }
+                let expected = if change == "codec" {
+                    "hevc_nvenc"
+                } else {
+                    name
+                };
+                assert_eq!(
+                    p.frame(Reopen::Opens).as_deref(),
+                    Some(expected),
+                    "{change} {target}"
+                );
+                assert_eq!(p.opened.1, target, "{change} {target}");
+                assert_eq!(play(&mut p, &[], 60_000), [], "{change} {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_target_is_applied_never_dropped() {
+        // A rise held through a failed reopen of something else, then left
+        // alone: it reopens once its 20 s are up.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.opened.1 = 8_000_000;
+        p.bitrate = 10_000_000;
+        assert_eq!(play(&mut p, &[], 10_000), []);
+        p.hevc_wanted = true;
+        assert_eq!(p.frame(Reopen::Fails).as_deref(), Some("hevc_nvenc"));
+        assert_eq!(p.opened, ("h264_nvenc".to_string(), 8_000_000, 60));
+        assert_eq!(play(&mut p, &[], 20_000), [(10_000, 10_000_000)]);
+        // A drop that waits for the second after an open, then a rise back
+        // above the open session's bitrate before it is due: the rise waits
+        // its 20 s and then opens at the newest target.
+        let mut p = Pipeline::new("h264_amf", "h264_amf", Instant::now());
+        let steps = [
+            (0, None),
+            (300, Some(10_000_000)),
+            (600, Some(20_000_000)),
+            (900, Some(25_000_000)),
+        ];
+        assert_eq!(
+            play(&mut p, &steps, 30_000),
+            [(0, 15_000_000), (20_608, 25_000_000)]
+        );
+    }
+
+    #[test]
+    fn libx264_takes_every_bitrate_change_in_place_at_once() {
+        // Rises and drops, some within a second of each other: each applies
+        // on the frame it arrives, and none reopens.
+        let t0 = Instant::now();
+        let mut p = Pipeline::new("libx264", "libx264", t0);
+        for (at, bitrate) in [
+            (0, 12_000_000),
+            (100, 10_000_000),
+            (5_000, 15_000_000),
+            (5_100, 12_000_000),
+        ] {
+            p.now = t0 + Duration::from_millis(at);
+            p.bitrate = bitrate;
+            assert_eq!(p.frame(Reopen::Opens), None, "at {at} ms");
+            assert_eq!(p.opened.1, bitrate, "at {at} ms");
+        }
+        assert_eq!(p.in_place, 4);
+        assert_eq!(play(&mut p, &[], 60_000), []);
+    }
+
+    #[test]
+    fn the_reopen_line_says_why() {
+        let nvenc = ("h264_nvenc", 60);
+        let x264 = ("libx264", 60);
+        assert_eq!(reopen_reason(nvenc, nvenc, false, false, false), "bitrate");
+        assert_eq!(
+            reopen_reason(nvenc, ("h264_nvenc", 30), false, false, false),
+            "fps"
+        );
+        assert_eq!(
+            reopen_reason(nvenc, ("hevc_nvenc", 60), false, false, false),
+            "codec"
+        );
+        assert_eq!(reopen_reason(x264, nvenc, false, false, true), "recovery");
+        assert_eq!(
+            reopen_reason(x264, ("hevc_nvenc", 60), false, false, true),
+            "recovery"
+        );
+        let amf = ("h264_amf", 60);
+        assert_eq!(reopen_reason(amf, amf, false, true, false), "keyframe");
+        assert_eq!(
+            reopen_reason(nvenc, ("hevc_nvenc", 30), true, true, false),
+            "size"
+        );
     }
 
     #[test]
