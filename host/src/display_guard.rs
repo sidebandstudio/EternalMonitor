@@ -16,6 +16,13 @@
 //! keeps any real screen sees no change at all. A turn on is only logged:
 //! a layout with the virtual display alone cannot attach, so the attempt
 //! times out and its turn off brings the guard in. One attempt per change.
+//! Right before "PC screen only" the guard reads the screens again, and
+//! stops if one came back or they can't be read.
+//!
+//! The layout from before a turn on is also kept on disk, so the failure
+//! reporter, a new process, compares with it when the host that turned
+//! the display on ended. The record names that host by id and start time,
+//! and anything else is ignored; a turn off that worked deletes it.
 //!
 //! `installer/scripts/display-guard.ps1` does the same around Setup's
 //! driver steps.
@@ -117,7 +124,7 @@ pub fn line(screens: Option<&[Screen]>) -> String {
 
 /// What the guard needs from Windows.
 pub trait Displays {
-    type Saved;
+    type Saved: Saved;
     /// The active paths now. `None` when Windows can't say.
     fn read(&mut self) -> Option<Layout<Self::Saved>>;
     /// `SetDisplayConfig` with the saved paths and modes. The error is its code.
@@ -126,6 +133,20 @@ pub trait Displays {
     fn internal_only(&mut self) -> Result<(), i32>;
     fn sleep(&mut self, duration: Duration);
     fn log(&mut self, warn: bool, text: &str);
+    /// The host whose layout from before its turn on is kept on disk: this
+    /// one, or in the failure reporter the one that ended. `None` when a
+    /// later process with the same id could not be told from it.
+    fn owner(&self) -> Option<String>;
+    /// Replace the kept record, or delete it with `None`.
+    fn keep(&mut self, record: Option<&str>);
+    /// The kept record, if there is one.
+    fn kept(&mut self) -> Option<String>;
+}
+
+/// A layout's saved paths and modes as one line of text, for the kept record.
+pub trait Saved: Sized {
+    fn encode(&self) -> String;
+    fn decode(text: &str) -> Option<Self>;
 }
 
 /// How a turn off ended.
@@ -136,7 +157,105 @@ pub enum Outcome {
     Restored {
         internal: bool,
     },
+    /// Windows brought a real screen back while the guard was restoring, so
+    /// it changed nothing more.
+    Recovered,
     Failed,
+}
+
+const RECORD_HEADER: &str = "eternalmonitor-screens 1";
+/// A kept record longer than this, or with more screens, is not one.
+pub const MAX_RECORD: usize = 64 * 1024;
+const MAX_RECORD_SCREENS: usize = 64;
+
+/// The kept record: `layout` from before `owner`'s turn on. It holds what
+/// `SetDisplayConfig` needs and each screen's kind, target and mode, and
+/// nothing that names the PC, its user or a monitor.
+pub fn record<S: Saved>(owner: &str, layout: &Layout<S>) -> String {
+    let mut text = format!("{RECORD_HEADER}\nowner {owner}\n");
+    for screen in &layout.screens {
+        let mode = match screen.mode {
+            Some((width, height, millihertz)) => format!("{width} {height} {millihertz}"),
+            None => "- - -".into(),
+        };
+        text += &format!(
+            "screen {:x} {} {} {} {mode}\n",
+            screen.adapter,
+            screen.target,
+            u8::from(screen.internal),
+            u8::from(screen.virtual_display)
+        );
+    }
+    text + &format!("saved {}\n", layout.saved.encode())
+}
+
+/// The layout in a kept record, if `owner` wrote it. Anything else, a
+/// record from another host, boot or session included, is ignored.
+pub fn parse<S: Saved>(owner: &str, text: &str) -> Option<Layout<S>> {
+    if text.len() > MAX_RECORD {
+        return None;
+    }
+    let mut lines = text.lines();
+    if lines.next()? != RECORD_HEADER || lines.next()?.strip_prefix("owner ")? != owner {
+        return None;
+    }
+    let mut screens = Vec::new();
+    for line in lines.by_ref() {
+        if let Some(saved) = line.strip_prefix("saved ") {
+            return (lines.next().is_none() && screens.len() <= MAX_RECORD_SCREENS)
+                .then(|| S::decode(saved))
+                .flatten()
+                .map(|saved| Layout { screens, saved });
+        }
+        let fields: Vec<&str> = line.strip_prefix("screen ")?.split(' ').collect();
+        let [adapter, target, internal, virtual_display, width, height, millihertz] = fields[..]
+        else {
+            return None;
+        };
+        let flag = |text: &str| match text {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        };
+        let mode = match (width, height, millihertz) {
+            ("-", "-", "-") => None,
+            _ => Some((
+                width.parse().ok()?,
+                height.parse().ok()?,
+                millihertz.parse().ok()?,
+            )),
+        };
+        screens.push(Screen {
+            adapter: u64::from_str_radix(adapter, 16).ok()?,
+            target: target.parse().ok()?,
+            internal: flag(internal)?,
+            virtual_display: flag(virtual_display)?,
+            mode,
+        });
+    }
+    None
+}
+
+/// Whether a kept record names `owner`, read or not.
+fn names(owner: &str, text: &str) -> bool {
+    let mut lines = text.lines();
+    lines.next() == Some(RECORD_HEADER)
+        && lines.next().and_then(|line| line.strip_prefix("owner ")) == Some(owner)
+}
+
+/// Lower-case hex, for saved bytes.
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn from_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
 }
 
 /// The layout from before the virtual display was turned on, until the
@@ -155,10 +274,13 @@ impl<S> Guard<S> {
     pub const fn new() -> Self {
         Self { reference: None }
     }
+}
 
+impl<S: Saved> Guard<S> {
     /// Before a driver change: log the screens. A turn on keeps them to
-    /// compare with; a turn off keeps them only when no turn on did, as at
-    /// startup or after a crash.
+    /// compare with, also on disk for the failure reporter. A turn off
+    /// with nothing kept, as at startup or in the reporter, compares with
+    /// the record its host kept, else with the screens just before it.
     pub fn before(&mut self, enabled: bool, displays: &mut impl Displays<Saved = S>) {
         let layout = displays.read();
         let text = format!(
@@ -167,14 +289,36 @@ impl<S> Guard<S> {
             line(layout.as_ref().map(|layout| &layout.screens[..]))
         );
         displays.log(false, &text);
-        if enabled || self.reference.is_none() {
+        if enabled {
+            if let Some(owner) = displays.owner() {
+                let kept = layout.as_ref().map(|layout| record(&owner, layout));
+                displays.keep(kept.as_deref());
+            }
             self.reference = layout;
+        } else if self.reference.is_none() {
+            let kept = displays
+                .owner()
+                .and_then(|owner| parse::<S>(&owner, &displays.kept()?));
+            if let Some(kept) = &kept {
+                let text = format!(
+                    "Comparing with the screens kept from before the virtual display turned on: {}",
+                    line(Some(&kept.screens))
+                );
+                displays.log(false, &text);
+            }
+            self.reference = kept.or(layout);
         }
     }
 
     /// After a driver change: log the screens, and after a turn off,
-    /// restore them if every real screen is gone.
-    pub fn after(&mut self, enabled: bool, displays: &mut impl Displays<Saved = S>) -> Outcome {
+    /// restore them if every real screen is gone. A turn off that `done`
+    /// deletes the kept record once checked.
+    pub fn after(
+        &mut self,
+        enabled: bool,
+        done: bool,
+        displays: &mut impl Displays<Saved = S>,
+    ) -> Outcome {
         if enabled {
             let layout = displays.read();
             let text = format!(
@@ -184,6 +328,18 @@ impl<S> Guard<S> {
             displays.log(false, &text);
             return Outcome::Left;
         }
+        let outcome = self.check(displays);
+        if done {
+            if let Some(owner) = displays.owner() {
+                if displays.kept().is_some_and(|text| names(&owner, &text)) {
+                    displays.keep(None);
+                }
+            }
+        }
+        outcome
+    }
+
+    fn check(&mut self, displays: &mut impl Displays<Saved = S>) -> Outcome {
         let reference = self.reference.take();
         let before = reference
             .as_ref()
@@ -210,54 +366,83 @@ impl<S> Guard<S> {
         );
         // Each step's result, for the log when nothing worked.
         let mut tried = Vec::new();
-        let mut restored = Some(after);
         match displays.reapply(&reference.saved) {
             Ok(()) => {
-                restored = settle(displays, &reference.screens);
-                if !has_real(&restored) {
-                    tried.push("reason=saved_layout_no_screen".to_string());
+                let now = settle(displays, &reference.screens);
+                if has_real(&now) {
+                    return restored(displays, "saved_layout", &now);
                 }
+                tried.push("reason=saved_layout_no_screen".to_string());
             }
             Err(code) => tried.push(format!("reason=saved_layout_refused code={code}")),
         }
-        let mut applied = "saved_layout";
-        if !has_real(&restored) && internal {
-            applied = "internal";
-            match displays.internal_only() {
-                Ok(()) => {
-                    restored = settle(displays, &reference.screens);
-                    if !has_real(&restored) {
-                        tried.push("reason=internal_no_screen".to_string());
-                    }
-                }
-                Err(code) => tried.push(format!("reason=internal_refused code={code}")),
-            }
+        // Windows may have changed the screens during that call. Look again
+        // right before changing anything more: a screen that came back
+        // stays as Windows set it.
+        let now = displays.read();
+        if has_real(&now) {
+            let text = format!(
+                "Screens came back without a change outcome=restored applied=none {}",
+                line(now.as_ref().map(|layout| &layout.screens[..]))
+            );
+            displays.log(false, &text);
+            return Outcome::Recovered;
         }
-        let now = line(restored.as_ref().map(|layout| &layout.screens[..]));
-        if has_real(&restored) {
-            displays.log(
-                false,
-                &format!("Screens restored outcome=restored applied={applied} {now}"),
-            );
-            Outcome::Restored {
-                internal: applied == "internal",
+        if now.is_none() {
+            tried.push("reason=screens_unknown".into());
+            return failed(displays, &tried, &now);
+        }
+        if !internal {
+            return failed(displays, &tried, &now);
+        }
+        match displays.internal_only() {
+            Ok(()) => {
+                let now = settle(displays, &reference.screens);
+                if has_real(&now) {
+                    return restored(displays, "internal", &now);
+                }
+                tried.push("reason=internal_no_screen".into());
+                failed(displays, &tried, &now)
             }
-        } else {
-            let tried = if tried.is_empty() {
-                String::new()
-            } else {
-                format!("{} ", tried.join(" "))
-            };
-            displays.log(
-                true,
-                &format!(
-                    "Could not restore the screens outcome=restore_failed {tried}{now}; \
-                     Windows+P then \"PC screen only\" brings the built-in screen back"
-                ),
-            );
-            Outcome::Failed
+            Err(code) => {
+                tried.push(format!("reason=internal_refused code={code}"));
+                failed(displays, &tried, &now)
+            }
         }
     }
+}
+
+fn restored<D: Displays>(
+    displays: &mut D,
+    applied: &str,
+    now: &Option<Layout<D::Saved>>,
+) -> Outcome {
+    let text = format!(
+        "Screens restored outcome=restored applied={applied} {}",
+        line(now.as_ref().map(|layout| &layout.screens[..]))
+    );
+    displays.log(false, &text);
+    Outcome::Restored {
+        internal: applied == "internal",
+    }
+}
+
+fn failed<D: Displays>(
+    displays: &mut D,
+    tried: &[String],
+    now: &Option<Layout<D::Saved>>,
+) -> Outcome {
+    let text = format!(
+        "Could not restore the screens outcome=restore_failed {}{}; Windows+P then \
+         \"PC screen only\" brings the built-in screen back",
+        tried
+            .iter()
+            .map(|step| format!("{step} "))
+            .collect::<String>(),
+        line(now.as_ref().map(|layout| &layout.screens[..]))
+    );
+    displays.log(true, &text);
+    Outcome::Failed
 }
 
 fn has_real<S>(layout: &Option<Layout<S>>) -> bool {
@@ -287,13 +472,21 @@ fn settle<D: Displays>(displays: &mut D, before: &[Screen]) -> Option<Layout<D::
 static GUARD: parking_lot::Mutex<Guard<windows_impl::Saved>> =
     parking_lot::Mutex::new(Guard::new());
 
-/// Run a driver change with the guard around it. `log` writes one line.
+/// Run a driver change for `owner`'s display with the guard around it.
+/// `log` writes one line; `done` tells a change that succeeded.
 #[cfg(windows)]
-pub fn around<T>(enabled: bool, log: fn(bool, &str), change: impl FnOnce() -> T) -> T {
-    let mut displays = windows_impl::Windows { log };
+pub(crate) fn around<T>(
+    enabled: bool,
+    owner: crate::startup::ProcessId,
+    log: fn(bool, &str),
+    change: impl FnOnce() -> T,
+    done: impl FnOnce(&T) -> bool,
+) -> T {
+    let mut displays = windows_impl::Windows::new(owner, log);
     GUARD.lock().before(enabled, &mut displays);
     let result = change();
-    GUARD.lock().after(enabled, &mut displays);
+    let done = done(&result);
+    GUARD.lock().after(enabled, done, &mut displays);
     result
 }
 
@@ -312,8 +505,59 @@ mod windows_impl {
 
     pub type Saved = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
+    /// The kept record, next to the virtual display's owner record.
+    const RECORD_FILE: &str = "virtual-display-screens";
+
     pub struct Windows {
-        pub log: fn(bool, &str),
+        log: fn(bool, &str),
+        owner: Option<String>,
+        file: Option<std::path::PathBuf>,
+    }
+
+    impl Windows {
+        pub fn new(owner: crate::startup::ProcessId, log: fn(bool, &str)) -> Self {
+            Self {
+                log,
+                // Without its start time a process id could be a later process's.
+                owner: (owner.start != 0).then(|| owner.to_string()),
+                file: crate::settings::app_data_dir().map(|directory| directory.join(RECORD_FILE)),
+            }
+        }
+    }
+
+    /// The structs as Windows filled them: plain data, every byte written.
+    fn bytes<T: Copy>(items: &[T]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(items.as_ptr().cast(), std::mem::size_of_val(items)) }
+    }
+
+    fn items<T: Copy + Default>(bytes: &[u8]) -> Option<Vec<T>> {
+        let size = std::mem::size_of::<T>();
+        if !bytes.len().is_multiple_of(size) {
+            return None;
+        }
+        let mut items = vec![T::default(); bytes.len() / size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), items.as_mut_ptr().cast(), bytes.len())
+        };
+        Some(items)
+    }
+
+    impl super::Saved for Saved {
+        fn encode(&self) -> String {
+            format!(
+                "{} {}",
+                super::to_hex(bytes(&self.0)),
+                super::to_hex(bytes(&self.1))
+            )
+        }
+
+        fn decode(text: &str) -> Option<Self> {
+            let (paths, modes) = text.split_once(' ')?;
+            Some((
+                items(&super::from_hex(paths)?)?,
+                items(&super::from_hex(modes)?)?,
+            ))
+        }
     }
 
     fn screen(path: &DISPLAYCONFIG_PATH_INFO, modes: &[DISPLAYCONFIG_MODE_INFO]) -> Screen {
@@ -391,6 +635,42 @@ mod windows_impl {
         fn log(&mut self, warn: bool, text: &str) {
             (self.log)(warn, text);
         }
+
+        fn owner(&self) -> Option<String> {
+            self.owner.clone()
+        }
+
+        fn keep(&mut self, record: Option<&str>) {
+            let Some(file) = &self.file else { return };
+            let result = match record {
+                // Replaced in one step, so the reporter never reads half of it.
+                Some(record) => {
+                    let temp = file.with_extension("tmp");
+                    std::fs::write(&temp, record).and_then(|()| std::fs::rename(&temp, file))
+                }
+                None => match std::fs::remove_file(file) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+            };
+            if let Err(error) = result {
+                (self.log)(
+                    true,
+                    &format!("Could not keep the screens for the failure reporter error={error}"),
+                );
+            }
+        }
+
+        fn kept(&mut self) -> Option<String> {
+            use std::io::Read;
+            let mut text = String::new();
+            std::fs::File::open(self.file.as_ref()?)
+                .ok()?
+                .take(super::MAX_RECORD as u64 + 1)
+                .read_to_string(&mut text)
+                .ok()?;
+            Some(text)
+        }
     }
 }
 
@@ -442,10 +722,26 @@ mod tests {
         internal: Option<Vec<Screen>>,
         refuse_reapply: bool,
         refuse_internal: bool,
+        /// What reads return after a refused call: Windows changed the
+        /// screens meanwhile. `Some(None)`: they can't be read.
+        after_refused: Option<Option<Vec<Screen>>>,
         reapply_calls: Vec<usize>,
         internal_calls: usize,
         slept: Duration,
         logs: Vec<(bool, String)>,
+        owner: Option<String>,
+        /// The record on disk.
+        kept: Option<String>,
+    }
+
+    impl Saved for usize {
+        fn encode(&self) -> String {
+            self.to_string()
+        }
+
+        fn decode(text: &str) -> Option<Self> {
+            text.parse().ok()
+        }
     }
 
     impl Fake {
@@ -483,6 +779,10 @@ mod tests {
         fn reapply(&mut self, saved: &usize) -> Result<(), i32> {
             self.reapply_calls.push(*saved);
             if self.refuse_reapply {
+                if let Some(screens) = self.after_refused.clone() {
+                    self.reads.clear();
+                    self.last = screens;
+                }
                 return Err(87);
             }
             if let Some(screens) = self.reapplied.clone() {
@@ -511,6 +811,18 @@ mod tests {
         fn log(&mut self, warn: bool, text: &str) {
             self.logs.push((warn, text.to_string()));
         }
+
+        fn owner(&self) -> Option<String> {
+            self.owner.clone()
+        }
+
+        fn keep(&mut self, record: Option<&str>) {
+            self.kept = record.map(str::to_string);
+        }
+
+        fn kept(&mut self) -> Option<String> {
+            self.kept.clone()
+        }
     }
 
     /// A Second screen session: before and after the turn on, then the
@@ -518,9 +830,9 @@ mod tests {
     fn session(fake: &mut Fake) -> (Guard<usize>, Outcome) {
         let mut guard = Guard::new();
         guard.before(true, fake);
-        guard.after(true, fake);
+        guard.after(true, true, fake);
         guard.before(false, fake);
-        let outcome = guard.after(false, fake);
+        let outcome = guard.after(false, true, fake);
         (guard, outcome)
     }
 
@@ -573,7 +885,7 @@ mod tests {
         let mut fake = Fake::reading([vec![panel()], vec![vdd()]]);
         let mut guard = Guard::new();
         guard.before(true, &mut fake);
-        assert_eq!(guard.after(true, &mut fake), Outcome::Left);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
     }
 
@@ -713,7 +1025,7 @@ mod tests {
         // The next turn off, with nothing turned on since, compares with the
         // screens just before it: none, so nothing more is tried.
         guard.before(false, &mut fake);
-        assert_eq!(guard.after(false, &mut fake), Outcome::Left);
+        assert_eq!(guard.after(false, true, &mut fake), Outcome::Left);
         assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 1));
         // Reads stop once the bounded wait ends.
         assert!(fake.read_count < 40, "{}", fake.read_count);
@@ -729,7 +1041,7 @@ mod tests {
         let mut guard = Guard::new();
         guard.before(false, &mut fake);
         assert_eq!(
-            guard.after(false, &mut fake),
+            guard.after(false, true, &mut fake),
             Outcome::Restored { internal: true }
         );
         assert_eq!(fake.reapply_calls, [1]);
@@ -751,5 +1063,255 @@ mod tests {
         fake.reads.push_back(None);
         assert_eq!(session(&mut fake).1, Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
+    }
+
+    #[test]
+    fn the_fallback_looks_again_and_leaves_screens_windows_brought_back() {
+        // Windows put both screens back while it refused the saved layout.
+        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        fake.refuse_reapply = true;
+        fake.after_refused = Some(Some(vec![panel(), monitor()]));
+        fake.internal = Some(vec![panel()]);
+        assert_eq!(session(&mut fake).1, Outcome::Recovered);
+        // No "PC screen only", which would turn the monitor off.
+        assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 0));
+        assert!(
+            fake.text().ends_with(
+                "Screens came back without a change outcome=restored applied=none paths=2 \
+                 [internal tgt=d2c1/4352 1920x1200@165Hz | external tgt=d2c1/4353 \
+                 2560x1440@59.94Hz] vdd=0"
+            ),
+            "{}",
+            fake.text()
+        );
+        // The same after a layout Windows took that showed nothing at first.
+        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        fake.internal = Some(vec![panel()]);
+        let mut guard = Guard::new();
+        guard.before(true, &mut fake);
+        guard.after(true, true, &mut fake);
+        guard.before(false, &mut fake);
+        let mut late = LateRecovery(&mut fake, 0);
+        assert_eq!(guard.after(false, true, &mut late), Outcome::Recovered);
+        assert_eq!(fake.internal_calls, 0);
+    }
+
+    /// Reads nothing back through the wait after the reapply, then both
+    /// screens: Windows finished the change just after the guard gave up
+    /// waiting. `.1` counts the reads at the end of that wait.
+    struct LateRecovery<'a>(&'a mut Fake, usize);
+
+    impl Displays for LateRecovery<'_> {
+        type Saved = usize;
+        fn read(&mut self) -> Option<Layout<usize>> {
+            if !self.0.reapply_calls.is_empty() && self.0.slept >= SETTLE * 2 {
+                self.1 += 1;
+                if self.1 > 1 {
+                    self.0.last = Some(vec![panel(), monitor()]);
+                }
+            }
+            self.0.read()
+        }
+        fn reapply(&mut self, saved: &usize) -> Result<(), i32> {
+            self.0.reapply(saved)
+        }
+        fn internal_only(&mut self) -> Result<(), i32> {
+            self.0.internal_only()
+        }
+        fn sleep(&mut self, duration: Duration) {
+            self.0.sleep(duration)
+        }
+        fn log(&mut self, warn: bool, text: &str) {
+            self.0.log(warn, text)
+        }
+        fn owner(&self) -> Option<String> {
+            self.0.owner()
+        }
+        fn keep(&mut self, record: Option<&str>) {
+            self.0.keep(record)
+        }
+        fn kept(&mut self) -> Option<String> {
+            self.0.kept()
+        }
+    }
+
+    #[test]
+    fn the_fallback_stops_when_the_screens_cannot_be_read() {
+        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()], vec![]]);
+        fake.refuse_reapply = true;
+        fake.after_refused = Some(None);
+        fake.internal = Some(vec![panel()]);
+        assert_eq!(session(&mut fake).1, Outcome::Failed);
+        assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 0));
+        assert!(
+            fake.text().contains(
+                "outcome=restore_failed reason=saved_layout_refused code=87 \
+                 reason=screens_unknown paths=unknown"
+            ),
+            "{}",
+            fake.text()
+        );
+    }
+
+    const HOST: &str = "4242-133456789012345678";
+
+    /// The host turned the display on, which left the virtual display alone,
+    /// then crashed. Its failure reporter, a new process with nothing in
+    /// memory, turns the display off and the PC has no screen.
+    #[test]
+    fn the_failure_reporter_restores_the_layout_its_host_kept() {
+        let mut host = Fake::reading([vec![panel(), monitor()], vec![vdd()]]);
+        host.owner = Some(HOST.into());
+        let mut guard = Guard::new();
+        guard.before(true, &mut host);
+        guard.after(true, true, &mut host);
+        let kept = host.kept.clone().expect("the host kept its screens");
+
+        let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+        reporter.read_count = 100;
+        reporter.owner = Some(HOST.into());
+        reporter.kept = Some(kept.clone());
+        reporter.reapplied = Some(vec![panel(), monitor()]);
+        let mut guard = Guard::new();
+        guard.before(false, &mut reporter);
+        assert_eq!(
+            guard.after(false, true, &mut reporter),
+            Outcome::Restored { internal: false }
+        );
+        // The host's layout, read before its turn on: its first read.
+        assert_eq!(reporter.reapply_calls, [1]);
+        assert!(
+            reporter.text().contains(
+                "Comparing with the screens kept from before the virtual display turned on: \
+                 paths=2 [internal"
+            ),
+            "{}",
+            reporter.text()
+        );
+        // Checked after a turn off that worked: deleted.
+        assert_eq!(reporter.kept, None);
+
+        // Without the record, the reporter only sees the virtual display before:
+        // nothing to compare with, the screen stays black. This is what the
+        // record fixes.
+        let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+        reporter.owner = Some(HOST.into());
+        reporter.reapplied = Some(vec![panel()]);
+        let mut guard = Guard::new();
+        guard.before(false, &mut reporter);
+        assert_eq!(guard.after(false, true, &mut reporter), Outcome::Left);
+        assert_eq!(reporter.set_display_config_calls(), 0);
+    }
+
+    #[test]
+    fn a_record_from_another_host_or_one_that_does_not_parse_is_ignored() {
+        let mut host = Fake::reading([vec![panel()]]);
+        host.owner = Some(HOST.into());
+        Guard::new().before(true, &mut host);
+        let kept = host.kept.clone().unwrap();
+        for (owner, record) in [
+            // Another host, boot or session: another id or start time.
+            (Some("4242-1"), kept.clone()),
+            (Some("17-133456789012345678"), kept.clone()),
+            // No start time to tell it apart: never used.
+            (None, kept.clone()),
+            (Some(HOST), kept.replace("saved 1", "saved x")),
+            (
+                Some(HOST),
+                kept.replace("screen d2c1 4352 1 0", "screen d2c1 4352 2 0"),
+            ),
+            (Some(HOST), format!("{kept}screen d2c1 1 0 0 - - -\n")),
+            (Some(HOST), String::new()),
+        ] {
+            let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+            reporter.owner = owner.map(str::to_string);
+            reporter.kept = Some(record.clone());
+            reporter.reapplied = Some(vec![panel()]);
+            let mut guard = Guard::new();
+            guard.before(false, &mut reporter);
+            assert_eq!(
+                guard.after(false, true, &mut reporter),
+                Outcome::Left,
+                "{record}"
+            );
+            assert_eq!(reporter.set_display_config_calls(), 0, "{record}");
+            // Another host's record stays, for its own reporter.
+            if owner != Some(HOST) {
+                assert_eq!(reporter.kept.as_deref(), Some(record.as_str()));
+            }
+        }
+        // A host with no start time keeps nothing.
+        let mut host = Fake::reading([vec![panel()]]);
+        Guard::new().before(true, &mut host);
+        assert_eq!(host.kept, None);
+    }
+
+    #[test]
+    fn the_record_is_deleted_only_after_a_turn_off_that_worked() {
+        let mut fake = Fake::reading([vec![panel()], vec![panel(), vdd()]]);
+        fake.owner = Some(HOST.into());
+        let mut guard = Guard::new();
+        guard.before(true, &mut fake);
+        guard.after(true, true, &mut fake);
+        // A failed turn off may leave the display on: the record stays.
+        guard.before(false, &mut fake);
+        guard.after(false, false, &mut fake);
+        assert!(fake.kept.is_some());
+        // The next turn off, with nothing in memory, still compares with it.
+        fake.reads.push_back(Some(vec![panel()]));
+        guard.before(false, &mut fake);
+        assert!(
+            fake.text().contains("Comparing with the screens kept"),
+            "{}",
+            fake.text()
+        );
+        guard.after(false, true, &mut fake);
+        assert_eq!(fake.kept, None);
+    }
+
+    #[test]
+    fn the_record_round_trips_and_is_bounded() {
+        let layout = Layout {
+            screens: vec![
+                panel(),
+                Screen {
+                    mode: None,
+                    ..monitor()
+                },
+                vdd(),
+            ],
+            saved: 7usize,
+        };
+        let text = record(HOST, &layout);
+        assert_eq!(
+            text,
+            format!(
+                "eternalmonitor-screens 1\nowner {HOST}\nscreen d2c1 4352 1 0 1920 1200 165000\n\
+                 screen d2c1 4353 0 0 - - -\nscreen 200000101 256 0 1 2732 2048 60000\nsaved 7\n"
+            )
+        );
+        let back = parse::<usize>(HOST, &text).unwrap();
+        assert_eq!((back.screens, back.saved), (layout.screens, 7));
+        assert!(parse::<usize>(HOST, &text.replace("eternalmonitor-screens 1", "x")).is_none());
+        assert!(parse::<usize>(HOST, &format!("{text}saved 8\n")).is_none());
+        assert!(parse::<usize>(HOST, &text.replace("\nsaved 7\n", "\n")).is_none());
+        let many = Layout {
+            screens: vec![monitor(); MAX_RECORD_SCREENS + 1],
+            saved: 1usize,
+        };
+        assert!(parse::<usize>(HOST, &record(HOST, &many)).is_none());
+        let long = Layout {
+            screens: vec![],
+            saved: usize::MAX,
+        };
+        let padded =
+            record(HOST, &long).replace("saved ", &format!("saved {}", "0".repeat(MAX_RECORD)));
+        assert!(parse::<usize>(HOST, &padded).is_none());
+        // The saved bytes go as hex.
+        assert_eq!(to_hex(&[0, 0xab, 0x10]), "00ab10");
+        assert_eq!(from_hex("00ab10"), Some(vec![0, 0xab, 0x10]));
+        for bad in ["0", "zz", "é0"] {
+            assert_eq!(from_hex(bad), None, "{bad}");
+        }
     }
 }

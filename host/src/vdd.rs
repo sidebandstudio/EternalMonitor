@@ -463,9 +463,13 @@ fn request_on_turn(
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed(None);
             crate::startup::display::change(enabled, progress, |progress| {
-                outcome = crate::display_guard::around(enabled, log_screens, || {
-                    run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
-                });
+                outcome = crate::display_guard::around(
+                    enabled,
+                    crate::startup::ProcessId::current(),
+                    log_screens,
+                    || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
+                    |outcome| *outcome == TaskOutcome::Done,
+                );
                 outcome == TaskOutcome::Done
             });
             *ran = Some(outcome);
@@ -523,9 +527,14 @@ pub(crate) fn disable_for_ended(
         host,
         || crate::startup::display::other_host(host, reporters),
         || {
-            crate::display_guard::around(false, crate::startup::reporter_log, || {
-                run_task(TASK_DISABLE, &mut || {})
-            }) == TaskOutcome::Done
+            // The host's layout from before its turn on, which it kept on disk.
+            crate::display_guard::around(
+                false,
+                host,
+                crate::startup::reporter_log,
+                || run_task(TASK_DISABLE, &mut || {}),
+                |outcome| *outcome == TaskOutcome::Done,
+            ) == TaskOutcome::Done
         },
     )
 }
