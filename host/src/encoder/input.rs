@@ -1,4 +1,5 @@
 use ffmpeg_next::format::Pixel;
+use tracing::info;
 
 use crate::capture::FRAME_PADDING;
 
@@ -11,7 +12,7 @@ pub enum EncoderInput {
     /// BGRA is unsupported in the pinned SDK; see docs/decisions.md.
     #[default]
     Automatic,
-    /// BGRA whenever the encoder takes it.
+    /// BGRA whenever the encoder takes it and encodes it as 4:2:0.
     Auto,
     Bgra,
     Yuv420,
@@ -33,6 +34,17 @@ fn is_nvenc(codec_name: &str) -> bool {
     matches!(codec_name, "h264_nvenc" | "hevc_nvenc")
 }
 
+/// Quick Sync HEVC, which encodes BGRA as a 4:4:4 (HEVC RExt) stream rather
+/// than 4:2:0: FFmpeg 7.1's qsvenc.c sets the frame's chroma format from the
+/// input's subsampling, none for BGRA, and with no profile set asks for
+/// 4:4:4 output. Encoder input picks what the encoder reads, not the
+/// stream's chroma; 4:4:4 is untested on the iPad and spends more of the
+/// same bitrate on colour. NVENC converts BGRA to 4:2:0 unless asked to keep
+/// 4:4:4.
+fn encodes_bgra_as_444(codec_name: &str) -> bool {
+    codec_name == "hevc_qsv"
+}
+
 pub(super) fn select_input(
     mode: EncoderInput,
     codec_name: &str,
@@ -43,6 +55,14 @@ pub(super) fn select_input(
     }
     let native = match mode {
         EncoderInput::Automatic => is_nvenc(codec_name),
+        EncoderInput::Auto | EncoderInput::Bgra if encodes_bgra_as_444(codec_name) => {
+            info!(
+                encoder = codec_name,
+                input = ?mode,
+                "This encoder would stream BGRA as 4:4:4; using YUV420"
+            );
+            false
+        }
         EncoderInput::Auto | EncoderInput::Bgra => true,
         EncoderInput::Yuv420 => false,
     };
@@ -53,7 +73,7 @@ pub(super) fn select_input(
             }
         }
     }
-    if mode == EncoderInput::Bgra {
+    if mode == EncoderInput::Bgra && !encodes_bgra_as_444(codec_name) {
         return Err("The selected encoder does not accept BGRA/BGR0 input");
     }
     // YUV420P and NV12 are both 8-bit 4:2:0. Quick Sync accepts NV12,
@@ -275,10 +295,6 @@ mod tests {
             ));
         }
         assert_eq!(
-            select_input(EncoderInput::Bgra, "hevc_qsv", &hevc_qsv),
-            Ok(Pixel::BGRA)
-        );
-        assert_eq!(
             select_input(automatic, "libx264", &[Pixel::BGRA]),
             Ok(Pixel::YUV420P)
         );
@@ -304,9 +320,63 @@ mod tests {
                     Ok(Pixel::NV12)
                 );
             }
-            assert!(select_input(EncoderInput::Bgra, name, &[Pixel::NV12]).is_err());
         }
+        assert!(select_input(EncoderInput::Bgra, "h264_qsv", &[Pixel::NV12]).is_err());
+        assert_eq!(
+            select_input(EncoderInput::Bgra, "hevc_qsv", &[Pixel::NV12]),
+            Ok(Pixel::NV12)
+        );
         assert!(select_input(EncoderInput::Yuv420, "unknown", &[Pixel::QSV]).is_err());
+    }
+
+    /// Quick Sync HEVC streams BGRA as 4:4:4, so it gets NV12 whatever was
+    /// picked, while NVENC keeps a picked BGRA.
+    #[test]
+    fn quick_sync_hevc_never_gets_bgra() {
+        // What FFmpeg 7.1.1's hevc_qsv advertises.
+        let hevc_qsv = [
+            Pixel::NV12,
+            Pixel::P010LE,
+            Pixel::P012LE,
+            Pixel::YUYV422,
+            Pixel::Y210LE,
+            Pixel::QSV,
+            Pixel::BGRA,
+            Pixel::X2RGB10LE,
+            Pixel::VUYX,
+            Pixel::XV30LE,
+        ];
+        for mode in [
+            EncoderInput::Automatic,
+            EncoderInput::Auto,
+            EncoderInput::Bgra,
+            EncoderInput::Yuv420,
+        ] {
+            assert_eq!(
+                select_input(mode, "hevc_qsv", &hevc_qsv),
+                Ok(Pixel::NV12),
+                "{mode:?}"
+            );
+            assert_eq!(
+                select_input(mode, "hevc_qsv", &[Pixel::NV12, Pixel::BGRZ]),
+                Ok(Pixel::NV12),
+                "{mode:?}"
+            );
+        }
+        let nvenc = [Pixel::YUV420P, Pixel::NV12, Pixel::BGRZ, Pixel::BGRA];
+        for name in ["h264_nvenc", "hevc_nvenc"] {
+            for mode in [EncoderInput::Auto, EncoderInput::Bgra] {
+                assert_eq!(select_input(mode, name, &nvenc), Ok(Pixel::BGRA));
+            }
+        }
+        let h264_qsv = [Pixel::NV12, Pixel::QSV];
+        for mode in [
+            EncoderInput::Automatic,
+            EncoderInput::Auto,
+            EncoderInput::Yuv420,
+        ] {
+            assert_eq!(select_input(mode, "h264_qsv", &h264_qsv), Ok(Pixel::NV12));
+        }
     }
 
     fn fill_pattern(rows: &mut [u8], row_bytes: usize) {
