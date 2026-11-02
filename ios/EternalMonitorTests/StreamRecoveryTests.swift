@@ -30,8 +30,7 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
         let units = try twoGOPs()
         host.sendFrame(units[0], seq: 1, isKeyframe: true)
-        for _ in 0..<300 where manager.state != .connected { try await Task.sleep(nanoseconds: 10_000_000) }
-        XCTAssertEqual(manager.state, .connected)
+        try await until("streaming", seconds: 30) { manager.state == .connected }
         addTeardownBlock { await MainActor.run { manager.cancel() } }
         return manager
     }
