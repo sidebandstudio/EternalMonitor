@@ -462,11 +462,14 @@ fn request_on_turn(
     {
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed(None);
+            // Read here, after the gate decided and before the task runs.
+            let display_off = TASKS.gate.lock().known_enabled == Some(false);
             crate::startup::display::change(enabled, progress, |progress| {
                 outcome = crate::display_guard::around(
                     enabled,
                     crate::startup::ProcessId::current(),
                     log_screens,
+                    display_off,
                     || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
                     |outcome| *outcome == TaskOutcome::Done,
                 );
@@ -532,6 +535,8 @@ pub(crate) fn disable_for_ended(
                 false,
                 host,
                 crate::startup::reporter_log,
+                // Only for a turn on.
+                false,
                 || run_task(TASK_DISABLE, &mut || {}),
                 |outcome| *outcome == TaskOutcome::Done,
             ) == TaskOutcome::Done

@@ -137,8 +137,11 @@ pub trait Displays {
     /// one, or in the failure reporter the one that ended. `None` when a
     /// later process with the same id could not be told from it.
     fn owner(&self) -> Option<String>;
-    /// Replace the kept record, or delete it with `None`.
-    fn keep(&mut self, record: Option<&str>);
+    /// Replace the kept record.
+    fn keep(&mut self, record: &str);
+    /// Delete the kept record if it names [`Displays::owner`], read and
+    /// deleted in one step: a record another host put in its place stays.
+    fn forget(&mut self);
     /// The kept record, if there is one.
     fn kept(&mut self) -> Option<String>;
 }
@@ -237,7 +240,7 @@ pub fn parse<S: Saved>(owner: &str, text: &str) -> Option<Layout<S>> {
 }
 
 /// Whether a kept record names `owner`, read or not.
-fn names(owner: &str, text: &str) -> bool {
+pub fn names(owner: &str, text: &str) -> bool {
     let mut lines = text.lines();
     lines.next() == Some(RECORD_HEADER)
         && lines.next().and_then(|line| line.strip_prefix("owner ")) == Some(owner)
@@ -281,7 +284,13 @@ impl<S: Saved> Guard<S> {
     /// compare with, also on disk for the failure reporter. A turn off
     /// with nothing kept, as at startup or in the reporter, compares with
     /// the record its host kept, else with the screens just before it.
-    pub fn before(&mut self, enabled: bool, displays: &mut impl Displays<Saved = S>) {
+    /// `display_off`: the driver tasks know the display is off.
+    pub fn before(
+        &mut self,
+        enabled: bool,
+        display_off: bool,
+        displays: &mut impl Displays<Saved = S>,
+    ) {
         let layout = displays.read();
         let text = format!(
             "Screens before the virtual display turns {}: {}",
@@ -290,15 +299,30 @@ impl<S: Saved> Guard<S> {
         );
         displays.log(false, &text);
         if enabled {
-            if let Some(owner) = displays.owner() {
-                let kept = layout.as_ref().map(|layout| record(&owner, layout));
-                displays.keep(kept.as_deref());
+            // A turn on can run while the display is still on: after an
+            // Enable that finished once the host had given up on it, or a
+            // failed Disable. The screens then may be the virtual display's
+            // alone, so they never replace a kept layout with a real
+            // screen, unless the display is known to be off.
+            let earlier = self.reference.take().or_else(|| own_record(displays));
+            let layout = if !display_off && !has_real(&layout) && has_real(&earlier) {
+                let text = format!(
+                    "Keeping the screens from before the virtual display first turned on: {}",
+                    line(earlier.as_ref().map(|layout| &layout.screens[..]))
+                );
+                displays.log(false, &text);
+                earlier
+            } else {
+                layout
+            };
+            match (displays.owner(), &layout) {
+                (Some(owner), Some(layout)) => displays.keep(&record(&owner, layout)),
+                (Some(_), None) => displays.forget(),
+                (None, _) => {}
             }
             self.reference = layout;
         } else if self.reference.is_none() {
-            let kept = displays
-                .owner()
-                .and_then(|owner| parse::<S>(&owner, &displays.kept()?));
+            let kept = own_record(displays);
             if let Some(kept) = &kept {
                 let text = format!(
                     "Comparing with the screens kept from before the virtual display turned on: {}",
@@ -330,11 +354,7 @@ impl<S: Saved> Guard<S> {
         }
         let outcome = self.check(displays);
         if done {
-            if let Some(owner) = displays.owner() {
-                if displays.kept().is_some_and(|text| names(&owner, &text)) {
-                    displays.keep(None);
-                }
-            }
+            displays.forget();
         }
         outcome
     }
@@ -412,6 +432,12 @@ impl<S: Saved> Guard<S> {
     }
 }
 
+/// The layout in the record this host kept, if there is one.
+fn own_record<D: Displays>(displays: &mut D) -> Option<Layout<D::Saved>> {
+    let owner = displays.owner()?;
+    parse(&owner, &displays.kept()?)
+}
+
 fn restored<D: Displays>(
     displays: &mut D,
     applied: &str,
@@ -473,17 +499,19 @@ static GUARD: parking_lot::Mutex<Guard<windows_impl::Saved>> =
     parking_lot::Mutex::new(Guard::new());
 
 /// Run a driver change for `owner`'s display with the guard around it.
-/// `log` writes one line; `done` tells a change that succeeded.
+/// `log` writes one line; `display_off` says the driver tasks know the
+/// display is off; `done` tells a change that succeeded.
 #[cfg(windows)]
 pub(crate) fn around<T>(
     enabled: bool,
     owner: crate::startup::ProcessId,
     log: fn(bool, &str),
+    display_off: bool,
     change: impl FnOnce() -> T,
     done: impl FnOnce(&T) -> bool,
 ) -> T {
     let mut displays = windows_impl::Windows::new(owner, log);
-    GUARD.lock().before(enabled, &mut displays);
+    GUARD.lock().before(enabled, display_off, &mut displays);
     let result = change();
     let done = done(&result);
     GUARD.lock().after(enabled, done, &mut displays);
@@ -640,23 +668,31 @@ mod windows_impl {
             self.owner.clone()
         }
 
-        fn keep(&mut self, record: Option<&str>) {
+        // As the virtual display's owner record: replaced in one step, so
+        // the reporter never reads half of it, and deleted only through the
+        // handle that read it.
+        fn keep(&mut self, record: &str) {
             let Some(file) = &self.file else { return };
-            let result = match record {
-                // Replaced in one step, so the reporter never reads half of it.
-                Some(record) => {
-                    let temp = file.with_extension("tmp");
-                    std::fs::write(&temp, record).and_then(|()| std::fs::rename(&temp, file))
-                }
-                None => match std::fs::remove_file(file) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    result => result,
-                },
-            };
-            if let Err(error) = result {
+            let writer = crate::startup::ProcessId::current();
+            if let Err(error) = crate::startup::display::replace(file, writer, record) {
                 (self.log)(
                     true,
                     &format!("Could not keep the screens for the failure reporter error={error}"),
+                );
+            }
+        }
+
+        fn forget(&mut self) {
+            let (Some(file), Some(owner)) = (&self.file, &self.owner) else {
+                return;
+            };
+            let owns = |text: &str| super::names(owner, text);
+            if let Err(error) = crate::startup::display::delete_if_its(file, owns) {
+                (self.log)(
+                    true,
+                    &format!(
+                        "Could not delete the screens kept for the failure reporter error={error}"
+                    ),
                 );
             }
         }
@@ -816,8 +852,17 @@ mod tests {
             self.owner.clone()
         }
 
-        fn keep(&mut self, record: Option<&str>) {
-            self.kept = record.map(str::to_string);
+        fn keep(&mut self, record: &str) {
+            self.kept = Some(record.to_string());
+        }
+
+        fn forget(&mut self) {
+            let owner = self.owner.clone();
+            if owner
+                .is_some_and(|owner| self.kept.as_deref().is_some_and(|text| names(&owner, text)))
+            {
+                self.kept = None;
+            }
         }
 
         fn kept(&mut self) -> Option<String> {
@@ -829,9 +874,9 @@ mod tests {
     /// turn off, with each read taking the next layout.
     fn session(fake: &mut Fake) -> (Guard<usize>, Outcome) {
         let mut guard = Guard::new();
-        guard.before(true, fake);
+        guard.before(true, false, fake);
         guard.after(true, true, fake);
-        guard.before(false, fake);
+        guard.before(false, false, fake);
         let outcome = guard.after(false, true, fake);
         (guard, outcome)
     }
@@ -884,7 +929,7 @@ mod tests {
         // the layout stays the user's until the turn off.
         let mut fake = Fake::reading([vec![panel()], vec![vdd()]]);
         let mut guard = Guard::new();
-        guard.before(true, &mut fake);
+        guard.before(true, false, &mut fake);
         assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
     }
@@ -1024,7 +1069,7 @@ mod tests {
         );
         // The next turn off, with nothing turned on since, compares with the
         // screens just before it: none, so nothing more is tried.
-        guard.before(false, &mut fake);
+        guard.before(false, false, &mut fake);
         assert_eq!(guard.after(false, true, &mut fake), Outcome::Left);
         assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 1));
         // Reads stop once the bounded wait ends.
@@ -1039,7 +1084,7 @@ mod tests {
         fake.refuse_reapply = true;
         fake.internal = Some(vec![panel()]);
         let mut guard = Guard::new();
-        guard.before(false, &mut fake);
+        guard.before(false, false, &mut fake);
         assert_eq!(
             guard.after(false, true, &mut fake),
             Outcome::Restored { internal: true }
@@ -1088,9 +1133,9 @@ mod tests {
         let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
         fake.internal = Some(vec![panel()]);
         let mut guard = Guard::new();
-        guard.before(true, &mut fake);
+        guard.before(true, false, &mut fake);
         guard.after(true, true, &mut fake);
-        guard.before(false, &mut fake);
+        guard.before(false, false, &mut fake);
         let mut late = LateRecovery(&mut fake, 0);
         assert_eq!(guard.after(false, true, &mut late), Outcome::Recovered);
         assert_eq!(fake.internal_calls, 0);
@@ -1127,8 +1172,11 @@ mod tests {
         fn owner(&self) -> Option<String> {
             self.0.owner()
         }
-        fn keep(&mut self, record: Option<&str>) {
+        fn keep(&mut self, record: &str) {
             self.0.keep(record)
+        }
+        fn forget(&mut self) {
+            self.0.forget()
         }
         fn kept(&mut self) -> Option<String> {
             self.0.kept()
@@ -1163,7 +1211,7 @@ mod tests {
         let mut host = Fake::reading([vec![panel(), monitor()], vec![vdd()]]);
         host.owner = Some(HOST.into());
         let mut guard = Guard::new();
-        guard.before(true, &mut host);
+        guard.before(true, false, &mut host);
         guard.after(true, true, &mut host);
         let kept = host.kept.clone().expect("the host kept its screens");
 
@@ -1173,7 +1221,7 @@ mod tests {
         reporter.kept = Some(kept.clone());
         reporter.reapplied = Some(vec![panel(), monitor()]);
         let mut guard = Guard::new();
-        guard.before(false, &mut reporter);
+        guard.before(false, false, &mut reporter);
         assert_eq!(
             guard.after(false, true, &mut reporter),
             Outcome::Restored { internal: false }
@@ -1198,7 +1246,7 @@ mod tests {
         reporter.owner = Some(HOST.into());
         reporter.reapplied = Some(vec![panel()]);
         let mut guard = Guard::new();
-        guard.before(false, &mut reporter);
+        guard.before(false, false, &mut reporter);
         assert_eq!(guard.after(false, true, &mut reporter), Outcome::Left);
         assert_eq!(reporter.set_display_config_calls(), 0);
     }
@@ -1207,7 +1255,7 @@ mod tests {
     fn a_record_from_another_host_or_one_that_does_not_parse_is_ignored() {
         let mut host = Fake::reading([vec![panel()]]);
         host.owner = Some(HOST.into());
-        Guard::new().before(true, &mut host);
+        Guard::new().before(true, false, &mut host);
         let kept = host.kept.clone().unwrap();
         for (owner, record) in [
             // Another host, boot or session: another id or start time.
@@ -1228,7 +1276,7 @@ mod tests {
             reporter.kept = Some(record.clone());
             reporter.reapplied = Some(vec![panel()]);
             let mut guard = Guard::new();
-            guard.before(false, &mut reporter);
+            guard.before(false, false, &mut reporter);
             assert_eq!(
                 guard.after(false, true, &mut reporter),
                 Outcome::Left,
@@ -1242,7 +1290,7 @@ mod tests {
         }
         // A host with no start time keeps nothing.
         let mut host = Fake::reading([vec![panel()]]);
-        Guard::new().before(true, &mut host);
+        Guard::new().before(true, false, &mut host);
         assert_eq!(host.kept, None);
     }
 
@@ -1251,15 +1299,15 @@ mod tests {
         let mut fake = Fake::reading([vec![panel()], vec![panel(), vdd()]]);
         fake.owner = Some(HOST.into());
         let mut guard = Guard::new();
-        guard.before(true, &mut fake);
+        guard.before(true, false, &mut fake);
         guard.after(true, true, &mut fake);
         // A failed turn off may leave the display on: the record stays.
-        guard.before(false, &mut fake);
+        guard.before(false, false, &mut fake);
         guard.after(false, false, &mut fake);
         assert!(fake.kept.is_some());
         // The next turn off, with nothing in memory, still compares with it.
         fake.reads.push_back(Some(vec![panel()]));
-        guard.before(false, &mut fake);
+        guard.before(false, false, &mut fake);
         assert!(
             fake.text().contains("Comparing with the screens kept"),
             "{}",
@@ -1313,5 +1361,95 @@ mod tests {
         for bad in ["0", "zz", "é0"] {
             assert_eq!(from_hex(bad), None, "{bad}");
         }
+    }
+
+    /// An Enable timed out, then finished late, leaving the virtual display
+    /// alone; the retry's turn on must not save that as the layout to
+    /// restore, for the host or its failure reporter.
+    #[test]
+    fn a_turn_on_while_the_display_is_on_keeps_the_layout_with_a_real_screen() {
+        let mut fake = Fake::reading([
+            vec![panel(), monitor()],
+            vec![panel(), monitor()],
+            vec![vdd()],
+        ]);
+        fake.owner = Some(HOST.into());
+        fake.reapplied = Some(vec![panel(), monitor()]);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        // The Enable timed out: the gate no longer knows the display's state.
+        guard.after(true, false, &mut fake);
+        // The retry, after the late Enable left the virtual display alone.
+        guard.before(true, false, &mut fake);
+        assert!(
+            fake.text().contains(
+                "Keeping the screens from before the virtual display first turned on: paths=2"
+            ),
+            "{}",
+            fake.text()
+        );
+        // The record on disk still holds the first read, for the reporter.
+        let kept = parse::<usize>(HOST, fake.kept.as_deref().unwrap()).unwrap();
+        assert_eq!((kept.screens.len(), kept.saved), (2, 1));
+        guard.after(true, true, &mut fake);
+        guard.before(false, false, &mut fake);
+        fake.reads.push_back(Some(vec![]));
+        assert_eq!(
+            guard.after(false, true, &mut fake),
+            Outcome::Restored { internal: false }
+        );
+        assert_eq!(fake.reapply_calls, [1]);
+
+        // The same retry in a host whose layout is only on disk, as after a
+        // failed Disable that left nothing in memory.
+        let mut fake = Fake::reading([vec![panel()], vec![vdd()]]);
+        fake.owner = Some(HOST.into());
+        let mut first = Guard::new();
+        first.before(true, false, &mut fake);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(
+            parse::<usize>(HOST, fake.kept.as_deref().unwrap())
+                .unwrap()
+                .saved,
+            1
+        );
+
+        // Known off, the screens now are the truth, even with none.
+        let mut fake = Fake::reading([vec![panel()], vec![]]);
+        fake.owner = Some(HOST.into());
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        guard.before(true, true, &mut fake);
+        assert_eq!(
+            parse::<usize>(HOST, fake.kept.as_deref().unwrap())
+                .unwrap()
+                .saved,
+            2
+        );
+    }
+
+    /// A host started again while the reporter restored: its record
+    /// replaced the ended host's, and the reporter's turn off leaves it.
+    #[test]
+    fn the_reporter_never_deletes_a_record_another_host_wrote_meanwhile() {
+        let mut host = Fake::reading([vec![panel()]]);
+        host.owner = Some(HOST.into());
+        Guard::new().before(true, false, &mut host);
+        let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+        reporter.owner = Some(HOST.into());
+        reporter.kept = host.kept.clone();
+        reporter.reapplied = Some(vec![panel()]);
+        let mut guard = Guard::new();
+        guard.before(false, false, &mut reporter);
+        let mut new_host = Fake::reading([vec![panel()]]);
+        new_host.owner = Some("5150-133456789099999999".into());
+        Guard::new().before(true, false, &mut new_host);
+        reporter.kept = new_host.kept.clone();
+        assert_eq!(
+            guard.after(false, true, &mut reporter),
+            Outcome::Restored { internal: false }
+        );
+        assert_eq!(reporter.kept, new_host.kept);
     }
 }

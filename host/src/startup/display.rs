@@ -130,8 +130,15 @@ fn change_on<P: FnMut()>(
 
 /// Replace the record in one step, so a reader never sees half of it.
 fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
-    let temp = path.with_extension(format!("{owner}.tmp"));
-    fs::write(&temp, owner.to_string())?;
+    replace(path, owner, &owner.to_string())
+}
+
+/// Replace `path` with `contents` in one step, through a temporary file
+/// named for `writer`, the process writing. For the owner record and the
+/// display guard's record (`display_guard.rs`).
+pub(crate) fn replace(path: &Path, writer: ProcessId, contents: &str) -> io::Result<()> {
+    let temp = path.with_extension(format!("{writer}.tmp"));
+    fs::write(&temp, contents)?;
     let replaced = with_retries(&SystemClock, || fs::rename(&temp, path));
     if replaced.is_err() {
         let _ = fs::remove_file(&temp);
@@ -236,10 +243,27 @@ enum Removal {
 /// record is never deleted. `before_delete` runs between the two steps and
 /// stops the deletion by returning false, for tests. `posix` asks for the
 /// deletion to take the name away at once where the volume supports it.
-#[cfg(windows)]
 fn delete_if_owned(
     path: &Path,
     owner: ProcessId,
+    before_delete: impl FnOnce() -> bool,
+    posix: bool,
+) -> io::Result<Removal> {
+    let owns = |text: &str| ProcessId::from_name(text.trim()) == Some(owner);
+    delete_if(path, owns, before_delete, posix)
+}
+
+/// Delete the file at `path` only if `owns` accepts its text, read and
+/// deleted through one handle as in [`delete_if_owned`]. True when deleted.
+/// For the display guard's record.
+pub(crate) fn delete_if_its(path: &Path, owns: impl FnOnce(&str) -> bool) -> io::Result<bool> {
+    delete_if(path, owns, || true, true).map(|removal| removal == Removal::Deleted)
+}
+
+#[cfg(windows)]
+fn delete_if(
+    path: &Path,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
     posix: bool,
 ) -> io::Result<Removal> {
@@ -262,7 +286,7 @@ fn delete_if_owned(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
         Err(error) => return Err(error),
     };
-    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+    if let Some(kept) = check_owner(&mut file, owns, before_delete)? {
         return Ok(kept);
     }
     let handle = HANDLE(file.as_raw_handle());
@@ -301,16 +325,16 @@ fn delete_if_owned(
     .map_err(io::Error::from)
 }
 
-/// Read the opened record. `None` when it names `owner` and may be deleted.
+/// Read the opened record. `None` when `owns` accepts it and it may be deleted.
 fn check_owner(
     file: &mut fs::File,
-    owner: ProcessId,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
 ) -> io::Result<Option<Removal>> {
     use std::io::Read;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
-    Ok(if ProcessId::from_name(text.trim()) != Some(owner) {
+    Ok(if !owns(&text) {
         Some(Removal::OtherOwner)
     } else if !before_delete() {
         Some(Removal::Stopped)
@@ -322,9 +346,9 @@ fn check_owner(
 /// Unix has no deletion through a handle; the reporter runs only on Windows.
 /// For tests, this deletes the path only while it is still the opened file.
 #[cfg(not(windows))]
-fn delete_if_owned(
+fn delete_if(
     path: &Path,
-    owner: ProcessId,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
     _posix: bool,
 ) -> io::Result<Removal> {
@@ -334,7 +358,7 @@ fn delete_if_owned(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
         Err(error) => return Err(error),
     };
-    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+    if let Some(kept) = check_owner(&mut file, owns, before_delete)? {
         return Ok(kept);
     }
     let opened = file.metadata().map(|m| (m.dev(), m.ino()))?;
