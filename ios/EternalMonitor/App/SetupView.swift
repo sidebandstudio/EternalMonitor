@@ -16,6 +16,7 @@ enum FirstRun {
         "preferUSB", "promotionEnabled",
         "checkForUpdates", "updateDismissedBuild", "updatePopupClosedBuild",
         DiagnosticsUpload.enabledKey, FeedbackAsk.sessionsKey, FeedbackAsk.doneKey,
+        StarAsk.tappedKey, StarAsk.closedKey,
     ]
 
     /// A fresh install: no PC paired and none of `upgradeKeys` saved.

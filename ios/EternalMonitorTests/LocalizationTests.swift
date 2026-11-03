@@ -107,7 +107,7 @@ final class LocalizationTests: XCTestCase {
             "playPCaudio": false, "targetFPS": 120, "pictureFit": "fill", "allowUSB": false,
             "didSeeOnboarding": false, "lastHost": "192.168.1.20", "recentConnections": Data(),
             "deviceId": "42", "checkForUpdates": false, DiagnosticsUpload.enabledKey: true,
-            FeedbackAsk.doneKey: true, "preferUSB": false, "promotionEnabled": false,
+            FeedbackAsk.doneKey: true, StarAsk.closedKey: true, "preferUSB": false, "promotionEnabled": false,
         ]
         for (key, value) in upgrades {
             XCTAssertFalse(FirstRun.isFreshInstall(saved: launchWrites.merging([key: value]) { $1 }, hasPairings: false), key)

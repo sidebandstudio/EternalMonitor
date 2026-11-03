@@ -7,7 +7,11 @@ final class ConnectScreenTests: UITestCase {
 
     func testConnectControls() {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
+        // No long session yet, a card that was never closed and no update
+        // banner: the saved state can't hide the card for another reason.
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876",
+                               "-feedbackLongSessions", "0", "-feedbackAskDone", "NO", "-starCardClosed", "NO",
+                               "-checkForUpdates", "<false/>"]
         launchCleanly(app)
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
@@ -17,10 +21,46 @@ final class ConnectScreenTests: UITestCase {
         }
         XCTAssertEqual(app.textFields["connect.host"].value as? String, "127.0.0.1")
         XCTAssertTrue(app.buttons["connect.button"].isEnabled)
+        XCTAssertFalse(app.buttons["connect.starCard"].exists, "no star card before a long session")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "connect-screen"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+    }
+
+    /// After a long session the star card sits under the PCs. The feedback
+    /// ask comes instead while it is due, and Close retires the card. The
+    /// update banner rule is a unit test: a found update is saved, and its
+    /// banner would follow every later UI test.
+    func testTheStarCardFollowsALongSessionAndCloses() {
+        let app = XCUIApplication()
+        let base = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-feedbackAskDone", "NO", "-starCardTapped", "NO"]
+        app.launchArguments = base + ["-feedbackLongSessions", "3", "-starCardClosed", "NO"]
+        launchCleanly(app)
+        XCTAssertTrue(app.buttons["feedback.askSend"].waitForExistence(timeout: 10))
+        let star = app.buttons["connect.starCard"]
+        XCTAssertFalse(star.exists, "not next to the feedback ask")
+
+        // Updates off, so an update another test saved can't show its banner
+        // instead. A plist false, as UpdateChecker reads the setting as a Bool.
+        let noUpdates = base + ["-checkForUpdates", "<false/>"]
+        app.launchArguments = noUpdates + ["-feedbackLongSessions", "1", "-starCardClosed", "NO"]
+        launchCleanly(app)
+        XCTAssertTrue(star.waitForExistence(timeout: 10))
+        XCTAssertEqual(star.label, "Enjoying EternalMonitor? A GitHub star helps others put a spare iPad to work")
+        XCTAssertLessThan(app.buttons["connect.button"].frame.maxY, star.frame.minY, "under the connect controls")
+        XCTAssertTrue(app.swipeUp(toReveal: star))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "star-card"; shot.lifetime = .keepAlways; add(shot)
+        // Close is at the card's trailing end.
+        star.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -34, dy: 0)).tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: star)
+        waitForExpectations(timeout: 5)
+
+        app.launchArguments = noUpdates + ["-feedbackLongSessions", "1"]
+        launchCleanly(app)
+        XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
+        XCTAssertFalse(star.waitForExistence(timeout: 2), "closed for good")
     }
 
     func testSettingsOpenAndDismiss() {

@@ -193,3 +193,59 @@ struct FeedbackAskCard: View {
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 }
+
+/// "Enjoying EternalMonitor?" under the PCs, as on the PC app. A tap opens
+/// the repository on GitHub; the card then says thank you. VoiceOver reads
+/// it as one button, with Close as its action.
+struct StarAskCard: View {
+    let thanked: Bool
+    let open: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        let title = thanked ? L("Thank you!") : L("Enjoying EternalMonitor?")
+        let detail = thanked ? L("It helps others find us") : L("A GitHub star helps others put a spare iPad to work")
+        HStack(spacing: 4) {
+            Button(action: open) {
+                HStack(spacing: 12) {
+                    Image(systemName: thanked ? "star.fill" : "star")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 34, height: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Theme.accent.opacity(thanked ? 0.16 : 0.1))
+                        )
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.app(15, .semibold, relativeTo: .subheadline))
+                            .foregroundStyle(Theme.text)
+                        Text(detail)
+                            .font(.app(13, relativeTo: .footnote))
+                            .foregroundStyle(Theme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textFaint)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .card(padding: 12)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: "\(title) \(detail)"))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(.default, open)
+        .accessibilityAction(named: Text(verbatim: L("Close")), close)
+        .accessibilityIdentifier("connect.starCard")
+        .transition(.opacity)
+    }
+}
