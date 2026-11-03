@@ -29,8 +29,9 @@ final class ConnectScreenTests: UITestCase {
     }
 
     /// After a long session the star card sits under the PCs. The feedback
-    /// ask and the update banner come instead while they show, and Close
-    /// retires the card.
+    /// ask comes instead while it is due, and Close retires the card. The
+    /// update banner rule is a unit test: a found update is saved, and its
+    /// banner would follow every later UI test.
     func testTheStarCardFollowsALongSessionAndCloses() {
         let app = XCUIApplication()
         let base = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-feedbackAskDone", "NO", "-starCardTapped", "NO"]
@@ -40,20 +41,8 @@ final class ConnectScreenTests: UITestCase {
         let star = app.buttons["connect.starCard"]
         XCTAssertFalse(star.exists, "not next to the feedback ask")
 
-        // Debug builds read EM_UPDATE_MANIFEST instead of the website.
-        app.launchArguments = base + ["-feedbackLongSessions", "1", "-starCardClosed", "NO", "-checkForUpdates", "YES",
-                                      "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0"]
-        app.launchEnvironment["EM_UPDATE_MANIFEST"] = #"{"schema":1,"ipad":{"version":"9.9.9","build":999}}"#
-        launchCleanly(app)
-        let later = app.buttons["updatePopup.later"]
-        XCTAssertTrue(later.waitForExistence(timeout: 10))
-        later.tap()
-        XCTAssertTrue(app.otherElements["update.banner"].waitForExistence(timeout: 5))
-        XCTAssertFalse(star.exists, "not next to the update banner")
-        app.launchEnvironment["EM_UPDATE_MANIFEST"] = nil
-
-        // The update stays saved, so its banner would come back: updates off.
-        // A plist false, as UpdateChecker reads the setting as a Bool object.
+        // Updates off, so an update another test saved can't show its banner
+        // instead. A plist false, as UpdateChecker reads the setting as a Bool.
         let noUpdates = base + ["-checkForUpdates", "<false/>"]
         app.launchArguments = noUpdates + ["-feedbackLongSessions", "1", "-starCardClosed", "NO"]
         launchCleanly(app)
