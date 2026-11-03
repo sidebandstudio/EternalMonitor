@@ -56,6 +56,13 @@ final class ConnectScreenTests: UITestCase {
         star.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -34, dy: 0)).tap()
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: star)
         waitForExpectations(timeout: 5)
+        // Leave the app the way a person does before relaunching it: XCTest's
+        // kill 130 ms after Close beat the saved setting to disk on CI.
+        XCUIDevice.shared.press(.home)
+        expectation(for: NSPredicate(format: "state == %d OR state == %d",
+                                     XCUIApplication.State.runningBackground.rawValue,
+                                     XCUIApplication.State.runningBackgroundSuspended.rawValue), evaluatedWith: app)
+        waitForExpectations(timeout: 5)
 
         app.launchArguments = noUpdates + ["-feedbackLongSessions", "1"]
         launchCleanly(app)
