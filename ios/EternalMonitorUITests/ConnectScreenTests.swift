@@ -7,7 +7,11 @@ final class ConnectScreenTests: UITestCase {
 
     func testConnectControls() {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876"]
+        // No long session yet, a card that was never closed and no update
+        // banner: the saved state can't hide the card for another reason.
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-lastHost", "127.0.0.1", "-lastPort", "9876",
+                               "-feedbackLongSessions", "0", "-feedbackAskDone", "NO", "-starCardClosed", "NO",
+                               "-checkForUpdates", "<false/>"]
         launchCleanly(app)
 
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 10))
@@ -25,7 +29,8 @@ final class ConnectScreenTests: UITestCase {
     }
 
     /// After a long session the star card sits under the PCs. The feedback
-    /// ask comes instead while it is due, and Close retires the card.
+    /// ask and the update banner come instead while they show, and Close
+    /// retires the card.
     func testTheStarCardFollowsALongSessionAndCloses() {
         let app = XCUIApplication()
         let base = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-feedbackAskDone", "NO", "-starCardTapped", "NO"]
@@ -35,7 +40,22 @@ final class ConnectScreenTests: UITestCase {
         let star = app.buttons["connect.starCard"]
         XCTAssertFalse(star.exists, "not next to the feedback ask")
 
-        app.launchArguments = base + ["-feedbackLongSessions", "1", "-starCardClosed", "NO"]
+        // Debug builds read EM_UPDATE_MANIFEST instead of the website.
+        app.launchArguments = base + ["-feedbackLongSessions", "1", "-starCardClosed", "NO", "-checkForUpdates", "YES",
+                                      "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0"]
+        app.launchEnvironment["EM_UPDATE_MANIFEST"] = #"{"schema":1,"ipad":{"version":"9.9.9","build":999}}"#
+        launchCleanly(app)
+        let later = app.buttons["updatePopup.later"]
+        XCTAssertTrue(later.waitForExistence(timeout: 10))
+        later.tap()
+        XCTAssertTrue(app.otherElements["update.banner"].waitForExistence(timeout: 5))
+        XCTAssertFalse(star.exists, "not next to the update banner")
+        app.launchEnvironment["EM_UPDATE_MANIFEST"] = nil
+
+        // The update stays saved, so its banner would come back: updates off.
+        // A plist false, as UpdateChecker reads the setting as a Bool object.
+        let noUpdates = base + ["-checkForUpdates", "<false/>"]
+        app.launchArguments = noUpdates + ["-feedbackLongSessions", "1", "-starCardClosed", "NO"]
         launchCleanly(app)
         XCTAssertTrue(star.waitForExistence(timeout: 10))
         XCTAssertEqual(star.label, "Enjoying EternalMonitor? A GitHub star helps others put a spare iPad to work")
@@ -48,7 +68,7 @@ final class ConnectScreenTests: UITestCase {
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: star)
         waitForExpectations(timeout: 5)
 
-        app.launchArguments = base + ["-feedbackLongSessions", "1"]
+        app.launchArguments = noUpdates + ["-feedbackLongSessions", "1"]
         launchCleanly(app)
         XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
         XCTAssertFalse(star.waitForExistence(timeout: 2), "closed for good")

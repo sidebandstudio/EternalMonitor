@@ -8,6 +8,7 @@ struct ConnectView: View {
     @StateObject private var scanner = NetworkScanner()
     @ObservedObject private var pairings = PairingStore.shared
     @ObservedObject private var language = LanguageStore.shared
+    @ObservedObject private var updates = UpdateChecker.shared
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
@@ -123,7 +124,8 @@ struct ConnectView: View {
 
                             // Last, so it never moves the PCs or the controls.
                             if connectionManager.isIdleOnConnect
-                                && starAsk.shown(connectionManager.feedbackAsk, streaming: connectionManager.state == .connected) {
+                                && starAsk.shown(connectionManager.feedbackAsk, streaming: connectionManager.state == .connected,
+                                                 updateBanner: updates.banner != nil) {
                                 StarAskCard(thanked: starAsk.tapped, open: openRepository, close: {
                                     withAnimation(Motion.fade) { starAsk.close() }
                                 })
