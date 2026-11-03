@@ -144,8 +144,9 @@ struct FeedbackAsk {
 
 /// The GitHub star card on the Connect screen, like the PC app's. It shows
 /// after a session of five minutes or more, never while streaming and
-/// never next to the feedback ask or the update banner. A tap opens the repository and turns it
-/// into a thank-you, which stays until closed; closing retires it for good.
+/// never next to the feedback ask or the update banner. A tap opens the
+/// repository and turns it into a thank-you, which stays until closed;
+/// closing retires it for good.
 struct StarAsk {
     static let tappedKey = "starCardTapped"
     static let closedKey = "starCardClosed"
