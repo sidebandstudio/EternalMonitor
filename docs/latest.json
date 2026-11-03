@@ -1,11 +1,10 @@
 {
   "schema": 1,
   "windows": {
-    "version": "0.3.3",
-    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe",
-    "sha256": "3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b",
-    "recommended": true,
-    "note": "Fixes Second screen not starting on some PCs, especially laptops with Intel and NVIDIA graphics. Your iPad now shows your screen right away while the second screen starts."
+    "version": "0.3.4",
+    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe",
+    "sha256": "fd504888b11aff376fd004c0f50ab15459c5ca2a4544b3b6cd975d4be3368f09",
+    "note": "Fixes the problems reported with 0.3.3: start-up crashes on AMD and Intel graphics, USB freezes on slower PCs and smeared frames on Wi-Fi. Update the iPad app in TestFlight once 0.3.4 appears."
   },
   "ipad": {
     "version": "0.3.3",
