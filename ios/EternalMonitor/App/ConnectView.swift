@@ -22,6 +22,8 @@ struct ConnectView: View {
     @State private var showQRScanner = false
     @State private var showDetails = false
     @State private var feedbackRequest: FeedbackRequest?
+    @State private var starAsk = StarAsk()
+    @Environment(\.openURL) private var openURL
     /// Send feedback was tapped and its sheet is on the way (Mail first
     /// collects diagnostics). Nothing else may open meanwhile.
     @State private var preparingFeedback = false
@@ -117,6 +119,15 @@ struct ConnectView: View {
                             if !unlistedRecents.isEmpty {
                                 recentSection
                                     .entrance(appeared, delay: 0.26)
+                            }
+
+                            // Last, so it never moves the PCs or the controls.
+                            if connectionManager.isIdleOnConnect
+                                && starAsk.shown(connectionManager.feedbackAsk, streaming: connectionManager.state == .connected) {
+                                StarAskCard(thanked: starAsk.tapped, open: openRepository, close: {
+                                    withAnimation(Motion.fade) { starAsk.close() }
+                                })
+                                .entrance(appeared, delay: 0.32)
                             }
 
                             if isConnecting || connectionManager.connectionError != nil || connectionManager.problem != nil
@@ -393,6 +404,16 @@ struct ConnectView: View {
             #endif
             feedbackRequest = await FeedbackRequest.make(kind, context: context)
         }
+    }
+
+    /// The star card: the repository in the browser, as Settings' link
+    /// opens it, and the card's thank-you from then on.
+    private func openRepository() {
+        if let url = URL(string: Feedback.repoURL) {
+            openURL(url)
+        }
+        SupportDiagnostics.shared.record("info", "feedback", "GitHub star card tapped")
+        withAnimation(Motion.fade) { starAsk.tap() }
     }
 
     private func openAppSettings() {

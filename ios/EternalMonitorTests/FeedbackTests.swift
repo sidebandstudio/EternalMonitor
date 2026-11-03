@@ -162,4 +162,51 @@ final class FeedbackTests: XCTestCase {
         relaunched.sessionEnded(after: 600, defaults: store)
         XCTAssertFalse(relaunched.due(streaming: false))
     }
+
+    func testTheStarCardWaitsForALongSessionAndGivesWayToTheAsk() {
+        let store = defaults()
+        var ask = FeedbackAsk(defaults: store)
+        let star = StarAsk(defaults: store)
+        // A first run, and short sessions, show nothing.
+        XCTAssertFalse(star.shown(ask, streaming: false))
+        ask.sessionEnded(after: 299, defaults: store)
+        XCTAssertFalse(star.shown(ask, streaming: false))
+        ask.sessionEnded(after: 300, defaults: store)
+        XCTAssertTrue(star.shown(ask, streaming: false))
+        // Never over the picture.
+        XCTAssertFalse(star.shown(ask, streaming: true))
+        // The feedback ask wins while it is due, and the card returns once
+        // it is answered.
+        ask.sessionEnded(after: 600, defaults: store)
+        ask.sessionEnded(after: 600, defaults: store)
+        XCTAssertTrue(ask.due(streaming: false))
+        XCTAssertFalse(star.shown(ask, streaming: false))
+        ask.finish(defaults: store)
+        XCTAssertTrue(star.shown(ask, streaming: false))
+        XCTAssertFalse(star.shown(ask, streaming: true))
+    }
+
+    func testATapThanksAndACloseRetiresTheStarCard() {
+        let store = defaults()
+        store.set(1, forKey: FeedbackAsk.sessionsKey)
+        let ask = FeedbackAsk(defaults: store)
+        var star = StarAsk(defaults: store)
+        XCTAssertFalse(star.tapped)
+        star.tap(defaults: store)
+        XCTAssertTrue(star.tapped)
+        // The thank-you stays, after a relaunch too, until closed.
+        var relaunched = StarAsk(defaults: store)
+        XCTAssertTrue(relaunched.tapped)
+        XCTAssertTrue(relaunched.shown(ask, streaming: false))
+        relaunched.close(defaults: store)
+        XCTAssertFalse(relaunched.shown(ask, streaming: false))
+        XCTAssertFalse(StarAsk(defaults: store).shown(ask, streaming: false))
+        // Closed without a tap: also for good.
+        let other = defaults()
+        other.set(1, forKey: FeedbackAsk.sessionsKey)
+        var untapped = StarAsk(defaults: other)
+        untapped.close(defaults: other)
+        XCTAssertFalse(untapped.tapped)
+        XCTAssertFalse(StarAsk(defaults: other).shown(FeedbackAsk(defaults: other), streaming: false))
+    }
 }

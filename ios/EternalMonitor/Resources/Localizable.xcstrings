@@ -73,6 +73,18 @@
         }
       }
     },
+    "A GitHub star helps others put a spare iPad to work" : {
+      "comment" : "The star card's line under its title",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A GitHub star helps others put a spare iPad to work"
+          }
+        }
+      }
+    },
     "About" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -566,6 +578,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "选择 EternalMonitor 的语言。之后可以在设置中更改。"
+          }
+        }
+      }
+    },
+    "Close" : {
+      "comment" : "VoiceOver action that hides the star card for good",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
           }
         }
       }
@@ -1923,6 +1947,18 @@
         }
       }
     },
+    "Enjoying EternalMonitor?" : {
+      "comment" : "The star card's title on the Connect screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enjoying EternalMonitor?"
+          }
+        }
+      }
+    },
     "Enter the 6-digit code shown in EternalMonitor on your PC. You only need to do this once." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -3058,6 +3094,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "隐藏键盘"
+          }
+        }
+      }
+    },
+    "It helps others find us" : {
+      "comment" : "The star card's line once it was tapped",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "It helps others find us"
           }
         }
       }
@@ -7824,6 +7872,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "轻点以连接 · %@"
+          }
+        }
+      }
+    },
+    "Thank you!" : {
+      "comment" : "The star card's title once it was tapped",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thank you!"
           }
         }
       }

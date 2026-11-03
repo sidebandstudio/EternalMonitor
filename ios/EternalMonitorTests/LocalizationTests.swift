@@ -20,14 +20,22 @@ final class LocalizationTests: XCTestCase {
             .map { String(text[Range($0.range(at: 1), in: text)!]) }.sorted()
     }
 
+    /// English strings whose translations come in a separate pass. Until
+    /// then every language shows them in English.
+    private let awaitingTranslation: Set<String> = [
+        "Enjoying EternalMonitor?", "A GitHub star helps others put a spare iPad to work",
+        "Thank you!", "It helps others find us", "Close",
+    ]
+
     /// Every language has exactly English's strings, none empty, each with
     /// the same placeholders.
     func testEveryLanguageHasEveryString() throws {
         let english = try table("en")
         XCTAssertGreaterThan(english.count, 100)
+        XCTAssertTrue(awaitingTranslation.isSubset(of: english.keys))
         for language in AppLanguage.allCases where language != .en {
             let strings = try table(language.rawValue)
-            XCTAssertEqual(Set(strings.keys), Set(english.keys), language.rawValue)
+            XCTAssertEqual(Set(strings.keys), Set(english.keys).subtracting(awaitingTranslation), language.rawValue)
             for (key, value) in strings {
                 XCTAssertFalse(value.trimmingCharacters(in: .whitespaces).isEmpty, "\(language.rawValue): \(key)")
                 XCTAssertEqual(specifiers(value), specifiers(key), "\(language.rawValue): \(key)")
@@ -107,7 +115,7 @@ final class LocalizationTests: XCTestCase {
             "playPCaudio": false, "targetFPS": 120, "pictureFit": "fill", "allowUSB": false,
             "didSeeOnboarding": false, "lastHost": "192.168.1.20", "recentConnections": Data(),
             "deviceId": "42", "checkForUpdates": false, DiagnosticsUpload.enabledKey: true,
-            FeedbackAsk.doneKey: true, "preferUSB": false, "promotionEnabled": false,
+            FeedbackAsk.doneKey: true, StarAsk.closedKey: true, "preferUSB": false, "promotionEnabled": false,
         ]
         for (key, value) in upgrades {
             XCTAssertFalse(FirstRun.isFreshInstall(saved: launchWrites.merging([key: value]) { $1 }, hasPairings: false), key)

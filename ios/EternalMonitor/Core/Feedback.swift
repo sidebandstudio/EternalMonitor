@@ -142,6 +142,38 @@ struct FeedbackAsk {
     }
 }
 
+/// The GitHub star card on the Connect screen, like the PC app's. It shows
+/// after a session of five minutes or more, never while streaming and
+/// never next to the feedback ask. A tap opens the repository and turns it
+/// into a thank-you, which stays until closed; closing retires it for good.
+struct StarAsk {
+    static let tappedKey = "starCardTapped"
+    static let closedKey = "starCardClosed"
+
+    private(set) var tapped: Bool
+    private(set) var closed: Bool
+
+    init(defaults: UserDefaults = .standard) {
+        tapped = defaults.bool(forKey: Self.tappedKey)
+        closed = defaults.bool(forKey: Self.closedKey)
+    }
+
+    /// `ask` counts the long sessions, and wins while it is due.
+    func shown(_ ask: FeedbackAsk, streaming: Bool) -> Bool {
+        !closed && !streaming && ask.longSessions >= 1 && !ask.due(streaming: streaming)
+    }
+
+    mutating func tap(defaults: UserDefaults = .standard) {
+        tapped = true
+        defaults.set(true, forKey: Self.tappedKey)
+    }
+
+    mutating func close(defaults: UserDefaults = .standard) {
+        closed = true
+        defaults.set(true, forKey: Self.closedKey)
+    }
+}
+
 /// EternalMonitor versions PCs announce over Bonjour, by address and name.
 @MainActor
 enum PCVersions {
