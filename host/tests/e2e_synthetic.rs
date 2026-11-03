@@ -885,6 +885,8 @@ fn free_udp_port() -> u16 {
 struct H264TestDecoder {
     decoder: ffmpeg_next::codec::decoder::Video,
     frame: ffmpeg_next::frame::Video,
+    /// Width and height of the last picture that came out.
+    size: (u32, u32),
 }
 
 impl H264TestDecoder {
@@ -899,6 +901,7 @@ impl H264TestDecoder {
         Self {
             decoder,
             frame: ffmpeg_next::frame::Video::empty(),
+            size: (0, 0),
         }
     }
 
@@ -911,6 +914,7 @@ impl H264TestDecoder {
         }
         let mut counters = Vec::new();
         while self.decoder.receive_frame(&mut self.frame).is_ok() {
+            self.size = (self.frame.width(), self.frame.height());
             let stride = self.frame.stride(0);
             let luma = self.frame.data(0);
             counters.push(decode_frame_counter_from_luma(luma, stride, SYNTH_W));
@@ -2683,6 +2687,184 @@ fn input_relay_maps_touches_end_to_end() {
                 pressure: 0,
                 ..sample
             })
+        ]
+    );
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}
+
+/// A screen with an odd size streams at the even size below it: libx264
+/// refused 1680x945 and the pipeline gave up after six restarts. The iPad
+/// is told the size it decodes, the picture is intact, and a touch on its
+/// last pixel lands there while its far edge reaches the row and column left
+/// out. Off Windows only: the input recorder stands in for real injection.
+#[cfg(not(windows))]
+#[test]
+fn an_odd_screen_streams_cropped_and_input_still_reaches_its_edge() {
+    use eternal_host::input::{
+        desktop_pixel_to_abs, recorder, Injection, VirtualScreen, KIND_TOUCH,
+    };
+    use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+    const ODD_W: u32 = SYNTH_W + 1;
+    const ODD_H: u32 = SYNTH_H + 1;
+
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{ODD_W}x{ODD_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            gpu_info,
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+
+    let mut receiver = FakeReceiver::connect_with_caps(listen_port, FEATURE_WANTS_INPUT);
+    let deadline = Instant::now() + DEADLINE;
+    let mut reassembler = Reassembler::new();
+    let mut decoder = H264TestDecoder::new();
+    let mut datagram = [0u8; 2048];
+    let mut decoded_counters: Vec<u64> = Vec::new();
+    let mut heartbeats_seen = 0u32;
+    let mut highest_seq = 0u32;
+    while decoded_counters.len() < WANT_DECODED_FRAMES || heartbeats_seen == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: {} decoded frames, heartbeats={heartbeats_seen}",
+            decoded_counters.len()
+        );
+        receiver.maybe_report(highest_seq, decoded_counters.len() as u32);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        let bytes = &datagram[..len];
+        match classify(bytes) {
+            Classified::Control(_) => {
+                // Heartbeats before the first capture carry no size.
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(bytes) {
+                    let size = (hb.stream_config.width, hb.stream_config.height);
+                    if size != (0, 0) {
+                        heartbeats_seen += 1;
+                        assert_eq!(size, (SYNTH_W as u16, SYNTH_H as u16));
+                    }
+                }
+            }
+            Classified::Media { .. } => {
+                let (header, payload) = MediaHeader::decode(bytes).expect("valid media datagram");
+                highest_seq = highest_seq.max(header.frame_seq);
+                let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
+                    header.frame_seq,
+                    header.frag_index,
+                    header.frag_count,
+                    header.stream_epoch,
+                    payload,
+                    Instant::now(),
+                ) else {
+                    continue;
+                };
+                let counters = decoder.decode(&frame_bytes);
+                if !counters.is_empty() {
+                    assert_eq!(decoder.size, (SYNTH_W, SYNTH_H));
+                }
+                decoded_counters.extend(counters);
+            }
+            _ => {}
+        }
+    }
+    // Real pictures: the counter in the top-left corner reads back and rises.
+    for pair in decoded_counters.windows(2) {
+        assert!(pair[1] > pair[0], "decoded counters must rise: {pair:?}");
+    }
+
+    let _ = recorder::take();
+    let screen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: ODD_W,
+        height: ODD_H,
+    };
+    // TouchRelay.swift: the touch's fraction of the 640x360 picture.
+    let centre = |pixel: u32, pixels: u32| {
+        ((f64::from(pixel) + 0.5) / f64::from(pixels) * 65_535.0).round() as u16
+    };
+    let tap = InputEvent {
+        input_ver: 1,
+        kind: KIND_TOUCH,
+        phase: 0,
+        buttons: 1,
+        event_id: 1,
+        x_norm: centre(SYNTH_W - 1, SYNTH_W),
+        y_norm: centre(SYNTH_H - 1, SYNTH_H),
+        pressure_x1000: 0,
+        scroll_dx: 0,
+        scroll_dy: 0,
+        keycode: 0,
+        modifiers: 0,
+        client_time_us: 0,
+        tilt_x: 0,
+        tilt_y: 0,
+    };
+    for event in [
+        tap,
+        InputEvent {
+            phase: 1,
+            event_id: 2,
+            x_norm: 65_535,
+            y_norm: 65_535,
+            ..tap
+        },
+        InputEvent {
+            phase: 2,
+            event_id: 3,
+            x_norm: 65_535,
+            y_norm: 65_535,
+            ..tap
+        },
+    ] {
+        receiver.send(&ControlMessage::InputEvent(event));
+    }
+    let inject_deadline = Instant::now() + Duration::from_secs(5);
+    while recorder::peek().len() < 5 && Instant::now() < inject_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    let (lx, ly) = desktop_pixel_to_abs(SYNTH_W as i32 - 1, SYNTH_H as i32 - 1, screen);
+    let (ex, ey) = desktop_pixel_to_abs(ODD_W as i32 - 1, ODD_H as i32 - 1, screen);
+    assert_eq!(
+        recorder::take(),
+        [
+            Injection::MoveAbs { x: lx, y: ly },
+            Injection::LeftDown { x: lx, y: ly },
+            Injection::MoveAbs { x: ex, y: ey },
+            Injection::MoveAbs { x: ex, y: ey },
+            Injection::LeftUp { x: ex, y: ey },
         ]
     );
 

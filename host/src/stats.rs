@@ -18,6 +18,9 @@ pub struct PipelineStats {
 
     // Capture
     pub capture_fps: f64,
+    /// The size the stream encodes at: capture's, without an odd last
+    /// column or row (see [`crate::encoder::encoded_size`]). The iPad's
+    /// stream config, the GUI and the stats summary report it.
     pub capture_resolution: (u32, u32),
     pub capture_frame_count: u64,
     pub gpu_name: String,
@@ -207,7 +210,7 @@ impl PipelineStats {
     pub fn record_capture(&mut self, width: u32, height: u32) {
         let now = Instant::now();
         self.capture_frame_count += 1;
-        self.capture_resolution = (width, height);
+        self.capture_resolution = crate::encoder::encoded_size(width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
     }
