@@ -4,6 +4,8 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
 
+use crate::stall::Call;
+
 const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
@@ -53,15 +55,13 @@ pub struct GpuInfo {
 
 impl GpuInfo {
     /// Detect the best GPU via DXGI and resolve the preferred encoder.
-    /// Falls back to software encoding if detection fails.
+    /// Falls back to software encoding if detection fails, or does not
+    /// return within its limit ([`Call::GpuDetect`]), so a stuck driver
+    /// cannot hold startup and the window.
     pub fn detect() -> Self {
-        match detect_from_dxgi() {
-            Ok(info) => info,
-            Err(e) => {
-                warn!(error = %e, "DXGI GPU detection failed, falling back to software encoding");
-                Self::software_fallback()
-            }
-        }
+        detect_within(crate::stall::lanes(), Call::GpuDetect.limits(), || {
+            detect_from_dxgi().map_err(|e| e.to_string())
+        })
     }
 
     pub fn software_fallback() -> Self {
@@ -73,6 +73,25 @@ impl GpuInfo {
             encoder_name: "libx264".to_string(),
             codec_display_name: "H.264 (x264)".to_string(),
         }
+    }
+}
+
+/// `detect`'s result, run on a thread of its own in `lanes` under `limits`.
+/// One the caller gives up on is dropped when it returns: the facts it
+/// found are passed on at startup and not updated later. The stall guard
+/// logs the one line for a timeout.
+fn detect_within(
+    lanes: &'static crate::stall::Lanes,
+    limits: crate::stall::Limits,
+    detect: impl FnOnce() -> Result<GpuInfo, String> + Send + 'static,
+) -> GpuInfo {
+    match crate::stall::run_on(lanes, Call::GpuDetect, limits, detect, || {}) {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => {
+            warn!(error = %e, "DXGI GPU detection failed, falling back to software encoding");
+            GpuInfo::software_fallback()
+        }
+        Err(_) => GpuInfo::software_fallback(),
     }
 }
 
@@ -322,6 +341,111 @@ mod tests {
             Some(adapter) => adapter.clone(),
             None => Err(DXGI_ERROR_NOT_FOUND.into()),
         })
+    }
+
+    /// `detect_within` over `detect` in lanes of its own, under a 300 ms
+    /// limit: what it found, how long it took and what it logged.
+    fn detect_held(
+        detect: impl FnOnce() -> Result<GpuInfo, String> + Send + 'static,
+    ) -> (
+        GpuInfo,
+        std::time::Duration,
+        String,
+        &'static crate::stall::Lanes,
+    ) {
+        use std::sync::Arc;
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let limits = crate::stall::Limits {
+            warn: std::time::Duration::from_millis(100),
+            limit: std::time::Duration::from_millis(300),
+        };
+        let out = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(Arc::clone(&writer)))
+            .finish();
+        let started = std::time::Instant::now();
+        let info =
+            tracing::subscriber::with_default(subscriber, || detect_within(lanes, limits, detect));
+        let took = started.elapsed();
+        let text = String::from_utf8(out.lock().clone()).unwrap();
+        (info, took, text, lanes)
+    }
+
+    fn found(name: &str) -> GpuInfo {
+        GpuInfo {
+            vendor: GpuVendor::Nvidia,
+            name: name.to_string(),
+            encoder_name: "h264_nvenc".to_string(),
+            codec_display_name: "H.264 (NVENC)".to_string(),
+            ..GpuInfo::software_fallback()
+        }
+    }
+
+    #[test]
+    fn a_stuck_detection_starts_at_its_limit_with_the_software_facts() {
+        // The detector waits on a driver that does not return until the
+        // test lets it.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (returned, late) = std::sync::mpsc::channel::<()>();
+        let (info, took, text, lanes) = detect_held(move || {
+            let _ = held.recv();
+            let _ = returned.send(());
+            Ok(found("late"))
+        });
+        // The same facts as a detection that finds nothing, at the limit.
+        assert_eq!(info.name, "Software");
+        assert_eq!(info.encoder_name, "libx264");
+        assert_eq!(info.vendor, GpuVendor::Unknown);
+        assert!(
+            took >= std::time::Duration::from_millis(300)
+                && took < std::time::Duration::from_secs(3),
+            "{took:?}"
+        );
+        // One WARN, saying detection timed out and after how long.
+        let warns: Vec<_> = text.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warns.len(), 1, "{text}");
+        assert!(warns[0].contains("stall=gpu_detect after_ms="), "{text}");
+        assert!(warns[0].contains("limit_ms=300"), "{text}");
+        // Until it returns, the lane holds it; its late result is dropped.
+        assert_eq!(lanes.abandoned(Call::GpuDetect), 1);
+        release.send(()).unwrap();
+        late.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lanes.abandoned(Call::GpuDetect) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane did not free"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_detection_that_returns_in_time_keeps_its_facts() {
+        let (info, _, text, _) = detect_held(|| Ok(found("RTX")));
+        assert_eq!(
+            (info.name.as_str(), info.encoder_name.as_str()),
+            ("RTX", "h264_nvenc")
+        );
+        assert!(!text.contains("WARN"), "{text}");
+        // A failed one falls back with its own line, as before.
+        let (info, _, text, _) = detect_held(|| Err("no adapters".to_string()));
+        assert_eq!(info.encoder_name, "libx264");
+        assert!(text.contains("DXGI GPU detection failed"), "{text}");
+        assert!(!text.contains("stall="), "{text}");
     }
 
     #[test]

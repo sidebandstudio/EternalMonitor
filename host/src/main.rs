@@ -130,9 +130,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Best-effort capture source for the banner — reflects the default (primary). The
     // authoritative per-run source (including a persisted/fallback selection) is logged
-    // inside the capture loop when the stream starts.
+    // inside the capture loop when the stream starts. Skipped while a GPU
+    // detection given up on is still stuck: this would wait on the same
+    // driver.
     let capture_summary = {
-        let outputs = capture::enumerate_outputs();
+        let outputs = if eternal_host::stall::abandoned(eternal_host::stall::Call::GpuDetect) == 0 {
+            capture::enumerate_outputs()
+        } else {
+            Vec::new()
+        };
         outputs
             .iter()
             .find(|o| o.is_primary)
