@@ -40,8 +40,6 @@ This release fixes the problems reported with 0.3.3.
   every frame with **Encoder input** on Automatic, up from about 91%.
 - If the second screen can't start, the PC mirrors and retries later, even
   after a restart, or at once after a driver, Windows or app update.
-- If installing or Second screen turns off every PC screen, EternalMonitor
-  turns them back on.
 - A stuck graphics driver no longer freezes a session: video uses the
   processor until it answers.
 - On a slow disk, falling back from the second screen no longer pauses the
@@ -72,7 +70,7 @@ This release fixes the problems reported with 0.3.3.
 ### Known issues
 
 - If your PC's screen stays black after installing or after Second screen,
-  press Win+P and choose **PC screen only**.
+  press Win+P and choose **PC screen only**, or restart the PC.
 
 ### What to test
 
