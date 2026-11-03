@@ -116,10 +116,12 @@ pub(super) fn conversion_context(
     .map(Some)
 }
 
-/// Converts capture's tightly packed BGRA rows into `output` where they lie:
-/// swscale reads the capture buffer itself, with no copy into a BGRA frame
-/// first. The call returns when the conversion is done, so the buffer can
-/// go back to capture straight after.
+/// Converts capture's BGRA rows, `row_bytes` apart, into `output` where they
+/// lie: swscale reads the capture buffer itself, with no copy into a BGRA
+/// frame first. Rows wider than the scaler's input, or more of them, are a
+/// capture with an odd last column or row, which is left out. The call
+/// returns when the conversion is done, so the buffer can go back to
+/// capture straight after.
 ///
 /// swscale can read up to [`FRAME_PADDING`] bytes past the last row, so
 /// `rows` without that many after the picture, as capture's
@@ -128,12 +130,14 @@ pub(super) fn conversion_context(
 pub(super) fn convert_packed_bgra(
     scaler: &mut ffmpeg_next::software::scaling::Context,
     rows: &[u8],
+    row_bytes: usize,
     output: &mut ffmpeg_next::frame::Video,
 ) -> Result<(), ffmpeg_next::Error> {
     let input = *scaler.input();
-    let row_bytes = input.width as usize * 4;
-    let frame_bytes = row_bytes * input.height as usize;
-    if input.format != Pixel::BGRA || rows.len() < frame_bytes {
+    let picture_bytes = input.width as usize * 4;
+    // The last row ends after its picture's pixels.
+    let frame_bytes = row_bytes * (input.height as usize).saturating_sub(1) + picture_bytes;
+    if input.format != Pixel::BGRA || row_bytes < picture_bytes || rows.len() < frame_bytes {
         return Err(ffmpeg_next::Error::InputChanged);
     }
     let wanted = scaler.output();
@@ -144,7 +148,7 @@ pub(super) fn convert_packed_bgra(
         return Err(ffmpeg_next::Error::OutputChanged);
     }
     if rows.len() < frame_bytes + FRAME_PADDING {
-        let copied = copied_frame(&rows[..frame_bytes], input.width, input.height);
+        let copied = copied_frame(&rows[..frame_bytes], row_bytes, input.width, input.height);
         return scaler.run(&copied, output);
     }
     let planes = [
@@ -154,9 +158,9 @@ pub(super) fn convert_packed_bgra(
         std::ptr::null(),
     ];
     let strides = [row_bytes as libc::c_int, 0, 0, 0];
-    // swscale reads `input.height` rows of `row_bytes` from `rows`, and at
-    // most FRAME_PADDING more, checked above, and writes the planes `output`
-    // allocated at the output size.
+    // swscale reads `input.height` rows of `picture_bytes`, `row_bytes`
+    // apart, from `rows`, and at most FRAME_PADDING more, checked above, and
+    // writes the planes `output` allocated at the output size.
     let result = unsafe {
         ffmpeg_next::ffi::sws_scale(
             scaler.as_mut_ptr(),
@@ -174,19 +178,25 @@ pub(super) fn convert_packed_bgra(
     Ok(())
 }
 
-/// `rows` copied into a BGRA frame FFmpeg allocated. At odd widths swscale
-/// reads one pixel past each row for the last chroma sample, which lands in
-/// the frame's unset stride padding, so each row's last pixel is repeated
-/// there.
-fn copied_frame(rows: &[u8], width: u32, height: u32) -> ffmpeg_next::frame::Video {
-    let row_bytes = width as usize * 4;
+/// The top-left `width`x`height` of `rows`, `row_bytes` apart, copied into a
+/// BGRA frame FFmpeg allocated. At odd widths swscale reads one pixel past
+/// each row for the last chroma sample, which lands in the frame's unset
+/// stride padding, so each row's last pixel is repeated there.
+fn copied_frame(
+    rows: &[u8],
+    row_bytes: usize,
+    width: u32,
+    height: u32,
+) -> ffmpeg_next::frame::Video {
+    let picture_bytes = width as usize * 4;
     let mut copied = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
     let stride = copied.stride(0);
-    for (y, row) in rows.chunks_exact(row_bytes).enumerate() {
+    for (y, row) in rows.chunks(row_bytes).take(height as usize).enumerate() {
+        let row = &row[..picture_bytes];
         let line = &mut copied.data_mut(0)[y * stride..(y + 1) * stride];
-        line[..row_bytes].copy_from_slice(row);
-        if let Some(next) = line.get_mut(row_bytes..row_bytes + 4) {
-            next.copy_from_slice(&row[row_bytes - 4..]);
+        line[..picture_bytes].copy_from_slice(row);
+        if let Some(next) = line.get_mut(picture_bytes..picture_bytes + 4) {
+            next.copy_from_slice(&row[picture_bytes - 4..]);
         }
     }
     copied
@@ -394,7 +404,7 @@ mod tests {
         height: u32,
     ) -> ffmpeg_next::frame::Video {
         let frame_bytes = width as usize * 4 * height as usize;
-        let copied = copied_frame(&rows[..frame_bytes], width, height);
+        let copied = copied_frame(&rows[..frame_bytes], width as usize * 4, width, height);
         let mut converted = ffmpeg_next::frame::Video::new(format, width, height);
         scaler.run(&copied, &mut converted).unwrap();
         converted
@@ -437,16 +447,25 @@ mod tests {
                 let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
                 let before = converted_from_copy(&mut scaler, format, &rows, width, height);
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
-                convert_packed_bgra(&mut scaler, &rows, &mut after).unwrap();
+                convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut after).unwrap();
                 assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
                 // A short buffer or another size is refused, never read past.
                 assert_eq!(
-                    convert_packed_bgra(&mut scaler, &rows[..frame_bytes - 1], &mut after),
+                    convert_packed_bgra(
+                        &mut scaler,
+                        &rows[..frame_bytes - 1],
+                        row_bytes,
+                        &mut after
+                    ),
+                    Err(ffmpeg_next::Error::InputChanged)
+                );
+                assert_eq!(
+                    convert_packed_bgra(&mut scaler, &rows, row_bytes - 4, &mut after),
                     Err(ffmpeg_next::Error::InputChanged)
                 );
                 let mut other = ffmpeg_next::frame::Video::new(format, width + 2, height);
                 assert_eq!(
-                    convert_packed_bgra(&mut scaler, &rows, &mut other),
+                    convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut other),
                     Err(ffmpeg_next::Error::OutputChanged)
                 );
             }
@@ -491,7 +510,7 @@ mod tests {
             };
             fill_pattern(rows, row_bytes);
             // The pixel swscale reads after each odd-width row is set.
-            let copied = copied_frame(rows, width, height);
+            let copied = copied_frame(rows, row_bytes, width, height);
             let stride = copied.stride(0);
             for y in 0..height as usize {
                 let line = &copied.data(0)[y * stride..y * stride + row_bytes + 4];
@@ -500,7 +519,7 @@ mod tests {
             for format in [Pixel::YUV420P, Pixel::NV12] {
                 let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
-                convert_packed_bgra(&mut scaler, rows, &mut after).unwrap();
+                convert_packed_bgra(&mut scaler, rows, row_bytes, &mut after).unwrap();
                 let before = converted_from_copy(&mut scaler, format, rows, width, height);
                 assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
             }

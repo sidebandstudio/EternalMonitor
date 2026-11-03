@@ -124,6 +124,8 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "avoided",
     "attached",
     "advertised_formats",
+    "capture_size",
+    "encoded_size",
     "usb_state",
     "wire_stream",
     "running",
@@ -1939,6 +1941,11 @@ mod tests {
             (
                 "modes",
                 "INFO Second screen mode mode=2732x2048 requested=the driver's modes",
+            ),
+            (
+                "1680x945",
+                "INFO Encoding without the capture's odd last column or row \
+                 capture_size=1680x945 encoded_size=1680x944",
             ),
             ("arm64", "INFO EternalMonitor host 0.3.4 revision=x | OS=Windows arch=arm64 logical_cpus=8"),
             (

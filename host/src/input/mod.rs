@@ -136,6 +136,12 @@ pub struct PenSample {
 /// Map a wire-normalized point (0..65535 over the displayed video, which the
 /// client letterbox-corrects before sending) to a desktop pixel on the
 /// captured output.
+///
+/// `output` is the whole capture, also when the video leaves out its odd
+/// last column or row ([`crate::encoder::encoded_size`]): the video's `n`
+/// pixels then span `n` steps of this mapping, so each one's centre lands
+/// on its own desktop pixel, and the picture's far edge on the pixel left
+/// out, which stays reachable.
 pub fn norm_to_output_pixel(x_norm: u16, y_norm: u16, output: CaptureGeometry) -> (i32, i32) {
     let x = output.left
         + ((u64::from(x_norm) * u64::from(output.width.saturating_sub(1))) / 65_535) as i32;
@@ -1017,6 +1023,42 @@ mod tests {
         let (cx, cy) = norm_to_output_pixel(32_768, 32_768, OUTPUT);
         assert!((cx - 960).abs() <= 1, "center x {cx}");
         assert!((cy - 540).abs() <= 1, "center y {cy}");
+    }
+
+    /// A 1365x945 screen streams 1364x944. A touch on the centre of any
+    /// pixel of that picture, normalized as the iPad does, lands on that
+    /// pixel, and the picture's far edge on the column and row left out.
+    #[test]
+    fn a_cropped_picture_maps_each_pixel_onto_itself() {
+        let output = CaptureGeometry {
+            left: -1365,
+            top: 0,
+            width: 1365,
+            height: 945,
+        };
+        let (width, height) = crate::encoder::encoded_size(output.width, output.height);
+        assert_eq!((width, height), (1364, 944));
+        // TouchRelay.swift: the touch's fraction of the picture, rounded.
+        let norm = |pixel: u32, pixels: u32| {
+            ((f64::from(pixel) + 0.5) / f64::from(pixels) * 65_535.0).round() as u16
+        };
+        for x in 0..width {
+            for y in [0, height / 2, height - 1] {
+                assert_eq!(
+                    norm_to_output_pixel(norm(x, width), norm(y, height), output),
+                    (output.left + x as i32, y as i32),
+                    "pixel {x},{y}"
+                );
+            }
+        }
+        for y in 0..height {
+            assert_eq!(
+                norm_to_output_pixel(norm(width - 1, width), norm(y, height), output),
+                (-2, y as i32),
+                "row {y}"
+            );
+        }
+        assert_eq!(norm_to_output_pixel(65_535, 65_535, output), (-1, 944));
     }
 
     #[test]

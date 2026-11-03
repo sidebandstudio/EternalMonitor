@@ -29,6 +29,16 @@ const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
 
+/// The size a capture of `width`x`height` streams at. 4:2:0 needs even
+/// dimensions, which libx264 enforces and hardware encoders may too, so a
+/// screen such as 1680x945 encodes without its odd last row (or column):
+/// cropped, not scaled, so every other pixel stays exact. Input still maps
+/// onto the whole capture (see [`crate::input::norm_to_output_pixel`]), so
+/// the cropped row stays reachable at the picture's edge.
+pub fn encoded_size(width: u32, height: u32) -> (u32, u32) {
+    (width & !1, height & !1)
+}
+
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
 pub struct NALUnit {
@@ -404,8 +414,8 @@ fn run_encode_loop(
                         from = previous,
                         to = desired_bitrate,
                         encoder = %desired_encoder,
-                        width = raw_frame.width,
-                        height = raw_frame.height,
+                        width = state.frame.width(),
+                        height = state.frame.height(),
                         size_changed,
                         keyframe = keyframe_reopen,
                         reason,
@@ -479,44 +489,8 @@ fn run_encode_loop(
         let current_bitrate = encoder.opened_bitrate;
         let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
 
-        let src_row_bytes = (raw_frame.width * 4) as usize;
         let convert_start = Instant::now();
-        #[cfg(target_os = "macos")]
-        let converted = match encoder.native_converter.as_ref().map(|converter| {
-            converter.convert(
-                &raw_frame.data,
-                raw_frame.width,
-                raw_frame.height,
-                src_row_bytes,
-                &mut encoder.frame,
-            )
-        }) {
-            Some(Ok(())) => true,
-            Some(Err(error)) => {
-                warn!(%error, "Using swscale after native color conversion failed");
-                encoder.native_converter = None;
-                false
-            }
-            None => false,
-        };
-        #[cfg(not(target_os = "macos"))]
-        let converted = false;
-        if !converted {
-            if let Some(scaler) = encoder.scaler.as_mut() {
-                input::convert_packed_bgra(scaler, &raw_frame.data, &mut encoder.frame)?;
-            } else {
-                // BGRA input: the encoder converts. Its frame takes a copy,
-                // so capture's buffer is free before the encoder can block.
-                let stride = encoder.frame.stride(0);
-                let bgra_plane = encoder.frame.data_mut(0);
-                for y in 0..raw_frame.height as usize {
-                    let src_offset = y * src_row_bytes;
-                    let dst_offset = y * stride;
-                    bgra_plane[dst_offset..dst_offset + src_row_bytes]
-                        .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
-                }
-            }
-        }
+        encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
@@ -725,19 +699,29 @@ impl EncoderState {
         true
     }
 
+    /// Opens a session for captures of `capture_width`x`capture_height`,
+    /// at their [`encoded_size`].
     #[allow(clippy::too_many_arguments)]
     fn new(
         encoder_name: &str,
-        width: u32,
-        height: u32,
+        capture_width: u32,
+        capture_height: u32,
         bitrate_bps: u32,
         target_fps: u32,
         input_mode: &mut EncoderInput,
         opening: Opening,
         progress: &mut dyn FnMut(),
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (width, height) = encoded_size(capture_width, capture_height);
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
+        if (width, height) != (capture_width, capture_height) {
+            info!(
+                capture_size = %format_args!("{capture_width}x{capture_height}"),
+                encoded_size = %format_args!("{width}x{height}"),
+                "Encoding without the capture's odd last column or row"
+            );
+        }
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
         // AVCodec owns this terminated static list. A null list means that
@@ -902,8 +886,38 @@ impl EncoderState {
             .unwrap_or(just_submitted)
     }
 
+    /// Converts a capture whose rows lie `row_bytes` apart into `self.frame`:
+    /// its top-left `self.frame`-sized part, pixel for pixel, which leaves an
+    /// odd last column or row out (see [`encoded_size`]).
+    fn convert(&mut self, rows: &[u8], row_bytes: usize) -> Result<(), ffmpeg_next::Error> {
+        let (width, height) = (self.frame.width(), self.frame.height());
+        #[cfg(target_os = "macos")]
+        if let Some(converter) = self.native_converter.as_ref() {
+            match converter.convert(rows, width, height, row_bytes, &mut self.frame) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    warn!(%error, "Using swscale after native color conversion failed");
+                    self.native_converter = None;
+                }
+            }
+        }
+        if let Some(scaler) = self.scaler.as_mut() {
+            return input::convert_packed_bgra(scaler, rows, row_bytes, &mut self.frame);
+        }
+        // BGRA input: the encoder converts. Its frame takes a copy,
+        // so capture's buffer is free before the encoder can block.
+        let picture_bytes = width as usize * 4;
+        let stride = self.frame.stride(0);
+        let bgra_plane = self.frame.data_mut(0);
+        for y in 0..height as usize {
+            bgra_plane[y * stride..][..picture_bytes]
+                .copy_from_slice(&rows[y * row_bytes..][..picture_bytes]);
+        }
+        Ok(())
+    }
+
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
-        self.frame.width() == width && self.frame.height() == height
+        encoded_size(width, height) == (self.frame.width(), self.frame.height())
     }
 
     fn observe_amf_diagnostics(
@@ -2321,6 +2335,183 @@ mod tests {
         let mut second = open();
         let labels = run(&mut second, 480..490, false);
         assert_eq!(labels, (480..490).map(|n| (at(n), n)).collect::<Vec<_>>());
+    }
+
+    fn libx264_at(width: u32, height: u32) -> EncoderState {
+        EncoderState::new(
+            "libx264",
+            width,
+            height,
+            8_000_000,
+            60,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        )
+        .unwrap_or_else(|error| panic!("{width}x{height}: {error}"))
+    }
+
+    /// A synthetic capture, in a buffer as capture hands it over.
+    fn synthetic_capture(width: u32, height: u32, frame_number: u64) -> Vec<u8> {
+        let frame_bytes = width as usize * 4 * height as usize;
+        let mut rows = crate::capture::frame_buffer(frame_bytes);
+        crate::capture::synthetic::render_synthetic_frame(
+            &mut rows[..frame_bytes],
+            width,
+            height,
+            frame_number,
+        );
+        rows
+    }
+
+    /// A screen with an odd height (1680x945, from a report) or width
+    /// streams: libx264 refused to open at those sizes, and the pipeline
+    /// gave up after six restarts. The encoder opens at the even size below,
+    /// takes the capture's frames, and they decode at that size with the
+    /// picture intact.
+    #[test]
+    fn odd_screen_sizes_encode_at_the_even_size_below() {
+        ffmpeg_next::init().unwrap();
+        for ((width, height), encoded) in [
+            ((1680, 945), (1680, 944)),
+            ((1365, 768), (1364, 768)),
+            ((641, 361), (640, 360)),
+            ((1366, 768), (1366, 768)),
+        ] {
+            let mut state = libx264_at(width, height);
+            assert_eq!((state.frame.width(), state.frame.height()), encoded);
+            // The same capture size never reopens the session; another does.
+            assert!(state.accepts_frame(width, height));
+            assert!(!state.accepts_frame(width + 2, height));
+            assert!(!state.accepts_frame(width, height + 2));
+            let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+            let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
+                .decoder()
+                .video()
+                .unwrap();
+            let mut decoded = ffmpeg_next::frame::Video::empty();
+            let mut counters = Vec::new();
+            let start = Instant::now();
+            for n in 1..=10u64 {
+                let rows = synthetic_capture(width, height, n);
+                state.convert(&rows, width as usize * 4).unwrap();
+                let captured = start + Duration::from_micros(n * 16_667);
+                let pts = state.next_pts(captured, n);
+                state.frame.set_pts(Some(pts));
+                state.send_frame(pts, captured, n).unwrap();
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {
+                    if state.h264.needs_parameter_sets() {
+                        state
+                            .h264
+                            .refresh_parameter_sets_from_extradata(encoder_extradata(
+                                &state.encoder,
+                            ));
+                    }
+                    // What the transport sends: Annex B with parameter sets.
+                    let (annex_b, _) = normalize_h264_payload_with_info(
+                        state.packet.data().unwrap_or_default(),
+                        state.packet.is_key(),
+                        &mut state.h264,
+                        &state.opened_encoder,
+                    );
+                    decoder
+                        .send_packet(&ffmpeg_next::Packet::copy(&annex_b))
+                        .unwrap();
+                    while decoder.receive_frame(&mut decoded).is_ok() {
+                        assert_eq!((decoded.width(), decoded.height()), encoded);
+                        counters.push(crate::capture::synthetic::decode_frame_counter_from_luma(
+                            decoded.data(0),
+                            decoded.stride(0),
+                            encoded.0,
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                counters,
+                (1..=counters.len() as u64).collect::<Vec<_>>(),
+                "{width}x{height}"
+            );
+            assert!(counters.len() >= 5, "{width}x{height}: {counters:?}");
+        }
+    }
+
+    /// The rows of each of `frame`'s planes that hold the picture.
+    fn picture(frame: &ffmpeg_next::frame::Video) -> Vec<Vec<u8>> {
+        use ffmpeg_next::format::Pixel;
+        let mut rows = Vec::new();
+        for plane in 0..frame.planes() {
+            let bytes = match (frame.format(), plane) {
+                (Pixel::BGRA | Pixel::BGRZ, _) => frame.width() as usize * 4,
+                (Pixel::NV12, 1) => frame.plane_width(1) as usize * 2,
+                _ => frame.plane_width(plane) as usize,
+            };
+            for y in 0..frame.plane_height(plane) as usize {
+                rows.push(frame.data(plane)[y * frame.stride(plane)..][..bytes].to_vec());
+            }
+        }
+        rows
+    }
+
+    /// A capture with an odd last column or row encodes exactly what the
+    /// rest of it, alone, does: the crop leaves that column and row out and
+    /// resamples nothing, on every input path (swscale to YUV420P and NV12,
+    /// Accelerate on macOS, the BGRA copy NVENC reads), with or without
+    /// padding after the capture's last row.
+    #[test]
+    fn cropping_changes_no_pixel_of_the_picture() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        for (width, height) in [(1365u32, 945u32), (1365, 944), (1366, 945)] {
+            let (even_width, even_height) = encoded_size(width, height);
+            let capture = synthetic_capture(width, height, 77);
+            let row_bytes = width as usize * 4;
+            let unpadded = &capture[..row_bytes * height as usize];
+            // The capture's top-left even_width x even_height, alone.
+            let even_bytes = even_width as usize * 4;
+            let mut alone = crate::capture::frame_buffer(even_bytes * even_height as usize);
+            for y in 0..even_height as usize {
+                alone[y * even_bytes..][..even_bytes]
+                    .copy_from_slice(&capture[y * row_bytes..][..even_bytes]);
+            }
+            let mut paths = vec!["YUV420P", "NV12", "BGRA"];
+            if cfg!(target_os = "macos") {
+                paths.push("Accelerate");
+            }
+            for path in paths {
+                let label = format!("{width}x{height} {path}");
+                let mut state = libx264_at(width, height);
+                // The frame and conversion an encoder that takes `path` has.
+                #[cfg(target_os = "macos")]
+                if path != "Accelerate" {
+                    state.native_converter = None;
+                }
+                let format = match path {
+                    "NV12" => Pixel::NV12,
+                    "BGRA" => Pixel::BGRA,
+                    _ => Pixel::YUV420P,
+                };
+                state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
+                state.scaler = input::conversion_context(format, even_width, even_height).unwrap();
+                assert_eq!(state.scaler.is_some(), format != Pixel::BGRA);
+                state.convert(&alone, even_bytes).unwrap();
+                let expected = picture(&state.frame);
+                for rows in [&capture[..], unpadded] {
+                    state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
+                    state.convert(rows, row_bytes).unwrap();
+                    assert_eq!(picture(&state.frame), expected, "{label}");
+                }
+                // Accelerate converted each, with no fallback to swscale.
+                #[cfg(target_os = "macos")]
+                assert_eq!(state.native_converter.is_some(), path == "Accelerate");
+                if format == Pixel::BGRA {
+                    let rows = capture.chunks(row_bytes).take(even_height as usize);
+                    for (y, row) in rows.enumerate() {
+                        assert_eq!(expected[y], row[..even_bytes], "{label} row {y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
