@@ -8,7 +8,7 @@ SCENARIO="${EM_SCENARIO:-pairing}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 STARTED=$SECONDS
 mkdir -p "$OUT"
-rm -f "$OUT/result.json"
+rm -rf "${OUT:?}/result.json" "${OUT:?}/attachments" "${OUT:?}/app.log"
 status=0
 EM_TEST_STAMP="$STAMP" "$ROOT/scripts/test_ios.sh" \
     -only-testing:EternalMonitorUITests/PairingFlowTests/testPairingFlow > "$OUT/ui-run.log" 2>&1 || status=$?
@@ -19,6 +19,13 @@ SHOTS="$TEST_ROOT/screenshots/ui-$STAMP"
 [ ! -f "$ROOT/build/ios-ui-pairing-host-$STAMP.log" ] || cp "$ROOT/build/ios-ui-pairing-host-$STAMP.log" "$OUT/host.log"
 if [ -d "$RESULT" ]; then
     xcrun xcresulttool get test-results summary --path "$RESULT" --format json > "$OUT/tests.json" || status=1
+fi
+if [ "$status" != 0 ]; then
+    # Keep what shows a failure: the screen recording, UI snapshots and the
+    # app's log of its last launch.
+    [ ! -d "$SHOTS" ] || cp -R "$SHOTS" "$OUT/attachments"
+    APP_DATA=$(xcrun simctl get_app_container "${EM_SIM_UDID:-06416ADB-C33D-4EE4-82DB-44FCD663362F}" com.eternal.monitor data 2>/dev/null) || APP_DATA=""
+    [ -z "$APP_DATA" ] || cp "$APP_DATA/tmp/eternal-e2e.log" "$OUT/app.log" 2>/dev/null || true
 fi
 python3 - "$OUT" "$SHOTS" "$SCENARIO" "$status" "$((SECONDS-STARTED))" <<'PY'
 import json,pathlib,shutil,sys
