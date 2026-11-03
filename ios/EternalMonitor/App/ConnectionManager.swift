@@ -671,31 +671,33 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
+                let failure = ConnectionProblem.pcGoodbye(reason)
                 switch reason {
                 case .hostShuttingDown:
                     // Only Stop and update on the PC sends this. The PC comes
                     // back on the new version, so reconnect as for a restart.
                     if self.reconnectCycleID != nil {
                         self.disconnect(.pcGoodbye)
-                        self.reconnectFailure = .pcUpdating(.reconnecting)
-                        self.problem = .pcUpdating(.reconnecting)
+                        self.reconnectFailure = failure
+                        self.problem = failure
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting), end: .pcGoodbye)
+                        self.beginReconnect(.pcStoppedResponding, failure: failure, end: .pcGoodbye)
                     }
                 case .userDisconnect, .superseded:
                     // Disconnected from the PC, or another device took over:
                     // stay away until the user connects again.
                     self.endReconnectCycle()
                     self.disconnect(.pcGoodbye)
-                    self.problem = .pcEndedSession
+                    self.problem = failure
                 default:
-                    // A PC that stops or restarts its stream may come back.
+                    // A PC that stops or restarts its stream may come back,
+                    // as may one that stopped hearing this iPad (an error).
                     // A running cycle keeps going; otherwise start one.
                     if self.reconnectCycleID != nil {
                         self.disconnect(.pcGoodbye)
-                        self.problem = .pcEndedSession
+                        self.problem = failure
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession, end: .pcGoodbye)
+                        self.beginReconnect(.pcStoppedResponding, failure: failure, end: .pcGoodbye)
                     }
                 }
             }

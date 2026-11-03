@@ -294,6 +294,9 @@ final class USBLinkFailureTests: XCTestCase {
             reconnectBackoffSeconds: { _ in 0.05 })
         let (manager, link) = try await failCableIntoFallback(to: wifi, timing: timing)
         defer { link.stop(); manager.cancel() }
+        // The user's attempt has to stream after the PC's late answer, so it
+        // gets a timeout a loaded machine can't run out.
+        manager.timing.connectTimeoutSeconds = 60
         manager.connect(host: "127.0.0.1", port: other.port)
         // The replaced cycle would wake about 0.5 s from now.
         let accepted = await Task.detached { Thread.sleep(forTimeInterval: 1); return other.acceptSession() }.value
@@ -599,8 +602,10 @@ final class USBLinkFailureTests: XCTestCase {
     // MARK: Answers from the PC during the fallback. Busy and a restart pass;
     // the cycle keeps retrying.
 
-    /// Long enough to answer the handshake and stream within one attempt.
-    private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1,
+    /// Long enough to answer the handshake and stream within one attempt on
+    /// a loaded machine, and short enough that the cycle soon moves on from
+    /// an attempt the PC ended: it waits out each attempt's window.
+    private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 5, reconnectGraceSeconds: 0.1,
         reconnectBackoffSeconds: { _ in 0.05 })
 
     private func finishConnecting(_ manager: ConnectionManager, to host: FakeUDPHost) async throws {

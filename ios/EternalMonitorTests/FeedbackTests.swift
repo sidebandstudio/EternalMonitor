@@ -69,7 +69,8 @@ final class FeedbackTests: XCTestCase {
         let failures: [ConnectionProblem] = [
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .routerAddress, .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed,
-            .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcUpdating(.notBack),
+            .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcEndedSessionOnError,
+            .pcUpdating(.notBack),
         ]
         for problem in failures {
             XCTAssertTrue(problem.canReport, problem.title)

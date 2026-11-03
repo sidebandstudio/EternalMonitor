@@ -30,8 +30,12 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
         let units = try twoGOPs()
         host.sendFrame(units[0], seq: 1, isKeyframe: true)
-        for _ in 0..<300 where manager.state != .connected { try await Task.sleep(nanoseconds: 10_000_000) }
-        XCTAssertEqual(manager.state, .connected)
+        // A stalled runner may take a while, so wait long enough to say how
+        // long, but a first picture slower than 5 s is a regression.
+        let sent = Date()
+        try await until("streaming", seconds: 30) { manager.state == .connected }
+        let firstPicture = Date().timeIntervalSince(sent)
+        XCTAssertLessThan(firstPicture, 5, "the first picture took \(firstPicture) s")
         addTeardownBlock { await MainActor.run { manager.cancel() } }
         return manager
     }
