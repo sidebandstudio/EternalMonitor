@@ -2708,7 +2708,8 @@ fn input_relay_maps_touches_end_to_end() {
 /// refused 1680x945 and the pipeline gave up after six restarts. The iPad
 /// is told the size it decodes, the picture is intact, and a touch on its
 /// last pixel lands there while its far edge reaches the row and column left
-/// out.
+/// out. Off Windows only: the input recorder stands in for real injection.
+#[cfg(not(windows))]
 #[test]
 fn an_odd_screen_streams_cropped_and_input_still_reaches_its_edge() {
     use eternal_host::input::{
