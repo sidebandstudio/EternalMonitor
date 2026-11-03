@@ -1,6 +1,6 @@
 ## EternalMonitor v0.3.4
 
-Released [date set at release].
+Released November 3, 2026.
 Windows and iPad versions listed on the download page work together.
 Each 0.3.4 app works with the other app on 0.3.3.
 
