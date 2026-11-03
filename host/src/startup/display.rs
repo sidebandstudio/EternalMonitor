@@ -29,24 +29,44 @@ fn paths() -> Option<(PathBuf, PathBuf)> {
 /// quit with it.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The time the lock wait and the record retries read and sleep on, so
+/// tests can pause it.
+trait Clock {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&self, duration: std::time::Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
 /// Wait for the driver lock, calling `waiting` meanwhile. A lock that cannot
 /// be opened, or is still held after [`LOCK_WAIT`], does not stop the driver
 /// change, as a record that cannot be written does not.
-fn hold(lock: &Path, waiting: impl FnMut()) -> Option<super::lock::Locked> {
-    hold_for(lock, LOCK_WAIT, waiting)
+fn hold(clock: &impl Clock, lock: &Path, waiting: impl FnMut()) -> Option<super::lock::Locked> {
+    hold_for(clock, lock, LOCK_WAIT, waiting)
 }
 
 fn hold_for(
+    clock: &impl Clock,
     lock: &Path,
     wait: std::time::Duration,
     mut waiting: impl FnMut(),
 ) -> Option<super::lock::Locked> {
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = clock.now() + wait;
     loop {
         match super::lock::try_lock(lock) {
             Ok(locked) => return Some(locked),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
+                if clock.now() >= deadline {
                     tracing::warn!(
                         waited_ms = wait.as_millis() as u64,
                         "Another process held the virtual display driver lock; changing the driver without it"
@@ -54,7 +74,7 @@ fn hold_for(
                     return None;
                 }
                 waiting();
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                clock.sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
                 tracing::warn!(%error, "Could not lock the virtual display driver");
@@ -79,10 +99,21 @@ fn change_at<P: FnMut()>(
     path: &Path,
     lock: &Path,
     enabled: bool,
+    progress: P,
+    run: impl FnOnce(P) -> bool,
+) -> bool {
+    change_on(&SystemClock, path, lock, enabled, progress, run)
+}
+
+fn change_on<P: FnMut()>(
+    clock: &impl Clock,
+    path: &Path,
+    lock: &Path,
+    enabled: bool,
     mut progress: P,
     run: impl FnOnce(P) -> bool,
 ) -> bool {
-    let _driver = hold(lock, &mut progress);
+    let _driver = hold(clock, lock, &mut progress);
     if enabled {
         if let Err(error) = record(path, ProcessId::current()) {
             tracing::warn!(%error, "Could not record the virtual display's owner");
@@ -99,9 +130,16 @@ fn change_at<P: FnMut()>(
 
 /// Replace the record in one step, so a reader never sees half of it.
 fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
-    let temp = path.with_extension(format!("{owner}.tmp"));
-    fs::write(&temp, owner.to_string())?;
-    let replaced = with_retries(|| fs::rename(&temp, path));
+    replace(path, owner, &owner.to_string())
+}
+
+/// Replace `path` with `contents` in one step, through a temporary file
+/// named for `writer`, the process writing. For the owner record and the
+/// display guard's record (`display_guard.rs`).
+pub(crate) fn replace(path: &Path, writer: ProcessId, contents: &str) -> io::Result<()> {
+    let temp = path.with_extension(format!("{writer}.tmp"));
+    fs::write(&temp, contents)?;
+    let replaced = with_retries(&SystemClock, || fs::rename(&temp, path));
     if replaced.is_err() {
         let _ = fs::remove_file(&temp);
     }
@@ -111,13 +149,13 @@ fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
 /// A reporter holds the record open for a moment while it checks and deletes
 /// it. Where Windows cannot replace an open file (FAT volumes), the replace
 /// fails meanwhile; try again for a few milliseconds.
-fn with_retries(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+fn with_retries(clock: &impl Clock, mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut tries = 1;
     loop {
         match attempt() {
             Err(_) if tries < 10 => {
                 tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                clock.sleep(std::time::Duration::from_millis(2));
             }
             result => return result,
         }
@@ -168,7 +206,7 @@ fn disable_for_ended_at(
     // Again just before the driver changes: the process scan takes a while,
     // and a replacement host may have started or turned the display on. From
     // here a host that turns it on waits until the turn-off is done.
-    let _driver = hold(lock, || {});
+    let _driver = hold(&SystemClock, lock, || {});
     check(&mut other_host)?;
     let done = disable();
     if done {
@@ -205,10 +243,27 @@ enum Removal {
 /// record is never deleted. `before_delete` runs between the two steps and
 /// stops the deletion by returning false, for tests. `posix` asks for the
 /// deletion to take the name away at once where the volume supports it.
-#[cfg(windows)]
 fn delete_if_owned(
     path: &Path,
     owner: ProcessId,
+    before_delete: impl FnOnce() -> bool,
+    posix: bool,
+) -> io::Result<Removal> {
+    let owns = |text: &str| ProcessId::from_name(text.trim()) == Some(owner);
+    delete_if(path, owns, before_delete, posix)
+}
+
+/// Delete the file at `path` only if `owns` accepts its text, read and
+/// deleted through one handle as in [`delete_if_owned`]. True when deleted.
+/// For the display guard's record.
+pub(crate) fn delete_if_its(path: &Path, owns: impl FnOnce(&str) -> bool) -> io::Result<bool> {
+    delete_if(path, owns, || true, true).map(|removal| removal == Removal::Deleted)
+}
+
+#[cfg(windows)]
+fn delete_if(
+    path: &Path,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
     posix: bool,
 ) -> io::Result<Removal> {
@@ -231,7 +286,7 @@ fn delete_if_owned(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
         Err(error) => return Err(error),
     };
-    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+    if let Some(kept) = check_owner(&mut file, owns, before_delete)? {
         return Ok(kept);
     }
     let handle = HANDLE(file.as_raw_handle());
@@ -270,16 +325,16 @@ fn delete_if_owned(
     .map_err(io::Error::from)
 }
 
-/// Read the opened record. `None` when it names `owner` and may be deleted.
+/// Read the opened record. `None` when `owns` accepts it and it may be deleted.
 fn check_owner(
     file: &mut fs::File,
-    owner: ProcessId,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
 ) -> io::Result<Option<Removal>> {
     use std::io::Read;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
-    Ok(if ProcessId::from_name(text.trim()) != Some(owner) {
+    Ok(if !owns(&text) {
         Some(Removal::OtherOwner)
     } else if !before_delete() {
         Some(Removal::Stopped)
@@ -291,9 +346,9 @@ fn check_owner(
 /// Unix has no deletion through a handle; the reporter runs only on Windows.
 /// For tests, this deletes the path only while it is still the opened file.
 #[cfg(not(windows))]
-fn delete_if_owned(
+fn delete_if(
     path: &Path,
-    owner: ProcessId,
+    owns: impl FnOnce(&str) -> bool,
     before_delete: impl FnOnce() -> bool,
     _posix: bool,
 ) -> io::Result<Removal> {
@@ -303,7 +358,7 @@ fn delete_if_owned(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
         Err(error) => return Err(error),
     };
-    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+    if let Some(kept) = check_owner(&mut file, owns, before_delete)? {
         return Ok(kept);
     }
     let opened = file.metadata().map(|m| (m.dev(), m.ino()))?;
@@ -540,14 +595,68 @@ mod tests {
         fs::remove_file(lock).unwrap();
     }
 
+    /// A clock that moves only when the code under test sleeps, so a wait's
+    /// length does not depend on how fast the machine runs.
+    struct PausedClock {
+        start: std::time::Instant,
+        elapsed: std::cell::Cell<std::time::Duration>,
+        /// Reads since the last sleep. A wait that stopped sleeping on this
+        /// clock would never reach its deadline, so too many fail the test.
+        reads: std::cell::Cell<u32>,
+    }
+
+    impl PausedClock {
+        fn new() -> Self {
+            Self {
+                start: std::time::Instant::now(),
+                elapsed: std::cell::Cell::new(std::time::Duration::ZERO),
+                reads: std::cell::Cell::new(0),
+            }
+        }
+
+        fn elapsed(&self) -> std::time::Duration {
+            self.elapsed.get()
+        }
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> std::time::Instant {
+            self.reads.set(self.reads.get() + 1);
+            assert!(
+                self.reads.get() <= 100,
+                "read the paused clock 100 times without sleeping on it"
+            );
+            self.start + self.elapsed.get()
+        }
+
+        fn sleep(&self, duration: std::time::Duration) {
+            self.reads.set(0);
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "without sleeping on it")]
+    fn a_wait_that_never_sleeps_on_the_paused_clock_fails() {
+        let clock = PausedClock::new();
+        let deadline = clock.now() + std::time::Duration::from_millis(50);
+        for _ in 0..1000 {
+            if clock.now() >= deadline {
+                return;
+            }
+        }
+    }
+
     #[test]
     fn a_driver_lock_held_too_long_does_not_stop_the_change() {
         let lock = owner_file("held-lock");
         let held = super::super::lock::try_lock(&lock).unwrap();
-        let started = std::time::Instant::now();
+        let clock = PausedClock::new();
         let mut waits = 0;
-        let got = hold_for(&lock, std::time::Duration::from_millis(300), || waits += 1);
-        let waited = started.elapsed();
+        let got = hold_for(&clock, &lock, std::time::Duration::from_millis(300), || {
+            waits += 1
+        });
+        let waited = clock.elapsed();
         assert!(got.is_none(), "took a lock another holder has");
         assert!(waits > 0, "never reported the wait");
         assert!(
@@ -557,7 +666,9 @@ mod tests {
         );
         // Once the holder lets go, the lock is taken at once.
         drop(held);
-        assert!(hold_for(&lock, std::time::Duration::from_millis(300), || {}).is_some());
+        let clock = PausedClock::new();
+        assert!(hold_for(&clock, &lock, std::time::Duration::from_millis(300), || {}).is_some());
+        assert_eq!(clock.elapsed(), std::time::Duration::ZERO);
         assert_eq!(LOCK_WAIT, std::time::Duration::from_secs(5));
         fs::remove_file(lock).unwrap();
     }
@@ -568,9 +679,10 @@ mod tests {
         let lock = owner_file("hung-holder-lock");
         // Another process stuck in its own driver change.
         let _hung = super::super::lock::try_lock(&lock).unwrap();
-        let started = std::time::Instant::now();
+        let clock = PausedClock::new();
         let mut ran = false;
-        assert!(change_at(
+        assert!(change_on(
+            &clock,
             &path,
             &lock,
             false,
@@ -580,7 +692,7 @@ mod tests {
                 true
             }
         ));
-        let waited = started.elapsed();
+        let waited = clock.elapsed();
         assert!(ran, "the Disable never ran");
         assert!(
             waited >= LOCK_WAIT && waited < LOCK_WAIT + std::time::Duration::from_secs(2),
@@ -951,9 +1063,9 @@ mod tests {
 
     #[test]
     fn writing_a_record_tries_again_for_a_few_milliseconds() {
+        let clock = PausedClock::new();
         let mut failures = 3;
-        let started = std::time::Instant::now();
-        assert!(with_retries(|| {
+        assert!(with_retries(&clock, || {
             if failures == 0 {
                 Ok(())
             } else {
@@ -963,13 +1075,13 @@ mod tests {
         })
         .is_ok());
         let mut attempts = 0;
-        let result = with_retries(|| {
+        let result = with_retries(&clock, || {
             attempts += 1;
             Err(io::ErrorKind::PermissionDenied.into())
         });
         assert!(result.is_err());
         assert_eq!(attempts, 10);
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(clock.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[cfg(windows)]

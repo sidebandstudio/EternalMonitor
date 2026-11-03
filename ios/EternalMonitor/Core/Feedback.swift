@@ -67,9 +67,9 @@ enum Feedback {
     }
 
     /// Said first in Mail whenever the Diagnostics report is attached, since
-    /// the report can name the PC and iPad.
+    /// the report can hold the PC's name and address.
     static let attachmentNotice = "We attached a diagnostics report to help us look into it. "
-        + "It can include your PC's and iPad's names and local network addresses. "
+        + "It can include your PC's name and local network address. "
         + "Remove it before sending if you'd rather not share it."
 
     /// Room to write, then the details in short lines. With the Diagnostics
@@ -139,6 +139,40 @@ struct FeedbackAsk {
     mutating func finish(defaults: UserDefaults = .standard) {
         done = true
         defaults.set(true, forKey: Self.doneKey)
+    }
+}
+
+/// The GitHub star card on the Connect screen, like the PC app's. It shows
+/// after a session of five minutes or more, never while streaming and
+/// never next to the feedback ask or the update banner. A tap opens the
+/// repository and turns it into a thank-you, which stays until closed;
+/// closing retires it for good.
+struct StarAsk {
+    static let tappedKey = "starCardTapped"
+    static let closedKey = "starCardClosed"
+
+    private(set) var tapped: Bool
+    private(set) var closed: Bool
+
+    init(defaults: UserDefaults = .standard) {
+        tapped = defaults.bool(forKey: Self.tappedKey)
+        closed = defaults.bool(forKey: Self.closedKey)
+    }
+
+    /// `ask` counts the long sessions, and wins while it is due. So does
+    /// the update banner.
+    func shown(_ ask: FeedbackAsk, streaming: Bool, updateBanner: Bool) -> Bool {
+        !closed && !streaming && !updateBanner && ask.longSessions >= 1 && !ask.due(streaming: streaming)
+    }
+
+    mutating func tap(defaults: UserDefaults = .standard) {
+        tapped = true
+        defaults.set(true, forKey: Self.tappedKey)
+    }
+
+    mutating func close(defaults: UserDefaults = .standard) {
+        closed = true
+        defaults.set(true, forKey: Self.closedKey)
     }
 }
 

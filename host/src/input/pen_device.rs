@@ -25,6 +25,8 @@ pub trait PenApi {
     fn destroy(&mut self, handle: Self::Handle);
     /// The virtual screen that frame locations are measured on now.
     fn screen(&self) -> VirtualScreen;
+    /// The time now, for spacing frames.
+    fn now(&self) -> Instant;
     /// Inject one frame. `output` is the capture rect, for diagnostics.
     fn inject(
         &mut self,
@@ -187,6 +189,10 @@ impl<A: PenApi> PenTarget for Target<'_, A> {
         self.slot.handle.is_some()
     }
 
+    fn now(&self) -> Instant {
+        self.slot.api.now()
+    }
+
     fn recreate(&mut self) {
         self.slot.destroy();
         self.slot.create(self.now);
@@ -341,6 +347,13 @@ impl<A: PenApi> PenDevice<A> {
         };
         self.contact.flush(output, now, &mut target);
         self.hand_over(output, now);
+    }
+
+    /// When to `flush` again for a frame held back to keep frames
+    /// `FRAME_SPACING` apart.
+    #[cfg_attr(not(windows), allow(dead_code))] // Only the Windows relay asks.
+    pub fn spaced_until(&self) -> Option<Instant> {
+        self.contact.spaced_until().filter(|_| self.available())
     }
 
     /// Whether the refresh tick has work even without a device: mouse input
@@ -576,6 +589,28 @@ mod tests {
         /// A release a dropped device left owed, where Windows keeps it for
         /// the next device's Windows.
         owed: std::rc::Rc<std::cell::Cell<Option<(i32, i32)>>>,
+        clock: Unhurried,
+    }
+
+    /// A clock on which frames are never close enough to be held back for
+    /// their spacing: each frame takes `FRAME_SPACING`.
+    #[derive(Debug)]
+    struct Unhurried(Instant);
+
+    impl Default for Unhurried {
+        fn default() -> Self {
+            Self(Instant::now())
+        }
+    }
+
+    impl Unhurried {
+        fn now(&self) -> Instant {
+            self.0
+        }
+
+        fn frame(&mut self) {
+            self.0 += super::super::pen_contact::FRAME_SPACING;
+        }
     }
 
     impl FakeApi {
@@ -592,6 +627,7 @@ mod tests {
                 button: false,
                 screen: SCREEN,
                 owed: Default::default(),
+                clock: Unhurried::default(),
             }
         }
     }
@@ -646,6 +682,10 @@ mod tests {
             self.screen
         }
 
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+
         fn inject(
             &mut self,
             handle: usize,
@@ -655,6 +695,7 @@ mod tests {
             _: Option<CaptureGeometry>,
         ) -> Outcome {
             assert!(!self.destroyed.contains(&handle), "used a destroyed device");
+            self.clock.frame();
             self.frames.push((handle, frame.phase));
             self.answers.pop_front().unwrap_or(self.answer)
         }
@@ -1452,6 +1493,7 @@ mod tests {
         blocked: bool,
         /// The time of the call in progress.
         now: Instant,
+        clock: Unhurried,
         seen: Vec<Seen>,
         coverage: Coverage,
     }
@@ -1478,6 +1520,10 @@ mod tests {
             SCREEN
         }
 
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+
         fn inject(
             &mut self,
             _: (),
@@ -1486,6 +1532,7 @@ mod tests {
             _: VirtualScreen,
             _: Option<CaptureGeometry>,
         ) -> Outcome {
+            self.clock.frame();
             let roll = if self.ready { 19 } else { self.rng.below(20) };
             match roll {
                 _ if self.stuck && !self.ready => {
@@ -1587,6 +1634,7 @@ mod tests {
                 stuck: false,
                 blocked: false,
                 now: start,
+                clock: Unhurried::default(),
                 seen: Vec::new(),
                 coverage: Coverage::default(),
             });
@@ -1773,10 +1821,14 @@ mod tests {
                     lost |= !device.available();
                 }
             }
-            // Everything works again; the next tick delivers what waits.
+            // Everything works again; the next tick delivers what waits, in
+            // as many passes as the transport's deadline asks for.
             device.slot.api.ready = true;
             device.slot.api.now = now;
             flush_one(&mut device, now);
+            while device.spaced_until().is_some() {
+                flush_one(&mut device, now);
+            }
             note_drops(
                 &mut device,
                 false,

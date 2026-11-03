@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eternal_host::capture::synthetic::{decode_frame_counter_from_luma, render_synthetic_frame};
-use eternal_host::capture::{frame_slot, RawFrame};
+use eternal_host::capture::{frame_buffer, frame_slot, RawFrame};
 use eternal_host::control::SharedControl;
 use eternal_host::encoder::{run_encode_stage, NALUnit, NAL_CHANNEL_CAPACITY};
 use eternal_host::gpu::GpuInfo;
@@ -148,7 +148,7 @@ fn run_stage(
             shared.force_next_idr.store(true, Ordering::SeqCst);
         }
         let (width, height) = size_of(number);
-        let mut data = vec![0u8; (width * height * 4) as usize];
+        let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
         producer.publish(RawFrame {
             frame_number: number,
@@ -356,6 +356,33 @@ fn unavailable_quick_sync_uses_another_gpu_and_decodes() {
         "Unavailable QSV recovered through {} and decoded {} packets",
         run.codec_name,
         run.packets.len()
+    );
+}
+
+/// After a hybrid laptop is switched to Power saving, capture runs on the
+/// integrated card while detection still picks NVENC (the card with the most
+/// video memory). Capture hands the encoder plain CPU bytes and FFmpeg's
+/// NVENC opens its own CUDA context, so the cards never share a device.
+/// To prove it, set this test exe to Power saving (`GpuPreference=1;` under
+/// `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`) so DXGI runs the
+/// process on the iGPU, then run
+/// `cargo test -p eternal-host --test amf_encoder nvenc_encodes -- --ignored --nocapture`.
+#[cfg(windows)]
+#[test]
+#[ignore = "native: an NVIDIA card, with this exe on another card"]
+fn nvenc_encodes_while_the_process_runs_on_another_card() {
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let facts = eternal_host::gpu_preference::facts().expect("graphics card facts");
+    let app_gpu = facts.running_on().expect("a hardware adapter").name.clone();
+    let started = Instant::now();
+    let run = run_stage("h264_nvenc", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    assert!(!run.software_fallback, "NVENC fell back to the CPU");
+    assert!(run.codec_name.contains("NVENC"), "{}", run.codec_name);
+    assert_keyframe_on_request(&run, Id::H264);
+    eprintln!(
+        "process on {app_gpu}: NVENC encoded {} packets in {:?}",
+        run.packets.len(),
+        started.elapsed()
     );
 }
 

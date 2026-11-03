@@ -13,6 +13,8 @@ fn helpers_then_single_instance_then_the_display_reset() {
     };
     let steps = [
         "eternal_host::startup::run_reporter_if_requested();",
+        // A restart copy signals the old window before anything else.
+        "eternal_host::relaunch::take_over_if_requested();",
         "eternal_host::single_instance::acquire()",
         // A launch that loses the instance check must not rotate the running
         // host's session log or start a second uploader on its outbox.

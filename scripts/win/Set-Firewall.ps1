@@ -9,8 +9,7 @@ Get-NetFirewallRule -DisplayName "$name *" -ErrorAction SilentlyContinue | Remov
 if (!$Remove) {
     Get-NetFirewallApplicationFilter -Program $Program -ErrorAction SilentlyContinue |
         Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' } | Remove-NetFirewallRule
-    foreach ($protocol in @('UDP','TCP')) {
-        New-NetFirewallRule -DisplayName "$name $protocol" -Direction Inbound -Action Allow -Program $Program -Protocol $protocol -Profile Private,Public | Out-Null
-    }
+    # As the installer's rule: the host listens only on UDP.
+    New-NetFirewallRule -DisplayName "$name UDP" -Direction Inbound -Action Allow -Program $Program -Protocol UDP -Profile Domain,Private,Public | Out-Null
 }
 Write-Host "Firewall $name program=$Program removed=$Remove"

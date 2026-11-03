@@ -28,6 +28,9 @@ enum ConnectionProblem: Equatable {
     case reconnecting(attempt: Int, of: Int)
     case reconnectFailed
     case pcEndedSession
+    /// The PC ended the session on an error: it stopped hearing this iPad (a
+    /// Wi-Fi stall) or hit a problem of its own. Nobody stopped the stream.
+    case pcEndedSessionOnError
     /// The PC is streaming to another device, or still to this iPad's cable.
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
@@ -64,7 +67,7 @@ enum ConnectionProblem: Equatable {
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
         case .noNetwork: return "This iPad isn't connected to a network"
-        case .localNetworkBlocked: return "EternalMonitor isn't allowed on your local network"
+        case .localNetworkBlocked: return "Local Network is turned off for EternalMonitor"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
         case .lost(.pcStoppedResponding): return "Lost the connection to your PC"
@@ -72,7 +75,7 @@ enum ConnectionProblem: Equatable {
         case .lost(.usbTurnedOff): return "USB connections were turned off"
         case .reconnecting: return "Reconnecting to your PC…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
-        case .pcEndedSession: return "Your PC ended the session"
+        case .pcEndedSession, .pcEndedSessionOnError: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
@@ -103,7 +106,8 @@ enum ConnectionProblem: Equatable {
         case .noNetwork:
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
-            return "Open Settings and turn on Local Network for EternalMonitor, then try again."
+            return "iPadOS is stopping this app from reaching your PC over Wi-Fi. "
+                + Self.localNetworkSteps(then: "Try again") + " A USB cable works without this setting."
         case .couldNotConnect:
             return "Check that this iPad and your PC are on the same Wi-Fi and that EternalMonitor is open on the PC, then try again."
         case .usbFailed:
@@ -120,6 +124,8 @@ enum ConnectionProblem: Equatable {
             return "Check that the PC is awake and EternalMonitor is open on it, then try again."
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
+        case .pcEndedSessionOnError:
+            return "The connection to your PC dropped, or the PC ran into a problem. Tap Try again to reconnect."
         case .pcUpdating(.reconnecting):
             return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcUpdating(.manual):
@@ -129,6 +135,14 @@ enum ConnectionProblem: Equatable {
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
         }
+    }
+
+    /// Where Local Network is turned on, then the button to tap. The
+    /// switch is on the app's own Settings page (Open Settings) once iPadOS
+    /// has asked for it, and always in Privacy & Security.
+    static func localNetworkSteps(then button: String) -> String {
+        "Tap Open Settings and turn on Local Network, or go to Settings > Privacy & Security > Local Network "
+            + "and turn on EternalMonitor. Then tap \(button)."
     }
 
     /// Whether the card offers Report this problem. Not on cards that only
@@ -147,7 +161,7 @@ enum ConnectionProblem: Equatable {
 
     var actions: [Action] {
         switch self {
-        case .localNetworkBlocked: return [.openSettings]
+        case .localNetworkBlocked: return [.openSettings, .retry]
         case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
         default: return [.retry]
         }
@@ -185,7 +199,8 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession, .pcUpdating:
+        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
+             .pcEndedSessionOnError, .pcUpdating:
             return lastAttempt ?? .reconnectFailed
         default:
             return .reconnectFailed
@@ -196,10 +211,21 @@ enum ConnectionProblem: Equatable {
     /// PC updates it turns sessions away (Busy), then stops answering until
     /// the new version starts; neither replaces the update as the reason.
     static func kept(_ kept: ConnectionProblem?, after attempt: ConnectionProblem?) -> ConnectionProblem? {
-        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
+        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession, .pcEndedSessionOnError].contains(attempt) {
             return kept
         }
         return afterReconnecting(lastAttempt: attempt) != .reconnectFailed ? attempt : kept
+    }
+
+    /// The problem a goodbye from the PC leaves. Only an update sends
+    /// `hostShuttingDown`; the PC sends `error` when it stopped hearing this
+    /// iPad, so that one must not say someone stopped the stream.
+    static func pcGoodbye(_ reason: ByeReason) -> ConnectionProblem {
+        switch reason {
+        case .hostShuttingDown: return .pcUpdating(.reconnecting)
+        case .error: return .pcEndedSessionOnError
+        case .userDisconnect, .superseded, .appBackground: return .pcEndedSession
+        }
     }
 
     /// The problem to show when no automatic attempt will run (Auto-reconnect
@@ -322,14 +348,16 @@ struct NoPictureStreak: Equatable {
 enum USBStatusText {
     static func describe(_ status: String) -> String {
         switch status {
-        case "USB: off": return "Off. Turn on to connect with a cable."
-        case "USB: waiting for a cable": return "Plug this iPad into your PC. Keep Apple Devices open on the PC."
-        case "USB: disconnected": return "Paused. Tap Connect USB to use the cable again."
-        case "USB: connecting": return "Connecting over the cable…"
+        case "USB: off": return L("Off. Turn on to connect with a cable.")
+        case "USB: waiting for a cable": return L("Plug this iPad into your PC. Keep Apple Devices open on the PC.")
+        case "USB: disconnected": return L("Paused. Tap Connect USB to use the cable again.")
+        case "USB: connecting": return L("Connecting over the cable…")
+        // A problem: stays English, like the other problem text.
         case "USB: unavailable": return "The cable can't be used right now. Wi-Fi still works."
         default:
             if status.hasPrefix("USB: connected to ") {
-                return "Connected to \(status.dropFirst("USB: connected to ".count)) over the cable."
+                let name = String(status.dropFirst("USB: connected to ".count))
+                return L("Connected to \(name) over the cable.")
             }
             return status
         }

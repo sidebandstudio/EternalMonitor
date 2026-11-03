@@ -44,6 +44,19 @@ enum E2E {
         return host.isEmpty ? nil : (host, port)
     }
 
+    /// Simulator builds: `EM_USB_PORT=port` moves the USB listener off 9877
+    /// (0 takes any free port). Every simulator on a Mac shares its
+    /// loopback, so an app on another simulator holding 9877 would leave
+    /// this one's cable "unavailable".
+    static var usbListenPort: UInt16 {
+        #if targetEnvironment(simulator)
+        if let port = ProcessInfo.processInfo.environment["EM_USB_PORT"].flatMap({ UInt16($0) }) {
+            return port
+        }
+        #endif
+        return 9877
+    }
+
     static func firstFrame(width: Int, height: Int, link: String = "udp") {
         guard enabled else { return }
         let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000

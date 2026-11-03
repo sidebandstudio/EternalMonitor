@@ -62,7 +62,7 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
         ])
 
         let hint = UILabel()
-        hint.text = "Point at the QR code in EternalMonitor on your PC"
+        hint.text = L("Point at the QR code in EternalMonitor on your PC")
         hint.font = UIFont(name: "Geist-Medium", size: 17) ?? .systemFont(ofSize: 17, weight: .medium)
         hint.textColor = .white
         hint.textAlignment = .center
@@ -76,7 +76,7 @@ final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputOb
         ])
 
         var cancel = UIButton.Configuration.filled()
-        cancel.title = "Cancel"
+        cancel.title = L("Cancel")
         cancel.baseBackgroundColor = UIColor.white.withAlphaComponent(0.16)
         cancel.baseForegroundColor = .white
         cancel.cornerStyle = .capsule

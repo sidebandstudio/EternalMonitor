@@ -120,7 +120,10 @@ fn udp_goodbyes(stop: Stop) -> usize {
             Stop::Shutdown => shared.stop(),
             Stop::EncoderEof => drop(nal_tx),
         }
-        tokio::time::timeout(Duration::from_secs(2), transport)
+        // Only a backstop for a transport that never stops. It stops at its
+        // next liveness tick, 250 ms away, but a loaded machine can leave
+        // this thread unscheduled for longer than that.
+        tokio::time::timeout(Duration::from_secs(30), transport)
             .await
             .expect("the transport stops")
             .unwrap();

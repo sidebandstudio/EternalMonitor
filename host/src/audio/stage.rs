@@ -302,6 +302,30 @@ pub(crate) fn restart_stats(
     }
 }
 
+/// When to try again to open audio while FFmpeg's encoder lane is stuck:
+/// soon at first, then at most every 8 s, so a long stall neither spins nor
+/// floods the log.
+#[derive(Default)]
+struct StallRetry {
+    next: Option<Instant>,
+    wait: Duration,
+}
+
+impl StallRetry {
+    const FIRST: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(8);
+
+    fn due(&self, now: Instant) -> bool {
+        self.next.is_none_or(|next| now >= next)
+    }
+
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.wait = (self.wait * 2).clamp(Self::FIRST, Self::MAX);
+        self.next = Some(now + self.wait);
+        self.wait
+    }
+}
+
 /// An endpoint is opened only after both peers opt in. A failed capture
 /// attempt stays disabled for that session; reconnecting or toggling the
 /// host audio setting off and on retries without restarting video.
@@ -313,6 +337,7 @@ pub fn run_audio_stage(
 ) {
     let mut active: Option<CaptureSession> = None;
     let mut failed_session = None;
+    let mut stalled = StallRetry::default();
     let mut next_log = Instant::now() + Duration::from_secs(1);
     while shared.running.load(Ordering::SeqCst)
         && generation_is_current(generation)
@@ -338,7 +363,7 @@ pub fn run_audio_stage(
             continue;
         }
         let session_id = wanted.unwrap();
-        if failed_session == Some(session_id) {
+        if failed_session == Some(session_id) || !stalled.due(Instant::now()) {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -377,8 +402,24 @@ pub fn run_audio_stage(
             break;
         }
         match result {
-            Ok(true) => {}
+            Ok(true) => stalled = StallRetry::default(),
             Ok(false) => break,
+            // Video's encoder holds FFmpeg's lock in a stuck driver call:
+            // not this session's failure. Video goes on; the open is tried
+            // again later, once the call has returned.
+            Err(error) if super::encoder::is_stall(error.as_ref()) => {
+                log_final(active.take());
+                let wait = stalled.failed(Instant::now());
+                tracing::warn!(
+                    session_id,
+                    retry_ms = wait.as_millis() as u64,
+                    "PC audio waits for a stuck graphics driver call; video continues"
+                );
+                update_current(generation, |audio| {
+                    audio.stopped("Waiting for the graphics driver");
+                    audio.error = Some(error.to_string());
+                });
+            }
             Err(error) => {
                 log_final(active.take());
                 failed_session = Some(session_id);
@@ -409,6 +450,27 @@ pub fn run_audio_stage(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn audio_retries_a_stalled_open_with_a_bounded_backoff() {
+        let mut retry = StallRetry::default();
+        let now = Instant::now();
+        assert!(retry.due(now));
+        let waits: Vec<u64> = (0..7)
+            .map(|_| retry.failed(now).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, [500, 1000, 2000, 4000, 8000, 8000, 8000]);
+        assert!(!retry.due(now + Duration::from_secs(7)));
+        assert!(retry.due(now + Duration::from_secs(8)));
+        // A stall is retried; any other open failure still ends the session.
+        let stall: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(crate::stall::Stall::Refused {
+                call: crate::stall::Call::EncoderOpen,
+            });
+        assert!(crate::audio::encoder::is_stall(stall.as_ref()));
+        let other: Box<dyn std::error::Error + Send + Sync> = "libopus encoder unavailable".into();
+        assert!(!crate::audio::encoder::is_stall(other.as_ref()));
+    }
 
     #[test]
     fn opus_packets_seen_in_the_field_are_sent_not_fatal() {

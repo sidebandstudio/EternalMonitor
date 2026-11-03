@@ -2,6 +2,7 @@ use ffmpeg::{codec, frame, ChannelLayout, Dictionary};
 use ffmpeg_next as ffmpeg;
 
 use super::{AudioPacket, AudioResult, BITRATE, FRAME_SAMPLES, SAMPLE_RATE};
+use crate::stall::{Call, Lanes, Stall};
 
 const FORMAT: ffmpeg::format::Sample =
     ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
@@ -13,9 +14,33 @@ pub struct OpusEncoder {
     quiet: bool,
     discontinuity: bool,
     max_payload: usize,
+    lanes: &'static Lanes,
 }
 
-fn open_encoder() -> AudioResult<codec::encoder::Audio> {
+/// libopus opens under FFmpeg's process-wide codec lock, like the hardware
+/// video encoders (FF_CODEC_CAP_NOT_INIT_THREADSAFE), so it opens in their
+/// time-limited lane: while a stuck video open holds that lock, an Opus
+/// open is refused at once (or given up on) instead of blocking audio.
+fn open_encoder(lanes: &'static Lanes) -> AudioResult<codec::encoder::Audio> {
+    match crate::stall::run_on(
+        lanes,
+        Call::EncoderOpen,
+        crate::stall::encoder_open_limits("libopus"),
+        open_libopus,
+        || {},
+    ) {
+        Ok(opened) => opened,
+        Err(stall) => Err(Box::new(stall)),
+    }
+}
+
+/// Whether an audio error is an Opus open the stuck lane refused or gave up
+/// on: the audio waits for the lane instead of failing.
+pub fn is_stall(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<Stall>().is_some()
+}
+
+fn open_libopus() -> AudioResult<codec::encoder::Audio> {
     let codec = ffmpeg::encoder::find_by_name("libopus").ok_or("libopus encoder unavailable")?;
     let mut encoder = codec::context::Context::new_with_codec(codec)
         .encoder()
@@ -42,15 +67,35 @@ fn open_encoder() -> AudioResult<codec::encoder::Audio> {
 
 impl OpusEncoder {
     pub fn new(max_payload: usize) -> AudioResult<Self> {
+        Self::new_on(crate::stall::lanes(), max_payload)
+    }
+
+    fn new_on(lanes: &'static Lanes, max_payload: usize) -> AudioResult<Self> {
         ffmpeg::init()?;
         Ok(Self {
-            encoder: open_encoder()?,
+            encoder: open_encoder(lanes)?,
             seq: 0,
             pts: 0,
             quiet: false,
             discontinuity: true,
             max_payload,
+            lanes,
         })
+    }
+
+    /// Replace the encoder with a fresh one. Ok(false) when the lane is
+    /// stuck: the current encoder stays, and the next reset tries again.
+    fn replace_encoder(&mut self) -> AudioResult<bool> {
+        match open_encoder(self.lanes) {
+            Ok(encoder) => {
+                self.drain_tail();
+                self.encoder = encoder;
+                self.discontinuity = true;
+                Ok(true)
+            }
+            Err(error) if is_stall(error.as_ref()) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn encode(&mut self, pcm: &[(f32, f32)], capture_ts_us: u64) -> AudioResult<AudioPacket> {
@@ -63,9 +108,7 @@ impl OpusEncoder {
             // Clear the encoder's tonal history at digital silence. The new
             // stream's genuine Opus silence packets are three bytes. Tell the
             // receiver to reset its codec prediction, while preserving time.
-            self.drain_tail();
-            self.encoder = open_encoder()?;
-            self.discontinuity = true;
+            self.replace_encoder()?;
         }
         self.quiet = quiet;
         let mut input = frame::Audio::new(FORMAT, FRAME_SAMPLES, ChannelLayout::STEREO);
@@ -99,10 +142,8 @@ impl OpusEncoder {
     }
 
     pub fn reopen(&mut self) -> AudioResult<()> {
-        self.drain_tail();
-        self.encoder = open_encoder()?;
+        self.replace_encoder()?;
         self.quiet = false;
-        self.discontinuity = true;
         Ok(())
     }
 
@@ -196,6 +237,75 @@ mod tests {
         assert!(output[96 * FRAME_SAMPLES..100 * FRAME_SAMPLES]
             .iter()
             .all(|s| s.abs() < 0.0001));
+    }
+
+    #[test]
+    fn audio_waits_out_a_stuck_video_open_instead_of_blocking_or_failing() {
+        use crate::stall::{no_hooks, run_in, Wait};
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        use std::time::{Duration, Instant};
+        let lanes: &'static Lanes = Box::leak(Box::new(Lanes::new()));
+        // Normal case: opens and resets work as before.
+        let mut encoder = OpusEncoder::new_on(lanes, 1000).unwrap();
+        let tone = |encoder: &mut OpusEncoder, source: &mut SyntheticSource, n: u64| {
+            encoder
+                .encode(&source.read(FRAME_SAMPLES), n * 20_000)
+                .unwrap()
+        };
+        let silence = vec![(0.0, 0.0); FRAME_SAMPLES];
+        let mut source = SyntheticSource::default();
+        assert!(tone(&mut encoder, &mut source, 0).discontinuity);
+        assert!(!tone(&mut encoder, &mut source, 1).discontinuity);
+        assert!(encoder.encode(&silence, 40_000).unwrap().discontinuity);
+
+        // An NVENC open hangs holding FFmpeg's lock and is given up on.
+        let start = Instant::now();
+        let reads = AtomicU64::new(0);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stuck = run_in(
+            lanes,
+            Call::EncoderOpen,
+            Wait {
+                limits: Call::EncoderOpen.limits(),
+                slice: Duration::from_millis(1),
+                now: move || start + Duration::from_millis(100 * reads.fetch_add(1, SeqCst)),
+            },
+            move || {
+                let _ = released.recv();
+            },
+            || {},
+            no_hooks(),
+        );
+        assert!(matches!(stuck, Err(Stall::TimedOut { .. })));
+
+        // A new audio session's open is refused at once, as a stall.
+        let started = Instant::now();
+        let error = OpusEncoder::new_on(lanes, 1000)
+            .err()
+            .expect("opened past a stuck lane");
+        assert!(is_stall(error.as_ref()), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The open session keeps its encoder through a silence edge and a
+        // gap: sound continues, without waiting.
+        let started = Instant::now();
+        let after_tone = tone(&mut encoder, &mut source, 3);
+        assert!(!after_tone.discontinuity);
+        let edge = encoder.encode(&silence, 80_000).unwrap();
+        assert!(!edge.discontinuity, "kept encoder marked as reset");
+        encoder.reopen().unwrap();
+        tone(&mut encoder, &mut source, 5);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // Once the stuck open returns, opens and resets work again.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while lanes.abandoned(Call::EncoderOpen) != 0 {
+            assert!(Instant::now() < deadline, "the lane did not free");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(OpusEncoder::new_on(lanes, 1000).is_ok());
+        tone(&mut encoder, &mut source, 6);
+        assert!(encoder.encode(&silence, 140_000).unwrap().discontinuity);
     }
 
     #[test]

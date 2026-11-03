@@ -27,8 +27,9 @@ CHECKED_TABLES = ("### Messages on the iPad", "### Messages on the PC")
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
 RUST_RAW = re.compile(r'b?r(#*)"')
 RUST_CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
-# The format string is a macro's first argument, or its second after a writer.
-RUST_FORMAT_CALL = re.compile(r"\w!\(\s*(?:[^,()\"]+,\s*)?$")
+# The format string is a macro's first argument, or its second after a writer,
+# or the host's translated text with placeholders (`trf("… {name} …", …)`).
+RUST_FORMAT_CALL = re.compile(r"(?:\w!|\btrf)\(\s*(?:[^,()\"]+,\s*)?$")
 SWIFT_OPEN = re.compile(r'(#*)("""|")')
 
 

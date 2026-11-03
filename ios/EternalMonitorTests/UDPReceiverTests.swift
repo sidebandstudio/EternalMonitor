@@ -1,4 +1,5 @@
 import Darwin
+import os
 import XCTest
 @testable import EternalMonitor
 
@@ -136,5 +137,44 @@ final class UDPReceiverTests: XCTestCase {
     func testInvalidPortDoesNotStart() {
         let receiver = UDPReceiver(port: 0, backend: .bsd)
         XCTAssertFalse(receiver.start(host: "127.0.0.1"))
+    }
+
+    /// Media for another session (a PC streaming before the acceptance
+    /// arrives, or an old session) is logged once per session, not per datagram.
+    func testForeignSessionMediaIsLoggedOncePerSession() {
+        let datagrams = MediaDatagrams()
+        var ignored: [String] = []
+        datagrams.onDatagramIgnored = { ignored.append($0) }
+        func media(session: UInt32, seq: UInt32) -> Data {
+            MediaHeader(sessionId: session, streamEpoch: 1, frameSeq: seq, fragIndex: 0, fragCount: 2, isKeyframe: false,
+                        captureTimestampUs: 0, payloadLen: 1).encode(payload: Data([0]))
+        }
+        for seq in UInt32(1)...20 { datagrams.handle(media(session: 41, seq: seq)) }
+        datagrams.setAcceptedSessionId(41)
+        for seq in UInt32(1)...20 { datagrams.handle(media(session: 40, seq: seq)) }
+        datagrams.setAcceptedSessionId(42)
+        for seq in UInt32(1)...20 { datagrams.handle(media(session: 41, seq: seq)) }
+        datagrams.reset()
+        datagrams.handle(media(session: 43, seq: 1))
+        XCTAssertEqual(ignored, ["Dropped media for foreign session 41", "Dropped media for foreign session 40",
+                                 "Dropped media for foreign session 41", "Dropped media for foreign session 43"])
+    }
+
+    /// A path that isn't ready (here a name that doesn't resolve) is
+    /// reported once per connection, however often Network.framework
+    /// re-evaluates it.
+    func testAPathThatIsNotReadyIsReportedOncePerConnection() {
+        let receiver = UDPReceiver(port: 9, backend: .networkFramework)
+        let errors = OSAllocatedUnfairLock<[LinkError.Kind]>(initialState: [])
+        let first = expectation(description: "path not ready")
+        receiver.onError = { error in
+            if errors.withLock({ $0.append(error.kind); return $0.count }) == 1 { first.fulfill() }
+        }
+        XCTAssertTrue(receiver.start(host: "no-such-pc.invalid"))
+        wait(for: [first], timeout: 10)
+        // Network.framework re-checks a waiting path; give it the time it took the field.
+        Thread.sleep(forTimeInterval: 3)
+        receiver.stop()
+        XCTAssertEqual(errors.withLock { $0 }, [.pathUnavailable])
     }
 }

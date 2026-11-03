@@ -7,17 +7,28 @@
 //! - on Stream, the "Pairing", "USB connection" and "PC audio" rows, and a
 //!   "Connected iPad" card that lists "Decode rate" and "Repaired fragments"
 //!   (or "Waiting for an iPad" when nobody is connected);
-//! - on Settings, the "Encoder input" row;
+//! - on Settings, the "Encoder input" row, under "Troubleshooting", which
+//!   opens when clicked;
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
 //! - in the sidebar, "Send feedback" and the GitHub star card (see
-//!   `feedback_panel.rs`).
+//!   `feedback_panel.rs`);
+//! - in first-run setup, "Next", "Back", "Skip setup" and "Done".
+//!
+//! In another language these widgets show and are named by the translation,
+//! and keep their English name as their UI Automation AutomationId (AccessKit
+//! `author_id`, see `widgets::automation_id`): scripts and tests find them by
+//! that id first, then by name, so the same name works in every language.
 
 mod feedback_panel;
+mod fonts;
 mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
-mod renderer;
+mod page_troubleshooting;
+mod port_notice;
+pub(crate) mod renderer;
+mod setup;
 mod theme;
 mod update_banner;
 mod update_toast;
@@ -35,10 +46,15 @@ use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_regist
 use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
+use crate::gpu_preference::{Change, Preference, SwitchRecord};
+use crate::handoff::Handoff;
+use crate::i18n::{self, tr, trf, Lang};
+use crate::relaunch::Reason;
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
 use crate::transport::link::{LinkId, PeerId};
 use crate::transport::session::ClientInfo;
+use crate::troubleshooting::{Overrides, WindowDrawing};
 use eternal_wire::v2::control::ReceiverReport;
 
 use icons::Icon;
@@ -64,6 +80,7 @@ struct StatsSnapshot {
     bitrate_bps: u32,
     codec_name: String,
     using_software_fallback: bool,
+    nvidia_driver_outdated: bool,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -101,6 +118,7 @@ impl StatsSnapshot {
             bitrate_bps: s.bitrate_bps,
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
+            nvidia_driver_outdated: s.nvidia_driver_outdated,
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -147,11 +165,14 @@ impl ClientSnapshot {
         }
     }
 
-    fn link_name(&self) -> &'static str {
-        if self
-            .peer
+    /// Whether an iPad is streaming over the USB cable right now.
+    fn on_usb(&self) -> bool {
+        self.peer
             .is_some_and(|p| matches!(p.link, LinkId::Usb { .. }))
-        {
+    }
+
+    fn link_name(&self) -> &'static str {
+        if self.on_usb() {
             "USB"
         } else {
             "Wi-Fi"
@@ -310,23 +331,56 @@ pub struct AnalyzerApp {
     restart_pending: bool,
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
+    /// The home network address offered under a VPN's or virtual switch's.
+    address_hint: crate::network::HintCache,
     copied: Option<(Copied, Instant)>,
     /// The Send feedback dialog, while open.
     feedback: Option<feedback_panel::Draft>,
     feedback_ask: crate::feedback::Ask,
     star_clicked: bool,
+    /// Settings > Troubleshooting is open.
+    troubleshooting_open: bool,
+    /// The networks Listen on offers, by name with their address, listed
+    /// when Troubleshooting opens.
+    listen_choices: crate::network::ListenChoices,
+    /// Which Troubleshooting values an environment variable fixes.
+    overrides: Overrides,
+    settings_window_drawing: WindowDrawing,
+    /// EternalMonitor's own Windows graphics preference value, read when
+    /// Troubleshooting opens.
+    gpu_value: Option<String>,
+    /// A graphics card choice waiting for "Restart EternalMonitor".
+    gpu_choice: Option<Change>,
+    /// The graphics card switch record as last saved; capture changes it.
+    saved_gpu_switch: Option<SwitchRecord>,
+    /// Why a graphics card setting couldn't be saved, when it couldn't.
+    gpu_error: Option<String>,
+    /// "Restart EternalMonitor": waiting for the new copy, or failed.
+    restart: crate::relaunch::Restart,
+    /// A restart an update refused (its reason says which button), and an
+    /// update a restart refused, while what refused it hands over.
+    restart_refused: Option<Reason>,
+    update_refused: bool,
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
+    /// The saved language choice (see `i18n::resolve`).
+    settings_language: Option<String>,
+    /// A language whose fonts were just installed; it shows from the next
+    /// frame, when egui uses them.
+    pending_language: Option<Lang>,
+    /// First-run setup, while open.
+    setup: Option<setup::Setup>,
 }
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
-        theme::install(&cc.egui_ctx);
-
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
+        let language = theme::install(&cc.egui_ctx, i18n::resolve(persisted.language.as_deref()));
+        i18n::activate(language);
+        info!(language = language.code(), "Window language");
 
         let runtime_bitrate_mbps =
             control.shared.bitrate_bps.load(Ordering::SeqCst) as f32 / 1_000_000.0;
@@ -343,18 +397,24 @@ impl AnalyzerApp {
             runtime_bitrate_mbps
         };
 
+        // An environment variable wins over each saved value (developers,
+        // CI); the settings below keep the saved values, which are what the
+        // file stores.
+        let overrides = Overrides::from_process(&persisted).unwrap_or_else(|_| {
+            Overrides::resolve(&persisted, |_| None).expect("no environment, no error")
+        });
         let fps_target = if [30, 60, 90, 120].contains(&persisted.target_fps) {
             persisted.target_fps
         } else {
-            control.shared.target_fps.load(Ordering::SeqCst)
+            crate::control::DEFAULT_TARGET_FPS
         };
         control
             .shared
             .target_fps
-            .store(fps_target, Ordering::SeqCst);
+            .store(overrides.target_fps.value, Ordering::SeqCst);
+        *control.shared.encoder_override.lock() = overrides.encoder.value.clone();
 
         let encoder_choice = if let Some(name) = persisted.encoder_override.as_deref() {
-            *control.shared.encoder_override.lock() = Some(name.to_string());
             ENCODER_CHOICES
                 .iter()
                 .find(|(_, ffmpeg)| *ffmpeg == name)
@@ -388,7 +448,7 @@ impl AnalyzerApp {
         control
             .shared
             .hevc_enabled
-            .store(persisted.hevc_enabled, Ordering::SeqCst);
+            .store(overrides.hevc.value, Ordering::SeqCst);
         control
             .shared
             .audio_enabled
@@ -414,6 +474,7 @@ impl AnalyzerApp {
             crate::updates::Updater::start(
                 persisted.check_for_updates,
                 control.shared.session.clone(),
+                control.shared.handoff.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
                     if let Some(version) = version {
                         update_toast::show(&ctx, version);
@@ -422,16 +483,18 @@ impl AnalyzerApp {
                 }),
             )
         };
-        let encoder_input = *control.shared.encoder_input.lock();
+        *control.shared.encoder_input.lock() = overrides.encoder_input.value;
+        let saved_gpu_switch = control.shared.gpu_switch.lock().clone();
+        let restart = crate::relaunch::Restart::new(control.shared.handoff.clone());
         Self {
-            settings_encoder_input: encoder_input,
+            settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
-            ipad_last_seen: Some(Instant::now()),
+            ipad_last_seen: Some(popup_now()),
             popup_quiet: popup_quiet(),
             ipad_notice_dismissed: false,
-            settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
+            settings_packet_size: u32::from(persisted.max_dgram.clamp(576, 1400)),
             control,
             page: Page::Stream,
             settings_bitrate_mbps: bitrate_mbps,
@@ -447,6 +510,7 @@ impl AnalyzerApp {
             restart_pending: false,
             show_qr_modal: false,
             qr_cache: None,
+            address_hint: Default::default(),
             copied: None,
             feedback: None,
             feedback_ask: crate::feedback::Ask::new(
@@ -454,13 +518,32 @@ impl AnalyzerApp {
                 persisted.feedback_ask_done,
             ),
             star_clicked: persisted.star_clicked,
+            troubleshooting_open: false,
+            listen_choices: Default::default(),
+            overrides,
+            settings_window_drawing: persisted.window_drawing,
+            gpu_value: None,
+            gpu_choice: None,
+            saved_gpu_switch,
+            gpu_error: None,
+            restart,
+            restart_refused: None,
+            update_refused: false,
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
+            settings_language: persisted.language,
+            pending_language: None,
+            setup: crate::settings::fresh_install().then(setup::Setup::default),
         }
     }
 
     fn persist_settings(&self) {
+        // Logged in `save`; nothing here depends on the file.
+        let _ = self.settings_file().save();
+    }
+
+    fn settings_file(&self) -> SettingsFile {
         let encoder_override = ENCODER_CHOICES
             .iter()
             .find(|(label, _)| *label == self.settings_encoder_choice)
@@ -472,7 +555,7 @@ impl AnalyzerApp {
                 }
             });
         let pairing = self.control.shared.pairing.lock();
-        let file = SettingsFile {
+        SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
             max_dgram: self.settings_packet_size as u16,
@@ -493,11 +576,14 @@ impl AnalyzerApp {
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
+            listen_on: self.control.shared.listen_on.lock().clone(),
             feedback_sessions: self.feedback_ask.long_sessions,
             feedback_ask_done: self.feedback_ask.done,
             star_clicked: self.star_clicked,
-        };
-        file.save();
+            window_drawing: self.settings_window_drawing,
+            gpu_switch: self.control.shared.gpu_switch.lock().clone(),
+            language: self.settings_language.clone(),
+        }
     }
 }
 
@@ -523,6 +609,7 @@ impl AnalyzerApp {
             return;
         }
         self.settings_fps_target = fps;
+        let fps = self.overrides.target_fps.live(fps);
         self.control.shared.target_fps.store(fps, Ordering::SeqCst);
         info!(target_fps = fps, "Capture target FPS updated from GUI");
         self.persist_settings();
@@ -530,8 +617,13 @@ impl AnalyzerApp {
 
     fn set_packet_size(&mut self, bytes: u32) {
         self.settings_packet_size = bytes;
-        self.control.shared.max_dgram.store(bytes, Ordering::SeqCst);
-        self.settings_dirty_at = Some(Instant::now());
+        let bytes = self.overrides.max_dgram.live(bytes as u16);
+        self.control
+            .shared
+            .max_dgram
+            .store(u32::from(bytes), Ordering::SeqCst);
+        info!(max_dgram = bytes, "Media packet size changed");
+        self.persist_settings();
     }
 
     fn set_encoder_input(&mut self, input: crate::encoder::input::EncoderInput) {
@@ -539,9 +631,9 @@ impl AnalyzerApp {
             return;
         }
         self.settings_encoder_input = input;
-        *self.control.shared.encoder_input.lock() = input;
+        *self.control.shared.encoder_input.lock() = self.overrides.encoder_input.live(input);
         self.persist_settings();
-        self.restart_pending = true;
+        self.restart_pending |= self.overrides.encoder_input.env().is_none();
     }
 
     fn set_encoder_choice(&mut self, label: &str) {
@@ -553,16 +645,18 @@ impl AnalyzerApp {
             .iter()
             .find(|(choice, _)| *choice == label)
             .map(|(_, ffmpeg)| (*ffmpeg).to_string());
-        *self.control.shared.encoder_override.lock() = ffmpeg_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        *self.control.shared.encoder_override.lock() = self.overrides.encoder.live(
+            ffmpeg_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
         info!(
             encoder = self.settings_encoder_choice,
             "Encoder override set — takes effect on next stream restart"
         );
         self.persist_settings();
-        self.restart_pending = true;
+        self.restart_pending |= self.overrides.encoder.env().is_none();
     }
 
     fn set_capture_display(&mut self, display: String) {
@@ -628,6 +722,7 @@ impl AnalyzerApp {
 
     fn set_hevc(&mut self, enabled: bool) {
         self.settings_hevc_enabled = enabled;
+        let enabled = self.overrides.hevc.live(enabled);
         self.control
             .shared
             .hevc_enabled
@@ -658,6 +753,34 @@ impl AnalyzerApp {
         }
     }
 
+    /// `choice` is a language code or `i18n::SYSTEM`. The window redraws in
+    /// it from the next frame, once its fonts are in.
+    fn set_language(&mut self, ctx: &egui::Context, choice: &str) {
+        if self.settings_language.as_deref() == Some(choice) {
+            return;
+        }
+        self.settings_language = Some(choice.to_string());
+        self.persist_settings();
+        let language = theme::set_language(ctx, i18n::resolve(Some(choice)));
+        info!(
+            choice,
+            language = language.code(),
+            "Window language changed"
+        );
+        self.pending_language = Some(language);
+        ctx.request_repaint();
+    }
+
+    /// What the language picker shows as chosen: `None` for System
+    /// language. Before a choice in the app, the installer's.
+    fn language_choice(&self) -> Option<Lang> {
+        match self.settings_language.as_deref() {
+            Some(i18n::SYSTEM) => None,
+            Some(code) => Lang::from_code(code).or_else(i18n::installer_language),
+            None => i18n::installer_language(),
+        }
+    }
+
     fn set_check_updates(&mut self, enabled: bool) {
         self.settings_check_updates = enabled;
         self.updates.set_auto(enabled);
@@ -665,12 +788,23 @@ impl AnalyzerApp {
     }
 
     fn set_require_pairing(&mut self, required: bool) {
-        self.control.shared.pairing.lock().required = required;
+        {
+            let mut pairing = self.control.shared.pairing.lock();
+            pairing.required = required;
+            pairing.warn_if_off();
+        }
         self.persist_settings();
     }
 
     fn new_pairing_code(&mut self) {
         let result = self.control.shared.pairing.lock().rotate_code();
+        if let Err(error) = result {
+            self.settings_error = Some(format!("Could not create a pairing code: {error}"));
+        }
+    }
+
+    fn resume_code_pairing(&mut self) {
+        let result = self.control.shared.pairing.lock().resume_code_pairing();
         if let Err(error) = result {
             self.settings_error = Some(format!("Could not create a pairing code: {error}"));
         }
@@ -687,6 +821,234 @@ impl AnalyzerApp {
     fn restart_stream(&mut self) {
         self.restart_pending = false;
         self.control.request_restart();
+    }
+
+    /// The Stream page notice: move EternalMonitor onto the card the screen
+    /// is wired to. The value is saved now; Windows applies it when the app
+    /// starts, so EternalMonitor then restarts.
+    fn switch_graphics_card(&mut self, preference: Preference, gpu: &str) {
+        if !self.restart_allowed() {
+            return;
+        }
+        info!(
+            ?preference,
+            gpu, "Graphics card switch: saving the card the screen is wired to"
+        );
+        let saved = self.save_gpu(|store, record, persist| {
+            crate::gpu_preference::switch(store, record, preference, gpu, persist)
+        });
+        if saved {
+            self.restart_now(Reason::GraphicsCard);
+        }
+    }
+
+    /// Puts EternalMonitor's graphics card setting back as it was before the
+    /// switch, and restarts. A refused write keeps the switch and its Undo.
+    fn undo_graphics_switch(&mut self) {
+        if !self.restart_allowed() {
+            return;
+        }
+        let Some(record) = self.control.shared.gpu_switch.lock().clone() else {
+            return;
+        };
+        info!(
+            preference = ?crate::gpu_preference::preference_in(record.before.as_deref()),
+            "Graphics card switch undone"
+        );
+        if self
+            .save_gpu(|store, record, persist| crate::gpu_preference::undo(store, record, persist))
+        {
+            self.restart_now(Reason::GraphicsCard);
+        }
+    }
+
+    /// Runs `save` on EternalMonitor's own graphics preference with the
+    /// switch record; each record it keeps is saved to settings.json, and
+    /// the last one is shared with capture once it worked (see
+    /// `save_gpu_switch`). False, with the reason shown, when it failed:
+    /// then nothing changed.
+    fn save_gpu(
+        &mut self,
+        save: impl FnOnce(
+            &mut crate::gpu_preference::OwnValue,
+            &mut Option<SwitchRecord>,
+            &mut dyn FnMut(&Option<SwitchRecord>) -> Result<(), String>,
+        ) -> Result<(), String>,
+    ) -> bool {
+        let last_saved = std::cell::RefCell::new(None);
+        let result = crate::capture::recovery::save_gpu_switch(&self.control.shared, |record| {
+            let mut store = crate::gpu_preference::OwnValue::new()?;
+            save(&mut store, record, &mut |record| {
+                let file = SettingsFile {
+                    gpu_switch: record.clone(),
+                    ..self.settings_file()
+                };
+                file.save()?;
+                *last_saved.borrow_mut() = Some(record.clone());
+                Ok(())
+            })
+        });
+        // A verdict capture made meanwhile (a refused write leaves it
+        // shared) is saved by the next frame.
+        if let Some(saved) = last_saved.into_inner() {
+            self.saved_gpu_switch = saved;
+        }
+        match result {
+            Ok(()) => {
+                self.gpu_error = None;
+                self.gpu_value = crate::gpu_preference::read_value().ok().flatten();
+                true
+            }
+            Err(error) => {
+                warn!(%error, "Could not save the graphics card setting");
+                self.gpu_error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// Starts the new copy and closes this window once it runs (see
+    /// `relaunch`). Every restart button does nothing while one waits, and
+    /// says why while an update hands over.
+    fn restart_now(&mut self, reason: Reason) {
+        match self.restart.begin(reason, crate::relaunch::hand_over_now) {
+            Ok(()) => info!(?reason, "Restarting EternalMonitor"),
+            Err(handoff) => self.refuse_restart(handoff, reason),
+        }
+    }
+
+    /// Whether a graphics card restart could start now. Checked before the
+    /// change is saved, so a change is never saved without its restart.
+    fn restart_allowed(&mut self) -> bool {
+        match self.restart.blocked() {
+            Some(handoff) => {
+                self.refuse_restart(handoff, Reason::GraphicsCard);
+                false
+            }
+            None => true,
+        }
+    }
+
+    fn refuse_restart(&mut self, handoff: Handoff, reason: Reason) {
+        if handoff == Handoff::Update {
+            info!(?reason, "Restart refused: an update is installing");
+            self.restart_refused = Some(reason);
+        }
+    }
+
+    /// Troubleshooting's Listen on choice, applied when the stream restarts.
+    fn set_listen_on(&mut self, choice: crate::network::ListenOn) {
+        if *self.control.shared.listen_on.lock() == choice {
+            return;
+        }
+        info!(
+            listen_on = choice.label(),
+            "Listen on changed — takes effect on next stream restart"
+        );
+        *self.control.shared.listen_on.lock() = choice;
+        self.listen_choices = crate::network::listen_choices();
+        self.refresh_listen_addr();
+        self.persist_settings();
+        self.restart_pending = true;
+    }
+
+    /// The Address row and QR code follow the Listen on choice.
+    fn refresh_listen_addr(&self) {
+        let port = PIPELINE_STATS
+            .lock()
+            .listen_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok());
+        if let Some(port) = port {
+            // Resolved before locking: the stats lock is shared with every
+            // pipeline thread.
+            let choice = self.control.shared.listen_on.lock().clone();
+            let listen_addr = listen_address(&choice, port);
+            PIPELINE_STATS.lock().set_listen_addr(listen_addr);
+        }
+    }
+
+    /// Reads the graphics cards and EternalMonitor's own preference when
+    /// Troubleshooting opens. Outside Windows the fixture's facts stay.
+    fn refresh_gpu_facts(&mut self) {
+        if let Some(facts) = crate::gpu_preference::facts() {
+            *self.control.shared.gpu_facts.lock() = Some(facts);
+        }
+        self.gpu_value = crate::gpu_preference::read_value().ok().flatten();
+    }
+
+    /// Troubleshooting's graphics card choice, applied at the restart.
+    fn choose_graphics_card(&mut self, preference: Preference) {
+        let current = crate::gpu_preference::preference_in(self.gpu_value.as_deref()).unwrap_or(0);
+        self.gpu_choice = (preference.value() != current).then_some(Change::Set(preference));
+    }
+
+    fn apply_graphics_card(&mut self) {
+        if !self.restart_allowed() {
+            return;
+        }
+        let Some(change) = self.gpu_choice.clone() else {
+            return;
+        };
+        info!(
+            preference = match &change {
+                Change::Set(preference) => preference.value(),
+                Change::Restore(value) =>
+                    crate::gpu_preference::preference_in(value.as_deref()).unwrap_or(0),
+            },
+            "Graphics card choice changed in Troubleshooting"
+        );
+        // The user's own choice, or Reset's undo, replaces any switch the
+        // notice made.
+        let saved = self.save_gpu(|store, record, persist| {
+            crate::gpu_preference::save_change(store, record, &change, None, persist)
+        });
+        if saved {
+            self.gpu_choice = None;
+            self.restart_now(Reason::GraphicsCard);
+        }
+    }
+
+    fn set_window_drawing(&mut self, drawing: WindowDrawing) {
+        if self.settings_window_drawing == drawing {
+            return;
+        }
+        self.settings_window_drawing = drawing;
+        info!(
+            ?drawing,
+            "Window drawing changed — applies at the next start"
+        );
+        self.persist_settings();
+    }
+
+    /// Every Troubleshooting option back to Automatic. A value an
+    /// environment variable sets stays in effect; only the saved choice
+    /// goes. The graphics card waits for "Restart EternalMonitor", like any
+    /// change to it.
+    fn reset_troubleshooting(&mut self) {
+        info!("Troubleshooting settings reset to Automatic");
+        self.set_encoder_choice(ENCODER_AUTO_LABEL);
+        self.set_encoder_input(crate::encoder::input::EncoderInput::default());
+        if self.settings_hevc_enabled {
+            self.set_hevc(false);
+        }
+        if self.settings_packet_size != u32::from(crate::troubleshooting::FULL_PACKET) {
+            self.set_packet_size(u32::from(crate::troubleshooting::FULL_PACKET));
+        }
+        self.set_window_drawing(WindowDrawing::Automatic);
+        self.set_listen_on(crate::network::ListenOn::All);
+        // A switch the notice made is undone, back to what the user had;
+        // otherwise a preference is cleared.
+        let record = self.control.shared.gpu_switch.lock().clone();
+        self.gpu_choice = match record {
+            Some(record) => {
+                (record.before != self.gpu_value).then_some(Change::Restore(record.before))
+            }
+            None => crate::gpu_preference::preference_in(self.gpu_value.as_deref())
+                .filter(|&value| value != 0)
+                .map(|_| Change::Set(Preference::Automatic)),
+        };
     }
 
     fn copy(&mut self, ctx: &egui::Context, what: Copied, text: String) {
@@ -716,6 +1078,10 @@ impl eframe::App for AnalyzerApp {
         renderer::frame_started(ui.ctx());
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
+        if let Some(language) = self.pending_language.take() {
+            i18n::activate(language);
+        }
+        i18n::begin_pass();
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= Duration::from_millis(800) {
                 self.settings_dirty_at = None;
@@ -728,10 +1094,34 @@ impl eframe::App for AnalyzerApp {
         // encoder.
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        // Holds no lock: a second screen record writer that could not start
+        // is started here, once its wait is over.
+        crate::capture::second_screen::retry_saving(&self.control.shared);
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
         self.observe_session(&client);
+        // The new copy runs: this one leaves.
+        if self.restart.poll() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.restart.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // A refusal is shown while what refused it still hands over.
+        let holder = self.control.shared.handoff.holder();
+        if holder != Some(Handoff::Update) {
+            self.restart_refused = None;
+        }
+        if holder != Some(Handoff::Restart) {
+            self.update_refused = false;
+        }
+        // Capture recorded how a graphics card switch went: save that.
+        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
+        if gpu_switch != self.saved_gpu_switch {
+            self.saved_gpu_switch = gpu_switch;
+            self.persist_settings();
+        }
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;
@@ -762,6 +1152,7 @@ impl eframe::App for AnalyzerApp {
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
                                 self.update_banner(ui, &snap, &client);
+                                self.restart_banner(ui);
                                 match self.page {
                                     Page::Stream => self.stream_page(ui, &snap, &client),
                                     Page::Performance => self.performance_page(ui, &snap),
@@ -774,9 +1165,33 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
+        self.draw_setup(&ctx, &snap);
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
     }
+}
+
+/// The time the update popup's quiet period reads. Debug builds let the GUI
+/// tests hold it and move it themselves, so whether the popup waited does
+/// not depend on how fast a machine draws frames. Release builds always
+/// read the real time.
+#[cfg(debug_assertions)]
+static POPUP_CLOCK: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+/// Debug builds only: runs the popup's quiet period on `now` instead of the
+/// real time, until called with `None`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_popup_clock(now: Option<Instant>) {
+    *POPUP_CLOCK.lock() = now;
+}
+
+fn popup_now() -> Instant {
+    #[cfg(debug_assertions)]
+    if let Some(now) = *POPUP_CLOCK.lock() {
+        return now;
+    }
+    Instant::now()
 }
 
 /// [`update_banner::POPUP_QUIET`]. Debug builds only:
@@ -811,10 +1226,10 @@ impl AnalyzerApp {
                 self.draw_brand(ui);
                 ui.add_space(26.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
-                let stream = self.nav_item(ui, Page::Stream, Icon::Display, "Stream");
+                let stream = self.nav_item(ui, Page::Stream, Icon::Display, tr("Stream"));
                 let performance =
-                    self.nav_item(ui, Page::Performance, Icon::Activity, "Performance");
-                let settings = self.nav_item(ui, Page::Settings, Icon::Sliders, "Settings");
+                    self.nav_item(ui, Page::Performance, Icon::Activity, tr("Performance"));
+                let settings = self.nav_item(ui, Page::Settings, Icon::Sliders, tr("Settings"));
                 // A lime bar marks the open page and slides to the one clicked.
                 let active = match self.page {
                     Page::Stream => stream,
@@ -833,11 +1248,17 @@ impl AnalyzerApp {
                 );
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    let version = trf(
+                        "Version {version}",
+                        &[("version", env!("CARGO_PKG_VERSION"))],
+                    );
+                    let response = ui.label(faint(&version));
+                    widgets::automation_id(&response, &version);
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
                     ui.add_space(6.0);
-                    if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
+                    if feedback_panel::sidebar_action(ui, Icon::Mail, tr("Send feedback")).clicked()
+                    {
                         self.open_feedback();
                     }
                     ui.add_space(2.0);
@@ -878,6 +1299,7 @@ impl AnalyzerApp {
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        widgets::automation_id(&response, label);
         if response.clicked() {
             self.page = page;
         }
@@ -932,13 +1354,19 @@ impl AnalyzerApp {
 fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
     let state = StreamState::of(snap, client);
     let (title, detail) = match state {
-        StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
-        StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
+        StreamState::Off => (
+            tr("Stopped").to_string(),
+            tr("Streaming is off").to_string(),
+        ),
+        StreamState::Ready => (
+            tr("Ready").to_string(),
+            tr("Waiting for an iPad").to_string(),
+        ),
         StreamState::Streaming | StreamState::Paused => (
             if state == StreamState::Paused {
-                "Paused"
+                tr("Paused")
             } else {
-                "Streaming"
+                tr("Streaming")
             }
             .to_string(),
             format!(
@@ -965,8 +1393,9 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
                 widgets::status_dot(ui, dot.center(), state.color(), 4.0, state.dot());
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(strong(title));
-                    ui.add(egui::Label::new(faint(detail)).truncate());
+                    let response = ui.label(strong(&title));
+                    widgets::automation_id(&response, &title);
+                    widgets::truncated(ui, &detail, faint);
                 });
             });
         });
@@ -1017,27 +1446,25 @@ fn logo_texture(ctx: &egui::Context, pixels: usize) -> Option<egui::TextureHandl
 // ── QR dialog ───────────────────────────────────────────────────────────────
 
 impl AnalyzerApp {
-    fn open_qr(&mut self, snap: &StatsSnapshot) {
+    fn open_qr(&mut self) {
         // Re-resolve the LAN address on open — DHCP renews and interface
         // changes would otherwise leave the QR encoding a stale IP from
         // process start.
-        if let Some(port) = snap
-            .listen_addr
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<u16>().ok())
-        {
-            PIPELINE_STATS.lock().set_listen_addr(detect_local_ip(port));
-        }
+        self.refresh_listen_addr();
         self.show_qr_modal = true;
     }
 
-    fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
-        let listen_addr = if snap.listen_addr.is_empty() {
+    /// The address the QR code and the pairing step show.
+    fn qr_address(&self, snap: &StatsSnapshot) -> String {
+        if snap.listen_addr.is_empty() {
             self.control.shared.target_addr.lock().to_string()
         } else {
             snap.listen_addr.clone()
-        };
+        }
+    }
+
+    /// The pairing QR code on a white tile `tile` points wide.
+    fn qr_tile(&mut self, ui: &mut egui::Ui, listen_addr: &str, tile: f32) {
         let url = format!(
             "eternaldisplay://{}?t={}",
             listen_addr,
@@ -1059,7 +1486,43 @@ impl AnalyzerApp {
                 }
             }
         }
+        let (rect, _) = ui.allocate_exact_size(vec2(tile, tile), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 14.0, Color32::WHITE);
+        match self.qr_cache.as_ref().map(|(_, code)| code) {
+            Some(code) => {
+                let width = code.width();
+                let modules = code.to_colors();
+                let quiet = 16.0_f32 * tile / 244.0;
+                let module = ((tile - 2.0 * quiet) / width as f32).floor().max(1.0);
+                let offset = (tile - module * width as f32) / 2.0;
+                let origin = rect.min + vec2(offset, offset);
+                for y in 0..width {
+                    for x in 0..width {
+                        if matches!(modules[y * width + x], QrModuleColor::Dark) {
+                            let cell = Rect::from_min_size(
+                                origin + vec2(x as f32 * module, y as f32 * module),
+                                vec2(module, module),
+                            );
+                            painter.rect_filled(cell, 0.0, Color32::BLACK);
+                        }
+                    }
+                }
+            }
+            None => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "The QR code could not be created",
+                    egui::FontId::new(SMALL, egui::FontFamily::Proportional),
+                    DANGER,
+                );
+            }
+        }
+    }
 
+    fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
+        let listen_addr = self.qr_address(snap);
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::new("qr-dialog"))
             .backdrop_color(Color32::from_black_alpha(175))
@@ -1080,13 +1543,15 @@ impl AnalyzerApp {
                 ui.set_width(320.0);
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.vertical_centered(|ui| {
-                    ui.label(overline("QR code"));
-                    ui.label(
-                        egui::RichText::new("Scan to connect")
+                    widgets::overline_label(ui, tr("QR code"));
+                    let title = tr("Scan to connect");
+                    let response = ui.label(
+                        egui::RichText::new(title)
                             .family(semibold())
                             .size(20.0)
                             .color(TEXT),
                     );
+                    widgets::automation_id(&response, title);
                     ui.add(
                         egui::Label::new(muted(
                             "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
@@ -1094,40 +1559,7 @@ impl AnalyzerApp {
                         .wrap(),
                     );
                     ui.add_space(12.0);
-                    let tile = 244.0;
-                    let (rect, _) = ui.allocate_exact_size(vec2(tile, tile), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 14.0, Color32::WHITE);
-                    match self.qr_cache.as_ref().map(|(_, code)| code) {
-                        Some(code) => {
-                            let width = code.width();
-                            let modules = code.to_colors();
-                            let quiet = 16.0_f32;
-                            let module = ((tile - 2.0 * quiet) / width as f32).floor().max(1.0);
-                            let offset = (tile - module * width as f32) / 2.0;
-                            let origin = rect.min + vec2(offset, offset);
-                            for y in 0..width {
-                                for x in 0..width {
-                                    if matches!(modules[y * width + x], QrModuleColor::Dark) {
-                                        let cell = Rect::from_min_size(
-                                            origin + vec2(x as f32 * module, y as f32 * module),
-                                            vec2(module, module),
-                                        );
-                                        painter.rect_filled(cell, 0.0, Color32::BLACK);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "The QR code could not be created",
-                                egui::FontId::new(SMALL, egui::FontFamily::Proportional),
-                                DANGER,
-                            );
-                        }
-                    }
+                    self.qr_tile(ui, &listen_addr, 244.0);
                     ui.add_space(12.0);
                     ui.label(mono(listen_addr.clone(), 14.0));
                     ui.add(
@@ -1138,7 +1570,7 @@ impl AnalyzerApp {
                     );
                     ui.add_space(14.0);
                     let width = ui.available_width();
-                    if widgets::button_ex(ui, Tone::Primary, None, "Done", true, width).clicked() {
+                    if widgets::button_ex(ui, Tone::Primary, None, tr("Done"), true, width).clicked() {
                         close = true;
                     }
                 });
@@ -1310,6 +1742,22 @@ pub fn detect_local_ip(listen_port: u16) -> String {
     }
 
     format!("unknown:{listen_port}")
+}
+
+/// Where iPads reach the stream: [`detect_local_ip`] when it listens on
+/// every network, else the chosen network's address. "unknown" while that
+/// network isn't connected.
+pub fn listen_address(choice: &crate::network::ListenOn, listen_port: u16) -> String {
+    shown_address(crate::network::listen_ip_now(choice), listen_port)
+}
+
+/// What the Address row shows for a stream listening on `ip`.
+pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
+    match ip {
+        ip if ip.is_unspecified() => detect_local_ip(listen_port),
+        ip if ip.is_loopback() => format!("unknown:{listen_port}"),
+        ip => format!("{ip}:{listen_port}"),
+    }
 }
 
 /// Launch the GUI window. Blocks the calling thread.

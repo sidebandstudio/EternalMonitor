@@ -203,6 +203,11 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(9876, forKey: "lastPort")
         let (manager, link) = try await connectOverCable(timing: fast)
         defer { link.stop(); manager.cancel() }
+        // Every Wi-Fi attempt's lookup fails at once. A real lookup of an
+        // .invalid name raced each attempt's 0.4 s timeout: on CI its answer
+        // came too late, the attempts ended as plain timeouts, and the
+        // cable advice rightly stayed.
+        manager.makeUDPLink = { _ in UnresolvableLink() }
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
         try await waitForFallbackToGiveUp(manager)
@@ -289,6 +294,9 @@ final class USBLinkFailureTests: XCTestCase {
             reconnectBackoffSeconds: { _ in 0.05 })
         let (manager, link) = try await failCableIntoFallback(to: wifi, timing: timing)
         defer { link.stop(); manager.cancel() }
+        // The user's attempt has to stream after the PC's late answer, so it
+        // gets a timeout a loaded machine can't run out.
+        manager.timing.connectTimeoutSeconds = 60
         manager.connect(host: "127.0.0.1", port: other.port)
         // The replaced cycle would wake about 0.5 s from now.
         let accepted = await Task.detached { Thread.sleep(forTimeInterval: 1); return other.acceptSession() }.value
@@ -594,8 +602,10 @@ final class USBLinkFailureTests: XCTestCase {
     // MARK: Answers from the PC during the fallback. Busy and a restart pass;
     // the cycle keeps retrying.
 
-    /// Long enough to answer the handshake and stream within one attempt.
-    private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1,
+    /// Long enough to answer the handshake and stream within one attempt on
+    /// a loaded machine, and short enough that the cycle soon moves on from
+    /// an attempt the PC ended: it waits out each attempt's window.
+    private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 5, reconnectGraceSeconds: 0.1,
         reconnectBackoffSeconds: { _ in 0.05 })
 
     private func finishConnecting(_ manager: ConnectionManager, to host: FakeUDPHost) async throws {
@@ -655,4 +665,25 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
         try await finishConnecting(manager, to: wifi)
     }
+}
+
+/// A Wi-Fi link whose lookup fails at once, as a host name that doesn't
+/// resolve does, without asking DNS.
+private final class UnresolvableLink: MediaLink {
+    let datagrams = MediaDatagrams()
+    let controlQueue = DispatchQueue(label: "test.unresolvable")
+    var onConnectionEstablished: (() -> Void)?
+    var onError: ((LinkError) -> Void)?
+    var onListenerReady: ((UInt16) -> Void)?
+    var onClosed: (() -> Void)?
+
+    @discardableResult func start(host: String) -> Bool {
+        controlQueue.async { [weak self] in
+            self?.onError?(LinkError(.resolve, "Cannot resolve \(host)"))
+        }
+        return true
+    }
+
+    func send(_ data: Data) {}
+    func stop() {}
 }

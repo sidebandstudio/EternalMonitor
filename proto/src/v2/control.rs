@@ -46,6 +46,10 @@ pub const HOSTCAP_USB: u16 = 1 << 2;
 pub const HOSTCAP_KEYBOARD: u16 = 1 << 3;
 /// Native Windows pen injection, including input_ver 2 tilt and hover.
 pub const HOSTCAP_PEN: u16 = 1 << 4;
+/// Media `frame_seq` counts the access units sent in a stream epoch without
+/// gaps, so a forward gap is a frame lost in transit. Without it, numbers
+/// may skip frames that were never sent. Older iPads ignore the bit.
+pub const HOSTCAP_CONTIGUOUS_FRAME_SEQ: u16 = 1 << 5;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;

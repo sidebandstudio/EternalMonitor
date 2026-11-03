@@ -21,7 +21,7 @@ impl AnalyzerApp {
         let copied = self.recently_copied(Copied::Logs);
         page_header(
             ui,
-            "Performance",
+            crate::i18n::tr("Performance"),
             "Live measurements from capture, encoding and the network on this PC.",
             |ui| {
                 let label = if copied { "Copied" } else { "Copy logs" };
@@ -189,8 +189,10 @@ pub(super) fn page_header(ui: &mut Ui, title: &str, subtitle: &str, actions: imp
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(super::theme::title(title));
-                ui.label(muted(subtitle));
+                let response = ui.label(super::theme::title(title));
+                super::widgets::automation_id(&response, title);
+                let response = ui.label(muted(subtitle));
+                super::widgets::automation_id(&response, subtitle);
             });
             ui.with_layout(Layout::right_to_left(Align::Center), actions);
         },

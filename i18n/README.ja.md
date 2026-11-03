@@ -78,7 +78,7 @@ EternalMonitor が役に立ったら、スターを付けると他の人が見�
 
 v0.3.3 のリリースチェックは Windows、macOS、iPad シミュレーターで合格しました。[docs/hardware-verification.md](../docs/hardware-verification.md) には v0.3.0 からの実際の PC と iPad での検証結果を記録しています。
 
-両アプリは問題を発見し修正するため、デバイスの詳細、アプリのエラー、配信統計などの診断情報を共有します。PC と iPad の名前、オーディオデバイス名、ネットワークアドレスも含まれます。画面の内容、音声、ペアリングの認証情報は含まれません。共有は設定で無効にできます。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)には送信内容と保存期間が詳しく記載されています。iPad では設定 > サポート > 診断を開き、レポートをコピーまたは書き出せます。
+Windows と iPad の診断情報には、デバイスの詳細、アプリのエラー、配信の統計が含まれます。レポートにはグラフィックカードとディスプレイの名前、ネットワークアドレスが含まれますが、画面の内容、音声、ペアリングの認証情報は含まれません。0.3.4 から、Windows の送信データから PC の名前、ユーザー名、ユーザーフォルダー、iPad の名前、オーディオデバイス名が取り除かれ、各オーディオデバイスの種類だけが残ります。iPad の送信データからは PC の名前が取り除かれます。自動共有は **設定** (Settings) で無効にできます。診断情報は最大 30 日間保存され、それより早く削除される場合もあります。削除済みまたは期限切れの診断情報は、日次バックアップにさらに最大 7 日間残る場合があります。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)を参照してください。iPad では **設定** (Settings) > **サポート** (Support) > **診断** (Diagnostics) を開き、レポートをコピーまたは書き出せます。
 
 ## 仕組み
 
@@ -166,7 +166,7 @@ scripts/soak.sh 1800              # 30-minute frame-rate and memory check
 | `ETERNAL_ENCODER` | エンコーダーを指定します（`h264_nvenc`、`h264_amf`、`h264_qsv`、`libx264`） |
 | `ETERNAL_HEVC` | `1` または `0` で HEVC の設定を上書きします |
 | `ETERNAL_FPS` | ホストのフレームレートを変更します。iPad の設定が上限になります |
-| `ETERNAL_INPUT` | エンコーダー入力: `yuv420`（既定）、`auto`、`bgra` |
+| `ETERNAL_INPUT` | エンコーダー入力: `automatic`（既定。NVIDIA は BGRA、その他は YUV420）、`yuv420`、`auto`、`bgra` |
 | `ETERNAL_MAX_DGRAM` | メディアデータグラムのサイズ、576〜1400 バイト |
 | `ETERNAL_CAPTURE` | `synthetic` で DXGI の代わりに生成されたテストパターンを使用します |
 | `ETERNAL_AUDIO` | `synthetic` で再現可能な音声テストソースを選択します |

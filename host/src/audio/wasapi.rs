@@ -140,7 +140,13 @@ impl Loopback {
         unsafe {
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
             let id = device_id(&device)?;
-            let name = device_name(&device).unwrap_or_else(|_| "Default PC output".into());
+            let name = match device_name(&device) {
+                Ok(name) => {
+                    crate::telemetry::note_audio_device(&name);
+                    name
+                }
+                Err(_) => "Default PC output".into(),
+            };
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let mix = MixFormat(client.GetMixFormat()?);
             let (format, encoding) = parse_format(&mix)?;

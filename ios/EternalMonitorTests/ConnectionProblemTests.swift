@@ -195,7 +195,7 @@ final class ConnectionProblemTests: XCTestCase {
         // A classified failure in the last attempt is more useful than
         // "Couldn't reconnect"; a PC that just never answered is not.
         for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture,
-                                             .pcBusy, .pcEndedSession] {
+                                             .pcBusy, .pcEndedSession, .pcEndedSessionOnError] {
             XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: specific), specific)
         }
         for generic: ConnectionProblem? in [nil, .noReply(usb: false), .reconnecting(attempt: 6, of: 6), .couldNotConnect] {
@@ -208,7 +208,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy, .pairingCodeAsAddress, .routerAddress,
+            .pcEndedSessionOnError, .pcBusy, .pairingCodeAsAddress, .routerAddress,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
         ]
         for problem in all {
@@ -219,15 +219,46 @@ final class ConnectionProblemTests: XCTestCase {
             }
         }
         XCTAssertEqual(ConnectionProblem.noReply(usb: false).actions, [.retry])
-        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings])
+        XCTAssertEqual(ConnectionProblem.localNetworkBlocked.actions, [.openSettings, .retry])
         XCTAssertEqual(ConnectionProblem.lost(.cableUnplugged).actions, [])
         XCTAssertTrue(ConnectionProblem.noReply(usb: false).detail.contains("Firewall"))
         XCTAssertTrue(ConnectionProblem.noReply(usb: true).detail.contains("Apple Devices"))
     }
 
+    /// Each goodbye the PC can send leaves its own card. An error (the PC
+    /// stopped hearing this iPad, as after a Wi-Fi stall) must not say that
+    /// someone stopped the stream; the other reasons keep saying so.
+    func testEachGoodbyeFromThePCMapsToItsProblemAndText() {
+        let reasons = (0...UInt8.max).compactMap(ByeReason.init(rawValue:))
+        XCTAssertEqual(reasons.count, 5, "a new goodbye reason needs its card here")
+        let userAction = "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. "
+            + "Try again when the PC says Ready for your iPad."
+        let expected: [ByeReason: (ConnectionProblem, String)] = [
+            .userDisconnect: (.pcEndedSession, userAction),
+            .superseded: (.pcEndedSession, userAction),
+            .appBackground: (.pcEndedSession, userAction),
+            .error: (.pcEndedSessionOnError,
+                     "The connection to your PC dropped, or the PC ran into a problem. Tap Try again to reconnect."),
+            .hostShuttingDown: (.pcUpdating(.reconnecting),
+                                "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."),
+        ]
+        for reason in reasons {
+            let problem = ConnectionProblem.pcGoodbye(reason)
+            XCTAssertEqual(problem, expected[reason]?.0, "\(reason)")
+            XCTAssertEqual(problem.detail, expected[reason]?.1, "\(reason)")
+        }
+        let error = ConnectionProblem.pcEndedSessionOnError
+        XCTAssertEqual(error.title, ConnectionProblem.pcEndedSession.title, "one title, as SETUP.md lists it")
+        XCTAssertFalse(error.detail.contains("Stop") || error.detail.contains("setting"), error.detail)
+        XCTAssertEqual(error.actions, [.retry])
+        XCTAssertTrue(error.canReport)
+        XCTAssertEqual(error.withoutReconnecting, error)
+        XCTAssertEqual(error.afterTheCycle, error)
+    }
+
     func testAnUpdateStaysTheReasonWhileThePCRestarts() {
         // Busy during the handoff and silence while Setup runs are the update.
-        for attempt: ConnectionProblem in [.pcBusy, .noReply(usb: false), .pcEndedSession] {
+        for attempt: ConnectionProblem in [.pcBusy, .noReply(usb: false), .pcEndedSession, .pcEndedSessionOnError] {
             XCTAssertEqual(ConnectionProblem.kept(.pcUpdating(.reconnecting), after: attempt), .pcUpdating(.reconnecting), "\(attempt)")
         }
         // Something the user must fix replaces it.
@@ -268,5 +299,19 @@ final class ConnectionProblemTests: XCTestCase {
         for status in ["USB: off", "USB: waiting for a cable", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
             XCTAssertFalse(USBStatusText.describe(status).hasPrefix("USB:"), status)
         }
+    }
+
+    /// A HELLO no one answered is a warning (a PC off, asleep or elsewhere)
+    /// unless that PC answered at this address earlier in this launch.
+    func testAnUnansweredHelloIsAnErrorOnlyWhereAPCAnsweredBefore() {
+        let unanswered = ConnectionDebugState(host: "192.168.1.20", port: 9876, listenerReadyPort: 9877, helloAttempts: 4)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .warning)
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: false, answeredHereBefore: true), .error)
+        // Every other timeout stays an error.
+        XCTAssertEqual(unanswered.timeoutLevel(handshakeDone: true, answeredHereBefore: false), .error)
+        XCTAssertEqual(ConnectionDebugState(listenerReadyPort: nil).timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
+        var answered = unanswered
+        answered.datagramsReceived = 3
+        XCTAssertEqual(answered.timeoutLevel(handshakeDone: false, answeredHereBefore: false), .error)
     }
 }

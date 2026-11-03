@@ -59,4 +59,27 @@ final class FramedLinkTests: XCTestCase {
         }
         XCTAssertEqual(actual, expected, "Stop must deliver all queued controls before the final BYE")
     }
+
+    /// A failed connection is one support-log line: the link's own while it
+    /// waits for its preamble, or none once a connection took the link and
+    /// logs it with its state.
+    func testAFailedConnectionIsLoggedOnce() {
+        for owned in [false, true] {
+            var lines: [[String]] = []
+            var errors: [LinkError.Kind] = []
+            let link = FramedLink(connection: NWConnection(host: "127.0.0.1", port: 9, using: .tcp),
+                                  record: { lines.append([$0, $1, $2]) })
+            if owned { link.onError = { errors.append($0.kind) } }
+            var closed = 0
+            link.onClosed = { closed += 1 }
+            link.controlQueue.sync { link.handle(.failed(.posix(.ECONNRESET))) }
+            XCTAssertEqual(lines.count, owned ? 0 : 1, "\(lines)")
+            if let line = lines.first {
+                XCTAssertEqual(Array(line.prefix(2)), ["error", "usb"])
+                XCTAssertTrue(line[2].hasPrefix("USB connection failed: ") && line[2].contains("Connection reset by peer"), line[2])
+            }
+            XCTAssertEqual(errors, owned ? [.connectionFailed] : [])
+            XCTAssertEqual(closed, 1)
+        }
+    }
 }

@@ -379,7 +379,12 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     ack.host_caps = HOSTCAP_NACK;
     vectors.push((
         "hello_ack_paired",
-        encode_control(0, 3, &ControlMessage::HelloAck(ack)),
+        encode_control(0, 3, &ControlMessage::HelloAck(ack.clone())),
+    ));
+    ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ;
+    vectors.push((
+        "hello_ack_contiguous_seq",
+        encode_control(0, 5, &ControlMessage::HelloAck(ack)),
     ));
     let (_, ControlMessage::Hello2(mut hello)) = parse_control(
         &vectors
@@ -533,4 +538,21 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
     assert_eq!(PacketType::Nack as u8, 0x19);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
+}
+
+/// A host that numbers frames contiguously says so in HELLO_ACK; one that
+/// does not leaves the bit clear, so an iPad reads its numbers as before.
+#[test]
+fn contiguous_frame_seq_capability_round_trips() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    let caps = |name: &str| match parse_control(&vectors[name]).unwrap().1 {
+        ControlMessage::HelloAck(ack) => ack.host_caps,
+        other => panic!("{name}: {other:?}"),
+    };
+    assert_eq!(
+        caps("hello_ack_contiguous_seq"),
+        HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ
+    );
+    assert_eq!(caps("hello_ack_paired") & HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0);
+    assert_eq!(HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0x0020);
 }

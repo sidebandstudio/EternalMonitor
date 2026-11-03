@@ -28,6 +28,9 @@ pub struct PipelineStats {
     // Encoder
     pub encode_fps: f64,
     pub encode_time_us: u128,
+    /// The last frame's conversion from capture's BGRA to the encoder's
+    /// input (or its copy into a BGRA frame), before `encode_time_us` starts.
+    pub convert_time_us: u128,
     pub encode_frame_count: u64,
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
@@ -36,6 +39,10 @@ pub struct PipelineStats {
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
+    /// NVENC refused to open because the NVIDIA driver is older than the
+    /// linked FFmpeg's NVENC needs. The fallback notice then says to update
+    /// it.
+    pub nvidia_driver_outdated: bool,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -92,11 +99,13 @@ impl PipelineStats {
 
             encode_fps: 0.0,
             encode_time_us: 0,
+            convert_time_us: 0,
             encode_frame_count: 0,
             nal_bytes_last: 0,
             bitrate_bps: 0,
             codec_name: String::new(),
             using_software_fallback: false,
+            nvidia_driver_outdated: false,
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -137,6 +146,7 @@ impl PipelineStats {
         self.bitrate_bps = previous.bitrate_bps;
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
+        self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }
@@ -200,6 +210,10 @@ impl PipelineStats {
         self.capture_resolution = (width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
+    }
+
+    pub fn record_convert(&mut self, convert_us: u128) {
+        self.convert_time_us = convert_us;
     }
 
     pub fn record_encode(&mut self, encode_us: u128, nal_bytes: usize, bitrate_bps: u32) {

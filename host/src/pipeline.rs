@@ -6,7 +6,7 @@
 use std::sync::mpsc;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
@@ -108,13 +108,51 @@ pub async fn run_pipeline_supervised(
             .await
         {
             Ok(()) => StageOutcome::Completed,
-            Err(e) => {
-                error!(error = %e, "Transport sender exited with error");
-                StageOutcome::Failed(e.to_string())
-            }
+            Err(e) => transport_failure(&*e),
         };
     reporter.stage_exited(Stage::Transport, transport_outcome);
 
     stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
     info!(generation, "Pipeline ended");
+}
+
+/// A transport that could not bind the stream port waits for it (see
+/// `startup::port`); anything else is a failure.
+fn transport_failure(error: &(dyn std::error::Error + 'static)) -> StageOutcome {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(crate::startup::port::is_held)
+    {
+        warn!(%error, "The stream port was taken before the stream could bind it");
+        return StageOutcome::PortInUse;
+    }
+    error!(error = %error, "Transport sender exited with error");
+    StageOutcome::Failed(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream's bind error, as `start_sender` returns it.
+    #[test]
+    fn a_port_in_use_waits_and_other_transport_errors_fail() {
+        let in_use: Box<dyn std::error::Error + Send + Sync> =
+            std::io::Error::from(std::io::ErrorKind::AddrInUse).into();
+        assert_eq!(transport_failure(&*in_use), StageOutcome::PortInUse);
+        // WSAEACCES: a program holds it exclusively, or Windows reserved it.
+        let exclusive: Box<dyn std::error::Error + Send + Sync> =
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        let waits = cfg!(windows);
+        assert_eq!(
+            transport_failure(&*exclusive) == StageOutcome::PortInUse,
+            waits
+        );
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            std::io::Error::from(std::io::ErrorKind::AddrNotAvailable).into();
+        assert!(matches!(
+            transport_failure(&*other),
+            StageOutcome::Failed(_)
+        ));
+    }
 }

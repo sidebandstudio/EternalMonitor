@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "windows": {
+    "version": "0.3.4",
+    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe",
+    "sha256": "3dfcd9ab8106589d5fb01addd169b060e418f9adc9ddb229fea1b3ec6aaf122b",
+    "recommended": true,
+    "note": "Fixes Second screen not starting on some PCs.",
+    "rollout": { "start": "2026-11-02T00:00:00Z", "days": 7 },
+    "config": {
+      "schema": 1,
+      "attach_timeout_s": 45,
+      "second_screen_rules": [
+        {
+          "gpus": ["intel", "nvidia"],
+          "gpu_driver": { "gpu": "nvidia", "min": "32.0.15.6000", "max": "32.0.15.6099" },
+          "display_driver": { "min": "25.7.0", "max": "25.7.99" }
+        },
+        {
+          "gpus": ["amd"],
+          "gpu_driver": { "gpu": "amd", "min": "31.0.21001.45000", "max": "31.0.21001.45099" },
+          "windows": { "min": "26100.0", "max": "26100.2999" }
+        }
+      ],
+      "renderer_rules": [
+        {
+          "vendor": "nvidia",
+          "driver": { "min": "32.0.15.8000", "max": "32.0.15.8099" },
+          "backend": "dx12"
+        }
+      ]
+    }
+  },
+  "ipad": {
+    "version": "0.3.4",
+    "build": 320,
+    "testflight": "https://testflight.apple.com/join/ppc9QfXc",
+    "note": "Connects faster to PCs that start their second screen slowly.",
+    "rollout": { "start": "2026-11-02T00:00:00Z", "days": 3 },
+    "config": { "schema": 1, "first_frame_timeout_s": 12 }
+  }
+}

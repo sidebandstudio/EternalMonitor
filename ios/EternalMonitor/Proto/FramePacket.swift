@@ -12,4 +12,6 @@ struct FramePacket {
     let width: UInt32
     let height: UInt32
     let isKeyframe: Bool
+    /// The host pipeline run the frame belongs to; another one is a new encoder.
+    var streamEpoch: UInt32 = 0
 }

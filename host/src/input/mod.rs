@@ -392,6 +392,81 @@ pub mod recorder {
     }
 }
 
+/// Off Windows, a test can give every relay on its thread a native pen
+/// device that accepts every frame on the real clock, so the transport loop
+/// spaces and flushes pen frames as it does on Windows.
+#[cfg(all(test, not(windows)))]
+pub(crate) mod native_pen {
+    use super::pen_contact::{Outcome, PointerKind};
+    use super::pen_device::{PenApi, PenDevice};
+    use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    pub(crate) const SCREEN: VirtualScreen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    };
+
+    /// Frames Windows took, with when.
+    pub(crate) type Taken = Rc<RefCell<Vec<(PenSample, Instant)>>>;
+
+    #[derive(Debug)]
+    pub(crate) struct Windows(Taken);
+
+    impl PenApi for Windows {
+        type Handle = ();
+        type Error = &'static str;
+        fn create(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn destroy(&mut self, _: ()) {}
+        fn screen(&self) -> VirtualScreen {
+            SCREEN
+        }
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn inject(
+            &mut self,
+            _: (),
+            frame: PenSample,
+            _: PointerKind,
+            _: VirtualScreen,
+            _: Option<CaptureGeometry>,
+        ) -> Outcome {
+            self.0.borrow_mut().push((frame, Instant::now()));
+            Outcome::Injected
+        }
+        fn send_mouse(&mut self, inputs: &[Injection]) -> usize {
+            inputs.len()
+        }
+        fn owe_release(&mut self, _: (i32, i32)) {}
+        fn take_owed_release(&mut self) -> Option<(i32, i32)> {
+            None
+        }
+    }
+
+    thread_local! {
+        static DEVICE: RefCell<Option<PenDevice<Windows>>> = const { RefCell::new(None) };
+    }
+
+    /// Give this thread's relays a device, and return what Windows takes.
+    pub(crate) fn install() -> Taken {
+        let taken = Taken::default();
+        DEVICE.set(Some(PenDevice::new(Windows(Rc::clone(&taken)))));
+        taken
+    }
+
+    /// The installed device, if any.
+    pub(crate) fn with<R>(f: impl FnOnce(&mut PenDevice<Windows>) -> R) -> Option<R> {
+        DEVICE.with_borrow_mut(|device| device.as_mut().map(f))
+    }
+}
+
 fn log_injections(injections: &[Injection]) {
     if std::env::var("ETERNAL_INPUT_RECORDER_LOG").is_ok_and(|value| value == "1") {
         for injection in injections {
@@ -407,6 +482,7 @@ fn log_injections(injections: &[Injection]) {
 pub struct InputRelay {
     session: Option<(u32, EventDeduper)>,
     held: HeldInputs,
+    dropped: DroppedPresses,
     pen_sequence: Option<u32>,
     last_pen_input: Option<std::time::Instant>,
     /// The capture rect the last batch was mapped onto.
@@ -424,7 +500,112 @@ struct HeldInputs {
     pen: Option<PenSample>,
 }
 
+/// Presses dropped because they arrived late, whose releases are dropped
+/// too: the PC never saw them go down.
+#[derive(Debug, Default)]
+struct DroppedPresses {
+    keys: std::collections::BTreeSet<(u16, bool)>,
+    buttons: u8,
+    /// A Pencil stroke whose start was dropped, to its end.
+    pen: bool,
+}
+
+/// The [`HeldInputs`] bit of a mouse button injection, and whether it is
+/// the press.
+fn button_edge(injection: &Injection) -> Option<(u8, bool)> {
+    Some(match injection {
+        Injection::LeftDown { .. } => (1, true),
+        Injection::LeftUp { .. } => (1, false),
+        Injection::RightDown { .. } => (2, true),
+        Injection::RightUp { .. } => (2, false),
+        Injection::MiddleDown { .. } => (4, true),
+        Injection::MiddleUp { .. } => (4, false),
+        _ => return None,
+    })
+}
+
 impl HeldInputs {
+    /// Keeps of `injections` what may land: all of fresh input but the
+    /// release of a press dropped before, and of late input only what
+    /// releases a key, button or Pencil contact the PC holds, where it was
+    /// last seen. Nothing is left held that the iPad has released.
+    fn drop_late(&self, dropped: &mut DroppedPresses, injections: &mut Vec<Injection>, late: bool) {
+        let pen_contact = self
+            .pen
+            .is_some_and(|pen| matches!(pen.phase, PenPhase::Down | PenPhase::Move));
+        injections.retain_mut(|injection| {
+            if let Some((bit, press)) = button_edge(injection) {
+                let held = self.buttons & bit != 0;
+                if press {
+                    if late && !held {
+                        dropped.buttons |= bit;
+                    } else if !late {
+                        dropped.buttons &= !bit;
+                    }
+                    return !late;
+                }
+                let pressed_late = dropped.buttons & bit != 0;
+                dropped.buttons &= !bit;
+                if held && late {
+                    let (x, y) = self.pointer;
+                    match injection {
+                        Injection::LeftUp { x: at_x, y: at_y }
+                        | Injection::RightUp { x: at_x, y: at_y }
+                        | Injection::MiddleUp { x: at_x, y: at_y } => (*at_x, *at_y) = (x, y),
+                        _ => {}
+                    }
+                }
+                return held || (!late && !pressed_late);
+            }
+            match injection {
+                Injection::KeyDown { scan, extended } => {
+                    let key = (*scan, *extended);
+                    if !late {
+                        dropped.keys.remove(&key);
+                    } else if !self.keys.contains(&key) {
+                        dropped.keys.insert(key);
+                    }
+                    !late
+                }
+                Injection::KeyUp { scan, extended } => {
+                    let key = (*scan, *extended);
+                    let pressed_late = dropped.keys.remove(&key);
+                    self.keys.contains(&key) || (!late && !pressed_late)
+                }
+                Injection::Pen(sample) => match sample.phase {
+                    PenPhase::Down => {
+                        if !late {
+                            dropped.pen = false;
+                        } else if !pen_contact {
+                            dropped.pen = true;
+                        }
+                        !late
+                    }
+                    PenPhase::Move => !late && !(dropped.pen && !pen_contact),
+                    PenPhase::Hover => {
+                        if !late {
+                            dropped.pen = false;
+                        }
+                        !late
+                    }
+                    PenPhase::Up | PenPhase::Cancel | PenPhase::Leave => {
+                        let stroke_dropped = std::mem::take(&mut dropped.pen);
+                        match self.pen {
+                            Some(held) if late => {
+                                (sample.x, sample.y) = (held.x, held.y);
+                                (sample.x_norm, sample.y_norm) = (held.x_norm, held.y_norm);
+                                true
+                            }
+                            Some(_) => true,
+                            None => !late && !stroke_dropped,
+                        }
+                    }
+                },
+                _ => !late,
+            }
+        });
+    }
+
     fn record(&mut self, injections: &[Injection]) {
         for injection in injections {
             match *injection {
@@ -504,9 +685,31 @@ impl InputRelay {
         {
             self.pen_device.available() || self.pen_device.mouse_waiting()
         }
-        #[cfg(not(windows))]
+        #[cfg(all(test, not(windows)))]
+        {
+            native_pen::with(|device| device.available() || device.mouse_waiting()).unwrap_or(false)
+        }
+        #[cfg(all(not(test), not(windows)))]
         {
             false
+        }
+    }
+
+    /// When the transport should call `keep_pen_alive` for a pen frame held
+    /// back to keep frames `FRAME_SPACING` apart, which a backlog of samples
+    /// needs. Waiting for it never blocks the transport.
+    pub fn pen_spaced_until(&self) -> Option<std::time::Instant> {
+        #[cfg(windows)]
+        {
+            self.pen_device.spaced_until()
+        }
+        #[cfg(all(test, not(windows)))]
+        {
+            native_pen::with(|device| device.spaced_until()).flatten()
+        }
+        #[cfg(all(not(test), not(windows)))]
+        {
+            None
         }
     }
 
@@ -547,6 +750,7 @@ impl InputRelay {
                 .collect()
         };
         self.inject(&releases);
+        self.dropped = DroppedPresses::default();
         self.session = None;
         self.pen_sequence = None;
         self.last_pen_input = None;
@@ -591,11 +795,14 @@ impl InputRelay {
     /// Windows expires stationary synthetic contacts unless they are refreshed.
     /// Real samples always win; never keep a released or disconnected tip down.
     /// `output` is the current capture rect: a held contact follows it if the
-    /// display moved or changed mode since the Pencil last moved.
+    /// display moved or changed mode since the Pencil last moved. Also sends
+    /// frames held back for their spacing.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
         self.pen_device
             .flush(output.or(self.output), std::time::Instant::now());
+        #[cfg(all(test, not(windows)))]
+        native_pen::with(|device| device.flush(output.or(self.output), std::time::Instant::now()));
         let Some(output) = output else {
             return;
         };
@@ -633,6 +840,23 @@ impl InputRelay {
 
     /// Dedupe, map, and inject one session-validated event.
     pub fn relay(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
+        self.relay_event(session_id, event, output, false);
+    }
+
+    /// [`Self::relay`] for an event that arrived late (see
+    /// `transport::session::INPUT_LATE`): only a release of what the PC holds
+    /// lands.
+    pub fn relay_late(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
+        self.relay_event(session_id, event, output, true);
+    }
+
+    fn relay_event(
+        &mut self,
+        session_id: u32,
+        event: &InputEvent,
+        output: CaptureGeometry,
+        late: bool,
+    ) {
         match &self.session {
             Some((id, _)) if *id == session_id => {}
             _ => {
@@ -662,6 +886,12 @@ impl InputRelay {
         self.log_mapping(session_id, output, screen);
         self.output = Some(output);
         let mut injections = resolve(event, output, screen);
+        let resolved = injections.len();
+        self.held
+            .drop_late(&mut self.dropped, &mut injections, late);
+        if resolved > 0 && injections.is_empty() {
+            return;
+        }
         if let Some(Injection::Pen(sample)) = injections.first().copied() {
             let held = self
                 .held
@@ -917,6 +1147,114 @@ mod tests {
             ),
             (-2560, -200)
         );
+    }
+
+    /// Input that arrived late never presses anything, and the release of
+    /// a press it dropped is dropped too, fresh or late; a late release of
+    /// what the PC holds still lands, where the PC last saw it. Keys, the
+    /// mouse and the Pencil alike, and nothing is left held.
+    #[cfg(not(windows))]
+    #[test]
+    fn late_input_never_leaves_a_press_held() {
+        let mut relay = InputRelay::default();
+        let mut next_id = 0;
+        let mut send = |relay: &mut InputRelay, mut event: InputEvent, late: bool| {
+            next_id += 1;
+            event.event_id = next_id;
+            if late {
+                relay.relay_late(7, &event, OUTPUT);
+            } else {
+                relay.relay(7, &event, OUTPUT);
+            }
+            recorder::take()
+        };
+        let key = |keycode, phase| InputEvent {
+            keycode,
+            ..event(KIND_KEY, phase, 0, 0)
+        };
+        let a = Injection::KeyDown {
+            scan: hid_to_scancode(0x04).unwrap().0,
+            extended: false,
+        };
+        let Injection::KeyDown { scan: a_scan, .. } = a else {
+            unreachable!()
+        };
+
+        // A late press, then its release fresh or late: nothing lands.
+        for late_release in [false, true] {
+            assert!(send(&mut relay, key(0x04, PHASE_BEGAN), true).is_empty());
+            assert!(send(&mut relay, key(0x04, PHASE_ENDED), late_release).is_empty());
+        }
+        // A fresh press lands, and its late release releases it.
+        assert_eq!(send(&mut relay, key(0x04, PHASE_BEGAN), false), [a]);
+        assert_eq!(
+            send(&mut relay, key(0x04, PHASE_ENDED), true),
+            [Injection::KeyUp {
+                scan: a_scan,
+                extended: false
+            }]
+        );
+        // A release with no press dropped lands as before.
+        assert_eq!(send(&mut relay, key(0x05, PHASE_ENDED), false).len(), 1);
+
+        // A late touch: no button goes down, a fresh drag only moves the
+        // pointer, and its fresh release lands nothing.
+        assert!(send(&mut relay, event(KIND_TOUCH, PHASE_BEGAN, 10, 10), true).is_empty());
+        let moved = send(&mut relay, event(KIND_TOUCH, PHASE_MOVED, 20, 20), false);
+        assert!(matches!(moved.as_slice(), [Injection::MoveAbs { .. }]));
+        let ended = send(&mut relay, event(KIND_TOUCH, PHASE_ENDED, 30, 30), false);
+        assert!(ended.iter().all(|i| button_edge(i).is_none()), "{ended:?}");
+        // A fresh press, then late moves and a late release far away: the
+        // button comes up where the PC last saw the pointer.
+        let pressed = send(&mut relay, event(KIND_TOUCH, PHASE_BEGAN, 100, 100), false);
+        let Some(&Injection::MoveAbs { x, y }) = pressed.first() else {
+            panic!("{pressed:?}")
+        };
+        assert!(send(
+            &mut relay,
+            event(KIND_TOUCH, PHASE_MOVED, 60_000, 60_000),
+            true
+        )
+        .is_empty());
+        assert_eq!(
+            send(
+                &mut relay,
+                event(KIND_TOUCH, PHASE_ENDED, 60_000, 60_000),
+                true
+            ),
+            [Injection::LeftUp { x, y }]
+        );
+
+        // A Pencil stroke that started late is dropped to its end.
+        let pen = |phase, x| InputEvent {
+            input_ver: 2,
+            pressure_x1000: 500,
+            ..event(KIND_PENCIL, phase, x, 100)
+        };
+        assert!(send(&mut relay, pen(PHASE_BEGAN, 100), true).is_empty());
+        for x in [200, 300] {
+            assert!(send(&mut relay, pen(PHASE_MOVED, x), false).is_empty());
+        }
+        assert!(send(&mut relay, pen(PHASE_ENDED, 300), false).is_empty());
+        // A fresh stroke lands; late samples don't, and its late end lifts
+        // the tip where it last was.
+        let down = send(&mut relay, pen(PHASE_BEGAN, 400), false);
+        let [Injection::Pen(down)] = down.as_slice() else {
+            panic!("{down:?}")
+        };
+        assert!(send(&mut relay, pen(PHASE_MOVED, 900), true).is_empty());
+        let up = send(&mut relay, pen(PHASE_ENDED, 900), true);
+        let [Injection::Pen(up)] = up.as_slice() else {
+            panic!("{up:?}")
+        };
+        assert_eq!(
+            (up.phase, up.x, up.y, up.x_norm),
+            (PenPhase::Up, down.x, down.y, down.x_norm)
+        );
+
+        // Nothing is held: dropping the relay releases nothing.
+        drop(relay);
+        assert!(recorder::take().is_empty());
     }
 
     #[cfg(not(windows))]
@@ -1545,9 +1883,23 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    thread_local! {
+        /// The time for every `RecordingTarget`, so frames stay spaced
+        /// across batches.
+        static CLOCK: std::cell::Cell<std::time::Instant> =
+            std::cell::Cell::new(std::time::Instant::now());
+    }
+
+    #[cfg(not(windows))]
     impl pen_contact::PenTarget for RecordingTarget {
         fn screen(&self) -> VirtualScreen {
             self.screen
+        }
+
+        /// Frames here are never close enough to be held back for their
+        /// spacing: each takes `FRAME_SPACING`.
+        fn now(&self) -> std::time::Instant {
+            CLOCK.get()
         }
 
         fn inject(
@@ -1555,6 +1907,7 @@ mod tests {
             frame: PenSample,
             _: pen_contact::PointerKind,
         ) -> pen_contact::Outcome {
+            CLOCK.set(CLOCK.get() + pen_contact::FRAME_SPACING);
             self.frames
                 .push(pen_contact::PointerFrame::new(frame, self.screen));
             self.outcome

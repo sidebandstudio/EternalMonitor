@@ -25,18 +25,30 @@ Capture, encode and audio have dedicated threads. Capture publishes the latest
 raw frame; a slow encoder skips obsolete raw frames. The encoder copies into its
 own input buffer and releases capture's reference for reuse. Encoded access
 units use a bounded channel: silently dropping an arbitrary encoded P-frame
-would corrupt the GOP. The USB sender instead drops whole queued access units
-when necessary and requests an IDR, keeping its queue bounded.
+would corrupt the GOP. The USB sender instead drops whole access units, the
+newest first, and requests an IDR with backoff, keeping its queue bounded. It
+finishes the frame it is writing, and a keyframe replaces queued frames only
+when it cannot fit behind them.
 
 DXGI captures the selected desktop rectangle and composites the cursor. Synthetic
 capture supplies a deterministic moving pattern and an encoded frame counter on
-macOS and in tests. YUV420P is the encoder-input default. The optional Auto/BGRA
-path checks the selected codec's advertised formats; software x264 stays YUV.
-Windows converts with swscale; the macOS development path uses a tested
-Accelerate conversion with a swscale fallback.
+macOS and in tests. On fresh settings NVIDIA's encoders take BGRA and convert
+it on the graphics card, and every other encoder takes YUV420P (NV12 on Quick
+Sync); settings from earlier versions keep the input they saved.
+BGRA and Auto check the selected codec's advertised formats; software x264
+stays YUV. Windows converts with swscale, which reads the capture buffer
+directly (capture pads it by FFmpeg's 64 bytes); the macOS development path uses a tested Accelerate conversion with a
+swscale fallback.
 
 The supervisor owns pipeline generations, exit reports, watchdogs, backoff and a
-restart-storm brake. The client session outlives an encoder/capture restart. A new
+restart-storm brake. Driver calls that can block for good (D3D11 device creation,
+DuplicateOutput, NVENC/AMF/QSV, libx265 and libopus opens, the VDD tasks, the graphics card
+read behind the second screen's decisions) run under limits in
+`stall.rs`: a call past its limit takes that call's error path, is logged once as
+`stall=<call>`, and its thread is abandoned; its late result is released there.
+The transport never waits for that graphics card read: it decides from a snapshot
+refreshed on its own thread, and a missing, stale or timed-out one counts as no evidence.
+The client session outlives an encoder/capture restart. A new
 stream epoch resets assembly and requests a fresh keyframe. The iPad keeps one
 VideoToolbox session per format, sniffs the bitstream codec, and renders NV12 with
 Metal using aspect-fit geometry.
@@ -64,13 +76,16 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 | PING / PONG | Min-RTT clock estimate for end-to-end latency |
 | INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
 | Audio | Sequenced Opus packets with discontinuity and capture timing |
-| BYE | User, background or shutdown teardown |
+| BYE | User, background or shutdown teardown; the host ending a silent session |
 
 One session owns the active link. Another device receives Busy; a reconnect from
 the same device supersedes its prior session. Duplicate accepted nonces replay
 the same ACK. All established-session traffic is session-id gated. Reports/input
-maintain liveness; expiry removes the client, and 10 s later its managed
-virtual display unless the iPad has come back.
+maintain liveness. After 3 s of silence a client that had a picture is held:
+its input is released and another device may connect, but the stream goes on.
+Anything from it resumes the session; at 10 s the host ends it with a BYE. A
+client that never had a picture ends at 3 s. The managed virtual display goes
+10 s after the silence reaches 3 s unless the iPad has come back.
 
 UDP carries video, audio and control on the same socket. The iPad's established
 Network.framework backend remains the default. A selectable BSD backend uses a
@@ -141,10 +156,12 @@ AVOption. Quiet periods use explicitly reset, compact Opus silence packets.
 Pairing is required by default. A random 128-bit host token authenticates known
 iPads; a six-digit code authorizes first contact and rotates after success. Five
 failed attempts per source IP in a minute trigger the cooldown; the tracking map
-is bounded. QR links include the token. The iPad stores learned credentials in
-Keychain, clears rejected stale tokens, and offers Forget paired hosts. USB trusts
-physical access. This is access control over an unencrypted local connection;
-video, audio, input and pairing credentials are not confidential on the network.
+is bounded. Ten wrong codes from all addresses in ten minutes pause code pairing
+and change the code. Only a new pairing's ACK carries the token. QR links include
+the token. The iPad stores learned credentials in Keychain, clears rejected stale
+tokens, and offers Forget paired hosts. USB trusts physical access. This is
+access control over an unencrypted local connection; video, audio, input and
+pairing credentials are not confidential on the network.
 
 Touch coordinates are normalized within the displayed video, excluding letterbox
 bars. The host maps them through the captured output rectangle onto the Windows
@@ -176,7 +193,11 @@ an opt-in Win mapping; iPadOS retains its reserved shortcuts.
 The installer registers SYSTEM VDD enable/disable tasks and grants ordinary
 Users read/execute permission. The host starts a virtual display only for a
 connected client, writes the requested mode first in VDD XML, and reports actual
-task failures. It also ships TCP/UDP firewall rules. Runtime upgrade, task-ACL and
+task failures. Setup and the host log the active display paths around every
+driver change; when a change leaves the PC without any real screen it had, they
+re-apply the saved layout once, else switch to "PC screen only" if the built-in
+panel was on (`display_guard.rs`, `display-guard.ps1`). It also ships a UDP
+firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
 mDNS advertises `_eternaldisplay._udp` with version/protocol/platform metadata,

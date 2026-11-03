@@ -13,6 +13,9 @@ struct UpdateManifest: Decodable, Equatable {
         var recommended: Bool? = nil
         /// One short sentence the popup shows under its message.
         var note: String? = nil
+        /// Spreads the banner and popup for this build over a few days.
+        /// Missing means everyone at once.
+        var rollout: RemoteConfig.Rollout? = nil
 
         var isRecommended: Bool { recommended ?? true }
     }
@@ -35,11 +38,18 @@ struct UpdateManifest: Decodable, Equatable {
     }
 
     /// A note the popup can show: one trimmed line, not empty and not too
-    /// long. Anything else is dropped rather than failing the check.
+    /// long, without control, format (U+200B and the like) or line and
+    /// paragraph separator characters, as the PC and check-versions.sh
+    /// refuse them. Anything else is dropped rather than failing the check.
     static func shortNote(_ note: String?) -> String? {
         guard let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty,
               note.count <= maxNoteLength,
-              !note.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+              !note.unicodeScalars.contains(where: { scalar in
+                  switch scalar.properties.generalCategory {
+                  case .control, .format, .lineSeparator, .paragraphSeparator: return true
+                  default: return false
+                  }
+              })
         else { return nil }
         return note
     }
@@ -47,7 +57,12 @@ struct UpdateManifest: Decodable, Equatable {
 
 extension UpdateManifest.IPad {
     private enum CodingKeys: String, CodingKey {
-        case version, build, testflight, recommended, note
+        case version, build, testflight, recommended, note, rollout
+    }
+
+    private struct RawRollout: Decodable {
+        let start: String
+        let days: Int
     }
 
     /// The optional fields are read leniently: a wrong type must not hide the update.
@@ -58,6 +73,8 @@ extension UpdateManifest.IPad {
         testflight = try container.decodeIfPresent(String.self, forKey: .testflight)
         recommended = (try? container.decodeIfPresent(Bool.self, forKey: .recommended)) ?? nil
         note = (try? container.decodeIfPresent(String.self, forKey: .note)) ?? nil
+        let raw = (try? container.decodeIfPresent(RawRollout.self, forKey: .rollout)) ?? nil
+        rollout = raw.flatMap { RemoteConfig.Rollout(start: $0.start, days: $0.days) }
     }
 }
 
@@ -191,6 +208,11 @@ final class UpdateChecker: ObservableObject {
         static let note = "updateAvailableNote"
         static let popupBuild = "updatePopupClosedBuild"
         static let popupAt = "updatePopupClosedAt"
+        static let rolloutStart = "updateAvailableRolloutStart"
+        static let rolloutDays = "updateAvailableRolloutDays"
+        /// The staged build whose prompt this iPad has reached.
+        static let rolloutReached = "updateRolloutReachedBuild"
+        static let saved = [version, build, testflight, recommended, note, rolloutStart, rolloutDays]
     }
 
     enum Source {
@@ -213,12 +235,15 @@ final class UpdateChecker: ObservableObject {
     private let defaults: UserDefaults
     private let source: Source
     private var checking = false
+    /// Places this iPad in staged rollouts. Never sent anywhere by them.
+    private let installationID: () -> String
 
     init(defaults: UserDefaults = .standard, source: Source = UpdateChecker.defaultSource, installed: InstalledApp = .current,
-         now: Date = Date()) {
+         now: Date = Date(), installationID: @escaping () -> String = { DiagnosticsUpload.shared.installationID }) {
         self.defaults = defaults
         self.source = source
         self.installed = installed
+        self.installationID = installationID
         automatic = defaults.object(forKey: Key.automatic) as? Bool ?? true
         if let version = defaults.string(forKey: Key.version) {
             let found = UpdateManifest.IPad(
@@ -226,7 +251,10 @@ final class UpdateChecker: ObservableObject {
                 build: defaults.integer(forKey: Key.build),
                 testflight: defaults.string(forKey: Key.testflight),
                 recommended: defaults.object(forKey: Key.recommended) as? Bool,
-                note: defaults.string(forKey: Key.note)
+                note: defaults.string(forKey: Key.note),
+                rollout: (defaults.object(forKey: Key.rolloutStart) as? Date).flatMap { start in
+                    RemoteConfig.Rollout(start: start, days: defaults.integer(forKey: Key.rolloutDays))
+                }
             )
             available = installed.isOlder(than: found) ? found : nil
         }
@@ -260,8 +288,22 @@ final class UpdateChecker: ObservableObject {
         #endif
     }
 
+    /// The update the banner and popup may offer at `now`: nil while a
+    /// staged rollout hasn't reached this iPad.
+    /// Once this iPad's turn comes for a build, its prompt keeps showing,
+    /// whatever the clock does later.
+    func prompted(now: Date) -> UpdateManifest.IPad? {
+        guard let available, let rollout = available.rollout else { return available }
+        if defaults.integer(forKey: Key.rolloutReached) == available.build { return available }
+        guard rollout.shows(id: installationID(), version: available.version, now: now) else { return nil }
+        defaults.set(available.build, forKey: Key.rolloutReached)
+        return available
+    }
+
     var banner: UpdateBannerModel? {
-        UpdateBannerModel.make(available: available, installed: installed, automatic: automatic, dismissed: dismissed, now: Date())
+        let now = Date()
+        return UpdateBannerModel.make(available: prompted(now: now), installed: installed, automatic: automatic,
+                                      dismissed: dismissed, now: now)
     }
 
     var popup: UpdatePopupModel? {
@@ -269,7 +311,8 @@ final class UpdateChecker: ObservableObject {
     }
 
     func popup(now: Date) -> UpdatePopupModel? {
-        UpdatePopupModel.make(available: available, installed: installed, automatic: automatic, closed: popupClosed, now: now)
+        UpdatePopupModel.make(available: prompted(now: now), installed: installed, automatic: automatic,
+                              closed: popupClosed, now: now)
     }
 
     func closePopup(now: Date = Date()) {
@@ -302,7 +345,7 @@ final class UpdateChecker: ObservableObject {
         case .disabled:
             return
         case .injected(let data):
-            apply(UpdateManifest.parse(data), now: now)
+            apply(data, now: now)
         case .network(let url):
             if let last = defaults.object(forKey: Key.checkedAt) as? Date,
                now.timeIntervalSince(last) < Self.checkInterval, last <= now {
@@ -310,20 +353,22 @@ final class UpdateChecker: ObservableObject {
             }
             checking = true
             Task {
-                let found = await Self.fetch(url)
+                let data = await Self.fetch(url)
                 checking = false
                 // Offline: keep what we knew and try again next time.
-                guard let found else { return }
-                apply(found, now: now)
+                guard let data else { return }
+                apply(data, now: now)
             }
         }
     }
 
-    private func apply(_ found: UpdateManifest.IPad?, now: Date) {
+    private func apply(_ data: Data, now: Date) {
         defaults.set(now, forKey: Key.checkedAt)
-        guard let found, installed.isOlder(than: found) else {
+        // The first-picture wait applies from the next launch.
+        RemoteConfig.save(RemoteConfig.parse(data), to: defaults, now: now)
+        guard let found = UpdateManifest.parse(data), installed.isOlder(than: found) else {
             available = nil
-            for key in [Key.version, Key.build, Key.testflight, Key.recommended, Key.note] { defaults.removeObject(forKey: key) }
+            for key in Key.saved { defaults.removeObject(forKey: key) }
             return
         }
         available = found
@@ -332,10 +377,12 @@ final class UpdateChecker: ObservableObject {
         defaults.set(found.testflight, forKey: Key.testflight)
         defaults.set(found.recommended, forKey: Key.recommended)
         defaults.set(found.note, forKey: Key.note)
+        defaults.set(found.rollout?.start, forKey: Key.rolloutStart)
+        defaults.set(found.rollout?.days, forKey: Key.rolloutDays)
     }
 
     /// A plain GET: no cookies, no cache, no identifiers.
-    private nonisolated static func fetch(_ url: URL) async -> UpdateManifest.IPad?? {
+    private nonisolated static func fetch(_ url: URL) async -> Data? {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -346,6 +393,6 @@ final class UpdateChecker: ObservableObject {
               (response as? HTTPURLResponse)?.statusCode == 200,
               data.count <= 256 * 1024
         else { return nil }
-        return .some(UpdateManifest.parse(data))
+        return data
     }
 }

@@ -7,8 +7,18 @@ struct EternalMonitorApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        #if DEBUG
+        // UI tests: EM_FRESH_INSTALL=1 starts with nothing saved, as a new
+        // install does. Pairings are in the Keychain and stay.
+        if ProcessInfo.processInfo.environment["EM_FRESH_INSTALL"] == "1", let id = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: id)
+        }
+        #endif
         FontRegistry.shared.registerBundledFonts()
         SupportDiagnostics.shared.recordDeviceSnapshot()
+        SupportDiagnostics.shared.record("info", "update",
+            RemoteConfig.summary(RemoteConfig.launch, rollout: UpdateChecker.shared.available?.rollout))
+        CrashReporting.shared.start()
     }
 
     var body: some Scene {
@@ -36,10 +46,18 @@ struct EternalMonitorApp: App {
                     connectionManager.refreshAudioPreference(enabled)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-                    SupportDiagnostics.shared.record("warning", "device", "Memory warning")
+                    let footprint = MemoryFootprint.megabytes().map(String.init) ?? "unknown"
+                    let video = connectionManager.videoSize
+                    SupportDiagnostics.shared.record("warning", "device", "Memory warning footprint_mb=\(footprint) video=\(Int(video.width))x\(Int(video.height)) state=\(connectionManager.state)")
                 }
                 .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
                     SupportDiagnostics.shared.record("warning", "device", "Thermal state changed to \(ProcessInfo.processInfo.thermalState.rawValue)")
+                }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in
+                    CrashReporting.shared.marker.clear()
+                }
+                .onChange(of: connectionManager.state) { _, state in
+                    CrashReporting.shared.marker.update(state)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
                     DiagnosticsUpload.shared.flushSoon()
@@ -54,8 +72,10 @@ struct EternalMonitorApp: App {
             // down) instead of timing out on liveness. Coming back to the
             // foreground resumes the interrupted session (opt-out toggle).
             if phase == .background {
+                CrashReporting.shared.marker.clear()
                 connectionManager.handleAppBackgrounded()
             } else if phase == .active {
+                CrashReporting.shared.marker.activated(connectionManager.state)
                 connectionManager.handleAppForegrounded()
                 UpdateChecker.shared.checkIfDue()
             }

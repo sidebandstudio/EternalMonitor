@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -17,7 +18,9 @@ pub struct SettingsFile {
     pub target_ip: Option<String>,
     #[serde(default)]
     pub encoder_override: Option<String>,
-    #[serde(default)]
+    /// Saved as `encoder_input`, and `encoder_input_automatic` for
+    /// Automatic (see [`saved_input`]).
+    #[serde(flatten, with = "saved_input")]
     pub encoder_input: crate::encoder::input::EncoderInput,
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
@@ -35,6 +38,9 @@ pub struct SettingsFile {
     pub require_pairing: bool,
     #[serde(default)]
     pub auth_token_hex: String,
+    /// Troubleshooting: which network the stream listens on.
+    #[serde(default)]
+    pub listen_on: crate::network::ListenOn,
     /// Ask the virtual display driver to offer the connected iPad's native
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
@@ -51,10 +57,80 @@ pub struct SettingsFile {
     /// The sidebar's GitHub star card was clicked; it says thank you since.
     #[serde(default)]
     pub star_clicked: bool,
+    /// Troubleshooting: how the window is drawn, from the next start.
+    #[serde(default)]
+    pub window_drawing: crate::troubleshooting::WindowDrawing,
+    /// A graphics card switch made from the Stream page, for its outcome
+    /// after the relaunch and for Undo.
+    #[serde(default)]
+    pub gpu_switch: Option<crate::gpu_preference::SwitchRecord>,
+    /// The window's language: a code such as `de`, `system` for the
+    /// Windows display language, or none until one is picked in the app,
+    /// when the installer's choice applies (see `i18n::resolve`).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// The encoder input on disk. `encoder_input` keeps to the values every
+/// version reads (auto, bgra, yuv420): a version that can't read one resets
+/// every setting, the pairing too, as after a downgrade. A file from before
+/// Automatic keeps the input it names, yuv420 for nearly every PC, so an
+/// upgrade changes nothing that works. Automatic, given to fresh settings
+/// or picked, is saved as yuv420 with `encoder_input_automatic`, which older
+/// versions ignore, reading their default YUV420.
+mod saved_input {
+    use crate::encoder::input::EncoderInput;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Saved {
+        Auto,
+        Bgra,
+        Yuv420,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Fields {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoder_input: Option<Saved>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        encoder_input_automatic: bool,
+    }
+
+    pub fn serialize<S: Serializer>(
+        input: &EncoderInput,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let (encoder_input, encoder_input_automatic) = match input {
+            EncoderInput::Automatic => (Saved::Yuv420, true),
+            EncoderInput::Auto => (Saved::Auto, false),
+            EncoderInput::Bgra => (Saved::Bgra, false),
+            EncoderInput::Yuv420 => (Saved::Yuv420, false),
+        };
+        Fields {
+            encoder_input: Some(encoder_input),
+            encoder_input_automatic,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<EncoderInput, D::Error> {
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(match fields.encoder_input {
+            None => EncoderInput::Automatic,
+            Some(Saved::Yuv420) if fields.encoder_input_automatic => EncoderInput::Automatic,
+            Some(Saved::Auto) => EncoderInput::Auto,
+            Some(Saved::Bgra) => EncoderInput::Bgra,
+            Some(Saved::Yuv420) => EncoderInput::Yuv420,
+        })
+    }
 }
 
 fn default_max_dgram() -> u16 {
@@ -76,11 +152,15 @@ impl Default for SettingsFile {
             stream_audio: true,
             require_pairing: true,
             auth_token_hex: String::new(),
+            listen_on: Default::default(),
             vdd_match_resolution: true,
             start_on_boot: false,
             feedback_sessions: 0,
             feedback_ask_done: false,
             star_clicked: false,
+            window_drawing: Default::default(),
+            gpu_switch: None,
+            language: None,
         }
     }
 }
@@ -94,7 +174,7 @@ impl SettingsFile {
         }
         let token = crate::pairing::new_token()?;
         self.auth_token_hex = crate::pairing::token_hex(&token);
-        self.save();
+        let _ = self.save();
         Ok(token)
     }
 
@@ -123,9 +203,12 @@ impl SettingsFile {
         }
     }
 
-    pub fn save(&self) {
+    /// Writes settings.json atomically. Failures are logged here too;
+    /// callers that can go on without the file ignore the error.
+    pub fn save(&self) -> Result<(), String> {
         let Some(path) = settings_path() else {
-            return;
+            warn!("Failed to save settings: no folder for settings (APPDATA and HOME unset)");
+            return Err("no folder for settings".into());
         };
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
@@ -134,7 +217,7 @@ impl SettingsFile {
                     error = %error,
                     "Failed to create settings directory"
                 );
-                return;
+                return Err(error.to_string());
             }
         }
         match serde_json::to_string_pretty(self) {
@@ -150,10 +233,13 @@ impl SettingsFile {
                         error = %error,
                         "Failed to write settings.json"
                     );
+                    return Err(error.to_string());
                 }
+                Ok(())
             }
             Err(error) => {
                 warn!(error = %error, "Failed to serialize settings");
+                Err(error.to_string())
             }
         }
     }
@@ -179,6 +265,33 @@ pub fn app_data_dir() -> Option<PathBuf> {
 
 fn settings_path() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+}
+
+static FRESH_INSTALL: AtomicBool = AtomicBool::new(false);
+
+/// Notes whether this is a fresh install, when the window opens first-run
+/// setup. Call first thing at launch: the single-instance check, the
+/// session log and diagnostics create the settings folder and files in it.
+pub fn note_launch() {
+    let fresh = app_data_dir().is_some_and(|dir| holds_nothing(&dir));
+    FRESH_INSTALL.store(fresh, Ordering::SeqCst);
+}
+
+/// See [`note_launch`]. False when it was never called (tests).
+pub fn fresh_install() -> bool {
+    FRESH_INSTALL.load(Ordering::SeqCst)
+}
+
+/// A fresh install has no settings folder yet, or an empty one. Anything in
+/// it is from an earlier run, so this is an upgrade, with or without
+/// settings.json: versions before 0.3.0 saved it only once a setting
+/// changed, but every version since 0.1.2 keeps its session log in `logs`
+/// there. A folder that cannot be read counts as an upgrade too.
+fn holds_nothing(dir: &Path) -> bool {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +335,183 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    /// A settings file from before Automatic keeps the input it names, so
+    /// an upgraded PC keeps YUV420 until someone picks Automatic. Only a
+    /// fresh install (no file, or no input in it) starts on Automatic.
+    #[test]
+    fn upgraded_settings_keep_their_input_and_fresh_ones_get_automatic() {
+        use crate::encoder::input::EncoderInput;
+        let old = |input: &str| {
+            format!(
+                r#"{{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false,"auth_token_hex":"0123456789abcdef0123456789abcdef","encoder_input":"{input}"}}"#
+            )
+        };
+        let read = |text: &str| {
+            serde_json::from_str::<SettingsFile>(text)
+                .unwrap()
+                .encoder_input
+        };
+        assert_eq!(read(&old("yuv420")), EncoderInput::Yuv420);
+        assert_eq!(read(&old("auto")), EncoderInput::Auto);
+        assert_eq!(read(&old("bgra")), EncoderInput::Bgra);
+        assert!(serde_json::from_str::<SettingsFile>(&old("rgb")).is_err());
+        // A save after the upgrade still says yuv420, and it reads back so.
+        let upgraded: SettingsFile = serde_json::from_str(&old("yuv420")).unwrap();
+        let saved = serde_json::to_string_pretty(&upgraded).unwrap();
+        assert_eq!(read(&saved), EncoderInput::Yuv420, "{saved}");
+        assert_eq!(
+            serde_json::from_str::<SettingsFile>(&saved)
+                .unwrap()
+                .auth_token_hex,
+            upgraded.auth_token_hex
+        );
+
+        // Fresh: what load() returns without a file, and a file without
+        // the input, as from versions before it existed.
+        assert_eq!(
+            SettingsFile::default().encoder_input,
+            EncoderInput::Automatic
+        );
+        assert_eq!(
+            read(r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#),
+            EncoderInput::Automatic
+        );
+    }
+
+    /// How 0.3.2 and 0.3.3 read and save the file: unknown fields are
+    /// dropped, an unknown input fails the whole file.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Before {
+        Auto,
+        Bgra,
+        Yuv420,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OlderVersion {
+        bitrate_mbps: f32,
+        target_fps: u32,
+        start_on_boot: bool,
+        #[serde(default = "before_default")]
+        encoder_input: Before,
+        #[serde(default)]
+        auth_token_hex: String,
+    }
+
+    fn before_default() -> Before {
+        Before::Yuv420
+    }
+
+    /// Every input survives a save, Automatic included, and what is saved
+    /// stays readable by 0.3.2 and 0.3.3, which reset every setting, the
+    /// pairing too, on an input they don't know. Automatic is saved as
+    /// yuv420, what those versions choose by default.
+    #[test]
+    fn encoder_input_round_trips_and_stays_readable_by_older_versions() {
+        use crate::encoder::input::EncoderInput;
+        for (input, saved, marked, before) in [
+            (EncoderInput::Automatic, "yuv420", true, Before::Yuv420),
+            (EncoderInput::Auto, "auto", false, Before::Auto),
+            (EncoderInput::Bgra, "bgra", false, Before::Bgra),
+            (EncoderInput::Yuv420, "yuv420", false, Before::Yuv420),
+        ] {
+            let settings = SettingsFile {
+                encoder_input: input,
+                auth_token_hex: "0123456789abcdef0123456789abcdef".into(),
+                ..Default::default()
+            };
+            let json = serde_json::to_string_pretty(&settings).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["encoder_input"], saved, "{json}");
+            assert_eq!(
+                value.get("encoder_input_automatic").is_some(),
+                marked,
+                "{json}"
+            );
+            let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.encoder_input, input, "{json}");
+            assert_eq!(parsed.auth_token_hex, settings.auth_token_hex);
+            assert_eq!(parsed.bitrate_mbps, settings.bitrate_mbps);
+            let older = serde_json::from_str::<OlderVersion>(&json).unwrap();
+            assert_eq!(older.encoder_input, before, "{json}");
+            assert_eq!(older.auth_token_hex, settings.auth_token_hex);
+        }
+    }
+
+    /// Automatic, downgraded to 0.3.3 and saved there, then upgraded again:
+    /// 0.3.3 streams its default YUV420, its save drops the marker, and
+    /// the upgrade keeps YUV420 like any file from before Automatic. The
+    /// pairing survives every step.
+    #[test]
+    fn automatic_downgrades_to_yuv420_and_keeps_it_on_upgrade() {
+        use crate::encoder::input::EncoderInput;
+        let token = "0123456789abcdef0123456789abcdef";
+        let automatic = SettingsFile {
+            auth_token_hex: token.into(),
+            ..Default::default()
+        };
+        assert_eq!(automatic.encoder_input, EncoderInput::Automatic);
+        let written = serde_json::to_string_pretty(&automatic).unwrap();
+
+        let downgraded = serde_json::from_str::<OlderVersion>(&written).unwrap();
+        assert_eq!(downgraded.encoder_input, Before::Yuv420, "{written}");
+        assert_eq!(downgraded.auth_token_hex, token);
+        let resaved = serde_json::to_string_pretty(&downgraded).unwrap();
+        assert!(!resaved.contains("encoder_input_automatic"), "{resaved}");
+
+        let upgraded: SettingsFile = serde_json::from_str(&resaved).unwrap();
+        assert_eq!(upgraded.encoder_input, EncoderInput::Yuv420, "{resaved}");
+        assert_eq!(upgraded.auth_token_hex, token);
+        let saved_again = serde_json::to_string_pretty(&upgraded).unwrap();
+        let again: SettingsFile = serde_json::from_str(&saved_again).unwrap();
+        assert_eq!(again.encoder_input, EncoderInput::Yuv420, "{saved_again}");
+        assert_eq!(again.auth_token_hex, token);
+    }
+
+    #[test]
+    fn language_defaults_to_unset_and_round_trips() {
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.language, None);
+        let settings = SettingsFile {
+            language: Some("pt-BR".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("pt-BR"));
+    }
+
+    #[test]
+    fn only_a_missing_or_empty_settings_folder_is_a_fresh_install() {
+        let root = std::env::temp_dir().join(format!("eternal-fresh-{}", std::process::id()));
+        let dir = root.join(APP_FOLDER);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(holds_nothing(&dir), "no folder");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(holds_nothing(&dir), "an empty folder");
+
+        // Only a session log, as an older version that never saved settings
+        // leaves it.
+        fs::create_dir_all(dir.join("logs")).unwrap();
+        fs::write(dir.join("logs").join("session.log"), "earlier run\n").unwrap();
+        assert!(!holds_nothing(&dir), "logs only");
+        fs::remove_dir_all(dir.join("logs")).unwrap();
+
+        fs::write(dir.join(SETTINGS_FILE_NAME), "{ not json").unwrap();
+        assert!(!holds_nothing(&dir), "malformed settings.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(!holds_nothing(&dir), "a folder that cannot be read");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

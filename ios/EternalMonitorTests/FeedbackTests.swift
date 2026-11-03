@@ -69,7 +69,8 @@ final class FeedbackTests: XCTestCase {
         let failures: [ConnectionProblem] = [
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .routerAddress, .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed,
-            .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcUpdating(.notBack),
+            .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcEndedSessionOnError,
+            .pcUpdating(.notBack),
         ]
         for problem in failures {
             XCTAssertTrue(problem.canReport, problem.title)
@@ -79,7 +80,7 @@ final class FeedbackTests: XCTestCase {
     func testMailSaysTheDiagnosticsAreAttachedAndHowToRemoveThem() {
         let attached = Feedback.body(.problem("Your PC didn't answer"), context, attachesDiagnostics: true)
         XCTAssertTrue(attached.hasPrefix(Feedback.attachmentNotice + "\n\n\n\n--\n"), attached)
-        XCTAssertTrue(Feedback.attachmentNotice.contains("PC's and iPad's names and local network addresses"))
+        XCTAssertTrue(Feedback.attachmentNotice.contains("your PC's name and local network address"))
         XCTAssertTrue(Feedback.attachmentNotice.contains("Remove it before sending"))
         // Without an attachment (the copy sheet) it says nothing about one.
         XCTAssertFalse(Feedback.body(.general, context).contains("diagnostics"))
@@ -160,5 +161,53 @@ final class FeedbackTests: XCTestCase {
         XCTAssertFalse(relaunched.due(streaming: false))
         relaunched.sessionEnded(after: 600, defaults: store)
         XCTAssertFalse(relaunched.due(streaming: false))
+    }
+
+    func testTheStarCardWaitsForALongSessionAndGivesWayToTheAsk() {
+        let store = defaults()
+        var ask = FeedbackAsk(defaults: store)
+        let star = StarAsk(defaults: store)
+        // A first run, and short sessions, show nothing.
+        XCTAssertFalse(star.shown(ask, streaming: false, updateBanner: false))
+        ask.sessionEnded(after: 299, defaults: store)
+        XCTAssertFalse(star.shown(ask, streaming: false, updateBanner: false))
+        ask.sessionEnded(after: 300, defaults: store)
+        XCTAssertTrue(star.shown(ask, streaming: false, updateBanner: false))
+        // Never over the picture, nor under the update banner.
+        XCTAssertFalse(star.shown(ask, streaming: true, updateBanner: false))
+        XCTAssertFalse(star.shown(ask, streaming: false, updateBanner: true))
+        // The feedback ask wins while it is due, and the card returns once
+        // it is answered.
+        ask.sessionEnded(after: 600, defaults: store)
+        ask.sessionEnded(after: 600, defaults: store)
+        XCTAssertTrue(ask.due(streaming: false))
+        XCTAssertFalse(star.shown(ask, streaming: false, updateBanner: false))
+        ask.finish(defaults: store)
+        XCTAssertTrue(star.shown(ask, streaming: false, updateBanner: false))
+        XCTAssertFalse(star.shown(ask, streaming: true, updateBanner: false))
+    }
+
+    func testATapThanksAndACloseRetiresTheStarCard() {
+        let store = defaults()
+        store.set(1, forKey: FeedbackAsk.sessionsKey)
+        let ask = FeedbackAsk(defaults: store)
+        var star = StarAsk(defaults: store)
+        XCTAssertFalse(star.tapped)
+        star.tap(defaults: store)
+        XCTAssertTrue(star.tapped)
+        // The thank-you stays, after a relaunch too, until closed.
+        var relaunched = StarAsk(defaults: store)
+        XCTAssertTrue(relaunched.tapped)
+        XCTAssertTrue(relaunched.shown(ask, streaming: false, updateBanner: false))
+        relaunched.close(defaults: store)
+        XCTAssertFalse(relaunched.shown(ask, streaming: false, updateBanner: false))
+        XCTAssertFalse(StarAsk(defaults: store).shown(ask, streaming: false, updateBanner: false))
+        // Closed without a tap: also for good.
+        let other = defaults()
+        other.set(1, forKey: FeedbackAsk.sessionsKey)
+        var untapped = StarAsk(defaults: other)
+        untapped.close(defaults: other)
+        XCTAssertFalse(untapped.tapped)
+        XCTAssertFalse(StarAsk(defaults: other).shown(FeedbackAsk(defaults: other), streaming: false, updateBanner: false))
     }
 }

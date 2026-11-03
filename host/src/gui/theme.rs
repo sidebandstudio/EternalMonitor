@@ -7,6 +7,10 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
     Shadow, Stroke, TextStyle,
 };
+use parking_lot::Mutex;
+
+use super::fonts;
+use crate::i18n::Lang;
 
 // ── Surfaces ────────────────────────────────────────────────────────────────
 pub const CANVAS: Color32 = Color32::from_rgb(10, 10, 11);
@@ -100,10 +104,12 @@ pub fn faint(text: impl Into<String>) -> RichText {
 
 /// Small uppercase label above a group or value.
 pub fn overline(text: &str) -> RichText {
+    // Spacing letters apart would break up joined Arabic letters.
+    let spacing = if crate::i18n::is_rtl() { 0.0 } else { 0.9 };
     RichText::new(text.to_uppercase())
         .family(medium())
         .size(10.5)
-        .extra_letter_spacing(0.9)
+        .extra_letter_spacing(spacing)
         .color(TEXT_FAINT)
 }
 
@@ -116,14 +122,47 @@ pub fn mono(text: impl Into<String>, size: f32) -> RichText {
 
 // ── Setup ───────────────────────────────────────────────────────────────────
 
-/// Install fonts and the dark style. Called once from the app constructor.
-pub fn install(ctx: &egui::Context) {
-    ctx.set_fonts(fonts());
+/// Install fonts for `lang` and the dark style. Called once from the app
+/// constructor. Returns the language the fonts can draw (see
+/// [`set_language`]).
+pub fn install(ctx: &egui::Context, lang: Lang) -> Lang {
+    let shown = set_language(ctx, lang);
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(apply_style);
+    shown
 }
 
-fn fonts() -> FontDefinitions {
+/// Installs the fonts `lang` needs, from the next frame on. When its font
+/// is missing the window stays in English, which says so in the log once.
+pub fn set_language(ctx: &egui::Context, lang: Lang) -> Lang {
+    let face = if fonts::needs_system_font(lang) {
+        match fonts::load(lang) {
+            Some(face) => Some(face),
+            None => {
+                static LOGGED: Mutex<Vec<Lang>> = Mutex::new(Vec::new());
+                let mut logged = LOGGED.lock();
+                if !logged.contains(&lang) {
+                    logged.push(lang);
+                    tracing::warn!(
+                        language = lang.code(),
+                        dir = %fonts::fonts_dir().display(),
+                        "No font for the chosen language; the window stays in English"
+                    );
+                }
+                ctx.set_fonts(definitions(None));
+                return Lang::En;
+            }
+        }
+    } else {
+        None
+    };
+    ctx.set_fonts(definitions(face));
+    lang
+}
+
+/// Geist first, then the language's own face (Arabic letters are never in
+/// Geist, see `i18n::bidi`), then egui's bundled faces.
+fn definitions(language_face: Option<FontData>) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let faces: [(&str, &'static [u8]); 5] = [
         (
@@ -155,16 +194,31 @@ fn fonts() -> FontDefinitions {
 
     // Keep egui's bundled faces behind Geist so device names in other
     // scripts, symbols and emoji still render.
-    let fallback_sans = fonts
+    let mut fallback_sans = fonts
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let fallback_mono = fonts
+    let mut fallback_mono = fonts
         .families
         .get(&FontFamily::Monospace)
         .cloned()
         .unwrap_or_default();
+    if let Some(face) = language_face {
+        fonts.font_data.insert("language".into(), Arc::new(face));
+        fallback_sans.insert(0, "language".into());
+        fallback_mono.insert(0, "language".into());
+    }
+    // Each language name in the picker is drawn by its own subset.
+    for (_, name, bytes) in fonts::NAME_FACES {
+        fonts
+            .font_data
+            .insert(name.into(), Arc::new(FontData::from_static(bytes)));
+        fonts.families.insert(
+            FontFamily::Name(name.into()),
+            vec![name.to_string(), "geist".to_string()],
+        );
+    }
     let with_fallback = |face: &str, fallback: &[String]| {
         std::iter::once(face.to_string())
             .chain(fallback.iter().cloned())

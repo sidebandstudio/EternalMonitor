@@ -78,7 +78,7 @@ A versão atual é v0.3.3 para Windows e v0.3.3 (build 364) para iPad. Ela leva 
 
 As verificações da versão v0.3.3 passaram no Windows, macOS e simuladores de iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) registra os resultados práticos em um PC e um iPad reais desde a v0.3.0.
 
-Os dois aplicativos compartilham diagnósticos para encontrar e corrigir problemas: detalhes do dispositivo, erros do aplicativo e estatísticas da transmissão, incluindo nomes do PC e do iPad, nomes de dispositivos de áudio e endereços de rede. Os diagnósticos nunca incluem conteúdo da tela, áudio ou credenciais de pareamento. Desative o compartilhamento em Configurações. [Diagnósticos automáticos](../SETUP.md#automatic-diagnostics) e o [aviso de privacidade](https://eternalmonitor.dev/privacy.html) detalham o que é enviado e por quanto tempo é mantido. No iPad, abra Configurações > Suporte > Diagnósticos para copiar ou exportar um relatório.
+Os diagnósticos do Windows e do iPad incluem detalhes do dispositivo, erros do aplicativo e estatísticas da transmissão. Os relatórios incluem nomes de placas de vídeo e monitores e endereços de rede, mas não incluem conteúdo da tela, áudio nem credenciais de pareamento. A partir da versão 0.3.4, os dados enviados pelo Windows têm removidos o nome do PC, o nome de usuário, a pasta do usuário, o nome do iPad e os nomes dos dispositivos de áudio, mantendo apenas o tipo de cada dispositivo de áudio; os dados enviados pelo iPad têm removido o nome do PC. Desative o compartilhamento automático em **Configurações** (Settings). Os diagnósticos são mantidos por até 30 dias e podem ser removidos antes. Diagnósticos excluídos ou expirados podem permanecer nos backups diários por até mais 7 dias. Consulte [Diagnósticos automáticos](../SETUP.md#automatic-diagnostics) e o [aviso de privacidade](https://eternalmonitor.dev/privacy.html). No iPad, abra **Configurações** (Settings) > **Suporte** (Support) > **Diagnósticos** (Diagnostics) para copiar ou exportar um relatório.
 
 ## Como funciona
 
@@ -166,7 +166,7 @@ Cada linha verifica a taxa de quadros decodificados (pelo menos 55 fps), perdas,
 | `ETERNAL_ENCODER` | Força um codificador (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` ou `0` substitui a preferência por HEVC |
 | `ETERNAL_FPS` | Substitui a taxa de quadros do host; a preferência do iPad ainda define o limite |
-| `ETERNAL_INPUT` | Entrada do codificador: `yuv420` (padrão), `auto` ou `bgra` |
+| `ETERNAL_INPUT` | Entrada do codificador: `automatic` (padrão: BGRA para NVIDIA, YUV420 para os demais), `yuv420`, `auto` ou `bgra` |
 | `ETERNAL_MAX_DGRAM` | Tamanho do datagrama de mídia, de 576 a 1400 bytes |
 | `ETERNAL_CAPTURE` | `synthetic` substitui DXGI por um padrão de teste gerado |
 | `ETERNAL_AUDIO` | `synthetic` seleciona a fonte de teste de áudio determinística |

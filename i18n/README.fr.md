@@ -78,7 +78,7 @@ La version actuelle est v0.3.3 pour Windows et v0.3.3 (build 364) pour iPad. Ell
 
 Les vérifications de la version v0.3.3 ont réussi sur Windows, macOS et les simulateurs iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) consigne les résultats des tests pratiques sur un vrai PC et un vrai iPad depuis v0.3.0.
 
-Les deux applications partagent des diagnostics pour trouver et corriger les problèmes : informations sur les appareils, erreurs des applications et statistiques de diffusion, notamment les noms du PC, de l'iPad et des périphériques audio ainsi que les adresses réseau. Les diagnostics ne contiennent jamais le contenu de l'écran, l'audio ni les identifiants de jumelage. Désactivez le partage dans Paramètres. [Diagnostics automatiques](../SETUP.md#automatic-diagnostics) et l'[avis de confidentialité](https://eternalmonitor.dev/privacy.html) précisent ce qui est envoyé et la durée de conservation. Sur iPad, ouvrez Paramètres > Assistance > Diagnostics pour copier ou exporter un rapport.
+Les diagnostics Windows et iPad comprennent des informations sur les appareils, les erreurs des applications et les statistiques de diffusion. Les rapports contiennent les noms des cartes graphiques et des écrans ainsi que les adresses réseau, mais excluent le contenu de l'écran, l'audio et les identifiants de jumelage. À partir de la version 0.3.4, les données envoyées par Windows sont débarrassées du nom du PC, du nom d'utilisateur, du dossier utilisateur, du nom de l'iPad et des noms des périphériques audio, seul le type de chaque périphérique audio étant conservé ; les données envoyées par l'iPad sont débarrassées du nom du PC. Désactivez le partage automatique dans **Paramètres** (Settings). Les diagnostics sont conservés jusqu'à 30 jours et peuvent être supprimés plus tôt. Les diagnostics supprimés ou expirés peuvent rester dans les sauvegardes quotidiennes jusqu'à 7 jours supplémentaires. Consultez [Diagnostics automatiques](../SETUP.md#automatic-diagnostics) et l'[avis de confidentialité](https://eternalmonitor.dev/privacy.html). Sur iPad, ouvrez **Paramètres** (Settings) > **Assistance** (Support) > **Diagnostics** pour copier ou exporter un rapport.
 
 ## Fonctionnement
 
@@ -166,7 +166,7 @@ Chaque ligne vérifie la fréquence d'images décodées (au moins 55 fps), les p
 | `ETERNAL_ENCODER` | Forcer un encodeur (`h264_nvenc`, `h264_amf`, `h264_qsv`, `libx264`) |
 | `ETERNAL_HEVC` | `1` ou `0` remplace la préférence HEVC |
 | `ETERNAL_FPS` | Remplacer la fréquence d'images de l'hôte ; la préférence de l'iPad reste la limite |
-| `ETERNAL_INPUT` | Entrée de l'encodeur : `yuv420` (par défaut), `auto` ou `bgra` |
+| `ETERNAL_INPUT` | Entrée de l'encodeur : `automatic` (par défaut : BGRA pour NVIDIA, YUV420 pour les autres), `yuv420`, `auto` ou `bgra` |
 | `ETERNAL_MAX_DGRAM` | Taille des datagrammes média, de 576 à 1400 octets |
 | `ETERNAL_CAPTURE` | `synthetic` remplace DXGI par une mire générée |
 | `ETERNAL_AUDIO` | `synthetic` sélectionne la source audio de test déterministe |

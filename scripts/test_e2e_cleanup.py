@@ -1,6 +1,7 @@
 import os
 import pathlib
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -50,6 +51,32 @@ class SimulatorCleanup(unittest.TestCase):
         finally:
             if alive(pid):
                 os.kill(pid, 9)
+
+    def test_cleanup_stops_the_host_before_the_app(self):
+        # An app stopped first leaves the host to expire its liveness.
+        text = SCRIPT.read_text()
+        script = text[text.index("bounded() {"):text.index("trap cleanup EXIT")]
+        with tempfile.TemporaryDirectory() as root:
+            events = pathlib.Path(root, "events")
+            remote = pathlib.Path(root, "scripts/win/remote.sh")
+            remote.parent.mkdir(parents=True)
+            remote.write_text(f'#!/bin/sh\necho "remote $*" >> {events}\n')
+            remote.chmod(0o755)
+            body = f"""
+ROOT={root} OUT={root} APP_LOG={root}/app.log UDID=SIM-A EM_STOP_REMOTE_HOST=1
+SOAK_PID= PROFILE_PID= MONITOR_PID= PROXY_PID= APP_PID= INSTALL_DIR= SCENARIO=s STARTED=$SECONDS
+bash -c 'trap "echo host stopped >> {events}; exit 0" TERM; while :; do sleep 0.1; done' &
+HOST_PID=$!
+sleep 0.5
+xcrun() {{ echo "app $*" >> {events}; }}
+cleanup
+"""
+            started = time.monotonic()
+            result = subprocess.run(["bash", "-c", script + body], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(events.read_text().splitlines(),
+                             ["host stopped", "remote stop-host", "app simctl terminate SIM-A com.eternal.monitor"])
 
 
 if __name__ == "__main__":
