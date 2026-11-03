@@ -31,7 +31,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.eternal.monitor
         TARGETED_DEVICE_FAMILY: "2"
         SUPPORTS_XR: "NO"
-        MARKETING_VERSION: "0.3.3"
+        MARKETING_VERSION: "0.3.4"
         CURRENT_PROJECT_VERSION: "8"
         DEVELOPMENT_TEAM: "9X79V37Q89"
         CODE_SIGN_STYLE: Automatic

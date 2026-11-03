@@ -350,7 +350,7 @@ pub fn session_log_text() -> Option<String> {
         .lock()
         .clone()
         .unwrap_or_else(|| "none".to_string());
-    let mut report = format!("EternalMonitor support report, schema 1\n{}\nOutput queue dropped lines: {dropped}\nStorage failures: {storage_failures}, last error: {storage_error}\nLogs may contain PC/device names and local network addresses.\n\n--- Startup evidence ---\n{}\n",
+    let mut report = format!("EternalMonitor support report, schema 1\n{}\nOutput queue dropped lines: {dropped}\nStorage failures: {storage_failures}, last error: {storage_error}\nLogs may contain this PC's name, the Windows user name and user folder, device names and network addresses.\n\n--- Startup evidence ---\n{}\n",
         crate::diagnostics::system_report(), STARTUP_LOG.lock().join("\n"));
     let path = session_log_path();
     for suffix in [".2", ".1", ""] {

@@ -78,7 +78,7 @@ EternalMonitor 将 iPad 变成 Windows 电脑的显示器。它免费、基于 M
 
 v0.3.3 的发行检查已在 Windows、macOS 和 iPad 模拟器上通过。[docs/hardware-verification.md](../docs/hardware-verification.md) 记录了从 v0.3.0 起在真实电脑和 iPad 上进行的实测结果。
 
-两个应用会共享诊断信息以便发现和修复问题：设备详情、应用错误和串流统计数据，包括电脑和 iPad 名称、音频设备名称及网络地址。诊断信息绝不包含屏幕内容、音频或配对凭据。可在设置中关闭共享。[自动诊断](../SETUP.md#automatic-diagnostics)和[隐私声明](https://eternalmonitor.dev/privacy.html)详细说明了发送的内容和保留时间。在 iPad 上，打开设置 > 支持 > 诊断以复制或导出报告。
+Windows 和 iPad 的诊断信息包括设备详情、应用错误和串流统计数据。报告包含显卡和显示器名称及网络地址，但不包含屏幕内容、音频或配对凭据。从 0.3.4 起，Windows 上传的数据会移除电脑名称、用户名、用户文件夹、iPad 名称和音频设备名称，仅保留每个音频设备的类型；iPad 上传的数据会移除电脑名称。可在**设置** (Settings) 中关闭自动共享。诊断信息最多保留 30 天，也可能提前删除。已删除或过期的诊断信息可能在每日备份中再保留最多 7 天。参见[自动诊断](../SETUP.md#automatic-diagnostics)和[隐私声明](https://eternalmonitor.dev/privacy.html)。在 iPad 上，打开**设置** (Settings) > **支持** (Support) > **诊断** (Diagnostics) 以复制或导出报告。
 
 ## 工作原理
 

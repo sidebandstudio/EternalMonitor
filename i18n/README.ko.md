@@ -78,7 +78,7 @@ EternalMonitor가 유용하다면 별을 눌러 다른 사람들이 찾을 수 �
 
 v0.3.3 릴리스 검사는 Windows, macOS 및 iPad 시뮬레이터에서 통과했습니다. [docs/hardware-verification.md](../docs/hardware-verification.md)에는 v0.3.0부터 실제 PC와 iPad에서 수행한 검증 결과가 기록되어 있습니다.
 
-두 앱은 문제를 찾고 해결하기 위해 기기 정보, 앱 오류와 스트림 통계를 포함한 진단 정보를 공유합니다. PC와 iPad 이름, 오디오 기기 이름 및 네트워크 주소도 포함됩니다. 화면 내용, 오디오와 페어링 자격 증명은 절대 포함되지 않습니다. 설정에서 공유를 끄세요. [자동 진단](../SETUP.md#automatic-diagnostics)과 [개인정보 처리방침](https://eternalmonitor.dev/privacy.html)에 전송 내용과 보관 기간이 자세히 나와 있습니다. iPad에서 설정 > 지원 > 진단을 열어 보고서를 복사하거나 내보내세요.
+Windows와 iPad 진단에는 기기 정보, 앱 오류와 스트림 통계가 포함됩니다. 보고서에는 그래픽 카드와 디스플레이 이름 및 네트워크 주소가 포함되지만 화면 내용, 오디오와 페어링 자격 증명은 제외됩니다. 0.3.4부터 Windows가 전송하는 데이터에서는 PC 이름, 사용자 이름, 사용자 폴더, iPad 이름과 오디오 기기 이름이 제거되고 각 오디오 기기의 종류만 남습니다. iPad가 전송하는 데이터에서는 PC 이름이 제거됩니다. 설정에서 자동 공유를 끌 수 있습니다. 진단 정보는 최대 30일 동안 보관되며 더 일찍 삭제될 수 있습니다. 삭제되거나 만료된 진단 정보는 일일 백업에 최대 7일 더 남을 수 있습니다. [자동 진단](../SETUP.md#automatic-diagnostics)과 [개인정보 처리방침](https://eternalmonitor.dev/privacy.html)을 참조하세요. iPad에서 **설정** (Settings) > **지원** (Support) > **진단** (Diagnostics)을 열어 보고서를 복사하거나 내보내세요.
 
 ## 작동 방식
 

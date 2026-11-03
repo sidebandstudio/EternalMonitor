@@ -213,7 +213,7 @@ impl AnalyzerApp {
                         }
                         widgets::paragraph(
                             ui,
-                            faint("To include logs, click Copy with logs and paste into your email. Logs can include this PC's name and network addresses."),
+                            faint("To include logs, click Copy with logs and paste into your email. Logs can include this PC's name, the Windows user name and user folder, device names and network addresses."),
                         );
                     });
                 ui.add_space(10.0);

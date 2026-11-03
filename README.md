@@ -121,13 +121,17 @@ The v0.3.3 release checks passed on Windows, macOS and iPad simulators, and
 [docs/hardware-verification.md](docs/hardware-verification.md) records hands-on
 results on a real PC and iPad from v0.3.0.
 
-Both apps share diagnostics so problems can be found and fixed: device details,
-app errors and stream statistics, including PC and iPad names, audio device names
-and network addresses. Diagnostics never include screen content, audio or pairing
-credentials. Turn sharing off in Settings. [Automatic diagnostics](SETUP.md#automatic-diagnostics)
-and the [privacy notice](https://eternalmonitor.dev/privacy.html) list exactly what
-is sent and how long it is kept. On iPad, open Settings > Support > Diagnostics to
-copy or export a report.
+Windows and iPad diagnostics include device details, app errors and stream
+statistics. Reports include graphics card and display names and network
+addresses, but exclude screen content, audio and pairing credentials. From
+0.3.4, Windows uploads remove the PC's name, the user name, the user folder,
+the iPad's name and audio device names, keeping only each audio device's kind,
+and iPad uploads remove the PC's name. Disable automatic sharing in Settings.
+Diagnostics are kept up to 30 days and may be removed sooner. Deleted or
+expired diagnostics can remain in daily backups for up to 7 more days. See
+[Automatic diagnostics](SETUP.md#automatic-diagnostics) and the
+[privacy notice](https://eternalmonitor.dev/privacy.html).
+On iPad, open Settings > Support > Diagnostics to copy or export a report.
 
 ## How it works
 
