@@ -19,21 +19,15 @@ final class PairingFlowTests: UITestCase {
         let wrongCode = code == "111111" ? "222222" : "111111"
         // The sixth digit pairs. On iPadOS 27 the number pad opens over the
         // Pair button, so typing the code must be the only step.
-        input.typeText(wrongCode)
+        enter(wrongCode, into: input)
         let error = app.staticTexts["pairing.error"]
-        XCTAssertTrue(error.waitForExistence(timeout: 5))
+        XCTAssertTrue(error.waitForExistence(timeout: 5), "No refusal; the field holds \(value(of: input))")
         XCTAssertTrue(error.label.contains("didn’t match"))
         XCTAssertTrue(input.exists)
         capture("pairing-wrong-code", app: app)
         // The field keeps its focus, with the caret after the refused code;
-        // another tap can move it before the digits. A busy simulator can
-        // drop keys, and the refused code or five digits never pair, so read
-        // each step back: a lost key must not look like a PC that ignored
-        // the right code.
-        let start = String(code.dropLast())
-        XCTAssertTrue(replace(input, with: start), "The field holds \(value(of: input)), not \(start)")
-        XCTAssertTrue(type(String(code.suffix(1)), into: input, until: { $0 != start }),
-                      "The last digit did not reach the field")
+        // another tap can move it before the digits.
+        enter(code, into: input)
         let connected = app.buttons["display.disconnect"].waitForExistence(timeout: 10)
         if !connected { capture("pairing-right-code", app: app) }
         XCTAssertTrue(connected, "The right code did not pair; the field holds \(value(of: input)), error: \(errorText(app))")
@@ -65,6 +59,16 @@ final class PairingFlowTests: UITestCase {
 
     private func disconnect(_ app: XCUIApplication) {
         app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
+    }
+
+    /// A busy simulator can drop keys, and the refused code or five digits
+    /// never pair, so each step reads back: a lost key must not look like a
+    /// PC that ignored a code. Only the sixth digit can send it.
+    private func enter(_ code: String, into input: XCUIElement) {
+        let start = String(code.dropLast())
+        XCTAssertTrue(replace(input, with: start), "The field holds \(value(of: input)), not \(start)")
+        XCTAssertTrue(type(String(code.suffix(1)), into: input, until: { $0 != start }),
+                      "The last digit did not reach the field, which holds \(value(of: input))")
     }
 
     /// Empties the field, then types `text`, until it reads back. The field

@@ -22,8 +22,8 @@ if [ -d "$RESULT" ]; then
 fi
 if [ "$status" != 0 ]; then
     # Keep what shows a failure: the screen recording, UI snapshots and the
-    # app's log of its last launch.
-    [ ! -d "$SHOTS" ] || cp -R "$SHOTS" "$OUT/attachments"
+    # app's log of its last launch. Best effort: result.json must be written.
+    [ ! -d "$SHOTS" ] || cp -R "$SHOTS" "$OUT/attachments" || true
     APP_DATA=$(xcrun simctl get_app_container "${EM_SIM_UDID:-06416ADB-C33D-4EE4-82DB-44FCD663362F}" com.eternal.monitor data 2>/dev/null) || APP_DATA=""
     [ -z "$APP_DATA" ] || cp "$APP_DATA/tmp/eternal-e2e.log" "$OUT/app.log" 2>/dev/null || true
 fi
