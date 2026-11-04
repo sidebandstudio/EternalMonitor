@@ -7,8 +7,9 @@
     "note": "Fixes the problems reported with 0.3.3: start-up crashes on AMD and Intel graphics, USB freezes on slower PCs and smeared frames on Wi-Fi. Update the iPad app in TestFlight once 0.3.4 appears."
   },
   "ipad": {
-    "version": "0.3.3",
-    "build": 364,
-    "testflight": "https://testflight.apple.com/join/ppc9QfXc"
+    "version": "0.3.4",
+    "build": 698,
+    "testflight": "https://testflight.apple.com/join/ppc9QfXc",
+    "note": "Keeps the last clear picture after a lost Wi-Fi frame instead of smeared blocks, and comes in 11 languages. Works with Windows 0.3.4 and 0.3.3."
   }
 }
