@@ -32,10 +32,10 @@ EternalMonitor превращает iPad в монитор для ПК с Window
 
 ## Быстрый старт
 
-[![Скачать для Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Скачать для Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![Получить приложение iPad в TestFlight](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Установите приложение Windows.** Запустите [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) в 64-разрядной Windows 10 (версии 1809 или новее) или Windows 11 с графикой NVIDIA, AMD или Intel. Если Windows SmartScreen запросит подтверждение, выберите **Подробнее**, затем **Выполнить в любом случае**. SHA-256 файла указан на [странице выпуска](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3).
+1. **Установите приложение Windows.** Запустите [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) в 64-разрядной Windows 10 (версии 1809 или новее) или Windows 11 с графикой NVIDIA, AMD или Intel. Если Windows SmartScreen запросит подтверждение, выберите **Подробнее**, затем **Выполнить в любом случае**. SHA-256 файла указан на [странице выпуска](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4).
 2. **Установите приложение iPad.** На iPad с iPadOS 17 или новее установите **TestFlight** из App Store, затем откройте на iPad [ссылку EternalMonitor в TestFlight](https://testflight.apple.com/join/ppc9QfXc) и нажмите **Установить**.
 3. **Подключитесь.** Откройте оба приложения в одной сети и нажмите на свой ПК на iPad или отсканируйте QR-код, показанный на ПК. Для USB в Windows 10 22H2 или Windows 11 подключите кабель и оставьте на ПК открытым бесплатное приложение Apple [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k).
 
@@ -74,9 +74,9 @@ EternalMonitor превращает iPad в монитор для ПК с Window
 
 ## Состояние
 
-Текущий выпуск: v0.3.3 для Windows и v0.3.3 (build 364) для iPad. Он добавляет **Второй экран** (Second screen) на большее число ноутбуков с графикой Intel и NVIDIA: iPad сразу показывает основной экран ПК, а затем переключается на второй экран, когда Windows его добавит. В [RELEASE_NOTES.md](../RELEASE_NOTES.md) описаны все версии, а в [ROADMAP.md](../ROADMAP.md) — планы развития.
+Текущий выпуск: v0.3.4 для Windows и v0.3.4 (build 698) для iPad. Он исправляет проблемы, о которых сообщали в версии 0.3.3: сбои при запуске с графикой AMD и Intel, зависания при подключении по USB на медленных ПК и искажённые кадры по Wi-Fi. Оба приложения теперь доступны на 11 языках. В [RELEASE_NOTES.md](../RELEASE_NOTES.md) описаны все версии, а в [ROADMAP.md](../ROADMAP.md) — планы развития.
 
-Проверки выпуска v0.3.3 прошли в Windows, macOS и симуляторах iPad. В [docs/hardware-verification.md](../docs/hardware-verification.md) записаны результаты практических проверок на настоящих ПК и iPad начиная с v0.3.0.
+Проверки выпуска v0.3.4 прошли в Windows, macOS и симуляторах iPad. В [docs/hardware-verification.md](../docs/hardware-verification.md) записаны результаты практических проверок на настоящих ПК и iPad начиная с v0.3.0.
 
 Диагностические данные Windows и iPad содержат сведения об устройствах, ошибки приложений и статистику трансляции. Отчёты включают названия видеокарт и дисплеев и сетевые адреса, но не содержат изображение экрана, звук и данные сопряжения. Начиная с версии 0.3.4 из данных, отправляемых Windows, удаляются имя ПК, имя пользователя, папка пользователя, имя iPad и названия аудиоустройств, при этом сохраняется только тип каждого аудиоустройства; из данных, отправляемых iPad, удаляется имя ПК. Автоматическую отправку можно отключить в настройках. Диагностические данные хранятся до 30 дней и могут быть удалены раньше. Удалённые или устаревшие данные могут оставаться в ежедневных резервных копиях ещё до 7 дней. См. [Автоматическая диагностика](../SETUP.md#automatic-diagnostics) и [уведомление о конфиденциальности](https://eternalmonitor.dev/privacy.html). На iPad откройте **Настройки** (Settings) > **Поддержка** (Support) > **Диагностика** (Diagnostics), чтобы скопировать или экспортировать отчёт.
 
