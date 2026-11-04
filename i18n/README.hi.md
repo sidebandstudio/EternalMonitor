@@ -74,7 +74,7 @@ EternalMonitor iPad को आपके Windows PC का मॉनिटर ब
 
 ## स्थिति
 
-मौजूदा रिलीज़ Windows के लिए v0.3.4 और iPad के लिए v0.3.4 (build 698) है। यह 0.3.3 में रिपोर्ट की गई समस्याएँ ठीक करती है: AMD और Intel ग्राफ़िक्स पर शुरू होते समय क्रैश, धीमे PC पर USB के साथ फ़्रीज़ होना और Wi-Fi पर धुंधले फ़्रेम। दोनों ऐप अब 11 भाषाओं में उपलब्ध हैं। [RELEASE_NOTES.md](../RELEASE_NOTES.md) हर संस्करण और [ROADMAP.md](../ROADMAP.md) आगे की योजना बताता है।
+मौजूदा रिलीज़ Windows के लिए v0.3.4 और iPad के लिए v0.3.4 (build 698) है। यह 0.3.3 में रिपोर्ट की गई समस्याएँ ठीक करती है: AMD और Intel ग्राफ़िक्स पर शुरू होते समय क्रैश, धीमे PC पर USB के साथ फ़्रीज़ होना और Wi-Fi पर बिगड़े हुए फ़्रेम। दोनों ऐप अब 11 भाषाओं में उपलब्ध हैं। [RELEASE_NOTES.md](../RELEASE_NOTES.md) हर संस्करण और [ROADMAP.md](../ROADMAP.md) आगे की योजना बताता है।
 
 v0.3.4 रिलीज़ जाँच Windows, macOS और iPad सिमुलेटर पर पास हुई। [docs/hardware-verification.md](../docs/hardware-verification.md) में v0.3.0 से वास्तविक PC और iPad पर हुए परीक्षणों के परिणाम हैं।
 

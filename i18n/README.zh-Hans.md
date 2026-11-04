@@ -74,7 +74,7 @@ EternalMonitor 将 iPad 变成 Windows 电脑的显示器。它免费、基于 M
 
 ## 状态
 
-当前版本为 Windows v0.3.4 和 iPad v0.3.4 (build 698)。它修复了 0.3.3 中报告的问题：使用 AMD 和 Intel 显卡时启动崩溃、较慢的电脑通过 USB 连接时卡死，以及通过 Wi-Fi 传输时画面模糊。两个应用现在均支持 11 种语言。[RELEASE_NOTES.md](../RELEASE_NOTES.md) 介绍各版本，[ROADMAP.md](../ROADMAP.md) 介绍后续计划。
+当前版本为 Windows v0.3.4 和 iPad v0.3.4 (build 698)。它修复了 0.3.3 中报告的问题：使用 AMD 和 Intel 显卡时启动崩溃、较慢的电脑通过 USB 连接时卡死，以及通过 Wi-Fi 传输时画面花屏。两个应用现在均支持 11 种语言。[RELEASE_NOTES.md](../RELEASE_NOTES.md) 介绍各版本，[ROADMAP.md](../ROADMAP.md) 介绍后续计划。
 
 v0.3.4 的发行检查已在 Windows、macOS 和 iPad 模拟器上通过。[docs/hardware-verification.md](../docs/hardware-verification.md) 记录了从 v0.3.0 起在真实电脑和 iPad 上进行的实测结果。
 

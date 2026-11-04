@@ -74,7 +74,7 @@ Este README y el [sitio web](https://eternalmonitor.dev) están disponibles en 1
 
 ## Estado
 
-La versión actual es v0.3.4 para Windows y v0.3.4 (build 698) para iPad. Corrige los problemas reportados en 0.3.3: cierres al iniciar con gráficos AMD e Intel, bloqueos de USB en PC más lentos y fotogramas borrosos por Wi-Fi. Ambas aplicaciones están ahora disponibles en 11 idiomas. [RELEASE_NOTES.md](../RELEASE_NOTES.md) cubre todas las versiones y [ROADMAP.md](../ROADMAP.md), lo que viene después.
+La versión actual es v0.3.4 para Windows y v0.3.4 (build 698) para iPad. Corrige los problemas reportados en 0.3.3: cierres al iniciar con gráficos AMD e Intel, bloqueos de USB en PC más lentos y fotogramas dañados por Wi-Fi. Ambas aplicaciones están ahora disponibles en 11 idiomas. [RELEASE_NOTES.md](../RELEASE_NOTES.md) cubre todas las versiones y [ROADMAP.md](../ROADMAP.md), lo que viene después.
 
 Las comprobaciones de la versión v0.3.4 se aprobaron en Windows, macOS y simuladores de iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) registra los resultados de las pruebas prácticas con un PC y un iPad reales desde v0.3.0.
 

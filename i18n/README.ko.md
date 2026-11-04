@@ -74,7 +74,7 @@ EternalMonitor가 유용하다면 별을 눌러 다른 사람들이 찾을 수 �
 
 ## 상태
 
-현재 릴리스는 Windows용 v0.3.4와 iPad용 v0.3.4 (build 698)입니다. 0.3.3에서 보고된 AMD 및 Intel 그래픽의 시작 시 충돌, 느린 PC에서 USB 사용 중 멈춤, Wi-Fi에서 프레임이 뭉개지는 문제를 수정합니다. 두 앱은 이제 11개 언어를 지원합니다. [RELEASE_NOTES.md](../RELEASE_NOTES.md)는 각 버전을, [ROADMAP.md](../ROADMAP.md)는 앞으로의 계획을 설명합니다.
+현재 릴리스는 Windows용 v0.3.4와 iPad용 v0.3.4 (build 698)입니다. 0.3.3에서 보고된 AMD 및 Intel 그래픽의 시작 시 충돌, 느린 PC에서 USB 사용 중 멈춤, Wi-Fi에서 프레임이 깨지는 문제를 수정합니다. 두 앱은 이제 11개 언어를 지원합니다. [RELEASE_NOTES.md](../RELEASE_NOTES.md)는 각 버전을, [ROADMAP.md](../ROADMAP.md)는 앞으로의 계획을 설명합니다.
 
 v0.3.4 릴리스 검사는 Windows, macOS 및 iPad 시뮬레이터에서 통과했습니다. [docs/hardware-verification.md](../docs/hardware-verification.md)에는 v0.3.0부터 실제 PC와 iPad에서 수행한 검증 결과가 기록되어 있습니다.
 
