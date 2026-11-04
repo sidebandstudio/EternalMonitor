@@ -57,11 +57,11 @@ https://testflight.apple.com/join/ppc9QfXc
 ### Current setup
 
 The App Store Connect app and CI signing credentials are configured for
-`sidebandstudio/EternalMonitor`. iPad v0.3.3, build 364, is the current update.
+`sidebandstudio/EternalMonitor`. iPad v0.3.4, build 698, is the current update.
 Apple approved it for external testing. It belongs to `FriendsExternal`, whose
 public link and automatic tester notification are enabled. The current Windows installer is
-[v0.3.3](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3),
-which works with this build. iPad 0.3.3 is not on TestFlight yet.
+[v0.3.4](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4),
+which works with this build.
 
 Build 166 was the previous 0.3.1 release. It does not include the Apple Pencil
 placement fix, Fill or in-app updates. Verify App Store Connect's external build
@@ -223,9 +223,9 @@ for people you want inside the developer account.
 
 Two links:
 
-- The v0.3.3 Windows installer from the release page or
+- The v0.3.4 Windows installer from the release page or
   eternalmonitor.dev/download.html.
-- The TestFlight public link for iPad v0.3.3, build 364, which Apple approved
+- The TestFlight public link for iPad v0.3.4, build 698, which Apple approved
   for external testing.
 
 Tell them where feedback goes: the form at
