@@ -32,10 +32,10 @@
 
 ## البدء السريع
 
-[![تنزيل لنظام Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![تنزيل لنظام Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![الحصول على تطبيق iPad عبر TestFlight](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **ثبّت تطبيق Windows.** شغّل [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) على Windows 10 (الإصدار 1809 أو أحدث) أو Windows 11 بمعمارية 64 بت وبطاقة رسومات NVIDIA أو AMD أو Intel. إذا سأل Windows SmartScreen، اختر **مزيد من المعلومات** ثم **التشغيل على أي حال**. تعرض [صفحة الإصدار](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) قيمة SHA-256 للملف.
+1. **ثبّت تطبيق Windows.** شغّل [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) على Windows 10 (الإصدار 1809 أو أحدث) أو Windows 11 بمعمارية 64 بت وبطاقة رسومات NVIDIA أو AMD أو Intel. إذا سأل Windows SmartScreen، اختر **مزيد من المعلومات** ثم **التشغيل على أي حال**. تعرض [صفحة الإصدار](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4) قيمة SHA-256 للملف.
 2. **ثبّت تطبيق iPad.** على iPad يعمل بنظام iPadOS 17 أو أحدث، ثبّت **TestFlight** من App Store، ثم افتح [رابط EternalMonitor على TestFlight](https://testflight.apple.com/join/ppc9QfXc) على iPad واضغط **تثبيت**.
 3. **اتصل.** افتح التطبيقين على الشبكة نفسها، ثم اضغط على جهاز الكمبيوتر في iPad أو امسح رمز QR الذي يعرضه الكمبيوتر. لاستخدام USB على Windows 10 22H2 أو Windows 11، وصّل الكابل وأبقِ تطبيق [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) المجاني من Apple مفتوحًا على الكمبيوتر.
 
@@ -74,9 +74,9 @@
 
 ## الحالة
 
-الإصدار الحالي هو v0.3.3 لنظام Windows وv0.3.3 (build 364) لجهاز iPad. يتيح **شاشة ثانية** (Second screen) على مزيد من الحواسيب المحمولة ذات بطاقات Intel وNVIDIA: يعرض iPad شاشة الكمبيوتر الرئيسية فورًا، ثم ينتقل إلى الشاشة الثانية عندما يضيفها Windows. يشرح [RELEASE_NOTES.md](../RELEASE_NOTES.md) كل إصدار، ويعرض [ROADMAP.md](../ROADMAP.md) ما سيأتي لاحقًا.
+الإصدار الحالي هو v0.3.4 لنظام Windows وv0.3.4 (build 698) لجهاز iPad. يصلح المشاكل التي أُبلغ عنها في 0.3.3: تعطل التطبيق عند بدء التشغيل مع بطاقات رسومات AMD وIntel، وتجمّده عند استخدام USB على أجهزة الكمبيوتر الأبطأ، وظهور إطارات مشوشة عبر Wi-Fi. يتوفر التطبيقان الآن بـ 11 لغة. يشرح [RELEASE_NOTES.md](../RELEASE_NOTES.md) كل إصدار، ويعرض [ROADMAP.md](../ROADMAP.md) ما سيأتي لاحقًا.
 
-اجتازت اختبارات الإصدار v0.3.3 على Windows وmacOS ومحاكيات iPad. يسجل [docs/hardware-verification.md](../docs/hardware-verification.md) نتائج الاختبارات العملية على كمبيوتر وiPad فعليين منذ v0.3.0.
+اجتازت اختبارات الإصدار v0.3.4 على Windows وmacOS ومحاكيات iPad. يسجل [docs/hardware-verification.md](../docs/hardware-verification.md) نتائج الاختبارات العملية على كمبيوتر وiPad فعليين منذ v0.3.0.
 
 تتضمن تشخيصات Windows وiPad تفاصيل الجهاز وأخطاء التطبيق وإحصاءات البث. تشمل التقارير أسماء بطاقات الرسوميات وشاشات العرض وعناوين الشبكة، لكنها تستثني محتوى الشاشة والصوت وبيانات الاقتران. بدءًا من الإصدار 0.3.4، تزيل البيانات المرسلة من Windows اسم الكمبيوتر واسم المستخدم ومجلد المستخدم واسم iPad وأسماء أجهزة الصوت، مع الاحتفاظ بنوع كل جهاز صوت فقط، بينما تزيل البيانات المرسلة من iPad اسم الكمبيوتر. يمكنك تعطيل المشاركة التلقائية في الإعدادات. تُحتفظ التشخيصات لمدة تصل إلى 30 يومًا وقد تُحذف قبل ذلك. قد تبقى التشخيصات المحذوفة أو المنتهية في النسخ الاحتياطية اليومية لمدة تصل إلى 7 أيام إضافية. راجع [التشخيصات التلقائية](../SETUP.md#automatic-diagnostics) و[إشعار الخصوصية](https://eternalmonitor.dev/privacy.html). على iPad، افتح **الإعدادات** (Settings) > **الدعم** (Support) > **التشخيصات** (Diagnostics) لنسخ تقرير أو تصديره.
 

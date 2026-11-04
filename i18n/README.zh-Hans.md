@@ -32,10 +32,10 @@ EternalMonitor 将 iPad 变成 Windows 电脑的显示器。它免费、基于 M
 
 ## 快速开始
 
-[![下载 Windows 版](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![下载 Windows 版](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![通过 TestFlight 获取 iPad 应用](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **安装 Windows 应用。** 在配备 NVIDIA、AMD 或 Intel 显卡的 64 位 Windows 10（版本 1809 或更高）或 Windows 11 上运行 [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)。如果 Windows SmartScreen 提示，请选择**更多信息**，然后选择**仍要运行**。[发行页面](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)列出了文件的 SHA-256。
+1. **安装 Windows 应用。** 在配备 NVIDIA、AMD 或 Intel 显卡的 64 位 Windows 10（版本 1809 或更高）或 Windows 11 上运行 [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)。如果 Windows SmartScreen 提示，请选择**更多信息**，然后选择**仍要运行**。[发行页面](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4)列出了文件的 SHA-256。
 2. **安装 iPad 应用。** 在运行 iPadOS 17 或更高版本的 iPad 上，从 App Store 安装 **TestFlight**，然后在 iPad 上打开 [EternalMonitor TestFlight 链接](https://testflight.apple.com/join/ppc9QfXc)并轻点**安装**。
 3. **连接。** 在同一网络上打开两个应用，在 iPad 上轻点你的电脑，或扫描电脑显示的 QR 码。在 Windows 10 22H2 或 Windows 11 上使用 USB 时，请连接线缆，并在电脑上保持 Apple 的免费应用 [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) 打开。
 
@@ -74,9 +74,9 @@ EternalMonitor 将 iPad 变成 Windows 电脑的显示器。它免费、基于 M
 
 ## 状态
 
-当前版本为 Windows v0.3.3 和 iPad v0.3.3 (build 364)。它让更多配备 Intel 和 NVIDIA 显卡的笔记本电脑支持**第二屏幕** (Second screen)：iPad 会立即显示电脑主屏幕，等 Windows 添加第二屏幕后切换过去。[RELEASE_NOTES.md](../RELEASE_NOTES.md) 介绍各版本，[ROADMAP.md](../ROADMAP.md) 介绍后续计划。
+当前版本为 Windows v0.3.4 和 iPad v0.3.4 (build 698)。它修复了 0.3.3 中报告的问题：使用 AMD 和 Intel 显卡时启动崩溃、较慢的电脑通过 USB 连接时卡死，以及通过 Wi-Fi 传输时画面模糊。两个应用现在均支持 11 种语言。[RELEASE_NOTES.md](../RELEASE_NOTES.md) 介绍各版本，[ROADMAP.md](../ROADMAP.md) 介绍后续计划。
 
-v0.3.3 的发行检查已在 Windows、macOS 和 iPad 模拟器上通过。[docs/hardware-verification.md](../docs/hardware-verification.md) 记录了从 v0.3.0 起在真实电脑和 iPad 上进行的实测结果。
+v0.3.4 的发行检查已在 Windows、macOS 和 iPad 模拟器上通过。[docs/hardware-verification.md](../docs/hardware-verification.md) 记录了从 v0.3.0 起在真实电脑和 iPad 上进行的实测结果。
 
 Windows 和 iPad 的诊断信息包括设备详情、应用错误和串流统计数据。报告包含显卡和显示器名称及网络地址，但不包含屏幕内容、音频或配对凭据。从 0.3.4 起，Windows 上传的数据会移除电脑名称、用户名、用户文件夹、iPad 名称和音频设备名称，仅保留每个音频设备的类型；iPad 上传的数据会移除电脑名称。可在**设置** (Settings) 中关闭自动共享。诊断信息最多保留 30 天，也可能提前删除。已删除或过期的诊断信息可能在每日备份中再保留最多 7 天。参见[自动诊断](../SETUP.md#automatic-diagnostics)和[隐私声明](https://eternalmonitor.dev/privacy.html)。在 iPad 上，打开**设置** (Settings) > **支持** (Support) > **诊断** (Diagnostics) 以复制或导出报告。
 
