@@ -52,28 +52,27 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
         "{body}"
     );
 
-    // A rule for every program: Setup can't remove it, so no Setup advice.
+    // A rule for every program: Setup can't remove it, so it is only
+    // logged, alone or beside this exe's own block.
     let everyone = report(
         &[profile(PUBLIC, false)],
         &[allow.clone(), Rule::unscoped("", false, PUBLIC)],
         true,
     );
-    let (title, body) = firewall_notice(Some(&everyone), false).unwrap();
-    assert_eq!(
-        title,
-        "A Windows Firewall rule blocks EternalMonitor's port"
-    );
-    assert!(body.contains("blocks port 9876 for all apps"), "{body}");
-    assert!(body.contains("Windows Security"), "{body}");
-    assert!(!body.contains("installer"), "{body}");
+    assert_eq!(firewall_notice(Some(&everyone), false), None);
     let mine_too = report(
         &[profile(PUBLIC, false)],
         &[block(PUBLIC), Rule::unscoped("", false, PUBLIC)],
         true,
     );
-    let (_, body) = firewall_notice(Some(&mine_too), false).unwrap();
-    assert!(!body.contains("installer"), "{body}");
-    assert_eq!(firewall_notice(Some(&everyone), true), None);
+    assert_eq!(firewall_notice(Some(&mine_too), false), None);
+    // An Allow rule that asks for IPsec may let traffic past: not shown.
+    let bypass = Rule {
+        secure_flags: Some(2),
+        ..allow.clone()
+    };
+    let maybe = report(&[profile(PUBLIC, false)], &[bypass, block(PUBLIC)], true);
+    assert_eq!(firewall_notice(Some(&maybe), false), None);
 
     // Not certain for the network an iPad uses: logged, not shown.
     let one_of_two = report(

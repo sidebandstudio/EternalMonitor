@@ -173,6 +173,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "block_rules",
     "all_programs_block_rules",
     "scoped_block_rules",
+    "bypass_rules",
     "lan",
     "verdict",
     // The virtual display snapshot.

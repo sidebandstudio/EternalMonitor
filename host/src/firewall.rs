@@ -9,10 +9,13 @@
 //! the result when it changes.
 //!
 //! The Stream page warns only when the block is certain for the network an
-//! iPad would use: every profile in use blocks, the PC has a home network
-//! address, and no iPad is connected. A Block rule scoped to some addresses,
-//! interfaces or a service, or a block on one of two networks, is only
-//! logged.
+//! iPad would use, and only for what Setup or one switch removes: this
+//! exe's own unscoped Block rule, or "Blocks all incoming connections", on
+//! every profile in use, with a home network address and no iPad connected.
+//! Everything else is only logged: a Block rule for every program or one
+//! scoped to some addresses, interfaces, a service, a package, users or
+//! machines, a block on one of two networks, and any block an Allow rule
+//! asking for IPsec might let traffic past.
 //!
 //! The log line names profiles and counts rules. It holds no path, rule name
 //! or address.
@@ -66,6 +69,16 @@ pub struct Rule {
     pub interfaces: Option<bool>,
     /// The rule is for a service, not every process of the program.
     pub service: Option<String>,
+    /// INetFwRule3's restrictions: an app package, a user owning the
+    /// process, and users or machines allowed to connect. Any of them limits
+    /// whose traffic the rule is for.
+    pub package: Option<String>,
+    pub local_user_owner: Option<String>,
+    pub local_users: Option<String>,
+    pub remote_users: Option<String>,
+    pub remote_machines: Option<String>,
+    /// `NET_FW_AUTHENTICATE_TYPE`: 0 is none; anything else asks for IPsec.
+    pub secure_flags: Option<i32>,
 }
 
 impl Rule {
@@ -85,6 +98,12 @@ impl Rule {
             interface_types: Some("All".into()),
             interfaces: Some(false),
             service: Some(String::new()),
+            package: Some(String::new()),
+            local_user_owner: Some(String::new()),
+            local_users: Some(String::new()),
+            remote_users: Some(String::new()),
+            remote_machines: Some(String::new()),
+            secure_flags: Some(0),
         }
     }
 }
@@ -99,6 +118,12 @@ pub enum Field {
     RemoteAddresses,
     InterfaceTypes,
     Service,
+    /// INetFwRule3 from here on.
+    Package,
+    LocalUserOwner,
+    LocalUsers,
+    RemoteUsers,
+    RemoteMachines,
 }
 
 /// A rule as Windows hands it out. Each getter can fail on its own.
@@ -112,6 +137,8 @@ pub trait RuleSource {
     fn text(&self, field: Field) -> Result<String, String>;
     /// Whether the rule names particular interfaces.
     fn interfaces_listed(&self) -> Result<bool, String>;
+    /// INetFwRule3's `SecureFlags`.
+    fn secure_flags(&self) -> Result<i32, String>;
 }
 
 /// The inbound rule `source` describes, or `None` for an outbound one. A
@@ -136,6 +163,12 @@ pub fn rule_from(source: &impl RuleSource) -> Result<Option<Rule>, String> {
         interface_types: text(Field::InterfaceTypes),
         interfaces: source.interfaces_listed().ok(),
         service: text(Field::Service),
+        package: text(Field::Package),
+        local_user_owner: text(Field::LocalUserOwner),
+        local_users: text(Field::LocalUsers),
+        remote_users: text(Field::RemoteUsers),
+        remote_machines: text(Field::RemoteMachines),
+        secure_flags: source.secure_flags().ok(),
     }))
 }
 
@@ -144,8 +177,9 @@ pub fn rule_from(source: &impl RuleSource) -> Result<Option<Rule>, String> {
 pub enum Reach {
     /// Every datagram an iPad sends to the stream port.
     All,
-    /// Only some, or unknown: it names addresses, ports, interfaces or a
-    /// service, or a field of it could not be read.
+    /// Only some, or unknown: it names addresses, ports, interfaces, a
+    /// service, a package, users or machines, asks for IPsec, or a field of
+    /// it could not be read.
     Some,
     /// None of it: another port.
     None,
@@ -196,7 +230,17 @@ pub fn reach(rule: &Rule, port: u16) -> Reach {
         && any(&rule.remote_addresses)
         && all_types
         && rule.interfaces == Some(false)
-        && rule.service.as_deref().is_some_and(|s| s.trim().is_empty());
+        && [
+            &rule.service,
+            &rule.package,
+            &rule.local_user_owner,
+            &rule.local_users,
+            &rule.remote_users,
+            &rule.remote_machines,
+        ]
+        .iter()
+        .all(|value| value.as_deref().is_some_and(|v| v.trim().is_empty()))
+        && rule.secure_flags == Some(0);
     if unscoped {
         Reach::All
     } else {
@@ -278,19 +322,18 @@ pub struct Report {
     /// Block rules that reach only some of the stream's traffic, or that
     /// could not be read whole.
     pub scoped_block_rules: usize,
+    /// Allow rules for this exe or every program that may let IPsec
+    /// traffic past Block rules (see [`judge`]).
+    pub bypass_rules: usize,
     /// The PC has a home network address (see [`crate::network::Reach::Lan`]).
     pub lan: bool,
 }
 
-/// What the Stream page may say: a block certain on every network in use.
+/// What the Stream page may say: a block certain on every network in use,
+/// and one Setup or a single switch removes. A rule for every program is
+/// only logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CertainBlock {
-    /// A rule for every program blocks the stream's port: Setup can't remove
-    /// it. On `all_blocked` networks "Blocks all incoming connections" too.
-    AllPrograms {
-        port: u16,
-        all_blocked: Vec<&'static str>,
-    },
     /// Block rules for this exe, and on `all_blocked` networks "Blocks all
     /// incoming connections" as well.
     Rule { all_blocked: Vec<&'static str> },
@@ -302,7 +345,9 @@ impl Report {
     /// The whole picture in one word for the log.
     pub fn verdict(&self) -> &'static str {
         let blocking = self.profiles.iter().filter(|(_, v)| v.blocks()).count();
-        if !self.profiles.is_empty() && blocking == self.profiles.len() {
+        if blocking > 0 && self.bypass_rules > 0 {
+            "uncertain"
+        } else if !self.profiles.is_empty() && blocking == self.profiles.len() {
             "blocked"
         } else if blocking > 0 {
             "partly_blocked"
@@ -315,11 +360,18 @@ impl Report {
         }
     }
 
-    /// A block certain for the network an iPad would use: every profile in
-    /// use blocks, and the PC has a home network address. Otherwise `None`,
-    /// and the log line says what is known.
+    /// A block certain for the network an iPad would use, and one Setup or
+    /// a single switch removes: every profile in use is blocked by this
+    /// exe's own rule or blocks all incoming connections, the PC has a home
+    /// network address, and no Allow rule may let traffic past. Otherwise
+    /// `None`, and the log line says what is known.
     pub fn certain_block(&self) -> Option<CertainBlock> {
-        if !self.lan || self.profiles.is_empty() || !self.profiles.iter().all(|(_, v)| v.blocks()) {
+        let fixable = |v: &Verdict| matches!(v, Verdict::Blocked | Verdict::BlocksAll);
+        if !self.lan
+            || self.bypass_rules > 0
+            || self.profiles.is_empty()
+            || !self.profiles.iter().all(|(_, v)| fixable(v))
+        {
             return None;
         }
         let all_blocked: Vec<_> = self
@@ -328,22 +380,11 @@ impl Report {
             .filter(|(_, v)| *v == Verdict::BlocksAll)
             .map(|(bit, _)| profile_name(*bit))
             .collect();
-        Some(
-            if self
-                .profiles
-                .iter()
-                .any(|(_, v)| *v == Verdict::BlockedForAllApps)
-            {
-                CertainBlock::AllPrograms {
-                    port: self.port,
-                    all_blocked,
-                }
-            } else if all_blocked.len() == self.profiles.len() {
-                CertainBlock::AllIncoming(all_blocked)
-            } else {
-                CertainBlock::Rule { all_blocked }
-            },
-        )
+        Some(if all_blocked.len() == self.profiles.len() {
+            CertainBlock::AllIncoming(all_blocked)
+        } else {
+            CertainBlock::Rule { all_blocked }
+        })
     }
 
     /// The log line: profile names, verdicts and counts only.
@@ -354,12 +395,13 @@ impl Report {
             .map(|(bit, verdict)| format!("{}:{}", profile_name(*bit), verdict.label()))
             .collect();
         format!(
-            "Windows Firewall: profiles=[{}] allow_rules={} block_rules={} all_programs_block_rules={} scoped_block_rules={} lan={} verdict={}",
+            "Windows Firewall: profiles=[{}] allow_rules={} block_rules={} all_programs_block_rules={} scoped_block_rules={} bypass_rules={} lan={} verdict={}",
             profiles.join(" "),
             self.allow_rules,
             self.block_rules,
             self.all_programs_block_rules,
             self.scoped_block_rules,
+            self.bypass_rules,
             self.lan,
             self.verdict(),
         )
@@ -445,6 +487,22 @@ pub fn judge(
         |r: &Rule, whose, reach| !r.allow && whose == Whose::AllPrograms && reach == Reach::All;
     let unsure =
         |r: &Rule, whose, reach| !r.allow && (whose == Whose::Unknown || reach == Reach::Some);
+    // An Allow rule that asks for IPsec (SecureFlags) can come with
+    // "Override block rules": IPsec-authenticated traffic then gets past
+    // Block rules for the exe. iPads never authenticate, so it changes
+    // nothing for them, but the COM API doesn't say whether the override is
+    // set: any such rule, or one whose flags couldn't be read, makes a block
+    // uncertain. Protocol and port aren't looked at: fewer warnings, never
+    // a wrong one.
+    let bypass_rules = rules
+        .iter()
+        .filter(|r| {
+            r.enabled
+                && r.allow
+                && r.secure_flags != Some(0)
+                && matches!(whose(r, exe, &lookup), Whose::Ours | Whose::AllPrograms)
+        })
+        .count();
     let verdicts = profiles
         .iter()
         .map(|p| {
@@ -471,6 +529,7 @@ pub fn judge(
         block_rules: count(on, &ours),
         all_programs_block_rules: count(on, &everyone),
         scoped_block_rules: count(on, &unsure),
+        bypass_rules,
         lan,
     }
 }
@@ -548,8 +607,8 @@ mod windows_policy {
     use windows::core::{IUnknown, Interface, VARIANT};
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::NetworkManagement::WindowsFirewall::{
-        INetFwPolicy2, INetFwRule, NetFwPolicy2, NET_FW_ACTION_ALLOW, NET_FW_PROFILE_TYPE2,
-        NET_FW_RULE_DIR_IN,
+        INetFwPolicy2, INetFwRule, INetFwRule3, NetFwPolicy2, NET_FW_ACTION_ALLOW,
+        NET_FW_PROFILE_TYPE2, NET_FW_RULE_DIR_IN,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -635,6 +694,16 @@ mod windows_policy {
                     Field::RemoteAddresses => self.RemoteAddresses(),
                     Field::InterfaceTypes => self.InterfaceTypes(),
                     Field::Service => self.ServiceName(),
+                    restriction => {
+                        let rule3: INetFwRule3 = self.cast().map_err(|e| e.to_string())?;
+                        match restriction {
+                            Field::Package => rule3.LocalAppPackageId(),
+                            Field::LocalUserOwner => rule3.LocalUserOwner(),
+                            Field::LocalUsers => rule3.LocalUserAuthorizedList(),
+                            Field::RemoteUsers => rule3.RemoteUserAuthorizedList(),
+                            _ => rule3.RemoteMachineAuthorizedList(),
+                        }
+                    }
                 }
             };
             value.map(|v| v.to_string()).map_err(|e| e.to_string())
@@ -644,6 +713,11 @@ mod windows_policy {
             Ok(!unsafe { self.Interfaces() }
                 .map_err(|e| e.to_string())?
                 .is_empty())
+        }
+
+        fn secure_flags(&self) -> Result<i32, String> {
+            let rule3: INetFwRule3 = self.cast().map_err(|e| e.to_string())?;
+            unsafe { rule3.SecureFlags() }.map_err(|e| e.to_string())
         }
     }
 
@@ -891,9 +965,10 @@ mod tests {
     }
 
     /// A rule for every program blocks the stream as surely as one for this
-    /// exe, but Setup's delete by program can't remove it.
+    /// exe, but Setup's delete by program can't remove it: it is logged and
+    /// never shown.
     #[test]
-    fn a_block_for_every_program_on_the_port_is_certain_and_told_apart() {
+    fn a_block_for_every_program_on_the_port_is_logged_not_shown() {
         let everyone = report(
             &[on(PUBLIC)],
             &[installer_rule(), Rule::unscoped("", false, PUBLIC)],
@@ -904,23 +979,15 @@ mod tests {
             (0, 1)
         );
         assert_eq!(everyone.verdict(), "blocked");
-        assert_eq!(
-            everyone.certain_block(),
-            Some(CertainBlock::AllPrograms {
-                port: PORT,
-                all_blocked: vec![]
-            })
-        );
-        // With this exe's own block as well, the all-programs one decides
-        // the advice: re-running Setup would leave it.
+        assert_eq!(everyone.certain_block(), None);
+        assert!(everyone.summary().contains("public:blocked_all_programs"));
+        // With this exe's own block as well: Setup would leave the other.
         let both = report(
             &[on(PUBLIC)],
             &[prompt_block(PUBLIC), Rule::unscoped("  ", false, PUBLIC)],
         );
-        assert!(matches!(
-            both.certain_block(),
-            Some(CertainBlock::AllPrograms { .. })
-        ));
+        assert_eq!(both.profiles, [(PUBLIC, Verdict::BlockedForAllApps)]);
+        assert_eq!(both.certain_block(), None);
         // Another port, or scoped: not a block, or only logged.
         let other_port = Rule {
             local_ports: Some("443".into()),
@@ -992,11 +1059,19 @@ mod tests {
                 Field::RemoteAddresses => ("remote_addresses", &self.rule.remote_addresses),
                 Field::InterfaceTypes => ("interface_types", &self.rule.interface_types),
                 Field::Service => ("service", &self.rule.service),
+                Field::Package => ("package", &self.rule.package),
+                Field::LocalUserOwner => ("local_user_owner", &self.rule.local_user_owner),
+                Field::LocalUsers => ("local_users", &self.rule.local_users),
+                Field::RemoteUsers => ("remote_users", &self.rule.remote_users),
+                Field::RemoteMachines => ("remote_machines", &self.rule.remote_machines),
             };
             self.get(name, value.clone().unwrap_or_default())
         }
         fn interfaces_listed(&self) -> Result<bool, String> {
             self.get("interfaces", self.rule.interfaces.unwrap_or(false))
+        }
+        fn secure_flags(&self) -> Result<i32, String> {
+            self.get("secure_flags", self.rule.secure_flags.unwrap_or(0))
         }
     }
 
@@ -1015,7 +1090,8 @@ mod tests {
         for block in [prompt_block(PUBLIC), Rule::unscoped("", false, PUBLIC)] {
             let read = rule_from(&fake(block.clone(), None)).unwrap().unwrap();
             assert_eq!(read, block);
-            assert!(report(&[on(PUBLIC)], &[read]).certain_block().is_some());
+            // Read whole, it blocks (this exe's rule or every program's).
+            assert!(report(&[on(PUBLIC)], &[read]).profiles[0].1.blocks());
             for broken in [
                 "program",
                 "local_ports",
@@ -1025,6 +1101,12 @@ mod tests {
                 "interface_types",
                 "interfaces",
                 "service",
+                "package",
+                "local_user_owner",
+                "local_users",
+                "remote_users",
+                "remote_machines",
+                "secure_flags",
             ] {
                 let read = rule_from(&fake(block.clone(), Some(broken)))
                     .unwrap()
@@ -1051,6 +1133,103 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(report(&[on(PUBLIC)], &[other]).scoped_block_rules, 0);
+    }
+
+    /// INetFwRule3's restrictions limit whose traffic a rule is for: a
+    /// package-only rule for every program is not a block on this exe. Each
+    /// one, set or unread, makes a rule scoped.
+    #[test]
+    fn a_rule_limited_to_a_package_user_or_machine_is_never_certain() {
+        type Set = fn(&mut Rule);
+        let limits: [(&str, Set); 6] = [
+            ("package", |r| r.package = Some("S-1-15-2-1".into())),
+            ("local_user_owner", |r| {
+                r.local_user_owner = Some("S-1-5-21-1".into())
+            }),
+            ("local_users", |r| {
+                r.local_users = Some("O:LSD:(A;;CC;;;S-1-5-21-1)".into())
+            }),
+            ("remote_users", |r| {
+                r.remote_users = Some("O:LSD:(A;;CC;;;S-1-5-21-2)".into())
+            }),
+            ("remote_machines", |r| {
+                r.remote_machines = Some("O:LSD:(A;;CC;;;S-1-5-21-3)".into())
+            }),
+            ("secure_flags", |r| r.secure_flags = Some(1)),
+        ];
+        for program in [EXE.to_lowercase(), String::new()] {
+            for (name, set) in limits {
+                let mut limited = Rule::unscoped(&program, false, PUBLIC);
+                set(&mut limited);
+                let read = rule_from(&fake(limited, None)).unwrap().unwrap();
+                let judged = report(&[on(PUBLIC)], &[installer_rule(), read]);
+                assert_eq!(
+                    judged.profiles,
+                    [(PUBLIC, Verdict::Allowed)],
+                    "{name} {program:?}"
+                );
+                assert_eq!(judged.scoped_block_rules, 1, "{name}");
+                assert_eq!(judged.certain_block(), None, "{name}");
+            }
+        }
+        // Empty restrictions and no IPsec: the prompt's rule as Windows
+        // stores it stays a certain block.
+        let plain = rule_from(&fake(prompt_block(PUBLIC), None))
+            .unwrap()
+            .unwrap();
+        assert!(report(&[on(PUBLIC)], &[plain]).certain_block().is_some());
+    }
+
+    /// An Allow rule asking for IPsec may override Block rules for
+    /// authenticated traffic. Whatever blocks, the verdict is uncertain and
+    /// nothing is shown; it is logged as bypass_rules.
+    #[test]
+    fn an_allow_rule_that_may_bypass_blocks_makes_any_block_uncertain() {
+        let secure = |program: &str, flags: Option<i32>| Rule {
+            secure_flags: flags,
+            ..Rule::unscoped(program, true, 0x7fff_ffff)
+        };
+        let shields = Profile {
+            block_all_inbound: true,
+            ..on(PUBLIC)
+        };
+        for bypass in [
+            secure(EXE, Some(2)),
+            secure("", Some(4)),
+            secure(&EXE.to_lowercase(), None),
+        ] {
+            for (profiles, rules) in [
+                (vec![on(PUBLIC)], vec![prompt_block(PUBLIC), bypass.clone()]),
+                (vec![shields], vec![bypass.clone()]),
+            ] {
+                let judged = report(&profiles, &rules);
+                assert_eq!(judged.bypass_rules, 1, "{bypass:?}");
+                assert_eq!(judged.verdict(), "uncertain");
+                assert_eq!(judged.certain_block(), None);
+                assert!(judged.summary().contains("bypass_rules=1 "));
+            }
+        }
+        // Not ours, disabled, or a Block rule: no bypass.
+        let others = [
+            secure(r"C:\Tools\Other.exe", Some(2)),
+            Rule {
+                enabled: false,
+                ..secure(EXE, Some(2))
+            },
+            Rule {
+                allow: false,
+                remote_addresses: Some("10.0.0.0/8".into()),
+                ..secure(EXE, Some(2))
+            },
+        ];
+        for other in others {
+            let judged = report(&[on(PUBLIC)], &[prompt_block(PUBLIC), other.clone()]);
+            assert_eq!(judged.bypass_rules, 0, "{other:?}");
+            assert!(judged.certain_block().is_some(), "{other:?}");
+        }
+        // Nothing blocks: a bypass rule alone changes nothing.
+        let open = report(&[on(PUBLIC)], &[secure(EXE, Some(2))]);
+        assert_eq!(open.verdict(), "allowed");
     }
 
     /// The fields the verdict can't do without fail the whole reading,
@@ -1293,7 +1472,7 @@ mod tests {
         assert_eq!(
             report.summary(),
             "Windows Firewall: profiles=[private:allowed public:blocked] allow_rules=1 \
-             block_rules=1 all_programs_block_rules=0 scoped_block_rules=1 lan=true verdict=partly_blocked"
+             block_rules=1 all_programs_block_rules=0 scoped_block_rules=1 bypass_rules=0 lan=true verdict=partly_blocked"
         );
         let line = format!("2026-11-05T12:00:00.000000Z  WARN {}", report.summary());
         assert_eq!(crate::telemetry::uploaded(&line), line);

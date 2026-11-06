@@ -1359,9 +1359,9 @@ pub(super) fn usb_cable_notice(
 }
 
 /// What the Stream page says while Windows Firewall keeps iPads out: only
-/// for a block certain on the network an iPad would use (see
-/// [`crate::firewall::Report::certain_block`]), and never while an iPad is
-/// connected, over Wi-Fi or the cable.
+/// for a block certain on the network an iPad would use that Setup or one
+/// switch removes (see [`crate::firewall::Report::certain_block`]), and
+/// never while an iPad is connected, over Wi-Fi or the cable.
 pub(super) fn firewall_notice(
     report: Option<&crate::firewall::Report>,
     session_active: bool,
@@ -1379,19 +1379,6 @@ pub(super) fn firewall_notice(
         )
     };
     Some(match report?.certain_block()? {
-        // Setup removes only this exe's rules: it can't help here.
-        CertainBlock::AllPrograms { port, all_blocked } => {
-            let mut body = format!(
-                "{lead} A Windows Firewall rule blocks port {port} for all apps. In Windows Security, open Firewall & network protection, then Advanced settings, and turn off that rule under Inbound Rules."
-            );
-            if !all_blocked.is_empty() {
-                body = format!("{body} {}", turn_off(&all_blocked));
-            }
-            (
-                "A Windows Firewall rule blocks EternalMonitor's port".into(),
-                format!("{body} {usb}"),
-            )
-        }
         CertainBlock::Rule { all_blocked } => {
             let mut body =
                 format!("{lead} Run the EternalMonitor installer again: it removes the block.");
