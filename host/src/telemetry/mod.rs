@@ -1863,6 +1863,40 @@ mod tests {
         assert_eq!(event_with(&stamped, "info", &names).message, stamped);
     }
 
+    /// The Windows Firewall line uploads byte for byte, even when the PC or
+    /// user is named like one of its tokens; the same names elsewhere go.
+    #[test]
+    fn the_firewall_line_is_never_redacted() {
+        let names = redact::Names::new(Some(r"C:\Users\blocked"), Some("blocked"), Some("public"));
+        let profiles = |bit| crate::firewall::Profile {
+            bit,
+            on: true,
+            block_all_inbound: false,
+        };
+        let exe = std::path::Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe");
+        let report = crate::firewall::judge(
+            &[
+                profiles(crate::firewall::PRIVATE),
+                profiles(crate::firewall::PUBLIC),
+            ],
+            &[crate::firewall::Rule::unscoped(
+                &exe.to_string_lossy().to_lowercase(),
+                false,
+                crate::firewall::PUBLIC,
+            )],
+            exe,
+            9876,
+            true,
+            |_| None,
+        );
+        let stamped = format!("2026-11-06T02:04:08.196847Z  WARN {}", report.summary());
+        assert!(stamped.contains("public:blocked"), "{stamped}");
+        assert_eq!(event_with(&stamped, "warn", &names).message, stamped);
+        let named = "2026-11-06T02:04:08.196847Z  INFO Signed in as blocked on public";
+        let uploaded = event_with(named, "info", &names).message;
+        assert!(!uploaded.contains(" blocked on public"), "{uploaded}");
+    }
+
     /// Names that are also the summary's own tokens leave it byte for byte,
     /// while the same words elsewhere are names.
     /// A line is redacted as it is queued: a device name the registry lets

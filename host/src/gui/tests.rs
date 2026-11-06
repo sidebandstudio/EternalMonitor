@@ -13,41 +13,76 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
         on: true,
         block_all_inbound,
     };
-    let rule = |allow| Rule {
-        program: exe.to_string_lossy().to_lowercase(),
-        allow,
-        enabled: true,
-        udp: true,
-        profiles: PUBLIC,
-    };
-    let notice = |profiles: &[Profile], rules: &[Rule]| {
-        firewall_notice(&judge(profiles, rules, exe, |_| None))
+    let block = |profiles| Rule::unscoped(&exe.to_string_lossy().to_lowercase(), false, profiles);
+    let allow = Rule::unscoped(&exe.to_string_lossy(), true, 0x7fff_ffff);
+    let report = |profiles: &[Profile], rules: &[Rule], lan| {
+        judge(profiles, rules, exe, 9876, lan, |_| None)
     };
 
-    let (title, body) = notice(&[profile(PUBLIC, false)], &[rule(true), rule(false)]).unwrap();
+    let blocked = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&blocked), false).unwrap();
     assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
     assert!(
         body.contains("Run the EternalMonitor installer again"),
         "{body}"
     );
     assert!(body.contains("A USB cable still works."), "{body}");
+    // Any connected iPad, over Wi-Fi or the cable, hides it.
+    assert_eq!(firewall_notice(Some(&blocked), true), None);
+    // No reading, or the last read failed.
+    assert_eq!(firewall_notice(None, false), None);
 
-    let (title, body) = notice(
-        &[profile(PRIVATE, false), profile(PUBLIC, true)],
-        &[rule(true)],
-    )
-    .unwrap();
+    let shields = report(&[profile(PUBLIC, true)], std::slice::from_ref(&allow), true);
+    let (title, body) = firewall_notice(Some(&shields), false).unwrap();
     assert_eq!(title, "Windows Firewall blocks every incoming connection");
     assert!(body.contains("choose the public network"), "{body}");
+    let both = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, true)],
+        &[block(PRIVATE)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&both), false).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    assert!(
+        body.contains("installer again") && body.contains("choose the public network"),
+        "{body}"
+    );
 
-    assert_eq!(notice(&[profile(PUBLIC, false)], &[rule(true)]), None);
-    // No rule it can read: a port rule may still let iPads in.
-    assert_eq!(notice(&[profile(PUBLIC, false)], &[]), None);
-    let off = Profile {
-        on: false,
-        ..profile(PUBLIC, true)
+    // Not certain for the network an iPad uses: logged, not shown.
+    let one_of_two = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&one_of_two), false), None);
+    let scoped = Rule {
+        remote_addresses: "LocalSubnet".into(),
+        ..block(PUBLIC)
     };
-    assert_eq!(notice(&[off], &[rule(false)]), None);
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[scoped], true)),
+            false
+        ),
+        None
+    );
+    let no_lan = report(&[profile(PUBLIC, false)], &[block(PUBLIC)], false);
+    assert_eq!(firewall_notice(Some(&no_lan), false), None);
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[allow], true)),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        firewall_notice(Some(&report(&[profile(PUBLIC, false)], &[], true)), false),
+        None
+    );
 }
 
 #[test]

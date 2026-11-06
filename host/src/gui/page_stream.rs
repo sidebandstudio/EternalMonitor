@@ -56,10 +56,8 @@ impl AnalyzerApp {
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
-        let on_wifi = client.peer.is_some() && !client.on_usb();
-        if let Some((title, body)) = crate::firewall::latest()
-            .filter(|_| !on_wifi)
-            .and_then(|report| firewall_notice(&report))
+        if let Some((title, body)) =
+            firewall_notice(crate::firewall::latest().as_ref(), client.peer.is_some())
         {
             widgets::banner(ui, WARNING, Icon::Warning, &title, &body, 0.0, |_| {});
             ui.add_space(GAP - 10.0);
@@ -1360,26 +1358,43 @@ pub(super) fn usb_cable_notice(
     })
 }
 
-/// What the Stream page says while Windows Firewall keeps iPads out. Only
-/// for blocks it is sure of: a missing rule may be made up for by a rule it
-/// doesn't read, such as one for the port.
-pub(super) fn firewall_notice(report: &crate::firewall::Report) -> Option<(String, String)> {
-    use crate::firewall::Verdict;
-    let usb = "A USB cable still works.";
-    match report.verdict {
-        Verdict::Blocked => Some((
-            "Windows Firewall is blocking EternalMonitor".into(),
-            format!("iPads on Wi-Fi can't reach this PC, so they say it didn't answer. Run the EternalMonitor installer again: it removes the block. {usb}"),
-        )),
-        Verdict::BlocksAll => {
-            let network = report.blocking_profiles().join(" and ");
-            Some((
-                "Windows Firewall blocks every incoming connection".into(),
-                format!("iPads on Wi-Fi can't reach this PC, so they say it didn't answer. In Windows Security, open Firewall & network protection, choose the {network} network and turn off Blocks all incoming connections. {usb}"),
-            ))
-        }
-        Verdict::Allowed | Verdict::NoRule | Verdict::Off => None,
+/// What the Stream page says while Windows Firewall keeps iPads out: only
+/// for a block certain on the network an iPad would use (see
+/// [`crate::firewall::Report::certain_block`]), and never while an iPad is
+/// connected, over Wi-Fi or the cable.
+pub(super) fn firewall_notice(
+    report: Option<&crate::firewall::Report>,
+    session_active: bool,
+) -> Option<(String, String)> {
+    use crate::firewall::CertainBlock;
+    if session_active {
+        return None;
     }
+    let lead = "iPads on Wi-Fi can't reach this PC, so they say it didn't answer.";
+    let usb = "A USB cable still works.";
+    let turn_off = |networks: &[&str]| {
+        format!(
+            "In Windows Security, open Firewall & network protection, choose the {} network and turn off Blocks all incoming connections.",
+            networks.join(" and ")
+        )
+    };
+    Some(match report?.certain_block()? {
+        CertainBlock::Rule { all_blocked } => {
+            let mut body =
+                format!("{lead} Run the EternalMonitor installer again: it removes the block.");
+            if !all_blocked.is_empty() {
+                body = format!("{body} {}", turn_off(&all_blocked));
+            }
+            (
+                "Windows Firewall is blocking EternalMonitor".into(),
+                format!("{body} {usb}"),
+            )
+        }
+        CertainBlock::AllIncoming(networks) => (
+            "Windows Firewall blocks every incoming connection".into(),
+            format!("{lead} {} {usb}", turn_off(&networks)),
+        ),
+    })
 }
 
 /// What the USB row says. The Apple Devices hint appears only when Apple's
