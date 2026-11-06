@@ -379,8 +379,10 @@ pub fn default_route() -> Option<IpAddr> {
         .map(|addr| addr.ip())
 }
 
-/// The startup line: address counts by reach, the default route's reach and
-/// the kinds of adapters with an address. No address and no adapter name.
+/// The startup line: address counts by reach, the default route's reach, the
+/// kinds of adapters with an address and the kinds with a home network
+/// address, which tell a PC on a cable from one on Wi-Fi. No address and no
+/// adapter name.
 pub fn summary(adapters: Option<&[Adapter]>, route: Option<IpAddr>) -> String {
     let Some(adapters) = adapters else {
         return "Network: addresses unavailable".to_string();
@@ -394,17 +396,25 @@ pub fn summary(adapters: Option<&[Adapter]>, route: Option<IpAddr>) -> String {
             .find(|address| IpAddr::V4(address.ip) == ip)
             .map_or("unknown", |address| address.reach.label()),
     };
-    let mut kinds: Vec<&str> = ranked.iter().map(|address| address.kind.label()).collect();
-    kinds.sort_unstable();
-    kinds.dedup();
+    let kinds = |reach: Option<Reach>| {
+        let mut kinds: Vec<&str> = ranked
+            .iter()
+            .filter(|address| reach.is_none_or(|reach| address.reach == reach))
+            .map(|address| address.kind.label())
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds.join(" ")
+    };
     format!(
-        "Network: addresses lan={} other={} virtual={} vpn={} link_local={} route={route} adapters=[{}]",
+        "Network: addresses lan={} other={} virtual={} vpn={} link_local={} route={route} adapters=[{}] lan_adapters=[{}]",
         count(Reach::Lan),
         count(Reach::Other),
         count(Reach::Virtual),
         count(Reach::Vpn),
         count(Reach::LinkLocal),
-        kinds.join(" "),
+        kinds(None),
+        kinds(Some(Reach::Lan)),
     )
 }
 
@@ -897,7 +907,18 @@ mod tests {
         assert_eq!(
             line,
             "Network: addresses lan=1 other=0 virtual=1 vpn=1 link_local=0 route=vpn \
-             adapters=[virtual vpn wifi]"
+             adapters=[virtual vpn wifi] lan_adapters=[wifi]"
+        );
+        // A PC on a cable, its Wi-Fi without DHCP: which one iPads reach.
+        let cable = classify(6, "Realtek PCIe GbE Family Controller", "Ethernet");
+        let both = [
+            adapter(cable, true, [192, 168, 1, 21]),
+            adapter(wifi, false, [169, 254, 7, 9]),
+        ];
+        assert_eq!(
+            summary(Some(&both), Some(IpAddr::V4(ip([192, 168, 1, 21])))),
+            "Network: addresses lan=1 other=0 virtual=0 vpn=0 link_local=1 route=lan \
+             adapters=[ethernet wifi] lan_adapters=[ethernet]"
         );
         for private in [
             "100.",
@@ -913,7 +934,7 @@ mod tests {
             assert!(!line.contains(private), "{private} in {line}");
         }
         assert_eq!(summary(None, None), "Network: addresses unavailable");
-        assert!(summary(Some(&[]), None).contains("route=none adapters=[]"));
+        assert!(summary(Some(&[]), None).contains("route=none adapters=[] lan_adapters=[]"));
     }
 
     /// Windows says the list grew every time: three bigger buffers, then no

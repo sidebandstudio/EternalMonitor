@@ -166,6 +166,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "choice",
     // The startup network line.
     "route",
+    "lan_adapters",
     // The virtual display snapshot.
     "driver",
     "tech",

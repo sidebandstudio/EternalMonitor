@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod display_guard;
 pub mod encoder;
 pub mod feedback;
+pub mod firewall;
 pub mod gpu_preference;
 pub mod gui;
 pub mod handoff;

@@ -1,8 +1,54 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
-    usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, firewall_notice, second_screen_notice,
+    software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
+
+#[test]
+fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
+    use crate::firewall::{judge, Profile, Rule, PRIVATE, PUBLIC};
+    let exe = std::path::Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe");
+    let profile = |bit, block_all_inbound| Profile {
+        bit,
+        on: true,
+        block_all_inbound,
+    };
+    let rule = |allow| Rule {
+        program: exe.to_string_lossy().to_lowercase(),
+        allow,
+        enabled: true,
+        udp: true,
+        profiles: PUBLIC,
+    };
+    let notice = |profiles: &[Profile], rules: &[Rule]| {
+        firewall_notice(&judge(profiles, rules, exe, |_| None))
+    };
+
+    let (title, body) = notice(&[profile(PUBLIC, false)], &[rule(true), rule(false)]).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    assert!(
+        body.contains("Run the EternalMonitor installer again"),
+        "{body}"
+    );
+    assert!(body.contains("A USB cable still works."), "{body}");
+
+    let (title, body) = notice(
+        &[profile(PRIVATE, false), profile(PUBLIC, true)],
+        &[rule(true)],
+    )
+    .unwrap();
+    assert_eq!(title, "Windows Firewall blocks every incoming connection");
+    assert!(body.contains("choose the public network"), "{body}");
+
+    assert_eq!(notice(&[profile(PUBLIC, false)], &[rule(true)]), None);
+    // No rule it can read: a port rule may still let iPads in.
+    assert_eq!(notice(&[profile(PUBLIC, false)], &[]), None);
+    let off = Profile {
+        on: false,
+        ..profile(PUBLIC, true)
+    };
+    assert_eq!(notice(&[off], &[rule(false)]), None);
+}
 
 #[test]
 fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {

@@ -160,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Listen:  {}:{}", listen_ip, listen_port);
     info!("══════════════════════════════════");
     eternal_host::network::log_addresses();
+    eternal_host::firewall::watch();
 
     let auth_token = persisted
         .ensure_auth_token()
