@@ -1379,6 +1379,19 @@ pub(super) fn firewall_notice(
         )
     };
     Some(match report?.certain_block()? {
+        // Setup removes only this exe's rules: it can't help here.
+        CertainBlock::AllPrograms { port, all_blocked } => {
+            let mut body = format!(
+                "{lead} A Windows Firewall rule blocks port {port} for all apps. In Windows Security, open Firewall & network protection, then Advanced settings, and turn off that rule under Inbound Rules."
+            );
+            if !all_blocked.is_empty() {
+                body = format!("{body} {}", turn_off(&all_blocked));
+            }
+            (
+                "A Windows Firewall rule blocks EternalMonitor's port".into(),
+                format!("{body} {usb}"),
+            )
+        }
         CertainBlock::Rule { all_blocked } => {
             let mut body =
                 format!("{lead} Run the EternalMonitor installer again: it removes the block.");

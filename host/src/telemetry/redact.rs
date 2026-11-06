@@ -171,6 +171,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "profiles",
     "allow_rules",
     "block_rules",
+    "all_programs_block_rules",
     "scoped_block_rules",
     "lan",
     "verdict",

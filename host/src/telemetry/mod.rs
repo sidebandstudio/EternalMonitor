@@ -1879,18 +1879,25 @@ mod tests {
                 profiles(crate::firewall::PRIVATE),
                 profiles(crate::firewall::PUBLIC),
             ],
-            &[crate::firewall::Rule::unscoped(
-                &exe.to_string_lossy().to_lowercase(),
-                false,
-                crate::firewall::PUBLIC,
-            )],
+            &[
+                crate::firewall::Rule::unscoped(
+                    &exe.to_string_lossy().to_lowercase(),
+                    false,
+                    crate::firewall::PUBLIC,
+                ),
+                crate::firewall::Rule::unscoped("", false, crate::firewall::PRIVATE),
+            ],
             exe,
             9876,
             true,
             |_| None,
         );
         let stamped = format!("2026-11-06T02:04:08.196847Z  WARN {}", report.summary());
-        assert!(stamped.contains("public:blocked"), "{stamped}");
+        assert!(
+            stamped.contains("private:blocked_all_programs public:blocked")
+                && stamped.contains("all_programs_block_rules=1"),
+            "{stamped}"
+        );
         assert_eq!(event_with(&stamped, "warn", &names).message, stamped);
         let named = "2026-11-06T02:04:08.196847Z  INFO Signed in as blocked on public";
         let uploaded = event_with(named, "info", &names).message;

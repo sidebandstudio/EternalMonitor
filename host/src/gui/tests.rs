@@ -52,6 +52,29 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
         "{body}"
     );
 
+    // A rule for every program: Setup can't remove it, so no Setup advice.
+    let everyone = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&everyone), false).unwrap();
+    assert_eq!(
+        title,
+        "A Windows Firewall rule blocks EternalMonitor's port"
+    );
+    assert!(body.contains("blocks port 9876 for all apps"), "{body}");
+    assert!(body.contains("Windows Security"), "{body}");
+    assert!(!body.contains("installer"), "{body}");
+    let mine_too = report(
+        &[profile(PUBLIC, false)],
+        &[block(PUBLIC), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    let (_, body) = firewall_notice(Some(&mine_too), false).unwrap();
+    assert!(!body.contains("installer"), "{body}");
+    assert_eq!(firewall_notice(Some(&everyone), true), None);
+
     // Not certain for the network an iPad uses: logged, not shown.
     let one_of_two = report(
         &[profile(PRIVATE, false), profile(PUBLIC, false)],
@@ -60,7 +83,7 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
     );
     assert_eq!(firewall_notice(Some(&one_of_two), false), None);
     let scoped = Rule {
-        remote_addresses: "LocalSubnet".into(),
+        remote_addresses: Some("LocalSubnet".into()),
         ..block(PUBLIC)
     };
     assert_eq!(
