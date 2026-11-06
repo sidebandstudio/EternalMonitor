@@ -37,8 +37,8 @@ impl CursorState {
 }
 
 /// Where the cursor was drawn into a frame, and the desktop pixels it covers.
-/// A pointer-only update moves the cursor in a copy of the last frame: no
-/// desktop readback, which used to be the cost of every pointer frame (#183).
+/// Between pointer updates, a frame moves the cursor in a copy of the last
+/// frame, without a desktop readback (#183).
 #[derive(Default)]
 pub(super) struct DrawnCursor {
     /// Left, top, width and height in pixels, clipped to the frame.
