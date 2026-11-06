@@ -1,8 +1,111 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
-    usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, firewall_notice, second_screen_notice,
+    software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
+
+#[test]
+fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
+    use crate::firewall::{judge, Profile, Rule, PRIVATE, PUBLIC};
+    let exe = std::path::Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe");
+    let profile = |bit, block_all_inbound| Profile {
+        bit,
+        on: true,
+        block_all_inbound,
+    };
+    let block = |profiles| Rule::unscoped(&exe.to_string_lossy().to_lowercase(), false, profiles);
+    let allow = Rule::unscoped(&exe.to_string_lossy(), true, 0x7fff_ffff);
+    let report = |profiles: &[Profile], rules: &[Rule], lan| {
+        judge(profiles, rules, exe, 9876, lan, |_| None)
+    };
+
+    let blocked = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&blocked), false).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    assert!(
+        body.contains("Run the EternalMonitor installer again"),
+        "{body}"
+    );
+    assert!(body.contains("A USB cable still works."), "{body}");
+    // Any connected iPad, over Wi-Fi or the cable, hides it.
+    assert_eq!(firewall_notice(Some(&blocked), true), None);
+    // No reading, or the last read failed.
+    assert_eq!(firewall_notice(None, false), None);
+
+    let shields = report(&[profile(PUBLIC, true)], std::slice::from_ref(&allow), true);
+    let (title, body) = firewall_notice(Some(&shields), false).unwrap();
+    assert_eq!(title, "Windows Firewall blocks every incoming connection");
+    assert!(body.contains("choose the public network"), "{body}");
+    let both = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, true)],
+        &[block(PRIVATE)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&both), false).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    assert!(
+        body.contains("installer again") && body.contains("choose the public network"),
+        "{body}"
+    );
+
+    // A rule for every program: Setup can't remove it, so it is only
+    // logged, alone or beside this exe's own block.
+    let everyone = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&everyone), false), None);
+    let mine_too = report(
+        &[profile(PUBLIC, false)],
+        &[block(PUBLIC), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&mine_too), false), None);
+    // An Allow rule that asks for IPsec may let traffic past: not shown.
+    let bypass = Rule {
+        secure_flags: Some(2),
+        ..allow.clone()
+    };
+    let maybe = report(&[profile(PUBLIC, false)], &[bypass, block(PUBLIC)], true);
+    assert_eq!(firewall_notice(Some(&maybe), false), None);
+
+    // Not certain for the network an iPad uses: logged, not shown.
+    let one_of_two = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&one_of_two), false), None);
+    let scoped = Rule {
+        remote_addresses: Some("LocalSubnet".into()),
+        ..block(PUBLIC)
+    };
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[scoped], true)),
+            false
+        ),
+        None
+    );
+    let no_lan = report(&[profile(PUBLIC, false)], &[block(PUBLIC)], false);
+    assert_eq!(firewall_notice(Some(&no_lan), false), None);
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[allow], true)),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        firewall_notice(Some(&report(&[profile(PUBLIC, false)], &[], true)), false),
+        None
+    );
+}
 
 #[test]
 fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {

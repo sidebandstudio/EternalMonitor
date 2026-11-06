@@ -166,6 +166,16 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "choice",
     // The startup network line.
     "route",
+    "lan_adapters",
+    // The Windows Firewall line.
+    "profiles",
+    "allow_rules",
+    "block_rules",
+    "all_programs_block_rules",
+    "scoped_block_rules",
+    "bypass_rules",
+    "lan",
+    "verdict",
     // The virtual display snapshot.
     "driver",
     "tech",

@@ -206,6 +206,10 @@ Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.
 ; listens only on UDP; the TCP rule older versions added is removed and not re-added.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
+; Every other inbound rule for the host goes too. Windows adds Block rules for it when its
+; "allow access" prompt is dismissed, and a Block rule beats the Allow rule below: iPads then
+; get no answer. Running Setup again is the fix the PC and the iPad offer for that.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all dir=in program=""{app}\EternalMonitor-host.exe"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=domain,private,public enable=yes"; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
 ; Save the screens before the driver steps: starting the virtual display can leave a PC with no

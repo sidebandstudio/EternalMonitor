@@ -56,6 +56,12 @@ impl AnalyzerApp {
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
+        if let Some((title, body)) =
+            firewall_notice(crate::firewall::latest().as_ref(), client.peer.is_some())
+        {
+            widgets::banner(ui, WARNING, Icon::Warning, &title, &body, 0.0, |_| {});
+            ui.add_space(GAP - 10.0);
+        }
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
@@ -1349,6 +1355,45 @@ pub(super) fn usb_cable_notice(
             "Your iPad is plugged in, but Apple Devices is not installed",
             "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. Wi-Fi works without it.",
         )
+    })
+}
+
+/// What the Stream page says while Windows Firewall keeps iPads out: only
+/// for a block certain on the network an iPad would use that Setup or one
+/// switch removes (see [`crate::firewall::Report::certain_block`]), and
+/// never while an iPad is connected, over Wi-Fi or the cable.
+pub(super) fn firewall_notice(
+    report: Option<&crate::firewall::Report>,
+    session_active: bool,
+) -> Option<(String, String)> {
+    use crate::firewall::CertainBlock;
+    if session_active {
+        return None;
+    }
+    let lead = "iPads on Wi-Fi can't reach this PC, so they say it didn't answer.";
+    let usb = "A USB cable still works.";
+    let turn_off = |networks: &[&str]| {
+        format!(
+            "In Windows Security, open Firewall & network protection, choose the {} network and turn off Blocks all incoming connections.",
+            networks.join(" and ")
+        )
+    };
+    Some(match report?.certain_block()? {
+        CertainBlock::Rule { all_blocked } => {
+            let mut body =
+                format!("{lead} Run the EternalMonitor installer again: it removes the block.");
+            if !all_blocked.is_empty() {
+                body = format!("{body} {}", turn_off(&all_blocked));
+            }
+            (
+                "Windows Firewall is blocking EternalMonitor".into(),
+                format!("{body} {usb}"),
+            )
+        }
+        CertainBlock::AllIncoming(networks) => (
+            "Windows Firewall blocks every incoming connection".into(),
+            format!("{lead} {} {usb}", turn_off(&networks)),
+        ),
     })
 }
 
