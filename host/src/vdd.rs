@@ -472,6 +472,8 @@ fn request_on_turn(
                     display_off,
                     || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
                     |outcome| *outcome == TaskOutcome::Done,
+                    // Left on: the next turn off tries again.
+                    || TaskOutcome::Failed(None),
                 );
                 outcome == TaskOutcome::Done
             });
@@ -539,6 +541,7 @@ pub(crate) fn disable_for_ended(
                 false,
                 || run_task(TASK_DISABLE, &mut || {}),
                 |outcome| *outcome == TaskOutcome::Done,
+                || TaskOutcome::Failed(None),
             ) == TaskOutcome::Done
         },
     )

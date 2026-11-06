@@ -13,11 +13,20 @@
 //! turned on, the guard re-applies that layout, or else switches Windows to
 //! "PC screen only" when the built-in panel was on, and logs the result.
 //! Nothing else ever changes the layout, which stays the user's: a PC that
-//! keeps any real screen sees no change at all. A turn on is only logged:
-//! a layout with the virtual display alone cannot attach, so the attempt
-//! times out and its turn off brings the guard in. One attempt per change.
-//! Right before "PC screen only" the guard reads the screens again, and
-//! stops if one came back or they can't be read.
+//! keeps any real screen sees no change at all.
+//!
+//! Turning the display off while it is the only screen on is what loses the
+//! panel for good: on a hybrid laptop, Windows then stops reporting any
+//! screen, and refuses every layout until the PC restarts. So the guard acts
+//! while the display is still on. A turn on that leaves the virtual display
+//! alone, where the PC had a real screen before, switches Windows to
+//! "Extend", which keeps the second screen, or else puts the saved layout
+//! back, or "PC screen only". A turn off that finds the virtual display
+//! alone first puts the saved layout back, "PC screen only", or "Extend",
+//! and if none brings a real screen back it leaves the display on: the
+//! desktop stays on it, which the iPad and Windows+P can still reach.
+//! One attempt per change. Between two calls the guard reads the screens
+//! again, and stops if one came back or they can't be read.
 //!
 //! The layout from before a turn on is also kept on disk, so the failure
 //! reporter, a new process, compares with it when the host that turned
@@ -131,6 +140,8 @@ pub trait Displays {
     fn reapply(&mut self, saved: &Self::Saved) -> Result<(), i32>;
     /// `SetDisplayConfig` with "PC screen only".
     fn internal_only(&mut self) -> Result<(), i32>;
+    /// `SetDisplayConfig` with "Extend".
+    fn extend(&mut self) -> Result<(), i32>;
     fn sleep(&mut self, duration: Duration);
     fn log(&mut self, warn: bool, text: &str);
     /// The host whose layout from before its turn on is kept on disk: this
@@ -152,11 +163,15 @@ pub trait Saved: Sized {
     fn decode(text: &str) -> Option<Self>;
 }
 
-/// How a turn off ended.
+/// How a change ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Nothing to do, or nothing known to compare with.
     Left,
+    /// A turn on left the virtual display alone, and "Extend" put the PC's
+    /// screens back beside it.
+    Extended,
+    /// The PC's screens are back, without the virtual display.
     Restored {
         internal: bool,
     },
@@ -265,6 +280,9 @@ pub fn from_hex(text: &str) -> Option<Vec<u8>> {
 /// next turn off checks against it.
 pub struct Guard<S> {
     reference: Option<Layout<S>>,
+    /// The last turn on left the virtual display alone, and "Extend" did
+    /// not put the PC's screens beside it: it will not attach.
+    alone: bool,
 }
 
 impl<S> Default for Guard<S> {
@@ -275,8 +293,49 @@ impl<S> Default for Guard<S> {
 
 impl<S> Guard<S> {
     pub const fn new() -> Self {
-        Self { reference: None }
+        Self {
+            reference: None,
+            alone: false,
+        }
     }
+
+    /// Whether the last turn on left the virtual display alone, with no
+    /// real screen beside it.
+    pub fn alone(&self) -> bool {
+        self.alone
+    }
+}
+
+/// A `SetDisplayConfig` call that can bring a real screen back while the
+/// virtual display is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// "Extend": the PC's screens beside the virtual display.
+    Extend,
+    /// The layout from before the turn on, without the virtual display.
+    SavedLayout,
+    /// "PC screen only".
+    Internal,
+}
+
+impl Step {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Extend => "extend",
+            Self::SavedLayout => "saved_layout",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// How [`take_back`] ended.
+enum TakeBack<S> {
+    /// This call brought a real screen back.
+    Applied(Step, Option<Layout<S>>),
+    /// A real screen came back between two calls.
+    CameBack(Option<Layout<S>>),
+    /// None did: each call's result, and the screens now.
+    Failed(Vec<String>, Option<Layout<S>>),
 }
 
 impl<S: Saved> Guard<S> {
@@ -284,13 +343,15 @@ impl<S: Saved> Guard<S> {
     /// compare with, also on disk for the failure reporter. A turn off
     /// with nothing kept, as at startup or in the reporter, compares with
     /// the record its host kept, else with the screens just before it.
-    /// `display_off`: the driver tasks know the display is off.
+    /// `display_off`: the driver tasks know the display is off. False when
+    /// the turn off must not run: the virtual display is the only screen
+    /// on, the PC had a real one, and nothing brought it back.
     pub fn before(
         &mut self,
         enabled: bool,
         display_off: bool,
         displays: &mut impl Displays<Saved = S>,
-    ) {
+    ) -> bool {
         let layout = displays.read();
         let text = format!(
             "Screens before the virtual display turns {}: {}",
@@ -298,6 +359,7 @@ impl<S: Saved> Guard<S> {
             line(layout.as_ref().map(|layout| &layout.screens[..]))
         );
         displays.log(false, &text);
+        let alone = layout.as_ref().is_some_and(|layout| alone(&layout.screens));
         if enabled {
             // A turn on can run while the display is still on: after an
             // Enable that finished once the host had given up on it, or a
@@ -332,11 +394,69 @@ impl<S: Saved> Guard<S> {
             }
             self.reference = kept.or(layout);
         }
+        if !enabled && alone {
+            return self.take_back_before_off(displays);
+        }
+        true
     }
 
-    /// After a driver change: log the screens, and after a turn off,
-    /// restore them if every real screen is gone. A turn off that `done`
-    /// deletes the kept record once checked.
+    /// The virtual display is the only screen on, and is about to turn off:
+    /// put a real screen back first. False when none came back and the PC
+    /// had one before, so the turn off must not run.
+    fn take_back_before_off(&mut self, displays: &mut impl Displays<Saved = S>) -> bool {
+        let reference = self.reference.as_ref();
+        let had_real = reference.is_some_and(|layout| real(&layout.screens).next().is_some());
+        let internal = reference.is_some_and(|layout| real(&layout.screens).any(|s| s.internal));
+        displays.log(
+            true,
+            &format!(
+                "The virtual display is the only screen on; bringing the PC's screens back \
+                 before turning it off. Before: {}",
+                line(reference.map(|layout| &layout.screens[..]))
+            ),
+        );
+        let mut steps = Vec::new();
+        if had_real {
+            steps.push(Step::SavedLayout);
+        }
+        if internal {
+            steps.push(Step::Internal);
+        }
+        steps.push(Step::Extend);
+        match take_back(displays, &steps, reference) {
+            TakeBack::Applied(step, now) => {
+                restored(displays, step.name(), &now);
+                true
+            }
+            TakeBack::CameBack(now) => {
+                came_back(displays, &now);
+                true
+            }
+            TakeBack::Failed(tried, now) if had_real => {
+                let text = format!(
+                    "Leaving the virtual display on: turning it off now would leave the PC with \
+                     no screen outcome=kept_on {}{}; Windows+P then \"PC screen only\" brings \
+                     the built-in screen back",
+                    tried
+                        .iter()
+                        .map(|step| format!("{step} "))
+                        .collect::<String>(),
+                    line(now.as_ref().map(|layout| &layout.screens[..]))
+                );
+                displays.log(true, &text);
+                false
+            }
+            TakeBack::Failed(tried, now) => {
+                failed(displays, &tried, &now);
+                true
+            }
+        }
+    }
+
+    /// After a driver change: log the screens. After a turn on that left
+    /// the virtual display alone, put the PC's screens back; after a turn
+    /// off, restore them if every real screen is gone. A turn off that
+    /// `done` deletes the kept record once checked.
     pub fn after(
         &mut self,
         enabled: bool,
@@ -344,19 +464,64 @@ impl<S: Saved> Guard<S> {
         displays: &mut impl Displays<Saved = S>,
     ) -> Outcome {
         if enabled {
-            let layout = displays.read();
-            let text = format!(
-                "Screens after the virtual display turned on: {}",
-                line(layout.as_ref().map(|layout| &layout.screens[..]))
-            );
-            displays.log(false, &text);
-            return Outcome::Left;
+            let outcome = self.check_turn_on(displays);
+            self.alone = matches!(outcome, Outcome::Restored { .. } | Outcome::Failed);
+            return outcome;
         }
         let outcome = self.check(displays);
         if done {
             displays.forget();
         }
         outcome
+    }
+
+    /// Windows may have put the desktop on the virtual display alone. A
+    /// turn off then would lose the PC's screens, so bring them back now,
+    /// while Windows still reports them: beside it with "Extend", which
+    /// keeps the second screen, else without it.
+    fn check_turn_on(&mut self, displays: &mut impl Displays<Saved = S>) -> Outcome {
+        let reference = self.reference.as_ref();
+        let before = reference.map_or(&[][..], |layout| &layout.screens[..]);
+        let layout = settle(displays, before);
+        let text = format!(
+            "Screens after the virtual display turned on: {}",
+            line(layout.as_ref().map(|layout| &layout.screens[..]))
+        );
+        displays.log(false, &text);
+        let (Some(reference), Some(after)) = (reference, layout) else {
+            return Outcome::Left;
+        };
+        let Plan::Restore { internal } = plan(&reference.screens, &after.screens) else {
+            return Outcome::Left;
+        };
+        displays.log(
+            true,
+            &format!(
+                "Windows put the desktop on the virtual display alone; bringing the PC's \
+                 screens back while it is on. Before: {}",
+                line(Some(&reference.screens))
+            ),
+        );
+        let mut steps = vec![Step::Extend, Step::SavedLayout];
+        if internal {
+            steps.push(Step::Internal);
+        }
+        match take_back(displays, &steps, Some(reference)) {
+            TakeBack::Applied(step, now)
+                if now.as_ref().is_some_and(|now| has_vdd(&now.screens)) =>
+            {
+                let text = format!(
+                    "Screens back beside the virtual display outcome=extended applied={} {}",
+                    step.name(),
+                    line(now.as_ref().map(|layout| &layout.screens[..]))
+                );
+                displays.log(false, &text);
+                Outcome::Extended
+            }
+            TakeBack::Applied(step, now) => restored(displays, step.name(), &now),
+            TakeBack::CameBack(now) => came_back(displays, &now),
+            TakeBack::Failed(tried, now) => failed(displays, &tried, &now),
+        }
     }
 
     fn check(&mut self, displays: &mut impl Displays<Saved = S>) -> Outcome {
@@ -384,52 +549,61 @@ impl<S: Saved> Guard<S> {
                 line(Some(&reference.screens))
             ),
         );
-        // Each step's result, for the log when nothing worked.
-        let mut tried = Vec::new();
-        match displays.reapply(&reference.saved) {
+        let mut steps = vec![Step::SavedLayout];
+        // A switch to "PC screen only" would turn off an external monitor
+        // the user had on alone.
+        if internal {
+            steps.push(Step::Internal);
+        }
+        match take_back(displays, &steps, Some(&reference)) {
+            TakeBack::Applied(step, now) => restored(displays, step.name(), &now),
+            TakeBack::CameBack(now) => came_back(displays, &now),
+            TakeBack::Failed(tried, now) => failed(displays, &tried, &now),
+        }
+    }
+}
+
+/// Make each call of `steps` in turn until a real screen is on, waiting up
+/// to [`SETTLE`] after each one Windows takes. `reference` is the layout
+/// from before the turn on, for [`Step::SavedLayout`].
+fn take_back<D: Displays>(
+    displays: &mut D,
+    steps: &[Step],
+    reference: Option<&Layout<D::Saved>>,
+) -> TakeBack<D::Saved> {
+    // Each call's result, for the log when nothing worked.
+    let mut tried = Vec::new();
+    let mut now = None;
+    for &step in steps {
+        let result = match (step, reference) {
+            (Step::Extend, _) => displays.extend(),
+            (Step::SavedLayout, Some(reference)) => displays.reapply(&reference.saved),
+            (Step::SavedLayout, None) => continue,
+            (Step::Internal, _) => displays.internal_only(),
+        };
+        match result {
             Ok(()) => {
-                let now = settle(displays, &reference.screens);
+                now = wait_for_real(displays);
                 if has_real(&now) {
-                    return restored(displays, "saved_layout", &now);
+                    return TakeBack::Applied(step, now);
                 }
-                tried.push("reason=saved_layout_no_screen".to_string());
+                tried.push(format!("reason={}_no_screen", step.name()));
             }
-            Err(code) => tried.push(format!("reason=saved_layout_refused code={code}")),
+            Err(code) => tried.push(format!("reason={}_refused code={code}", step.name())),
         }
         // Windows may have changed the screens during that call. Look again
         // right before changing anything more: a screen that came back
         // stays as Windows set it.
-        let now = displays.read();
+        now = displays.read();
         if has_real(&now) {
-            let text = format!(
-                "Screens came back without a change outcome=restored applied=none {}",
-                line(now.as_ref().map(|layout| &layout.screens[..]))
-            );
-            displays.log(false, &text);
-            return Outcome::Recovered;
+            return TakeBack::CameBack(now);
         }
         if now.is_none() {
             tried.push("reason=screens_unknown".into());
-            return failed(displays, &tried, &now);
-        }
-        if !internal {
-            return failed(displays, &tried, &now);
-        }
-        match displays.internal_only() {
-            Ok(()) => {
-                let now = settle(displays, &reference.screens);
-                if has_real(&now) {
-                    return restored(displays, "internal", &now);
-                }
-                tried.push("reason=internal_no_screen".into());
-                failed(displays, &tried, &now)
-            }
-            Err(code) => {
-                tried.push(format!("reason=internal_refused code={code}"));
-                failed(displays, &tried, &now)
-            }
+            break;
         }
     }
+    TakeBack::Failed(tried, now)
 }
 
 /// The layout in the record this host kept, if there is one.
@@ -451,6 +625,15 @@ fn restored<D: Displays>(
     Outcome::Restored {
         internal: applied == "internal",
     }
+}
+
+fn came_back<D: Displays>(displays: &mut D, now: &Option<Layout<D::Saved>>) -> Outcome {
+    let text = format!(
+        "Screens came back without a change outcome=restored applied=none {}",
+        line(now.as_ref().map(|layout| &layout.screens[..]))
+    );
+    displays.log(false, &text);
+    Outcome::Recovered
 }
 
 fn failed<D: Displays>(
@@ -477,15 +660,33 @@ fn has_real<S>(layout: &Option<Layout<S>>) -> bool {
         .is_some_and(|layout| real(&layout.screens).next().is_some())
 }
 
+fn has_vdd(screens: &[Screen]) -> bool {
+    screens.iter().any(|screen| screen.virtual_display)
+}
+
+/// The virtual display is on, and no real screen is.
+fn alone(screens: &[Screen]) -> bool {
+    has_vdd(screens) && real(screens).next().is_none()
+}
+
 /// The screens once a real one is back, or as they are after [`SETTLE`]. A
 /// PC that has one returns at once; only one that lost them all waits.
 fn settle<D: Displays>(displays: &mut D, before: &[Screen]) -> Option<Layout<D::Saved>> {
+    if real(before).next().is_none() {
+        return displays.read();
+    }
+    wait_for_real(displays)
+}
+
+/// The screens once a real one is on, or as they are after [`SETTLE`], or
+/// once they can't be read.
+fn wait_for_real<D: Displays>(displays: &mut D) -> Option<Layout<D::Saved>> {
     let mut waited = Duration::ZERO;
     loop {
         let layout = displays.read();
         let lost = layout
             .as_ref()
-            .is_some_and(|layout| plan(before, &layout.screens) != Plan::Leave);
+            .is_some_and(|layout| real(&layout.screens).next().is_none());
         if !lost || waited >= SETTLE {
             return layout;
         }
@@ -500,7 +701,8 @@ static GUARD: parking_lot::Mutex<Guard<windows_impl::Saved>> =
 
 /// Run a driver change for `owner`'s display with the guard around it.
 /// `log` writes one line; `display_off` says the driver tasks know the
-/// display is off; `done` tells a change that succeeded.
+/// display is off; `done` tells a change that succeeded. A turn off that
+/// would leave the PC with no screen does not run: `kept_on` is its result.
 #[cfg(windows)]
 pub(crate) fn around<T>(
     enabled: bool,
@@ -509,13 +711,23 @@ pub(crate) fn around<T>(
     display_off: bool,
     change: impl FnOnce() -> T,
     done: impl FnOnce(&T) -> bool,
+    kept_on: impl FnOnce() -> T,
 ) -> T {
     let mut displays = windows_impl::Windows::new(owner, log);
-    GUARD.lock().before(enabled, display_off, &mut displays);
+    if !GUARD.lock().before(enabled, display_off, &mut displays) {
+        return kept_on();
+    }
     let result = change();
     let done = done(&result);
     GUARD.lock().after(enabled, done, &mut displays);
     result
+}
+
+/// Whether the last turn on left the virtual display alone, with no real
+/// screen beside it: then it does not attach as a second screen.
+#[cfg(windows)]
+pub(crate) fn last_turn_on_alone() -> bool {
+    GUARD.lock().alone()
 }
 
 #[cfg(windows)]
@@ -527,8 +739,8 @@ mod windows_impl {
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED, DISPLAYCONFIG_PATH_INFO,
-        QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_INTERNAL,
-        SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
+        QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
+        SDC_TOPOLOGY_INTERNAL, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
     };
 
     pub type Saved = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
@@ -656,6 +868,13 @@ mod windows_impl {
             }
         }
 
+        fn extend(&mut self) -> Result<(), i32> {
+            match unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND) } {
+                0 => Ok(()),
+                code => Err(code),
+            }
+        }
+
         fn sleep(&mut self, duration: Duration) {
             std::thread::sleep(duration);
         }
@@ -756,13 +975,16 @@ mod tests {
         /// After an accepted call, reads return this.
         reapplied: Option<Vec<Screen>>,
         internal: Option<Vec<Screen>>,
+        extended: Option<Vec<Screen>>,
         refuse_reapply: bool,
         refuse_internal: bool,
+        refuse_extend: bool,
         /// What reads return after a refused call: Windows changed the
         /// screens meanwhile. `Some(None)`: they can't be read.
         after_refused: Option<Option<Vec<Screen>>>,
         reapply_calls: Vec<usize>,
         internal_calls: usize,
+        extend_calls: usize,
         slept: Duration,
         logs: Vec<(bool, String)>,
         owner: Option<String>,
@@ -789,7 +1011,7 @@ mod tests {
         }
 
         fn set_display_config_calls(&self) -> usize {
-            self.reapply_calls.len() + self.internal_calls
+            self.reapply_calls.len() + self.internal_calls + self.extend_calls
         }
 
         fn text(&self) -> String {
@@ -834,6 +1056,18 @@ mod tests {
                 return Err(31);
             }
             if let Some(screens) = self.internal.clone() {
+                self.reads.clear();
+                self.last = Some(screens);
+            }
+            Ok(())
+        }
+
+        fn extend(&mut self) -> Result<(), i32> {
+            self.extend_calls += 1;
+            if self.refuse_extend {
+                return Err(1610);
+            }
+            if let Some(screens) = self.extended.clone() {
                 self.reads.clear();
                 self.last = Some(screens);
             }
@@ -901,6 +1135,215 @@ mod tests {
         assert_eq!(plan(&[], &[]), Plan::Leave);
     }
 
+    /// The hybrid laptop where the panel went black: its panel, on the
+    /// integrated card, was the only screen before the turn on.
+    fn laptop_panel() -> Screen {
+        Screen {
+            adapter: 0x1298b,
+            target: 512,
+            internal: true,
+            virtual_display: false,
+            mode: Some((1920, 1200, 165_000)),
+        }
+    }
+
+    /// After its turn on, Windows showed the desktop on the virtual display
+    /// alone, at 800x600.
+    fn lone_vdd() -> Screen {
+        Screen {
+            mode: Some((800, 600, 60_000)),
+            ..vdd()
+        }
+    }
+
+    /// The guard's check before a turn off: whether it may run.
+    fn turn_off_allowed(guard: &mut Guard<usize>, fake: &mut Fake) -> bool {
+        guard.before(false, false, fake)
+    }
+
+    /// The laptop's log: `paths=1 [internal …] vdd=0` before the turn on,
+    /// `paths=0 [] vdd=1` after it. The 0.3.4 guard only logged that, the
+    /// attempt timed out, and its turn off left Windows reporting no screen
+    /// at all (`paths=unknown`), which nothing but a restart repaired. Now
+    /// "Extend" puts the panel back beside the virtual display at once,
+    /// and the second screen can still attach.
+    #[test]
+    fn a_turn_on_that_leaves_the_virtual_display_alone_extends_at_once() {
+        let mut fake = Fake::reading([vec![laptop_panel()], vec![lone_vdd()]]);
+        fake.extended = Some(vec![laptop_panel(), lone_vdd()]);
+        let mut guard = Guard::new();
+        assert!(guard.before(true, false, &mut fake));
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Extended);
+        assert_eq!(
+            (
+                fake.extend_calls,
+                fake.reapply_calls.len(),
+                fake.internal_calls
+            ),
+            (1, 0, 0)
+        );
+        assert!(!guard.alone());
+        let text = fake.text();
+        assert!(
+            text.contains(
+                "Screens after the virtual display turned on: paths=0 [] vdd=1\n\
+                 Windows put the desktop on the virtual display alone; bringing the PC's \
+                 screens back while it is on. Before: paths=1 [internal tgt=1298b/512 \
+                 1920x1200@165Hz] vdd=0\n\
+                 Screens back beside the virtual display outcome=extended applied=extend \
+                 paths=1 [internal tgt=1298b/512 1920x1200@165Hz] vdd=1"
+            ),
+            "{text}"
+        );
+        // The session's turn off then finds the panel on, as on any PC.
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        fake.reads.push_back(Some(vec![laptop_panel()]));
+        assert_eq!(guard.after(false, true, &mut fake), Outcome::Left);
+        assert_eq!(fake.set_display_config_calls(), 1);
+    }
+
+    /// Where "Extend" does not bring the panel back, the layout from before
+    /// the turn on does, without the virtual display: the start falls back
+    /// to the mirror, and its turn off finds the panel on.
+    #[test]
+    fn a_lone_virtual_display_that_extend_cannot_fix_gives_the_panel_back() {
+        let mut fake = Fake::reading([vec![laptop_panel()], vec![lone_vdd()]]);
+        fake.refuse_extend = true;
+        fake.reapplied = Some(vec![laptop_panel()]);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(
+            guard.after(true, true, &mut fake),
+            Outcome::Restored { internal: false }
+        );
+        assert_eq!((fake.extend_calls, &fake.reapply_calls[..]), (1, &[1][..]));
+        assert!(guard.alone(), "the display will not attach");
+        assert!(
+            fake.text().ends_with(
+                "Screens restored outcome=restored applied=saved_layout paths=1 \
+                 [internal tgt=1298b/512 1920x1200@165Hz] vdd=0"
+            ),
+            "{}",
+            fake.text()
+        );
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        // Even a turn off after which Windows reports nothing, as on the
+        // laptop, changes nothing more: the panel was on before it.
+        fake.reads.push_back(None);
+        assert_eq!(guard.after(false, true, &mut fake), Outcome::Left);
+        assert_eq!(fake.set_display_config_calls(), 2);
+
+        // Nothing works: the display stays alone and will not attach.
+        let mut fake = Fake::reading([vec![laptop_panel()], vec![lone_vdd()]]);
+        (fake.refuse_extend, fake.refuse_reapply) = (true, true);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Failed);
+        assert_eq!((fake.extend_calls, fake.reapply_calls.len()), (1, 1));
+        // "PC screen only" too: the panel is the built-in one.
+        assert_eq!(fake.internal_calls, 1);
+        assert!(guard.alone());
+        // The next turn on that extends clears it.
+        let mut fake = Fake::reading([vec![laptop_panel()], vec![laptop_panel(), lone_vdd()]]);
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
+        assert!(!guard.alone());
+    }
+
+    /// The virtual display ended up alone during the session, Windows+P
+    /// "Second screen only" say. Its turn off would leave Windows with no
+    /// screen to report, so the guard puts the panel back first.
+    #[test]
+    fn a_turn_off_with_the_virtual_display_alone_puts_a_real_screen_back_first() {
+        let mut fake = Fake::reading([
+            vec![laptop_panel()],
+            vec![laptop_panel(), lone_vdd()],
+            vec![lone_vdd()],
+        ]);
+        fake.reapplied = Some(vec![laptop_panel()]);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        // The layout from before the turn on, before the turn off runs.
+        assert_eq!(fake.reapply_calls, [1]);
+        let text = fake.text();
+        assert!(
+            text.ends_with(
+                "Screens before the virtual display turns off: paths=0 [] vdd=1\n\
+                 The virtual display is the only screen on; bringing the PC's screens back \
+                 before turning it off. Before: paths=1 [internal tgt=1298b/512 \
+                 1920x1200@165Hz] vdd=0\n\
+                 Screens restored outcome=restored applied=saved_layout paths=1 \
+                 [internal tgt=1298b/512 1920x1200@165Hz] vdd=0"
+            ),
+            "{text}"
+        );
+        assert_eq!(guard.after(false, true, &mut fake), Outcome::Left);
+        assert_eq!(fake.set_display_config_calls(), 1);
+    }
+
+    /// When nothing brings a real screen back, the turn off does not run:
+    /// the desktop stays on the virtual display, where the iPad and
+    /// Windows+P still reach it, rather than on no screen at all.
+    #[test]
+    fn the_virtual_display_is_never_turned_off_while_it_is_the_only_screen() {
+        let mut fake = Fake::reading([
+            vec![laptop_panel()],
+            vec![laptop_panel(), lone_vdd()],
+            vec![lone_vdd()],
+        ]);
+        fake.owner = Some(HOST.into());
+        (fake.refuse_reapply, fake.refuse_extend) = (true, true);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        guard.after(true, true, &mut fake);
+        assert!(!turn_off_allowed(&mut guard, &mut fake));
+        // Every call, once: the layout, "PC screen only", "Extend".
+        assert_eq!(
+            (
+                fake.reapply_calls.len(),
+                fake.internal_calls,
+                fake.extend_calls
+            ),
+            (1, 1, 1)
+        );
+        let (warn, text) = fake.logs.last().unwrap();
+        assert!(*warn);
+        assert_eq!(
+            text,
+            "Leaving the virtual display on: turning it off now would leave the PC with no \
+             screen outcome=kept_on reason=saved_layout_refused code=87 \
+             reason=internal_no_screen reason=extend_refused code=1610 paths=0 [] vdd=1; \
+             Windows+P then \"PC screen only\" brings the built-in screen back"
+        );
+        // The layout stays kept, in memory and for the failure reporter.
+        assert!(fake.kept.is_some());
+        // The next turn off, the quit's say, tries again with it.
+        fake.refuse_reapply = false;
+        fake.reapplied = Some(vec![laptop_panel()]);
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.reapply_calls, [1, 1]);
+        guard.after(false, true, &mut fake);
+        assert_eq!(fake.kept, None);
+
+        // A PC that had no real screen before turns it off as it did.
+        let mut fake = Fake::reading([vec![], vec![lone_vdd()], vec![lone_vdd()]]);
+        fake.refuse_extend = true;
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(
+            (
+                fake.reapply_calls.len(),
+                fake.internal_calls,
+                fake.extend_calls
+            ),
+            (0, 0, 1)
+        );
+    }
+
     #[test]
     fn a_healthy_pc_sees_no_set_display_config_call() {
         // Panel and monitor stay through the session; the monitor as the
@@ -924,13 +1367,6 @@ mod tests {
             vec![panel()],
         ]);
         assert_eq!(session(&mut fake).1, Outcome::Left);
-        assert_eq!(fake.set_display_config_calls(), 0);
-        // A turn on that leaves the virtual display alone is only logged:
-        // the layout stays the user's until the turn off.
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()]]);
-        let mut guard = Guard::new();
-        guard.before(true, false, &mut fake);
-        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
     }
 
@@ -975,8 +1411,13 @@ mod tests {
 
     #[test]
     fn every_real_screen_lost_reapplies_the_layout_from_before_the_turn_on() {
-        // The desktop moved to the virtual display alone, then nothing.
-        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        // Both screens went with the virtual display's turn off.
+        let mut fake = Fake::reading([
+            vec![panel(), monitor()],
+            vec![panel(), monitor(), vdd()],
+            vec![panel(), monitor(), vdd()],
+            vec![],
+        ]);
         fake.reapplied = Some(vec![panel(), monitor()]);
         let (_, outcome) = session(&mut fake);
         assert_eq!(outcome, Outcome::Restored { internal: false });
@@ -1006,7 +1447,13 @@ mod tests {
 
     #[test]
     fn a_screen_windows_brings_back_by_itself_is_left_alone() {
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()], vec![], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel()],
+            vec![panel(), vdd()],
+            vec![panel(), vdd()],
+            vec![],
+            vec![],
+        ]);
         fake.reads.push_back(Some(vec![panel()]));
         assert_eq!(session(&mut fake).1, Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
@@ -1015,7 +1462,12 @@ mod tests {
 
     #[test]
     fn a_refused_layout_falls_back_to_pc_screen_only_when_the_panel_was_on() {
-        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel(), monitor()],
+            vec![panel(), monitor(), vdd()],
+            vec![panel(), monitor(), vdd()],
+            vec![],
+        ]);
         fake.refuse_reapply = true;
         fake.internal = Some(vec![panel()]);
         assert_eq!(session(&mut fake).1, Outcome::Restored { internal: true });
@@ -1029,7 +1481,12 @@ mod tests {
             fake.text()
         );
         // A layout Windows took that brought no screen back counts as failed too.
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel()],
+            vec![panel(), vdd()],
+            vec![panel(), vdd()],
+            vec![],
+        ]);
         fake.internal = Some(vec![panel()]);
         assert_eq!(session(&mut fake).1, Outcome::Restored { internal: true });
         assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 1));
@@ -1038,7 +1495,12 @@ mod tests {
     #[test]
     fn without_the_panel_before_there_is_no_switch_to_it() {
         // A closed laptop on an external monitor that went dark.
-        let mut fake = Fake::reading([vec![monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![monitor()],
+            vec![monitor(), vdd()],
+            vec![monitor(), vdd()],
+            vec![],
+        ]);
         fake.refuse_reapply = true;
         assert_eq!(session(&mut fake).1, Outcome::Failed);
         assert_eq!((fake.reapply_calls.len(), fake.internal_calls), (1, 0));
@@ -1054,7 +1516,12 @@ mod tests {
 
     #[test]
     fn one_attempt_per_change() {
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel()],
+            vec![panel(), vdd()],
+            vec![panel(), vdd()],
+            vec![],
+        ]);
         (fake.refuse_reapply, fake.refuse_internal) = (true, true);
         let (mut guard, outcome) = session(&mut fake);
         assert_eq!(outcome, Outcome::Failed);
@@ -1104,7 +1571,7 @@ mod tests {
             fake.text()
         );
         // Known before, unknown after.
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()]]);
+        let mut fake = Fake::reading([vec![panel()], vec![panel(), vdd()], vec![panel(), vdd()]]);
         fake.reads.push_back(None);
         assert_eq!(session(&mut fake).1, Outcome::Left);
         assert_eq!(fake.set_display_config_calls(), 0);
@@ -1113,7 +1580,12 @@ mod tests {
     #[test]
     fn the_fallback_looks_again_and_leaves_screens_windows_brought_back() {
         // Windows put both screens back while it refused the saved layout.
-        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel(), monitor()],
+            vec![panel(), monitor(), vdd()],
+            vec![panel(), monitor(), vdd()],
+            vec![],
+        ]);
         fake.refuse_reapply = true;
         fake.after_refused = Some(Some(vec![panel(), monitor()]));
         fake.internal = Some(vec![panel()]);
@@ -1130,7 +1602,12 @@ mod tests {
             fake.text()
         );
         // The same after a layout Windows took that showed nothing at first.
-        let mut fake = Fake::reading([vec![panel(), monitor()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel(), monitor()],
+            vec![panel(), monitor(), vdd()],
+            vec![panel(), monitor(), vdd()],
+            vec![],
+        ]);
         fake.internal = Some(vec![panel()]);
         let mut guard = Guard::new();
         guard.before(true, false, &mut fake);
@@ -1163,6 +1640,9 @@ mod tests {
         fn internal_only(&mut self) -> Result<(), i32> {
             self.0.internal_only()
         }
+        fn extend(&mut self) -> Result<(), i32> {
+            self.0.extend()
+        }
         fn sleep(&mut self, duration: Duration) {
             self.0.sleep(duration)
         }
@@ -1185,7 +1665,12 @@ mod tests {
 
     #[test]
     fn the_fallback_stops_when_the_screens_cannot_be_read() {
-        let mut fake = Fake::reading([vec![panel()], vec![vdd()], vec![vdd()], vec![]]);
+        let mut fake = Fake::reading([
+            vec![panel()],
+            vec![panel(), vdd()],
+            vec![panel(), vdd()],
+            vec![],
+        ]);
         fake.refuse_reapply = true;
         fake.after_refused = Some(None);
         fake.internal = Some(vec![panel()]);
@@ -1203,19 +1688,19 @@ mod tests {
 
     const HOST: &str = "4242-133456789012345678";
 
-    /// The host turned the display on, which left the virtual display alone,
-    /// then crashed. Its failure reporter, a new process with nothing in
-    /// memory, turns the display off and the PC has no screen.
+    /// The host turned the display on, then crashed. Its failure reporter,
+    /// a new process with nothing in memory, turns the display off, which
+    /// takes the PC's screens with it.
     #[test]
     fn the_failure_reporter_restores_the_layout_its_host_kept() {
-        let mut host = Fake::reading([vec![panel(), monitor()], vec![vdd()]]);
+        let mut host = Fake::reading([vec![panel(), monitor()], vec![panel(), monitor(), vdd()]]);
         host.owner = Some(HOST.into());
         let mut guard = Guard::new();
         guard.before(true, false, &mut host);
         guard.after(true, true, &mut host);
         let kept = host.kept.clone().expect("the host kept its screens");
 
-        let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+        let mut reporter = Fake::reading([vec![panel(), monitor(), vdd()], vec![]]);
         reporter.read_count = 100;
         reporter.owner = Some(HOST.into());
         reporter.kept = Some(kept.clone());
@@ -1239,16 +1724,31 @@ mod tests {
         // Checked after a turn off that worked: deleted.
         assert_eq!(reporter.kept, None);
 
-        // Without the record, the reporter only sees the virtual display before:
-        // nothing to compare with, the screen stays black. This is what the
-        // record fixes.
+        // The host's display was left on alone: the reporter puts that
+        // layout back before its turn off.
+        let mut reporter = Fake::reading([vec![vdd()]]);
+        reporter.read_count = 100;
+        reporter.owner = Some(HOST.into());
+        reporter.kept = Some(kept);
+        reporter.reapplied = Some(vec![panel(), monitor()]);
+        let mut guard = Guard::new();
+        assert!(guard.before(false, false, &mut reporter));
+        assert_eq!(reporter.reapply_calls, [1]);
+        assert_eq!(guard.after(false, true, &mut reporter), Outcome::Left);
+
+        // Without the record, the reporter only sees the virtual display
+        // before: no layout to put back, only "Extend", which found no
+        // screen here. This is what the record fixes.
         let mut reporter = Fake::reading([vec![vdd()], vec![]]);
         reporter.owner = Some(HOST.into());
         reporter.reapplied = Some(vec![panel()]);
         let mut guard = Guard::new();
-        guard.before(false, false, &mut reporter);
+        assert!(guard.before(false, false, &mut reporter));
         assert_eq!(guard.after(false, true, &mut reporter), Outcome::Left);
-        assert_eq!(reporter.set_display_config_calls(), 0);
+        assert_eq!(
+            (reporter.reapply_calls.len(), reporter.extend_calls),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -1282,7 +1782,9 @@ mod tests {
                 Outcome::Left,
                 "{record}"
             );
-            assert_eq!(reporter.set_display_config_calls(), 0, "{record}");
+            // Only "Extend", which needs no layout.
+            assert!(reporter.reapply_calls.is_empty(), "{record}");
+            assert_eq!(reporter.internal_calls, 0, "{record}");
             // Another host's record stays, for its own reporter.
             if owner != Some(HOST) {
                 assert_eq!(reporter.kept.as_deref(), Some(record.as_str()));
@@ -1391,14 +1893,12 @@ mod tests {
         // The record on disk still holds the first read, for the reporter.
         let kept = parse::<usize>(HOST, fake.kept.as_deref().unwrap()).unwrap();
         assert_eq!((kept.screens.len(), kept.saved), (2, 1));
-        guard.after(true, true, &mut fake);
-        guard.before(false, false, &mut fake);
-        fake.reads.push_back(Some(vec![]));
+        // "Extend" brings nothing back here; the first read's layout does.
         assert_eq!(
-            guard.after(false, true, &mut fake),
+            guard.after(true, true, &mut fake),
             Outcome::Restored { internal: false }
         );
-        assert_eq!(fake.reapply_calls, [1]);
+        assert_eq!((fake.extend_calls, &fake.reapply_calls[..]), (1, &[1][..]));
 
         // The same retry in a host whose layout is only on disk, as after a
         // failed Disable that left nothing in memory.
@@ -1436,7 +1936,7 @@ mod tests {
         let mut host = Fake::reading([vec![panel()]]);
         host.owner = Some(HOST.into());
         Guard::new().before(true, false, &mut host);
-        let mut reporter = Fake::reading([vec![vdd()], vec![]]);
+        let mut reporter = Fake::reading([vec![panel(), vdd()], vec![]]);
         reporter.owner = Some(HOST.into());
         reporter.kept = host.kept.clone();
         reporter.reapplied = Some(vec![panel()]);

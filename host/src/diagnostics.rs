@@ -285,7 +285,9 @@ fn take_fallback(session_id: u32) -> Option<&'static str> {
 }
 
 /// A `second_screen_fallback` reason as the summary names it. `remembered`
-/// is a failure saved by an earlier app run.
+/// is a failure saved by an earlier app run. The backend's check of the
+/// summary lists each token, so a newer reason, `vdd_only`, goes as `other`
+/// until it lists that one too.
 fn fallback_token(reason: &str) -> &'static str {
     match reason {
         "attach_timeout" => "attach_timeout",
@@ -883,6 +885,7 @@ pub(crate) mod tests {
             ("no_frames", "no_frames"),
             ("duplication_failed", "duplication_failed"),
             ("remembered", "remembered"),
+            ("vdd_only", "other"),
             ("C:\\Users\\someone", "other"),
         ] {
             assert_eq!(fallback_token(reason), token);
