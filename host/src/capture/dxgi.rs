@@ -462,9 +462,12 @@ pub fn run_capture_loop(
                     }
                     continue;
                 }
-                // A pointer-only update leaves the desktop as last read back:
-                // the paced frame below moves the cursor in a copy of it.
-                let frame_data = if frame_info.LastPresentTime == 0 {
+                // A pointer-only update is read back only when its frame is
+                // due; the paced frame below fills the gaps between updates
+                // from a copy of the last image. Copies only, without the
+                // readback, left an RTX 5080 in a lower power state, where a
+                // 3440x1440 frame took 14 ms to encode instead of 5 (#183).
+                let frame_data = if frame_info.LastPresentTime == 0 && !pacer.due(Instant::now()) {
                     unsafe {
                         dupl.ReleaseFrame()?;
                     }
