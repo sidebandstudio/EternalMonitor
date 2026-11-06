@@ -20,6 +20,8 @@ use crate::control::{CaptureTarget, VddStatus};
 #[cfg(windows)]
 use crate::vdd_device::DeviceState;
 
+#[cfg(any(windows, test))]
+mod cursor;
 #[cfg(windows)]
 pub mod dxgi;
 pub mod recovery;
@@ -95,6 +97,58 @@ impl IdleGate {
         } else {
             FrameUse::Cache
         }
+    }
+}
+
+/// How long the pointer counts as moving after its last reported move.
+/// Windows reports a steadily moved mouse in bursts, with 30-60 ms gaps
+/// between them (#183).
+#[cfg(any(windows, test))]
+pub(crate) const POINTER_HOLD: Duration = Duration::from_millis(100);
+
+/// Paces the frames of a pointer moving over a still desktop. Each
+/// pointer-only update used to become one frame, so the frame rate followed
+/// how often Windows reported the pointer: an iPad decoded between 15 and
+/// 117 fps at a 120 fps target (#183). While the pointer moves, a frame is
+/// due every frame budget, with the pointer where it was last reported.
+/// Only runs once the duplication has an image to draw the pointer on.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct PointerPacer {
+    moved_at: Option<Instant>,
+    /// Moved since the last frame, which the next frame must show.
+    pending: bool,
+    next: Option<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl PointerPacer {
+    /// The pointer moved, was shown or hidden, or changed shape.
+    pub(crate) fn moved(&mut self, now: Instant) {
+        self.moved_at = Some(now);
+        self.pending = true;
+    }
+
+    /// A frame left with the pointer where it is now: a paced frame or a
+    /// desktop update.
+    pub(crate) fn sent(&mut self, now: Instant, budget: Duration) {
+        self.pending = false;
+        // On time keeps the cadence. A desktop update in between, or a late
+        // frame, starts it again.
+        self.next = Some(match self.next {
+            Some(due) if now >= due && now < due + budget => due + budget,
+            _ => now + budget,
+        });
+    }
+
+    /// While the pointer moves: when its next frame is due.
+    pub(crate) fn deadline(&self, now: Instant) -> Option<Instant> {
+        let moving = self.pending || self.moved_at.is_some_and(|at| now < at + POINTER_HOLD);
+        moving.then(|| self.next.unwrap_or(now))
+    }
+
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.deadline(now).is_some_and(|due| now >= due)
     }
 }
 
@@ -1175,6 +1229,201 @@ mod tests {
     use super::*;
     use crate::control::CaptureTarget;
     use std::cell::Cell;
+
+    /// A frame the DXGI loop hands to the encoder in [`pointer_frames`].
+    #[derive(Debug, Clone, Copy)]
+    struct Sent {
+        at: Duration,
+        /// Pointer updates it shows.
+        moves: usize,
+        /// Desktop updates it shows.
+        changes: usize,
+    }
+
+    /// What the DXGI loop sends at `fps` for pointer updates at `moves` and
+    /// desktop updates at `changes` (ms after the start), until `end_ms`, on
+    /// a paused clock. It mirrors the loop's use of [`PointerPacer`]: an
+    /// acquire returns every update that arrived by then or times out, a
+    /// desktop update or a paced frame is sent after it, and the loop sleeps
+    /// to the pacer's deadline or the rest of the budget. A timeout with the
+    /// pointer still runs the idle keepalive.
+    fn pointer_frames(fps: u32, moves: &[f64], changes: &[f64], end_ms: f64) -> Vec<Sent> {
+        let us = |ms: f64| Duration::from_micros((ms * 1000.0) as u64);
+        let start = Instant::now();
+        let budget = frame_budget_for(fps);
+        let default_timeout = Duration::from_millis((budget.as_millis() as u64 / 2).clamp(4, 16));
+        let mut pacer = PointerPacer::default();
+        let (mut moved, mut changed) = (0, 0);
+        let (mut t, mut last_send) = (Duration::ZERO, Duration::ZERO);
+        let mut sent = Vec::new();
+        while t < us(end_ms) {
+            let frame_start = t;
+            let timeout = match pacer.deadline(start + t) {
+                Some(_) => Duration::ZERO,
+                None => default_timeout,
+            };
+            let next = [moves.get(moved), changes.get(changed)]
+                .into_iter()
+                .flatten()
+                .map(|&ms| us(ms))
+                .min();
+            let mut desktop = false;
+            match next {
+                Some(at) if at <= t + timeout => {
+                    t = t.max(at);
+                    let before = moved;
+                    while moves.get(moved).is_some_and(|&ms| us(ms) <= t) {
+                        moved += 1;
+                    }
+                    while changes.get(changed).is_some_and(|&ms| us(ms) <= t) {
+                        changed += 1;
+                        desktop = true;
+                    }
+                    if moved > before {
+                        pacer.moved(start + t);
+                    }
+                }
+                _ => {
+                    t += timeout;
+                    if pacer.deadline(start + t).is_none() {
+                        if t - last_send >= IDLE_KEEPALIVE {
+                            sent.push(Sent {
+                                at: t,
+                                moves: moved,
+                                changes: changed,
+                            });
+                            last_send = t;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if desktop || pacer.due(start + t) {
+                sent.push(Sent {
+                    at: t,
+                    moves: moved,
+                    changes: changed,
+                });
+                last_send = t;
+                pacer.sent(start + t, budget);
+            }
+            let wake = pacer
+                .deadline(start + t)
+                .map_or(frame_start + budget, |at| at - start);
+            t = t.max(wake);
+        }
+        sent
+    }
+
+    /// Bursts of four pointer updates 1 ms apart, then 30-60 ms without one,
+    /// as Windows reports a mouse moved at a steady speed (#183).
+    fn bursty_moves(from_ms: f64, bursts: usize) -> Vec<f64> {
+        let mut moves = Vec::new();
+        let mut at = from_ms;
+        for gap in [30.0, 45.0, 60.0, 38.0, 52.0, 33.0]
+            .iter()
+            .cycle()
+            .take(bursts)
+        {
+            moves.extend((0..4).map(|i| at + i as f64));
+            at += gap;
+        }
+        moves
+    }
+
+    fn ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    #[test]
+    fn a_moving_pointer_gets_a_frame_every_budget_until_it_stops() {
+        let us = |ms: f64| Duration::from_micros((ms * 1000.0) as u64);
+        for fps in [120, 60] {
+            let budget = frame_budget_for(fps);
+            let moves = bursty_moves(20.0, 36);
+            let (first, last) = (us(moves[0]), us(*moves.last().unwrap()));
+            let sent = pointer_frames(fps, &moves, &[], ms(last) + 2_000.0);
+
+            let moving: Vec<_> = sent
+                .iter()
+                .filter(|frame| frame.at >= first && frame.at <= last)
+                .collect();
+            assert_eq!(moving[0].at, first, "{fps} fps: the first move waits");
+            let gaps: Vec<_> = moving
+                .windows(2)
+                .map(|pair| (pair[1].at - pair[0].at, pair[1].at))
+                .collect();
+            let (longest, at) = gaps.iter().max().unwrap();
+            assert!(
+                *longest <= budget + Duration::from_millis(1),
+                "{fps} fps: {:.1} ms without a frame before {:.1} ms while the pointer \
+                 moved, budget {:.1} ms",
+                ms(*longest),
+                ms(*at),
+                ms(budget),
+            );
+            let (shortest, at) = gaps.iter().min().unwrap();
+            assert!(
+                *shortest >= budget,
+                "{fps} fps: frames {:.1} ms apart at {:.1} ms",
+                ms(*shortest),
+                ms(*at),
+            );
+            // Every update is shown within one budget.
+            for (i, &at) in moves.iter().enumerate() {
+                let shown = sent.iter().find(|frame| frame.moves > i).unwrap();
+                assert!(shown.at - us(at) <= budget, "{fps} fps: update {i}");
+            }
+
+            // The pointer stops: frames stop once it has been still for
+            // POINTER_HOLD, and the idle keepalive takes over.
+            let paced_until = last + POINTER_HOLD + budget;
+            let after: Vec<_> = sent.iter().filter(|frame| frame.at > last).collect();
+            assert_eq!(after[0].moves, moves.len(), "{fps} fps: the last position");
+            let held = after
+                .iter()
+                .rposition(|frame| frame.at <= paced_until)
+                .unwrap();
+            let next = after[held + 1];
+            assert!(
+                next.at - after[held].at >= IDLE_KEEPALIVE,
+                "{fps} fps: a frame {:.1} ms after the pointer stopped",
+                ms(next.at - last),
+            );
+            assert!(after[held].at >= last + POINTER_HOLD - budget);
+        }
+    }
+
+    #[test]
+    fn desktop_updates_keep_their_frames_while_the_pointer_moves() {
+        let us = |ms: f64| Duration::from_micros((ms * 1000.0) as u64);
+        let budget = frame_budget_for(120);
+        // No pointer: desktop updates go out as they come, then keepalives.
+        let changes = [100.0, 112.5, 400.2];
+        let sent = pointer_frames(120, &[], &changes, 2_000.0);
+        let times: Vec<_> = sent.iter().map(|frame| ms(frame.at)).collect();
+        assert_eq!(&times[..3], &[100.0, 112.5, 400.2], "{times:?}");
+        assert!(sent[2..]
+            .windows(2)
+            .all(|pair| pair[1].at - pair[0].at >= IDLE_KEEPALIVE));
+
+        // Desktop updates while the pointer moves.
+        let moves = bursty_moves(20.0, 20);
+        let changes = [305.4, 702.9, 703.5];
+        let sent = pointer_frames(120, &moves, &changes, 1_500.0);
+        for (i, &at) in changes.iter().enumerate() {
+            let shown = sent.iter().find(|frame| frame.changes > i).unwrap();
+            assert!(shown.at - us(at) <= budget, "desktop update {i}");
+        }
+        let last = us(*moves.last().unwrap());
+        let moving: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame.at >= us(moves[0]) && frame.at <= last)
+            .collect();
+        assert!(moving
+            .windows(2)
+            .all(|pair| pair[1].at - pair[0].at <= budget + Duration::from_millis(1)));
+    }
 
     /// The LUIDs of the hybrid laptop of the 0.3.4 beta report.
     pub(crate) const NVIDIA: crate::gpu_preference::AdapterId = (0, 0x14c81);

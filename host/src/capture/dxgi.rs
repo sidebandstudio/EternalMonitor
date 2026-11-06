@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
+use super::cursor::{CursorState, DrawnCursor};
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
     LossStep, OpenStep, LOSS_GIVE_UP,
@@ -18,8 +19,8 @@ use super::recovery::{
 use super::{
     client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
     keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
-    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
-    FPS_WINDOW, FRAME_PADDING,
+    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, PointerPacer, RawFrame,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -311,6 +312,9 @@ pub fn run_capture_loop(
     let mut cursor_visible = false;
     let mut cursor_x: i32 = 0;
     let mut cursor_y: i32 = 0;
+    // The cursor in `last_frame`, so a pointer-only update can move it there.
+    let mut drawn = DrawnCursor::default();
+    let mut pacer = PointerPacer::default();
     let mut recovery = LossRecovery::default();
     let mut resumed = false;
     let mut idle = IdleGate::new();
@@ -351,11 +355,17 @@ pub fn run_capture_loop(
         // Half the frame budget, clamped: at 60 fps this is the classic 8 ms;
         // high-rate modes (ETERNAL_FPS=120) must not block a whole 16 ms in
         // AcquireNextFrame, and below 4 ms the wakeups outrun the compositor.
-        let acquire_timeout_ms =
-            ((frame_budget.as_millis() as u32) / 2).clamp(4, ACQUIRE_TIMEOUT_MS);
+        // While the pointer moves, the sleep below waits for its next frame.
+        let acquire_timeout_ms = if pacer.deadline(frame_start).is_some() {
+            0
+        } else {
+            ((frame_budget.as_millis() as u32) / 2).clamp(4, ACQUIRE_TIMEOUT_MS)
+        };
 
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource: Option<IDXGIResource> = None;
+        // A frame for the encoder, and when it was captured.
+        let mut frame: Option<(Instant, Arc<Vec<u8>>)> = None;
 
         let acquire_start = Instant::now();
         let dupl = duplication
@@ -393,13 +403,21 @@ pub fn run_capture_loop(
                 }
 
                 // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
+                let before = (cursor_visible, cursor_x, cursor_y);
                 if frame_info.LastMouseUpdateTime != 0 {
                     cursor_visible = frame_info.PointerPosition.Visible.as_bool();
                     cursor_x = frame_info.PointerPosition.Position.x;
                     cursor_y = frame_info.PointerPosition.Position.y;
                 }
-                if frame_info.PointerShapeBufferSize > 0 {
+                let reshaped = frame_info.PointerShapeBufferSize > 0;
+                if reshaped {
                     cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
+                }
+                let shown_changed = before.0 != cursor_visible
+                    || (cursor_visible
+                        && (reshaped || before != (cursor_visible, cursor_x, cursor_y)));
+                if seen_image && shown_changed {
+                    pacer.moved(Instant::now());
                 }
 
                 // --- Get dirty rect count ---
@@ -444,111 +462,94 @@ pub fn run_capture_loop(
                     }
                     continue;
                 }
-                let frame_data = read_back_image(&shared, generation, &mut seen_image, || {
-                    windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
-                        match resource.cast::<ID3D11Texture2D>() {
-                            Ok(desktop_texture) => {
-                                unsafe {
-                                    device_context.CopyResource(&staging_texture, &desktop_texture);
-                                }
-
-                                // Release acquired frame — staging texture has its own copy
-                                unsafe {
-                                    dupl.ReleaseFrame()?;
-                                }
-
-                                let mut pixel_buf = match spare
-                                    .take()
-                                    .and_then(|arc| Arc::try_unwrap(arc).ok())
-                                {
-                                    Some(buf) if buf.len() == frame_bytes + FRAME_PADDING => buf,
-                                    _ => frame_buffer(frame_bytes),
-                                };
-
-                                // Map staging texture for CPU read
-                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                                unsafe {
-                                    device_context.Map(
-                                        &staging_texture,
-                                        0,
-                                        D3D11_MAP_READ,
-                                        0,
-                                        Some(&mut mapped),
-                                    )?;
-                                }
-
-                                // Copy row-by-row (pitch may differ from width*4)
-                                let src_pitch = mapped.RowPitch as usize;
-                                let src_ptr = mapped.pData as *const u8;
-                                for row in 0..tex_height as usize {
-                                    let src_offset = row * src_pitch;
-                                    let dst_offset = row * row_bytes;
+                // A pointer-only update leaves the desktop as last read back:
+                // the paced frame below moves the cursor in a copy of it.
+                let frame_data = if frame_info.LastPresentTime == 0 {
+                    unsafe {
+                        dupl.ReleaseFrame()?;
+                    }
+                    None
+                } else {
+                    read_back_image(&shared, generation, &mut seen_image, || {
+                        windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
+                            match resource.cast::<ID3D11Texture2D>() {
+                                Ok(desktop_texture) => {
                                     unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            src_ptr.add(src_offset),
-                                            pixel_buf.as_mut_ptr().add(dst_offset),
-                                            row_bytes,
-                                        );
+                                        device_context
+                                            .CopyResource(&staging_texture, &desktop_texture);
                                     }
-                                }
 
-                                unsafe {
-                                    device_context.Unmap(&staging_texture, 0);
-                                }
+                                    // Release acquired frame — staging texture has its own copy
+                                    unsafe {
+                                        dupl.ReleaseFrame()?;
+                                    }
 
-                                // Composite the mouse cursor into the BGRA frame.
-                                if cursor_visible && cursor.has_shape {
-                                    draw_cursor(
+                                    let mut pixel_buf = recycled(&mut spare, frame_bytes);
+
+                                    // Map staging texture for CPU read
+                                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                                    unsafe {
+                                        device_context.Map(
+                                            &staging_texture,
+                                            0,
+                                            D3D11_MAP_READ,
+                                            0,
+                                            Some(&mut mapped),
+                                        )?;
+                                    }
+
+                                    // Copy row-by-row (pitch may differ from width*4)
+                                    let src_pitch = mapped.RowPitch as usize;
+                                    let src_ptr = mapped.pData as *const u8;
+                                    for row in 0..tex_height as usize {
+                                        let src_offset = row * src_pitch;
+                                        let dst_offset = row * row_bytes;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                src_ptr.add(src_offset),
+                                                pixel_buf.as_mut_ptr().add(dst_offset),
+                                                row_bytes,
+                                            );
+                                        }
+                                    }
+
+                                    unsafe {
+                                        device_context.Unmap(&staging_texture, 0);
+                                    }
+
+                                    // Composite the mouse cursor into the BGRA frame.
+                                    drawn.draw(
                                         &mut pixel_buf,
                                         tex_width,
                                         tex_height,
                                         row_bytes,
-                                        &cursor,
-                                        cursor_x,
-                                        cursor_y,
+                                        cursor.at(cursor_visible, cursor_x, cursor_y),
                                     );
+
+                                    Some(Arc::new(pixel_buf))
                                 }
-
-                                Some(Arc::new(pixel_buf))
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
-                                unsafe {
-                                    dupl.ReleaseFrame()?;
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
+                                    unsafe {
+                                        dupl.ReleaseFrame()?;
+                                    }
+                                    None
                                 }
-                                None
                             }
-                        }
-                    } else {
-                        unsafe {
-                            dupl.ReleaseFrame()?;
-                        }
-                        None
-                    })
-                })?;
-
-                if let Some(data) = frame_data {
-                    if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
-                        PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
-                        heartbeat(&shared.hb_capture_frame_ms);
-
-                        slot.publish(RawFrame {
-                            frame_number: *frame_number,
-                            timestamp: now,
-                            data: Arc::clone(&data),
-                            width: tex_width,
-                            height: tex_height,
-                        });
-                        last_send = now;
-                    } else {
-                        idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
-                    }
-                    // The displaced spare (if any) plus last_frame keep at most
-                    // two buffers alive; steady state recycles them.
-                    spare = Some(Arc::clone(&last_frame));
-                    last_frame = data;
-                }
+                        } else {
+                            unsafe {
+                                dupl.ReleaseFrame()?;
+                            }
+                            None
+                        })
+                    })?
+                };
+                frame = frame_data.map(|data| (now, data));
             }
+            // The pointer moves over a still desktop: its frame is due below.
+            Err(e)
+                if e.code() == DXGI_ERROR_WAIT_TIMEOUT
+                    && pacer.deadline(Instant::now()).is_some() => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // Desktop unchanged — not an error.
                 if !shared.running.load(Ordering::SeqCst)
@@ -696,6 +697,7 @@ pub fn run_capture_loop(
                         Ok(d) => {
                             duplication = Some(d);
                             seen_image = false;
+                            pacer = PointerPacer::default();
                             super::second_screen::note_recovery(
                                 &shared,
                                 generation,
@@ -736,6 +738,7 @@ pub fn run_capture_loop(
                     frame_bytes = row_bytes * tex_height as usize;
                     spare = None;
                     last_frame = Arc::new(frame_buffer(frame_bytes));
+                    drawn = DrawnCursor::default();
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(
@@ -757,13 +760,56 @@ pub fn run_capture_loop(
             }
         }
 
-        // Frame pacing — sleep remainder of budget
-        let frame_elapsed = frame_start.elapsed();
-        if frame_elapsed < frame_budget {
-            std::thread::sleep(frame_budget - frame_elapsed);
+        // The pointer moved over the last image: draw it on a copy.
+        if frame.is_none() && pacer.due(Instant::now()) {
+            *frame_number += 1;
+            let mut pixel_buf = recycled(&mut spare, frame_bytes);
+            pixel_buf.copy_from_slice(&last_frame);
+            drawn.erase(&mut pixel_buf, row_bytes);
+            drawn.draw(
+                &mut pixel_buf,
+                tex_width,
+                tex_height,
+                row_bytes,
+                cursor.at(cursor_visible, cursor_x, cursor_y),
+            );
+            frame = Some((Instant::now(), Arc::new(pixel_buf)));
+        }
+
+        if let Some((now, data)) = frame {
+            if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
+                PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                heartbeat(&shared.hb_capture_frame_ms);
+
+                slot.publish(RawFrame {
+                    frame_number: *frame_number,
+                    timestamp: now,
+                    data: Arc::clone(&data),
+                    width: tex_width,
+                    height: tex_height,
+                });
+                last_send = now;
+            } else {
+                idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
+            }
+            // The displaced spare (if any) plus last_frame keep at most
+            // two buffers alive; steady state recycles them.
+            spare = Some(Arc::clone(&last_frame));
+            last_frame = data;
+            pacer.sent(now, frame_budget);
+        }
+
+        // Frame pacing — sleep remainder of budget, or until the moving
+        // pointer's next frame
+        let wake = pacer
+            .deadline(Instant::now())
+            .unwrap_or(frame_start + frame_budget);
+        let now = Instant::now();
+        if now < wake {
+            std::thread::sleep(wake - now);
         } else {
             debug!(
-                over_budget_us = (frame_elapsed - frame_budget).as_micros(),
+                over_budget_us = (now - wake).as_micros(),
                 "Frame over budget"
             );
         }
@@ -814,6 +860,14 @@ fn duplicate_output(
         move || unsafe { output.DuplicateOutput(&device) },
         progress,
     )
+}
+
+/// A frame buffer from `spare` when nothing else holds it, else a new one.
+fn recycled(spare: &mut Option<Arc<Vec<u8>>>, frame_bytes: usize) -> Vec<u8> {
+    match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
+        Some(buf) if buf.len() == frame_bytes + FRAME_PADDING => buf,
+        _ => frame_buffer(frame_bytes),
+    }
 }
 
 /// Hand the last captured image downstream again, so the encoder emits a
@@ -948,24 +1002,6 @@ fn get_dirty_rect_count(
     }
 }
 
-// DXGI pointer shape types (DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*).
-const DXGI_POINTER_SHAPE_MONOCHROME: u32 = 1;
-const DXGI_POINTER_SHAPE_COLOR: u32 = 2;
-const DXGI_POINTER_SHAPE_MASKED_COLOR: u32 = 4;
-
-/// Caches the latest mouse-cursor shape from DXGI Desktop Duplication. The shape only
-/// arrives when it changes, so it's kept across frames and composited at the per-frame
-/// pointer position.
-#[derive(Default)]
-struct CursorState {
-    shape: Vec<u8>,
-    shape_type: u32,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    has_shape: bool,
-}
-
 impl CursorState {
     /// Fetch the current pointer shape. Must be called while a frame is acquired
     /// (before `ReleaseFrame`). On failure the previous shape is kept.
@@ -990,152 +1026,6 @@ impl CursorState {
             }
             Err(e) => {
                 warn!(error = %e, "GetFramePointerShape failed — cursor shape not updated");
-            }
-        }
-    }
-}
-
-/// Composite the cached cursor into a BGRA frame at top-left `(px, py)` (this output's
-/// pixel space). Handles the three DXGI pointer shape types; out-of-bounds pixels are
-/// clipped.
-fn draw_cursor(
-    buf: &mut [u8],
-    frame_w: u32,
-    frame_h: u32,
-    row_bytes: usize,
-    cursor: &CursorState,
-    px: i32,
-    py: i32,
-) {
-    match cursor.shape_type {
-        DXGI_POINTER_SHAPE_COLOR => {
-            draw_color_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py, false)
-        }
-        DXGI_POINTER_SHAPE_MASKED_COLOR => {
-            draw_color_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py, true)
-        }
-        DXGI_POINTER_SHAPE_MONOCHROME => {
-            draw_monochrome_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py)
-        }
-        _ => {}
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_color_cursor(
-    buf: &mut [u8],
-    frame_w: u32,
-    frame_h: u32,
-    row_bytes: usize,
-    cursor: &CursorState,
-    px: i32,
-    py: i32,
-    masked: bool,
-) {
-    let pitch = cursor.pitch as usize;
-    for row in 0..cursor.height {
-        let sy = py + row as i32;
-        if sy < 0 || sy >= frame_h as i32 {
-            continue;
-        }
-        for col in 0..cursor.width {
-            let sx = px + col as i32;
-            if sx < 0 || sx >= frame_w as i32 {
-                continue;
-            }
-            let src = row as usize * pitch + col as usize * 4;
-            if src + 4 > cursor.shape.len() {
-                continue;
-            }
-            let (b, g, r, a) = (
-                cursor.shape[src],
-                cursor.shape[src + 1],
-                cursor.shape[src + 2],
-                cursor.shape[src + 3],
-            );
-            let dst = sy as usize * row_bytes + sx as usize * 4;
-            if dst + 4 > buf.len() {
-                continue;
-            }
-            if masked {
-                // MASKED_COLOR: alpha 0 = opaque pixel; alpha 0xFF = XOR with screen.
-                if a == 0 {
-                    buf[dst] = b;
-                    buf[dst + 1] = g;
-                    buf[dst + 2] = r;
-                } else {
-                    buf[dst] ^= b;
-                    buf[dst + 1] ^= g;
-                    buf[dst + 2] ^= r;
-                }
-            } else {
-                // COLOR: straight alpha blend over the screen.
-                let af = a as u32;
-                let inv = 255 - af;
-                buf[dst] = ((b as u32 * af + buf[dst] as u32 * inv) / 255) as u8;
-                buf[dst + 1] = ((g as u32 * af + buf[dst + 1] as u32 * inv) / 255) as u8;
-                buf[dst + 2] = ((r as u32 * af + buf[dst + 2] as u32 * inv) / 255) as u8;
-            }
-        }
-    }
-}
-
-fn draw_monochrome_cursor(
-    buf: &mut [u8],
-    frame_w: u32,
-    frame_h: u32,
-    row_bytes: usize,
-    cursor: &CursorState,
-    px: i32,
-    py: i32,
-) {
-    // Monochrome shapes pack an AND mask (top half) and an XOR mask (bottom half),
-    // 1 bit per pixel. The real cursor height is half the reported buffer height.
-    let pitch = cursor.pitch as usize;
-    let cur_h = cursor.height / 2;
-    for row in 0..cur_h {
-        let sy = py + row as i32;
-        if sy < 0 || sy >= frame_h as i32 {
-            continue;
-        }
-        for col in 0..cursor.width {
-            let sx = px + col as i32;
-            if sx < 0 || sx >= frame_w as i32 {
-                continue;
-            }
-            let byte = col as usize / 8;
-            let bit = 7u8 - (col % 8) as u8;
-            let and_idx = row as usize * pitch + byte;
-            let xor_idx = (row + cur_h) as usize * pitch + byte;
-            if xor_idx >= cursor.shape.len() {
-                continue;
-            }
-            let and_bit = (cursor.shape[and_idx] >> bit) & 1;
-            let xor_bit = (cursor.shape[xor_idx] >> bit) & 1;
-            let dst = sy as usize * row_bytes + sx as usize * 4;
-            if dst + 4 > buf.len() {
-                continue;
-            }
-            match (and_bit, xor_bit) {
-                (0, 0) => {
-                    // Opaque black.
-                    buf[dst] = 0;
-                    buf[dst + 1] = 0;
-                    buf[dst + 2] = 0;
-                }
-                (0, 1) => {
-                    // Opaque white.
-                    buf[dst] = 255;
-                    buf[dst + 1] = 255;
-                    buf[dst + 2] = 255;
-                }
-                (1, 0) => {} // Transparent — leave the screen pixel.
-                _ => {
-                    // (1, 1): invert the screen pixel.
-                    buf[dst] = !buf[dst];
-                    buf[dst + 1] = !buf[dst + 1];
-                    buf[dst + 2] = !buf[dst + 2];
-                }
             }
         }
     }
