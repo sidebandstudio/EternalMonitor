@@ -225,7 +225,7 @@ fn a_restart_while_windows_holds_input_never_releases_the_new_generations_keys()
 
     // Windows answers again. Once everything queued has landed, A is down.
     hold::release();
-    assert!(shared.input.finish(Duration::from_secs(5)));
+    assert!(shared.input.wait_idle(Duration::from_secs(5)));
     let injected = recorder::take();
     assert_eq!(a_is_down(&injected), Some(true), "{injected:?}");
 

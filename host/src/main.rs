@@ -367,8 +367,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
 
-    // The last stream's releases of held keys and buttons reach Windows,
-    // unless Windows is stuck.
+    // Release every key and button the iPad left held, behind whatever the
+    // last stream queued, unless Windows is stuck.
     gui_control
         .shared
         .input

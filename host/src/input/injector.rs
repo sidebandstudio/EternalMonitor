@@ -120,6 +120,9 @@ enum Command {
     Reset,
     /// The generation's stream stopped: release what it holds.
     End,
+    /// The app quits: release what the PC holds, whichever stream it is
+    /// from, and take no more input.
+    ReleaseAll,
 }
 
 impl Command {
@@ -163,14 +166,14 @@ impl Command {
     fn is_edge(&self) -> bool {
         match self {
             Command::Relay { event, .. } => event.phase != PHASE_MOVED,
-            Command::Begin { .. } | Command::Reset | Command::End => true,
+            Command::Begin { .. } | Command::Reset | Command::End | Command::ReleaseAll => true,
         }
     }
 
     /// An end or reset: what keeps the PC from holding a key or button.
     fn releases(&self) -> bool {
         match self {
-            Command::Reset | Command::End => true,
+            Command::Reset | Command::End | Command::ReleaseAll => true,
             Command::Begin { .. } => false,
             Command::Relay { event, .. } => event.phase > PHASE_MOVED,
         }
@@ -273,7 +276,10 @@ impl Shared {
         }
         // A generation's start and end always go in: there is one of each
         // per stream.
-        let boundary = matches!(command, Command::Begin { .. } | Command::End);
+        let boundary = matches!(
+            command,
+            Command::Begin { .. } | Command::End | Command::ReleaseAll
+        );
         if waiting >= self.limits.capacity && !boundary {
             let barrier = state
                 .commands
@@ -355,9 +361,32 @@ impl InputThread {
             .map_or(0, |shared| shared.state.lock().relays_queued)
     }
 
-    /// At quit: wait up to `limit` for what is queued, the last stream's
-    /// releases among it, to reach Windows. Whether it did.
+    /// At quit: release what the PC holds, after everything queued, and
+    /// wait up to `limit` for it to reach Windows. Whether it did. A stream
+    /// still running need not have queued its end.
     pub fn finish(&self, limit: Duration) -> bool {
+        let Some(shared) = self.shared.get() else {
+            return true;
+        };
+        shared.push(0, Command::ReleaseAll, Instant::now());
+        let done = self.idle(limit);
+        if !done {
+            warn!(
+                waiting = shared.state.lock().commands.len(),
+                "Quitting before Windows took the last input"
+            );
+        }
+        done
+    }
+
+    /// Wait up to `limit` for everything queued to reach Windows, without
+    /// releasing anything.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn wait_idle(&self, limit: Duration) -> bool {
+        self.idle(limit)
+    }
+
+    fn idle(&self, limit: Duration) -> bool {
         let Some(shared) = self.shared.get() else {
             return true;
         };
@@ -365,10 +394,6 @@ impl InputThread {
         let mut state = shared.state.lock();
         while state.in_windows_since.is_some() || !state.commands.is_empty() {
             if shared.idle.wait_until(&mut state, deadline).timed_out() {
-                warn!(
-                    waiting = state.commands.len(),
-                    "Quitting before Windows took the last input"
-                );
                 return false;
             }
         }
@@ -608,6 +633,10 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
                         current.relayed = true;
                     }
                 }
+                Command::ReleaseAll => {
+                    current = None;
+                    sink.reset();
+                }
                 // An ended generation's: its end released what it held.
                 Command::End | Command::Reset | Command::Relay { .. } => {}
             }
@@ -799,7 +828,7 @@ mod tests {
 
         /// Nothing more reaches Windows.
         fn settled(&self, count: usize) {
-            assert!(self.thread.finish(Duration::from_secs(5)));
+            assert!(self.thread.wait_idle(Duration::from_secs(5)));
             assert_eq!(self.calls.lock().len(), count, "{:?}", self.calls.lock());
         }
     }
@@ -950,7 +979,7 @@ mod tests {
             relayed(KIND_MOUSE_ABS, PHASE_ENDED, 300),
             Call::Reset,
         ];
-        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert!(harness.thread.wait_idle(Duration::from_secs(5)));
         assert_eq!(*harness.calls.lock(), expected);
     }
 
@@ -1125,6 +1154,20 @@ mod tests {
         assert_eq!(logs(), 1);
     }
 
+    /// A quit while a stream still runs, its end not yet queued, still
+    /// releases what the PC holds.
+    #[test]
+    fn quitting_releases_what_a_running_stream_holds() {
+        let harness = harness(Limits::default());
+        harness.stuck();
+        harness.go.send(()).unwrap();
+        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert_eq!(
+            *harness.calls.lock(),
+            [relayed(KIND_KEY, PHASE_BEGAN, 0), Call::Reset]
+        );
+    }
+
     #[test]
     fn quitting_waits_for_queued_releases_but_not_past_its_limit() {
         let harness = harness(Limits::default());
@@ -1134,8 +1177,15 @@ mod tests {
         assert!(!harness.thread.finish(Duration::from_millis(50)));
         assert!(started.elapsed() < Duration::from_secs(1));
         harness.go.send(()).unwrap();
-        assert!(harness.thread.finish(Duration::from_secs(5)));
-        assert_eq!(harness.calls.lock().len(), 2);
+        assert!(harness.thread.wait_idle(Duration::from_secs(5)));
+        assert_eq!(
+            *harness.calls.lock(),
+            [
+                relayed(KIND_KEY, PHASE_BEGAN, 0),
+                relayed(KIND_KEY, PHASE_ENDED, 1),
+                Call::Reset,
+            ]
+        );
     }
 
     /// The hop the thread adds: from the transport queueing an event to the
