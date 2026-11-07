@@ -415,8 +415,43 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         "hello2_v030",
         encode_control(0, 4, &ControlMessage::Hello2(hello)),
     ));
+    let nonce = std::array::from_fn(|index| 0xA0 + index as u8);
+    vectors.push((
+        "identify",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce,
+            }),
+        ),
+    ));
+    // The proof for pairing token 01..10, port 9876 and two addresses: the
+    // same known answer the host's pairing tests and the iPad's identity
+    // tests check.
+    vectors.push((
+        "identity",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce,
+                port: 9876,
+                addresses: IDENTITY_ADDRESSES.to_vec(),
+                proof: IDENTITY_PROOF,
+            }),
+        ),
+    ));
     vectors
 }
+
+const IDENTITY_ADDRESSES: [[u8; 4]; 2] = [[192, 0, 2, 10], [198, 51, 100, 10]];
+const IDENTITY_PROOF: [u8; 32] = [
+    0x18, 0xfb, 0x81, 0xd7, 0x6b, 0xbb, 0x96, 0xe9, 0x11, 0x01, 0x11, 0x97, 0x75, 0xad, 0x97, 0x66,
+    0xb0, 0xc3, 0x32, 0xb2, 0xc4, 0x94, 0x41, 0xe6, 0xf0, 0x7e, 0xc3, 0x3b, 0xe1, 0xc6, 0xd9, 0x4e,
+];
 
 fn render(vectors: &[(&'static str, Vec<u8>)]) -> String {
     let mut out = String::new();
@@ -549,6 +584,42 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
     assert_eq!(PacketType::Nack as u8, 0x19);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
+    assert_eq!(PacketType::Identify as u8, 0x1A);
+    assert_eq!(PacketType::Identity as u8, 0x1B);
+}
+
+/// The request is as long as the answer, so answering never sends more
+/// bytes than arrived; a request cut short of its reserved bytes is refused.
+#[test]
+fn identify_request_is_as_long_as_its_answer() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    assert_eq!(vectors["identify"].len(), vectors["identity"].len());
+    assert_eq!(vectors["identify"].len(), 16 + IDENTIFY_BODY_SIZE);
+    match parse_control(&vectors["identity"]).unwrap().1 {
+        ControlMessage::Identity(identity) => {
+            assert_eq!(identity.proof, IDENTITY_PROOF);
+            assert_eq!(identity.port, 9876);
+            assert_eq!(identity.addresses, IDENTITY_ADDRESSES);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Five addresses don't fit: the answer is refused, never longer.
+    let mut five = vectors["identity"].clone();
+    five[16 + 1 + 16 + 2] = 5;
+    assert!(parse_control(&five).is_err());
+    // Only the addresses counted are read and signed.
+    let mut one = vectors["identity"].clone();
+    one[16 + 1 + 16 + 2] = 1;
+    match parse_control(&one).unwrap().1 {
+        ControlMessage::Identity(identity) => {
+            assert_eq!(identity.addresses, [IDENTITY_ADDRESSES[0]])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_ne!(
+        identity_message(&[0xA0; 16], 9876, &IDENTITY_ADDRESSES),
+        identity_message(&[0xA0; 16], 9876, &IDENTITY_ADDRESSES[..1])
+    );
 }
 
 /// A host that numbers frames contiguously says so in HELLO_ACK; one that

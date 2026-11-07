@@ -27,6 +27,11 @@ enum AttemptEnd: Equatable {
     case closedBeforePicture
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
+    /// No answer at the saved address, and Bonjour found the same PC at
+    /// another: a new attempt goes there.
+    case pcMoved
+    /// The PC found at a saved PC's new address turned out to be another PC.
+    case otherPC
     case receiverFailed
     /// The PC asked for the pairing code, and a new HELLO2 sends it: the
     /// refused one is over, the attempt goes on.
@@ -93,6 +98,7 @@ struct SessionSummary: Equatable {
         case .userDisconnect, .usbTurnedOff: return "user_ended"
         case .appBackground, .superseded, .pcGoodbye: return "app_ended"
         case .connectTimeout: return sessionId == nil ? "no_reply" : "no_picture"
+        case .pcMoved: return "no_reply"
         case .closedBeforePicture: return "no_picture"
         default: return "error"
         }
@@ -100,11 +106,11 @@ struct SessionSummary: Equatable {
 
     private var failure: String {
         switch end {
-        case .connectTimeout where sessionId == nil: return "no_reply"
+        case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
-        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled: return "other"
+        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
         default: return "none"
         }
     }
@@ -113,7 +119,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .userDisconnect, .usbTurnedOff: return "user"
         case .appBackground: return "background"
-        case .superseded, .retriedWithCode: return "superseded"
+        case .superseded, .retriedWithCode, .pcMoved: return "superseded"
         case .pcGoodbye: return "goodbye"
         case .connectTimeout: return "timeout"
         case .pcStoppedResponding: return "liveness"

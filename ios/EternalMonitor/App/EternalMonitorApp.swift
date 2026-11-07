@@ -33,7 +33,8 @@ struct EternalMonitorApp: App {
                     // Automated end-to-end harness: EM_AUTOCONNECT=host:port
                     // connects immediately, bypassing the connect screen.
                     if let target = E2E.autoconnectTarget {
-                        connectionManager.connect(host: target.host, port: target.port)
+                        connectionManager.connect(host: target.host, port: target.port, token: target.token,
+                                                  found: target.found)
                     }
                     #if DEBUG
                     UIPreview.apply(to: connectionManager)

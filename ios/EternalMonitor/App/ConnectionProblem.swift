@@ -8,6 +8,9 @@ enum ConnectionProblem: Equatable {
     /// Nothing came back from the address (PC closed, asleep, other network,
     /// blocked by a firewall or the router).
     case noReply(usb: Bool)
+    /// The saved address didn't answer, and Bonjour found the PC at this
+    /// new one, which didn't answer either.
+    case noReplyAtNewAddress(String)
     /// The PC answered, but no picture could be shown.
     case noPicture
     /// This iPad could not open its side of the connection.
@@ -61,6 +64,7 @@ enum ConnectionProblem: Equatable {
         switch self {
         case .noReply(usb: false): return "Your PC didn't answer"
         case .noReply(usb: true): return "Your PC didn't answer over the cable"
+        case .noReplyAtNewAddress: return "Your PC didn't answer at its new address"
         case .noPicture: return "Your PC answered, but no picture arrived"
         case .receiverNotReady: return "This iPad couldn't start the connection"
         case .badAddress: return "That address doesn't look right"
@@ -90,6 +94,10 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor is open on the PC and says Ready for your iPad, that the PC is awake, "
                 + "and that both are on the same Wi-Fi, not a guest network. If all of that is right, Windows Firewall "
                 + "or security software on the PC may be blocking EternalMonitor: run the PC installer again, or connect with a USB cable."
+        case .noReplyAtNewAddress(let address):
+            return "This iPad found your PC on the network at a new address, \(address), but EternalMonitor didn't answer there. "
+                + "Check that the PC says Ready for your iPad. If it does, Windows Firewall or security software on the PC "
+                + "may be blocking EternalMonitor: run the PC installer again, or connect with a USB cable."
         case .noReply(usb: true):
             return "Check that EternalMonitor and Apple Devices are both open on the PC, then unplug the cable and plug it in again."
         case .noPicture:
