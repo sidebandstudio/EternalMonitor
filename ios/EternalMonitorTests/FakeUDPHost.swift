@@ -14,6 +14,10 @@ final class FakeUDPHost: @unchecked Sendable {
     private var answered = Set<UInt32>()
     /// The nonce of the HELLO2 answered last.
     private(set) var lastNonce: UInt32 = 0
+    /// The pairing token the HELLO2 answered last carried.
+    private(set) var lastAuthToken = Data()
+    /// A HELLO2 came before the identify request was answered.
+    private(set) var helloBeforeIdentify = false
 
     init() {
         var address = sockaddr_in()
@@ -50,14 +54,17 @@ final class FakeUDPHost: @unchecked Sendable {
     /// Answers the next HELLO2 attempt, with session 41 unless `status`
     /// refuses it. False after thirty quiet seconds, a backstop that a
     /// loaded machine's slow start does not reach.
-    func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2, hostCaps: UInt16 = 0) -> Bool {
+    func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2, hostCaps: UInt16 = 0,
+                       hostName: String = "Test PC", authToken: Data = Data(17...32)) -> Bool {
         for _ in 0..<100 {
             guard let (data, from, length) = receive() else { continue }
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
             client = (from, length)
             lastNonce = hello.clientNonce
-            send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion, hostCaps: hostCaps))
+            lastAuthToken = hello.authToken
+            send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion,
+                          hostName: hostName, authToken: authToken, hostCaps: hostCaps))
             return true
         }
         return false
@@ -82,6 +89,64 @@ final class FakeUDPHost: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Answers the next identify request as the PC holding `token` would,
+    /// receiving at this fake's port on `addresses` (loopback unless given),
+    /// or with `proof` instead. False after thirty quiet seconds.
+    func answerIdentify(token: Data, proof: Data? = nil, addresses: [Data] = [Data([127, 0, 0, 1])]) -> Bool {
+        for _ in 0..<100 {
+            guard let (data, from, length) = receive() else { continue }
+            let message = Wire.parseControl(data)?.message
+            if case .hello2? = message { helloBeforeIdentify = true }
+            guard case .identify(let request)? = message else { continue }
+            client = (from, length)
+            send(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identity(WireIdentity(
+                nonce: request.nonce, port: port, addresses: addresses,
+                proof: proof ?? MovedPC.proof(token: token, nonce: request.nonce, port: port, addresses: addresses)))))
+            return true
+        }
+        return false
+    }
+
+    /// Hands the next identify request to `pc` and gives the iPad whatever
+    /// `pc` answers, from this fake's port. False after thirty quiet seconds.
+    func forwardIdentify(to pc: FakeUDPHost) -> Bool {
+        var target = sockaddr_in()
+        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_addr.s_addr = inet_addr("127.0.0.1")
+        target.sin_port = pc.port.bigEndian
+        for _ in 0..<100 {
+            guard let (data, from, length) = receive() else { continue }
+            let message = Wire.parseControl(data)?.message
+            if case .hello2? = message { helloBeforeIdentify = true }
+            if case .identity? = message, client != nil {
+                send(data)
+                return true
+            }
+            guard case .identify? = message else { continue }
+            client = (from, length)
+            _ = data.withUnsafeBytes { bytes in
+                withUnsafePointer(to: &target) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        sendto(fd, bytes.baseAddress, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /// The control messages received within `seconds`, by type.
+    func received(within seconds: Double) -> [Wire.PacketType] {
+        var types: [Wire.PacketType] = []
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            guard let (data, _, _) = receive(), let (header, _) = Wire.parseControl(data) else { continue }
+            types.append(header.packetType)
+        }
+        return types
     }
 
     /// Ends session 41 from the PC's side.
