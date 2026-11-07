@@ -9043,6 +9043,18 @@
         }
       }
     },
+    "Your PC is locked. Unlock it to continue." : {
+      "comment" : "Over the held picture while the PC shows its lock screen or a permission prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC is locked. Unlock it to continue."
+          }
+        }
+      }
+    },
     "⌘ key acts as" : {
       "comment" : "Values are Ctrl or Win",
       "extractionState" : "manual",

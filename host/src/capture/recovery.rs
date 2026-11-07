@@ -373,6 +373,18 @@ pub fn run_until_unblocked(
     }
 }
 
+/// The heartbeat's notice while capture is blocked. A secure screen says the
+/// PC is locked, so the iPad doesn't show a frozen picture without a word; it
+/// clears with the block when capture works again. The other blocks keep the
+/// held picture as before.
+pub fn heartbeat_notice(block: Option<CaptureBlock>) -> u8 {
+    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+    match block {
+        Some(CaptureBlock::SecureDesktop) => NOTICE_PC_LOCKED,
+        _ => NOTICE_NONE,
+    }
+}
+
 /// Clears the blocked state once frames flow again.
 pub fn note_capture_resumed(shared: &SharedControl) {
     if let Some(block) = shared.capture_block.lock().take() {
@@ -491,6 +503,26 @@ mod tests {
         assert_eq!(record.gpu, earlier.gpu);
         note_gpu_outcome(&shared, Outcome::StillUnsupported);
         assert!(shared.gpu_switch.lock().as_ref().unwrap().failed);
+    }
+
+    #[test]
+    fn only_a_secure_screen_tells_the_ipad_the_pc_is_locked() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+        assert_eq!(
+            heartbeat_notice(Some(CaptureBlock::SecureDesktop)),
+            NOTICE_PC_LOCKED
+        );
+        assert_eq!(heartbeat_notice(None), NOTICE_NONE);
+        for block in [
+            CaptureBlock::DisplayChanging,
+            CaptureBlock::NoDisplay,
+            CaptureBlock::UnsupportedOnThisGpu,
+            CaptureBlock::TooManyCaptureApps,
+            CaptureBlock::SessionDisconnected,
+            CaptureBlock::DriverNotResponding,
+        ] {
+            assert_eq!(heartbeat_notice(Some(block)), NOTICE_NONE, "{block:?}");
+        }
     }
 
     #[test]

@@ -248,6 +248,17 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
                 stream_config: stream_config(),
+                notice: NOTICE_NONE,
+            }),
+        ),
+        (
+            "heartbeat_pc_locked",
+            0x1234_5678,
+            42,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_PC_LOCKED,
             }),
         ),
         (

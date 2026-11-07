@@ -329,6 +329,13 @@ struct HelloAck: Equatable {
 struct Heartbeat: Equatable {
     var hostTimeUs: UInt64
     var streamConfig: StreamConfig
+    /// What to say over the picture, for as long as it lasts. PCs older than
+    /// the field leave it off: `noticeNone`. Unknown values are ignored.
+    var notice: UInt8 = Heartbeat.noticeNone
+
+    static let noticeNone: UInt8 = 0
+    /// The PC is locked or shows a permission prompt, so it can't capture.
+    static let noticePCLocked: UInt8 = 1
 }
 
 enum ByeReason: UInt8 {
@@ -498,6 +505,7 @@ extension Wire {
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
             hb.streamConfig.encode(into: &body)
+            if hb.notice != Heartbeat.noticeNone { body.append(hb.notice) }
         case .bye(let reason):
             body.append(reason.rawValue)
         case .keyframeRequest(let k):
@@ -602,7 +610,8 @@ extension Wire {
         case .heartbeat:
             guard let hostTimeUs = r.readU64(),
                   let cfg = StreamConfig.decode(&r) else { return nil }
-            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg))
+            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg,
+                                           notice: r.readU8() ?? Heartbeat.noticeNone))
         case .bye:
             guard let raw = r.readU8(), let reason = ByeReason(rawValue: raw) else { return nil }
             message = .bye(reason)
