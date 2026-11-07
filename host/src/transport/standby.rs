@@ -113,10 +113,10 @@ async fn serve(
             biased;
             _ = &mut *stopped => return false,
             _ = network_check.tick() => {
+                // Every network listens on 0.0.0.0, so a change to or from
+                // it shows here too.
                 let listen_on = shared.listen_on.lock().clone();
-                if listen_on != crate::network::ListenOn::All
-                    && crate::network::listen_ip_now(&listen_on) != bound.ip()
-                {
+                if crate::network::listen_ip_now(&listen_on) != bound.ip() {
                     return true;
                 }
             }

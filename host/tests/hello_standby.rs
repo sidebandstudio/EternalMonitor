@@ -469,8 +469,8 @@ fn the_storm_brake_says_why_and_waits_for_start() {
 
 /// A stopped PC listens where iPads can reach it, as the stream does: on
 /// this PC only while the chosen network is down, on the network's address
-/// once it is back, and on this PC again when it goes. It never starts the
-/// stream to do so.
+/// once it is back, on this PC again when it goes, and on every network
+/// once Listen on says so. It never starts the stream to do so.
 #[cfg(debug_assertions)]
 #[test]
 fn a_stopped_pc_follows_the_chosen_network() {
@@ -514,6 +514,14 @@ fn a_stopped_pc_follows_the_chosen_network() {
     let ack = here
         .ask_until_answered(3, Duration::from_secs(20))
         .expect("never answered on this PC once the network went");
+    assert_eq!(ack.status, HelloStatus::Stopped);
+
+    // Listen on goes back to every network while stopped: the network's
+    // address answers again, though the adapter is still down.
+    *host.shared.listen_on.lock() = ListenOn::All;
+    let ack = lan
+        .ask_until_answered(4, Duration::from_secs(20))
+        .expect("never answered on every network after Listen on changed to All");
     assert_eq!(ack.status, HelloStatus::Stopped);
     assert!(
         !host.streaming(),
