@@ -119,6 +119,9 @@ static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+/// Adapters chosen for the window this launch. After the first, each
+/// replaces a lost device (`vendor/egui-wgpu`).
+static SELECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// How this launch draws its window, for Settings > Troubleshooting.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -577,6 +580,12 @@ impl PresentTracker {
     }
 }
 
+/// How many devices the window has drawn with, or tried to: one more after
+/// each loss. Its textures must be made again on each.
+pub(super) fn devices() -> u64 {
+    SELECTIONS.load(Ordering::SeqCst)
+}
+
 fn select(
     adapters: &[wgpu::Adapter],
     surface: Option<&wgpu::Surface<'_>>,
@@ -585,6 +594,10 @@ fn select(
     rules: &[RendererRule],
     overruled: Option<&'static str>,
 ) -> Result<wgpu::Adapter, String> {
+    // A replacement for a lost device chooses as the start did, but this
+    // launch's marker stays as it is: the window started, so a later end is
+    // not a failed start.
+    let replacing = SELECTIONS.fetch_add(1, Ordering::SeqCst) > 0;
     let usable: Vec<&wgpu::Adapter> = adapters
         .iter()
         .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
@@ -602,7 +615,7 @@ fn select(
         apply_rule(&candidates, &gpus, picked, rules, overruled),
         picked,
         STATE_DIR.get().map(PathBuf::as_path),
-        |index| start(marker(index)),
+        |index| replacing || start(marker(index)),
     );
     if let Some((rule, outcome)) = ruled {
         info!("{}", rule_line(rule, outcome, &gpus[picked]));
@@ -620,6 +633,7 @@ fn select(
             "remote rule"
         },
         avoided = ?history.iter().filter(|f| gpus.contains(&f.gpu) && avoided(history, &f.gpu, &f.backend)).map(|f| (&f.gpu, &f.backend, &f.fault)).collect::<Vec<_>>(),
+        replacing_lost_device = replacing,
         "Window renderer selected"
     );
     let drawing = match info.backend {

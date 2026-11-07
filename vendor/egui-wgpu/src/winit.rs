@@ -9,8 +9,14 @@ use crate::{
     capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
 };
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
+
+/// EternalMonitor patch: how often a lost device's replacement is tried again
+/// while it can't be created, as during a driver reset.
+const REBUILD_RETRY: Duration = Duration::from_millis(500);
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
@@ -43,6 +49,16 @@ pub struct Painter {
     surfaces: ViewportIdMap<SurfaceState>,
     capture_tx: CaptureSender,
     capture_rx: CaptureReceiver,
+
+    // EternalMonitor patch: device-loss recovery.
+    /// Set when the current device is lost: by its lost callback, or when a frame's upload
+    /// fails. The next paint drops the device and everything made on it.
+    device_lost: Arc<AtomicBool>,
+    /// The lost device was dropped; [`Self::set_window`] builds a new one, and failing
+    /// that is retried instead of returned.
+    rebuilding: bool,
+    /// The new device's first paint uploads the font atlas again.
+    restore_fonts: bool,
 }
 
 impl Painter {
@@ -83,6 +99,10 @@ impl Painter {
 
             capture_tx,
             capture_rx,
+
+            device_lost: Arc::new(AtomicBool::new(false)),
+            rebuilding: false,
+            restore_fonts: false,
         }
     }
 
@@ -196,8 +216,19 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                let surface = self.instance.create_surface(window)?;
-                self.add_surface(surface, viewport_id, size).await?;
+                let added = match self.instance.create_surface(window) {
+                    Ok(surface) => self.add_surface(surface, viewport_id, size).await,
+                    Err(err) => Err(err.into()),
+                };
+                match added {
+                    // EternalMonitor patch: while a lost device is replaced, the window
+                    // skips frames until a new one can be made.
+                    Err(err) if self.rebuilding => {
+                        log::warn!("Could not replace the lost wgpu device yet: {err}");
+                        self.context.request_repaint_after(REBUILD_RETRY);
+                    }
+                    added => added?,
+                }
             }
         } else {
             log::warn!("No window - clearing all surfaces");
@@ -245,10 +276,51 @@ impl Painter {
             let render_state =
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
+            self.watch_device(&render_state.device);
+            if self.rebuilding {
+                log::info!("Replaced the lost wgpu device");
+                self.rebuilding = false;
+                self.restore_fonts = true;
+            }
             self.render_state = Some(render_state);
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         Ok(())
+    }
+
+    /// EternalMonitor patch: flag the loss of `device`, and keep wgpu's default handler
+    /// from panicking on the errors a lost device then reports.
+    fn watch_device(&mut self, device: &wgpu::Device) {
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            log::warn!("The wgpu device was lost ({reason:?}): {message}");
+            flag.store(true, Ordering::SeqCst);
+        });
+        let flag = Arc::clone(&lost);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            if flag.load(Ordering::SeqCst) {
+                log::debug!("wgpu error on the lost device: {error}");
+            } else {
+                // As wgpu's default handler.
+                panic!("wgpu error: {error}\n");
+            }
+        }));
+        self.device_lost = lost;
+    }
+
+    /// EternalMonitor patch: forget a lost device and everything made on it. eframe calls
+    /// [`Self::set_window`] before each paint, which builds a new device and surfaces.
+    fn drop_lost_device(&mut self) {
+        log::warn!("Rebuilding the window renderer after its wgpu device was lost");
+        self.render_state = None;
+        self.surfaces.clear();
+        self.depth_texture_view.clear();
+        self.msaa_texture_view.clear();
+        self.screen_capture_state = None;
+        self.rebuilding = true;
+        self.restore_fonts = false;
+        self.context.request_repaint();
     }
 
     /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
@@ -510,6 +582,12 @@ impl Painter {
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
 
+        // EternalMonitor patch: a lost device draws nothing again; replace it.
+        if self.device_lost.load(Ordering::SeqCst) {
+            self.drop_lost_device();
+            return vsync_sec;
+        }
+
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action match
         // below set `needs_recreate`. Recreate the surface now, before re-borrowing
         // `self.render_state` / `self.surfaces` for the rest of the paint.
@@ -565,6 +643,17 @@ impl Painter {
 
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
+            // EternalMonitor patch: the font atlas went with the lost device. Other textures
+            // are the app's to load again.
+            if core::mem::take(&mut self.restore_fonts) {
+                let atlas = self.context.fonts(|fonts| fonts.image());
+                renderer.update_texture(
+                    &render_state.device,
+                    &render_state.queue,
+                    epaint::TextureId::default(),
+                    &epaint::ImageDelta::full(atlas, epaint::TextureAtlas::texture_options()),
+                );
+            }
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {
@@ -585,6 +674,14 @@ impl Painter {
                 &screen_descriptor,
             )
         };
+
+        // EternalMonitor patch: skip a frame whose upload failed; the next one replaces the
+        // device.
+        if render_state.renderer.read().upload_failed || self.device_lost.load(Ordering::SeqCst) {
+            self.device_lost.store(true, Ordering::SeqCst);
+            self.context.request_repaint_of(viewport_id);
+            return vsync_sec;
+        }
 
         if surface_state.needs_reconfigure {
             Self::configure_surface(surface_state, render_state, &self.config.surface);

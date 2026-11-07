@@ -229,7 +229,7 @@ impl AnalyzerApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                if let Some((_, texture)) = &self.logo {
+                if let Some((_, _, texture)) = &self.logo {
                     ui.painter().image(
                         texture.id(),
                         rect,

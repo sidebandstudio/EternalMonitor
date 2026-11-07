@@ -258,6 +258,10 @@ pub struct Renderer {
     ///
     /// See also [`CallbackTrait`].
     pub callback_resources: CallbackResources,
+
+    /// EternalMonitor patch: the last [`Self::update_buffers`] could not upload its meshes,
+    /// as happens once the device is lost, so [`Self::render`] draws nothing.
+    pub(crate) upload_failed: bool,
 }
 
 impl Renderer {
@@ -463,6 +467,7 @@ impl Renderer {
             samplers: HashMap::default(),
             options,
             callback_resources: CallbackResources::default(),
+            upload_failed: false,
         }
     }
 
@@ -483,6 +488,10 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) {
         profiling::function_scope!();
+
+        if self.upload_failed {
+            return;
+        }
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
@@ -960,6 +969,8 @@ impl Renderer {
             })
         };
 
+        self.upload_failed = false;
+
         if index_count > 0 {
             profiling::scope!("indices", index_count.to_string().as_str());
 
@@ -980,12 +991,16 @@ impl Renderer {
                 NonZeroU64::new(required_index_buffer_size).unwrap(),
             );
 
+            // EternalMonitor patch: wgpu gives no staging buffer once the device is lost (or out
+            // of memory). Skip this frame instead of panicking; the painter replaces the device.
             let Some(mut index_buffer_staging) = index_buffer_staging else {
-                panic!(
+                log::warn!(
                     "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.index_buffer.buffer.size(),
                     self.index_buffer.capacity
                 );
+                self.upload_failed = true;
+                return Vec::new();
             };
 
             let mut index_offset = 0;
@@ -1026,12 +1041,16 @@ impl Renderer {
                 NonZeroU64::new(required_vertex_buffer_size).unwrap(),
             );
 
+            // EternalMonitor patch: wgpu gives no staging buffer once the device is lost (or out
+            // of memory). Skip this frame instead of panicking; the painter replaces the device.
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
-                panic!(
+                log::warn!(
                     "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.vertex_buffer.buffer.size(),
                     self.vertex_buffer.capacity
                 );
+                self.upload_failed = true;
+                return Vec::new();
             };
 
             let mut vertex_offset = 0;

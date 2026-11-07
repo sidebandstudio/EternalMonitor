@@ -363,7 +363,9 @@ pub struct AnalyzerApp {
     update_refused: bool,
     history: History,
     quality: QualityMeter,
-    logo: Option<(f32, egui::TextureHandle)>,
+    /// The logo for a scale and the window renderer's device it was made
+    /// on: textures go with a lost device.
+    logo: Option<(f32, u64, egui::TextureHandle)>,
     /// The saved language choice (see `i18n::resolve`).
     settings_language: Option<String>,
     /// A language whose fonts were just installed; it shows from the next
@@ -1271,14 +1273,19 @@ impl AnalyzerApp {
     fn draw_brand(&mut self, ui: &mut egui::Ui) {
         const LOGO: f32 = 30.0;
         let ppp = ui.ctx().pixels_per_point();
-        if self.logo.as_ref().is_none_or(|(scale, _)| *scale != ppp) {
+        let device = renderer::devices();
+        if self
+            .logo
+            .as_ref()
+            .is_none_or(|(scale, made_on, _)| (*scale, *made_on) != (ppp, device))
+        {
             let pixels = (LOGO * ppp).round().max(1.0) as usize;
-            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, texture));
+            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, device, texture));
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (rect, _) = ui.allocate_exact_size(vec2(LOGO, LOGO), Sense::hover());
-            if let Some((_, texture)) = &self.logo {
+            if let Some((_, _, texture)) = &self.logo {
                 ui.painter().image(
                     texture.id(),
                     rect,
