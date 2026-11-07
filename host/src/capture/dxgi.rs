@@ -13,13 +13,13 @@ use windows::core::Interface;
 
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
-    LossStep, OpenStep, LOSS_GIVE_UP,
+    LossStep, OpenStep, Reopen, LOSS_GIVE_UP,
 };
 use super::{
     client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
     keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
     resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, RawFrame,
-    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -323,6 +323,19 @@ pub fn run_capture_loop(
             break;
         }
         heartbeat(&shared.hb_capture_loop_ms);
+        if picture.held_too_long(Instant::now(), second_screen) {
+            info!(
+                device = %chosen.device_name,
+                held_s = PICTURE_HOLD.as_secs(),
+                "The second screen showed no new image since its duplication came back — opening it again"
+            );
+            return Err(Box::new(Reopen {
+                detail: format!(
+                    "no new image from {} since its duplication came back",
+                    chosen.device_name
+                ),
+            }));
+        }
 
         let wait = idle.wait_before_acquire(client_connected(&shared), Instant::now());
         if !wait.is_zero() {
@@ -612,18 +625,25 @@ pub fn run_capture_loop(
                 if !recovery.in_episode() {
                     info!("Desktop duplication access lost — reinitializing");
                 }
-                if super::target_moved(&enumerate_outputs(), &target, &chosen) {
-                    info!(
-                        device = %chosen.device_name,
-                        "The display layout changed — opening the display to capture again"
-                    );
-                    return Err(Box::new(CaptureUnavailable {
-                        block: CaptureBlock::DisplayChanging,
-                        detail: format!(
-                            "the display layout changed while capturing {}",
-                            chosen.device_name
-                        ),
-                    }));
+                let allowed = keepalive_allowed(picture.real(), second_screen);
+                let dims = (tex_width, tex_height);
+                let call = super::second_screen::driver_call(&shared, generation);
+                let moved = target_moved(&output1, &chosen, &target, false, || {
+                    if crate::supervisor::generation_is_current(generation) {
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            dims,
+                            allowed,
+                        );
+                    }
+                });
+                drop(call);
+                if moved {
+                    return Err(moved_away(&chosen));
                 }
                 // A second screen that shows no picture before this is
                 // re-created failed for a passing reason.
@@ -663,19 +683,15 @@ pub fn run_capture_loop(
                             return Ok(());
                         }
                         warn_if_overdue(&mut recovery);
-                        let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed())
-                            && keepalive_allowed(picture.real(), second_screen)
-                        {
-                            resend_last_frame(
-                                slot,
-                                &shared,
-                                frame_number,
-                                &mut last_send,
-                                &last_frame,
-                                (tex_width, tex_height),
-                            );
-                        }
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                            keepalive_allowed(picture.real(), second_screen),
+                        );
                         let now = Instant::now();
                         if now >= deadline {
                             break;
@@ -688,19 +704,15 @@ pub fn run_capture_loop(
                             return;
                         }
                         warn_if_overdue(&mut recovery);
-                        let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed())
-                            && keepalive_allowed(picture.real(), second_screen)
-                        {
-                            resend_last_frame(
-                                slot,
-                                &shared,
-                                frame_number,
-                                &mut last_send,
-                                &last_frame,
-                                (tex_width, tex_height),
-                            );
-                        }
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                            keepalive_allowed(picture.real(), second_screen),
+                        );
                     };
                     let call = super::second_screen::driver_call(&shared, generation);
                     let retried = duplicate_output(&output1, &device, poll);
@@ -721,7 +733,7 @@ pub fn run_capture_loop(
                     match retried {
                         Ok(d) => {
                             duplication = Some(d);
-                            picture.recreated();
+                            picture.recreated(Instant::now());
                             super::second_screen::note_recovery(
                                 &shared,
                                 generation,
@@ -739,6 +751,27 @@ pub fn run_capture_loop(
                             // Tell the GUI why while the retries continue.
                             if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
                                 *shared.capture_block.lock() = Some(block);
+                            }
+                            // The output may be gone: look at the whole layout.
+                            let allowed = keepalive_allowed(picture.real(), second_screen);
+                            let dims = (tex_width, tex_height);
+                            let call = super::second_screen::driver_call(&shared, generation);
+                            let moved = target_moved(&output1, &chosen, &target, true, || {
+                                if crate::supervisor::generation_is_current(generation) {
+                                    keep_picture_alive(
+                                        slot,
+                                        &shared,
+                                        frame_number,
+                                        &mut last_send,
+                                        &last_frame,
+                                        dims,
+                                        allowed,
+                                    );
+                                }
+                            });
+                            drop(call);
+                            if moved {
+                                return Err(moved_away(&chosen));
                             }
                         }
                     }
@@ -927,6 +960,84 @@ fn access_lost_or(
         Ok(error)
     } else {
         Err(error.into())
+    }
+}
+
+/// After ACCESS_LOST: whether the stage should open the target afresh,
+/// because it now resolves to another output or adapter than `chosen` (see
+/// [`super::target_moved`]). The duplicated output's own description is
+/// asked first, and the outputs are listed (a new factory and every adapter)
+/// only when it is off the desktop or renamed, while capture runs on the
+/// primary for a missing display, or when `list` asks after a failed
+/// re-creation. Both run under the stall limits while `progress` keeps the
+/// picture alive; one that does not return in time counts as no move, and
+/// the re-creation goes on.
+fn target_moved(
+    output: &IDXGIOutput1,
+    chosen: &OutputInfo,
+    target: &CaptureTarget,
+    list: bool,
+    mut progress: impl FnMut(),
+) -> bool {
+    let fallback = matches!(target, CaptureTarget::Output(name) if *name != chosen.device_name);
+    if !list && !fallback {
+        let (output, name) = (output.clone(), chosen.device_name.clone());
+        let same = crate::stall::run(
+            Call::ListOutputs,
+            move || {
+                unsafe { output.GetDesc() }.is_ok_and(|desc| {
+                    desc.AttachedToDesktop.as_bool() && utf16_to_string(&desc.DeviceName) == name
+                })
+            },
+            &mut progress,
+        );
+        if same.unwrap_or(true) {
+            return false;
+        }
+    }
+    let (target, chosen) = (target.clone(), chosen.clone());
+    let started = Instant::now();
+    let moved = crate::stall::run(
+        Call::ListOutputs,
+        move || super::target_moved(&enumerate_outputs(), &target, &chosen),
+        progress,
+    )
+    .unwrap_or(false);
+    info!(
+        took_ms = started.elapsed().as_millis() as u64,
+        moved, "Listed the display outputs after a lost duplication"
+    );
+    moved
+}
+
+/// [`Reopen`] for a target that moved off `chosen`.
+fn moved_away(chosen: &OutputInfo) -> Box<dyn std::error::Error + Send + Sync> {
+    info!(
+        device = %chosen.device_name,
+        "The display layout changed — opening the display to capture again"
+    );
+    Box::new(Reopen {
+        detail: format!(
+            "the display layout changed while capturing {}",
+            chosen.device_name
+        ),
+    })
+}
+
+/// While the duplication is away: resends the last picture when the viewer
+/// would otherwise go without one (see [`recovery_poll`]), if `allowed`.
+fn keep_picture_alive(
+    slot: &FrameSlot,
+    shared: &SharedControl,
+    frame_number: &mut u64,
+    last_send: &mut Instant,
+    last_frame: &Arc<Vec<u8>>,
+    dims: (u32, u32),
+    allowed: bool,
+) {
+    let now_ms = crate::clock::host_now_us() / 1000;
+    if recovery_poll(shared, now_ms, last_send.elapsed()) && allowed {
+        resend_last_frame(slot, shared, frame_number, last_send, last_frame, dims);
     }
 }
 

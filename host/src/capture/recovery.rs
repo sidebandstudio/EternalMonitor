@@ -112,6 +112,9 @@ pub fn passing_error(error: &(dyn std::error::Error + Send + Sync + 'static)) ->
     if let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() {
         return unavailable.block != CaptureBlock::UnsupportedOnThisGpu;
     }
+    if error.downcast_ref::<Reopen>().is_some() {
+        return true;
+    }
     if error.downcast_ref::<crate::stall::Stall>().is_some() {
         return true;
     }
@@ -189,6 +192,27 @@ impl std::fmt::Display for CaptureUnavailable {
 }
 
 impl std::error::Error for CaptureUnavailable {}
+
+/// The capture loop ended to open its display afresh: after a lost
+/// duplication the target is now another output or adapter, or a re-created
+/// duplication showed no new image for too long. The stage opens it again at
+/// once, not at the blocked pace.
+#[derive(Debug)]
+pub struct Reopen {
+    pub detail: String,
+}
+
+impl std::fmt::Display for Reopen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture reopens: {}", self.detail)
+    }
+}
+
+impl std::error::Error for Reopen {}
+
+/// A [`Reopen`] within this long of the last one waits at the blocked pace:
+/// a layout that keeps changing must not reopen the display in a loop.
+const REOPEN_SPACING: Duration = Duration::from_secs(1);
 
 /// Delays between duplication re-creations after ACCESS_LOST. The first retry
 /// is immediate, as before; a duplication that is lost again right after it
@@ -345,9 +369,25 @@ pub fn run_until_unblocked(
     let mut retry = BlockedRetry::default();
     let mut stalled = 0;
     let mut frame_number = 0;
+    let mut last_reopen: Option<Instant> = None;
     loop {
         let error = match capture(&mut frame_number) {
             Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let error: Box<dyn std::error::Error + Send + Sync> = match error.downcast::<Reopen>() {
+            Ok(reopen) => {
+                let now = Instant::now();
+                if last_reopen.is_none_or(|at| now.duration_since(at) >= REOPEN_SPACING) {
+                    last_reopen = Some(now);
+                    info!(detail = %reopen.detail, "Opening the display to capture again");
+                    continue;
+                }
+                Box::new(CaptureUnavailable {
+                    block: CaptureBlock::DisplayChanging,
+                    detail: reopen.detail,
+                })
+            }
             Err(error) => error,
         };
         // A driver call that did not return in time, or was refused while an
@@ -1240,6 +1280,46 @@ mod tests {
             *waits.borrow(),
             [500, 1000, 500, 1000, 2000, 500, 1000, 2000, 500, 1000, 2000, 500]
         );
+    }
+
+    /// Review r1 of #205: a display that moved was reopened after the
+    /// blocked pace's 500 ms. It is reopened at once; a second move right
+    /// after waits at that pace instead of reopening in a loop.
+    #[test]
+    fn a_moved_display_is_reopened_at_once_but_not_in_a_loop() {
+        let shared = SharedControl::new(0, 1);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(Reopen {
+                        detail: "the display layout changed".into(),
+                    }
+                    .into())
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| {
+                waits.push(delay.as_millis());
+                true
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, [500]);
+        assert_eq!(
+            *shared.capture_block.lock(),
+            Some(CaptureBlock::DisplayChanging)
+        );
+        // Not a failure of the second screen.
+        let reopen: Box<dyn std::error::Error + Send + Sync> = Box::new(Reopen {
+            detail: String::new(),
+        });
+        assert!(passing_error(reopen.as_ref()));
     }
 
     #[test]

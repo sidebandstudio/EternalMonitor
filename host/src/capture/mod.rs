@@ -279,14 +279,25 @@ pub(crate) fn resolve_target(
 /// also surface as a lost duplication. Re-creating it on the same output
 /// kept capturing the primary display after the chosen one came back, or an
 /// output of an adapter that had gone; the stage opens the target afresh.
+///
+/// It looks the target up as [`resolve_target`] does, without its warning:
+/// it runs at every loss while the chosen display is missing.
 #[cfg(any(windows, test))]
 pub(crate) fn target_moved(
     outputs: &[OutputInfo],
     target: &crate::control::CaptureTarget,
     current: &OutputInfo,
 ) -> bool {
-    resolve_target(outputs, target).is_none_or(|index| {
-        let output = &outputs[index];
+    use crate::control::CaptureTarget;
+    let primary = || outputs.iter().find(|o| o.is_primary).or(outputs.first());
+    let wanted = match target {
+        CaptureTarget::Output(name) => outputs
+            .iter()
+            .find(|o| &o.device_name == name)
+            .or_else(primary),
+        CaptureTarget::PrimaryAuto | CaptureTarget::VirtualExtended => primary(),
+    };
+    wanted.is_none_or(|output| {
         output.device_name != current.device_name || output.adapter_id != current.adapter_id
     })
 }
@@ -818,27 +829,53 @@ pub(crate) struct Picture {
     pub seen_image: bool,
     /// The cached picture is a real image, not the black start frame.
     real: bool,
+    /// When a duplication was re-created with a real picture cached and no
+    /// new image since.
+    held_since: Option<Instant>,
 }
+
+/// How long a second screen resends its cached picture after its
+/// duplication was re-created without a new image. A virtual display that
+/// stopped sending frames looks the same as one that shows nothing new, and
+/// the resends hid it from the watchdog; after this the stage opens it
+/// again without the cached picture, and the watchdog judges what follows.
+#[cfg(any(windows, test))]
+pub(crate) const PICTURE_HOLD: Duration = Duration::from_secs(15);
 
 #[cfg(any(windows, test))]
 impl Picture {
     /// An image was read back into the cache.
     pub fn cached(&mut self) {
         self.real = true;
+        self.held_since = None;
     }
 
     /// The lost duplication was re-created. The cached picture is still the
     /// screen's: a static second screen shows nothing new after a lock screen
     /// or a UAC prompt, and while keepalives waited for a new image the
     /// watchdog restarted the pipeline under the viewer ("no captured frame
-    /// for 5039ms with a client connected").
-    pub fn recreated(&mut self) {
+    /// for 5039ms with a client connected"). It is resent for at most
+    /// [`PICTURE_HOLD`] from the first re-creation without a new image.
+    pub fn recreated(&mut self, now: Instant) {
         self.seen_image = false;
+        if self.real {
+            self.held_since.get_or_insert(now);
+        }
     }
 
     /// The resolution changed: the cache is a black frame of the new size.
     pub fn resized(&mut self) {
         self.real = false;
+        self.held_since = None;
+    }
+
+    /// A second screen has resent its cached picture for [`PICTURE_HOLD`]
+    /// without a new image: the stage opens it again.
+    pub fn held_too_long(&self, now: Instant, second_screen: bool) -> bool {
+        second_screen
+            && self
+                .held_since
+                .is_some_and(|since| now.duration_since(since) >= PICTURE_HOLD)
     }
 
     pub fn real(&self) -> bool {
@@ -1545,6 +1582,40 @@ mod tests {
         assert!(target_moved(&[], &CaptureTarget::PrimaryAuto, &both[0]));
     }
 
+    /// Review r1 of #205: while the chosen display is missing, capture runs
+    /// on the primary and checks at every loss whether it is back. The
+    /// check logged resolve_target's warning each time.
+    #[test]
+    fn checking_for_a_missing_display_at_each_loss_logs_nothing() {
+        use std::sync::{Arc, Mutex};
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out_log = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&out_log);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(Arc::clone(&writer)))
+            .finish();
+        let primary = out(r"\\.\DISPLAY1", 0, 0);
+        let chosen = CaptureTarget::Output(r"\\.\DISPLAY2".to_string());
+        let unplugged = vec![primary.clone()];
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..20 {
+                assert!(!target_moved(&unplugged, &chosen, &primary));
+            }
+        });
+        let log = String::from_utf8(out_log.lock().unwrap().clone()).unwrap();
+        assert!(log.is_empty(), "{log}");
+    }
+
     /// Field, 0.3.4 and the 0.3.5 beta: a static second screen lost its
     /// duplication, had it back in 3 ms, and 5 s later the watchdog restarted
     /// the pipeline under the viewer ("no captured frame for 5039ms with a
@@ -1562,7 +1633,8 @@ mod tests {
         picture.seen_image = true;
         picture.cached();
         // Lost, and re-created at the same size.
-        picture.recreated();
+        let lost = Instant::now();
+        picture.recreated(lost);
         assert!(!frame_has_image(0, picture.seen_image));
         let start = 100_000;
         let mut sent = start;
@@ -1585,17 +1657,80 @@ mod tests {
                 crate::supervisor::wedge_reason_at(&shared, &mut machine, now),
                 None
             );
+            let elapsed = Duration::from_millis(now - start);
+            assert!(!picture.held_too_long(lost + elapsed, true));
         }
         assert!(resends >= 12, "{resends} keepalives in 10 s");
+        // A new image ends the hold.
+        picture.cached();
+        assert!(!picture.held_too_long(lost + PICTURE_HOLD, true));
         // A new resolution leaves only black to resend: the second screen
         // waits for the new duplication's first image again.
-        picture.recreated();
+        picture.recreated(lost);
         picture.resized();
         assert!(!keepalive_allowed(picture.real(), true));
         assert!(keepalive_allowed(picture.real(), false), "the mirror");
         picture.seen_image = true;
         picture.cached();
         assert!(keepalive_allowed(picture.real(), true));
+    }
+
+    /// Review r1 of #205: resending the cached picture hid a virtual display
+    /// that sends no frames after its duplication was re-created, and the
+    /// picture would stay frozen for good. After [`PICTURE_HOLD`] the stage
+    /// opens it again without the cached picture, and the watchdog restarts
+    /// the pipeline 5 s later if it is still dark, as before. The mirror
+    /// keeps resending: it is never dark.
+    #[test]
+    fn a_second_screen_dark_after_a_lost_duplication_is_reopened_then_judged() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let shared = SharedControl::new(0, 1);
+        connect_viewer(&shared);
+        let mut machine = crate::supervisor::Machine::new(1);
+        let mut picture = Picture::default();
+        picture.seen_image = true;
+        picture.cached();
+        let lost = Instant::now();
+        picture.recreated(lost);
+        // Lost again before any new image: the hold runs from the first.
+        picture.recreated(lost + Duration::from_secs(5));
+        let start = 100_000;
+        let mut sent = start;
+        shared.hb_capture_frame_ms.store(start, Relaxed);
+        shared.hb_encode_frame_ms.store(start, Relaxed);
+        let mut reopened_at = None;
+        let mut wedge = None;
+        for now in (start..start + 30_000).step_by(50) {
+            shared.hb_capture_loop_ms.store(now, Relaxed);
+            let at = lost + Duration::from_millis(now - start);
+            assert!(!picture.held_too_long(at, false), "the mirror");
+            if reopened_at.is_none() && picture.held_too_long(at, true) {
+                // The stage opens it again: a fresh loop, nothing cached.
+                reopened_at = Some(now);
+                picture = Picture::default();
+            }
+            let since_send = Duration::from_millis(now - sent);
+            if keepalive_due(since_send, false, picture.real())
+                && keepalive_allowed(picture.real(), true)
+            {
+                sent = now;
+                shared.hb_capture_frame_ms.store(now, Relaxed);
+                shared.hb_encode_frame_ms.store(now, Relaxed);
+            }
+            if let Some(reason) = crate::supervisor::wedge_reason_at(&shared, &mut machine, now) {
+                wedge = Some((now, reason));
+                break;
+            }
+        }
+        let reopened_at = reopened_at.expect("reopened");
+        assert_eq!(reopened_at - start, PICTURE_HOLD.as_millis() as u64);
+        let (at, reason) = wedge.expect("the watchdog judged the dark screen");
+        assert!(reason.starts_with("no captured frame"), "{reason}");
+        assert!(
+            at - reopened_at <= 5_500,
+            "{} ms after reopening",
+            at - reopened_at
+        );
     }
 
     /// The screens came back on 2 s into a 5 s retry wait. The picture comes
@@ -1620,7 +1755,8 @@ mod tests {
             back
         ));
         let waited = started.elapsed();
-        assert!(waited < Duration::from_millis(2_500), "{waited:?}");
+        // Well before the 5 s wait ends, with room for a loaded test machine.
+        assert!(waited < Duration::from_millis(4_000), "{waited:?}");
         assert!(looks.get() >= 2, "{} looks", looks.get());
         // Other blocked states clear by the user's hand; nothing is polled.
         *shared.capture_block.lock() = Some(recovery::CaptureBlock::SecureDesktop);

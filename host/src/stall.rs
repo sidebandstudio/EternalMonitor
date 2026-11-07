@@ -40,9 +40,12 @@ pub enum Call {
     /// Reading the graphics cards and the screens' wiring for the second
     /// screen's decisions (`capture::second_screen::facts`).
     GpuFacts,
+    /// After a lost duplication: asking the duplicated output whether it is
+    /// still on the desktop, and listing the outputs when it is not.
+    ListOutputs,
 }
 
-const CALLS: usize = 6;
+const CALLS: usize = 7;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +73,7 @@ impl Call {
             Self::VddEnable => "vdd_enable",
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
+            Self::ListOutputs => "list_outputs",
         }
     }
 
@@ -99,6 +103,10 @@ impl Call {
             // adapters, as device creation begins, then asks DXCore and reads
             // the display configuration; it keeps device creation's limits.
             Self::GpuFacts => Limits::ms(1_000, 4_000),
+            // Not timed in the field. Listing creates a DXGI factory and asks
+            // every adapter for its outputs, which is how device creation
+            // begins; it keeps device creation's limits.
+            Self::ListOutputs => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -781,6 +789,7 @@ mod tests {
             Call::VddEnable,
             Call::VddDisable,
             Call::GpuFacts,
+            Call::ListOutputs,
         ]
         .map(Call::name)
         .into();
@@ -798,6 +807,7 @@ mod tests {
             Call::EncoderOpen,
             Call::VddEnable,
             Call::GpuFacts,
+            Call::ListOutputs,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");
