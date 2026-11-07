@@ -369,43 +369,107 @@ impl Drop for Listing {
 }
 
 /// The home network addresses among `adapters`: IPv4 on Wi-Fi and Ethernet
-/// adapters that are up, in a private range or link-local, link-local last.
+/// adapters that are up, in a private range or link-local. Those on an
+/// adapter with a default gateway come first and link-local ones last, so a
+/// cap on how many are signed keeps the home network's.
 /// An iPad checking that it found this PC at an address gets these signed.
 pub fn home_addresses_of(adapters: &[Adapter]) -> Vec<Ipv4Addr> {
-    let mut addresses: Vec<Ipv4Addr> = adapters
+    let mut addresses: Vec<(Ipv4Addr, bool)> = adapters
         .iter()
         .filter(|adapter| adapter.up && matches!(adapter.kind, Kind::Wifi | Kind::Ethernet))
-        .flat_map(|adapter| adapter.ipv4.iter().copied())
-        .filter(|ip| ip.is_private() || ip.is_link_local())
+        .flat_map(|adapter| adapter.ipv4.iter().map(|&ip| (ip, adapter.gateway)))
+        .filter(|(ip, _)| ip.is_private() || ip.is_link_local())
         .collect();
-    addresses.sort_by_key(|ip| ip.is_link_local());
+    addresses.sort_by_key(|&(ip, gateway)| (ip.is_link_local(), !gateway));
     let mut seen = Vec::with_capacity(addresses.len());
-    addresses.retain(|ip| {
-        !seen.contains(ip) && {
-            seen.push(*ip);
-            true
+    for (ip, _) in addresses {
+        if !seen.contains(&ip) {
+            seen.push(ip);
         }
-    });
-    addresses
+    }
+    seen
 }
 
 /// How long one listing of the home network addresses answers.
 const HOME_TTL: Duration = Duration::from_secs(2);
 
-/// This PC's home network addresses now (see [`home_addresses_of`]), listed
-/// at most every 2 s.
-pub fn home_addresses() -> Vec<Ipv4Addr> {
-    static LISTED: Mutex<Option<(Instant, Vec<Ipv4Addr>)>> = Mutex::new(None);
-    let mut listed_at = LISTED.lock();
-    if let Some((_, addresses)) = listed_at.as_ref().filter(|(at, _)| at.elapsed() < HOME_TTL) {
-        return addresses.clone();
+/// The home network addresses from the last listing, listed on a thread of
+/// its own at most every 2 s. Asking never waits: an identity check asks
+/// under the session lock, and no listing runs while it is held.
+pub struct HomeCache {
+    list: fn() -> Option<Vec<Adapter>>,
+    ttl: Duration,
+    state: Arc<Mutex<HomeState>>,
+}
+
+#[derive(Default)]
+struct HomeState {
+    listed: Option<(Instant, Vec<Ipv4Addr>)>,
+    listing: bool,
+}
+
+impl HomeCache {
+    fn with(list: fn() -> Option<Vec<Adapter>>, ttl: Duration) -> Self {
+        Self {
+            list,
+            ttl,
+            state: Arc::default(),
+        }
     }
-    let addresses = listed()
-        .or_else(interfaces)
-        .map(|adapters| home_addresses_of(&adapters))
-        .unwrap_or_default();
-    *listed_at = Some((Instant::now(), addresses.clone()));
-    addresses
+
+    /// The last listing's addresses. A missing or stale one starts a listing
+    /// and reads as before (or none) until it is done.
+    pub fn get(&self) -> Vec<Ipv4Addr> {
+        let (addresses, start) = {
+            let mut state = self.state.lock();
+            let stale = state
+                .listed
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= self.ttl);
+            let start = stale && !state.listing;
+            state.listing |= start;
+            let addresses = state
+                .listed
+                .as_ref()
+                .map(|(_, addresses)| addresses.clone());
+            (addresses.unwrap_or_default(), start)
+        };
+        if start {
+            let (list, listing) = (self.list, HomeListing(self.state.clone()));
+            // A thread that can't start drops the closure, and with it the guard.
+            let _ = std::thread::Builder::new()
+                .name("home-addresses".into())
+                .spawn(move || {
+                    let addresses = list()
+                        .map(|adapters| home_addresses_of(&adapters))
+                        .unwrap_or_default();
+                    listing.0.lock().listed = Some((Instant::now(), addresses));
+                });
+        }
+        addresses
+    }
+}
+
+/// Ends a listing when dropped, so a worker that panics loses only that
+/// refresh.
+struct HomeListing(Arc<Mutex<HomeState>>);
+
+impl Drop for HomeListing {
+    fn drop(&mut self) {
+        self.0.lock().listing = false;
+    }
+}
+
+fn listed_home() -> Option<Vec<Adapter>> {
+    listed().or_else(interfaces)
+}
+
+/// This PC's home network addresses (see [`home_addresses_of`] and
+/// [`HomeCache`]).
+pub fn home_addresses() -> Vec<Ipv4Addr> {
+    static HOME: std::sync::LazyLock<HomeCache> =
+        std::sync::LazyLock::new(|| HomeCache::with(listed_home, HOME_TTL));
+    HOME.get()
 }
 
 /// What kind of interface a Unix name and flags say: network cards are
@@ -1072,6 +1136,71 @@ mod tests {
             ]
         );
         assert!(home_addresses_of(&[]).is_empty());
+    }
+
+    /// The home network's address goes first, so the 4 signed include it
+    /// however many other addresses the PC has.
+    #[test]
+    fn home_addresses_with_a_gateway_come_first() {
+        let direct = Adapter {
+            ipv4: (1..=4).map(|last| ip([10, 0, 9, last])).collect(),
+            ..adapter(Kind::Ethernet, false, [0, 0, 0, 0])
+        };
+        let adapters = [
+            adapter(Kind::Wifi, true, [169, 254, 3, 4]),
+            direct,
+            adapter(Kind::Wifi, true, [192, 168, 1, 20]),
+        ];
+        let addresses = home_addresses_of(&adapters);
+        assert_eq!(addresses[0], ip([192, 168, 1, 20]));
+        assert_eq!(
+            addresses[1..5],
+            (1..=4).map(|last| ip([10, 0, 9, last])).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(addresses.last(), Some(&ip([169, 254, 3, 4])));
+    }
+
+    static HOME_GATE: Mutex<()> = Mutex::new(());
+    static HOME_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static HOME_THREAD: Mutex<Option<String>> = Mutex::new(None);
+
+    fn gated_home() -> Option<Vec<Adapter>> {
+        *HOME_THREAD.lock() = std::thread::current().name().map(str::to_string);
+        HOME_CALLS.fetch_add(1, Ordering::SeqCst);
+        let _open = HOME_GATE.lock();
+        tailscale_and_wifi()
+    }
+
+    /// An identity check asks under the session lock: while the adapters are
+    /// still being listed it gets none at once, from one listing on a thread
+    /// of its own, and the addresses once it is done.
+    #[test]
+    fn home_addresses_never_wait_for_the_listing() {
+        let cache = Arc::new(HomeCache::with(gated_home, HOME_TTL));
+        let closed = HOME_GATE.lock();
+        for _ in 0..50 {
+            let (answer, asked) = std::sync::mpsc::channel();
+            let asking = cache.clone();
+            std::thread::spawn(move || answer.send(asking.get()));
+            let addresses = asked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("asking waited for the listing");
+            assert!(addresses.is_empty());
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while HOME_CALLS.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "no listing started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(HOME_THREAD.lock().as_deref(), Some("home-addresses"));
+        drop(closed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.get().is_empty() {
+            assert!(Instant::now() < deadline, "the addresses never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(cache.get(), [ip([192, 168, 1, 20])]);
+        assert_eq!(HOME_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]

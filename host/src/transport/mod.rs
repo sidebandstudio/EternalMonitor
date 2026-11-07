@@ -78,6 +78,29 @@ pub mod probe {
     }
 }
 
+/// What an identity proof signs for a socket on `listen`: that address, or
+/// for one on every address, `home()`. None, and no answer, without an
+/// address to sign.
+fn identity_endpoints(
+    listen: SocketAddr,
+    home: impl FnOnce() -> Vec<std::net::Ipv4Addr>,
+) -> Option<(u16, Vec<[u8; 4]>)> {
+    let std::net::IpAddr::V4(ip) = listen.ip() else {
+        return None;
+    };
+    let addresses = if ip.is_unspecified() {
+        home()
+    } else {
+        vec![ip]
+    };
+    (!addresses.is_empty()).then(|| {
+        (
+            listen.port(),
+            addresses.iter().map(|ip| ip.octets()).collect(),
+        )
+    })
+}
+
 /// Stream parameters advertised in HELLO_ACK and heartbeats.
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
@@ -117,21 +140,8 @@ impl ConfigSource for SharedConfigSource<'_> {
         }
     }
 
-    /// A socket on one address signs that one; one on every address signs
-    /// the PC's home network addresses.
     fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
-        let std::net::IpAddr::V4(ip) = self.listen.ip() else {
-            return None;
-        };
-        let addresses = if ip.is_unspecified() {
-            crate::network::home_addresses()
-        } else {
-            vec![ip]
-        };
-        Some((
-            self.listen.port(),
-            addresses.iter().map(|ip| ip.octets()).collect(),
-        ))
+        identity_endpoints(self.listen, crate::network::home_addresses)
     }
 
     fn notice(&self) -> u8 {
@@ -233,6 +243,10 @@ pub async fn start_sender(
         .max(1);
 
     let local_addr = socket.local_addr()?;
+    if bind_ip.is_unspecified() {
+        // Lists the home network addresses before anyone asks for them.
+        crate::network::home_addresses();
+    }
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
     // The Address row and QR code follow every bind, so a chosen network
     // that came back shows its address. Resolved before locking: the stats
@@ -1027,6 +1041,27 @@ mod tests {
             summaries[0]
         );
         crate::diagnostics::tests::assert_contract(&summaries[0]);
+    }
+
+    /// A socket on one address signs that address; one on every address
+    /// signs the home network addresses. With none to sign, or IPv6, the PC
+    /// answers nothing rather than an empty list.
+    #[test]
+    fn identity_endpoints_need_an_address_to_sign() {
+        let all = SocketAddr::from(([0, 0, 0, 0], 9876));
+        let home = || vec![std::net::Ipv4Addr::new(192, 0, 2, 4)];
+        assert_eq!(
+            identity_endpoints(all, home),
+            Some((9876, vec![[192, 0, 2, 4]]))
+        );
+        assert_eq!(identity_endpoints(all, Vec::new), None);
+        let one = SocketAddr::from(([198, 51, 100, 3], 9876));
+        assert_eq!(
+            identity_endpoints(one, || panic!("lists nothing")),
+            Some((9876, vec![[198, 51, 100, 3]]))
+        );
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9876));
+        assert_eq!(identity_endpoints(v6, home), None);
     }
 
     #[tokio::test]
