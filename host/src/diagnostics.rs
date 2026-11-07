@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::control::{CaptureTarget, SharedControl};
 use crate::transport::link::LinkId;
-use crate::transport::session::{EndReason, SessionEnd};
+use crate::transport::session::{EndReason, SessionEnd, StageFailure, StreamStop};
 use tracing::info;
 
 static SYSTEM_REPORT: OnceLock<String> = OnceLock::new();
@@ -341,9 +341,30 @@ pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
     );
 }
 
-/// The app is quitting: the summary of the stream it stops.
+/// The app is quitting: the summary of the stream it stops. Its iPad is
+/// told the PC ended the session, or, when a restart or an update hands over
+/// to a new copy, to connect again.
 pub fn log_session_end_at_quit(shared: &SharedControl) {
-    let end = shared.session.lock().shut_down(std::time::Instant::now());
+    let why = if shared.handoff.holder().is_some() {
+        StreamStop::Handoff
+    } else {
+        StreamStop::Quit
+    };
+    stop_session(shared, why);
+}
+
+/// The stream stops for good: ends the session, which the transport tells
+/// why on its way out, stops the stream, and logs the summary. The goodbye
+/// and `running` change under one session lock, so a transport starting
+/// meanwhile never takes the goodbye for a stale one
+/// (`Session::transport_resumed`).
+pub fn stop_session(shared: &SharedControl, why: StreamStop) {
+    let end = {
+        let mut session = shared.session.lock();
+        let end = session.shut_down(std::time::Instant::now(), why);
+        shared.stop();
+        end
+    };
     if let Some(end) = end {
         log_session_end(&end, shared);
     }
@@ -379,9 +400,12 @@ pub fn session_summary(
         _ if streamed => "streamed",
         EndReason::Goodbye(ByeReason::UserDisconnect) => "user_ended",
         EndReason::Goodbye(ByeReason::Error) | EndReason::Liveness => "no_picture",
-        EndReason::Goodbye(_) | EndReason::Superseded | EndReason::Shutdown => "app_ended",
+        EndReason::Goodbye(_)
+        | EndReason::Superseded
+        | EndReason::Shutdown
+        | EndReason::Stopped => "app_ended",
         EndReason::Revoked => "pairing",
-        EndReason::LinkLost => "error",
+        EndReason::LinkLost | EndReason::Failed(_) => "error",
     };
     let failure = match end.reason {
         EndReason::Refused(status) if pairing(status) => "none",
@@ -391,6 +415,9 @@ pub fn session_summary(
         EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed => "no_video",
         EndReason::Liveness => "signal_lost",
         EndReason::Goodbye(ByeReason::Error) => "other",
+        EndReason::Failed(StageFailure::Capture) => "capture_failed",
+        EndReason::Failed(StageFailure::Encoder) => "encoder_failed",
+        EndReason::Failed(StageFailure::Other) => "other",
         _ => "none",
     };
     let end_token = match end.reason {
@@ -398,7 +425,10 @@ pub fn session_summary(
         EndReason::Liveness => "liveness",
         EndReason::Superseded => "superseded",
         EndReason::Shutdown => "shutdown",
-        EndReason::Refused(_) | EndReason::LinkLost | EndReason::Revoked => "error",
+        EndReason::Stopped => "user",
+        EndReason::Refused(_) | EndReason::LinkLost | EndReason::Revoked | EndReason::Failed(_) => {
+            "error"
+        }
     };
     let session_id = end.session_id.map_or("-".to_string(), |id| id.to_string());
     let transport = match end.link {
@@ -766,6 +796,27 @@ pub(crate) mod tests {
             (
                 end(Shutdown, None, 20),
                 ["accepted", "app_ended", "none", "shutdown"],
+            ),
+            // Stop on the PC and the storm brake are not a clean quit.
+            (
+                end(Stopped, Some(250), 20_000),
+                ["steady", "streamed", "none", "user"],
+            ),
+            (
+                end(Stopped, None, 20),
+                ["accepted", "app_ended", "none", "user"],
+            ),
+            (
+                end(Failed(StageFailure::Capture), Some(250), 20_000),
+                ["steady", "streamed", "capture_failed", "error"],
+            ),
+            (
+                end(Failed(StageFailure::Encoder), None, 20),
+                ["accepted", "error", "encoder_failed", "error"],
+            ),
+            (
+                end(Failed(StageFailure::Other), Some(250), 9_000),
+                ["first_frame", "streamed", "other", "error"],
             ),
             (usb, ["first_frame", "streamed", "usb_lost", "error"]),
             (

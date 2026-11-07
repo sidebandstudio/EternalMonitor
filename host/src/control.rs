@@ -76,6 +76,9 @@ pub struct SharedControl {
     pub hb_capture_loop_ms: Arc<AtomicU64>,
     pub hb_capture_frame_ms: Arc<AtomicU64>,
     pub hb_encode_frame_ms: Arc<AtomicU64>,
+    /// The transport loop's heartbeat and the step it was taking, which the
+    /// supervisor watches (`transport::beat`).
+    pub transport_beat: Arc<crate::transport::beat::Beat>,
     /// Desktop-space rectangle of the output currently being captured, set by
     /// the capture stage at (re)init. The input relay maps the client's
     /// normalized touch coordinates onto this rect. `None` until the first
@@ -191,6 +194,7 @@ impl SharedControl {
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
+            transport_beat: Default::default(),
             capture_geometry: Arc::new(Mutex::new(None)),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
             audio_enabled: Arc::new(AtomicBool::new(true)),
