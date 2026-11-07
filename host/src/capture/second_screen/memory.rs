@@ -455,6 +455,7 @@ impl Memory {
 
     /// When Windows last started, in seconds since 1970: a lost panel saved
     /// before it was mended by that restart.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // Windows reads the start.
     pub(crate) fn set_boot(&mut self, booted_at: u64) {
         self.booted_at = Some(booted_at);
     }
