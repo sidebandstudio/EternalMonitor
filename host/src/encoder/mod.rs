@@ -14,7 +14,7 @@ use eternal_wire::h264::{
     normalize_h264_payload_with_info, parameter_sets_from_extradata, H264BitstreamState,
 };
 
-use crate::capture::FrameSlot;
+use crate::capture::{FrameSlot, RawFrame, Taken};
 use crate::control::SharedControl;
 use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
@@ -167,7 +167,29 @@ fn run_encode_loop(
         }
     };
 
-    while let Some(raw_frame) = frames.blocking_take() {
+    let mut owed_keyframe: Option<OwedKeyframe> = None;
+    loop {
+        let raw_frame = match owed_keyframe.as_mut() {
+            None => match frames.blocking_take() {
+                Some(frame) => frame,
+                None => break,
+            },
+            Some(owed) => match frames.take_within(KEYFRAME_FLUSH_WAIT) {
+                Taken::Frame(frame) => frame,
+                Taken::Closed => break,
+                Taken::Nothing => match owed.again() {
+                    Some(frame) => frame,
+                    None => {
+                        info!(
+                            given = owed.given,
+                            "The encoder still holds the session's first keyframe; waiting for the next capture"
+                        );
+                        owed_keyframe = None;
+                        continue;
+                    }
+                },
+            },
+        };
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
         {
@@ -491,6 +513,11 @@ fn run_encode_loop(
 
         let convert_start = Instant::now();
         encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
+        // The picture is kept only while a session's first keyframe may stay
+        // inside the encoder, to be given to it again.
+        let picture = (holds_last_frame(&encoder.opened_encoder)
+            && (encoder.frames_submitted == 0 || owed_keyframe.is_some()))
+        .then(|| raw_frame.clone());
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
@@ -516,6 +543,7 @@ fn run_encode_loop(
         let encode_start = Instant::now();
         encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number)?;
 
+        let mut keyframe_out = false;
         loop {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
@@ -560,6 +588,7 @@ fn run_encode_loop(
                             au_info.is_keyframe(packet_is_key, &encoder.opened_encoder);
                         (nal_data, is_keyframe)
                     };
+                    keyframe_out |= is_keyframe;
                     if !opened_is_hevc {
                         encoder.observe_amf_diagnostics(
                             &nal_data,
@@ -625,6 +654,13 @@ fn run_encode_loop(
                 Err(e) => return Err(e.into()),
             }
         }
+        owed_keyframe = match picture {
+            Some(picture) if !keyframe_out => Some(OwedKeyframe {
+                picture,
+                given: owed_keyframe.map_or(0, |owed| owed.given),
+            }),
+            _ => None,
+        };
     }
 
     info!("Capture channel closed, encoder shutting down");
@@ -1639,6 +1675,48 @@ pub fn ignores_forced_keyframes(encoder_name: &str) -> bool {
     matches!(encoder_name, "h264_amf" | "hevc_amf")
 }
 
+/// True for encoders that keep each frame until they are given the next.
+/// FFmpeg 7.1's AMF wrapper asks AMF for output only when it submits a frame
+/// (8.0 can wait for it, with `query_timeout`). On a still desktop a new
+/// viewer's opening keyframe sat inside AMF until capture's next picture,
+/// the 750 ms keepalive: AMD PCs were slow on 39-56% of reconnects.
+pub fn holds_last_frame(encoder_name: &str) -> bool {
+    matches!(encoder_name, "h264_amf" | "hevc_amf")
+}
+
+/// How long the encode loop waits for capture's next picture before it gives
+/// an encoder that [holds its last frame](holds_last_frame) the last picture
+/// again, to bring out a session's first keyframe. It is about one frame at
+/// 60 fps, and longer than AMF takes to encode one.
+const KEYFRAME_FLUSH_WAIT: Duration = Duration::from_millis(20);
+/// How many times the last picture is given again before the keyframe is
+/// left to capture's next picture: 500 ms, as an AMD driver can take a few
+/// hundred to encode a fresh session's first frame, and capture's keepalive
+/// follows at 750 ms.
+const KEYFRAME_FLUSHES: u32 = 25;
+
+/// A session's first keyframe still inside an encoder that holds its last
+/// frame, and the picture to give it again.
+struct OwedKeyframe {
+    picture: RawFrame,
+    given: u32,
+}
+
+impl OwedKeyframe {
+    fn again(&mut self) -> Option<RawFrame> {
+        if self.given >= KEYFRAME_FLUSHES {
+            return None;
+        }
+        self.given += 1;
+        debug!(
+            frame = self.picture.frame_number,
+            given = self.given,
+            "Giving the encoder its last picture again to bring out the keyframe"
+        );
+        Some(self.picture.clone())
+    }
+}
+
 /// Whether a pending keyframe request needs a session reopen: the encoder
 /// ignores per-frame requests, the session has already sent its opening IDR,
 /// and the last such reopen is older than the client's own request limit.
@@ -1830,7 +1908,17 @@ fn prepare_frame_for_encode(
         } else {
             "period"
         };
-        if is_amf {
+        // The period runs all stream long, and FFmpeg 7.1's AMF ignores it
+        // (see `ignores_forced_keyframes`): debug only.
+        if !force_hit {
+            debug!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else if is_amf {
             info!(
                 encoder = encoder_name,
                 frame = frame_number,

@@ -36,7 +36,6 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(any(windows, test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 /// With nobody connected the cached picture is refreshed this often, so a new
@@ -200,6 +199,41 @@ impl FrameSlot {
             self.inner.condvar.wait(&mut state);
         }
     }
+
+    /// As [`Self::blocking_take`], but gives up after `timeout`.
+    pub fn take_within(&self, timeout: Duration) -> Taken {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.state.lock();
+        loop {
+            if let Some(frame) = state.frame.take() {
+                return Taken::Frame(frame);
+            }
+            if state.closed {
+                return Taken::Closed;
+            }
+            if self
+                .inner
+                .condvar
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
+                return match state.frame.take() {
+                    Some(frame) => Taken::Frame(frame),
+                    None if state.closed => Taken::Closed,
+                    None => Taken::Nothing,
+                };
+            }
+        }
+    }
+}
+
+/// What [`FrameSlot::take_within`] found.
+#[derive(Debug)]
+pub enum Taken {
+    Frame(RawFrame),
+    /// No frame arrived in time.
+    Nothing,
+    Closed,
 }
 
 /// Stamp a watchdog heartbeat (ms on the process clock).
@@ -798,7 +832,6 @@ pub(crate) fn keepalive_allowed(seen_image: bool, second_screen: bool) -> bool {
 
 /// How long a keyframe request waits for the encoder to take the resent frame
 /// before the picture is resent again.
-#[cfg(any(windows, test))]
 const KEYFRAME_RESEND: Duration = Duration::from_millis(100);
 
 /// Whether an idle display's last picture is due to be resent to the viewer.
@@ -806,7 +839,6 @@ const KEYFRAME_RESEND: Duration = Duration::from_millis(100);
 /// at once when there is a real picture to send: a viewer back within the
 /// second screen's grace period otherwise waited for the next keepalive, up
 /// to 750 ms, before the encoder could start its session.
-#[cfg(any(windows, test))]
 pub(crate) fn keepalive_due(
     since_send: Duration,
     keyframe_requested: bool,
@@ -969,6 +1001,35 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_timed_take_returns_a_frame_nothing_or_the_close() {
+        let (producer, consumer) = super::frame_slot();
+        let frame = |frame_number| super::RawFrame {
+            frame_number,
+            timestamp: Instant::now(),
+            data: Arc::new(Vec::new()),
+            width: 2,
+            height: 2,
+        };
+        let short = Duration::from_millis(5);
+        assert!(matches!(consumer.take_within(short), super::Taken::Nothing));
+        producer.publish(frame(1));
+        assert!(matches!(
+            consumer.take_within(short),
+            super::Taken::Frame(taken) if taken.frame_number == 1
+        ));
+        let waiting = std::thread::spawn(move || consumer.take_within(Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(20));
+        producer.publish(frame(2));
+        assert!(matches!(
+            waiting.join().unwrap(),
+            super::Taken::Frame(taken) if taken.frame_number == 2
+        ));
+        let (producer, consumer) = super::frame_slot();
+        producer.close();
+        assert!(matches!(consumer.take_within(short), super::Taken::Closed));
+    }
 
     #[test]
     fn pointer_only_frames_are_not_read_back_before_the_first_image() {
