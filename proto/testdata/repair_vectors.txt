@@ -432,9 +432,11 @@ expect 2 0 2 0 0 0 0 1,3 0 -
 
 # Every frame up to the next keyframe refers to the keyframe, so a complete
 # frame behind an incomplete keyframe is no reason to drop it: at its
-# deadline the keyframe is held and asked for again, and its repair then
-# delivers both. On lossy WiFi, dropping it froze the picture for seconds,
-# because each replacement keyframe arrived incomplete too.
+# deadline the keyframe is held, and its repair then delivers both. On lossy
+# WiFi, dropping it froze the picture for seconds, because each replacement
+# keyframe arrived incomplete too. The hold only moves the deadline; the
+# request at 40 ms is the keyframe's retry, due since 31.667 ms and sent
+# because a resend arrived after its last request.
 reset 16667 10000
 add 0 1 1 0 3 0 1 1
 add 1000 1 1 2 3 0 3 1
@@ -446,8 +448,9 @@ expect 0 0 3 0 0 3 1 - 0 1:1|1:1|1:1
 add 45000 1 1 1 3 1 2 1
 expect 2 0 3 0 1 3 0 1,2 0 1:1|1:1|1:1
 
-# A held keyframe still goes a second after its gap, with the frames that
-# need it, under one keyframe request.
+# With nothing arriving, a held keyframe asks no more: its request and the
+# repair would wait in the same queue. It still goes a second after its gap,
+# with the frames that need it, under one keyframe request.
 reset 16667 10000
 add 0 1 1 0 3 0 1 1
 add 1000 1 1 2 3 0 3 1
@@ -461,14 +464,14 @@ tick 415000
 tick 615000
 tick 815000
 tick 1014999
-expect 0 0 3 0 0 9 1 - 0 1:1|1:1|1:1|1:1|1:1|1:1|1:1|1:1|1:1
+expect 0 0 3 0 0 3 1 - 0 1:1|1:1|1:1
 tick 1015000
-expect 0 2 3 1 0 9 0 - 1 1:1|1:1|1:1|1:1|1:1|1:1|1:1|1:1|1:1
+expect 0 2 3 1 0 3 0 - 1 1:1|1:1|1:1
 
 # A keyframe has many fragments, and one round of requests and repairs can
-# leave some missing, so it asks again every RTT + 5 ms instead of once. It
-# asks only after something arrived since it last asked: while WiFi holds
-# traffic, the request and the repair are still queued.
+# leave some missing, so it retries every RTT + 5 ms instead of once. After
+# its first retry it asks only once something arrived since it last asked,
+# and never on the tick that takes a datagram, which may be the missing one.
 reset 16667 10000
 add 0 1 1 0 3 0 1 1
 add 1000 1 1 2 3 0 3 1
@@ -484,3 +487,56 @@ tick 50000
 expect 0 0 2 0 0 3 1 - 0 1:1|1:1|1:1
 add 50000 1 1 1 3 1 2 1
 expect 1 0 2 0 1 3 0 1 0 1:1|1:1|1:1
+
+# A keyframe's hold expiring on the tick its retry falls due sends one
+# request, and the next waits a full RTT + 5 ms.
+reset 16667 10000
+add 0 1 1 0 3 0 1 1
+add 1000 1 1 2 3 0 3 1
+add 16667 1 2 0 1 0 4
+add 17000 1 1 0 3 1 1 1
+tick 40000
+expect 0 0 3 0 0 3 1 - 0 1:1|1:1|1:1
+add 50000 1 3 0 1 0 5
+tick 65000
+expect 0 0 4 0 0 4 1 - 0 1:1|1:1|1:1|1:1
+tick 79999
+expect 0 0 4 0 0 4 1 - 0 1:1|1:1|1:1|1:1
+
+# At 1 ms RTT a keyframe retries every 6 ms, within the PC's 5 ms resend
+# limit. Its hold expiring at 26 ms, 1 ms after a retry, asks nothing more.
+reset 16667 1000
+add 0 1 1 0 3 0 1 1
+add 1000 1 1 2 3 0 3 1
+add 6000 1 1 0 3 1 1 1
+tick 7000
+add 12000 1 1 0 3 1 1 1
+tick 13000
+add 18000 1 1 0 3 1 1 1
+tick 19000
+add 24000 1 1 0 3 1 1 1
+tick 25000
+expect 0 0 2 0 0 5 1 - 0 1:1|1:1|1:1|1:1|1:1
+tick 26000
+expect 0 0 2 0 0 5 1 - 0 1:1|1:1|1:1|1:1|1:1
+tick 30999
+expect 0 0 2 0 0 5 1 - 0 1:1|1:1|1:1|1:1|1:1
+add 31000 1 1 1 3 1 2 1
+expect 1 0 2 0 1 5 0 1 0 1:1|1:1|1:1|1:1|1:1
+
+# At 200 ms RTT a repair can't return sooner than that, so the holds at 26
+# and 51 ms ask nothing; the retry follows at RTT + 5 ms.
+reset 16667 200000
+add 0 1 1 0 3 0 1 1
+add 1000 1 1 2 3 0 3 1
+add 20000 1 1 0 3 1 1 1
+tick 26000
+expect 0 0 2 0 0 1 1 - 0 1:1
+tick 51000
+expect 0 0 2 0 0 1 1 - 0 1:1
+tick 205999
+expect 0 0 2 0 0 1 1 - 0 1:1
+tick 206000
+expect 0 0 2 0 0 2 1 - 0 1:1|1:1
+add 210000 1 1 1 3 1 2 1
+expect 1 0 2 0 1 2 0 1 0 1:1|1:1

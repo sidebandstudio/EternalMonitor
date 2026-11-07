@@ -237,15 +237,17 @@ frames need the keyframe, so the decoder held the picture and asked for
 another, which failed the same way.
 
 A keyframe now keeps its place while the frames after it complete. At its
-deadline it is held and asked for again, like a frame with nothing behind it,
-until it completes, a newer keyframe completes, a second has passed, or the
-32 frames the assembler holds are full. It
-also asks again every RTT + 5 ms, but only once something has arrived since
-its last request. The repair simulation (`proto/tests/wifi_repair_sim.rs`,
-10% loss each way, 150-fragment keyframes at 60 fps) completed 148 of 390
-keyframes before, with 35 freezes over a second and the longest 3.4 s. After,
-it completes 397 of 399, the longest freeze is 0.61 s, and no freeze lasts a
-second. The 1% loss rows also lost fewer frames.
+deadline it is held, like a frame with nothing behind it, until it completes,
+a newer keyframe completes, a second has passed, or the 32 frames the
+assembler holds are full. The hold only moves its deadline. The keyframe's
+requests follow one schedule: after its first retry it asks again every RTT +
+5 ms, sooner than which no repair can return, and only once something has
+arrived since its last request. The repair simulation
+(`proto/tests/wifi_repair_sim.rs`, 10% loss each way, 150-fragment keyframes
+at 60 fps) completed 148 of 390 keyframes before, with 35 freezes over a
+second and the longest 3.4 s. After, it completes 394 of 399, the longest
+freeze is 0.61 s, and no freeze lasts a second. The 1% loss rows also lost
+fewer frames.
 
 Delta frames keep the 25 ms rule and their single retry. Holding them too,
 for at most 100 ms, with every frame asking again, removed nearly every
