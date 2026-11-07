@@ -8,7 +8,8 @@
 //!
 //! In lossless mode (no drops, no disconnect, revoke, restart, roaming or
 //! spoofed sources, which all legitimately leave a commit unseen), every
-//! commit the host makes must also be one the iPad uses.
+//! commit the host makes must be used by the iPad, or replaced by a newer
+//! commit: the host never keeps a session live whose keys the iPad dropped.
 #![no_main]
 
 #[path = "../../tests/v3_sim/mod.rs"]
@@ -201,6 +202,6 @@ fuzz_target!(|data: &[u8]| {
         // Every commit old enough to have reached the iPad (its 11 s
         // retention, plus slack for latency and the durable write).
         let settled = sim.now - std::time::Duration::from_secs(12);
-        assert_eq!(sim.unused_commits_before(settled), 0, "a commit the iPad never used");
+        assert_eq!(sim.stranded_commits_before(settled), 0, "a commit the iPad never used, still live on the host");
     }
 });
