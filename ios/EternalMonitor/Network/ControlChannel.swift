@@ -34,6 +34,8 @@ final class ControlChannel {
     var onDiagnostic: ((String) -> Void)?
     /// Snapshot provider for periodic receiver reports.
     var reportProvider: (() -> ReceiverReport)?
+    /// Takes the PC's pointer when the PC sends it apart from the video.
+    var pointer: PointerOverlay?
 
     private let queue: DispatchQueue
     private let send: (Data) -> Void
@@ -225,6 +227,14 @@ final class ControlChannel {
             // traffic.
             guard header.sessionId == sessionId, sessionId != 0 else { return }
             onStreamConfig?(config)
+        case .pointerShape(let chunk):
+            guard header.sessionId == sessionId, sessionId != 0,
+                  hostCaps & HelloAck.hostCapPointer != 0 else { return }
+            pointer?.handle(chunk)
+        case .pointerState(let state):
+            guard header.sessionId == sessionId, sessionId != 0,
+                  hostCaps & HelloAck.hostCapPointer != 0 else { return }
+            pointer?.handle(state, msgSeq: header.msgSeq)
         default:
             break
         }
@@ -250,6 +260,7 @@ final class ControlChannel {
 
         sessionId = ack.sessionId
         hostCaps = ack.hostCaps
+        pointer?.reset()
         SupportDiagnostics.notePCName(ack.hostName)
         onDiagnostic?("Session \(ack.sessionId) established with \(ack.hostName)")
         lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }

@@ -55,6 +55,11 @@ pub enum PacketType {
     Pong = 0x17,
     StreamConfig = 0x18,
     Nack = 0x19,
+    /// Host → client pointer image, in chunks. Sent only to clients with
+    /// [`control::FEATURE_DRAWS_POINTER`].
+    PointerShape = 0x1A,
+    /// Host → client pointer position and visibility, as for `PointerShape`.
+    PointerState = 0x1B,
     InputEvent = 0x20,
     /// Reserved. Not sent in v2.0.
     Error = 0x7F,
@@ -76,6 +81,8 @@ impl PacketType {
             0x17 => Self::Pong,
             0x18 => Self::StreamConfig,
             0x19 => Self::Nack,
+            0x1A => Self::PointerShape,
+            0x1B => Self::PointerState,
             0x20 => Self::InputEvent,
             0x7F => Self::Error,
             _ => return None,

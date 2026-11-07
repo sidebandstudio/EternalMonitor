@@ -458,6 +458,32 @@ impl Session {
             .map(|session| session.session_id)
     }
 
+    /// The session's id while its client draws the pointer itself. A
+    /// client keeps its HELLO2's answer for the whole session, so capture
+    /// never switches mid-session.
+    pub fn pointer_session_id(&self) -> Option<u32> {
+        self.active
+            .as_ref()
+            .filter(|session| {
+                session.info.feature_caps & eternal_wire::v2::control::FEATURE_DRAWS_POINTER != 0
+            })
+            .map(|session| session.session_id)
+    }
+
+    /// `message` for the connected client, numbered like every other
+    /// control message the host sends it.
+    pub fn encode_for_client(&mut self, message: &ControlMessage) -> Option<(PeerId, Vec<u8>)> {
+        let (peer, session_id) = self
+            .active
+            .as_ref()
+            .map(|session| (session.peer, session.session_id))?;
+        let msg_seq = self.next_msg_seq();
+        Some((
+            peer,
+            eternal_wire::v2::control::encode_control(session_id, msg_seq, message),
+        ))
+    }
+
     pub fn last_report(&self) -> Option<ReceiverReport> {
         self.active.as_ref().and_then(|s| s.last_report)
     }
@@ -1679,6 +1705,47 @@ mod tests {
             info.refresh_hz, 120,
             "panel refresh feeds the VDD mode list"
         );
+    }
+
+    /// Only an iPad that said it draws the pointer gets it apart from the
+    /// video, numbered with the session's other control messages. An older
+    /// iPad keeps the pointer in the video.
+    #[test]
+    fn only_an_ipad_that_draws_the_pointer_gets_it_apart() {
+        use eternal_wire::v2::control::{parse_control, PointerState, FEATURE_DRAWS_POINTER};
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        assert_eq!(session.pointer_session_id(), None, "nobody connected");
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        assert!(session.is_active());
+        assert_eq!(session.pointer_session_id(), None, "an iPad before 0.3.5");
+
+        let ControlMessage::Hello2(mut draws) = hello(2, 50000) else {
+            unreachable!()
+        };
+        draws.feature_caps = FEATURE_DRAWS_POINTER;
+        let actions =
+            session.handle_control_authed(peer, ControlMessage::Hello2(draws), &TestConfig, now);
+        let (ack, _) = parse_control(&actions.replies[0].1).unwrap();
+        let id = session.pointer_session_id().expect("this iPad draws it");
+        assert_eq!(Some(id), session.session_id());
+        let state = ControlMessage::PointerState(PointerState::default());
+        let (to, datagram) = session.encode_for_client(&state).unwrap();
+        assert_eq!(to, peer);
+        let (header, parsed) = parse_control(&datagram).unwrap();
+        assert_eq!(parsed, state);
+        assert_eq!(header.session_id, id);
+        assert_eq!(header.msg_seq, ack.msg_seq + 1);
+
+        session.handle_control_authed(
+            peer,
+            ControlMessage::Bye(ByeReason::UserDisconnect),
+            &TestConfig,
+            now,
+        );
+        assert_eq!(session.pointer_session_id(), None);
+        assert!(session.encode_for_client(&state).is_none());
     }
 
     #[test]

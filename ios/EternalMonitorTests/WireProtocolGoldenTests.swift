@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 29,
+            Self.vectors.count, 35,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -241,6 +241,94 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertEqual(legacy.nacksSent, 0)
         XCTAssertEqual(legacy.audioPacketsLost, 0)
         XCTAssertEqual(legacy.audioBufferMs, 0)
+    }
+
+    // MARK: Pointer
+
+    func testPointerCapabilityVectors() throws {
+        XCTAssertEqual(Hello2.featureDrawsPointer, 0x0020)
+        XCTAssertEqual(HelloAck.hostCapPointer, 0x0040)
+        let (_, hello) = try XCTUnwrap(Wire.parseControl(try vector("hello2_draws_pointer")))
+        guard case .hello2(let h) = hello else { return XCTFail("wrong type") }
+        XCTAssertNotEqual(h.featureCaps & Hello2.featureDrawsPointer, 0)
+        let (_, ack) = try XCTUnwrap(Wire.parseControl(try vector("hello_ack_pointer")))
+        guard case .helloAck(let a) = ack else { return XCTFail("wrong type") }
+        XCTAssertNotEqual(a.hostCaps & HelloAck.hostCapPointer, 0)
+        let (_, old) = try XCTUnwrap(Wire.parseControl(try vector("hello_ack_paired")))
+        guard case .helloAck(let legacy) = old else { return XCTFail("wrong type") }
+        XCTAssertEqual(legacy.hostCaps & HelloAck.hostCapPointer, 0)
+    }
+
+    func testPointerShapeVector() throws {
+        let data = try vector("pointer_shape")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        XCTAssertEqual(header.packetType, .pointerShape)
+        guard case .pointerShape(let chunk) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(chunk.shapeId, 0x0A0B_0C0D)
+        XCTAssertEqual(chunk.sourceType, 1)
+        XCTAssertEqual(chunk.flags, PointerShapeChunk.invertFlag)
+        XCTAssertEqual([chunk.width, chunk.height, chunk.hotX, chunk.hotY], [3, 2, 1, 1])
+        XCTAssertEqual(chunk.totalLen, 26)
+        XCTAssertEqual(chunk.offset, 0)
+        XCTAssertEqual(Array(chunk.data.suffix(2)), [0b0010_0000, 0b1000_0000])
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        let image = PointerOverlay.image(chunk, bytes: [UInt8](chunk.data))
+        XCTAssertEqual([UInt8](try XCTUnwrap(image.invertMask)), [0, 0, 255, 255, 0, 0])
+        XCTAssertEqual([UInt8](image.pixels.prefix(8)), [0, 0, 0, 255, 255, 255, 255, 255])
+    }
+
+    func testPointerStateVectors() throws {
+        for (name, visible, x, y) in [("pointer_state", true, Int32(-5), Int32(1234)),
+                                      ("pointer_hidden", false, 3000, 7)] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .pointerState(let state) = message else { return XCTFail(name) }
+            XCTAssertEqual(state.visible, visible, name)
+            XCTAssertEqual(state.x, x, name)
+            XCTAssertEqual(state.y, y, name)
+            XCTAssertEqual(state.shapeId, 0x0A0B_0C0D, name)
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    func testReceiverReportNamesThePointerShape() throws {
+        let data = try vector("receiver_report_pointer")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .receiverReport(let report) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(report.pointerShapeId, 0x0A0B_0C0D)
+        XCTAssertEqual(report.fragsRepaired, 1234)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        let (_, old) = try XCTUnwrap(Wire.parseControl(try vector("receiver_report_v030")))
+        guard case .receiverReport(let legacy) = old else { return XCTFail("wrong type") }
+        XCTAssertEqual(legacy.pointerShapeId, 0)
+    }
+
+    func testPointerMessagesRejectWhatRustRejects() throws {
+        let good = try vector("pointer_shape")
+        // Body offsets: version 16, shape id 20, width 24, total length 32,
+        // chunk length 40.
+        let breaks: [(String, Range<Int>, [UInt8])] = [
+            ("version", 16..<17, [2]), ("zero id", 20..<24, [0, 0, 0, 0]), ("zero width", 24..<26, [0, 0]),
+            ("wide", 24..<26, [0x01, 0x02]), ("total length", 32..<36, [99, 0, 0, 0]),
+            ("past the end", 36..<40, [1, 0, 0, 0]), ("empty chunk", 40..<42, [0, 0]),
+        ]
+        for (name, range, bytes) in breaks {
+            var bad = good
+            bad.replaceSubrange(range, with: bytes)
+            XCTAssertNil(Wire.parseControl(bad), name)
+        }
+        for length in 0..<good.count {
+            var truncated = Data(good.prefix(length))
+            if truncated.count >= 8 {
+                let body = UInt16(max(0, truncated.count - ControlHeader.size))
+                truncated[6] = UInt8(body & 0xFF)
+                truncated[7] = UInt8(body >> 8)
+            }
+            XCTAssertNil(Wire.parseControl(truncated), "truncated to \(length)")
+        }
+        var state = try vector("pointer_state")
+        state[16] = 2
+        XCTAssertNil(Wire.parseControl(state))
     }
 
     // MARK: Control

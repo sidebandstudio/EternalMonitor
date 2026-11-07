@@ -54,6 +54,9 @@ pub struct PipelineStats {
     pub transport_packets_sent: u64,
     pub transport_fragments_sent: u64,
     pub transport_retransmits: u64,
+    /// Pointer positions and images sent to an iPad that draws the pointer.
+    pub pointer_states_sent: u64,
+    pub pointer_shapes_sent: u64,
     pub usb_service_reachable: bool,
     pub usb_devices: usize,
     pub usb_link_state: String,
@@ -116,6 +119,8 @@ impl PipelineStats {
             transport_packets_sent: 0,
             transport_fragments_sent: 0,
             transport_retransmits: 0,
+            pointer_states_sent: 0,
+            pointer_shapes_sent: 0,
             usb_service_reachable: false,
             usb_devices: 0,
             usb_link_state: "Checking Apple device service".into(),
@@ -163,6 +168,8 @@ impl PipelineStats {
         self.transport_packets_sent = 0;
         self.transport_fragments_sent = 0;
         self.transport_retransmits = 0;
+        self.pointer_states_sent = 0;
+        self.pointer_shapes_sent = 0;
         self.transport_timestamps.clear();
         self.bandwidth_samples.clear();
         self.bandwidth_bps = 0.0;

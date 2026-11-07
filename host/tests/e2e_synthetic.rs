@@ -3490,3 +3490,176 @@ fn quiet_clients_keep_their_session_until_they_go_silent() {
     let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
     let _ = supervisor.join();
 }
+
+/// #183: an iPad that draws the pointer gets it apart from the video. Over a
+/// still picture the pointer moves every frame while the host sends only an
+/// IDR and its idle keepalive; an older iPad on the same host gets a frame
+/// for every move and no pointer messages, as before.
+#[test]
+fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
+    use eternal_host::capture::synthetic::pointer_path;
+    use eternal_wire::v2::control::{FEATURE_DRAWS_POINTER, HOSTCAP_POINTER, POINTER_VISIBLE};
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_POINTER", "1");
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let shared = shared.clone();
+        let tx = supervisor_tx.clone();
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                GpuInfo::software_fallback(),
+                tx,
+                supervisor_rx,
+            );
+        })
+    };
+    // Positions on the synthetic path, to check every state against.
+    let path: std::collections::HashSet<(i32, i32)> = (0..20_000)
+        .map(|step| pointer_path(step, SYNTH_W, SYNTH_H))
+        .collect();
+    const WINDOW: Duration = Duration::from_secs(3);
+
+    for (feature_caps, nonce) in [(FEATURE_DRAWS_POINTER, 0xE2E0_0183u32), (0, 0xE2E0_0184)] {
+        let draws = feature_caps != 0;
+        let mut receiver =
+            FakeReceiver::connect_as(listen_port, CAP_DECODE_H264, feature_caps, 60, nonce);
+        assert_ne!(
+            receiver.host_caps & HOSTCAP_POINTER,
+            0,
+            "this host sends the pointer"
+        );
+        let mut reassembler = Reassembler::new();
+        let mut datagram = [0u8; 2048];
+        let (mut frames, mut highest, mut states) = (0u32, 0u32, Vec::new());
+        let mut shape: Option<(u32, Vec<u8>, usize)> = None;
+        let mut held_shape = 0;
+        let mut window_start: Option<Instant> = None;
+        let deadline = Instant::now() + DEADLINE;
+        while window_start.is_none_or(|at| at.elapsed() < WINDOW) {
+            assert!(Instant::now() < deadline, "no first frame (draws={draws})");
+            if receiver.last_report.elapsed() >= Duration::from_millis(400) {
+                receiver.last_report = Instant::now();
+                receiver.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                    highest_seq: highest,
+                    frames_complete: frames,
+                    pointer_shape_id: held_shape,
+                    ..Default::default()
+                }));
+            }
+            let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+                continue;
+            };
+            let bytes = &datagram[..len];
+            match classify(bytes) {
+                Classified::Media { .. } => {
+                    let (header, payload) = MediaHeader::decode(bytes).unwrap();
+                    highest = highest.max(header.frame_seq);
+                    let done = reassembler.add_fragment(
+                        header.frame_seq,
+                        header.frag_index,
+                        header.frag_count,
+                        header.stream_epoch,
+                        payload,
+                        Instant::now(),
+                    );
+                    if matches!(done, AddOutcome::Completed(_)) {
+                        // The window starts after the session's first frame.
+                        if window_start.is_some() {
+                            frames += 1;
+                        }
+                        window_start.get_or_insert_with(Instant::now);
+                    }
+                }
+                Classified::Control(_) => match parse_control(bytes).map(|(_, m)| m) {
+                    Ok(ControlMessage::PointerState(state)) if window_start.is_some() => {
+                        assert_ne!(state.flags & POINTER_VISIBLE, 0);
+                        states.push((state.x, state.y));
+                    }
+                    Ok(ControlMessage::PointerState(_)) => {}
+                    Ok(ControlMessage::PointerShape(chunk)) => {
+                        let (id, bytes, got) = shape.get_or_insert_with(|| {
+                            (chunk.shape_id, vec![0; chunk.total_len as usize], 0)
+                        });
+                        if *id == chunk.shape_id && held_shape != chunk.shape_id {
+                            let at = chunk.offset as usize;
+                            bytes[at..at + chunk.data.len()].copy_from_slice(&chunk.data);
+                            *got += chunk.data.len();
+                            if *got >= bytes.len() {
+                                held_shape = chunk.shape_id;
+                                assert_eq!((chunk.width, chunk.height), (12, 19), "the arrow");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                other => panic!("unexpected datagram from host: {other:?}"),
+            }
+        }
+        let distinct: std::collections::HashSet<_> = states.iter().collect();
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        eprintln!(
+            "draws={draws}: {frames} frames, {} pointer states ({} distinct) in {WINDOW:?} {load}",
+            states.len(),
+            distinct.len()
+        );
+        if draws {
+            assert_ne!(held_shape, 0, "the pointer image arrived whole");
+            // 60 fps for 3 s is 180 moves; leave room for a loaded runner.
+            assert!(
+                distinct.len() >= 60,
+                "{} distinct positions",
+                distinct.len()
+            );
+            assert!(
+                states.iter().all(|p| path.contains(p)),
+                "states off the path"
+            );
+            // The 750 ms keepalive, and nothing for the moves.
+            assert!(
+                frames <= 6,
+                "{frames} video frames while only the pointer moved"
+            );
+        } else {
+            assert!(
+                states.is_empty() && shape.is_none(),
+                "an older iPad gets no pointer messages"
+            );
+            assert!(
+                frames >= 60,
+                "only {frames} frames: each move must be a frame"
+            );
+        }
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+        let gone = Instant::now() + Duration::from_secs(5);
+        while shared.client_connected() {
+            assert!(Instant::now() < gone, "the session did not end after BYE");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    shared.stop();
+    supervisor_tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}

@@ -29,6 +29,8 @@ enum Wire {
         case pong = 0x17
         case streamConfig = 0x18
         case nack = 0x19
+        case pointerShape = 0x1A
+        case pointerState = 0x1B
         case inputEvent = 0x20
         case error = 0x7F
     }
@@ -255,6 +257,9 @@ struct Hello2: Equatable {
     static let featureSupportsNack: UInt16 = 1 << 2
     /// This app checks for its own updates, so the PC need not tell the user. 0.3.1 and older never set it.
     static let featureChecksUpdates: UInt16 = 1 << 4
+    /// This app draws the pointer from POINTER_SHAPE and POINTER_STATE, so
+    /// a PC with `HelloAck.hostCapPointer` leaves it out of the video.
+    static let featureDrawsPointer: UInt16 = 1 << 5
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -293,6 +298,9 @@ struct HelloAck: Equatable {
     /// Media frame_seq counts the frames sent in a stream epoch without gaps,
     /// so a forward gap is a frame lost in transit. Older iPads ignore it.
     static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
+    /// The PC sends the pointer apart from the video to an iPad that said
+    /// it draws it. Older iPads ignore it.
+    static let hostCapPointer: UInt16 = 1 << 6
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -362,6 +370,47 @@ struct ReceiverReport: Equatable {
     var nacksSent: UInt32 = 0
     var audioPacketsLost: UInt32 = 0
     var audioBufferMs: UInt16 = 0
+    /// The last pointer image held complete, 0 for none.
+    var pointerShapeId: UInt32 = 0
+}
+
+/// One chunk of a pointer image (see the Rust `PointerShapeChunk`). The
+/// image is `height` rows of `width` premultiplied BGRA pixels, then, with
+/// `invertFlag`, `height` rows of `(width + 7) / 8` mask bytes, most
+/// significant bit first: a set bit inverts the picture under that pixel.
+struct PointerShapeChunk: Equatable {
+    static let version: UInt8 = 1
+    static let invertFlag: UInt8 = 1 << 0
+    static let maxSide: UInt16 = 512
+
+    var shapeId: UInt32
+    var sourceType: UInt8
+    var flags: UInt8
+    var width: UInt16
+    var height: UInt16
+    var hotX: UInt16
+    var hotY: UInt16
+    var totalLen: UInt32
+    var offset: UInt32
+    var data: Data
+
+    static func imageLength(width: UInt16, height: UInt16, flags: UInt8) -> Int {
+        let (w, h) = (Int(width), Int(height))
+        return w * h * 4 + (flags & invertFlag != 0 ? (w + 7) / 8 * h : 0)
+    }
+}
+
+/// Where the PC's pointer is: the image's top-left corner in video pixels.
+struct PointerState: Equatable {
+    static let visibleFlag: UInt8 = 1 << 0
+
+    var flags: UInt8
+    var shapeId: UInt32
+    var x: Int32
+    var y: Int32
+    var hostTimeUs: UInt64
+
+    var visible: Bool { flags & Self.visibleFlag != 0 }
 }
 
 struct WirePing: Equatable {
@@ -404,6 +453,8 @@ enum ControlMessage: Equatable {
     case pong(WirePong)
     case streamConfig(StreamConfig)
     case inputEvent(WireInputEvent)
+    case pointerShape(PointerShapeChunk)
+    case pointerState(PointerState)
 
     var packetType: Wire.PacketType {
         switch self {
@@ -418,6 +469,8 @@ enum ControlMessage: Equatable {
         case .pong: return .pong
         case .streamConfig: return .streamConfig
         case .inputEvent: return .inputEvent
+        case .pointerShape: return .pointerShape
+        case .pointerState: return .pointerState
         }
     }
 }
@@ -496,11 +549,14 @@ extension Wire {
             body.appendLE(r.e2eLatencyMsX10)
             body.appendLE(r.rttMsX10)
             if r.fragsRepaired != 0 || r.nacksSent != 0
-                || r.audioPacketsLost != 0 || r.audioBufferMs != 0 {
+                || r.audioPacketsLost != 0 || r.audioBufferMs != 0 || r.pointerShapeId != 0 {
                 body.appendLE(r.fragsRepaired)
                 body.appendLE(r.nacksSent)
                 body.appendLE(r.audioPacketsLost)
                 body.appendLE(r.audioBufferMs)
+            }
+            if r.pointerShapeId != 0 {
+                body.appendLE(r.pointerShapeId)
             }
         case .ping(let p):
             body.appendLE(p.t1Us)
@@ -529,6 +585,28 @@ extension Wire {
                 body.appendLE(UInt16(bitPattern: e.tiltX))
                 body.appendLE(UInt16(bitPattern: e.tiltY))
             }
+        case .pointerShape(let c):
+            body.append(PointerShapeChunk.version)
+            body.append(c.sourceType)
+            body.append(c.flags)
+            body.append(0)  // reserved
+            body.appendLE(c.shapeId)
+            body.appendLE(c.width)
+            body.appendLE(c.height)
+            body.appendLE(c.hotX)
+            body.appendLE(c.hotY)
+            body.appendLE(c.totalLen)
+            body.appendLE(c.offset)
+            body.appendLE(UInt16(c.data.count))
+            body.append(c.data)
+        case .pointerState(let p):
+            body.append(PointerShapeChunk.version)
+            body.append(p.flags)
+            body.appendLE(UInt16(0))  // reserved
+            body.appendLE(p.shapeId)
+            body.appendLE(UInt32(bitPattern: p.x))
+            body.appendLE(UInt32(bitPattern: p.y))
+            body.appendLE(p.hostTimeUs)
         }
 
         var out = Data(capacity: ControlHeader.size + body.count)
@@ -609,6 +687,16 @@ extension Wire {
             message = .streamConfig(cfg)
         case .inputEvent:
             message = parseInputEvent(&r)
+        case .pointerShape:
+            message = parsePointerShape(&r)
+        case .pointerState:
+            guard r.readU8() == PointerShapeChunk.version,
+                  let flags = r.readU8(), let _ = r.readU16(),
+                  let shapeId = r.readU32(), let x = r.readU32(), let y = r.readU32(),
+                  let time = r.readU64() else { return nil }
+            message = .pointerState(PointerState(
+                flags: flags, shapeId: shapeId, x: Int32(bitPattern: x), y: Int32(bitPattern: y),
+                hostTimeUs: time))
         case .media, .mediaFec, .audio, .error:
             return nil
         }
@@ -699,7 +787,32 @@ extension Wire {
             report.audioPacketsLost = audioLost
             report.audioBufferMs = audioBuffer
         }
+        if r.remaining >= 4, let shape = r.readU32() {
+            report.pointerShapeId = shape
+        }
         return .receiverReport(report)
+    }
+
+    /// Enforces what the Rust parser does: a nonzero id, a size within the
+    /// cap, the length that size implies, and a chunk inside it.
+    private static func parsePointerShape(_ r: inout WireReader) -> ControlMessage? {
+        guard r.readU8() == PointerShapeChunk.version,
+              let sourceType = r.readU8(), let flags = r.readU8(), let _ = r.readU8(),
+              let shapeId = r.readU32(), shapeId != 0,
+              let width = r.readU16(), let height = r.readU16(),
+              (1...PointerShapeChunk.maxSide).contains(width),
+              (1...PointerShapeChunk.maxSide).contains(height),
+              let hotX = r.readU16(), let hotY = r.readU16(),
+              let totalLen = r.readU32(),
+              Int(totalLen) == PointerShapeChunk.imageLength(width: width, height: height, flags: flags),
+              let offset = r.readU32(),
+              let dataLen = r.readU16(), dataLen > 0,
+              Int(offset) + Int(dataLen) <= Int(totalLen),
+              let data = r.take(Int(dataLen))
+        else { return nil }
+        return .pointerShape(PointerShapeChunk(
+            shapeId: shapeId, sourceType: sourceType, flags: flags, width: width, height: height,
+            hotX: hotX, hotY: hotY, totalLen: totalLen, offset: offset, data: Data(data)))
     }
 
     private static func parseInputEvent(_ r: inout WireReader) -> ControlMessage? {

@@ -22,6 +22,7 @@ use crate::vdd_device::DeviceState;
 
 #[cfg(windows)]
 pub mod dxgi;
+pub mod pointer;
 pub mod recovery;
 pub mod second_screen;
 pub mod synthetic;
@@ -36,7 +37,6 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(any(windows, test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 /// With nobody connected the cached picture is refreshed this often, so a new

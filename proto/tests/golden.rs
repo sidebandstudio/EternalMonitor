@@ -384,7 +384,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ;
     vectors.push((
         "hello_ack_contiguous_seq",
-        encode_control(0, 5, &ControlMessage::HelloAck(ack)),
+        encode_control(0, 5, &ControlMessage::HelloAck(ack.clone())),
     ));
     let (_, ControlMessage::Hello2(mut hello)) = parse_control(
         &vectors
@@ -402,7 +402,92 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     hello.pairing_code = 123_456;
     vectors.push((
         "hello2_v030",
-        encode_control(0, 4, &ControlMessage::Hello2(hello)),
+        encode_control(0, 4, &ControlMessage::Hello2(hello.clone())),
+    ));
+    hello.feature_caps |= FEATURE_DRAWS_POINTER;
+    vectors.push((
+        "hello2_draws_pointer",
+        encode_control(0, 6, &ControlMessage::Hello2(hello)),
+    ));
+    // A 3x2 image: opaque black, opaque white, two clear pixels the mask
+    // after the image inverts, a half-covered pixel and opaque black.
+    let image: Vec<u8> = [
+        [0, 0, 0, 255],
+        [255, 255, 255, 255],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0x10, 0x20, 0x30, 0x80],
+        [0, 0, 0, 255],
+    ]
+    .concat();
+    let mut shape = image.clone();
+    shape.extend_from_slice(&[0b0010_0000, 0b1000_0000]);
+    vectors.push((
+        "pointer_shape",
+        encode_control(
+            0x1234_5678,
+            51,
+            &ControlMessage::PointerShape(PointerShapeChunk {
+                shape_id: 0x0A0B_0C0D,
+                source_type: 1,
+                flags: POINTER_SHAPE_INVERT,
+                width: 3,
+                height: 2,
+                hot_x: 1,
+                hot_y: 1,
+                total_len: shape.len() as u32,
+                offset: 0,
+                data: shape,
+            }),
+        ),
+    ));
+    vectors.push((
+        "pointer_state",
+        encode_control(
+            0x1234_5678,
+            52,
+            &ControlMessage::PointerState(PointerState {
+                flags: POINTER_VISIBLE,
+                shape_id: 0x0A0B_0C0D,
+                x: -5,
+                y: 1_234,
+                host_time_us: 0x0000_0123_4567_89AB,
+            }),
+        ),
+    ));
+    vectors.push((
+        "pointer_hidden",
+        encode_control(
+            0x1234_5678,
+            53,
+            &ControlMessage::PointerState(PointerState {
+                flags: 0,
+                shape_id: 0x0A0B_0C0D,
+                x: 3_000,
+                y: 7,
+                host_time_us: 0x0000_0123_4567_89AC,
+            }),
+        ),
+    ));
+    let (_, ControlMessage::ReceiverReport(mut report)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "receiver_report_v030")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    report.pointer_shape_id = 0x0A0B_0C0D;
+    vectors.push((
+        "receiver_report_pointer",
+        encode_control(0x1234_5678, 54, &ControlMessage::ReceiverReport(report)),
+    ));
+    ack.host_caps |= HOSTCAP_POINTER;
+    vectors.push((
+        "hello_ack_pointer",
+        encode_control(0, 7, &ControlMessage::HelloAck(ack)),
     ));
     vectors
 }
@@ -537,7 +622,48 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::Pong as u8, 0x17);
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
     assert_eq!(PacketType::Nack as u8, 0x19);
+    assert_eq!(PacketType::PointerShape as u8, 0x1A);
+    assert_eq!(PacketType::PointerState as u8, 0x1B);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
+}
+
+/// The pointer bits, and the fields their vectors carry.
+#[test]
+fn pointer_vectors_round_trip_with_their_capabilities() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    assert_eq!(FEATURE_DRAWS_POINTER, 0x0020);
+    assert_eq!(HOSTCAP_POINTER, 0x0040);
+    let ControlMessage::Hello2(hello) = parse_control(&vectors["hello2_draws_pointer"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_ne!(hello.feature_caps & FEATURE_DRAWS_POINTER, 0);
+    let ControlMessage::HelloAck(ack) = parse_control(&vectors["hello_ack_pointer"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_ne!(ack.host_caps & HOSTCAP_POINTER, 0);
+    let ControlMessage::PointerShape(shape) = parse_control(&vectors["pointer_shape"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_eq!((shape.width, shape.height, shape.total_len), (3, 2, 26));
+    let ControlMessage::PointerState(state) = parse_control(&vectors["pointer_state"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (state.x, state.y, state.flags),
+        (-5, 1_234, POINTER_VISIBLE)
+    );
+    let ControlMessage::ReceiverReport(report) = parse_control(&vectors["receiver_report_pointer"])
+        .unwrap()
+        .1
+    else {
+        panic!()
+    };
+    assert_eq!(report.pointer_shape_id, 0x0A0B_0C0D);
+    assert_eq!(report.frags_repaired, 1234);
 }
 
 /// A host that numbers frames contiguously says so in HELLO_ACK; one that

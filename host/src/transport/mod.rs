@@ -4,6 +4,7 @@ mod audio;
 pub mod fault;
 pub mod link;
 pub mod pacer;
+pub mod pointer;
 pub mod retransmit;
 pub mod session;
 pub mod usb;
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
+use eternal_wire::v2::control::ControlMessage;
 use eternal_wire::v2::media::{
     media_payload_size, MediaHeader, MAX_FRAG_COUNT, MAX_MEDIA_PAYLOAD, MEDIA_HEADER_SIZE,
 };
@@ -125,6 +127,7 @@ impl ConfigSource for SharedConfigSource<'_> {
         };
         numbering
             | eternal_wire::v2::control::HOSTCAP_KEYBOARD
+            | eternal_wire::v2::control::HOSTCAP_POINTER
             | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
@@ -269,6 +272,7 @@ pub async fn start_sender(
         fault,
         input_relay,
         abr,
+        pointer: Default::default(),
     };
     let mut audio_sender = audio::AudioSender::default();
     let pacing_clock = PacingClock::new()?;
@@ -303,6 +307,13 @@ pub async fn start_sender(
                 .keep_pen_alive(*shared.capture_geometry.lock());
         }
         pen_spacing.arm(state.input_relay.pen_spaced_until());
+        let pointer_due = {
+            let (shape, position) = shared.pointer.latest();
+            let budget = crate::capture::frame_budget_for(shared.effective_fps());
+            state
+                .pointer
+                .next_poll(budget, position, shape.map(|shape| shape.id))
+        };
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
@@ -320,6 +331,7 @@ pub async fn start_sender(
                 }
             }
             _ = heartbeat.tick() => {
+                state.pointer.refresh(now());
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
             }
@@ -384,6 +396,13 @@ pub async fn start_sender(
                 }
             }
 
+            // Before video: a position is small and the iPad draws it at once.
+            _ = shared.pointer.changed() => {
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
+            _ = tokio::time::sleep_until(pointer_due.unwrap_or_else(Instant::now).into()), if pointer_due.is_some() => {
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
             Some(packet) = audio_rx.recv() => {
                 audio_sender.send(packet, &links, &shared, stream_epoch).await;
             }
@@ -693,6 +712,7 @@ struct LoopState {
     fault: FaultInjector,
     input_relay: crate::input::InputRelay,
     abr: AbrController,
+    pointer: pointer::PointerSender,
 }
 
 /// Carries out everything the session decided. Every path that feeds the
@@ -725,6 +745,12 @@ async fn act(
                 state.input_relay.relay(session_id, &event, geometry);
             }
         }
+    }
+    if actions.force_idr || actions.new_target.is_some() {
+        state.pointer.keyframe(now());
+    }
+    if let Some(report) = actions.report.as_ref() {
+        state.pointer.report(report.pointer_shape_id, now());
     }
     if let Some(report) = actions.report.take() {
         // A slow log sink must not hold the capture/encode stats lock.
@@ -772,6 +798,57 @@ async fn act(
         }
     }
     execute_actions(actions, links, shared, supervisor_tx).await;
+    send_pointer(&mut state.pointer, links, shared).await;
+}
+
+/// Sends what [`pointer::PointerSender`] says is due, to a client that
+/// draws the pointer.
+async fn send_pointer(
+    sender: &mut pointer::PointerSender,
+    links: &TransportLinks,
+    shared: &SharedControl,
+) {
+    let session_id = shared.session.lock().pointer_session_id();
+    if session_id.is_some() && sender.session_id() != session_id {
+        info!(
+            ?session_id,
+            "The iPad draws the pointer: sending it apart from the video"
+        );
+    }
+    sender.serve(session_id);
+    if session_id.is_none() {
+        return;
+    }
+    let budget = crate::capture::frame_budget_for(shared.effective_fps());
+    for send in sender.poll(now(), budget, shared.pointer.latest()) {
+        let messages = match send {
+            pointer::Send::Shape(shape) => {
+                let image = &shape.image;
+                PIPELINE_STATS.lock().pointer_shapes_sent += 1;
+                eternal_wire::v2::control::pointer_shape_chunks(
+                    shape.id,
+                    image.source_type,
+                    image.flags,
+                    (image.width, image.height),
+                    image.hot,
+                    &image.bytes,
+                )
+                .into_iter()
+                .map(ControlMessage::PointerShape)
+                .collect()
+            }
+            pointer::Send::State(state) => {
+                PIPELINE_STATS.lock().pointer_states_sent += 1;
+                vec![ControlMessage::PointerState(state)]
+            }
+        };
+        for message in messages {
+            let Some((peer, datagram)) = shared.session.lock().encode_for_client(&message) else {
+                return;
+            };
+            let _ = links.send_to(&datagram, peer).await;
+        }
+    }
 }
 
 async fn execute_actions(
@@ -1136,6 +1213,7 @@ mod tests {
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
             input_relay: crate::input::InputRelay::default(),
             abr: AbrController::new(15_000_000, true),
+            pointer: Default::default(),
         }
     }
 
