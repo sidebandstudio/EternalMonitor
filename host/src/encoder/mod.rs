@@ -4790,22 +4790,39 @@ mod tests {
     }
 
     #[test]
-    fn the_kept_picture_is_given_again_only_until_the_deadline() {
+    fn the_kept_picture_is_given_again_before_the_deadline() {
         let (_producer, consumer) = crate::capture::frame_slot();
         let kept = std::sync::Arc::new(vec![0u8; 16]);
-        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_millis(60));
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(60));
         owed.picture = Some(raw(1, &kept));
         let started = Instant::now();
         let Next::Frame(frame) = owed.next(&consumer) else {
             panic!("the picture was not given again");
         };
         assert_eq!(frame.frame_number, 1);
-        assert!(started.elapsed() >= KEYFRAME_FLUSH_WAIT);
-        // The loop keeps the picture again after encoding it.
-        owed.picture = Some(frame);
-        std::thread::sleep(Duration::from_millis(80));
-        assert!(matches!(owed.next(&consumer), Next::GaveUp));
         assert_eq!(owed.given, 1);
+        assert!(
+            started.elapsed() >= KEYFRAME_FLUSH_WAIT,
+            "it did not wait for capture first"
+        );
+    }
+
+    #[test]
+    fn the_kept_picture_is_not_given_again_after_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let passed = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let mut owed = OwedKeyframe::until(passed);
+        owed.picture = Some(raw(1, &kept));
+        assert!(matches!(owed.next(&consumer), Next::GaveUp));
+        assert_eq!(owed.given, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the picture is let go"
+        );
     }
 
     #[test]
