@@ -62,6 +62,17 @@ enum E2E {
         return 9877
     }
 
+    /// Simulator builds: `EM_ROUTE_INTERFACE=en0` stands that interface in
+    /// for the loopback path to a PC on the simulator's own Mac, which no
+    /// iPad has (see `MovedPC.route`).
+    static var loopbackRouteInterface: String? {
+        #if targetEnvironment(simulator)
+        return ProcessInfo.processInfo.environment["EM_ROUTE_INTERFACE"].flatMap { $0.isEmpty ? nil : $0 }
+        #else
+        return nil
+        #endif
+    }
+
     static func firstFrame(width: Int, height: Int, link: String = "udp") {
         guard enabled else { return }
         let monotonicMs = DispatchTime.now().uptimeNanoseconds / 1_000_000

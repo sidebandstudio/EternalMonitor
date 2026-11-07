@@ -116,9 +116,13 @@ enum MovedPC {
             connection.start(queue: queue)
         }
         guard let path, case .hostPort(.ipv4(let local), _)? = path.localEndpoint,
-              let interface = path.availableInterfaces.first?.name else { return nil }
-        let direct = (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
+              var interface = path.availableInterfaces.first?.name else { return nil }
+        var direct = (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
             && !path.usesInterfaceType(.other) && !path.usesInterfaceType(.cellular)
+        if path.usesInterfaceType(.loopback), let stand = E2E.loopbackRouteInterface {
+            interface = stand
+            direct = true
+        }
         let address = local.rawValue.map { String($0) }.joined(separator: ".")
         guard let netmask = netmask(interface: interface, address: address) else { return nil }
         return Route(interface: interface, direct: direct, address: address, netmask: netmask)

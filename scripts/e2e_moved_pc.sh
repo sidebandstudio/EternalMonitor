@@ -156,7 +156,10 @@ start_host "$HOST_BIN" "$PORT"
 echo "==> Launching app: pairs and streams from the home network address, port $PORT"
 LINK="$LAN:$PORT"
 [ "$PAIRING" = on ] && LINK="eternaldisplay://$LINK?t=$TOKEN"
+# The simulator reaches this Mac's own address over loopback; the Mac's
+# network interface stands in for the iPad's Wi-Fi.
 SIMCTL_CHILD_EM_AUTOCONNECT="$LINK" SIMCTL_CHILD_EM_AUTOCONNECT_FOUND=1 SIMCTL_CHILD_EM_E2E_LOG=1 SIMCTL_CHILD_EM_USB_PORT=0 \
+    SIMCTL_CHILD_EM_ROUTE_INTERFACE="$IFACE" \
     xcrun simctl launch "$UDID" com.eternal.monitor -didSeeOnboarding YES -allowUSB NO -autoReconnect YES -playPCaudio NO >/dev/null
 wait_for "no first stream" "$TIMEOUT_SECS" frames_at_least 1
 
