@@ -14,8 +14,9 @@
 //! a stuck one.
 //!
 //! The queue is bounded. While Windows takes nothing, a pointer or Pencil
-//! move replaces the move queued just before it, so a backlog never replays
-//! a path the iPad already left. Input that waited longer than
+//! move replaces the newest queued move of its kind that no press or
+//! release follows, so a backlog never replays a path the iPad already
+//! left. Input that waited longer than
 //! [`INPUT_LATE`] goes to the relay as late, which lands only a release of
 //! what the PC holds, as for input that arrived late from the iPad. Ends,
 //! key releases and session resets are never merged, and never lost: at
@@ -38,12 +39,13 @@ use crate::transport::session::INPUT_LATE;
 
 /// Commands kept at most, besides one start and one end per stream
 /// generation. A second of a Pencil at 240 Hz with every other kind of
-/// input; while Windows is stuck, moves merge and the queue grows only by
-/// presses and releases.
+/// input. While Windows is stuck, each kind of move keeps only its newest
+/// after the last press or release, so the queue grows by presses and
+/// releases.
 const CAPACITY: usize = 1024;
 
-/// From this many waiting commands, a move replaces the move before it.
-/// Below it every sample goes to Windows, as the Pencil's ink needs.
+/// From this many waiting commands, a move replaces the newest move of its
+/// kind. Below it every sample goes to Windows, as the Pencil's ink needs.
 const MERGE_FROM: usize = 32;
 
 /// How often a native pen contact is refreshed; Windows expires a still one.
@@ -152,6 +154,15 @@ impl Command {
             && event.buttons == earlier_event.buttons
     }
 
+    /// A press, release, reset or generation change: what a move must not
+    /// pass.
+    fn is_edge(&self) -> bool {
+        match self {
+            Command::Relay { event, .. } => event.phase != PHASE_MOVED,
+            Command::Begin { .. } | Command::Reset | Command::End => true,
+        }
+    }
+
     /// An end or reset: what keeps the PC from holding a key or button.
     fn releases(&self) -> bool {
         match self {
@@ -207,17 +218,27 @@ impl Shared {
         let mut state = self.state.lock();
         let waiting = state.commands.len();
         if waiting >= self.limits.merge_from {
-            if let Some(last) = state.commands.back_mut() {
-                if last.generation == generation
-                    && !last.then_reset
-                    && command.merges_with(&last.command)
-                {
-                    // The newer sample, in the older one's place: it has
-                    // waited as long.
-                    last.command = command;
-                    state.merged += 1;
-                    return;
-                }
+            // The newest move of this kind, unless a press or release, or
+            // another generation, came after it.
+            let merges = state
+                .commands
+                .iter()
+                .enumerate()
+                .rev()
+                .take_while(|(_, queued)| {
+                    queued.generation == generation
+                        && !queued.then_reset
+                        && !queued.command.is_edge()
+                })
+                .find(|(_, queued)| command.merges_with(&queued.command))
+                .map(|(index, _)| index);
+            if let Some(index) = merges {
+                // It goes last, where it came: the other kinds' newest
+                // moves keep their order before it.
+                let earlier = state.commands.remove(index).expect("found above");
+                state.commands.push_back(Queued { command, ..earlier });
+                state.merged += 1;
+                return;
             }
         }
         // A generation's start and end always go in: there is one of each
@@ -859,6 +880,46 @@ mod tests {
         ];
         assert_eq!(harness.wait_for(expected.len()), expected);
         harness.settled(expected.len());
+    }
+
+    /// A Pencil hovering while the pointer moves sends both kinds of move
+    /// interleaved, about 250 a second. While Windows is stuck each kind
+    /// keeps only its newest move after the last press or release, in the
+    /// order those newest moves came.
+    #[test]
+    fn interleaved_moves_of_different_kinds_each_merge_up_to_the_last_edge() {
+        let harness = harness(Limits {
+            merge_from: 4,
+            ..Limits::default()
+        });
+        harness.stuck();
+        for id in 1..=104 {
+            let kind = if id % 2 == 1 { KIND_PENCIL } else { KIND_HOVER };
+            harness.send(kind, PHASE_MOVED, id);
+        }
+        harness.send(KIND_MOUSE_ABS, PHASE_BEGAN, 200);
+        for id in 201..=204 {
+            let kind = if id % 2 == 1 { KIND_PENCIL } else { KIND_HOVER };
+            harness.send(kind, PHASE_MOVED, id);
+        }
+        harness.send(KIND_MOUSE_ABS, PHASE_ENDED, 300);
+        harness.injector.as_ref().unwrap().reset();
+        harness.go.send(()).unwrap();
+        let expected = vec![
+            relayed(KIND_KEY, PHASE_BEGAN, 0),
+            relayed(KIND_PENCIL, PHASE_MOVED, 1),
+            relayed(KIND_HOVER, PHASE_MOVED, 2),
+            relayed(KIND_PENCIL, PHASE_MOVED, 103),
+            relayed(KIND_HOVER, PHASE_MOVED, 104),
+            // Moves never merge across a press or release.
+            relayed(KIND_MOUSE_ABS, PHASE_BEGAN, 200),
+            relayed(KIND_PENCIL, PHASE_MOVED, 203),
+            relayed(KIND_HOVER, PHASE_MOVED, 204),
+            relayed(KIND_MOUSE_ABS, PHASE_ENDED, 300),
+            Call::Reset,
+        ];
+        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert_eq!(*harness.calls.lock(), expected);
     }
 
     #[test]
