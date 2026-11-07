@@ -279,24 +279,47 @@ final class MovedPCTests: XCTestCase {
     /// another address, and says so: it isn't the saved PC at this address.
     /// No HELLO2, no token.
     func testAnAnswerFromAnotherAddressIsNotTheSamePC() async throws {
-        let old = FakeUDPHost(), relay = FakeUDPHost(), pc = FakeUDPHost()
-        let setup = try setUp(old: old, new: relay, token: Self.token, connectTimeout: 7)
+        let old = FakeUDPHost(), forwarder = FakeUDPHost(), pc = FakeUDPHost()
+        let setup = try setUp(old: old, new: forwarder, token: Self.token, connectTimeout: 7)
         defer { setup.manager.cancel() }
         setup.manager.connect(host: "127.0.0.1", port: old.port)
         async let answered = Task.detached { pc.answerIdentify(token: Self.token) }.value
         let types = await Task.detached { () -> [Wire.PacketType] in
-            guard relay.relayIdentify(to: pc) else { return [] }
-            return relay.received(within: 4)
+            guard forwarder.forwardIdentify(to: pc) else { return [] }
+            return forwarder.received(within: 4)
         }.value
         let pcAnswered = await answered
         XCTAssertTrue(pcAnswered, "the request reached the saved PC")
-        XCTAssertFalse(types.isEmpty, "the iPad asked the relay")
+        XCTAssertFalse(types.isEmpty, "the iPad asked the forwarder")
         XCTAssertFalse(types.contains(.hello2), "\(types)")
-        XCTAssertFalse(relay.helloBeforeIdentify)
+        XCTAssertFalse(forwarder.helloBeforeIdentify)
         try await until("timed out", seconds: 15) { setup.manager.state == .disconnected }
         XCTAssertEqual(setup.manager.problem, .noReply(usb: false))
         XCTAssertEqual(try setup.pairings.token(address: address(old)), Self.token)
-        XCTAssertNil(RecentConnectionStore.shared.entry(host: "127.0.0.1", port: relay.port))
+        XCTAssertNil(RecentConnectionStore.shared.entry(host: "127.0.0.1", port: forwarder.port))
+    }
+
+    /// The PC at the address and port asked proves it holds the pairing but
+    /// signs other addresses, or none: it isn't the saved PC at this
+    /// address. No HELLO2, no token, and the pairing stays.
+    func testAnAnswerSigningOtherAddressesIsNotTheSamePC() async throws {
+        for signed in [[Data([192, 0, 2, 7])], []] {
+            let old = FakeUDPHost(), new = FakeUDPHost()
+            let setup = try setUp(old: old, new: new, token: Self.token, connectTimeout: 7)
+            defer { setup.manager.cancel() }
+            setup.manager.connect(host: "127.0.0.1", port: old.port)
+            let types = await Task.detached { () -> [Wire.PacketType] in
+                guard new.answerIdentify(token: Self.token, addresses: signed) else { return [] }
+                return new.received(within: 4)
+            }.value
+            XCTAssertFalse(types.isEmpty, "\(signed): the iPad kept asking")
+            XCTAssertFalse(types.contains(.hello2), "\(signed): \(types)")
+            XCTAssertFalse(new.helloBeforeIdentify, "\(signed)")
+            try await until("timed out", seconds: 15) { setup.manager.state == .disconnected }
+            XCTAssertEqual(setup.manager.problem, .noReply(usb: false), "\(signed)")
+            XCTAssertEqual(try setup.pairings.token(address: address(old)), Self.token, "\(signed)")
+            XCTAssertNil(RecentConnectionStore.shared.entry(host: "127.0.0.1", port: new.port), "\(signed)")
+        }
     }
 
     /// Bonjour has the PC at a home network address that this iPad reaches

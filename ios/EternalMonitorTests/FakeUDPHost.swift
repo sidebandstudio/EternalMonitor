@@ -92,16 +92,15 @@ final class FakeUDPHost: @unchecked Sendable {
     }
 
     /// Answers the next identify request as the PC holding `token` would,
-    /// receiving at this fake's port on loopback, or with `proof` instead.
-    /// False after thirty quiet seconds.
-    func answerIdentify(token: Data, proof: Data? = nil) -> Bool {
+    /// receiving at this fake's port on `addresses` (loopback unless given),
+    /// or with `proof` instead. False after thirty quiet seconds.
+    func answerIdentify(token: Data, proof: Data? = nil, addresses: [Data] = [Data([127, 0, 0, 1])]) -> Bool {
         for _ in 0..<100 {
             guard let (data, from, length) = receive() else { continue }
             let message = Wire.parseControl(data)?.message
             if case .hello2? = message { helloBeforeIdentify = true }
             guard case .identify(let request)? = message else { continue }
             client = (from, length)
-            let addresses = [Data([127, 0, 0, 1])]
             send(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identity(WireIdentity(
                 nonce: request.nonce, port: port, addresses: addresses,
                 proof: proof ?? MovedPC.proof(token: token, nonce: request.nonce, port: port, addresses: addresses)))))
@@ -112,7 +111,7 @@ final class FakeUDPHost: @unchecked Sendable {
 
     /// Hands the next identify request to `pc` and gives the iPad whatever
     /// `pc` answers, from this fake's port. False after thirty quiet seconds.
-    func relayIdentify(to pc: FakeUDPHost) -> Bool {
+    func forwardIdentify(to pc: FakeUDPHost) -> Bool {
         var target = sockaddr_in()
         target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         target.sin_family = sa_family_t(AF_INET)
