@@ -6,6 +6,22 @@ final class KeyframeRequestTests: XCTestCase {
     /// A stall that damages many frames at once must ask the host once, as the
     /// host grants only one keyframe per 500 ms.
     func testRequestsWithinTheHostWindowAreCoalesced() async throws {
+        let requests = try await sent([(1_000_000, KeyframeReason.gapLoss), (1_010_000, .gapLoss),
+                                       (1_400_000, .decodeError), (1_500_000, .gapLoss)])
+        XCTAssertEqual(requests, [.gapLoss, .gapLoss], "one request per 500 ms window")
+    }
+
+    /// No first frame yet: the Startup request goes out although dropped
+    /// frames asked moments ago, so the PC's log shows it.
+    func testAStartupRequestIsNeverCoalesced() async throws {
+        let requests = try await sent([(1_000_000, KeyframeReason.gapLoss), (1_100_000, .startup),
+                                       (1_200_000, .gapLoss), (1_700_000, .gapLoss)])
+        XCTAssertEqual(requests, [.gapLoss, .startup, .gapLoss])
+    }
+
+    /// The keyframe requests a session's channel sends for `requests`, each
+    /// made at its time on the channel's clock.
+    private func sent(_ requests: [(UInt64, KeyframeReason)]) async throws -> [KeyframeReason] {
         let queue = DispatchQueue(label: "keyframe-request-test")
         let clock = OSAllocatedUnfairLock<UInt64>(initialState: 1_000_000)
         let (stream, continuation) = AsyncStream<Data>.makeStream()
@@ -16,7 +32,8 @@ final class KeyframeRequestTests: XCTestCase {
         var messages = stream.makeAsyncIterator()
         let first = await messages.next()
         guard case .hello2(let hello) = try XCTUnwrap(Wire.parseControl(XCTUnwrap(first))).message else {
-            return XCTFail("missing handshake")
+            XCTFail("missing handshake")
+            return []
         }
         queue.sync {
             channel.handleControl(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
@@ -24,18 +41,17 @@ final class KeyframeRequestTests: XCTestCase {
                 heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
                 streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0))))
         }
-        for (at, reason) in [(1_000_000, KeyframeReason.gapLoss), (1_010_000, .gapLoss),
-                             (1_400_000, .decodeError), (1_500_000, .gapLoss)] as [(UInt64, KeyframeReason)] {
+        for (at, reason) in requests {
             clock.withLock { $0 = at }
             channel.sendKeyframeRequest(streamEpoch: 1, lastCompleteSeq: 7, reason: reason)
             queue.sync {}
         }
         channel.stop()
         continuation.finish()
-        var requests: [KeyframeReason] = []
+        var reasons: [KeyframeReason] = []
         while let data = await messages.next() {
-            if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { requests.append(request.reason) }
+            if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { reasons.append(request.reason) }
         }
-        XCTAssertEqual(requests, [.gapLoss, .gapLoss], "one request per 500 ms window")
+        return reasons
     }
 }

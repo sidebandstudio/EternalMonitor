@@ -235,7 +235,16 @@ pub struct TransportLinks {
     pub udp: UdpLink,
     usb: HashMap<LinkId, ActiveLink>,
     events: mpsc::Receiver<HubEvent>,
-    token: u64,
+    _subscription: HubToken,
+}
+
+/// The hub's events go to this owner until it is dropped.
+struct HubToken(u64);
+
+impl Drop for HubToken {
+    fn drop(&mut self) {
+        UsbHub::get().unsubscribe(self.0);
+    }
 }
 
 impl TransportLinks {
@@ -245,7 +254,7 @@ impl TransportLinks {
             udp: UdpLink::new(socket),
             usb: HashMap::new(),
             events: subscription.events,
-            token: subscription.token,
+            _subscription: HubToken(subscription.token),
         };
         for (id, generation, link) in subscription.open {
             info!(?id, generation, "USB tunnel kept across pipeline restart");
@@ -356,11 +365,11 @@ impl TransportLinks {
             }
         }
     }
-}
 
-impl Drop for TransportLinks {
-    fn drop(&mut self) {
-        UsbHub::get().unsubscribe(self.token);
+    /// Lets go of the USB tunnels and returns the UDP socket, for the next
+    /// owner of the stream port.
+    pub fn into_udp_socket(self) -> UdpSocket {
+        self.udp.socket
     }
 }
 

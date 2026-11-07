@@ -35,9 +35,36 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 31,
+            Self.vectors.count, 37,
             "golden vector count drifted — update both test suites together"
         )
+    }
+
+    /// The identify request and its answer: nonce A0..AF, port 9876, two
+    /// addresses, and the proof of pairing token 01..10 over them, which the
+    /// iPad checks as the PC's own.
+    func testIdentifyAndIdentityVectors() throws {
+        let nonce = Data(0xA0...0xAF)
+        let request = try vector("identify")
+        let (requestHeader, asked) = try XCTUnwrap(Wire.parseControl(request))
+        XCTAssertEqual(asked, .identify(WireIdentify(version: 1, nonce: nonce)))
+        XCTAssertEqual(requestHeader.sessionId, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: asked), request)
+
+        let answer = try vector("identity")
+        XCTAssertEqual(answer.count, request.count, "never longer than the request")
+        let (_, message) = try XCTUnwrap(Wire.parseControl(answer))
+        guard case .identity(let identity) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(identity.nonce, nonce)
+        XCTAssertEqual(identity.port, 9876)
+        XCTAssertEqual(identity.addresses, [Data([192, 0, 2, 10]), Data([198, 51, 100, 10])])
+        XCTAssertEqual(identity.proof, MovedPC.proof(token: Data(1...16), nonce: nonce, port: 9876,
+                                                     addresses: identity.addresses))
+        // More addresses than fit are refused, never read past.
+        var five = answer
+        five[16 + 1 + 16 + 2] = 5
+        XCTAssertNil(Wire.parseControl(five))
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: message), answer)
     }
 
     func testPairingRejectionVectors() throws {
@@ -49,6 +76,53 @@ final class WireProtocolGoldenTests: XCTestCase {
             XCTAssertEqual(ack.sessionId, 0)
             XCTAssertEqual(ack.authToken, Data(repeating: 0, count: 16))
             XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    /// 0.3.5: the PC answers while it isn't streaming, a Failed answer with
+    /// its reason token.
+    func testNotStreamingVectors() throws {
+        for (name, status, reason): (String, HelloStatus, String) in [
+            ("hello_ack_stopped", .stopped, ""), ("hello_ack_restarting", .restarting, ""),
+            ("hello_ack_failed", .failed, "display_changing")
+        ] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+            XCTAssertEqual(ack.status, status)
+            XCTAssertTrue(ack.status.pcNotStreaming)
+            XCTAssertEqual(ack.reason, reason)
+            XCTAssertEqual(ack.sessionId, 0)
+            XCTAssertEqual(ack.hostCaps, HelloAck.hostCapNack)
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+    }
+
+    /// An iPad that asks for standby answers pads its HELLO2 with zeros, as
+    /// the PC encodes it, so no answer is larger than the question.
+    func testAStandbyHelloIsPaddedToFitAnyAnswer() throws {
+        let data = try vector("hello2_standby_padded")
+        XCTAssertEqual(data.count, Hello2.standbyLength)
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .hello2(let hello) = message else { return XCTFail("wrong type") }
+        XCTAssertNotEqual(hello.featureCaps & Hello2.featureStandbyStatus, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        // Without the bit, nothing is added.
+        var plain = hello
+        plain.featureCaps &= ~Hello2.featureStandbyStatus
+        XCTAssertLessThan(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(plain)).count, data.count)
+    }
+
+    /// How 0.3.4 and older treat a status they don't know: the whole ACK is
+    /// dropped, as if it were lost. The PC sends 6-8 only to iPads that set
+    /// `featureStandbyStatus`.
+    func testAnUnknownStatusIsDroppedLikeALostAck() throws {
+        var data = try vector("hello_ack_busy")
+        data[16] = 9
+        XCTAssertNil(Wire.parseControl(data))
+        XCTAssertEqual(Hello2.featureStandbyStatus, 1 << 3)
+        for status: HelloStatus in [.ok, .busy, .versionUnsupported, .error, .unauthorized, .rateLimited] {
+            XCTAssertFalse(status.pcNotStreaming, "\(status)")
         }
     }
 
