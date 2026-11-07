@@ -7,8 +7,10 @@ name: Beta builds
 # https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe
 # never changes (docs/download.html?channel=beta links it). No tag here starts
 # with v, so release.yml and testflight.yml never run for a beta build, and
-# docs/latest.json, /releases/latest and the apps' update checks never see
-# one. scripts/nightly.py has the version, branch and retention rules.
+# docs/latest.json, /releases/latest and stable installs never see one. A
+# Beta install reads the beta release's body for the newest Beta
+# (host/src/updates.rs). scripts/nightly.py has the version, branch and
+# retention rules.
 #
 # Only a run on main publishes. A manual run with dry_run, on any other
 # branch or for a pull request that changes this pipeline, builds and scans

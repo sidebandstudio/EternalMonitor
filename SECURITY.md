@@ -33,7 +33,10 @@ Knowing these limits helps you judge whether a finding is new.
 - The installer is not code-signed yet. Check its SHA-256 against the release page.
 - In-app updates (Windows) trust the network for nothing: the host fetches over
   HTTPS from an allowlist of GitHub hosts, and the installer must match the
-  SHA-256 in both eternalmonitor.dev/latest.json and the GitHub release. Against
+  SHA-256 in both eternalmonitor.dev/latest.json and the GitHub release. A Beta
+  build may also update to the newer Beta from the fixed `beta` GitHub release;
+  that installer must match both the SHA-256 in the release body and GitHub's own
+  digest of the file. Stable builds never take a Beta. Against
   other software already running as your Windows user, the updater adds defense
   in depth rather than a guarantee. Its helper loads DLLs only from System32 and
   imports only Windows system libraries. It inherits only its output pipe from

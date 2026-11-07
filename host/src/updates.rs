@@ -6,6 +6,10 @@
 //! iPad's while its TestFlight build awaits Apple. Before
 //! installing, the installer's SHA-256 must match both that manifest and the
 //! GitHub release body, which are published by different steps.
+//!
+//! A Beta build (`x.y.z-beta.…`) also reads the nightly's fixed `beta`
+//! GitHub release (scripts/nightly.py) and is offered the newer of that Beta
+//! and the stable release. Stable builds never see a Beta.
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -22,6 +26,14 @@ use crate::remote_config::Rollout;
 pub const WEBSITE_DOWNLOAD: &str = "https://eternalmonitor.dev/download.html";
 pub use eternal_updater::SETUP_FLAGS;
 const INSTALLER_NAME: &str = "EternalMonitor-Setup.exe";
+/// The nightly's fixed release and its installer (scripts/nightly.py).
+const BETA_TAG: &str = "beta";
+const BETA_INSTALLER_NAME: &str = "EternalMonitor-Setup-beta.exe";
+/// What the popup says under a Beta's title.
+const BETA_NOTE: &str = "A Beta build with the newest fixes, for testing.";
+/// A new Beta comes out most nights. Its notification and popup come at
+/// most this often, and its Later covers every Beta for this long.
+const BETA_INTERVAL: u64 = 24 * 60 * 60;
 const CHECK_INTERVAL: u64 = 24 * 60 * 60;
 /// A relaunch checks again only when the last check is this old, so a crash
 /// loop or repeated restarts cannot hammer the website.
@@ -117,6 +129,23 @@ pub fn newer_stable(candidate: &str, current: &str) -> Option<String> {
     (release > current).then(|| release.to_string())
 }
 
+/// Whether `version` is a Beta channel build: `x.y.z-beta.…`, either the
+/// nightly's `<next>-beta.<YYYYMMDD>.<run>` or a hand-made `-beta.1`.
+pub fn is_beta(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|version| version.pre.as_str().starts_with("beta."))
+}
+
+/// Whether `candidate` is newer than `current` by semver, previews included.
+/// Build metadata is ignored; malformed versions are never newer.
+fn newer(candidate: &str, current: &str) -> bool {
+    let parse = |version: &str| {
+        let mut version = semver::Version::parse(version).ok()?;
+        version.build = semver::BuildMetadata::EMPTY;
+        Some(version)
+    };
+    matches!((parse(candidate), parse(current)), (Some(a), Some(b)) if a > b)
+}
+
 /// The Windows release named by the manifest, already validated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
@@ -137,6 +166,12 @@ pub struct Release {
 
 fn recommended() -> bool {
     true
+}
+
+impl Release {
+    fn is_beta(&self) -> bool {
+        is_beta(&self.version)
+    }
 }
 
 /// Unknown fields are ignored, so a newer manifest still parses here.
@@ -280,6 +315,88 @@ fn published_sha256(body: &str) -> Option<String> {
     Some(pattern.captures(body)?[1].to_ascii_lowercase())
 }
 
+/// The Beta channel's fixed `beta` release as the GitHub API returns it, and
+/// its installer's size. scripts/nightly.py writes the body: a line
+/// `Version <version>, from the Beta channel…` and the installer's SHA-256
+/// in a code block. No website manifest names a Beta, so GitHub's own digest
+/// of the installer must match the body instead, which also fails closed
+/// while the nightly swaps the installer before it rewrites the body.
+pub fn parse_beta(data: &[u8], endpoints: &Endpoints) -> Result<(Release, u64), UpdateError> {
+    let bad = |why: &str| UpdateError::BadManifest(why.into());
+    let unsafe_download = |why: &str| UpdateError::UnsafeDownload(why.into());
+    let github: GithubRelease =
+        serde_json::from_slice(data).map_err(|error| bad(&error.to_string()))?;
+    if github.tag_name != BETA_TAG || github.draft || !github.prerelease {
+        return Err(unsafe_download("release is not the published Beta"));
+    }
+    let body = github.body.as_deref().unwrap_or_default();
+    let version = only_match(r"(?m)^Version (\S+), from the Beta channel", body)
+        .and_then(|version| semver::Version::parse(&version).ok())
+        .filter(|version| is_beta(&version.to_string()) && version.build.is_empty())
+        .ok_or_else(|| bad("Beta has no version"))?;
+    let sha256 = only_match(
+        r"(?m)^SHA-256 of EternalMonitor-Setup-beta\.exe:\s*```\s*([0-9A-Fa-f]{64})\s*```",
+        body,
+    )
+    .ok_or_else(|| bad("Beta has no SHA-256"))?
+    .to_ascii_lowercase();
+    let installer = format!(
+        "{}{BETA_TAG}/{BETA_INSTALLER_NAME}",
+        endpoints.installer_prefix
+    );
+    let asset = github
+        .assets
+        .iter()
+        .find(|asset| asset.name == BETA_INSTALLER_NAME)
+        .ok_or_else(|| unsafe_download("release has no installer"))?;
+    if asset.browser_download_url != installer {
+        return Err(unsafe_download("unexpected installer URL"));
+    }
+    if asset.digest.as_deref().map(str::to_ascii_lowercase) != Some(format!("sha256:{sha256}")) {
+        return Err(unsafe_download("GitHub digest is missing or differs"));
+    }
+    if asset.size == 0 || asset.size > MAX_INSTALLER_BYTES {
+        return Err(unsafe_download("installer size out of range"));
+    }
+    let release = Release {
+        version: version.to_string(),
+        installer,
+        sha256,
+        recommended: false,
+        note: Some(BETA_NOTE.into()),
+        rollout: None,
+    };
+    Ok((release, asset.size))
+}
+
+/// The first group of `pattern`'s one match in `text`. None, or two, is
+/// `None`.
+fn only_match(pattern: &str, text: &str) -> Option<String> {
+    let pattern = regex::Regex::new(pattern).ok()?;
+    let mut matches = pattern.captures_iter(text);
+    let first = matches.next()?[1].to_string();
+    matches.next().is_none().then_some(first)
+}
+
+/// Checks the Beta release against the one chosen and returns the
+/// installer's size. A Beta published since then is refused: its hash is not
+/// the one the helper will check.
+fn check_beta_release(
+    data: &[u8],
+    release: &Release,
+    endpoints: &Endpoints,
+) -> Result<u64, UpdateError> {
+    let (published, size) = parse_beta(data, endpoints)?;
+    if (&published.version, &published.installer, &published.sha256)
+        != (&release.version, &release.installer, &release.sha256)
+    {
+        return Err(UpdateError::UnsafeDownload(
+            "the Beta release changed".into(),
+        ));
+    }
+    Ok(size)
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -381,6 +498,13 @@ fn get_json_within(url: &str, accept: &str, timeout: Duration) -> Result<Vec<u8>
 pub fn fetch_manifest(endpoints: &Endpoints) -> Result<Release, UpdateError> {
     let data = get_json(&endpoints.manifest, "application/json")?;
     parse_manifest(&data, endpoints)
+}
+
+const GITHUB_JSON: &str = "application/vnd.github+json";
+
+pub fn fetch_beta(endpoints: &Endpoints) -> Result<Release, UpdateError> {
+    let data = get_json(&format!("{}{BETA_TAG}", endpoints.release_api), GITHUB_JSON)?;
+    parse_beta(&data, endpoints).map(|(release, _)| release)
 }
 
 // ── The failure message ─────────────────────────────────────────────────────
@@ -512,9 +636,14 @@ pub fn download(
     progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, UpdateError> {
     let io = |error: std::io::Error| UpdateError::Network(error.to_string());
-    let api = format!("{}v{}", endpoints.release_api, release.version);
-    let github = get_json(&api, "application/vnd.github+json")?;
-    let size = check_github_release(&github, release)?;
+    let size = if release.is_beta() {
+        let github = get_json(&format!("{}{BETA_TAG}", endpoints.release_api), GITHUB_JSON)?;
+        check_beta_release(&github, release, endpoints)?
+    } else {
+        let api = format!("{}v{}", endpoints.release_api, release.version);
+        let github = get_json(&api, GITHUB_JSON)?;
+        check_github_release(&github, release)?
+    };
     // Earlier updates are finished; their folders can go.
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root).map_err(io)?;
@@ -866,6 +995,12 @@ struct Saved {
     /// showing for that version, whatever the clock does later.
     #[serde(default)]
     rollout_reached: Option<String>,
+    /// The newest Beta, as last read. Offered only to a Beta build.
+    #[serde(default)]
+    beta: Option<Release>,
+    /// When a notification last announced a Beta.
+    #[serde(default)]
+    beta_notified: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -936,6 +1071,9 @@ pub enum Command {
 pub struct State {
     current: String,
     auto: bool,
+    /// A Beta build also reads the Beta channel unless this is off
+    /// (Settings).
+    beta_updates: bool,
     manual_check: bool,
     saved: Saved,
     /// The release being downloaded, waited for or installed. The helper
@@ -988,7 +1126,7 @@ fn take_pending(current: &str, saved: &mut Saved) -> Option<Previous> {
         Some(UpdateResult::Setup { exit, .. }) => Some(*exit),
         _ => None,
     };
-    if newer_stable(&to, current).is_none() {
+    if !newer(&to, current) {
         // Setup replaces the app before its last steps, so the new version
         // can run after Setup failed.
         return Some(match exit {
@@ -1092,6 +1230,7 @@ impl State {
         let mut state = Self {
             current: current.into(),
             auto,
+            beta_updates: true,
             manual_check: false,
             saved,
             chosen: None,
@@ -1134,11 +1273,57 @@ impl State {
                 .is_none_or(|last| now.saturating_sub(last) >= RECHECK_OFFER || last > now)
     }
 
+    /// The newer of the stable release and, on a Beta build, the Beta, if
+    /// it is newer than this version.
     fn available(&self) -> Option<&Release> {
-        self.saved
+        let stable = self
+            .saved
             .latest
             .as_ref()
-            .filter(|latest| newer_stable(&latest.version, &self.current).is_some())
+            .filter(|latest| newer_stable(&latest.version, &self.current).is_some());
+        let beta = self.saved.beta.as_ref().filter(|beta| {
+            self.beta_channel() && beta.is_beta() && newer(&beta.version, &self.current)
+        });
+        match (stable, beta) {
+            (Some(stable), Some(beta)) if newer(&beta.version, &stable.version) => Some(beta),
+            (stable, beta) => stable.or(beta),
+        }
+    }
+
+    /// This is a Beta build and Beta updates are on.
+    fn beta_channel(&self) -> bool {
+        self.beta_updates && is_beta(&self.current)
+    }
+
+    /// The Beta channel's answer, taken before [`Self::finish_check`] of the
+    /// same check. Offline, the saved Beta stays; a Beta that fails its
+    /// checks is not offered, and neither is the one saved before it.
+    fn finish_beta(&mut self, result: Result<Release, UpdateError>) {
+        match result {
+            Ok(release) => self.saved.beta = Some(release),
+            Err(error @ UpdateError::Network(_)) => {
+                tracing::info!(%error, "Beta check unavailable");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Beta release refused");
+                self.saved.beta = None;
+            }
+        }
+    }
+
+    /// A Beta is not announced while a stream runs, nor within a day of
+    /// the last Beta notification.
+    fn beta_quiet(&mut self, now: u64, version: &str) -> bool {
+        // A time ahead of the clock counts as now, as for the popup.
+        if let Some(at) = self.saved.beta_notified.as_mut() {
+            *at = (*at).min(now);
+        }
+        is_beta(version)
+            && (self.streaming
+                || self
+                    .saved
+                    .beta_notified
+                    .is_some_and(|at| now - at < BETA_INTERVAL))
     }
 
     /// The available release is staged and this install's turn has not come:
@@ -1230,17 +1415,24 @@ impl State {
             || self.snoozed(now)
             || self.held_back(now)
             || self.saved.notified.as_deref() == Some(&version)
+            || self.beta_quiet(now, &version)
         {
             return None;
         }
         self.saved.notified = Some(version.clone());
+        if is_beta(&version) {
+            self.saved.beta_notified = Some(now);
+        }
         Some(version)
     }
 
+    /// Later covers its version, and on a Beta every newer Beta, for a day.
     fn snoozed(&self, now: u64) -> bool {
         match (&self.saved.later, self.available()) {
             (Some((version, at)), Some(latest)) => {
-                *version == latest.version && now.saturating_sub(*at) < LATER_INTERVAL && *at <= now
+                (*version == latest.version || (is_beta(version) && latest.is_beta()))
+                    && now.saturating_sub(*at) < LATER_INTERVAL
+                    && *at <= now
             }
             _ => false,
         }
@@ -1278,7 +1470,8 @@ impl State {
     }
 
     /// Once per version while the banner offers it, then at most every
-    /// three days after it is closed. Never when automatic checks are off.
+    /// three days after it is closed; a Beta at most once a day, whichever
+    /// Beta was closed. Never when automatic checks are off.
     fn popup(&mut self, now: u64) -> Option<Popup> {
         self.reach_rollout(now);
         // Closed "in the future" means the clock was set back: count it as
@@ -1291,10 +1484,10 @@ impl State {
             return None;
         }
         let release = self.available()?;
-        let closed =
-            self.saved.popup.as_ref().is_some_and(|(version, at)| {
-                *version == release.version && now - at < POPUP_INTERVAL
-            });
+        let closed = self.saved.popup.as_ref().is_some_and(|(version, at)| {
+            (*version == release.version && now - at < POPUP_INTERVAL)
+                || (is_beta(version) && release.is_beta() && now - at < BETA_INTERVAL)
+        });
         (!closed).then(|| Popup {
             version: release.version.clone(),
             recommended: release.recommended,
@@ -1727,8 +1920,8 @@ fn wait_while_checks_held() {
 
 impl Updater {
     /// `gate` is the process's handoff gate, shared with the window's
-    /// restart.
-    pub fn start(auto: bool, session: SharedSession, gate: Gate, wake: Wake) -> Self {
+    /// restart. `beta`: a Beta build also offers newer Betas.
+    pub fn start(auto: bool, beta: bool, session: SharedSession, gate: Gate, wake: Wake) -> Self {
         let path = state_path();
         let saved = load(path.as_deref());
         let mut state = State::resume(
@@ -1738,6 +1931,7 @@ impl Updater {
             PREVIOUS.lock().take(),
         );
         state.gate = gate;
+        state.beta_updates = beta;
         let state = Arc::new(Mutex::new(state));
         save(path.as_deref(), &state.lock().saved);
         let (tx, rx) = mpsc::channel();
@@ -1832,6 +2026,17 @@ impl Updater {
         }
     }
 
+    /// Turning Beta updates back on reads the Beta channel again.
+    pub fn set_beta(&self, beta: bool) {
+        let check = self.with(|state| {
+            state.beta_updates = beta;
+            state.auto && state.beta_channel()
+        });
+        if check {
+            self.send(Some(Command::Check { manual: false }));
+        }
+    }
+
     pub fn check_now(&self) {
         let checking = self.with(|state| {
             let busy = state.check == CheckStatus::Checking;
@@ -1908,20 +2113,35 @@ impl Worker {
             };
             match command {
                 Command::Check { manual } => {
-                    self.state.lock().begin_check(manual);
+                    let beta = {
+                        let mut state = self.state.lock();
+                        state.begin_check(manual);
+                        state.beta_channel()
+                    };
                     (self.wake)(None);
                     wait_while_checks_held();
+                    let beta = beta.then(|| fetch_beta(&self.endpoints));
                     let result =
                         get_json(&self.endpoints.manifest, "application/json").and_then(|data| {
                             // Per-PC settings apply from the next app run.
                             crate::remote_config::save_fetched(&data);
                             parse_manifest(&data, &self.endpoints)
                         });
-                    let notify =
-                        self.update(|state| state.finish_check(now_secs(), manual, result));
+                    let notify = self.update(|state| {
+                        if let Some(beta) = beta {
+                            state.finish_beta(beta);
+                        }
+                        state.finish_check(now_secs(), manual, result)
+                    });
                     (self.wake)(notify.as_deref());
                 }
                 Command::Download(release) => {
+                    // A Beta published since the check replaces the offer
+                    // here, rather than failing the download's hash check.
+                    if release.is_beta() {
+                        let latest = fetch_beta(&self.endpoints);
+                        self.update(|state| state.finish_beta(latest));
+                    }
                     if !self.update(|state| state.download_starts(&release)) {
                         (self.wake)(None);
                         continue;

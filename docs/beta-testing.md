@@ -32,6 +32,15 @@ back to Stable by running the Stable installer over it.
   `docs/latest.json`, else that release's next patch. It sorts below `0.3.4`,
   so Beta users get the next Stable release from the normal update prompt, and
   Stable users are never offered a Beta build.
+- **Updates on Beta:** a Beta build also reads the `beta` release below and
+  offers the newer of that Beta and the next Stable release, with the same
+  banner, popup and helper as a Stable update. The version and SHA-256 come
+  from the release body `nightly.py` writes, and GitHub's digest of the
+  installer must match it. A new Beta is announced at most once a day, never
+  during a stream. Settings, General, **Get Beta updates** (shown only on a
+  Beta build) turns this off. Taking a Stable release leaves the Beta channel.
+  Betas built before this arrived can't update themselves, so their testers
+  install one newer Beta by hand.
 - **On GitHub:** each build is a pre-release tagged `beta-<YYYYMMDD>-<sha>`,
   titled like "EternalMonitor 0.3.4 beta (Oct 30, 2026)". The newest 7 are
   kept. The pre-release `beta` always holds the newest, so this link never
