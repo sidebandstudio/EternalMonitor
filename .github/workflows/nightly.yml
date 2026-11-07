@@ -165,6 +165,19 @@ jobs:
           python3 scripts/nightly.py notes --version "$VERSION" --branch "$BRANCH" \
             --sha "$SHA" --stable "$STABLE" --sha256 "$SHA256" > notes.md
 
+      # What scripts/sign_beta_manifest.py --sha256/--version must be given:
+      # the hash the build computed, which the step above checked.
+      - name: Summarize the build to sign
+        run: |
+          {
+            echo "### Beta build to sign"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | $VERSION |"
+            echo "| Installer SHA-256 | \`$SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The dated release first, checked anonymously; then the fixed beta link,
       # swapped by renames and checked byte for byte before the old asset goes;
       # the beta tag; and last the marker plan reads to skip a finished commit,

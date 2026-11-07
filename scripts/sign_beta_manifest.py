@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Sign the Beta channel's manifest, so Beta installs offer the newest Beta.
 
-  sign_beta_manifest.py [--repo R] [--public-key PEM] < private-key.pem
-      Read the beta release, write beta-manifest.txt from it, sign that with
-      the Ed25519 private key read from stdin, upload both files to the
-      release, then verify them as a Beta install does.
-  sign_beta_manifest.py --verify-only [--repo R] [--public-key PEM]
+  sign_beta_manifest.py --sha256 HEX [--version V] < private-key.pem
+      Read the beta release, check that it names the installer HEX (and V),
+      write beta-manifest.txt from it, sign that with the Ed25519 private key
+      read from stdin, check the signature with the pinned public key, upload
+      both files to the release, then verify them as a Beta install does.
+      HEX is the "Installer SHA-256" in the Publish job's summary of the Beta
+      builds run that published the build: the hash the build computed,
+      which GitHub's release can't vouch for by itself. Signs only for
+      sidebandstudio/EternalMonitor.
+  sign_beta_manifest.py --verify-only [--repo R] [--public-key PEM] [--sha256 HEX] [--version V]
       Only verify the published manifest and signature.
 
 A Beta install offers a Beta only when beta-manifest.sig is a valid Ed25519
@@ -124,10 +129,14 @@ def verified(manifest, signature, public_key, run=subprocess.run):
     return result.returncode == 0 and os.path.getsize(signature) == 64
 
 
-def verify_published(github, public_key=PUBLIC_KEY, run=subprocess.run):
+def verify_published(github, public_key=PUBLIC_KEY, run=subprocess.run, sha256=None, version=None):
     """Checks the published manifest and signature as a Beta install does, and
-    returns the version they vouch for."""
-    version, sha256, size = read_release(github.release())
+    returns the version they vouch for. With sha256, the release must name that
+    installer (and version)."""
+    found = read_release(github.release())
+    if sha256 is not None:
+        expect(found, sha256, version)
+    version, sha256, size = found
     with tempfile.TemporaryDirectory() as tmp:
         try:
             github.download([MANIFEST, SIGNATURE], tmp)
@@ -144,20 +153,32 @@ def verify_published(github, public_key=PUBLIC_KEY, run=subprocess.run):
     return version
 
 
-def sign_and_publish(github, private_key, public_key=PUBLIC_KEY, run=subprocess.run):
-    """Writes, signs and uploads the manifest for the release as it is now, then
-    verifies what was published. Returns the version."""
-    version, sha256, size = read_release(github.release())
+def expect(found, sha256, version=None):
+    """Refuses a release that does not name the installer the nightly run built."""
+    found_version, found_sha256, _ = found
+    if found_sha256 != sha256.lower():
+        raise SigningError(f"the release names installer {found_sha256}, not {sha256.lower()} from the nightly run")
+    if version is not None and found_version != version:
+        raise SigningError(f"the release names {found_version}, not {version}")
+
+
+def sign_and_publish(github, private_key, sha256, version=None, run=subprocess.run):
+    """Writes, signs and uploads the manifest for the release as it is now, once it
+    names the installer sha256 (and version), then verifies what was published
+    against the pinned key. Returns the version."""
+    found = read_release(github.release())
+    expect(found, sha256, version)
+    version, sha256, size = found
     with tempfile.TemporaryDirectory() as tmp:
         manifest, signature = os.path.join(tmp, MANIFEST), os.path.join(tmp, SIGNATURE)
         with open(manifest, "w", encoding="utf-8", newline="\n") as f:
             f.write(manifest_text(version, sha256, size))
         sign(manifest, signature, private_key, run)
         # A wrong key must not replace a good signature.
-        if not verified(manifest, signature, public_key, run):
-            raise SigningError("the private key does not match the public key")
+        if not verified(manifest, signature, PUBLIC_KEY, run):
+            raise SigningError("the private key does not match the pinned public key")
         github.upload([manifest, signature])
-    published = verify_published(github, public_key, run)
+    published = verify_published(github, PUBLIC_KEY, run)
     if published != version:
         raise SigningError(f"the release moved to {published} while signing {version}; run again")
     return version
@@ -166,22 +187,34 @@ def sign_and_publish(github, private_key, public_key=PUBLIC_KEY, run=subprocess.
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=os.environ.get("GH_REPO", REPO))
-    parser.add_argument("--public-key", help="PEM file to verify with instead of the pinned key")
+    parser.add_argument("--public-key", help="--verify-only: PEM file to verify with instead of the pinned key")
+    parser.add_argument("--sha256", help="the installer's SHA-256 from the nightly run (required to sign)")
+    parser.add_argument("--version", help="the Beta version the nightly run published")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
-    public_key = PUBLIC_KEY
-    if args.public_key:
-        with open(args.public_key, "rb") as f:
-            public_key = f.read()
-    github = GitHub(args.repo)
+    if args.sha256 is not None and not re.fullmatch(r"[0-9A-Fa-f]{64}", args.sha256):
+        parser.error("--sha256 takes the installer's 64-digit hex SHA-256")
+    if not args.verify_only:
+        if args.sha256 is None:
+            parser.error("signing needs --sha256, from the nightly run's Publish summary")
+        if args.public_key:
+            parser.error("--public-key only goes with --verify-only; signing checks the pinned key")
+        if args.repo != REPO:
+            parser.error(f"signing is only for {REPO}, not {args.repo}")
     try:
         if args.verify_only:
-            print(f"Verified the signed manifest for {verify_published(github, public_key)}")
+            public_key = PUBLIC_KEY
+            if args.public_key:
+                with open(args.public_key, "rb") as f:
+                    public_key = f.read()
+            version = verify_published(GitHub(args.repo), public_key, sha256=args.sha256, version=args.version)
+            print(f"Verified the signed manifest for {version}")
         else:
             private_key = sys.stdin.buffer.read()
             if b"PRIVATE KEY" not in private_key:
                 raise SigningError("pipe the Ed25519 private key PEM into stdin")
-            print(f"Signed and verified the manifest for {sign_and_publish(github, private_key, public_key)}")
+            version = sign_and_publish(GitHub(args.repo), private_key, args.sha256, args.version)
+            print(f"Signed and verified the manifest for {version}")
     except SigningError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

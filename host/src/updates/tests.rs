@@ -2653,7 +2653,8 @@ fn test_public_key() -> [u8; 32] {
 
 /// What the fake GitHub publishes for the Beta: `version` with `published`
 /// as its installer, which downloads as `served`; the manifest and
-/// signature, or `None` for no such asset.
+/// signature, or `None` for no such asset. With `status`, the listed
+/// manifest's download answers that HTTP status instead.
 #[derive(Clone)]
 struct BetaSite {
     version: String,
@@ -2661,6 +2662,7 @@ struct BetaSite {
     served: Vec<u8>,
     manifest: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
+    status: Option<u16>,
 }
 
 impl BetaSite {
@@ -2672,6 +2674,7 @@ impl BetaSite {
             served: published.to_vec(),
             manifest: None,
             signature: None,
+            status: None,
         };
         site.sign(BetaManifest {
             version: version.into(),
@@ -2742,7 +2745,10 @@ fn serve_beta(site: Arc<Mutex<BetaSite>>) -> (Endpoints, Arc<std::sync::atomic::
                 Vec::new(),
             ),
             "/assets/installer" => (200, vec![], site.served),
-            "/assets/manifest" => found(site.manifest),
+            "/assets/manifest" => match site.status {
+                Some(status) => (status, vec![], Vec::new()),
+                None => found(site.manifest),
+            },
             "/releases/download/beta/beta-manifest.sig" => found(site.signature),
             _ => (404, vec![], Vec::new()),
         }
@@ -3033,4 +3039,78 @@ fn the_worker_reads_the_beta_only_for_a_beta_build_and_again_before_downloading(
         state.notice(now_secs()),
         Some(Notice::Available(next.into()))
     );
+}
+
+#[test]
+fn a_manifest_file_that_is_not_served_or_too_large_drops_the_beta() {
+    let good = BetaSite::signed(BETA, b"MZ fake beta installer");
+    let mut large = good.clone();
+    large.manifest = Some(vec![b'a'; MAX_MANIFEST_BYTES as usize + 1]);
+    let mut missing = good.clone();
+    missing.status = Some(404);
+    let mut failing = good.clone();
+    failing.status = Some(500);
+    for (name, site) in [("too large", large), ("404", missing), ("500", failing)] {
+        let (_, fetched) = fetch_site(site);
+        assert!(
+            matches!(fetched, Err(UpdateError::BadManifest(_))),
+            "{name}: {fetched:?}"
+        );
+        let mut s = beta_state(Saved {
+            beta: Some(beta(BETA)),
+            ..Saved::default()
+        });
+        s.finish_beta(fetched);
+        assert_eq!(s.saved.beta, None, "{name}");
+    }
+}
+
+#[test]
+fn the_download_checks_the_signed_manifest_again() {
+    let payload = b"MZ fake beta installer";
+    let site = Arc::new(Mutex::new(BetaSite::signed(BETA, payload)));
+    let (endpoints, _) = serve_beta(site.clone());
+    let release = fetch_beta(&endpoints).unwrap();
+    // Between the check and the download, the manifest stops verifying.
+    site.lock().manifest.as_mut().unwrap()[40] ^= 1;
+    let error = download_case(&endpoints, &release).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::UnsafeDownload(why) if why.contains("signature")),
+        "{error}"
+    );
+    let mut unsigned = BetaSite::signed(BETA, payload);
+    unsigned.signature = None;
+    *site.lock() = unsigned;
+    assert!(matches!(
+        download_case(&endpoints, &release),
+        Err(UpdateError::BadManifest(_))
+    ));
+}
+
+#[test]
+fn an_older_signed_beta_than_one_verified_before_is_refused() {
+    let older = "0.3.5-beta.20261106.22";
+    let next = "0.3.5-beta.20261108.27";
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(1000), Some(Notice::Available(BETA.into())));
+    // A replayed older signed Beta, still newer than this build: no offer,
+    // also after a restart.
+    s.finish_beta(Ok(beta(older)));
+    s.finish_check(2000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(2000), None);
+    assert_eq!(s.saved.beta_highest.as_deref(), Some(BETA));
+    let mut s = beta_state(s.saved.clone());
+    s.finish_beta(Ok(beta(older)));
+    s.finish_check(3000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(3000), None);
+    // The same Beta again, or a newer one, is offered.
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(4000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(4000), Some(Notice::Available(BETA.into())));
+    s.finish_beta(Ok(beta(next)));
+    s.finish_check(5000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(5000), Some(Notice::Available(next.into())));
+    assert_eq!(s.saved.beta_highest.as_deref(), Some(next));
 }

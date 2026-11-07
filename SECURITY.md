@@ -39,8 +39,10 @@ Knowing these limits helps you judge whether a finding is new.
   Ed25519 signature by a public key pinned in the app, made with a key the
   release workflows don't have, and the manifest's version, SHA-256 and size
   must match the release body, GitHub's digest of the installer and the
-  downloaded file. Without a valid signature no Beta is offered. Stable builds
-  never take a Beta. Against
+  downloaded file. Without a valid signature no Beta is offered, and a signed
+  Beta older than one the install has already verified is refused, so an old
+  signed release can't be replayed to hold testers back. Stable builds never
+  take a Beta. Against
   other software already running as your Windows user, the updater adds defense
   in depth rather than a guarantee. Its helper loads DLLs only from System32 and
   imports only Windows system libraries. It inherits only its output pipe from

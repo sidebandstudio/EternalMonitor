@@ -475,15 +475,10 @@ pub fn check_beta_manifest(
     Ok(())
 }
 
-/// Checks the Beta release against the one chosen, whose manifest was
-/// verified, and returns the installer's size. A Beta published since then
-/// is refused: its hash is not the one the helper will check.
-fn check_beta_release(
-    data: &[u8],
-    release: &Release,
-    endpoints: &Endpoints,
-) -> Result<u64, UpdateError> {
-    let listing = parse_beta(data, endpoints)?;
+/// Checks the verified Beta release against the one chosen and returns the
+/// installer's size. A Beta published since then is refused: its hash is
+/// not the one the helper will check.
+fn check_beta_release(listing: &BetaListing, release: &Release) -> Result<u64, UpdateError> {
     let published = &listing.release;
     if (&published.version, &published.installer, &published.sha256)
         != (&release.version, &release.installer, &release.sha256)
@@ -602,17 +597,29 @@ const GITHUB_JSON: &str = "application/vnd.github+json";
 
 /// The newest Beta, offered only with a valid signed manifest.
 pub fn fetch_beta(endpoints: &Endpoints) -> Result<Release, UpdateError> {
+    verified_beta(endpoints).map(|listing| listing.release)
+}
+
+/// The `beta` release, once its signed manifest checks out.
+fn verified_beta(endpoints: &Endpoints) -> Result<BetaListing, UpdateError> {
     let data = get_json(&format!("{}{BETA_TAG}", endpoints.release_api), GITHUB_JSON)?;
     let listing = parse_beta(&data, endpoints)?;
     let manifest = get_asset(&listing.manifest, endpoints)?;
     let signature = get_asset(&listing.signature, endpoints)?;
     check_beta_manifest(&listing, &manifest, &signature, &endpoints.beta_key)?;
-    Ok(listing.release)
+    Ok(listing)
 }
 
-/// A small release file, following redirects only to allowed hosts.
+/// A manifest file, following redirects only to allowed hosts. One that
+/// isn't served or is too large is a bad Beta, not a network problem, so the
+/// saved Beta goes too.
 fn get_asset(url: &str, endpoints: &Endpoints) -> Result<Vec<u8>, UpdateError> {
-    let network = |error: &dyn std::fmt::Display| UpdateError::Network(error.to_string());
+    let bad = |why: String| UpdateError::BadManifest(why);
+    let network = |error: ureq::Error| match error {
+        ureq::Error::StatusCode(status) => bad(format!("Beta file: HTTP {status}")),
+        ureq::Error::BodyExceedsLimit(_) => bad("Beta file too large".into()),
+        error => UpdateError::Network(error.to_string()),
+    };
     let unsafe_download = |why: String| UpdateError::UnsafeDownload(why);
     let agent = agent(Duration::from_secs(10));
     let mut url = url.to_string();
@@ -624,7 +631,7 @@ fn get_asset(url: &str, endpoints: &Endpoints) -> Result<Vec<u8>, UpdateError> {
             .get(&url)
             .header("User-Agent", USER_AGENT)
             .call()
-            .map_err(|e| network(&e))?;
+            .map_err(network)?;
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -636,14 +643,14 @@ fn get_asset(url: &str, endpoints: &Endpoints) -> Result<Vec<u8>, UpdateError> {
             continue;
         }
         if !response.status().is_success() {
-            return Err(UpdateError::Network(format!("HTTP {}", response.status())));
+            return Err(bad(format!("Beta file: HTTP {}", response.status())));
         }
         return response
             .body_mut()
             .with_config()
             .limit(MAX_MANIFEST_BYTES)
             .read_to_vec()
-            .map_err(|e| network(&e));
+            .map_err(network);
     }
     Err(unsafe_download("too many redirects".into()))
 }
@@ -778,8 +785,8 @@ pub fn download(
 ) -> Result<PathBuf, UpdateError> {
     let io = |error: std::io::Error| UpdateError::Network(error.to_string());
     let size = if release.is_beta() {
-        let github = get_json(&format!("{}{BETA_TAG}", endpoints.release_api), GITHUB_JSON)?;
-        check_beta_release(&github, release, endpoints)?
+        // The signed manifest is checked again, right before the download.
+        check_beta_release(&verified_beta(endpoints)?, release)?
     } else {
         let api = format!("{}v{}", endpoints.release_api, release.version);
         let github = get_json(&api, GITHUB_JSON)?;
@@ -1142,6 +1149,11 @@ struct Saved {
     /// When a notification last announced a Beta.
     #[serde(default)]
     beta_notified: Option<u64>,
+    /// The highest Beta whose signed manifest checked out. An older signed
+    /// Beta served later is refused, so replaying one can't hold testers
+    /// back on it.
+    #[serde(default)]
+    beta_highest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1438,10 +1450,20 @@ impl State {
 
     /// The Beta channel's answer, taken before [`Self::finish_check`] of the
     /// same check. Offline, the saved Beta stays; a Beta that fails its
-    /// checks is not offered, and neither is the one saved before it.
+    /// checks, or is older than one verified before, is not offered, and
+    /// neither is the one saved before it.
     fn finish_beta(&mut self, result: Result<Release, UpdateError>) {
         match result {
-            Ok(release) => self.saved.beta = Some(release),
+            Ok(release) => match &self.saved.beta_highest {
+                Some(highest) if newer(highest, &release.version) => {
+                    tracing::warn!(version = %release.version, %highest, "Older Beta refused");
+                    self.saved.beta = None;
+                }
+                _ => {
+                    self.saved.beta_highest = Some(release.version.clone());
+                    self.saved.beta = Some(release);
+                }
+            },
             Err(error @ UpdateError::Network(_)) => {
                 tracing::info!(%error, "Beta check unavailable");
             }

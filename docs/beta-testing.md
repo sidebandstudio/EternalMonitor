@@ -40,9 +40,18 @@ back to Stable by running the Stable installer over it.
   manifest's version, SHA-256 and size must match the release body
   `nightly.py` writes, GitHub's digest of the installer and the downloaded
   file. The nightly does not sign; until a build is signed, Beta installs are
-  offered no Beta. After a nightly publishes, pipe the signing key into
-  `scripts/sign_beta_manifest.py`, which checks the release, signs, uploads
-  both files and verifies them; `--verify-only` checks what is published.
+  offered no Beta. After a nightly publishes, open its run (Actions, Beta
+  builds) and copy **Installer SHA-256** and **Version** from the Publish
+  job's summary, "Beta build to sign": the hash the Windows installer job
+  computed for the build it scanned, which Publish checks against the file
+  it uploads. Then run
+  `scripts/sign_beta_manifest.py --sha256 <hash> --version <version>` with
+  the signing key on stdin. It refuses a release that names another
+  installer or version, checks the release's parts agree, signs, checks the
+  signature with the pinned key, uploads both files and verifies them;
+  `--verify-only` checks what is published. A signed Beta older than one an
+  install has already seen is refused, so taking a bad Beta back means
+  signing a newer build, not re-signing an older one.
   A new Beta is announced at most once a day, never during a stream. Settings, General, **Get Beta updates** (shown only on a
   Beta build) turns this off. Taking a Stable release leaves the Beta channel.
   Betas built before this arrived can't update themselves, so their testers

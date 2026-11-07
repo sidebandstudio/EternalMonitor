@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import nightly  # noqa: E402
@@ -120,15 +121,22 @@ class ManifestTest(unittest.TestCase):
                 signer.read_release(data)
 
 
+def pinned(public):
+    """Signing checks the pinned key; tests pin a throwaway one."""
+    return mock.patch.object(signer, "PUBLIC_KEY", public)
+
+
 @unittest.skipUnless(ed25519_available(), "needs OpenSSL 3 with Ed25519")
 class SigningTest(unittest.TestCase):
     def test_signs_uploads_and_verifies(self):
         private, public = new_key()
         github, run = FakeGitHub(), Recorder()
-        self.assertEqual(signer.sign_and_publish(github, private, public, run), VERSION)
+        with pinned(public):
+            self.assertEqual(signer.sign_and_publish(github, private, HASH.upper(), VERSION, run), VERSION)
         self.assertEqual(github.assets[signer.MANIFEST], signer.manifest_text(VERSION, HASH, SIZE).encode())
         self.assertEqual(len(github.assets[signer.SIGNATURE]), 64)
         self.assertEqual(signer.verify_published(github, public), VERSION)
+        self.assertEqual(signer.verify_published(github, public, sha256=HASH, version=VERSION), VERSION)
         # The key went to openssl's stdin only: never an argument, never uploaded.
         with_key = [args for args, given in run.calls if given == private]
         self.assertEqual(len(with_key), 1)
@@ -138,29 +146,45 @@ class SigningTest(unittest.TestCase):
         for data in github.assets.values():
             self.assertNotIn(b"PRIVATE KEY", data)
 
+    def test_a_release_that_is_not_the_nightly_runs_build_is_not_signed(self):
+        private, public = new_key()
+        run = Recorder()
+        for sha256, version in [("0" * 64, None), ("0" * 64, VERSION), (HASH, "0.3.5-beta.20261108.27")]:
+            github = FakeGitHub()
+            with pinned(public), self.assertRaises(signer.SigningError, msg=(sha256, version)):
+                signer.sign_and_publish(github, private, sha256, version, run)
+            self.assertEqual(github.uploads, 0)
+        self.assertEqual(run.calls, [], "refused before anything is signed")
+        github = FakeGitHub()
+        with pinned(public):
+            signer.sign_and_publish(github, private, HASH)
+        with self.assertRaises(signer.SigningError):
+            signer.verify_published(github, public, sha256="0" * 64)
+
     def test_a_key_that_is_not_the_pinned_one_uploads_nothing(self):
         private, _ = new_key()
         _, other = new_key()
         github = FakeGitHub()
-        with self.assertRaises(signer.SigningError):
-            signer.sign_and_publish(github, private, other)
+        with pinned(other), self.assertRaises(signer.SigningError):
+            signer.sign_and_publish(github, private, HASH)
         self.assertEqual(github.uploads, 0)
         # Against the production key, a throwaway key fails too.
         with self.assertRaises(signer.SigningError):
-            signer.sign_and_publish(github, private)
+            signer.sign_and_publish(github, private, HASH)
         self.assertEqual(github.uploads, 0)
 
     def test_a_release_whose_parts_disagree_is_not_signed(self):
         private, public = new_key()
         github = FakeGitHub(release(digest=f"sha256:{'0' * 64}"))
-        with self.assertRaises(signer.SigningError):
-            signer.sign_and_publish(github, private, public)
+        with pinned(public), self.assertRaises(signer.SigningError):
+            signer.sign_and_publish(github, private, HASH)
         self.assertEqual(github.uploads, 0)
 
     def test_verify_only_refuses_a_bad_or_missing_manifest(self):
         private, public = new_key()
         github = FakeGitHub()
-        signer.sign_and_publish(github, private, public)
+        with pinned(public):
+            signer.sign_and_publish(github, private, HASH)
         _, other = new_key()
         with self.assertRaises(signer.SigningError):
             signer.verify_published(github, other)
@@ -196,16 +220,49 @@ class SigningTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def test_signing_needs_a_private_key_on_stdin(self):
+    def main(self, argv, stdin=b"-----BEGIN PRIVATE KEY-----\n"):
+        """main(argv) with stdin; the exit status, or the usage error's. Nothing
+        reaches GitHub: every case here stops before it would."""
         class Stdin:
-            buffer = __import__("io").BytesIO(b"not a key")
+            buffer = __import__("io").BytesIO(stdin)
 
         saved = sys.stdin
         sys.stdin = Stdin()
         try:
-            self.assertEqual(signer.main(["--repo", "example/none"]), 1)
+            with mock.patch.object(signer, "GitHub", side_effect=AssertionError("no GitHub")), \
+                    mock.patch("sys.stderr"):
+                return signer.main(argv)
+        except SystemExit as exit:
+            return exit.code
         finally:
             sys.stdin = saved
+
+    def test_signing_needs_the_nightly_runs_hash(self):
+        self.assertEqual(self.main([]), 2)
+        self.assertEqual(self.main(["--sha256", "abc"]), 2)
+        self.assertEqual(self.main(["--verify-only", "--sha256", "abc"]), 2)
+
+    def test_signing_is_only_for_the_real_repo_and_the_pinned_key(self):
+        self.assertEqual(self.main(["--sha256", HASH, "--repo", "someone/fork"]), 2)
+        with mock.patch.dict(os.environ, {"GH_REPO": "someone/fork"}):
+            self.assertEqual(self.main(["--sha256", HASH]), 2)
+        self.assertEqual(self.main(["--sha256", HASH, "--public-key", "other.pem"]), 2)
+
+    def test_signing_needs_a_private_key_on_stdin(self):
+        self.assertEqual(self.main(["--sha256", HASH], stdin=b"not a key"), 1)
+
+
+class WorkflowTest(unittest.TestCase):
+    def test_the_nightly_run_shows_the_hash_and_version_to_sign(self):
+        text = (ROOT / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
+        publish = text[text.index("\n  publish:"):]
+        self.assertIn("SHA256: ${{ needs.build.outputs.sha256 }}", publish)
+        self.assertIn("VERSION: ${{ needs.plan.outputs.version }}", publish)
+        summary = publish[publish.index("- name: Summarize the build to sign"):]
+        summary = summary[:summary.index("\n      - name:", 1)]
+        self.assertIn('echo "| Installer SHA-256 | \\`$SHA256\\` |"', summary)
+        self.assertIn('echo "| Version | $VERSION |"', summary)
+        self.assertIn('} >> "$GITHUB_STEP_SUMMARY"', summary)
 
 
 if __name__ == "__main__":
