@@ -117,6 +117,10 @@ impl ConfigSource for SharedConfigSource<'_> {
         }
     }
 
+    fn notice(&self) -> u8 {
+        crate::capture::recovery::heartbeat_notice(*self.shared.capture_block.lock())
+    }
+
     fn host_caps(&self) -> u16 {
         // `start_sender` numbers sent frames contiguously per epoch.
         let numbering = eternal_wire::v2::control::HOSTCAP_CONTIGUOUS_FRAME_SEQ;
@@ -1451,6 +1455,65 @@ mod tests {
             shared.force_next_idr.load(Ordering::SeqCst),
             "the resume IDR never reached the encoder"
         );
+    }
+
+    /// While the lock screen or a permission prompt keeps Windows from
+    /// letting capture work, every heartbeat tells the iPad the PC is locked.
+    /// Once capture works again, heartbeats say nothing more.
+    #[test]
+    fn heartbeats_say_the_pc_is_locked_while_a_secure_screen_blocks_capture() {
+        use crate::capture::recovery::{
+            note_capture_resumed, run_until_unblocked, CaptureBlock, CaptureUnavailable,
+        };
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.pairing.lock().required = false;
+        let now = Instant::now();
+        repairable_session(&shared, "127.0.0.1:50000".parse().unwrap(), now);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+        };
+        let notices = || {
+            let actions = shared.session.lock().tick(&config, true, now);
+            actions
+                .replies
+                .iter()
+                .filter_map(|(_, bytes)| match parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(heartbeat))) => Some(heartbeat.notice),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(notices(), [NOTICE_NONE]);
+        // Windows answers duplication with E_ACCESSDENIED until the user is
+        // back on the desktop.
+        let mut attempts = 0;
+        let mut while_blocked = Vec::new();
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(CaptureUnavailable {
+                        block: CaptureBlock::from_hresult(0x8007_0005_u32 as i32).unwrap(),
+                        detail: "Access is denied".into(),
+                    }
+                    .into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                while_blocked.extend(notices());
+                true
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(while_blocked, [NOTICE_PC_LOCKED, NOTICE_PC_LOCKED]);
+        note_capture_resumed(&shared);
+        assert_eq!(notices(), [NOTICE_NONE]);
     }
 
     /// A NACK of a session that ended for liveness, while another frame is

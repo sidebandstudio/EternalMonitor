@@ -176,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pairing = shared.pairing.lock();
         pairing.configure(persisted.require_pairing, auth_token);
         pairing.log_code();
-        pairing.warn_if_off();
+        pairing.log_if_off();
     }
     // Each Troubleshooting knob: an environment variable (developers, CI)
     // wins, then the saved setting, then Automatic.
