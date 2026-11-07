@@ -668,8 +668,8 @@ pub fn pin_result(
 /// back as UTF-8, the encoding the driver's own file has and every file this
 /// host writes. A UTF-16 document's `encoding="utf-16"` declaration becomes
 /// `utf-8` with it, so the declaration always names what is on disk. UTF-8
-/// keeps any byte order mark. Any other encoding is left alone, and the
-/// error says so.
+/// keeps any byte order mark. Any other encoding, UTF-32 included, is left
+/// alone, and the error says so.
 fn read_settings(path: &Path) -> io::Result<String> {
     decode_settings(&std::fs::read(path)?).ok_or_else(|| {
         io::Error::new(
@@ -680,6 +680,17 @@ fn read_settings(path: &Path) -> io::Result<String> {
 }
 
 fn decode_settings(bytes: &[u8]) -> Option<String> {
+    let text = decode_text(bytes)?;
+    // XML never holds NUL: text with one was read in the wrong encoding,
+    // such as UTF-32 without a byte order mark, which reads as UTF-8.
+    (!text.contains('\0')).then_some(text)
+}
+
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    // UTF-32's byte order marks; the little-endian one starts like UTF-16's.
+    if bytes.starts_with(&[0xFF, 0xFE, 0, 0]) || bytes.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        return None;
+    }
     let (units, big_endian): (&[u8], bool) = match bytes {
         [0xFF, 0xFE, rest @ ..] => (rest, false),
         [0xFE, 0xFF, rest @ ..] => (rest, true),
@@ -688,11 +699,11 @@ fn decode_settings(bytes: &[u8]) -> Option<String> {
         [0, b'<', 0, b'?', ..] => (bytes, true),
         _ => return String::from_utf8(bytes.to_vec()).ok(),
     };
-    if units.len() % 2 != 0 {
+    let (pairs, odd) = units.as_chunks::<2>();
+    if !odd.is_empty() {
         return None;
     }
-    let units = units.chunks_exact(2).map(|pair| {
-        let pair = [pair[0], pair[1]];
+    let units = pairs.iter().map(|&pair| {
         if big_endian {
             u16::from_be_bytes(pair)
         } else {
@@ -1688,6 +1699,55 @@ mod tests {
             assert_eq!(written.ok(), Some(PinOutcome::Named), "{name}");
             let text = std::fs::read_to_string(&path).expect(name);
             assert_eq!(text, render(&modes, Some(INTEL)), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: UTF-32's little-endian byte order mark starts like
+    /// UTF-16's. Read as UTF-16 it held NULs, did not parse, and a driver
+    /// Setup installed with a card to name had the whole file replaced.
+    #[test]
+    fn a_utf32_settings_file_is_left_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-32-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let utf32 = |big_endian: bool, bom: bool| -> Vec<u8> {
+            bom.then_some('\u{feff}')
+                .into_iter()
+                .chain(VENDOR.chars())
+                .flat_map(|c| {
+                    let c = c as u32;
+                    if big_endian {
+                        c.to_be_bytes()
+                    } else {
+                        c.to_le_bytes()
+                    }
+                })
+                .collect()
+        };
+        for (name, bytes) in [
+            ("utf-32 le, bom", utf32(false, true)),
+            ("utf-32 be, bom", utf32(true, true)),
+            ("utf-32 le, no bom", utf32(false, false)),
+            ("utf-32 be, no bom", utf32(true, false)),
+        ] {
+            for owned in [false, true] {
+                std::fs::write(&path, &bytes).unwrap();
+                let written = write_with_pin(&path, &record, owned, &default_modes(), Some(INTEL));
+                assert!(written.is_err(), "{name} owned={owned}");
+                assert!(
+                    apply_pin(&path, &record, owned, Some(INTEL)).is_err(),
+                    "{name}"
+                );
+                assert!(pin_gpu_in(&path, INTEL).is_err(), "{name}");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name} owned={owned}");
+                assert!(!record.exists(), "{name} owned={owned}");
+            }
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
