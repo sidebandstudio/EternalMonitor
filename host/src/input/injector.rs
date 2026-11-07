@@ -1062,7 +1062,7 @@ mod tests {
         harness.send(KIND_KEY, PHASE_BEGAN, 20_000);
         harness.injector.as_ref().unwrap().reset();
         harness.go.send(()).unwrap();
-        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert!(harness.thread.wait_idle(Duration::from_secs(5)));
         let calls = harness.calls.lock().clone();
         assert_eq!(
             calls.last(),
