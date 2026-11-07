@@ -211,25 +211,21 @@ fn a_restart_while_windows_holds_input_never_releases_the_new_generations_keys()
     stop(&shared, old);
     let new = start(&shared, port);
 
-    // The iPad, still in its session, presses A again on the new stream.
-    let pressed_again = ipad.event_id + 1;
-    let started = Instant::now();
-    while shared.transport_beat.read().is_none() || ipad.event_id < pressed_again {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the new loop starts"
-        );
-        if shared.transport_beat.read().is_some() {
-            ipad.press(KEY_A);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(300));
+    // The iPad, still in its session, presses A again on the new stream,
+    // and the press is queued while Windows still holds the old one's.
+    wait_until("the new loop starts", || {
+        shared.transport_beat.read().is_some()
+    });
+    let queued = shared.input.relays_queued();
+    ipad.press(KEY_A);
+    wait_until("the new press is queued", || {
+        shared.input.relays_queued() > queued
+    });
+    assert_eq!(hold::waiting(), 1, "Windows still holds the old input");
 
     // Windows answers again. Once everything queued has landed, A is down.
     hold::release();
     assert!(shared.input.finish(Duration::from_secs(5)));
-    std::thread::sleep(Duration::from_millis(200));
     let injected = recorder::take();
     assert_eq!(a_is_down(&injected), Some(true), "{injected:?}");
 

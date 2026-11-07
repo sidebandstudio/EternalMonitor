@@ -182,6 +182,10 @@ struct State {
     /// Releases that came while the queue was full, each now part of a
     /// release of everything.
     folded: u64,
+    /// Input events queued since the thread started, for tests that must
+    /// know one is behind another.
+    #[cfg(any(test, feature = "test-hooks"))]
+    relays_queued: u64,
 }
 
 /// What the transport's handles and the thread share.
@@ -232,6 +236,10 @@ impl Shared {
                 None => state.dropped += 1,
             }
             return;
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            state.relays_queued += u64::from(matches!(command, Command::Relay { .. }));
         }
         state.commands.push_back(Queued {
             generation,
@@ -286,6 +294,14 @@ impl InputThread {
         let thread = Self::default();
         let _ = thread.shared.set(spawn(limits, sink));
         thread
+    }
+
+    /// Input events queued so far, merged and dropped ones aside.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn relays_queued(&self) -> u64 {
+        self.shared
+            .get()
+            .map_or(0, |shared| shared.state.lock().relays_queued)
     }
 
     /// At quit: wait up to `limit` for what is queued, the last stream's
@@ -692,6 +708,21 @@ mod tests {
                 .relay(1, event(kind, phase, id), OUTPUT, false);
         }
 
+        /// Queued as though at `at`.
+        fn send_at(&self, kind: u8, phase: u8, id: u32, at: Instant) {
+            let injector = self.injector.as_ref().unwrap();
+            injector.shared.push(
+                injector.generation,
+                Command::Relay {
+                    session_id: 1,
+                    event: event(kind, phase, id),
+                    output: OUTPUT,
+                    late: false,
+                },
+                at,
+            );
+        }
+
         /// Holds Windows in the first event's call until `go`.
         fn stuck(&self) {
             self.send(KIND_KEY, PHASE_BEGAN, 0);
@@ -832,14 +863,16 @@ mod tests {
 
     #[test]
     fn input_that_waited_too_long_goes_as_late_and_releases_still_land() {
+        // A limit no pick-up under load comes near, and input queued as if
+        // long ago: no sleep decides which is late.
         let harness = harness(Limits {
-            stale_after: Duration::from_millis(50),
+            stale_after: Duration::from_secs(10),
             ..Limits::default()
         });
         harness.stuck();
-        harness.send(KIND_KEY, PHASE_ENDED, 1);
-        harness.send(KIND_MOUSE_ABS, PHASE_BEGAN, 2);
-        std::thread::sleep(Duration::from_millis(100));
+        let long_ago = Instant::now() - Duration::from_secs(20);
+        harness.send_at(KIND_KEY, PHASE_ENDED, 1, long_ago);
+        harness.send_at(KIND_MOUSE_ABS, PHASE_BEGAN, 2, long_ago);
         harness.go.send(()).unwrap();
         // Fresh input after Windows came back is not late.
         harness.wait_for(3);
