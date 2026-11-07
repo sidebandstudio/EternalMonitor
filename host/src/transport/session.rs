@@ -628,8 +628,7 @@ impl Session {
         self.handle(
             source,
             header.session_id,
-            Some(header.msg_seq),
-            Some(datagram_len),
+            Some((header.msg_seq, datagram_len)),
             message,
             config,
             now,
@@ -650,15 +649,15 @@ impl Session {
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
-        self.handle(source, header_session_id, None, None, message, config, now)
+        self.handle(source, header_session_id, None, message, config, now)
     }
 
     fn handle(
         &mut self,
         source: PeerId,
         header_session_id: u32,
-        msg_seq: Option<u32>,
-        datagram_len: Option<usize>,
+        // The datagram's msg_seq and size, when it came off a link.
+        datagram: Option<(u32, usize)>,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
@@ -681,13 +680,15 @@ impl Session {
         }
         match message {
             ControlMessage::Hello2(hello) => {
-                self.handle_hello(source, hello, datagram_len, config, now)
+                self.handle_hello(source, hello, datagram.map(|(_, len)| len), config, now)
             }
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
-            ControlMessage::InputEvent(event) => self.handle_input(source, event, msg_seq, now),
+            ControlMessage::InputEvent(event) => {
+                self.handle_input(source, event, datagram.map(|(seq, _)| seq), now)
+            }
             ControlMessage::Nack(nack) => self.handle_nack(source, nack, now),
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
