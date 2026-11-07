@@ -455,7 +455,7 @@ pub async fn start_sender(
                 // Held back until the client answers; the frames after it
                 // wait for the keyframe its answer asks for.
                 let wire_bytes = payload.len() + frag_count_usize * MEDIA_HEADER_SIZE;
-                if !shared.session.lock().may_send_media(session_id, wire_bytes) {
+                if !shared.session.lock().may_send_media(session_id, wire_bytes, now()) {
                     awaiting_keyframe = true;
                     continue;
                 }

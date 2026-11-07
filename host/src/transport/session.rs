@@ -69,6 +69,10 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// iPad pings the moment its HELLO_ACK lands, so it answers long before
 /// this runs out.
 pub const UNANSWERED_MEDIA_BUDGET: usize = 512 * 1024;
+/// Media to every client not yet heard counts against one host-wide budget
+/// of the same size, which comes back over [`UNANSWERED_FOR`]: a client
+/// that moves to another address, or many addresses in turn, get no more.
+///
 /// Addresses whose session ended before they answered, and for how long a
 /// new session there starts with its budget spent.
 const UNANSWERED_KEPT: usize = 64;
@@ -382,6 +386,9 @@ pub struct Session {
     /// Wi-Fi addresses whose session ended before they answered (see
     /// [`UNANSWERED_FOR`]).
     unanswered: std::collections::VecDeque<(std::net::IpAddr, Instant)>,
+    /// The host-wide media sent to clients before they answered, as of when
+    /// it was last counted (see [`UNANSWERED_MEDIA_BUDGET`]).
+    unanswered_media: (usize, Instant),
     /// Counts the sessions; each id is this count hashed with
     /// [`Self::session_id_keys`], so one id says nothing about the next.
     next_session_id: u32,
@@ -402,6 +409,7 @@ impl Session {
             refused: std::collections::VecDeque::new(),
             refusal_minute: None,
             unanswered: std::collections::VecDeque::new(),
+            unanswered_media: (0, Instant::now()),
             next_session_id: session_id_seed,
             session_id_keys: std::collections::hash_map::RandomState::new(),
             legacy_client_warned: false,
@@ -443,7 +451,8 @@ impl Session {
     /// it answers, frames go while they fit in its budget; the first that
     /// doesn't is held back, and so is every later one until it answers,
     /// which asks for a keyframe to start the picture again.
-    pub fn may_send_media(&mut self, session_id: u32, bytes: usize) -> bool {
+    pub fn may_send_media(&mut self, session_id: u32, bytes: usize, now: Instant) -> bool {
+        let host_spent = self.unanswered_media_at(now);
         let Some(session) = self
             .active
             .as_mut()
@@ -451,12 +460,25 @@ impl Session {
         else {
             return true;
         };
-        if session.withheld || session.unanswered_sent + bytes > UNANSWERED_MEDIA_BUDGET {
+        if session.withheld
+            || session.unanswered_sent + bytes > UNANSWERED_MEDIA_BUDGET
+            || host_spent + bytes > UNANSWERED_MEDIA_BUDGET
+        {
             session.withheld = true;
             return false;
         }
         session.unanswered_sent += bytes;
+        self.unanswered_media = (host_spent + bytes, now);
         true
+    }
+
+    /// The host-wide media to clients not yet heard that still counts at
+    /// `now`.
+    fn unanswered_media_at(&self, now: Instant) -> usize {
+        let (spent, at) = self.unanswered_media;
+        let back = UNANSWERED_MEDIA_BUDGET as u128 * now.saturating_duration_since(at).as_millis()
+            / UNANSWERED_FOR.as_millis();
+        spent.saturating_sub(usize::try_from(back).unwrap_or(usize::MAX))
     }
 
     /// Starts an update handoff. Atomic with admission: call with the session
@@ -891,6 +913,12 @@ impl Session {
             }
         }
 
+        // A session taken over before it was heard passes on what it spent.
+        let inherited = self
+            .active
+            .as_ref()
+            .filter(|session| !session.answered)
+            .map_or(0, |session| session.unanswered_sent);
         let silent_taken_over = self
             .active
             .as_ref()
@@ -912,7 +940,7 @@ impl Session {
             Some(addr) if self.unanswered.iter().any(|(ip, _)| *ip == addr.ip()) => {
                 UNANSWERED_MEDIA_BUDGET
             }
-            _ => 0,
+            _ => inherited,
         };
         crate::telemetry::note_client_device(&hello.device_name);
         info!(
@@ -3720,15 +3748,18 @@ mod tests {
         session.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
         let id = session.session_id().unwrap();
 
-        assert!(session.may_send_media(id, 300 * 1024), "the first keyframe");
-        assert!(session.may_send_media(id, UNANSWERED_MEDIA_BUDGET - 300 * 1024));
-        assert!(!session.may_send_media(id, 1), "the budget is spent");
+        assert!(
+            session.may_send_media(id, 300 * 1024, now),
+            "the first keyframe"
+        );
+        assert!(session.may_send_media(id, UNANSWERED_MEDIA_BUDGET - 300 * 1024, now));
+        assert!(!session.may_send_media(id, 1, now), "the budget is spent");
         let heartbeat = session.tick(&TestConfig, true, now + Duration::from_secs(1));
         assert_eq!(heartbeat.replies.len(), 1, "heartbeats go on");
 
         let answer = datagram(&mut session, ipad, id, ping(), now + Duration::from_secs(1));
         assert!(answer.force_idr, "a keyframe starts the picture again");
-        assert!(session.may_send_media(id, 4 * UNANSWERED_MEDIA_BUDGET));
+        assert!(session.may_send_media(id, 4 * UNANSWERED_MEDIA_BUDGET, now));
     }
 
     /// A frame that doesn't fit is held back, and so is every one after it
@@ -3741,10 +3772,10 @@ mod tests {
         let ipad = addr([10, 0, 0, 5], 50000);
         session.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
         let id = session.session_id().unwrap();
-        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1));
-        assert!(!session.may_send_media(id, 100));
+        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now));
+        assert!(!session.may_send_media(id, 100, now));
         datagram(&mut session, ipad, id, ping(), now);
-        assert!(session.may_send_media(id, 100));
+        assert!(session.may_send_media(id, 100, now));
     }
 
     /// Whatever the iPad sends first counts, and an answer before the
@@ -3776,17 +3807,17 @@ mod tests {
             datagram(&mut session, ipad, id, identified_hello(1, 77), now);
             datagram(&mut session, ipad, id.wrapping_add(1), ping(), now);
             datagram(&mut session, addr([10, 0, 0, 6], 50000), id, ping(), now);
-            assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1));
+            assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now));
             let heard = datagram(&mut session, ipad, id, answer.clone(), now);
             assert!(
-                session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1),
+                session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now),
                 "{answer:?}"
             );
 
             let mut early = Session::new(1234);
             early.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
             let id = early.session_id().unwrap();
-            assert!(early.may_send_media(id, 1000));
+            assert!(early.may_send_media(id, 1000, now));
             let heard_early = datagram(&mut early, ipad, id, answer.clone(), now);
             assert_eq!(
                 heard_early.force_idr,
@@ -3812,7 +3843,7 @@ mod tests {
         );
         let id = session.session_id().unwrap();
         assert_eq!(actions.new_target, Some(usb));
-        assert!(session.may_send_media(id, 10 * UNANSWERED_MEDIA_BUDGET));
+        assert!(session.may_send_media(id, 10 * UNANSWERED_MEDIA_BUDGET, Instant::now()));
     }
 
     /// A new session from an address whose last one ended before it was
@@ -3829,29 +3860,120 @@ mod tests {
         datagram(&mut session, ipad, 0, identified_hello(2, 77), at(100));
         let second = session.session_id().unwrap();
         assert_ne!(first, second);
-        assert!(!session.may_send_media(second, 1), "superseded unheard");
+        assert!(
+            !session.may_send_media(second, 1, at(100)),
+            "superseded unheard"
+        );
 
         let expired = session.tick(&TestConfig, false, at(3200));
         assert_eq!(expired.ended.unwrap().reason, EndReason::Liveness);
         datagram(&mut session, ipad, 0, identified_hello(3, 77), at(5000));
         let third = session.session_id().unwrap();
-        assert!(!session.may_send_media(third, 1), "expired unheard");
+        assert!(
+            !session.may_send_media(third, 1, at(5000)),
+            "expired unheard"
+        );
         session.tick(&TestConfig, false, at(8200));
         assert_eq!(session.last_end(), Some((third, EndReason::Liveness)));
 
         datagram(&mut session, ipad, 0, identified_hello(4, 77), at(68_000));
         let early = session.session_id().unwrap();
-        assert!(!session.may_send_media(early, 1), "not yet a minute");
+        assert!(
+            !session.may_send_media(early, 1, at(68_000)),
+            "not yet a minute"
+        );
         session.tick(&TestConfig, false, at(71_200));
 
         datagram(&mut session, ipad, 0, identified_hello(5, 77), at(132_000));
         let fresh = session.session_id().unwrap();
-        assert!(session.may_send_media(fresh, 1000), "a minute later");
+        assert!(
+            session.may_send_media(fresh, 1000, at(132_000)),
+            "a minute later"
+        );
 
         datagram(&mut session, ipad, fresh, ping(), at(132_010));
         datagram(&mut session, ipad, 0, identified_hello(6, 77), at(133_000));
         let reconnect = session.session_id().unwrap();
-        assert!(session.may_send_media(reconnect, 1000), "it was heard");
+        assert!(
+            session.may_send_media(reconnect, 1000, at(133_000)),
+            "it was heard"
+        );
+    }
+
+    /// A HELLO2 with the same device id from another address takes over a
+    /// session that was never heard, with what it already spent.
+    #[test]
+    fn an_address_change_with_the_same_device_id_brings_no_new_budget() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        datagram(
+            &mut session,
+            addr([10, 0, 0, 5], 50000),
+            0,
+            identified_hello(1, 77),
+            now,
+        );
+        let first = session.session_id().unwrap();
+        assert!(session.may_send_media(first, UNANSWERED_MEDIA_BUDGET, now));
+
+        let later = now + Duration::from_millis(50);
+        let moved = addr([10, 0, 0, 9], 50000);
+        let actions = datagram(&mut session, moved, 0, identified_hello(2, 77), later);
+        assert_eq!(actions.new_target, Some(moved));
+        let second = session.session_id().unwrap();
+        assert_ne!(first, second);
+        assert!(!session.may_send_media(second, 1, later));
+    }
+
+    /// Media to clients not yet heard counts against one host-wide budget,
+    /// whatever their address, which comes back over a minute. It still
+    /// holds once more addresses than the memory keeps have come and gone.
+    #[test]
+    fn the_host_budget_covers_every_address_even_with_the_memory_full() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let first = addr([10, 0, 0, 5], 50000);
+        datagram(&mut session, first, 0, identified_hello(1, 77), at(0));
+        let id = session.session_id().unwrap();
+        assert!(session.may_send_media(id, UNANSWERED_MEDIA_BUDGET, at(0)));
+        session.tick(&TestConfig, false, at(3200));
+        assert_eq!(session.last_end(), Some((id, EndReason::Liveness)));
+
+        // Every slot of the memory taken by other addresses.
+        for host in 0..UNANSWERED_KEPT as u8 {
+            let other = addr([10, 0, 1, host], 50000);
+            datagram(
+                &mut session,
+                other,
+                0,
+                identified_hello(10 + u32::from(host), 88),
+                at(4000 + u64::from(host)),
+            );
+        }
+        session.tick(&TestConfig, false, at(7200));
+        assert!(session.session_id().is_none());
+
+        datagram(&mut session, first, 0, identified_hello(2, 77), at(9000));
+        let back = session.session_id().unwrap();
+        assert!(!session.may_send_media(back, 200 * 1024, at(9000)));
+        session.tick(&TestConfig, false, at(12_200));
+
+        let fresh = addr([10, 0, 2, 1], 50000);
+        datagram(&mut session, fresh, 0, identified_hello(3, 99), at(13_000));
+        let other = session.session_id().unwrap();
+        assert!(
+            !session.may_send_media(other, 200 * 1024, at(13_000)),
+            "another address"
+        );
+        session.tick(&TestConfig, false, at(16_200));
+
+        datagram(&mut session, fresh, 0, identified_hello(4, 99), at(80_000));
+        let refilled = session.session_id().unwrap();
+        assert!(
+            session.may_send_media(refilled, UNANSWERED_MEDIA_BUDGET, at(80_000)),
+            "a minute after the last spend"
+        );
     }
 
     /// An iPad's HELLO2 as shipped since 0.3.0: the generic "iPad" name and
@@ -3978,7 +4100,7 @@ mod tests {
             (HelloStatus::Ok, "TEST-HOST")
         );
         datagram(&mut session, ipad, ack.session_id, ping(), now);
-        assert!(session.may_send_media(ack.session_id, 10 * UNANSWERED_MEDIA_BUDGET));
+        assert!(session.may_send_media(ack.session_id, 10 * UNANSWERED_MEDIA_BUDGET, now));
     }
 
     /// Each session's id is unrelated to the one before.
