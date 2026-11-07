@@ -239,4 +239,34 @@ final class StreamRecoveryTests: XCTestCase {
         let after = await Task.detached { host.keyframeRequests(within: 1) }.value
         XCTAssertEqual(after, [])
     }
+
+    /// Video arrives but no frame ever completes, as when every full-size
+    /// datagram is lost: 2 s on, the iPad logs the missing fragments and
+    /// asks for a fresh keyframe with reason Startup, which the PC logs,
+    /// besides the requests the dropped frames make.
+    func testAFirstFrameThatNeverCompletesAsksForAFreshKeyframe() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        let fragments = Task.detached {
+            for seq in UInt32(1)...80 where !Task.isCancelled {
+                host.sendFirstFragment(Data([0, 0, 0, 1, 0x65]), seq: seq)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        defer { fragments.cancel() }
+        let reasons = await Task.detached { host.keyframeRequests(within: 8) { $0 == .startup } }.value
+        XCTAssertEqual(reasons.last, .startup, "\(reasons)")
+        try await until("logged") {
+            manager.diagnostics.contains { $0.category == "assembly" && $0.message.hasPrefix(
+                "Video arrives but no frame completed in 2 s; asked the PC for a fresh keyframe: seq=") }
+        }
+        let logged = manager.diagnostics.first { $0.message.hasPrefix("Video arrives") }
+        XCTAssertEqual(logged?.level, .warning)
+        XCTAssertTrue(logged?.message.contains(" dropped with 1/2 fragments, missing 1") == true, logged?.message ?? "")
+        XCTAssertEqual(manager.state, .connecting)
+    }
 }

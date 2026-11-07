@@ -211,6 +211,18 @@ final class FakeUDPHost: @unchecked Sendable {
         timedKeyframeRequests(within: seconds, count: count).map(\.reason)
     }
 
+    /// The reasons of the keyframe requests received within `seconds`, up to
+    /// and including the first for which `last` is true.
+    func keyframeRequests(within seconds: Double, until last: (KeyframeReason) -> Bool) -> [KeyframeReason] {
+        var reasons: [KeyframeReason] = []
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !(reasons.last.map(last) ?? false) {
+            guard let (data, _, _) = receive() else { continue }
+            if case .keyframeRequest(let request) = Wire.parseControl(data)?.message { reasons.append(request.reason) }
+        }
+        return reasons
+    }
+
     /// The keyframe requests received within `seconds`, with when each came,
     /// or the first `count` of them as soon as they have come.
     func timedKeyframeRequests(within seconds: Double, count: Int = .max) -> [(reason: KeyframeReason, at: Date)] {

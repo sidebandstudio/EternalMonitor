@@ -22,6 +22,9 @@ enum ConnectionProblem: Equatable {
     /// usually the router.
     case routerAddress
     case noNetwork
+    /// iPadOS called the path unsatisfied for want of any usable network:
+    /// Wi-Fi is off, or joined to no network.
+    case wifiOff
     case localNetworkBlocked
     case couldNotConnect
     /// The cable connection failed after it had opened.
@@ -111,6 +114,7 @@ enum ConnectionProblem: Equatable {
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
         case .noNetwork: return "This iPad isn't connected to a network"
+        case .wifiOff: return "Wi-Fi is off"
         case .localNetworkBlocked: return "Local Network is turned off for EternalMonitor"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
@@ -156,7 +160,7 @@ enum ConnectionProblem: Equatable {
         case .routerAddress:
             return "Addresses ending in .1 usually belong to the Wi-Fi router. Type the Address shown in the "
                 + "EternalMonitor window on the PC, for example 192.168.1.20."
-        case .noNetwork:
+        case .noNetwork, .wifiOff:
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
             return "iPadOS is stopping this app from reaching your PC over Wi-Fi. "
@@ -261,7 +265,7 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
+        case .localNetworkBlocked, .noNetwork, .wifiOff, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
              .pcEndedSessionOnError, .pcUpdating:
             return lastAttempt ?? .reconnectFailed
         default:
@@ -309,6 +313,7 @@ enum ConnectionProblem: Equatable {
         // The cable is a local tunnel: Wi-Fi, DNS and Local Network don't apply.
         if isUSB { return .usbFailed }
         if error.kind == .localNetworkDenied { return .localNetworkBlocked }
+        if error.pathUnsatisfied { return .wifiOff }
         if let nw = error.underlying as? NWError {
             switch nw {
             case .dns(let code):
@@ -408,9 +413,17 @@ struct NoPictureStreak: Equatable {
 
 /// What the USB cable card says for each listener status.
 enum USBStatusText {
-    static func describe(_ status: String) -> String {
+    /// `appleDevicesUnreachable`: when this iPad last connected, the PC
+    /// couldn't reach Apple's USB service. That was one sample, and a host
+    /// may leave the capability out for other reasons, so the card gives
+    /// it as what happened and what to try, not as the current state.
+    static func describe(_ status: String, appleDevicesUnreachable: Bool = false) -> String {
         switch status {
         case "USB: off": return L("Off. Turn on to connect with a cable.")
+        case "USB: waiting for a cable" where appleDevicesUnreachable:
+            // A problem: stays English, like the other problem text.
+            return "Last time this iPad connected, your PC couldn't reach Apple Devices. If the cable doesn't connect, "
+                + "open Apple Devices on the PC, or install it from the Microsoft Store. Wi-Fi still works."
         case "USB: waiting for a cable": return L("Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         case "USB: disconnected": return L("Paused. Tap Connect USB to use the cable again.")
         case "USB: connecting": return L("Connecting over the cable…")

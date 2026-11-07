@@ -27,6 +27,9 @@ enum AttemptEnd: Equatable {
     case closedBeforePicture
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
+    /// iPadOS found no usable network for the path: Wi-Fi is off or
+    /// joined to none (`ConnectionProblem.wifiOff`).
+    case noNetwork
     /// No answer at the saved address, and Bonjour found the same PC at
     /// another: a new attempt goes there.
     case pcMoved
@@ -110,6 +113,7 @@ struct SessionSummary: Equatable {
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
+        case .noNetwork: return "no_network"
         case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
         default: return "none"
         }
