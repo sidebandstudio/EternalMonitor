@@ -58,8 +58,17 @@ jobs:
             cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30
             echo "::endgroup::"
           done
-      - name: Upload crash artifacts
+      - name: Check the crash artifacts for secret values
+        id: artifact-scan
         if: failure()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/artifact_secrets.py scan
+          --secrets GITHUB_TOKEN
+          proto/fuzz/artifacts
+      - name: Upload crash artifacts
+        if: failure() && steps.artifact-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: proto-fuzz-artifacts
