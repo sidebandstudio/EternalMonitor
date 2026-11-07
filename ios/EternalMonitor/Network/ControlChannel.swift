@@ -254,6 +254,12 @@ final class ControlChannel {
         helloTimer = nil
 
         if ack.status.pcNotStreaming {
+            // The nonce outlives the wait, so a late or reordered copy can
+            // come after the OK. The session is up: it means nothing now.
+            guard sessionId == 0 else {
+                onDiagnostic?("Ignored a late HELLO_ACK (\(ack.status)) for a session already established")
+                return
+            }
             // Same nonce: the PC answers this HELLO2 with a session once it streams.
             if !waitingForStream { onDiagnostic?("PC answered that it isn't streaming (\(ack.status))") }
             waitingForStream = true

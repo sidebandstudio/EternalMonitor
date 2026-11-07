@@ -95,6 +95,11 @@ final class FakeUDPHost: @unchecked Sendable {
         }
     }
 
+    /// A HELLO_ACK for `nonce`, sent again late, as Wi-Fi can reorder it.
+    func sendAck(nonce: UInt32, status: HelloStatus) {
+        send(Self.ack(nonce: nonce, status: status))
+    }
+
     /// Ends session 41 from the PC's side.
     func sendBye(_ reason: ByeReason) {
         send(Wire.encodeControl(sessionId: 41, msgSeq: 2, message: .bye(reason)))

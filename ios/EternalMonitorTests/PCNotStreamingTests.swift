@@ -132,6 +132,30 @@ final class PCNotStreamingTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 
+    /// The attempt keeps its nonce while it waits, so a Restarting answer
+    /// can arrive after the OK (Wi-Fi reordered it, or a late copy). Once the
+    /// session is up, it changes nothing: no card, no new timeout.
+    func testARestartingAnswerAfterTheSessionStartedIsIgnored() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager(timing: timing)
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let waiting = await Task.detached { host.acceptSession(status: .restarting) }.value
+        XCTAssertTrue(waiting)
+        try await until("waiting") { manager.problem == .pcNotStreaming(.restarting) }
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted)
+        try await until("handshake") { manager.hostInfo != nil }
+        XCTAssertNil(manager.problem)
+
+        host.sendAck(nonce: host.lastNonce, status: .restarting)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertNil(manager.problem, "a late Restarting answer brought the card back")
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        XCTAssertNil(manager.problem)
+    }
+
     func testCancelWhileWaitingClearsTheMessage() async throws {
         let host = FakeUDPHost()
         let manager = ConnectionManager(timing: timing)
