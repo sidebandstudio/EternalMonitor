@@ -875,27 +875,43 @@ fn wait_for_real<D: Displays>(displays: &mut D) -> Option<Layout<D::Saved>> {
 static GUARD: parking_lot::Mutex<Guard<windows_impl::Saved>> =
     parking_lot::Mutex::new(Guard::new());
 
-/// Run a driver change for `owner`'s display with the guard around it.
-/// `log` writes one line; `display_off` says the driver tasks know the
-/// display is off; `cleanup`, that nothing streams the display after this
-/// turn off; `done` tells a change that succeeded. A turn off that
-/// would leave the PC with no screen does not run: `kept_on` is its result.
+/// One driver change, for [`around`].
+#[cfg(windows)]
+pub(crate) struct Change {
+    /// A turn on, else a turn off.
+    pub enabled: bool,
+    /// The host whose display it is.
+    pub owner: crate::startup::ProcessId,
+    /// Writes one line.
+    pub log: fn(bool, &str),
+    /// The driver tasks know the display is off.
+    pub display_off: bool,
+    /// Nothing streams the display after this turn off.
+    pub cleanup: bool,
+}
+
+/// Run `change` with the guard around it: `run` makes it, `done` tells one
+/// that succeeded. A turn off that would leave the PC with no screen does
+/// not run: `kept_on` is its result.
 #[cfg(windows)]
 pub(crate) fn around<T>(
-    enabled: bool,
-    owner: crate::startup::ProcessId,
-    log: fn(bool, &str),
-    display_off: bool,
-    cleanup: bool,
-    change: impl FnOnce() -> T,
+    change: Change,
+    run: impl FnOnce() -> T,
     done: impl FnOnce(&T) -> bool,
     kept_on: impl FnOnce() -> T,
 ) -> T {
+    let Change {
+        enabled,
+        owner,
+        log,
+        display_off,
+        cleanup,
+    } = change;
     let mut displays = windows_impl::Windows::new(owner, log, cleanup);
     if !GUARD.lock().before(enabled, display_off, &mut displays) {
         return kept_on();
     }
-    let result = change();
+    let result = run();
     let done = done(&result);
     GUARD.lock().after(enabled, done, &mut displays);
     result
