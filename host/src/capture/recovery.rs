@@ -209,7 +209,17 @@ pub enum LossStep {
 /// has worked this long. A UAC prompt, the lock screen or a full-screen game
 /// can take the desktop again right after it returns; starting the ladder
 /// over at each return re-created the duplication at full speed in a loop.
-pub const LOSS_LADDER_RESET: Duration = Duration::from_secs(5);
+/// It was 5 s, and on a PC whose desktop was taken again every 1 to 4 s the
+/// ladder never came down from 2 s: each loss cost 2 s without a picture,
+/// and the iPad got 3 to 17 fps for an hour. A duplication that worked for
+/// a quarter of a second is re-created at once, so a steady stream of quick
+/// losses costs tens of milliseconds each, and re-creations still stay
+/// under four a second.
+pub const LOSS_LADDER_RESET: Duration = Duration::from_millis(250);
+
+/// A loss that is back within this long is routine (the lock screen, a UAC
+/// prompt, a mode change) and is logged at info; a longer one is a warning.
+pub const LOSS_QUIET: Duration = Duration::from_secs(1);
 
 /// One loss episode lasts from the first ACCESS_LOST until a frame or an idle
 /// timeout proves the new duplication works.
@@ -223,11 +233,25 @@ pub struct LossRecovery {
     step: usize,
     /// When the last episode ended, while `step` is kept.
     back_at: Option<Instant>,
+    /// This episode outlasted [`LOSS_QUIET`] and said so.
+    overdue: bool,
 }
 
 impl LossRecovery {
     pub fn in_episode(&self) -> bool {
         self.since.is_some()
+    }
+
+    /// True once per episode, when it has lasted [`LOSS_QUIET`].
+    pub fn overdue(&mut self, now: Instant) -> bool {
+        let Some(since) = self.since else {
+            return false;
+        };
+        if self.overdue || now.duration_since(since) < LOSS_QUIET {
+            return false;
+        }
+        self.overdue = true;
+        true
     }
 
     pub fn lost(&mut self, now: Instant) -> LossStep {
@@ -262,6 +286,7 @@ impl LossRecovery {
             return None;
         };
         self.back_at = Some(now);
+        self.overdue = false;
         let losses = std::mem::take(&mut self.losses);
         Some((losses, now.duration_since(since)))
     }
@@ -291,6 +316,14 @@ impl BlockedRetry {
         let index = (self.attempts as usize).min(BLOCKED_RETRY_MS.len() - 1);
         self.attempts += 1;
         (Duration::from_millis(BLOCKED_RETRY_MS[index]), changed)
+    }
+
+    /// Capture worked since the last blocked attempt. The next block is
+    /// retried at the quick pace again but is not logged again when it is
+    /// the same state: the pace climbed over a whole app run, and a PC
+    /// locked for the fourth time waited up to 5 s after it was unlocked.
+    pub fn resumed(&mut self) {
+        self.attempts = 0;
     }
 }
 
@@ -341,10 +374,21 @@ pub fn run_until_unblocked(
             continue;
         }
         stalled = 0;
+        #[cfg(windows)]
+        let error = access_lost_is_blocked(error);
         let Some(unavailable) = error.downcast_ref::<CaptureUnavailable>() else {
             return Err(error);
         };
-        *shared.capture_block.lock() = Some(unavailable.block);
+        // The first working frame clears the block (see
+        // [`note_capture_resumed`]).
+        if shared
+            .capture_block
+            .lock()
+            .replace(unavailable.block)
+            .is_none()
+        {
+            retry.resumed();
+        }
         let (delay, changed) = retry.blocked(unavailable.block);
         if changed {
             warn!(
@@ -359,14 +403,32 @@ pub fn run_until_unblocked(
     }
 }
 
+/// DXGI_ERROR_ACCESS_LOST that left the capture loop instead of reaching its
+/// handler: a display change the stage waits out, never a pipeline failure.
+/// The loop hands ACCESS_LOST from every call it knows to its handler; this
+/// is for any call it does not.
+#[cfg(windows)]
+fn access_lost_is_blocked(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match error.downcast_ref::<windows::core::Error>() {
+        Some(lost) if lost.code().0 as u32 == 0x887A_0026 => Box::new(CaptureUnavailable {
+            block: CaptureBlock::DisplayChanging,
+            detail: format!("desktop duplication lost outside its handler: {lost}"),
+        }),
+        _ => error,
+    }
+}
+
 /// The heartbeat's notice while capture is blocked. A secure screen says the
-/// PC is locked, so the iPad doesn't show a frozen picture without a word; it
-/// clears with the block when capture works again. The other blocks keep the
-/// held picture as before.
+/// PC is locked, and no display attached says so, so the iPad doesn't show a
+/// frozen picture without a word; it clears with the block when capture
+/// works again. The other blocks keep the held picture as before.
 pub fn heartbeat_notice(block: Option<CaptureBlock>) -> u8 {
-    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED};
     match block {
         Some(CaptureBlock::SecureDesktop) => NOTICE_PC_LOCKED,
+        Some(CaptureBlock::NoDisplay) => NOTICE_NO_DISPLAY,
         _ => NOTICE_NONE,
     }
 }
@@ -492,16 +554,21 @@ mod tests {
     }
 
     #[test]
-    fn only_a_secure_screen_tells_the_ipad_the_pc_is_locked() {
-        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+    fn only_a_secure_screen_or_no_display_has_a_notice_for_the_ipad() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED};
         assert_eq!(
             heartbeat_notice(Some(CaptureBlock::SecureDesktop)),
             NOTICE_PC_LOCKED
         );
+        // A closed lid or screens that are off: the field's PCs showed a
+        // frozen picture without a word until a display came back.
+        assert_eq!(
+            heartbeat_notice(Some(CaptureBlock::NoDisplay)),
+            NOTICE_NO_DISPLAY
+        );
         assert_eq!(heartbeat_notice(None), NOTICE_NONE);
         for block in [
             CaptureBlock::DisplayChanging,
-            CaptureBlock::NoDisplay,
             CaptureBlock::UnsupportedOnThisGpu,
             CaptureBlock::TooManyCaptureApps,
             CaptureBlock::SessionDisconnected,
@@ -635,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_frame_ends_the_episode_and_five_healthy_seconds_reset_the_ladder() {
+    fn a_working_frame_ends_the_episode_and_a_healthy_quarter_second_resets_the_ladder() {
         let ms = Duration::from_millis;
         let mut recovery = LossRecovery::default();
         let start = Instant::now();
@@ -645,7 +712,8 @@ mod tests {
         let ended = recovery.healthy(start + ms(300));
         assert_eq!(ended, Some((2, ms(300))));
         assert!(!recovery.in_episode());
-        // Frames keep coming for 5 s: the next loss is retried at once.
+        // Frames keep coming for a quarter of a second: the next loss is
+        // retried at once.
         let mut now = start + ms(300);
         while now < start + ms(300) + LOSS_LADDER_RESET {
             now += ms(16);
@@ -661,8 +729,8 @@ mod tests {
 
     /// A UAC prompt or a full-screen game takes the desktop again right after
     /// each return. The first retry is as quick as before; the returns that
-    /// follow within 5 s keep climbing the ladder instead of starting over
-    /// at 0 ms each time.
+    /// follow within a quarter of a second keep climbing the ladder instead of
+    /// starting over at 0 ms each time.
     #[test]
     fn a_duplication_lost_again_soon_after_it_returned_keeps_its_backoff() {
         let ms = Duration::from_millis;
@@ -670,35 +738,139 @@ mod tests {
         let start = Instant::now();
         let mut now = start;
         let mut delays = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..10 {
             let LossStep::Retry(delay) = recovery.lost(now) else {
                 panic!("gave up")
             };
             delays.push(delay.as_millis() as u64);
-            // The new duplication works for a second, then is lost again.
+            // The new duplication works for 200 ms, then is lost again.
             now += delay + ms(1);
             assert!(
                 recovery.healthy(now).is_some(),
                 "each loss is its own episode"
             );
-            now += ms(1_000);
+            now += ms(200);
             assert_eq!(recovery.healthy(now), None);
         }
-        assert_eq!(delays, [0, 100, 250, 500, 1000, 2000, 2000]);
-        // The last return was a second ago. Four healthy seconds are not
-        // enough; five are.
-        let back = now - ms(1_000);
-        assert_eq!(recovery.healthy(back + ms(4_000)), None);
-        assert_eq!(recovery.lost(back + ms(4_000)), LossStep::Retry(ms(2000)));
-        recovery.healthy(back + ms(6_000));
-        assert_eq!(recovery.healthy(back + ms(11_000)), None);
         assert_eq!(
-            recovery.lost(back + ms(11_000)),
+            delays,
+            [0, 100, 250, 500, 1000, 2000, 2000, 2000, 2000, 2000]
+        );
+        // The last return was 200 ms ago. 240 healthy ms are not enough;
+        // 250 are.
+        let back = now - ms(200);
+        assert_eq!(recovery.healthy(back + ms(240)), None);
+        assert_eq!(recovery.lost(back + ms(240)), LossStep::Retry(ms(2000)));
+        recovery.healthy(back + ms(2_300));
+        assert_eq!(recovery.healthy(back + ms(2_550)), None);
+        assert_eq!(
+            recovery.lost(back + ms(2_550)),
             LossStep::Retry(Duration::ZERO)
         );
         // Each return still ends its episode: the give-up window measures
         // one outage, not the whole loop.
         assert!(now.duration_since(start) > LOSS_GIVE_UP);
+    }
+
+    /// The field's looping PC (0.3.4): the desktop was taken again 1 to 4 s
+    /// after each return, for about an hour. With the ladder held for 5 s
+    /// every retry waited 2 s, and the iPad got 3 to 17 fps. A duplication
+    /// that worked for a quarter of a second is re-created at once.
+    #[test]
+    fn a_desktop_taken_every_few_seconds_is_retried_at_once() {
+        let ms = Duration::from_millis;
+        // How long each re-created duplication worked, from that PC's log,
+        // and two quicker losses.
+        let lives = [3006, 1789, 650, 1227, 2008, 300, 2260, 1005].map(ms);
+        let mut recovery = LossRecovery::default();
+        let start = Instant::now();
+        let mut now = start;
+        let mut without_picture = Duration::ZERO;
+        let mut losses = 0;
+        while now < start + Duration::from_secs(60) {
+            let LossStep::Retry(delay) = recovery.lost(now) else {
+                panic!("gave up")
+            };
+            losses += 1;
+            assert_eq!(delay, Duration::ZERO, "loss {losses} waited");
+            without_picture += delay;
+            now += delay;
+            assert!(recovery.healthy(now).is_some());
+            now += lives[losses % lives.len()];
+        }
+        assert!(
+            without_picture < ms(100),
+            "{without_picture:?} without a picture in a minute"
+        );
+        // Still never a spin: at most four re-creations a second.
+        assert!(losses <= 240, "{losses} re-creations in a minute");
+    }
+
+    /// ACCESS_LOST from a call the capture loop does not hand to its handler
+    /// (on 0.3.4, ReleaseFrame after an acquire: "Capture loop exited with
+    /// error" seven times in an hour, each a pipeline restart). The stage
+    /// waits it out like any display change, however often it comes.
+    #[cfg(windows)]
+    #[test]
+    fn access_lost_that_leaves_the_capture_loop_never_fails_the_stage() {
+        let shared = SharedControl::new(0, 1);
+        let mut attempts = 0;
+        let mut blocks = Vec::new();
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts <= 7 {
+                    Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                        0x887A_0026_u32 as i32,
+                    ))
+                    .into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                blocks.push(*shared.capture_block.lock());
+                true
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts, 8);
+        assert_eq!(blocks, [Some(CaptureBlock::DisplayChanging); 7]);
+        // Other Windows errors still reach the supervisor.
+        let failed = run_until_unblocked(
+            &shared,
+            |_| {
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x887A_0005_u32 as i32,
+                ))
+                .into())
+            },
+            |_| panic!("a removed device was retried in the stage"),
+        );
+        assert!(failed.is_err());
+    }
+
+    #[test]
+    fn only_a_loss_not_back_within_a_second_is_a_warning() {
+        let ms = Duration::from_millis;
+        let mut recovery = LossRecovery::default();
+        let start = Instant::now();
+        assert!(!recovery.overdue(start), "no episode yet");
+        recovery.lost(start);
+        assert!(!recovery.overdue(start + ms(999)));
+        recovery.lost(start + ms(500));
+        assert!(recovery.overdue(start + LOSS_QUIET));
+        assert!(!recovery.overdue(start + ms(5_000)), "said once");
+        recovery.healthy(start + ms(5_000));
+        // The next episode is judged on its own.
+        let next = start + ms(9_000);
+        recovery.lost(next);
+        assert!(recovery.healthy(next + ms(300)).is_some());
+        assert!(!recovery.overdue(next + ms(2_000)));
+        recovery.lost(next + ms(3_000));
+        assert!(!recovery.overdue(next + ms(3_999)));
+        assert!(recovery.overdue(next + ms(4_000)));
     }
 
     /// Review r1 of #141: "No display is on" told a desktop PC to open the
@@ -1034,6 +1206,40 @@ mod tests {
             |_| false,
         );
         assert!(result.is_ok(), "a stopped generation exits cleanly");
+    }
+
+    /// The lock screen, four times in one app run. Each unlock is retried
+    /// as quickly as the first, not 5 s later.
+    #[test]
+    fn a_block_after_capture_worked_again_is_retried_at_the_quick_pace() {
+        let shared = SharedControl::new(0, 1);
+        let attempts = RefCell::new(0);
+        let waits = RefCell::new(Vec::new());
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                *attempts.borrow_mut() += 1;
+                let attempt = *attempts.borrow();
+                if attempt > 12 {
+                    return Ok(());
+                }
+                // Three blocked attempts, then the user unlocks and capture
+                // works until the next lock.
+                if attempt % 3 == 0 {
+                    note_capture_resumed(&shared);
+                }
+                Err(blocked(CaptureBlock::SecureDesktop))
+            },
+            |delay| {
+                waits.borrow_mut().push(delay.as_millis());
+                true
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            *waits.borrow(),
+            [500, 1000, 500, 1000, 2000, 500, 1000, 2000, 500, 1000, 2000, 500]
+        );
     }
 
     #[test]

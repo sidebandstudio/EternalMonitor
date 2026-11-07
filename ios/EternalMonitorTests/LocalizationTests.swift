@@ -24,6 +24,7 @@ final class LocalizationTests: XCTestCase {
     /// then every language shows them in English.
     private let awaitingTranslation: Set<String> = [
         "Your PC is locked. Unlock it to continue.",
+        "Your PC has no active display. Turn on a screen to continue.",
     ]
 
     /// Every language has exactly English's strings, none empty, each with

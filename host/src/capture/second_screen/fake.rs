@@ -156,6 +156,7 @@ impl Driver for FakeDisplay {
             top: 0,
             is_primary: primary,
             adapter_name: APP_GPU.to_string(),
+            adapter_id: APP_CARD,
         };
         let mut outputs = vec![output("primary", true)];
         if attached {

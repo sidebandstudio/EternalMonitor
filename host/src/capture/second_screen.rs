@@ -1816,6 +1816,7 @@ mod tests {
             top: 0,
             is_primary: primary,
             adapter_name: "Test GPU".to_string(),
+            adapter_id: (0, 1),
         }
     }
 

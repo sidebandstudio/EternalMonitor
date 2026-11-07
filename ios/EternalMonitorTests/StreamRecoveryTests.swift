@@ -109,6 +109,30 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.pcLocked, "the next session starts without it")
     }
 
+    /// A closed lid or screens that are off leave the PC nothing to
+    /// capture. Its heartbeats say so, and the iPad says so over the held
+    /// picture, still connected, until a display comes back.
+    func testAPCWithNoDisplayIsShownOverTheHeldPictureUntilOneComesBack() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        XCTAssertFalse(manager.pcNoDisplay)
+        host.sendHeartbeat(notice: Heartbeat.noticeNoDisplay)
+        try await until("the PC says it has no display") { manager.pcNoDisplay }
+        XCTAssertEqual(manager.state, .connected)
+        XCTAssertFalse(manager.pcLocked)
+        // Unlocking a PC that still has no display doesn't say it is locked.
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("locked instead") { manager.pcLocked && !manager.pcNoDisplay }
+        host.sendHeartbeat(notice: Heartbeat.noticeNoDisplay)
+        try await until("no display again") { manager.pcNoDisplay && !manager.pcLocked }
+        host.sendHeartbeat()
+        try await until("a display is back") { !manager.pcNoDisplay }
+        host.sendHeartbeat(notice: Heartbeat.noticeNoDisplay)
+        try await until("no display again") { manager.pcNoDisplay }
+        manager.cancel()
+        XCTAssertFalse(manager.pcNoDisplay, "the next session starts without it")
+    }
+
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {
         // The PC reopened its encoder and its new keyframe (seq 2) was lost;
         // the new encoder's first P-frame continues the codec's count. A PC

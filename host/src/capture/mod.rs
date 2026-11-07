@@ -222,6 +222,9 @@ pub struct OutputInfo {
     pub top: i32,
     pub is_primary: bool,
     pub adapter_name: String,
+    /// The adapter's LUID. Ordinals change when an adapter comes or goes;
+    /// the LUID stays until the adapter is restarted.
+    pub adapter_id: crate::gpu_preference::AdapterId,
 }
 
 /// Enumerate every desktop-attached display output. Windows-only in substance;
@@ -268,6 +271,24 @@ pub(crate) fn resolve_target(
             }
         },
     }
+}
+
+/// After the duplication was lost: whether `target` now resolves to another
+/// output than `current`, the one being duplicated, by device name and
+/// adapter LUID. A display unplugged or back, a dock or a driver restart
+/// also surface as a lost duplication. Re-creating it on the same output
+/// kept capturing the primary display after the chosen one came back, or an
+/// output of an adapter that had gone; the stage opens the target afresh.
+#[cfg(any(windows, test))]
+pub(crate) fn target_moved(
+    outputs: &[OutputInfo],
+    target: &crate::control::CaptureTarget,
+    current: &OutputInfo,
+) -> bool {
+    resolve_target(outputs, target).is_none_or(|index| {
+        let output = &outputs[index];
+        output.device_name != current.device_name || output.adapter_id != current.adapter_id
+    })
 }
 
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
@@ -787,6 +808,44 @@ pub(crate) fn reconcile_virtual_display(
     }
 }
 
+/// What a static display's capture has to show. Sending the cached picture
+/// again keeps the viewer's stream alive while the desktop changes nothing.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+pub(crate) struct Picture {
+    /// The current duplication has delivered an image: the first frames of a
+    /// new one carry none (see [`frame_has_image`]).
+    pub seen_image: bool,
+    /// The cached picture is a real image, not the black start frame.
+    real: bool,
+}
+
+#[cfg(any(windows, test))]
+impl Picture {
+    /// An image was read back into the cache.
+    pub fn cached(&mut self) {
+        self.real = true;
+    }
+
+    /// The lost duplication was re-created. The cached picture is still the
+    /// screen's: a static second screen shows nothing new after a lock screen
+    /// or a UAC prompt, and while keepalives waited for a new image the
+    /// watchdog restarted the pipeline under the viewer ("no captured frame
+    /// for 5039ms with a client connected").
+    pub fn recreated(&mut self) {
+        self.seen_image = false;
+    }
+
+    /// The resolution changed: the cache is a black frame of the new size.
+    pub fn resized(&mut self) {
+        self.real = false;
+    }
+
+    pub fn real(&self) -> bool {
+        self.real
+    }
+}
+
 /// Whether an idle keepalive may resend the last frame. Before the second
 /// screen has delivered an image, that frame is the black placeholder:
 /// sending it would replace the iPad's mirror with black, so the switch
@@ -838,7 +897,6 @@ pub(crate) fn read_back_image<T, E>(
 pub fn run_capture_stage(
     slot: FrameSlot,
     shared: SharedControl,
-    adapter_index: u32,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct CloseOnExit(FrameSlot);
@@ -851,13 +909,7 @@ pub fn run_capture_stage(
     let result = recovery::run_until_unblocked(
         &shared,
         |frame_number| {
-            let result = run_platform_loop(
-                &guard.0,
-                shared.clone(),
-                adapter_index,
-                generation,
-                frame_number,
-            );
+            let result = run_platform_loop(&guard.0, shared.clone(), generation, frame_number);
             if let Err(error) = &result {
                 if recovery::passing_error(error.as_ref()) {
                     second_screen::note_interruption(&shared, generation);
@@ -868,7 +920,7 @@ pub fn run_capture_stage(
             }
             result
         },
-        |delay| wait_while_blocked(&shared, generation, delay),
+        |delay| wait_while_blocked(&shared, generation, delay, display_attached),
     );
     if let Err(ref e) = result {
         error!(error = %e, "Capture loop exited with error");
@@ -876,11 +928,34 @@ pub fn run_capture_stage(
     result
 }
 
+/// While no display is on, how often the wait looks for one to come back.
+const DISPLAY_LOOK: Duration = Duration::from_millis(250);
+
+/// Whether Windows lists a display attached to the desktop again.
+#[cfg(windows)]
+fn display_attached() -> bool {
+    dxgi::display_attached()
+}
+
+#[cfg(not(windows))]
+fn display_attached() -> bool {
+    false
+}
+
 /// Sleeps between blocked-capture retries. The watchdog has nothing to fix
 /// while Windows withholds the desktop, so the stage keeps its heartbeats.
-fn wait_while_blocked(shared: &SharedControl, generation: u64, delay: Duration) -> bool {
+/// While no display is on, `display_back` is asked every [`DISPLAY_LOOK`]
+/// and a display that came back ends the wait: the retries settle 5 s
+/// apart, and the picture came back up to 5 s after the screen did.
+fn wait_while_blocked(
+    shared: &SharedControl,
+    generation: u64,
+    delay: Duration,
+    mut display_back: impl FnMut() -> bool,
+) -> bool {
     use std::sync::atomic::Ordering;
     let deadline = Instant::now() + delay;
+    let mut next_look = Instant::now() + DISPLAY_LOOK;
     loop {
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
@@ -891,6 +966,14 @@ fn wait_while_blocked(shared: &SharedControl, generation: u64, delay: Duration) 
         let now = Instant::now();
         if now >= deadline {
             return true;
+        }
+        if now >= next_look {
+            next_look = now + DISPLAY_LOOK;
+            if *shared.capture_block.lock() == Some(recovery::CaptureBlock::NoDisplay)
+                && display_back()
+            {
+                return true;
+            }
         }
         std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
     }
@@ -934,14 +1017,13 @@ pub(crate) fn synthetic_requested() -> bool {
 fn run_platform_loop(
     slot: &FrameSlot,
     shared: SharedControl,
-    adapter_index: u32,
     generation: u64,
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if synthetic_requested() {
         synthetic::run_capture_loop(slot, shared, generation, frame_number)
     } else {
-        dxgi::run_capture_loop(slot, shared, adapter_index, generation, frame_number)
+        dxgi::run_capture_loop(slot, shared, generation, frame_number)
     }
 }
 
@@ -949,7 +1031,6 @@ fn run_platform_loop(
 fn run_platform_loop(
     slot: &FrameSlot,
     shared: SharedControl,
-    _adapter_index: u32,
     generation: u64,
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1436,7 +1517,126 @@ mod tests {
             top,
             is_primary: left == 0 && top == 0,
             adapter_name: "Test GPU".to_string(),
+            adapter_id: (0, 1),
         }
+    }
+
+    /// A lost duplication after a display was unplugged or plugged back in,
+    /// or after its adapter restarted, is opened afresh from the stage.
+    #[test]
+    fn a_lost_duplication_reopens_when_the_target_moved() {
+        let (one, two) = (r"\\.\DISPLAY1", r"\\.\DISPLAY2");
+        let both = vec![out(one, 0, 0), out(two, 1920, 0)];
+        let chosen = CaptureTarget::Output(two.to_string());
+        // A UAC prompt or a mode change: same output, same adapter.
+        assert!(!target_moved(&both, &chosen, &both[1]));
+        assert!(!target_moved(&both, &CaptureTarget::PrimaryAuto, &both[0]));
+        // The chosen display was unplugged: capture falls back to the primary.
+        let unplugged = vec![out(one, 0, 0)];
+        assert!(target_moved(&unplugged, &chosen, &both[1]));
+        // It is back while the primary is captured: return to it.
+        assert!(target_moved(&both, &chosen, &unplugged[0]));
+        // Same name on an adapter that restarted, or moved to the other card
+        // of a dock or hybrid laptop.
+        let mut restarted = both.clone();
+        restarted[1].adapter_id = (0, 2);
+        assert!(target_moved(&restarted, &chosen, &both[1]));
+        // Nothing listed at all: no display is on.
+        assert!(target_moved(&[], &CaptureTarget::PrimaryAuto, &both[0]));
+    }
+
+    /// Field, 0.3.4 and the 0.3.5 beta: a static second screen lost its
+    /// duplication, had it back in 3 ms, and 5 s later the watchdog restarted
+    /// the pipeline under the viewer ("no captured frame for 5039ms with a
+    /// client connected"). A re-created duplication delivers no image while
+    /// nothing on the screen changes, and keepalives waited for one.
+    #[test]
+    fn a_static_second_screen_keeps_its_picture_after_a_lost_duplication() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let shared = SharedControl::new(0, 1);
+        connect_viewer(&shared);
+        let mut machine = crate::supervisor::Machine::new(1);
+        let mut picture = Picture::default();
+        // Before its first image the second screen sends nothing.
+        assert!(!keepalive_allowed(picture.real(), true));
+        picture.seen_image = true;
+        picture.cached();
+        // Lost, and re-created at the same size.
+        picture.recreated();
+        assert!(!frame_has_image(0, picture.seen_image));
+        let start = 100_000;
+        let mut sent = start;
+        shared.hb_capture_frame_ms.store(start, Relaxed);
+        shared.hb_encode_frame_ms.store(start, Relaxed);
+        let mut resends = 0;
+        // Ten seconds of acquire timeouts on the unchanged screen.
+        for now in (start..start + 10_000).step_by(50) {
+            shared.hb_capture_loop_ms.store(now, Relaxed);
+            let since_send = Duration::from_millis(now - sent);
+            if keepalive_due(since_send, false, picture.real())
+                && keepalive_allowed(picture.real(), true)
+            {
+                sent = now;
+                resends += 1;
+                shared.hb_capture_frame_ms.store(now, Relaxed);
+                shared.hb_encode_frame_ms.store(now, Relaxed);
+            }
+            assert_eq!(
+                crate::supervisor::wedge_reason_at(&shared, &mut machine, now),
+                None
+            );
+        }
+        assert!(resends >= 12, "{resends} keepalives in 10 s");
+        // A new resolution leaves only black to resend: the second screen
+        // waits for the new duplication's first image again.
+        picture.recreated();
+        picture.resized();
+        assert!(!keepalive_allowed(picture.real(), true));
+        assert!(keepalive_allowed(picture.real(), false), "the mirror");
+        picture.seen_image = true;
+        picture.cached();
+        assert!(keepalive_allowed(picture.real(), true));
+    }
+
+    /// The screens came back on 2 s into a 5 s retry wait. The picture comes
+    /// back at the next look, not when the wait ends.
+    #[test]
+    fn a_display_coming_back_ends_the_no_display_wait() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let shared = SharedControl::new(0, 1);
+        shared.running.store(true, SeqCst);
+        let generation = crate::supervisor::CURRENT_GENERATION.load(SeqCst);
+        *shared.capture_block.lock() = Some(recovery::CaptureBlock::NoDisplay);
+        let started = Instant::now();
+        let looks = Cell::new(0);
+        let back = || {
+            looks.set(looks.get() + 1);
+            started.elapsed() >= Duration::from_millis(600)
+        };
+        assert!(wait_while_blocked(
+            &shared,
+            generation,
+            Duration::from_secs(5),
+            back
+        ));
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(2_500), "{waited:?}");
+        assert!(looks.get() >= 2, "{} looks", looks.get());
+        // Other blocked states clear by the user's hand; nothing is polled.
+        *shared.capture_block.lock() = Some(recovery::CaptureBlock::SecureDesktop);
+        let looks = Cell::new(0);
+        let started = Instant::now();
+        assert!(wait_while_blocked(
+            &shared,
+            generation,
+            Duration::from_millis(600),
+            || {
+                looks.set(looks.get() + 1);
+                true
+            }
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert_eq!(looks.get(), 0);
     }
 
     #[test]
