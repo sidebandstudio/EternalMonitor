@@ -1,8 +1,8 @@
 //! Host and iPad state machines together on the simulated network, with
 //! fuzzer-chosen loss, duplication, delay, latency, host answers, reconnects,
 //! replays and forged datagrams. After every step the host table's
-//! invariants hold, and the iPad only ever goes live on a session the host
-//! committed.
+//! invariants hold, and every iPad only ever goes live on a session the
+//! host committed for it, also after the network settles.
 #![no_main]
 
 #[path = "../../tests/v3_sim/mod.rs"]
@@ -62,7 +62,6 @@ fuzz_target!(|data: &[u8]| {
     });
     sim.policy.media_every = Some(ms(100));
     sim.connect();
-    let mut checked = 0;
     for _ in 0..300 {
         if cursor.borrow().done() {
             break;
@@ -113,20 +112,9 @@ fuzz_target!(|data: &[u8]| {
             }
             _ => sim.step(),
         }
-        let commits = sim.commits();
-        for event in &sim.events[checked..] {
-            if let Event::IpadLive { session_id, .. } = event {
-                assert!(commits.contains(session_id), "live on an uncommitted session");
-            }
-        }
-        checked = sim.events.len();
+        sim.check_live_only_on_commits();
     }
     // Let everything in flight settle, then check once more.
     sim.run_for(ms(6000));
-    let commits = sim.commits();
-    for event in &sim.events[checked..] {
-        if let Event::IpadLive { session_id, .. } = event {
-            assert!(commits.contains(session_id), "live on an uncommitted session");
-        }
-    }
+    sim.check_live_only_on_commits();
 });

@@ -11,12 +11,17 @@ on:
       - ".github/workflows/proto-fuzz.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: proto-fuzz-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # cargo-fuzz needs nightly; pinned so a nightly regression can't fail CI.
+  FUZZ_TOOLCHAIN: nightly-2026-11-06
 
 jobs:
   fuzz:
@@ -25,24 +30,38 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly
-        run: rustup toolchain install nightly --profile minimal
+      - name: Install the pinned nightly
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: proto/fuzz
       - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+        run: cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
       - name: Build fuzz targets
         working-directory: proto/fuzz
-        run: cargo +nightly fuzz build
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build
       - name: Run each target for 30 s
         working-directory: proto/fuzz
         run: |
-          for target in $(cargo +nightly fuzz list); do
+          set -euo pipefail
+          targets="v3_handshake v3_parsers v3_record_open v3_replay_window v3_session_sim"
+          listed=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$listed" != "$targets" ]; then
+            echo "::error::fuzz targets are '$listed', expected '$targets'"
+            exit 1
+          fi
+          for target in $targets; do
             sanitizer=address
             # Safe Rust only; it runs far faster without the sanitizer.
             if [ "$target" = v3_session_sim ]; then sanitizer=none; fi
             echo "::group::$target"
-            cargo +nightly fuzz run -s "$sanitizer" "$target" -- -max_total_time=30
+            cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30
             echo "::endgroup::"
           done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proto-fuzz-artifacts
+          path: proto/fuzz/artifacts
+          if-no-files-found: ignore

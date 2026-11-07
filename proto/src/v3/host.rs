@@ -24,13 +24,18 @@
 //!    cutover, sends an IDR, and finalizes a pending record durably.
 //! 3. [`HostSessions::ack`]: only then, the `SessionConfirmAck` goes out.
 //!
+//! Message 1 work is budgeted before any Diffie-Hellman: unknown `dev_id`s
+//! are dropped uncharged, known ones are limited per source IP, and cached
+//! answers (message 2, `Stale`) have their own per-source budgets, so
+//! replays from other sources never use up the iPad's.
+//!
 //! Per `dev_id` there is at most one live and one pending session. Every
 //! packet for a `session_id` whose keys are gone is dropped without a reply.
 //! Application records only flow under a committed session.
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use super::handshake::Responder;
@@ -52,18 +57,21 @@ pub struct HostConfig {
     pub pending_lifetime: Duration,
     /// How long a timed-out message 1 is remembered and dropped.
     pub expired_msg1_lifetime: Duration,
-    /// Shortest gap between two resends of a cached message 2.
+    /// Shortest gap between two resends of a cached message 2 to one
+    /// source.
     pub msg2_resend_interval: Duration,
-    /// `Stale` answers per `dev_id` per second.
+    /// New `Stale` answers per `dev_id` per second.
     pub stale_per_second: u32,
+    /// Resends of a cached `Stale` answer per source per second.
+    pub stale_replays_per_second: u32,
     /// Shortest gap between two re-sealed `SessionConfirmAck`s.
     pub confirm_ack_interval: Duration,
     /// How long a sealed `SessionRefused` is resent to its address.
     pub refusal_lifetime: Duration,
     /// Shortest gap between two resends of it.
     pub refusal_resend_interval: Duration,
-    /// Message 1s per source per second, before any Diffie-Hellman. The
-    /// source is [`PeerAddr::rate_bucket`].
+    /// Message 1s for a known `dev_id` per source per second, before any
+    /// Diffie-Hellman. The source is [`PeerAddr::rate_bucket`].
     pub msg1_per_second: u32,
     /// Pending sessions host-wide.
     pub max_pending: usize,
@@ -81,6 +89,7 @@ impl HostConfig {
             expired_msg1_lifetime: Duration::from_secs(30),
             msg2_resend_interval: Duration::from_millis(100),
             stale_per_second: 5,
+            stale_replays_per_second: 5,
             confirm_ack_interval: Duration::from_millis(50),
             refusal_lifetime: Duration::from_secs(5),
             refusal_resend_interval: Duration::from_millis(100),
@@ -92,8 +101,9 @@ impl HostConfig {
     }
 }
 
-/// A peer address. The message 1 rate limit counts per [`rate_bucket`]: the
-/// source IP, never the port, so one machine can't spread over many buckets.
+/// A peer address. The message 1 rate limits count per [`rate_bucket`]: the
+/// source IP, never the port, so one machine can't spread over many
+/// buckets, and two machines never share one.
 ///
 /// [`rate_bucket`]: PeerAddr::rate_bucket
 pub trait PeerAddr: Clone + Eq + Hash {
@@ -104,18 +114,16 @@ pub trait PeerAddr: Clone + Eq + Hash {
 impl PeerAddr for SocketAddr {
     type Bucket = IpAddr;
 
-    /// The IPv4 address, or the IPv6 /64 (one host's usual allocation).
+    /// The full IP address; a v4-mapped IPv6 address counts as its IPv4
+    /// address. Prefixes aren't grouped: Tailscale nodes, link-local
+    /// addresses and SLAAC hosts on one LAN all share a /64.
     fn rate_bucket(&self) -> IpAddr {
         match self.ip() {
-            IpAddr::V4(v4) => IpAddr::V4(v4),
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => IpAddr::V4(v4),
-                None => {
-                    let mut segments = v6.segments();
-                    segments[4..].fill(0);
-                    IpAddr::V6(Ipv6Addr::from(segments))
-                }
+                None => IpAddr::V6(v6),
             },
+            v4 => v4,
         }
     }
 }
@@ -282,18 +290,22 @@ fn msg1_key(msg1: &Msg1<'_>) -> Digest {
     out
 }
 
-struct PendingSession<A> {
+struct PendingSession<A: PeerAddr> {
     session_id: u32,
     sealer: Sealer,
     opener: Opener,
     msg1_key: Digest,
     msg2: Vec<u8>,
-    last_msg2_sent: Duration,
+    /// When the cached message 2 last went to each source.
+    msg2_sent: HashMap<<A as PeerAddr>::Bucket, Duration>,
     deadline: Duration,
     timestamp_us: u64,
     hello: HelloPayload,
+    /// The source of the newest authenticated `SessionConfirm`: where a
+    /// refusal goes, and the live session's first destination. Other
+    /// records under a pending session never move it.
     peer: A,
-    /// The counter of the authenticated record that last set `peer`.
+    /// The counter of the confirm that last set `peer`.
     peer_counter: Option<u64>,
     /// A `SessionConfirm` arrived and the caller hasn't answered yet.
     confirming: bool,
@@ -326,7 +338,7 @@ impl<A: Clone> LiveSession<A> {
     }
 }
 
-struct Device<A> {
+struct Device<A: PeerAddr> {
     live: Option<LiveSession<A>>,
     pending: Option<PendingSession<A>>,
     /// The newest timestamp committed in memory, in case the caller hasn't
@@ -334,7 +346,7 @@ struct Device<A> {
     committed_timestamp: u64,
 }
 
-impl<A> Default for Device<A> {
+impl<A: PeerAddr> Default for Device<A> {
     fn default() -> Self {
         Self {
             live: None,
@@ -385,16 +397,63 @@ impl RateWindow {
     }
 }
 
-/// Per-`dev_id` budget for `Stale` answers, with the last one cached so a
-/// replayed message 1 is answered without another Diffie-Hellman.
+/// Per-`dev_id` budget for new `Stale` answers, with recent answers cached
+/// so a replayed message 1 is answered without another Diffie-Hellman.
 struct StaleBudget {
     window: RateWindow,
-    last: Option<(Digest, Vec<u8>)>,
+    /// (message 1 key, the answer, when it's forgotten), newest last.
+    cached: Vec<(Digest, Vec<u8>, Duration)>,
 }
 
-/// Sources tracked by the message 1 rate limit. Beyond this, new sources
-/// share one bucket.
+/// Cached `Stale` answers per `dev_id`.
+const MAX_CACHED_STALE: usize = 8;
+
+/// Per-source rate windows. When the table is full, a new source evicts the
+/// source whose window is oldest, so no source ever waits on a shared
+/// bucket.
+struct SourceLimiter<B> {
+    windows: HashMap<B, RateWindow>,
+    limit: u32,
+}
+
+impl<B: Clone + Eq + Hash> SourceLimiter<B> {
+    fn new(limit: u32) -> Self {
+        Self {
+            windows: HashMap::new(),
+            limit,
+        }
+    }
+
+    fn allow(&mut self, now: Duration, bucket: &B) -> bool {
+        if !self.windows.contains_key(bucket) && self.windows.len() >= MAX_RATE_ENTRIES {
+            if let Some(oldest) = self
+                .windows
+                .iter()
+                .min_by_key(|(_, w)| w.start)
+                .map(|(b, _)| b.clone())
+            {
+                self.windows.remove(&oldest);
+            }
+        }
+        self.windows
+            .entry(bucket.clone())
+            .or_insert(RateWindow {
+                start: now,
+                count: 0,
+            })
+            .allow(now, self.limit)
+    }
+
+    fn prune(&mut self, now: Duration) {
+        self.windows
+            .retain(|_, w| now.saturating_sub(w.start) < Duration::from_secs(1));
+    }
+}
+
+/// Sources tracked by each per-source limit.
 const MAX_RATE_ENTRIES: usize = 1024;
+/// Sources a pending session remembers message 2 resends for.
+const MAX_MSG2_SOURCES: usize = 16;
 /// Remembered timed-out message 1s.
 const MAX_EXPIRED_MSG1: usize = 4096;
 
@@ -406,14 +465,16 @@ pub struct HostSessions<A: PeerAddr> {
     expired_msg1: HashMap<Digest, Duration>,
     refusal_contexts: Vec<RefusalContext<A>>,
     refusals: Vec<Refusal<A>>,
-    rate: HashMap<A::Bucket, RateWindow>,
-    overflow_rate: RateWindow,
+    msg1_rate: SourceLimiter<A::Bucket>,
+    stale_replay_rate: SourceLimiter<A::Bucket>,
     stale: HashMap<Id16, StaleBudget>,
 }
 
 impl<A: PeerAddr> HostSessions<A> {
     pub fn new(config: HostConfig, rng: Box<dyn Random + Send>) -> Self {
         Self {
+            msg1_rate: SourceLimiter::new(config.msg1_per_second),
+            stale_replay_rate: SourceLimiter::new(config.stale_replays_per_second),
             config,
             rng,
             devices: HashMap::new(),
@@ -421,11 +482,6 @@ impl<A: PeerAddr> HostSessions<A> {
             expired_msg1: HashMap::new(),
             refusal_contexts: Vec::new(),
             refusals: Vec::new(),
-            rate: HashMap::new(),
-            overflow_rate: RateWindow {
-                start: Duration::ZERO,
-                count: 0,
-            },
             stale: HashMap::new(),
         }
     }
@@ -477,29 +533,13 @@ impl<A: PeerAddr> HostSessions<A> {
         out
     }
 
-    fn allow_msg1(&mut self, now: Duration, from: &A) -> bool {
-        let limit = self.config.msg1_per_second;
-        let bucket = from.rate_bucket();
-        let window = if let Some(w) = self.rate.get_mut(&bucket) {
-            w
-        } else if self.rate.len() < MAX_RATE_ENTRIES {
-            self.rate.entry(bucket).or_insert(RateWindow {
-                start: now,
-                count: 0,
-            })
-        } else {
-            &mut self.overflow_rate
-        };
-        window.allow(now, limit)
-    }
-
     fn stale_budget(&mut self, dev_id: &Id16, now: Duration) -> &mut StaleBudget {
         self.stale.entry(*dev_id).or_insert(StaleBudget {
             window: RateWindow {
                 start: now,
                 count: 0,
             },
-            last: None,
+            cached: Vec::new(),
         })
     }
 
@@ -514,9 +554,7 @@ impl<A: PeerAddr> HostSessions<A> {
         let Ok(msg1) = wire::parse_msg1(datagram) else {
             return;
         };
-        if !self.allow_msg1(now, from) {
-            return;
-        }
+        let bucket = from.rate_bucket();
         let key = msg1_key(&msg1);
         if self
             .expired_msg1
@@ -529,8 +567,22 @@ impl<A: PeerAddr> HostSessions<A> {
         let resend_interval = self.config.msg2_resend_interval;
         if let Some(device) = self.devices.get_mut(&dev_id) {
             if let Some(p) = device.pending.as_mut().filter(|p| p.msg1_key == key) {
-                if now.saturating_sub(p.last_msg2_sent) >= resend_interval {
-                    p.last_msg2_sent = now;
+                let due = p
+                    .msg2_sent
+                    .get(&bucket)
+                    .is_none_or(|&t| now.saturating_sub(t) >= resend_interval);
+                if due {
+                    if !p.msg2_sent.contains_key(&bucket) && p.msg2_sent.len() >= MAX_MSG2_SOURCES {
+                        if let Some(oldest) = p
+                            .msg2_sent
+                            .iter()
+                            .min_by_key(|(_, t)| **t)
+                            .map(|(b, _)| b.clone())
+                        {
+                            p.msg2_sent.remove(&oldest);
+                        }
+                    }
+                    p.msg2_sent.insert(bucket, now);
                     out.push(HostOutput::Send {
                         to: from.clone(),
                         datagram: p.msg2.clone(),
@@ -543,20 +595,29 @@ impl<A: PeerAddr> HostSessions<A> {
             }
         }
         let stale_limit = self.config.stale_per_second;
-        if let Some(budget) = self.stale.get_mut(&dev_id) {
-            if let Some((_, msg2)) = budget.last.as_ref().filter(|(k, _)| *k == key) {
-                if budget.window.allow(now, stale_limit) {
-                    out.push(HostOutput::Send {
-                        to: from.clone(),
-                        datagram: msg2.clone(),
-                    });
-                }
-                return;
+        if let Some((_, msg2, _)) = self.stale.get(&dev_id).and_then(|b| {
+            b.cached
+                .iter()
+                .find(|(k, _, until)| *k == key && now < *until)
+        }) {
+            // A replay of the message 1 that got the cached Stale answer: its
+            // own per-source budget, apart from new answers.
+            let msg2 = msg2.clone();
+            if self.stale_replay_rate.allow(now, &bucket) {
+                out.push(HostOutput::Send {
+                    to: from.clone(),
+                    datagram: msg2,
+                });
             }
+            return;
         }
+        // Unknown dev_ids cost nothing and are never charged to a source.
         let Some(k_dev) = creds.key(&dev_id) else {
             return;
         };
+        if !self.msg1_rate.allow(now, &bucket) {
+            return;
+        }
         let has_pending = self
             .devices
             .get(&dev_id)
@@ -569,14 +630,20 @@ impl<A: PeerAddr> HostSessions<A> {
         };
         drop(k_dev);
         let timestamp_us = responder.payload().timestamp_us;
-        if timestamp_us > MAX_TIMESTAMP_US {
+        if timestamp_us >= MAX_TIMESTAMP_US {
             return;
         }
-        let committed = creds.last_committed_timestamp(&dev_id).max(
+        let mut committed = creds.last_committed_timestamp(&dev_id).max(
             self.devices
                 .get(&dev_id)
                 .map_or(0, |d| d.committed_timestamp),
         );
+        if committed >= MAX_TIMESTAMP_US - 1 {
+            // A committed value at the ceiling has no valid successor. The
+            // timestamp is only a filter in front of the commit rule, so the
+            // filter starts over rather than lock the device out.
+            committed = 0;
+        }
         if timestamp_us <= committed {
             let budget = self.stale_budget(&dev_id, now);
             if !budget.window.allow(now, stale_limit) {
@@ -586,7 +653,12 @@ impl<A: PeerAddr> HostSessions<A> {
                 stored_timestamp_us: committed,
             };
             if let Ok((msg2, _)) = responder.write_msg2(&reply) {
-                self.stale_budget(&dev_id, now).last = Some((key, msg2.clone()));
+                let until = now + self.config.expired_msg1_lifetime;
+                let budget = self.stale_budget(&dev_id, now);
+                if budget.cached.len() >= MAX_CACHED_STALE {
+                    budget.cached.remove(0);
+                }
+                budget.cached.push((key, msg2.clone(), until));
                 out.push(HostOutput::Send {
                     to: from.clone(),
                     datagram: msg2,
@@ -618,7 +690,7 @@ impl<A: PeerAddr> HostSessions<A> {
             opener,
             msg1_key: key,
             msg2: msg2.clone(),
-            last_msg2_sent: now,
+            msg2_sent: HashMap::from([(bucket, now)]),
             deadline: now + self.config.pending_lifetime,
             timestamp_us,
             hello,
@@ -676,15 +748,15 @@ impl<A: PeerAddr> HostSessions<A> {
             let Ok(opened) = p.opener.open(datagram) else {
                 return;
             };
-            if p.peer_counter.is_none_or(|c| opened.counter > c) {
-                p.peer = from.clone();
-                p.peer_counter = Some(opened.counter);
-            }
-            // Only SessionConfirm commits. Anything else under a pending
-            // session is dropped.
+            // Only SessionConfirm commits, and only a confirm moves the
+            // address. Anything else under a pending session is dropped.
             if let Ok(Some(SessionMessage::Confirm)) =
                 SessionMessage::parse(opened.inner_type, &opened.body)
             {
+                if p.peer_counter.is_none_or(|c| opened.counter > c) {
+                    p.peer = from.clone();
+                    p.peer_counter = Some(opened.counter);
+                }
                 if !p.confirming {
                     p.confirming = true;
                     out.push(HostOutput::ConfirmRequested {
@@ -1079,10 +1151,12 @@ impl<A: PeerAddr> HostSessions<A> {
         out.extend(cancelled);
         self.expired_msg1.retain(|_, until| *until > now);
         self.refusals.retain(|r| r.until > now);
-        self.rate
-            .retain(|_, w| now.saturating_sub(w.start) < Duration::from_secs(1));
-        self.stale
-            .retain(|_, b| now.saturating_sub(b.window.start) < Duration::from_secs(1));
+        self.msg1_rate.prune(now);
+        self.stale_replay_rate.prune(now);
+        self.stale.retain(|_, b| {
+            b.cached.retain(|(_, _, until)| now < *until);
+            !b.cached.is_empty() || now.saturating_sub(b.window.start) < Duration::from_secs(1)
+        });
         out
     }
 
@@ -1480,11 +1554,51 @@ mod tests {
             })
             .count();
         assert_eq!(answered, 20, "25 ports, one IP, one bucket");
-        let v6 =
-            |tail: u16| SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, tail, 1), 9));
-        assert_eq!(v6(1).rate_bucket(), v6(2).rate_bucket(), "one /64");
-        let mapped = SocketAddr::from((Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0x0a00, 7]), 9));
+        let mapped = SocketAddr::from((
+            std::net::Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0x0a00, 7]),
+            9,
+        ));
         assert_eq!(mapped.rate_bucket(), IpAddr::from([10, 0, 0, 7]));
+    }
+
+    #[test]
+    fn ipv6_peers_sharing_a_prefix_never_share_a_bucket() {
+        use std::net::Ipv6Addr;
+        let at = |segments: [u16; 8]| SocketAddr::from((Ipv6Addr::from(segments), 41_641));
+        // Two Tailscale nodes, two link-local peers, two SLAAC hosts on one /64.
+        for (a, b) in [
+            (
+                [0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x1234, 0x0001],
+                [0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x5678, 0x0002],
+            ),
+            (
+                [0xfe80, 0, 0, 0, 0x1, 0x2, 0x3, 0x4],
+                [0xfe80, 0, 0, 0, 0x5, 0x6, 0x7, 0x8],
+            ),
+            (
+                [0x2001, 0xdb8, 1, 2, 0xa, 0xb, 0xc, 0xd],
+                [0x2001, 0xdb8, 1, 2, 0xe, 0xf, 0x1, 0x2],
+            ),
+        ] {
+            assert_ne!(at(a).rate_bucket(), at(b).rate_bucket());
+        }
+
+        // And the limits act that way: a flood from one Tailscale node never
+        // touches another node's budget.
+        let mut creds = Creds::default();
+        creds.keys.insert(DEV, K);
+        let mut host: HostSessions<SocketAddr> =
+            HostSessions::new(HostConfig::new(HOST), Box::new(SeededRandom::new(4)));
+        let attacker = at([0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x6666, 0x0001]);
+        let ipad_addr = at([0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x1234, 0x0001]);
+        for i in 0..30u64 {
+            let forged = Initiator::start(&[9; 32], &DEV, &HOST, 1, &hello(i)).unwrap();
+            host.handle_datagram(T0, &attacker, forged.msg1(), &creds);
+        }
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        assert!(!host
+            .handle_datagram(T0, &ipad_addr, ipad.msg1(), &creds)
+            .is_empty());
     }
 
     #[test]
@@ -1543,17 +1657,34 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_beyond_the_bound_is_dropped() {
+    fn a_timestamp_at_or_beyond_the_bound_is_dropped() {
         let (mut host, creds) = setup();
-        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(MAX_TIMESTAMP_US + 1)).unwrap();
-        assert!(host
-            .handle_datagram(T0, &ADDR, ipad.msg1(), &creds)
-            .is_empty());
-        assert!(host.pending_session(&DEV).is_none());
-        let ipad = Initiator::start(&K, &DEV, &HOST, 2, &hello(MAX_TIMESTAMP_US)).unwrap();
+        for ts in [MAX_TIMESTAMP_US, MAX_TIMESTAMP_US + 1, u64::MAX] {
+            let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(ts)).unwrap();
+            assert!(host
+                .handle_datagram(T0, &ADDR, ipad.msg1(), &creds)
+                .is_empty());
+            assert!(host.pending_session(&DEV).is_none());
+        }
+        let ipad = Initiator::start(&K, &DEV, &HOST, 2, &hello(MAX_TIMESTAMP_US - 1)).unwrap();
         assert_eq!(
             sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds)).len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_committed_timestamp_at_the_ceiling_restarts_the_filter() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = MAX_TIMESTAMP_US - 1;
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(1)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+        assert!(
+            host.pending_session(&DEV).is_some(),
+            "a pending, not a Stale answer"
         );
     }
 
@@ -1639,5 +1770,131 @@ mod tests {
         assert!(text.contains("body_len: 12"), "{text}");
         assert!(!text.contains("116, 121, 112"), "{text}");
         let _ = SessionKeys::from_raw([0; 32], [1; 32]);
+    }
+
+    /// A handshake up to message 2; returns the iPad's sealer and opener.
+    fn accepted(
+        host: &mut HostSessions<u32>,
+        creds: &Creds,
+        ts: u64,
+        from: u32,
+    ) -> (Sealer, Opener, u32) {
+        let mut ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(ts)).unwrap();
+        let msg2 = sends(&host.handle_datagram(T0, &from, ipad.msg1(), creds)).remove(0);
+        let (reply, keys) = ipad.read_msg2(&msg2).unwrap();
+        let Msg2Payload::Accept(accept) = reply else {
+            panic!()
+        };
+        let (sealer, opener) = keys.unwrap().initiator(accept.session_id);
+        (sealer, opener, accept.session_id)
+    }
+
+    fn sends_to(out: &[HostOutput<u32>]) -> Vec<u32> {
+        out.iter()
+            .filter_map(|o| match o {
+                HostOutput::Send { to, .. } => Some(*to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_refusal_goes_to_the_address_that_confirmed_not_one_that_sent_other_records() {
+        let (mut host, creds) = setup();
+        let (mut sealer, _, sid) = accepted(&mut host, &creds, 10, 1);
+        let confirm = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        let other = sealer.seal(0x15, &[0; 36]).unwrap(); // higher counter
+        host.handle_datagram(T0, &2, &other, &creds);
+        host.handle_datagram(T0, &1, &confirm, &creds);
+        assert!(host.prepare_refusal(T0, &DEV, sid));
+        let out = host.refuse(T0 + ms(10), &DEV, sid, &creds);
+        assert_eq!(sends_to(&out), vec![1]);
+    }
+
+    #[test]
+    fn during_a_delayed_decision_the_refusal_follows_the_newest_confirm() {
+        let (mut host, creds) = setup();
+        let (mut sealer, _, sid) = accepted(&mut host, &creds, 10, 1);
+        let first = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        host.handle_datagram(T0, &1, &first, &creds);
+        // The iPad moves while the decision is pending and retries from there.
+        let retry = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        host.handle_datagram(T0 + ms(100), &3, &retry, &creds);
+        // A delayed copy of the first confirm doesn't move it back.
+        host.handle_datagram(T0 + ms(150), &1, &first, &creds);
+        let out = host.refuse(T0 + ms(800), &DEV, sid, &creds);
+        assert_eq!(sends_to(&out), vec![3]);
+    }
+
+    #[test]
+    fn message_2_resends_are_budgeted_per_source() {
+        let (mut host, creds) = setup();
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &1, ipad.msg1(), &creds)).len(),
+            1
+        );
+        // A spoofed replay of that message 1 from elsewhere...
+        assert_eq!(
+            sends_to(&host.handle_datagram(T0 + ms(120), &9, ipad.msg1(), &creds)),
+            vec![9]
+        );
+        assert!(host
+            .handle_datagram(T0 + ms(130), &9, ipad.msg1(), &creds)
+            .is_empty());
+        // ...never uses up the iPad's own resend.
+        assert_eq!(
+            sends_to(&host.handle_datagram(T0 + ms(150), &1, ipad.msg1(), &creds)),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn cached_stale_replays_have_their_own_per_source_budget() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1000;
+        let old = Initiator::start(&K, &DEV, &HOST, 1, &hello(500)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &1, old.msg1(), &creds)).len(),
+            1
+        );
+        // Replays of it from 20 sources, 10 times each.
+        let mut replies = 0;
+        for source in 100..120u32 {
+            for _ in 0..10 {
+                replies +=
+                    sends(&host.handle_datagram(T0 + ms(10), &source, old.msg1(), &creds)).len();
+            }
+        }
+        assert_eq!(replies, 20 * 5, "5 per second per source");
+        // The iPad's own new stale attempt is still answered.
+        let fresh = Initiator::start(&K, &DEV, &HOST, 2, &hello(600)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(20), &1, fresh.msg1(), &creds)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_dev_ids_are_never_charged_and_a_full_table_evicts_the_oldest() {
+        let (mut host, creds) = setup();
+        // Junk from many sources, unknown dev_ids: nothing is charged.
+        for source in 0..2000u32 {
+            let junk = Initiator::start(&K, &[0xEE; 16], &HOST, 1, &hello(1)).unwrap();
+            host.handle_datagram(T0, &(10_000 + source), junk.msg1(), &creds);
+        }
+        assert!(host.msg1_rate.windows.is_empty());
+        // Forged message 1s for the iPad's dev_id from 1,100 sources fill the
+        // table; the iPad still gets through.
+        for source in 0..1100u32 {
+            let forged = Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(1)).unwrap();
+            host.handle_datagram(T0, &(20_000 + source), forged.msg1(), &creds);
+        }
+        assert!(host.msg1_rate.windows.len() <= MAX_RATE_ENTRIES);
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
     }
 }

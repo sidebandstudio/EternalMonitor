@@ -565,13 +565,7 @@ fn soak_with_loss_duplication_and_reordering() {
                 && !s.client.is_confirming()),
             "seed {seed}"
         );
-        let commits = sim.commits();
-        for id in live_ids(&sim) {
-            assert!(
-                commits.contains(&id),
-                "seed {seed}: iPad live on {id} the host never committed"
-            );
-        }
+        sim.check_live_only_on_commits();
     }
 }
 
@@ -650,7 +644,16 @@ fn slow_decisions_never_cut_off_the_session_the_ipad_still_uses() {
 /// step 1 ends the record's sessions, then the durable writes, then refuse.
 #[test]
 fn a_refusal_reaches_the_ipad_through_the_full_invalidation_sequence() {
-    for (decision, durable) in [(0u64, 5u64), (200, 300), (900, 900)] {
+    for (decision, durable) in [
+        (0u64, 5u64),
+        (200, 300),
+        (900, 900),
+        (1000, 1000),
+        (500, 1600),
+        (1200, 1500),
+        (500, 3000),
+        (0, 3000),
+    ] {
         let mut sim = Sim::new(40 + decision);
         let live = connect_live(&mut sim);
         let other = ClientKey {
@@ -664,7 +667,7 @@ fn a_refusal_reaches_the_ipad_through_the_full_invalidation_sequence() {
         sim.policy.durable_delay = ms(durable);
         sim.connect_with(other.clone());
         assert!(
-            sim.run_until(ms(2000), |s| s
+            sim.run_until(ms(6000), |s| s
                 .events
                 .iter()
                 .any(|e| matches!(e, Event::IpadRefused { .. }))),
@@ -877,4 +880,148 @@ fn the_pending_cap_holds_with_many_ipads_connecting() {
     sim.run_for(ms(100));
     assert!(sim.host.pending_session(&sim.key.dev_id).is_none());
     assert!(sim.host.pending_count() <= 16);
+}
+
+/// The caller's decision lands just as the iPad's confirm window runs out,
+/// within one RTT of it, and the first copy of the next message 1 is lost.
+/// The host may commit the abandoned attempt; the iPad must then use it.
+#[test]
+fn a_decision_landing_as_the_ipad_gives_up_still_reaches_it() {
+    for latency_ms in [50u64, 100] {
+        for decision_ms in [
+            2000 - 2 * latency_ms,
+            2000 - 3 * latency_ms / 2,
+            2000 - latency_ms,
+            2000 - latency_ms / 2,
+            2000,
+        ] {
+            let mut sim = Sim::new(60 + latency_ms + decision_ms);
+            sim.latency = ms(latency_ms);
+            let old = connect_live(&mut sim);
+            sim.policy.decision_delay = ms(decision_ms);
+            // Message 1 of the attempt after the one being decided: lost once.
+            sim.fault = Box::new(|sent| match sent.kind {
+                Kind::Msg1 if sent.nth == 2 => Fate::Drop,
+                _ => Fate::Deliver,
+            });
+            sim.connect();
+            sim.run_for(Duration::from_secs(12));
+            let label = format!("latency {latency_ms} ms, decision {decision_ms} ms");
+            assert_eq!(
+                sim.unused_commits(),
+                0,
+                "{label}: a commit the iPad never used"
+            );
+            assert!(sim.both_live_on_same_session(), "{label}");
+            assert_ne!(sim.host_live(), Some(old), "{label}");
+            sim.check_live_only_on_commits();
+        }
+    }
+}
+
+/// The same race, over and over: a reconnect every 7 s for 60 s.
+#[test]
+fn repeated_reconnects_with_late_decisions_never_waste_a_commit() {
+    for latency_ms in [50u64, 100] {
+        let mut sim = Sim::new(70 + latency_ms);
+        sim.latency = ms(latency_ms);
+        connect_live(&mut sim);
+        sim.policy.decision_delay = ms(2000 - latency_ms);
+        for _ in 0..8 {
+            sim.connect();
+            sim.run_for(Duration::from_secs(7));
+        }
+        assert_eq!(sim.unused_commits(), 0, "latency {latency_ms} ms");
+        assert!(sim.both_live_on_same_session(), "latency {latency_ms} ms");
+        assert!(!sim.events.iter().any(|e| matches!(
+            e,
+            Event::HostClosed {
+                reason: CloseReason::Liveness,
+                ..
+            }
+        )));
+    }
+}
+
+/// Timestamps near the bound: two full connections in a row still work.
+#[test]
+fn two_consecutive_connections_at_the_timestamp_bound() {
+    use eternal_wire::v3::MAX_TIMESTAMP_US;
+    let mut sim = Sim::new(80);
+    // A clock far out of range, and a last value just below the bound.
+    sim.clock_offset_us = (MAX_TIMESTAMP_US as i64) + 1_000;
+    sim.client.set_last_timestamp(MAX_TIMESTAMP_US - 2);
+    let first = connect_live(&mut sim);
+    let second = connect_live(&mut sim);
+    assert_ne!(first, second);
+    let third = connect_live(&mut sim);
+    assert_ne!(second, third);
+    assert!(sim.client.last_timestamp() < MAX_TIMESTAMP_US);
+}
+
+/// Junk message 1s with unknown dev_ids from more sources than the rate
+/// table holds, and forged ones with the iPad's dev_id, never block it.
+#[test]
+fn a_flood_from_more_sources_than_the_rate_table_holds_never_blocks_the_ipad() {
+    use eternal_wire::v3::handshake::Initiator;
+    use eternal_wire::v3::wire::HelloPayload;
+    for known in [false, true] {
+        let mut sim = Sim::new(90 + u64::from(known));
+        let dev_id = sim.key.dev_id;
+        let junk: Vec<Vec<u8>> = (0..40u8)
+            .map(|i| {
+                let id = if known { dev_id } else { [i; 16] };
+                Initiator::start(&[i; 32], &id, &HOST_ID, 1, &HelloPayload::default())
+                    .unwrap()
+                    .msg1()
+                    .to_vec()
+            })
+            .collect();
+        let mut n = 0usize;
+        let mut flood = |sim: &mut Sim| {
+            for _ in 0..60 {
+                let source = SimAddr {
+                    ip: 1000 + (n % 1100) as u16,
+                    port: 1,
+                };
+                sim.inject_from(source, &junk[n % junk.len()]);
+                n += 1;
+            }
+        };
+        // Fill the table first, then keep flooding while the iPad connects.
+        for _ in 0..40 {
+            flood(&mut sim);
+            sim.step();
+        }
+        sim.connect();
+        let mut live = false;
+        for _ in 0..600 {
+            flood(&mut sim);
+            sim.step();
+            if sim.both_live_on_same_session() {
+                live = true;
+                break;
+            }
+        }
+        assert!(live, "known dev_id: {known}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "never committed")]
+fn the_live_check_covers_every_ipad() {
+    let mut sim = Sim::new(95);
+    let second = sim.add_ipad(SimAddr { ip: 30, port: 1 });
+    sim.connect();
+    sim.connect_other(second);
+    sim.run_for(ms(500));
+    sim.check_live_only_on_commits();
+    // A live event for the second iPad on a session committed only for the
+    // first must be caught.
+    let first = sim.host_live().unwrap();
+    sim.others[second].events.push(Event::IpadLive {
+        at: sim.now,
+        session_id: first,
+    });
+    sim.check_live_only_on_commits();
 }

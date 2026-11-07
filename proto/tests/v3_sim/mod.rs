@@ -868,6 +868,60 @@ impl Sim {
             .collect()
     }
 
+    /// Sessions the host committed for `dev_id`.
+    pub fn commits_for(&self, dev_id: &Id16) -> Vec<u32> {
+        let events: Box<dyn Iterator<Item = &Event>> = if *dev_id == self.key.dev_id {
+            Box::new(self.events.iter())
+        } else {
+            Box::new(
+                self.other_host_events
+                    .iter()
+                    .filter(move |(d, _)| d == dev_id)
+                    .map(|(_, e)| e),
+            )
+        };
+        events
+            .filter_map(|e| match e {
+                Event::HostCommitted { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every iPad, device 0 included, only ever goes live on a session the
+    /// host committed for that iPad.
+    pub fn check_live_only_on_commits(&self) {
+        let devices = std::iter::once((self.key.dev_id, &self.events))
+            .chain(self.others.iter().map(|o| (o.key.dev_id, &o.events)));
+        for (dev_id, events) in devices {
+            let commits = self.commits_for(&dev_id);
+            for event in events {
+                if let Event::IpadLive { session_id, .. } = event {
+                    assert!(
+                        commits.contains(session_id),
+                        "an iPad went live on {session_id}, which the host never committed for it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Commits whose session never went live on that iPad.
+    pub fn unused_commits(&self) -> usize {
+        let live: Vec<u32> = self
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::IpadLive { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .collect();
+        self.commits()
+            .iter()
+            .filter(|id| !live.contains(id))
+            .count()
+    }
+
     pub fn sent_of(&self, dir: Dir, kind: Kind) -> Vec<&Sent> {
         self.sent
             .iter()

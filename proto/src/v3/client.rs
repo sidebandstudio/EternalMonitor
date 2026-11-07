@@ -13,7 +13,12 @@
 //!   keys, freshly sealed every 100 ms for at most 2 s.
 //! - The new session goes live on `SessionConfirmAck`, or on the first other
 //!   valid record under it (confirms then continue until the ack or the end
-//!   of the window). The old session drains: its media is still delivered
+//!   of the window).
+//! - If the confirm window runs out, the iPad starts a new attempt but keeps
+//!   the old attempt's receive key for the host's pending lifetime plus a
+//!   margin ([`ClientConfig::abandoned_keep`]). The host may still commit or
+//!   refuse that attempt; its ack, media or refusal is then still handled,
+//!   and nothing is ever sealed under it. The old session drains: its media is still delivered
 //!   until the new session's first IDR decodes, for at most 1 s.
 //!
 //! Only input stops across the cutover. Reports, heartbeats and anything
@@ -46,6 +51,11 @@ pub struct ClientConfig {
     pub max_age: Duration,
     /// Reconnect this long before the session's maximum age.
     pub reconnect_margin: Duration,
+    /// How long, from message 2, an attempt whose confirm window ran out
+    /// keeps its receive key: the host's pending lifetime plus time for its
+    /// answer to arrive. A `SessionConfirmAck`, a refusal or media under it
+    /// in that time is still handled.
+    pub abandoned_keep: Duration,
 }
 
 impl ClientConfig {
@@ -59,6 +69,7 @@ impl ClientConfig {
             drain_limit: Duration::from_secs(1),
             max_age: SESSION_MAX_AGE,
             reconnect_margin: Duration::from_secs(60),
+            abandoned_keep: Duration::from_secs(6),
         }
     }
 }
@@ -238,7 +249,21 @@ pub struct Client {
     attempt: Attempt,
     live: Option<Session>,
     drain: Option<(Session, Duration)>,
+    /// Attempts whose confirm window ran out, oldest first, kept
+    /// receive-only: the host may still have committed or refused them.
+    abandoned: Vec<Abandoned>,
 }
+
+/// A confirming attempt the iPad stopped retrying. Nothing is sealed under
+/// it; it can only be promoted by the host's answer, or reported refused.
+struct Abandoned {
+    key: ClientKey,
+    session: Box<Session>,
+    until: Duration,
+}
+
+/// Abandoned attempts kept at once.
+const MAX_ABANDONED: usize = 3;
 
 impl Client {
     /// `hello` holds the session fields; its timestamp is set per attempt.
@@ -252,6 +277,7 @@ impl Client {
             attempt: Attempt::Idle,
             live: None,
             drain: None,
+            abandoned: Vec::new(),
         }
     }
 
@@ -261,8 +287,29 @@ impl Client {
         self.last_timestamp
     }
 
+    /// Values at or above [`MAX_TIMESTAMP_US`] are ignored.
     pub fn set_last_timestamp(&mut self, timestamp_us: u64) {
-        self.last_timestamp = self.last_timestamp.max(timestamp_us.min(MAX_TIMESTAMP_US));
+        if timestamp_us < MAX_TIMESTAMP_US {
+            self.last_timestamp = self.last_timestamp.max(timestamp_us);
+        }
+    }
+
+    /// The next message 1 timestamp: `max(clock, last + 1)`, using only
+    /// values below [`MAX_TIMESTAMP_US`]. An out-of-range clock is ignored.
+    /// If `last + 1` would reach the bound, the sequence restarts from the
+    /// clock, or from 1; the host restarts its filter at the same point.
+    fn next_timestamp(&self, clock_us: u64) -> u64 {
+        let clock = Some(clock_us).filter(|&c| c < MAX_TIMESTAMP_US);
+        let after_last = self
+            .last_timestamp
+            .checked_add(1)
+            .filter(|&t| t < MAX_TIMESTAMP_US);
+        match (clock, after_last) {
+            (Some(c), Some(n)) => c.max(n),
+            (None, Some(n)) => n,
+            (Some(c), None) => c,
+            (None, None) => 1,
+        }
     }
 
     pub fn live_session(&self) -> Option<u32> {
@@ -297,9 +344,7 @@ impl Client {
         stale_retried: bool,
         out: &mut Vec<ClientOutput>,
     ) {
-        let timestamp = clock_us
-            .max(self.last_timestamp.saturating_add(1))
-            .min(MAX_TIMESTAMP_US);
+        let timestamp = self.next_timestamp(clock_us);
         self.last_timestamp = timestamp;
         let mut nonce = [0u8; 4];
         self.rng.fill(&mut nonce);
@@ -446,6 +491,39 @@ impl Client {
             }
         }
 
+        if let Some(index) = self
+            .abandoned
+            .iter()
+            .position(|a| a.session.session_id == session_id)
+        {
+            let Ok(opened) = self.abandoned[index].session.opener.open(datagram) else {
+                return;
+            };
+            let dev_id = self.abandoned[index].key.dev_id;
+            match SessionMessage::parse(opened.inner_type, &opened.body) {
+                Ok(Some(SessionMessage::ConfirmAck(status))) => {
+                    self.promote_abandoned(now, index, out);
+                    out.push(ClientOutput::Status { dev_id, status });
+                }
+                Ok(Some(SessionMessage::Refused(status))) => {
+                    self.abandoned.remove(index);
+                    out.push(ClientOutput::Refused { dev_id, status });
+                }
+                Ok(None) => {
+                    self.promote_abandoned(now, index, out);
+                    out.push(ClientOutput::Deliver {
+                        session_id,
+                        counter: opened.counter,
+                        inner_type: opened.inner_type,
+                        body: opened.body,
+                        draining: false,
+                    });
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+            return;
+        }
+
         if let Some(live) = self.live.as_ref().filter(|s| s.session_id == session_id) {
             let Ok(opened) = live.opener.open(datagram) else {
                 return;
@@ -506,8 +584,7 @@ impl Client {
         // Anything else is for keys this side no longer has: drop.
     }
 
-    /// Makes the confirming session live and moves the old one to the drain.
-    /// A drain still running ends at once: there is at most one.
+    /// Makes the confirming session live.
     fn promote(&mut self, now: Duration, out: &mut Vec<ClientOutput>) {
         let Attempt::Confirming { .. } = self.attempt else {
             return;
@@ -517,6 +594,32 @@ impl Client {
         else {
             unreachable!()
         };
+        // Every abandoned attempt is older than this one.
+        self.abandoned.clear();
+        self.go_live(now, *session, key, out);
+    }
+
+    /// The host answered an abandoned attempt: it committed it after all.
+    /// Older abandoned attempts are dropped; a message 1 still unanswered is
+    /// no longer needed.
+    fn promote_abandoned(&mut self, now: Duration, index: usize, out: &mut Vec<ClientOutput>) {
+        let promoted = self.abandoned.remove(index);
+        self.abandoned.drain(..index);
+        if self.is_connecting() {
+            self.attempt = Attempt::Idle;
+        }
+        self.go_live(now, *promoted.session, promoted.key.clone(), out);
+    }
+
+    /// Makes `session` live and moves the old one to the drain. A drain
+    /// still running ends at once: there is at most one.
+    fn go_live(
+        &mut self,
+        now: Duration,
+        session: Session,
+        key: ClientKey,
+        out: &mut Vec<ClientOutput>,
+    ) {
         if let Some((old, _)) = self.drain.take() {
             out.push(ClientOutput::Closed {
                 session_id: old.session_id,
@@ -530,7 +633,7 @@ impl Client {
             session_id: session.session_id,
             accept: session.accept.clone(),
         });
-        self.live = Some(*session);
+        self.live = Some(session);
         self.key = Some(key);
     }
 
@@ -606,8 +709,26 @@ impl Client {
                 last_sent,
             } => {
                 if now.saturating_sub(*started) >= self.config.confirm_window {
-                    // Discard the session keys, not the credential.
+                    // Stop confirming and start over, but keep the receive
+                    // key: the host may still answer this attempt.
                     let key = key.clone();
+                    let until = *started + self.config.abandoned_keep;
+                    let Attempt::Confirming {
+                        session,
+                        key: old_key,
+                        ..
+                    } = std::mem::replace(&mut self.attempt, Attempt::Idle)
+                    else {
+                        unreachable!()
+                    };
+                    if self.abandoned.len() >= MAX_ABANDONED {
+                        self.abandoned.remove(0);
+                    }
+                    self.abandoned.push(Abandoned {
+                        key: old_key,
+                        session,
+                        until,
+                    });
                     self.start_attempt(now, key, clock_us, false, &mut out);
                 } else if now.saturating_sub(*last_sent) >= self.config.confirm_retry_interval {
                     *last_sent = now;
@@ -635,6 +756,8 @@ impl Client {
                 }
             }
         }
+
+        self.abandoned.retain(|a| now < a.until);
 
         if let Some((old, since)) = &self.drain {
             if now.saturating_sub(*since) >= self.config.drain_limit {
@@ -736,15 +859,23 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_at_the_limit_saturates_instead_of_overflowing() {
+    fn out_of_range_timestamps_are_ignored_never_clamped() {
         let mut ipad = client();
         ipad.set_last_timestamp(u64::MAX);
-        assert_eq!(ipad.last_timestamp(), MAX_TIMESTAMP_US);
+        ipad.set_last_timestamp(MAX_TIMESTAMP_US);
+        assert_eq!(ipad.last_timestamp(), 0, "out-of-range values are ignored");
+        // An out-of-range clock: last + 1 instead.
+        ipad.set_last_timestamp(500);
+        assert_eq!(ipad.next_timestamp(u64::MAX), 501);
+        // At the ceiling: restart from the clock, or from 1.
+        ipad.set_last_timestamp(MAX_TIMESTAMP_US - 1);
+        assert_eq!(ipad.next_timestamp(1_000), 1_000);
+        assert_eq!(ipad.next_timestamp(u64::MAX), 1);
+        // Never a value at or above the bound.
         let msg1 = sent(&ipad.connect(T0, key(), u64::MAX)).remove(0);
-        assert_eq!(ipad.last_timestamp(), MAX_TIMESTAMP_US);
         let parsed = wire::parse_msg1(&msg1).unwrap();
         let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
-        assert_eq!(host.payload().timestamp_us, MAX_TIMESTAMP_US);
+        assert!(host.payload().timestamp_us < MAX_TIMESTAMP_US);
     }
 
     #[test]

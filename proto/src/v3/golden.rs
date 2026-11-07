@@ -205,6 +205,9 @@ fn session_transcript() -> Vec<(&'static str, Vec<u8>)> {
     // host → iPad. Each opens, with its counter, under a fresh opener.
     let fresh_host = || Opener::new(&i2r, session_id);
     let fresh_ipad = || Opener::new(&r2i, session_id);
+    let counter_body = [0xC3u8; 32];
+    out.push(("input.counter_inner_type", vec![PacketType::Media as u8]));
+    out.push(("input.counter_body", counter_body.to_vec()));
     let mut boundary = Sealer::new(&r2i, session_id);
     for (name, counter) in [
         ("record.counter_255", 255u64),
@@ -214,7 +217,9 @@ fn session_transcript() -> Vec<(&'static str, Vec<u8>)> {
         ("record.counter_last", MAX_RECORDS_PER_DIRECTION - 1),
     ] {
         boundary.skip_to(counter);
-        let sealed = boundary.seal(PacketType::Media as u8, &[0xC3; 32]).unwrap();
+        let sealed = boundary
+            .seal(PacketType::Media as u8, &counter_body)
+            .unwrap();
         assert_eq!(
             fresh_ipad().open(&sealed).unwrap().counter,
             counter,
@@ -401,7 +406,8 @@ fn session_transcript_matches_golden_file() {
         "# v3 reconnect golden transcript. One `name<space>lowercase-hex` per line.\n\
          # input.* are fixed inputs; the rest are outputs both sides must reproduce\n\
          # byte for byte. Integers are little-endian. record.counter_* are host -> iPad\n\
-         # records that must open with that counter under the responder->initiator key.\n\
+         # records that must open with that counter under the responder->initiator key;\n\
+         # each seals input.counter_inner_type || input.counter_body.\n\
          # reject_auth.* must fail authentication under a fresh opener or handshake\n\
          # state for this session (record_media_session_flipped: the opener for the\n\
          # flipped id; record_input_reflected: the responder->initiator key).\n\
