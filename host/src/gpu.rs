@@ -407,6 +407,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         let started = std::time::Instant::now();
         let info = tracing::subscriber::with_default(subscriber, || {
             detect_within(lanes, limits, found, detect)
