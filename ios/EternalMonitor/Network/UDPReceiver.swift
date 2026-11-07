@@ -112,9 +112,8 @@ final class UDPReceiver: MediaLink {
             case .waiting(let error):
                 guard !self.reportedWaiting else { return }
                 self.reportedWaiting = true
-                let denied = connection.currentPath?.unsatisfiedReason == .localNetworkDenied
-                self.onError?(LinkError(denied ? .localNetworkDenied : .pathUnavailable,
-                    "UDP path not ready: \(error.localizedDescription)", underlying: error))
+                let path = connection.currentPath
+                self.onError?(Self.waitingError(error, status: path?.status, reason: path?.unsatisfiedReason))
             case .failed(let error):
                 SupportDiagnostics.shared.record("error", "udp", "Network.framework failed: \(error)")
                 self.onError?(LinkError(.connectionFailed, "UDP connection failed: \(error.localizedDescription)", underlying: error))
@@ -128,6 +127,16 @@ final class UDPReceiver: MediaLink {
 
         self.connection = connection
         connection.start(queue: queue)
+    }
+
+    /// What a connection waiting for its path reports: Local Network
+    /// denied, or a path that isn't ready. Only a path iPadOS calls
+    /// unsatisfied with no usable network is `pathUnsatisfied`.
+    static func waitingError(_ error: NWError, status: NWPath.Status?, reason: NWPath.UnsatisfiedReason?) -> LinkError {
+        var link = LinkError(reason == .localNetworkDenied ? .localNetworkDenied : .pathUnavailable,
+                             "UDP path not ready: \(error.localizedDescription)", underlying: error)
+        link.pathUnsatisfied = status == .unsatisfied && reason == .notAvailable
+        return link
     }
 
     private func startBSD(host: String) {

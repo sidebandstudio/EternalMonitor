@@ -143,6 +143,23 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var hostStreamConfig: StreamConfig?
 
     @Published private(set) var usbStatus = "USB: waiting for a cable"
+    /// A PC left the USB capability out of its HELLO_ACK: when it was
+    /// sampled, that PC couldn't reach Apple's USB service. Kept only for
+    /// the PC at that target, and only until `until`; see `USBStatusText`.
+    struct AppleDevicesSighting: Equatable {
+        static let lifetime: TimeInterval = 30 * 60
+        /// "host:port" of the PC over Wi-Fi, or "USB".
+        let target: String
+        let at: Date
+        let until: Date
+
+        func applies(now: Date) -> Bool { now >= at && now < until }
+    }
+    /// Cleared when it expires, so an idle Connect screen drops the hint too.
+    @Published private(set) var appleDevicesUnreachable: AppleDevicesSighting?
+    private var appleDevicesExpiry: Task<Void, Never>?
+    /// The wall clock for the Apple Devices sighting. Tests replace it.
+    var now: () -> Date = { Date() }
     private var mediaLink: (any MediaLink)?
     private var usbListener: USBListener?
     private var isForeground = true
@@ -216,6 +233,7 @@ final class ConnectionManager: ObservableObject {
             ?? Int(ConnectionManager.connectionTimeoutSeconds))
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+        var appleDevicesNoteSeconds = AppleDevicesSighting.lifetime
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
@@ -403,6 +421,9 @@ final class ConnectionManager: ObservableObject {
         }
         let isUSB = receiver.isUSB
         let pairingAddress = isUSB ? "USB" : PairingStore.address(host: normalizedHost, port: port)
+        let pcTarget = isUSB ? "USB" : "\(normalizedHost):\(port)"
+        // What one PC said about Apple Devices says nothing about another.
+        if appleDevicesUnreachable?.target != pcTarget { keepAppleDevicesSighting(nil) }
         let pairingToken = explicitPairingToken ?? ((try? pairingStore.token(address: pairingAddress)) ?? Data(repeating: 0, count: 16))
         explicitPairingToken = nil
         attemptMove = isUSB ? nil : pendingMove
@@ -600,6 +621,16 @@ final class ConnectionManager: ObservableObject {
         assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
             channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: seq, reason: .gapLoss)
         }
+        // Video arrives but the first frame never completes: ask for a fresh
+        // keyframe. The PC's packet size is its own setting; no message
+        // asks it for smaller datagrams.
+        assembler.onNoFrameYet = { [weak self, weak channel] epoch, missing in
+            channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: 0, reason: .startup)
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, "assembly", "Video arrives but no frame completed in 2 s; asked the PC for a fresh keyframe: \(missing)")
+            }
+        }
         channel.reportProvider = { [weak assembler, weak channel, weak decoder, weak audio] in
             var report = metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
                 decodeDepth: decoder?.decodeDepth ?? 0,
@@ -646,6 +677,11 @@ final class ConnectionManager: ObservableObject {
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                let seen = self.now()
+                self.keepAppleDevicesSighting(info.hostCaps & HelloAck.hostCapUSB == 0
+                    ? AppleDevicesSighting(target: pcTarget, at: seen,
+                                           until: seen.addingTimeInterval(self.timing.appleDevicesNoteSeconds))
+                    : nil)
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -843,7 +879,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect(.linkFailed)
+                    self.disconnect(failure == .wifiOff ? .noNetwork : .linkFailed)
                     self.problem = failure
                     return
                 }
@@ -1328,10 +1364,35 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// Shows `sighting` until it expires, then clears it, as long as no
+    /// newer one has replaced it.
+    private func keepAppleDevicesSighting(_ sighting: AppleDevicesSighting?) {
+        appleDevicesExpiry?.cancel()
+        appleDevicesExpiry = nil
+        guard let sighting, sighting.applies(now: now()) else {
+            appleDevicesUnreachable = nil
+            return
+        }
+        appleDevicesUnreachable = sighting
+        let wait = sighting.until.timeIntervalSince(now())
+        appleDevicesExpiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self, self.appleDevicesUnreachable == sighting else { return }
+            self.appleDevicesUnreachable = nil
+        }
+    }
+
+    /// A suspended app's timer may not have fired on time: check the
+    /// sighting against the clock again, and wait out what is left of it.
+    func recheckAppleDevicesSighting() {
+        if let sighting = appleDevicesUnreachable { keepAppleDevicesSighting(sighting) }
+    }
+
     /// Resume the session that backgrounding interrupted (opt-out toggle).
     func handleAppForegrounded() {
         endBackgroundGoodbye()
         isForeground = true
+        recheckAppleDevicesSighting()
         usbPaused = usbStoppedForNoPicture
         refreshUSBAvailability()
         guard resumeOnForeground else { return }

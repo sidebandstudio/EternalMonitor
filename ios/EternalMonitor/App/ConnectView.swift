@@ -597,7 +597,8 @@ struct ConnectView: View {
                 Text(L("USB cable"))
                     .font(.app(15, .medium, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
-                Text(USBStatusText.describe(connectionManager.usbStatus))
+                Text(USBStatusText.describe(connectionManager.usbStatus,
+                    appleDevicesUnreachable: connectionManager.appleDevicesUnreachable != nil))
                     .font(.app(13.5, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
@@ -707,7 +708,9 @@ struct ConnectView: View {
                             title: host.name,
                             subtitle: Self.discoveredSubtitle(host),
                             badge: nil,
-                            paired: false
+                            paired: false,
+                            note: updates.pcNeedsUpdate(PCVersions.version(address: host.address, name: host.name))
+                                ? Self.pcUpdateNote : nil
                         )
                     }
                     .buttonStyle(RowButtonStyle())
@@ -720,6 +723,10 @@ struct ConnectView: View {
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
+
+    /// Under a found PC whose EternalMonitor is older than the newest for
+    /// Windows. Update text stays English, like the other update text.
+    static let pcUpdateNote = "Update EternalMonitor on your PC"
 
     static func discoveredSubtitle(_ host: DiscoveredHost) -> String {
         if let address = host.address { return L("Tap to connect · \(address)") }
@@ -773,7 +780,8 @@ struct ConnectView: View {
             .padding(.leading, 70)
     }
 
-    private func hostRow(icon: String, title: String, subtitle: String, badge: String?, paired: Bool) -> some View {
+    private func hostRow(icon: String, title: String, subtitle: String, badge: String?, paired: Bool,
+                         note: String? = nil) -> some View {
         HStack(spacing: 14) {
             Image(systemName: icon)
                 .font(.system(size: 16, weight: .medium))
@@ -792,6 +800,13 @@ struct ConnectView: View {
                     .font(.app(13, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
                     .lineLimit(1)
+                if let note {
+                    Label(note, systemImage: "arrow.up.circle")
+                        .font(.app(12.5, relativeTo: .caption))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("discovered.pcUpdate")
+                }
             }
             Spacer(minLength: 8)
             if paired {
