@@ -292,7 +292,7 @@ impl HealthReporter {
 pub fn run(
     listen_port: u16,
     shared: SharedControl,
-    gpu_info: GpuInfo,
+    mut gpu_info: GpuInfo,
     command_tx: mpsc::Sender<SupervisorCommand>,
     command_rx: mpsc::Receiver<SupervisorCommand>,
 ) {
@@ -382,6 +382,11 @@ pub fn run(
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 machine.note_started(generation);
                 healthy_since = Instant::now();
+                if take_late_detection(&mut gpu_info, crate::gpu::take_late_detection) {
+                    let mut stats = PIPELINE_STATS.lock();
+                    stats.set_gpu_name(gpu_info.name.clone());
+                    stats.set_codec_name(gpu_info.codec_display_name.clone());
+                }
                 pipeline = Some(spawn_generation(
                     generation,
                     listen_port,
@@ -403,6 +408,25 @@ pub fn run(
         }
     }
     info!("Supervisor loop ended");
+}
+
+/// Swap startup's software facts for what a detection given up on at
+/// startup found once it returned (`late`), so this and later pipelines
+/// encode on the graphics card. True when they changed.
+fn take_late_detection(gpu: &mut GpuInfo, late: impl FnOnce() -> Option<GpuInfo>) -> bool {
+    if !gpu.detection_stalled {
+        return false;
+    }
+    let Some(found) = late() else {
+        return false;
+    };
+    info!(
+        gpu = %found.name,
+        encoder = %found.encoder_name,
+        "GPU detection returned after startup went on without it; this pipeline uses its graphics card"
+    );
+    *gpu = found;
+    true
 }
 
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
@@ -560,6 +584,41 @@ fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: 
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_late_detection_is_used_by_the_next_pipeline_only_after_a_stall() {
+        let late = || {
+            Some(GpuInfo {
+                name: "late".to_string(),
+                encoder_name: "h264_amf".to_string(),
+                ..GpuInfo::software_fallback()
+            })
+        };
+        // Startup gave up: the next pipeline takes what it found since.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(take_late_detection(&mut gpu, late));
+        assert_eq!(
+            (
+                gpu.name.as_str(),
+                gpu.encoder_name.as_str(),
+                gpu.detection_stalled
+            ),
+            ("late", "h264_amf", false)
+        );
+        // Not returned yet: the processor goes on encoding, still marked.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(!take_late_detection(&mut gpu, || None));
+        assert!(gpu.detection_stalled);
+        // A detection that answered at startup is never replaced.
+        let mut gpu = GpuInfo::software_fallback();
+        assert!(!take_late_detection(&mut gpu, late));
+        assert_eq!(gpu.name, "Software");
+    }
     #[test]
     fn audio_failures_never_restart_or_exhaust_the_video_failure_budget() {
         let mut machine = Machine::new(7);

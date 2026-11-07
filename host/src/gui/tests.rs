@@ -424,7 +424,7 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
 
 #[test]
 fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
-    let body = software_fallback_body(false, true);
+    let body = software_fallback_body(false, true, false);
     assert!(
         body.contains("NVIDIA driver to version 570 or newer"),
         "{body}"
@@ -441,10 +441,25 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
     }
     // Custom settings are still the first thing to undo.
     assert_eq!(
-        software_fallback_body(true, true),
-        software_fallback_body(true, false)
+        software_fallback_body(true, true, false),
+        software_fallback_body(true, false, false)
     );
-    assert!(!software_fallback_body(false, false).contains("570"));
+    assert!(!software_fallback_body(false, false, false).contains("570"));
+}
+
+#[test]
+fn a_driver_that_did_not_answer_at_startup_is_named_with_a_restart() {
+    let body = software_fallback_body(false, false, true);
+    assert!(
+        body.contains("graphics driver did not respond when EternalMonitor started"),
+        "{body}"
+    );
+    assert!(body.contains("Click Restart"), "{body}");
+    for jargon in ["DXGI", "libx264", "encoder", "timed out"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // It is the reason, whatever else is true.
+    assert_eq!(body, software_fallback_body(true, true, true));
 }
 
 #[test]

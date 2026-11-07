@@ -40,9 +40,15 @@ pub enum Call {
     /// Reading the graphics cards and the screens' wiring for the second
     /// screen's decisions (`capture::second_screen::facts`).
     GpuFacts,
+    /// The graphics calls before the window's first paint: finding the
+    /// graphics cards (`gpu::GpuInfo::detect`), listing the screens, the
+    /// window renderer's adapter list and its wgpu probe. They share one
+    /// lane: they wait on the same driver, so after one hangs the others
+    /// are refused at once instead of each waiting out its own limit.
+    GpuDetect,
 }
 
-const CALLS: usize = 6;
+const CALLS: usize = 7;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +76,7 @@ impl Call {
             Self::VddEnable => "vdd_enable",
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
+            Self::GpuDetect => "gpu_detect",
         }
     }
 
@@ -99,6 +106,12 @@ impl Call {
             // adapters, as device creation begins, then asks DXCore and reads
             // the display configuration; it keeps device creation's limits.
             Self::GpuFacts => Limits::ms(1_000, 4_000),
+            // 34 startups on 3 PCs (two test PCs, one field PC's uploads):
+            // median 10 ms, slowest 44 ms, from "Support system information"
+            // to "Selected encoder". It makes the same DXGI calls as
+            // GpuFacts and keeps its limits. One AMD laptop's dxgkrnl
+            // deadlock held it 62 s, and the window with it.
+            Self::GpuDetect => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -781,6 +794,7 @@ mod tests {
             Call::VddEnable,
             Call::VddDisable,
             Call::GpuFacts,
+            Call::GpuDetect,
         ]
         .map(Call::name)
         .into();
@@ -798,6 +812,7 @@ mod tests {
             Call::EncoderOpen,
             Call::VddEnable,
             Call::GpuFacts,
+            Call::GpuDetect,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");

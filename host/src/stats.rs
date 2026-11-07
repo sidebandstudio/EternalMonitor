@@ -46,6 +46,9 @@ pub struct PipelineStats {
     /// linked FFmpeg's NVENC needs. The fallback notice then says to update
     /// it.
     pub nvidia_driver_outdated: bool,
+    /// The processor encodes because startup's GPU detection did not return
+    /// in time. The fallback notice then says the driver did not answer.
+    pub gpu_detection_stalled: bool,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -109,6 +112,7 @@ impl PipelineStats {
             codec_name: String::new(),
             using_software_fallback: false,
             nvidia_driver_outdated: false,
+            gpu_detection_stalled: false,
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -150,6 +154,7 @@ impl PipelineStats {
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
         self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
+        self.gpu_detection_stalled = previous.gpu_detection_stalled;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }

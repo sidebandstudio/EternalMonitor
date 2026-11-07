@@ -19,6 +19,7 @@
 //! `author_id`, see `widgets::automation_id`): scripts and tests find them by
 //! that id first, then by name, so the same name works in every language.
 
+mod driver_wait;
 mod feedback_panel;
 mod fonts;
 mod icons;
@@ -44,7 +45,7 @@ use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
-use crate::capture::{enumerate_outputs, OutputInfo};
+use crate::capture::{enumerate_outputs, enumerate_outputs_at_startup, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
@@ -81,6 +82,7 @@ struct StatsSnapshot {
     codec_name: String,
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
+    gpu_detection_stalled: bool,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -119,6 +121,7 @@ impl StatsSnapshot {
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
             nvidia_driver_outdated: s.nvidia_driver_outdated,
+            gpu_detection_stalled: s.gpu_detection_stalled,
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -441,7 +444,8 @@ impl AnalyzerApp {
                 String::new()
             }
         };
-        let available_outputs = enumerate_outputs();
+        // Before the first paint, so a stuck driver must not hold it.
+        let available_outputs = enumerate_outputs_at_startup();
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -1774,6 +1778,19 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
         ..Default::default()
     };
     renderer::configure(&mut options.wgpu_options);
+    // The window's thread makes its first graphics call only once the
+    // driver has answered the same calls on another thread.
+    #[cfg(windows)]
+    if !driver_wait::wait_for_driver(
+        crate::stall::lanes(),
+        crate::stall::Call::GpuDetect.limits(),
+        || renderer::adapter_probe(&options.wgpu_options),
+        &mut driver_wait::MessageNotice::default(),
+        driver_wait::POLL,
+    ) {
+        renderer::window_closed();
+        return Ok(());
+    }
 
     let result = eframe::run_native(
         "EternalMonitor",

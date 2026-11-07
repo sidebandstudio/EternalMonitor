@@ -237,6 +237,14 @@ pub fn enumerate_outputs() -> Vec<OutputInfo> {
     }
 }
 
+/// [`enumerate_outputs`] on the way to the window's first paint, in the
+/// startup graphics lane ([`crate::stall::Call::GpuDetect`]): empty if it
+/// does not return within the limit, or while an earlier startup call is
+/// still stuck on the same driver.
+pub fn enumerate_outputs_at_startup() -> Vec<OutputInfo> {
+    crate::stall::run(crate::stall::Call::GpuDetect, enumerate_outputs, || {}).unwrap_or_default()
+}
+
 /// Resolve which output (index into `outputs`) the capture loop should duplicate for
 /// `target`. `PrimaryAuto` picks the (0,0) output, else the first attached. `Output(name)`
 /// matches the `DeviceName`, falling back to the primary (with a warning) when not found —

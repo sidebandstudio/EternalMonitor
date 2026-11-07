@@ -305,6 +305,68 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
     });
 }
 
+/// The wgpu calls the window's thread makes first, for another thread to
+/// make before it: an instance with this launch's backends lists its
+/// adapters (DX12 creates a device on each to describe it). Built on the
+/// window's thread, run on another by
+/// [`super::driver_wait::wait_for_driver`]. While it lists, the marker
+/// names that thread, so a driver crash there is still the window's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn adapter_probe(config: &WgpuConfiguration) -> impl FnOnce() + Send + 'static {
+    let window = current_thread();
+    let descriptor = match &config.wgpu_setup {
+        WgpuSetup::CreateNew(setup) => Some((
+            setup.instance_descriptor.backends,
+            setup.instance_descriptor.flags,
+            setup.instance_descriptor.backend_options.clone(),
+            setup.instance_descriptor.memory_budget_thresholds,
+        )),
+        WgpuSetup::Existing(_) => None,
+    };
+    move || {
+        let Some((backends, flags, backend_options, memory_budget_thresholds)) = descriptor else {
+            return;
+        };
+        mark_thread(current_thread());
+        let started = Instant::now();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags,
+            backend_options,
+            memory_budget_thresholds,
+            display: None,
+        });
+        let listed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map(|runtime| {
+                runtime
+                    .block_on(instance.enumerate_adapters(backends))
+                    .len()
+            });
+        drop(instance);
+        info!(
+            adapters = listed.unwrap_or(0),
+            took_ms = started.elapsed().as_millis() as u64,
+            "Window renderer: the graphics driver answered before the window"
+        );
+        mark_thread(window);
+    }
+}
+
+/// Name `thread` in this launch's marker and save it again.
+fn mark_thread(thread: Option<u32>) {
+    let Ok(mut started) = STARTED.lock() else {
+        return;
+    };
+    let Some(marker) = started.as_mut() else {
+        return;
+    };
+    marker.thread = thread;
+    if let Some(directory) = STATE_DIR.get() {
+        let _ = save_marker(directory, ProcessId::current(), marker);
+    }
+}
+
 /// `WGPU_BACKEND` decides when set, as in wgpu, and nothing is narrowed or
 /// recorded then. Otherwise the saved choice, unless it failed before. Also
 /// returns why a remote rule can't apply, if one of them decides.
@@ -814,8 +876,15 @@ fn system_gpus() -> String {
 }
 
 /// Vendor, device and driver version of each DXGI adapter. Creates no device.
+/// Runs in the startup graphics lane: empty if it does not return within
+/// the limit, or while an earlier call there is still stuck.
 #[cfg(windows)]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
+    crate::stall::run(crate::stall::Call::GpuDetect, list_dxgi_adapters, || {}).unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn list_dxgi_adapters() -> Vec<(u32, u32, String)> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {

@@ -106,13 +106,18 @@ fn run_encode_loop(
         return Err(format!("{} codec not found in FFmpeg", encoder_name).into());
     }
     info!(encoder = %encoder_name, "Found encoder codec");
+    // The processor encodes only because startup's GPU detection did not
+    // return in time, and no override chose the encoder.
+    let detection_stalled = gpu.detection_stalled && shared.encoder_override.lock().is_none();
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.set_codec_name(&codec_display_name);
         // Fresh pipeline start: clear any stale software-fallback flag. The encode loop
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
-        // libx264 override is not a fallback, so it intentionally leaves this false.
-        stats.set_software_fallback(false);
+        // libx264 override is not a fallback, so it intentionally leaves this false. A
+        // stalled detection is one from the start.
+        stats.set_software_fallback(detection_stalled);
+        stats.gpu_detection_stalled = detection_stalled;
         stats.nvidia_driver_outdated = false;
     }
 

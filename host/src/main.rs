@@ -130,9 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Best-effort capture source for the banner — reflects the default (primary). The
     // authoritative per-run source (including a persisted/fallback selection) is logged
-    // inside the capture loop when the stream starts.
+    // inside the capture loop when the stream starts. Time-boxed with GPU
+    // detection: it would wait on the same driver.
     let capture_summary = {
-        let outputs = capture::enumerate_outputs();
+        let outputs = capture::enumerate_outputs_at_startup();
         outputs
             .iter()
             .find(|o| o.is_primary)
