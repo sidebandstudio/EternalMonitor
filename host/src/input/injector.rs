@@ -18,7 +18,9 @@
 //! a path the iPad already left. Input that waited longer than
 //! [`INPUT_LATE`] goes to the relay as late, which lands only a release of
 //! what the PC holds, as for input that arrived late from the iPad. Ends,
-//! key releases and session resets are never dropped or merged.
+//! key releases and session resets are never merged, and never lost: at
+//! the bound, one becomes a release of everything after the last command
+//! queued.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -34,9 +36,10 @@ use super::{
 };
 use crate::transport::session::INPUT_LATE;
 
-/// Commands kept at most. A second of a Pencil at 240 Hz with every other
-/// kind of input; while Windows is stuck, moves merge and the queue grows
-/// only by presses and releases.
+/// Commands kept at most, besides one start and one end per stream
+/// generation. A second of a Pencil at 240 Hz with every other kind of
+/// input; while Windows is stuck, moves merge and the queue grows only by
+/// presses and releases.
 const CAPACITY: usize = 1024;
 
 /// From this many waiting commands, a move replaces the move before it.
@@ -149,11 +152,11 @@ impl Command {
             && event.buttons == earlier_event.buttons
     }
 
-    /// An end, reset or generation change: what keeps the PC from holding
-    /// a key or button.
-    fn must_land(&self) -> bool {
+    /// An end or reset: what keeps the PC from holding a key or button.
+    fn releases(&self) -> bool {
         match self {
-            Command::Begin { .. } | Command::Reset | Command::End => true,
+            Command::Reset | Command::End => true,
+            Command::Begin { .. } => false,
             Command::Relay { event, .. } => event.phase > PHASE_MOVED,
         }
     }
@@ -164,6 +167,9 @@ struct Queued {
     generation: u64,
     command: Command,
     at: Instant,
+    /// A release came while the queue was full: once this command has
+    /// landed, release everything its generation holds.
+    then_reset: bool,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +179,9 @@ struct State {
     busy: bool,
     merged: u64,
     dropped: u64,
+    /// Releases that came while the queue was full, each now part of a
+    /// release of everything.
+    folded: u64,
 }
 
 /// What the transport's handles and the thread share.
@@ -195,7 +204,10 @@ impl Shared {
         let waiting = state.commands.len();
         if waiting >= self.limits.merge_from {
             if let Some(last) = state.commands.back_mut() {
-                if last.generation == generation && command.merges_with(&last.command) {
+                if last.generation == generation
+                    && !last.then_reset
+                    && command.merges_with(&last.command)
+                {
                     // The newer sample, in the older one's place: it has
                     // waited as long.
                     last.command = command;
@@ -204,16 +216,28 @@ impl Shared {
                 }
             }
         }
-        // Ends and resets may pass the bound, by as many as were pressed.
-        let capacity = self.limits.capacity;
-        if waiting >= capacity && !(command.must_land() && waiting < 2 * capacity) {
-            state.dropped += 1;
+        // A generation's start and end always go in: there is one of each
+        // per stream.
+        let boundary = matches!(command, Command::Begin { .. } | Command::End);
+        if waiting >= self.limits.capacity && !boundary {
+            let barrier = state
+                .commands
+                .back_mut()
+                .filter(|last| command.releases() && last.generation == generation);
+            match barrier {
+                Some(last) => {
+                    last.then_reset = true;
+                    state.folded += 1;
+                }
+                None => state.dropped += 1,
+            }
             return;
         }
         state.commands.push_back(Queued {
             generation,
             command,
             at: now,
+            then_reset: false,
         });
         drop(state);
         self.wake.notify_one();
@@ -433,17 +457,19 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
                     break Next::Command(queued);
                 }
                 shared.idle.notify_all();
-                let (merged, dropped) = (
+                let (merged, dropped, folded) = (
                     std::mem::take(&mut state.merged),
                     std::mem::take(&mut state.dropped),
+                    std::mem::take(&mut state.folded),
                 );
-                if backlog.stale > 0 || merged > 0 || dropped > 0 {
+                if backlog.stale > 0 || merged > 0 || dropped > 0 || folded > 0 {
                     info!(
                         stale = backlog.stale,
                         merged,
                         dropped,
+                        folded,
                         longest_ms = backlog.longest.as_millis() as u64,
-                        "Input waited for Windows: moves merged, and only releases sent of what waited too long"
+                        "Input waited for Windows: moves merged, only releases sent of what waited too long, and everything released for releases past the bound"
                     );
                     backlog = Backlog::default();
                 }
@@ -474,6 +500,7 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
             generation,
             command,
             at,
+            then_reset,
         }) = next
         {
             let started = Instant::now();
@@ -516,6 +543,13 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
                 }
                 // An ended generation's: its end released what it held.
                 Command::End | Command::Reset | Command::Relay { .. } => {}
+            }
+            if then_reset
+                && current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+            {
+                sink.reset();
             }
             note_slow(started, "input");
             note_pen(shared, sink);
@@ -828,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_drops_new_moves_and_presses_but_keeps_releases() {
+    fn a_full_queue_drops_new_moves_and_presses_and_turns_a_release_into_a_reset() {
         let harness = harness(Limits {
             capacity: 3,
             merge_from: 100,
@@ -843,16 +877,51 @@ mod tests {
         harness.send(KIND_KEY, PHASE_ENDED, 6);
         harness.injector.as_ref().unwrap().reset();
         harness.go.send(()).unwrap();
+        // The key-up and the reset after it become one release of
+        // everything, after the last press queued.
+        let expected = [
+            relayed(KIND_KEY, PHASE_BEGAN, 0),
+            relayed(KIND_KEY, PHASE_BEGAN, 1),
+            relayed(KIND_KEY, PHASE_BEGAN, 2),
+            relayed(KIND_KEY, PHASE_BEGAN, 3),
+            Call::Reset,
+        ];
+        assert_eq!(harness.wait_for(5), expected);
+        harness.settled(expected.len());
+    }
+
+    /// Windows stays stuck while the queue fills to its bound and then
+    /// releases keep coming: the key-ups, and the disconnect's reset after
+    /// them. However many pile up, what the PC holds is released once
+    /// Windows answers, and nothing pressed lands after that.
+    #[test]
+    fn releases_past_the_hard_limit_still_release_everything() {
+        let harness = harness(Limits::default());
+        harness.stuck();
+        for id in 1..=CAPACITY as u32 {
+            harness.send(KIND_KEY, PHASE_BEGAN, id);
+        }
+        for id in 1..=CAPACITY as u32 {
+            harness.send(KIND_KEY, PHASE_ENDED, 10_000 + id);
+        }
+        harness.send(KIND_KEY, PHASE_BEGAN, 20_000);
+        harness.injector.as_ref().unwrap().reset();
+        harness.go.send(()).unwrap();
+        assert!(harness.thread.finish(Duration::from_secs(5)));
+        let calls = harness.calls.lock().clone();
         assert_eq!(
-            harness.wait_for(6),
-            [
-                relayed(KIND_KEY, PHASE_BEGAN, 0),
-                relayed(KIND_KEY, PHASE_BEGAN, 1),
-                relayed(KIND_KEY, PHASE_BEGAN, 2),
-                relayed(KIND_KEY, PHASE_BEGAN, 3),
-                relayed(KIND_KEY, PHASE_ENDED, 6),
-                Call::Reset,
-            ]
+            calls.last(),
+            Some(&Call::Reset),
+            "{:?}",
+            &calls[calls.len() - 3..]
+        );
+        assert!(calls.len() <= 2 * CAPACITY + 1, "{}", calls.len());
+        let pressed: Vec<_> = calls[1..=CAPACITY].to_vec();
+        assert_eq!(
+            pressed,
+            (1..=CAPACITY as u32)
+                .map(|id| relayed(KIND_KEY, PHASE_BEGAN, id))
+                .collect::<Vec<_>>()
         );
     }
 
