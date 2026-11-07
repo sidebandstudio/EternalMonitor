@@ -169,11 +169,21 @@ pub struct HelloAck {
     pub host_caps: u16,
 }
 
+/// [`Heartbeat::notice`] values. A notice is appended to the heartbeat only
+/// when it is not [`NOTICE_NONE`]: iPads older than the field ignore the byte,
+/// and an iPad ignores a value it does not know.
+pub const NOTICE_NONE: u8 = 0;
+/// The PC is locked or shows a permission prompt, so Windows lets nothing
+/// capture its screen and the picture stops until the user returns.
+pub const NOTICE_PC_LOCKED: u8 = 1;
+
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Heartbeat {
     pub host_time_us: u64,
     pub stream_config: StreamConfig,
+    /// What the iPad should say over the picture, for as long as it lasts.
+    pub notice: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +415,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut cfg = [0u8; STREAM_CONFIG_SIZE];
             hb.stream_config.encode_into(&mut cfg);
             body.extend_from_slice(&cfg);
+            if hb.notice != NOTICE_NONE {
+                body.push(hb.notice);
+            }
         }
         ControlMessage::Bye(reason) => body.push(*reason as u8),
         ControlMessage::KeyframeRequest(k) => {
@@ -589,6 +602,11 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
         PacketType::Heartbeat => ControlMessage::Heartbeat(Heartbeat {
             host_time_us: r.u64()?,
             stream_config: StreamConfig::decode(r.take(STREAM_CONFIG_SIZE)?)?,
+            notice: if r.remaining() >= 1 {
+                r.u8()?
+            } else {
+                NOTICE_NONE
+            },
         }),
         PacketType::Bye => ControlMessage::Bye(
             ByeReason::from_u8(r.u8()?).ok_or(WireError::InvalidField("bye_reason"))?,
@@ -908,6 +926,7 @@ mod tests {
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
                 stream_config: sample_config(),
+                notice: NOTICE_NONE,
             }),
             ControlMessage::Bye(ByeReason::AppBackground),
             ControlMessage::KeyframeRequest(KeyframeRequest {
@@ -986,6 +1005,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_heartbeat_notice_is_appended_only_when_there_is_one() {
+        let heartbeat = |notice| {
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: sample_config(),
+                notice,
+            })
+        };
+        // No notice: the bytes every earlier iPad already reads.
+        let plain = encode_control(7, 1, &heartbeat(NOTICE_NONE));
+        assert_eq!(plain.len(), CONTROL_HEADER_SIZE + 8 + STREAM_CONFIG_SIZE);
+        // A notice is one byte more. Such a body, cut back to the old length
+        // as an older iPad reads it, is the plain heartbeat; an unknown value
+        // reaches the iPad as it is, for it to ignore.
+        for notice in [NOTICE_PC_LOCKED, 0xC8] {
+            let datagram = encode_control(7, 1, &heartbeat(notice));
+            assert_eq!(datagram.len(), plain.len() + 1);
+            assert_eq!(datagram[..plain.len()][8..], plain[8..]);
+            assert_eq!(parse_control(&datagram).unwrap().1, heartbeat(notice));
+            for len in 0..datagram.len() {
+                assert!(parse_control(&datagram[..len]).is_err());
+            }
+        }
+        assert_eq!(parse_control(&plain).unwrap().1, heartbeat(NOTICE_NONE));
     }
 
     #[test]
