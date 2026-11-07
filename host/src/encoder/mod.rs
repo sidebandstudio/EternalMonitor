@@ -890,13 +890,15 @@ impl EncoderState {
     }
 
     fn next_pts(&mut self, captured: Instant, frame_number: u64) -> i64 {
-        if self.legacy_pts {
-            return frame_number as i64;
-        }
-        let epoch = *self.pts_epoch.get_or_insert(captured);
-        let real = captured.saturating_duration_since(epoch).as_micros() as i64;
-        // Strict monotonicity (keepalive resends and clock quirks).
-        let pts = real.max(self.last_pts + 1);
+        let pts = if self.legacy_pts {
+            frame_number as i64
+        } else {
+            let epoch = *self.pts_epoch.get_or_insert(captured);
+            captured.saturating_duration_since(epoch).as_micros() as i64
+        };
+        // Strict monotonicity (keepalive resends, a picture given again with
+        // its capture number and time, and clock quirks).
+        let pts = pts.max(self.last_pts + 1);
         self.last_pts = pts;
         pts
     }
@@ -4708,6 +4710,35 @@ mod tests {
             data: std::sync::Arc::clone(data),
             width: 2,
             height: 2,
+        }
+    }
+
+    /// A picture given again to bring out a keyframe keeps its capture time
+    /// and number, but is a separate frame to the encoder: it must not share
+    /// the PTS of the frame before it, under ETERNAL_LEGACY_PTS too.
+    #[test]
+    fn a_picture_given_again_gets_its_own_pts_in_both_pts_modes() {
+        ffmpeg_next::init().unwrap();
+        for legacy in [false, true] {
+            let mut state = libx264_at(640, 360);
+            state.legacy_pts = legacy;
+            let captured = Instant::now();
+            // Frame 7, given again twice, then capture's next frame.
+            let frames = [(captured, 7), (captured, 7), (captured, 7)]
+                .into_iter()
+                .chain([(captured + Duration::from_millis(16), 8)]);
+            let mut pts = Vec::new();
+            for (at, n) in frames {
+                let next = state.next_pts(at, n);
+                state.frame.set_pts(Some(next));
+                state.send_frame(next, at, n).unwrap();
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {}
+                pts.push(next);
+            }
+            assert!(
+                pts.windows(2).all(|pair| pair[0] < pair[1]),
+                "legacy={legacy}: PTS {pts:?}"
+            );
         }
     }
 
