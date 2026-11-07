@@ -41,6 +41,10 @@ use tracing::warn;
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
 use crate::gpu_preference::AdapterId;
 pub(crate) use memory::PANEL_LOST;
+
+/// The Stream page's reason for a lost panel from before the last restart:
+/// the panel is back, and Second screen only waits to be chosen again.
+pub(crate) const PANEL_LOST_BEFORE: &str = "panel_lost_before";
 use memory::{Hold, Memory};
 
 #[cfg(any(windows, test, debug_assertions))]
@@ -172,6 +176,8 @@ pub(crate) struct State {
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
     memory: Memory,
+    /// This app run's Enable took the built-in panel away.
+    panel_lost_this_run: bool,
     /// Windows refused the mirror's screen from the card EternalMonitor
     /// captures on, which the display configuration then wired to another
     /// card: see [`note_mirror_refused`].
@@ -501,6 +507,8 @@ pub fn load_memory(shared: &SharedControl) {
         Instant::now(),
     );
     memory.set_rule(rule, dir.join(memory::RULE_FILE_NAME));
+    let uptime = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } / 1000;
+    memory.set_boot(wall.saturating_sub(uptime));
     shared.second_screen.lock().memory = memory;
     #[cfg(not(test))]
     display_power::watch();
@@ -699,6 +707,18 @@ pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str>
         VddStatus::TaskFailed => Some(failure.unwrap_or("enable_failed")),
         _ => None,
     }
+}
+
+/// [`remembered_failure`] for the Stream page's notice, where a lost panel
+/// from before the last restart is [`PANEL_LOST_BEFORE`]: only one that is
+/// still off asks for a restart.
+pub(crate) fn notice_failure(shared: &SharedControl) -> Option<&'static str> {
+    let failure = remembered_failure(shared);
+    let state = shared.second_screen.lock();
+    if failure == Some(PANEL_LOST) && !state.panel_lost_this_run && !state.memory.panel_lost_now() {
+        return Some(PANEL_LOST_BEFORE);
+    }
+    failure
 }
 
 /// The user asked to try again: a failed start, or one whose thread is gone,
@@ -1524,6 +1544,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             *status = VddStatus::Failed;
             let mut state = shared.second_screen.lock();
             state.failure = Some(PANEL_LOST);
+            state.panel_lost_this_run = true;
             state.remember_panel_lost(now);
         }
         AttachResult::TimedOut => {

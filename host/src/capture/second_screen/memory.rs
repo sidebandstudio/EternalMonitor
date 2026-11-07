@@ -223,6 +223,8 @@ struct Failed {
     reason: &'static str,
     failures: u32,
     failed_at: u64,
+    /// Noted by this app run, not read from the file.
+    this_run: bool,
 }
 
 /// Where the failure is saved and what it is for. Without one, as in unit
@@ -269,6 +271,8 @@ pub(crate) struct Memory {
     /// failure and its count stay for the next app run.
     excused: bool,
     rule: Option<Rule>,
+    /// When Windows last started, in seconds since 1970, once known.
+    booted_at: Option<u64>,
 }
 
 impl Memory {
@@ -313,6 +317,7 @@ impl Memory {
                 reason,
                 failures: record.failures,
                 failed_at: record.failed_at,
+                this_run: false,
             }),
         };
         let saver = Arc::new(Saver::new(spawn));
@@ -331,6 +336,7 @@ impl Memory {
             failed,
             excused: false,
             rule: None,
+            booted_at: None,
         };
         if let Some(failed) = memory.failed {
             let hold = memory.hold(now);
@@ -447,6 +453,25 @@ impl Memory {
         })
     }
 
+    /// When Windows last started, in seconds since 1970: a lost panel saved
+    /// before it was mended by that restart.
+    pub(crate) fn set_boot(&mut self, booted_at: u64) {
+        self.booted_at = Some(booted_at);
+    }
+
+    /// Whether the saved failure is a lost panel that is still off: noted by
+    /// this app run, or saved since Windows last started. Not one from before
+    /// a restart, nor any while the start is unknown.
+    pub(crate) fn panel_lost_now(&self) -> bool {
+        self.failed.is_some_and(|failed| {
+            failed.reason == PANEL_LOST
+                && (failed.this_run
+                    || self
+                        .booted_at
+                        .is_some_and(|booted_at| failed.failed_at >= booted_at))
+        })
+    }
+
     /// Whether a failure is saved, held or due, and not
     /// [`Memory::excused`].
     pub(crate) fn saved(&self) -> bool {
@@ -482,6 +507,7 @@ impl Memory {
             reason,
             failures,
             failed_at,
+            this_run: true,
         });
         self.hold(now)
     }
@@ -931,9 +957,9 @@ fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        attach, next_step, note_attached, note_connected, note_image, remembered_failure,
-        retries_later, set_facts, start_proving, Driver, Failure, Step, TurnedOn,
-        BLOCKED_EXTEND_RETRY, PROVE_TIMEOUT,
+        attach, next_step, note_attached, note_connected, note_image, notice_failure,
+        remembered_failure, retries_later, set_facts, start_proving, Driver, Failure, Step,
+        TurnedOn, BLOCKED_EXTEND_RETRY, PANEL_LOST_BEFORE, PROVE_TIMEOUT,
     };
     use super::*;
     use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
@@ -1178,6 +1204,48 @@ mod tests {
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         *shared.vdd_status.lock() = VddStatus::WaitingForClient;
         assert_eq!(next_step(&shared, later), Step::Attach);
+        remove_folder(&path);
+    }
+
+    /// The Stream page asks for a restart only while the panel is off: in
+    /// the app run that lost it, and in a later one before the PC restarts.
+    /// After the restart the panel is back, and the notice only says that
+    /// Second screen waits to be chosen again.
+    #[test]
+    fn a_lost_panel_asks_for_a_restart_only_until_the_pc_restarted() {
+        let path = temp_file("panel-lost-notice");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches {
+            turned_on: TurnedOn::PanelLost,
+            ..NeverAttaches::new(start)
+        };
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(notice_failure(&shared), Some(PANEL_LOST));
+        // The user quits and starts the app again, with no restart between:
+        // Windows started an hour before the failure.
+        for (booted_at, notice) in [
+            (T0 - HOUR, PANEL_LOST),
+            // The restart, ten minutes after it.
+            (T0 + 600, PANEL_LOST_BEFORE),
+        ] {
+            let (mut memory, later) = app_run(&path, Duration::from_secs(1200));
+            memory.set_boot(booted_at);
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            note_connected(&shared, later);
+            assert_eq!(next_step(&shared, later), Step::Nothing, "held");
+            assert_eq!(remembered_failure(&shared), Some(PANEL_LOST));
+            assert_eq!(notice_failure(&shared), Some(notice), "{booted_at}");
+        }
+        // Without the start known, a saved one counts as from before.
+        let (memory, later) = app_run(&path, Duration::from_secs(1200));
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, later), Step::Nothing);
+        assert_eq!(notice_failure(&shared), Some(PANEL_LOST_BEFORE));
         remove_folder(&path);
     }
 

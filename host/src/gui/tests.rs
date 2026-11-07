@@ -709,6 +709,29 @@ fn a_lost_built_in_screen_says_to_restart_not_to_extend() {
     }
 }
 
+/// After the restart that brought the panel back, the notice is calm: no
+/// restart, only that Second screen is paused until it is chosen again.
+#[test]
+fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for problem in [None, Some(VddProblem::NotExtended)] {
+        let paused = second_screen_notice(
+            VddStatus::Failed,
+            VddTaskHealth::Ok,
+            problem,
+            Some("panel_lost_before"),
+        )
+        .unwrap();
+        assert_eq!(
+            paused.body,
+            "Second screen is paused on this laptop because it turned off the built-in screen last time. Click Try again to use it."
+        );
+        assert!(paused.retry && !paused.installer);
+    }
+}
+
 /// A second screen failure remembered for this PC is tried again later by
 /// itself; the notice says so beside Try again.
 #[test]

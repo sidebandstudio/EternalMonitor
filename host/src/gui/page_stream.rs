@@ -127,7 +127,7 @@ impl AnalyzerApp {
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
-        let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
+        let vdd_failure = crate::capture::second_screen::notice_failure(&self.control.shared);
         if let Some(mut notice) =
             second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
         {
@@ -920,6 +920,12 @@ pub(super) fn second_screen_notice(
         // Windows left the device as not extended too, but Extend can't help.
         (Failed, _, _) if failure == Some("panel_lost") => notice(
             "Your laptop's built-in screen turned off when the second screen started, and Windows only turns it back on after a restart. Until then your desktop is on the iPad: save your work there, then restart the PC. On this PC the second screen can turn the built-in screen off again, so the iPad shows your main screen until you click Try again or choose Second screen again.",
+            true,
+            false,
+        ),
+        // The same, after the restart that brought the panel back.
+        (Failed, _, _) if failure == Some("panel_lost_before") => notice(
+            "Second screen is paused on this laptop because it turned off the built-in screen last time. Click Try again to use it.",
             true,
             false,
         ),
