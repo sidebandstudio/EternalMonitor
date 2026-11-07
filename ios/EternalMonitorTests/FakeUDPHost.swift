@@ -156,9 +156,9 @@ final class FakeUDPHost: @unchecked Sendable {
     }
 
     /// A session 41 heartbeat, as the PC sends one each second.
-    func sendHeartbeat() {
+    func sendHeartbeat(notice: UInt8 = Heartbeat.noticeNone) {
         send(Wire.encodeControl(sessionId: 41, msgSeq: 3, message: .heartbeat(
-            Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig()))))
+            Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig(), notice: notice))))
     }
 
     /// The 64x64 H.264 keyframe fixture.

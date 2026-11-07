@@ -111,6 +111,9 @@ final class ConnectionManager: ObservableObject {
     /// Frames still arrive, but the picture has been held for over a second
     /// waiting for the keyframe that replaces a lost frame.
     @Published var pictureRestoring = false
+    /// The PC is locked or shows a permission prompt, so it can't capture and
+    /// the picture is held. Its heartbeats say so until capture works again.
+    @Published var pcLocked = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -416,6 +419,7 @@ final class ConnectionManager: ObservableObject {
         linkFailure = nil
         versionMismatch = nil
         signalLost = false
+        pcLocked = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -763,6 +767,11 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.hostStreamConfig = heartbeat.streamConfig
+                let locked = heartbeat.notice == Heartbeat.noticePCLocked
+                if locked != self.pcLocked {
+                    self.pcLocked = locked
+                    self.record(.info, "ctrl", locked ? "PC locked: holding the picture" : "PC unlocked")
+                }
             }
         }
         channel.onStreamConfig = { [weak self, weak assembler] config in
@@ -1395,6 +1404,7 @@ final class ConnectionManager: ObservableObject {
         stats = StreamStats()
         signalLost = false
         pictureRestoring = false
+        pcLocked = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil

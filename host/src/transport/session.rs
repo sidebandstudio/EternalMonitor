@@ -337,6 +337,11 @@ pub trait ConfigSource {
     fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
         None
     }
+
+    /// The heartbeat's notice for the iPad (`NOTICE_*` in the wire crate).
+    fn notice(&self) -> u8 {
+        eternal_wire::v2::control::NOTICE_NONE
+    }
 }
 
 pub struct Session {
@@ -1065,6 +1070,7 @@ impl Session {
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
                 stream_config: self.negotiated_config(config),
+                notice: config.notice(),
             });
             actions.replies.push((
                 peer,
