@@ -586,12 +586,14 @@ pub(crate) fn simulate_window_failure() {
 }
 
 /// [`SIMULATE_ENV`] asks for `device-lost-later`.
+#[cfg(any(debug_assertions, feature = "fault-injection"))]
 pub(crate) fn device_loss_requested() -> bool {
     simulated() == "device-lost-later"
 }
 
 /// True once, 15 s after the window works, when [`device_loss_requested`]:
 /// the window's graphics device is to be lost then.
+#[cfg(any(debug_assertions, feature = "fault-injection"))]
 pub(crate) fn simulate_device_loss_now() -> bool {
     static DONE: AtomicBool = AtomicBool::new(false);
     device_loss_requested()

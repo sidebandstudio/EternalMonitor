@@ -497,30 +497,36 @@ fn lose_launch(directory: &Path, marker: &Marker, owner: ProcessId) {
 /// Drop eframe's copy of the window's first device, which is kept for paint
 /// callbacks the window has none of. A lost device is only replaced once
 /// nothing holds it: D3D12 keeps one device per GPU in a process, and the
-/// window's old swapchain stays with it. When [`crate::startup::SIMULATE_ENV`]
-/// asks for a device loss, the copy is kept until then, and the device is lost
-/// on purpose: DX12 removes it, as a driver reset does; other backends destroy
-/// it.
+/// window's old swapchain stays with it.
 pub(super) fn release_render_state(frame: &mut eframe::Frame) {
-    if crate::startup::device_loss_requested() && !crate::startup::simulate_device_loss_now() {
+    #[cfg(any(debug_assertions, feature = "fault-injection"))]
+    if crate::startup::device_loss_requested() {
+        // The copy is kept until the simulated loss.
+        if crate::startup::simulate_device_loss_now() {
+            if let Some(render_state) = frame.wgpu_render_state.take() {
+                lose_device(&render_state.device);
+            }
+        }
         return;
     }
-    let Some(render_state) = frame.wgpu_render_state.take() else {
-        return;
-    };
-    if !crate::startup::device_loss_requested() {
-        return;
-    }
+    frame.wgpu_render_state = None;
+}
+
+/// Lose the window's device on purpose, when [`crate::startup::SIMULATE_ENV`]
+/// asks: with the `fault-injection` feature DX12 removes it, as a driver reset
+/// does; otherwise it is destroyed.
+#[cfg(any(debug_assertions, feature = "fault-injection"))]
+fn lose_device(device: &wgpu::Device) {
     warn!("Simulated loss of the window's graphics device");
-    #[cfg(windows)]
-    if remove_dx12_device(&render_state.device) {
+    #[cfg(all(windows, feature = "fault-injection"))]
+    if remove_dx12_device(device) {
         return;
     }
-    render_state.device.destroy();
+    device.destroy();
 }
 
 /// `ID3D12Device5::RemoveDevice` on a DX12 device; false on other backends.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "fault-injection"))]
 fn remove_dx12_device(device: &wgpu::Device) -> bool {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Device5};
