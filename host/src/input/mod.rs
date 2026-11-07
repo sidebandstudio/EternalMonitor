@@ -11,6 +11,8 @@ mod hid;
 pub use hid::hid_to_scancode;
 
 mod injector;
+#[cfg(test)]
+pub(crate) use injector::Sink;
 pub use injector::{Injector, InputThread};
 
 #[cfg(windows)]

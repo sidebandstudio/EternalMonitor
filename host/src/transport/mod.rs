@@ -1558,6 +1558,192 @@ mod tests {
         );
     }
 
+    /// Windows holds the input thread inside a still Pencil's refresh. The
+    /// loop takes the capture rect for every input datagram, so a refresh
+    /// that kept it while Windows held the call stopped the loop at the
+    /// iPad's next touch: no heartbeats, no HELLO answers, no goodbye.
+    #[test]
+    fn a_pen_refresh_windows_holds_never_stops_the_loop() {
+        use crate::input::{CaptureGeometry, InputThread, Sink, KIND_KEY, PHASE_BEGAN};
+        use eternal_wire::v2::control::{HelloStatus, InputEvent, FEATURE_WANTS_INPUT};
+
+        /// Holds the first refresh until told to go on.
+        struct StuckRefresh {
+            entered: Option<std_mpsc::Sender<()>>,
+            hold: Option<std_mpsc::Receiver<()>>,
+        }
+        impl Sink for StuckRefresh {
+            fn relay(&mut self, _: u32, _: &InputEvent, _: CaptureGeometry, _: bool) {}
+            fn reset(&mut self) {}
+            fn keep_alive(&mut self, _: Option<CaptureGeometry>) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(hold) = self.hold.take() {
+                    let _ = hold.recv();
+                }
+            }
+            fn pen_available(&self) -> bool {
+                true
+            }
+            fn spaced_until(&self) -> Option<Instant> {
+                None
+            }
+            fn tick_needed(&self) -> bool {
+                true
+            }
+        }
+
+        let ipad = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        ipad.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .unwrap()
+            .port();
+        let host = SocketAddr::from(([127, 0, 0, 1], port));
+        let (entered_tx, entered) = std_mpsc::channel();
+        let (go, hold) = std_mpsc::channel();
+        let mut shared = SharedControl::new(port, 15_000_000);
+        shared.input = std::sync::Arc::new(InputThread::with_fake(move || StuckRefresh {
+            entered: Some(entered_tx),
+            hold: Some(hold),
+        }));
+        shared.pairing.lock().required = false;
+        shared.running.store(true, Ordering::SeqCst);
+        *shared.capture_geometry.lock() = Some(CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1280,
+            height: 720,
+        });
+        let (nal_tx, nal_rx) = mpsc::channel(4);
+        let control = shared.clone();
+        let transport = std::thread::spawn(move || {
+            let (_audio_tx, audio_rx) = mpsc::channel(4);
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(start_sender(nal_rx, audio_rx, port, control, supervisor_tx))
+                .unwrap();
+        });
+        // The refresh ticks from the stream's start; Windows holds it.
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the input thread refreshes the pen");
+
+        let mut msg_seq = 0;
+        let mut send = |session_id, message: &ControlMessage| {
+            msg_seq += 1;
+            ipad.send_to(&encode_control(session_id, msg_seq, message), host)
+                .unwrap();
+        };
+        let heard = |until: Instant| {
+            let mut messages = Vec::new();
+            let mut bytes = [0u8; 2048];
+            while Instant::now() < until {
+                if let Ok((len, _)) = ipad.recv_from(&mut bytes) {
+                    if let Ok((_, message)) = parse_control(&bytes[..len]) {
+                        messages.push(message);
+                    }
+                }
+            }
+            messages
+        };
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_WANTS_INPUT,
+            screen_px_w: 1280,
+            screen_px_h: 720,
+            screen_pt_w: 1280,
+            screen_pt_h: 720,
+            refresh_hz: 60,
+            device_name: "Pen refresh test".into(),
+            device_id: 1,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let started = Instant::now();
+        let session_id = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no HELLO answer"
+            );
+            send(0, &hello);
+            let accepted = heard(Instant::now() + Duration::from_millis(200))
+                .into_iter()
+                .find_map(|message| match message {
+                    ControlMessage::HelloAck(ack) if ack.status == HelloStatus::Ok => {
+                        Some(ack.session_id)
+                    }
+                    _ => None,
+                });
+            if let Some(id) = accepted {
+                break id;
+            }
+        };
+
+        // The iPad keeps typing while Windows holds the refresh; the loop
+        // keeps its heartbeats going.
+        let mut watch = beat::Watch::default();
+        let mut verdicts = Vec::new();
+        let mut heartbeats = 0;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut event_id = 0;
+        while Instant::now() < until {
+            event_id += 1;
+            send(
+                session_id,
+                &ControlMessage::InputEvent(InputEvent {
+                    input_ver: 1,
+                    kind: KIND_KEY,
+                    phase: PHASE_BEGAN,
+                    buttons: 0,
+                    event_id,
+                    x_norm: 0,
+                    y_norm: 0,
+                    pressure_x1000: 0,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0x01,
+                    modifiers: 0,
+                    client_time_us: 0,
+                    tilt_x: 0,
+                    tilt_y: 0,
+                }),
+            );
+            heartbeats += heard(Instant::now() + Duration::from_millis(100))
+                .iter()
+                .filter(|message| matches!(message, ControlMessage::Heartbeat(_)))
+                .count();
+            verdicts.extend(watch.check(
+                shared.transport_beat.read(),
+                crate::clock::host_now_us() / 1000,
+            ));
+        }
+        let stuck = heartbeats < 2 || !verdicts.is_empty();
+        if stuck {
+            // Let a stuck loop go, so the test ends.
+            let _ = go.send(());
+        }
+        assert!(
+            heartbeats >= 2,
+            "heartbeats while Windows held the refresh: {heartbeats}"
+        );
+        assert_eq!(verdicts, []);
+        shared.stop();
+        drop(nal_tx);
+        transport.join().unwrap();
+        let _ = go.send(());
+    }
+
     #[test]
     fn a_failed_send_names_the_link_and_repeats_identically() {
         let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));

@@ -253,6 +253,11 @@ impl InputThread {
 
     /// A thread driving a test's fake instead of Windows.
     #[cfg(test)]
+    pub(crate) fn with_fake<S: Sink>(sink: impl FnOnce() -> S + Send + 'static) -> Self {
+        Self::with_sink(Limits::default(), sink)
+    }
+
+    #[cfg(test)]
     fn with_sink<S: Sink>(limits: Limits, sink: impl FnOnce() -> S + Send + 'static) -> Self {
         let thread = Self::default();
         let _ = thread.shared.set(spawn(limits, sink));
@@ -527,8 +532,11 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
             if tick_due {
                 next_tick = now + PEN_TICK;
             }
+            // Copied out first: the transport takes this lock for every
+            // input datagram, and Windows can hold the refresh.
+            let output = *current.geometry.lock();
             let started = Instant::now();
-            sink.keep_alive(*current.geometry.lock());
+            sink.keep_alive(output);
             note_slow(started, "pen_refresh");
         }
     }
