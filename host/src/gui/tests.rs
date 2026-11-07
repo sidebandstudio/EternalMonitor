@@ -680,6 +680,35 @@ fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
     assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
 }
 
+/// The hybrid laptop's lost panel: Windows also leaves the display "not
+/// extended", but Extend can't bring the panel back, so the notice says to
+/// restart, and that Try again can take the panel again.
+#[test]
+fn a_lost_built_in_screen_says_to_restart_not_to_extend() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for problem in [None, Some(VddProblem::NotExtended)] {
+        let lost = second_screen_notice(
+            VddStatus::Failed,
+            VddTaskHealth::Ok,
+            problem,
+            Some("panel_lost"),
+        )
+        .unwrap();
+        assert!(
+            lost.body.starts_with(
+                "Your laptop's built-in screen turned off when the second screen started"
+            ),
+            "{}",
+            lost.body
+        );
+        assert!(lost.body.contains("restart the PC"), "{}", lost.body);
+        assert!(!lost.body.contains("Extend"), "{}", lost.body);
+        assert!(lost.retry && !lost.installer);
+    }
+}
+
 /// A second screen failure remembered for this PC is tried again later by
 /// itself; the notice says so beside Try again.
 #[test]

@@ -28,6 +28,17 @@
 //! One attempt per change. Between two calls the guard reads the screens
 //! again, and stops if one came back or they can't be read.
 //!
+//! On a hybrid laptop (AMD integrated and discrete graphics), the virtual
+//! display's arrival also takes the built-in panel away below the layout:
+//! Windows lists the panel's target as unavailable, every layout that names
+//! it is refused, and only a restart gives it back. The guard tells that
+//! case apart, on a PC with more than one graphics card, by the panel's
+//! target: the virtual display is on, the panel is not, and no built-in
+//! target is offered any more. It then makes no `SetDisplayConfig` call and
+//! never turns the display off: the desktop stays on it, which the iPad
+//! still shows. Only when Windows ends the session does the turn off run,
+//! so the restart that brings the panel back starts without the display.
+//!
 //! The layout from before a turn on is also kept on disk, so the failure
 //! reporter, a new process, compares with it when the host that turned
 //! the display on ended. The record names that host by id and start time,
@@ -142,6 +153,13 @@ pub trait Displays {
     fn internal_only(&mut self) -> Result<(), i32>;
     /// `SetDisplayConfig` with "Extend".
     fn extend(&mut self) -> Result<(), i32>;
+    /// What Windows offers of the built-in panel's targets now, active or
+    /// not. `None` when it can't say.
+    fn built_in(&mut self) -> Option<BuiltIn>;
+    /// The PC has more than one graphics card.
+    fn hybrid(&self) -> bool;
+    /// Windows is ending the session: shutting down, restarting or signing out.
+    fn session_ending(&self) -> bool;
     fn sleep(&mut self, duration: Duration);
     fn log(&mut self, warn: bool, text: &str);
     /// The host whose layout from before its turn on is kept on disk: this
@@ -163,6 +181,18 @@ pub trait Saved: Sized {
     fn decode(text: &str) -> Option<Self>;
 }
 
+/// The built-in panel's targets, as `QDC_ALL_PATHS` lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltIn {
+    /// None listed: a desktop PC.
+    Missing,
+    /// At least one is available for a path.
+    Offered,
+    /// Listed, and none available: a closed lid, or the hybrid laptop's
+    /// panel after the virtual display took it.
+    Withdrawn,
+}
+
 /// How a change ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -179,6 +209,9 @@ pub enum Outcome {
     /// it changed nothing more.
     Recovered,
     Failed,
+    /// A turn on took the built-in panel away for good: see [`lost_panel`].
+    /// Nothing was tried, and the display stays on.
+    PanelLost,
 }
 
 const RECORD_HEADER: &str = "eternalmonitor-screens 1";
@@ -283,6 +316,8 @@ pub struct Guard<S> {
     /// The last turn on left the virtual display alone, and "Extend" did
     /// not put the PC's screens beside it: it will not attach.
     alone: bool,
+    /// The last turn on took the built-in panel away for good.
+    panel_lost: bool,
 }
 
 impl<S> Default for Guard<S> {
@@ -296,6 +331,7 @@ impl<S> Guard<S> {
         Self {
             reference: None,
             alone: false,
+            panel_lost: false,
         }
     }
 
@@ -303,6 +339,12 @@ impl<S> Guard<S> {
     /// real screen beside it.
     pub fn alone(&self) -> bool {
         self.alone
+    }
+
+    /// Whether the last turn on took the built-in panel away until the PC
+    /// restarts.
+    pub fn panel_lost(&self) -> bool {
+        self.panel_lost
     }
 }
 
@@ -360,6 +402,7 @@ impl<S: Saved> Guard<S> {
         );
         displays.log(false, &text);
         let alone = layout.as_ref().is_some_and(|layout| alone(&layout.screens));
+        let screens = layout.as_ref().map(|layout| layout.screens.clone());
         if enabled {
             // A turn on can run while the display is still on: after an
             // Enable that finished once the host had given up on it, or a
@@ -394,16 +437,40 @@ impl<S: Saved> Guard<S> {
             }
             self.reference = kept.or(layout);
         }
-        if !enabled && alone {
-            return self.take_back_before_off(displays);
+        if let (false, true, Some(screens)) = (enabled, alone, screens) {
+            return self.take_back_before_off(displays, &screens);
         }
         true
     }
 
     /// The virtual display is the only screen on, and is about to turn off:
     /// put a real screen back first. False when none came back and the PC
-    /// had one before, so the turn off must not run.
-    fn take_back_before_off(&mut self, displays: &mut impl Displays<Saved = S>) -> bool {
+    /// had one before, so the turn off must not run, nor while the panel is
+    /// lost. Windows ending the session lets it run: the desktop goes, and
+    /// the next start then begins without the display. `screens`: now.
+    fn take_back_before_off(
+        &mut self,
+        displays: &mut impl Displays<Saved = S>,
+        screens: &[Screen],
+    ) -> bool {
+        if displays.session_ending() {
+            displays.log(
+                false,
+                "Windows is ending the session — turning off the virtual display, the only \
+                 screen on, so the next start begins without it outcome=session_end",
+            );
+            return true;
+        }
+        if lost_panel(displays, screens) {
+            let text = format!(
+                "Leaving the virtual display on: the built-in screen is still unavailable, and \
+                 turning the display off would leave the PC with no screen outcome=kept_on \
+                 reason=panel_lost {}; restarting the PC brings the built-in screen back",
+                line(Some(screens))
+            );
+            displays.log(true, &text);
+            return false;
+        }
         let reference = self.reference.as_ref();
         let had_real = reference.is_some_and(|layout| real(&layout.screens).next().is_some());
         let internal = reference.is_some_and(|layout| real(&layout.screens).any(|s| s.internal));
@@ -465,7 +532,11 @@ impl<S: Saved> Guard<S> {
     ) -> Outcome {
         if enabled {
             let outcome = self.check_turn_on(displays);
-            self.alone = matches!(outcome, Outcome::Restored { .. } | Outcome::Failed);
+            self.alone = matches!(
+                outcome,
+                Outcome::Restored { .. } | Outcome::Failed | Outcome::PanelLost
+            );
+            self.panel_lost = outcome == Outcome::PanelLost;
             return outcome;
         }
         let outcome = self.check(displays);
@@ -491,6 +562,20 @@ impl<S: Saved> Guard<S> {
         let (Some(reference), Some(after)) = (reference, layout) else {
             return Outcome::Left;
         };
+        // No layout can name a target Windows withdrew, so none is tried.
+        if real(&reference.screens).any(|screen| screen.internal)
+            && lost_panel(displays, &after.screens)
+        {
+            let text = format!(
+                "The built-in screen went dark when the virtual display turned on: Windows \
+                 reports it unavailable, and only a restart brings it back. Leaving the virtual \
+                 display on, so the desktop stays on it outcome=panel_lost {}. Before: {}",
+                line(Some(&after.screens)),
+                line(Some(&reference.screens))
+            );
+            displays.log(true, &text);
+            return Outcome::PanelLost;
+        }
         let Plan::Restore { internal } = plan(&reference.screens, &after.screens) else {
             return Outcome::Left;
         };
@@ -669,6 +754,19 @@ fn alone(screens: &[Screen]) -> bool {
     has_vdd(screens) && real(screens).next().is_none()
 }
 
+/// The hybrid laptop's black panel: on a PC with more than one graphics
+/// card, the virtual display is on in `screens`, the built-in panel is off,
+/// and Windows no longer offers any built-in target. After a turn on this
+/// is read once the screens settle ([`SETTLE`] after the Enable, while no
+/// real screen came back). A closed lid reads the same; holding the display
+/// on then costs nothing.
+fn lost_panel<D: Displays>(displays: &mut D, screens: &[Screen]) -> bool {
+    has_vdd(screens)
+        && !screens.iter().any(|screen| screen.internal)
+        && displays.hybrid()
+        && displays.built_in() == Some(BuiltIn::Withdrawn)
+}
+
 /// The screens once a real one is back, or as they are after [`SETTLE`]. A
 /// PC that has one returns at once; only one that lost them all waits.
 fn settle<D: Displays>(displays: &mut D, before: &[Screen]) -> Option<Layout<D::Saved>> {
@@ -730,18 +828,27 @@ pub(crate) fn last_turn_on_alone() -> bool {
     GUARD.lock().alone()
 }
 
+/// Whether the last turn on took the built-in panel away until the PC
+/// restarts.
+#[cfg(windows)]
+pub(crate) fn last_turn_on_lost_panel() -> bool {
+    GUARD.lock().panel_lost()
+}
+
 #[cfg(windows)]
 mod windows_impl {
-    use super::{Layout, Screen};
+    use super::{BuiltIn, Layout, Screen};
     use std::time::Duration;
     use windows::Win32::Devices::Display::{
         SetDisplayConfig, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED, DISPLAYCONFIG_PATH_INFO,
-        QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
-        SDC_TOPOLOGY_INTERNAL, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
+        DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
+        SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND, SDC_TOPOLOGY_INTERNAL,
+        SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
 
     pub type Saved = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
@@ -800,6 +907,17 @@ mod windows_impl {
         }
     }
 
+    /// A laptop's built-in panel.
+    fn is_built_in(technology: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> bool {
+        [
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
+        ]
+        .contains(&technology)
+    }
+
     fn screen(path: &DISPLAYCONFIG_PATH_INFO, modes: &[DISPLAYCONFIG_MODE_INFO]) -> Screen {
         let technology = path.targetInfo.outputTechnology;
         // Without QDC_VIRTUAL_MODE_AWARE the index is the whole field.
@@ -818,13 +936,7 @@ mod windows_impl {
         Screen {
             adapter: crate::vdd_snapshot::luid_value(path.targetInfo.adapterId),
             target: path.targetInfo.id,
-            internal: [
-                DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
-                DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
-                DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
-                DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
-            ]
-            .contains(&technology),
+            internal: is_built_in(technology),
             virtual_display: crate::vdd_snapshot::is_vdd_monitor(
                 &crate::vdd_snapshot::monitor_path(path),
             ),
@@ -873,6 +985,29 @@ mod windows_impl {
                 0 => Ok(()),
                 code => Err(code),
             }
+        }
+
+        fn built_in(&mut self) -> Option<BuiltIn> {
+            let (paths, _) = crate::vdd_snapshot::display_config(QDC_ALL_PATHS)?;
+            let mut panels = paths
+                .iter()
+                .filter(|path| is_built_in(path.targetInfo.outputTechnology))
+                .peekable();
+            Some(if panels.peek().is_none() {
+                BuiltIn::Missing
+            } else if panels.any(|path| path.targetInfo.targetAvailable.as_bool()) {
+                BuiltIn::Offered
+            } else {
+                BuiltIn::Withdrawn
+            })
+        }
+
+        fn hybrid(&self) -> bool {
+            crate::diagnostics::host_facts().hybrid == Some(true)
+        }
+
+        fn session_ending(&self) -> bool {
+            unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
         }
 
         fn sleep(&mut self, duration: Duration) {
@@ -985,6 +1120,10 @@ mod tests {
         reapply_calls: Vec<usize>,
         internal_calls: usize,
         extend_calls: usize,
+        /// What `QDC_ALL_PATHS` says of the panel; `None` (unread) by default.
+        built_in: Option<BuiltIn>,
+        hybrid: bool,
+        session_ending: bool,
         slept: Duration,
         logs: Vec<(bool, String)>,
         owner: Option<String>,
@@ -1072,6 +1211,18 @@ mod tests {
                 self.last = Some(screens);
             }
             Ok(())
+        }
+
+        fn built_in(&mut self) -> Option<BuiltIn> {
+            self.built_in
+        }
+
+        fn hybrid(&self) -> bool {
+            self.hybrid
+        }
+
+        fn session_ending(&self) -> bool {
+            self.session_ending
         }
 
         fn sleep(&mut self, duration: Duration) {
@@ -1342,6 +1493,127 @@ mod tests {
             ),
             (0, 0, 1)
         );
+    }
+
+    /// The hybrid laptop as `QDC_ALL_PATHS` showed it on the second run:
+    /// after the turn on, the panel's target was listed for every source
+    /// but `available=False`, so "Extend" was refused (31), the saved layout
+    /// was refused (1610) and "PC screen only" brought nothing back. Each
+    /// later turn off was held back after the same three calls.
+    fn hybrid_laptop() -> Fake {
+        let mut fake = Fake::reading([vec![laptop_panel()], vec![lone_vdd()]]);
+        fake.owner = Some(HOST.into());
+        (fake.hybrid, fake.built_in) = (true, Some(BuiltIn::Withdrawn));
+        (fake.refuse_extend, fake.refuse_reapply) = (true, true);
+        fake
+    }
+
+    /// Its signature, the panel's target withdrawn while the virtual
+    /// display is on, ends the turn on with no `SetDisplayConfig` call, and
+    /// keeps the display on: the desktop stays on it, which the iPad shows.
+    #[test]
+    fn a_turn_on_that_takes_the_hybrid_laptops_panel_away_changes_nothing() {
+        let mut fake = hybrid_laptop();
+        let mut guard = Guard::new();
+        assert!(guard.before(true, false, &mut fake));
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::PanelLost);
+        assert_eq!(fake.set_display_config_calls(), 0);
+        assert!(guard.alone() && guard.panel_lost());
+        let (warn, text) = fake.logs.last().unwrap();
+        assert!(*warn);
+        assert_eq!(
+            text,
+            "The built-in screen went dark when the virtual display turned on: Windows reports \
+             it unavailable, and only a restart brings it back. Leaving the virtual display on, \
+             so the desktop stays on it outcome=panel_lost paths=0 [] vdd=1. Before: paths=1 \
+             [internal tgt=1298b/512 1920x1200@165Hz] vdd=0"
+        );
+        // Every turn off, the quit's too, stays held, still without a call.
+        for _ in 0..2 {
+            assert!(!turn_off_allowed(&mut guard, &mut fake));
+        }
+        assert_eq!(fake.set_display_config_calls(), 0);
+        assert_eq!(
+            fake.logs.last().unwrap().1,
+            "Leaving the virtual display on: the built-in screen is still unavailable, and \
+             turning the display off would leave the PC with no screen outcome=kept_on \
+             reason=panel_lost paths=0 [] vdd=1; restarting the PC brings the built-in screen \
+             back"
+        );
+        assert!(fake.kept.is_some(), "kept for the failure reporter");
+        // Once Windows ends the session, the turn off runs, so the restart
+        // starts without the display.
+        fake.session_ending = true;
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.set_display_config_calls(), 0);
+        assert!(fake.logs.last().unwrap().1.ends_with("outcome=session_end"));
+        // A panel that comes back (the lid opened, say) lets it run as on any PC.
+        let mut fake = hybrid_laptop();
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        guard.after(true, true, &mut fake);
+        fake.built_in = Some(BuiltIn::Offered);
+        fake.refuse_reapply = false;
+        fake.reapplied = Some(vec![laptop_panel()]);
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.reapply_calls, [1]);
+    }
+
+    /// The host that starts after a restart with the display still on
+    /// (Windows ended before the turn off ran) has no layout from before.
+    /// Its start-up turn off must not leave the PC with no screen either.
+    #[test]
+    fn a_start_up_turn_off_with_the_panel_withdrawn_leaves_the_display_on() {
+        let mut fake = hybrid_laptop();
+        fake.reads = VecDeque::from([Some(vec![lone_vdd()])]);
+        let mut guard = Guard::new();
+        assert!(!turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.set_display_config_calls(), 0);
+        // On a PC with one graphics card, it goes as before.
+        fake.hybrid = false;
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.extend_calls, 1);
+    }
+
+    /// The other ways a turn on leaves the virtual display alone keep the
+    /// guard's calls: one graphics card, a panel Windows still offers, a
+    /// desktop PC, or a target list Windows can't give.
+    #[test]
+    fn only_a_withdrawn_panel_on_a_hybrid_pc_is_the_lost_panel() {
+        for (hybrid, built_in) in [
+            (false, Some(BuiltIn::Withdrawn)),
+            (true, Some(BuiltIn::Offered)),
+            (true, Some(BuiltIn::Missing)),
+            (true, None),
+        ] {
+            let mut fake = hybrid_laptop();
+            (fake.hybrid, fake.built_in) = (hybrid, built_in);
+            let mut guard = Guard::new();
+            guard.before(true, false, &mut fake);
+            assert_eq!(
+                guard.after(true, true, &mut fake),
+                Outcome::Failed,
+                "{hybrid} {built_in:?}"
+            );
+            assert!(!guard.panel_lost());
+            assert_eq!(fake.set_display_config_calls(), 3, "{hybrid} {built_in:?}");
+        }
+        // The panel still on beside the display: nothing happened to it.
+        let mut fake = hybrid_laptop();
+        fake.reads = VecDeque::from([
+            Some(vec![laptop_panel()]),
+            Some(vec![laptop_panel(), lone_vdd()]),
+        ]);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Left);
+        assert!(!guard.panel_lost());
+        // A closed laptop on an external monitor never had the panel on.
+        let mut fake = hybrid_laptop();
+        fake.reads = VecDeque::from([Some(vec![monitor()]), Some(vec![lone_vdd()])]);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Failed);
     }
 
     #[test]
@@ -1642,6 +1914,15 @@ mod tests {
         }
         fn extend(&mut self) -> Result<(), i32> {
             self.0.extend()
+        }
+        fn built_in(&mut self) -> Option<BuiltIn> {
+            self.0.built_in()
+        }
+        fn hybrid(&self) -> bool {
+            self.0.hybrid()
+        }
+        fn session_ending(&self) -> bool {
+            self.0.session_ending()
         }
         fn sleep(&mut self, duration: Duration) {
             self.0.sleep(duration)

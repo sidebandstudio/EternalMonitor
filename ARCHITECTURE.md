@@ -199,7 +199,10 @@ re-apply the saved layout once, else switch to "PC screen only" if the built-in
 panel was on (`display_guard.rs`, `display-guard.ps1`). At runtime the host also
 acts while the virtual display is still on: a turn on that leaves it alone
 switches Windows to "Extend" (else the saved layout or "PC screen only"), and a
-turn off never runs while it is the only screen. It also ships a UDP
+turn off never runs while it is the only screen, until Windows ends the session.
+On a hybrid laptop whose panel the virtual display takes away until a restart
+(Windows withdraws its target), it tries nothing and keeps the display on, and
+Second screen mirrors there until the user chooses it again. It also ships a UDP
 firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 
