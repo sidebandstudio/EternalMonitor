@@ -465,13 +465,20 @@ fn request_on_turn(
             // Read here, after the gate decided and before the task runs.
             let display_off = TASKS.gate.lock().known_enabled == Some(false);
             crate::startup::display::change(enabled, progress, |progress| {
-                outcome = crate::display_guard::around(
+                let change = crate::display_guard::Change {
                     enabled,
-                    crate::startup::ProcessId::current(),
-                    log_screens,
+                    owner: crate::startup::ProcessId::current(),
+                    log: log_screens,
                     display_off,
+                    // Start-up, quit and panics: nothing streams it after.
+                    cleanup: !enabled && purpose == Purpose::Cleanup,
+                };
+                outcome = crate::display_guard::around(
+                    change,
                     || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
                     |outcome| *outcome == TaskOutcome::Done,
+                    // Left on: the next turn off tries again.
+                    || TaskOutcome::Failed(None),
                 );
                 outcome == TaskOutcome::Done
             });
@@ -531,14 +538,20 @@ pub(crate) fn disable_for_ended(
         || crate::startup::display::other_host(host, reporters),
         || {
             // The host's layout from before its turn on, which it kept on disk.
-            crate::display_guard::around(
-                false,
-                host,
-                crate::startup::reporter_log,
+            let change = crate::display_guard::Change {
+                enabled: false,
+                owner: host,
+                log: crate::startup::reporter_log,
                 // Only for a turn on.
-                false,
+                display_off: false,
+                // The host ended.
+                cleanup: true,
+            };
+            crate::display_guard::around(
+                change,
                 || run_task(TASK_DISABLE, &mut || {}),
                 |outcome| *outcome == TaskOutcome::Done,
+                || TaskOutcome::Failed(None),
             ) == TaskOutcome::Done
         },
     )
