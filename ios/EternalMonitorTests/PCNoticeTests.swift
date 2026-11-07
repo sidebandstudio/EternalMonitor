@@ -10,21 +10,64 @@ final class PCNoticeTests: XCTestCase {
         XCTAssertTrue(condition(), description)
     }
 
-    /// A PC that can't reach Apple's USB service (Apple Devices not running
-    /// or not installed) leaves the bit out of its HELLO_ACK. The USB card
-    /// then says so; a PC that reaches it clears that.
-    func testThePCsAppleDevicesStateReachesTheUSBCard() async throws {
+    /// One session with `host`, whose HELLO_ACK carries `caps`.
+    private func session(_ manager: ConnectionManager, _ host: FakeUDPHost, caps: UInt16) async throws {
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession(hostCaps: caps) }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        try await until("accepted") { manager.hostInfo?.hostCaps == caps }
+        manager.cancel()
+    }
+
+    /// A PC that couldn't reach Apple's USB service (Apple Devices not
+    /// running or not installed) leaves the bit out of its HELLO_ACK. It is
+    /// kept for that PC after the session, and cleared by the same PC's
+    /// next session once the service is back.
+    func testTheSightingClearsWhenThePCsServiceRecovers() async throws {
         let manager = ConnectionManager()
         addTeardownBlock { await MainActor.run { manager.cancel() } }
-        XCTAssertFalse(manager.pcLacksAppleDevices, "nothing known before a session")
-        for (caps, lacks) in [(UInt16(0), true), (HelloAck.hostCapUSB, false)] {
-            let host = FakeUDPHost()
-            manager.connect(host: "127.0.0.1", port: host.port)
-            let accepted = await Task.detached { host.acceptSession(hostCaps: caps) }.value
-            XCTAssertTrue(accepted, "the iPad never sent HELLO2")
-            try await until("accepted") { manager.hostInfo?.hostCaps == caps && manager.pcLacksAppleDevices == lacks }
-            manager.cancel()
-            XCTAssertEqual(manager.pcLacksAppleDevices, lacks, "kept after the session for the Connect screen")
-        }
+        XCTAssertNil(manager.appleDevicesUnreachable, "nothing known before a session")
+        let host = FakeUDPHost()
+        let before = Date()
+        try await session(manager, host, caps: 0)
+        let sighting = try XCTUnwrap(manager.appleDevicesUnreachable)
+        XCTAssertEqual(sighting.target, "127.0.0.1:\(host.port)")
+        XCTAssertTrue(sighting.applies(now: Date()))
+        XCTAssertGreaterThanOrEqual(sighting.at, before)
+
+        try await session(manager, host, caps: HelloAck.hostCapUSB)
+        XCTAssertNil(manager.appleDevicesUnreachable)
+    }
+
+    /// Connecting to another PC drops what the last one said, at once and
+    /// whether or not the new one answers.
+    func testSwitchingPCsDropsTheOtherPCsSighting() async throws {
+        let manager = ConnectionManager()
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        let first = FakeUDPHost()
+        try await session(manager, first, caps: 0)
+        XCTAssertNotNil(manager.appleDevicesUnreachable)
+
+        let second = FakeUDPHost()
+        manager.connect(host: "127.0.0.1", port: second.port)
+        XCTAssertNil(manager.appleDevicesUnreachable, "another PC's sighting")
+        manager.cancel()
+        XCTAssertNil(manager.appleDevicesUnreachable)
+
+        // The same PC again keeps it until that PC answers.
+        try await session(manager, first, caps: 0)
+        manager.connect(host: "127.0.0.1", port: first.port)
+        XCTAssertNotNil(manager.appleDevicesUnreachable)
+        manager.cancel()
+    }
+
+    /// A sighting is one sample: it stops applying after a while.
+    func testASightingGoesStale() {
+        let at = Date(timeIntervalSince1970: 1_000_000)
+        let sighting = ConnectionManager.AppleDevicesSighting(target: "192.168.1.20:9876", at: at)
+        XCTAssertTrue(sighting.applies(now: at))
+        XCTAssertTrue(sighting.applies(now: at + ConnectionManager.AppleDevicesSighting.lifetime - 1))
+        XCTAssertFalse(sighting.applies(now: at + ConnectionManager.AppleDevicesSighting.lifetime))
+        XCTAssertFalse(sighting.applies(now: at - 60), "a clock set back")
     }
 }

@@ -18,8 +18,8 @@ final class FrameAssembler {
     var onNack: ((Nack) -> Void)?
     var onNeedsKeyframe: ((_ epoch: UInt32, _ lastCompleteSeq: UInt32) -> Void)?
     /// Video has arrived for `noFrameYetUs` and no frame has completed, and
-    /// again after each further `noFrameYetUs` while video still arrives.
-    /// `missing` names the fragments the latest incomplete frames lack.
+    /// again after each further `noFrameYetUs` while video still arrives,
+    /// but never while a frame is still arriving in order. `missing` names the fragments the latest incomplete frames lack.
     var onNoFrameYet: ((_ epoch: UInt32, _ missing: String) -> Void)?
     var repairEnabled = false
     var framePeriodUs: UInt64 = 16_667
@@ -421,6 +421,15 @@ final class FrameAssembler {
     private func reportNoFrameYet(at now: UInt64) {
         guard !deliveredAny, let since = noFrameSince, now >= since + Self.noFrameYetUs,
               let arrived = lastArrivalUs, arrived >= since else { return }
+        // A frame that has been arriving in order for a while and still is,
+        // as a large keyframe does over a slow cable, isn't lost: another
+        // keyframe would only queue behind it. A frame with a hole, or one
+        // whose fragments all came at once, doesn't count.
+        let stillArriving = pending.values.contains { frame in
+            !frame.isComplete && Int(frame.contiguous) == frame.fragments.count
+                && now < frame.lastFragmentAt + Self.staleFrameUs && now >= frame.createdAt + Self.staleFrameUs
+        }
+        guard !stillArriving else { return }
         noFrameSince = now
         let waiting = pending.keys.sorted().compactMap { seq in
             pending[seq].flatMap { $0.isComplete ? nil : Self.describe(seq, $0, dropped: false) }

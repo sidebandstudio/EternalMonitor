@@ -27,7 +27,8 @@ enum AttemptEnd: Equatable {
     case closedBeforePicture
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
-    /// This iPad has no network: Wi-Fi is off or joined to none.
+    /// iPadOS found no usable network for the path: Wi-Fi is off or
+    /// joined to none (`ConnectionProblem.wifiOff`).
     case noNetwork
     case receiverFailed
     /// The PC asked for the pairing code, and a new HELLO2 sends it: the

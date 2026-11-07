@@ -61,7 +61,7 @@ enum UIPreview {
         case "error-local-network":
             manager.problem = .localNetworkBlocked
         case "error-wifi-off":
-            manager.problem = .noNetwork
+            manager.problem = .wifiOff
         case "mismatch":
             manager.versionMismatch = .iPadOlder
             manager.connectionError = VersionMismatch.iPadOlder.message

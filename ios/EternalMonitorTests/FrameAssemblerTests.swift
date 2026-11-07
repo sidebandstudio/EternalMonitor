@@ -716,6 +716,44 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertTrue(completed.isEmpty)
     }
 
+    /// Over the cable a large first keyframe can take longer than 2 s to
+    /// arrive, in order and without loss. That isn't a frame that never
+    /// completes: no report, so no request for another keyframe that would
+    /// only queue behind it.
+    func testAKeyframeStillArrivingInOrderIsNotReported() {
+        now = 0
+        assembler = FrameAssembler(nowUs: { [weak self] in self?.now ?? 0 })
+        assembler.onFrameAssembled = { [weak self] data, _, _, _ in self?.completed.append(data) }
+        var reports: [String] = []
+        assembler.onNoFrameYet = { _, missing in reports.append(missing) }
+        for index in UInt16(0)..<350 {
+            now = UInt64(index) * 10_000
+            add(seq: 1, index: index, count: 350, byte: 1, keyframe: true)
+            now += 5_000
+            assembler.tick()
+        }
+        XCTAssertEqual(reports, [])
+        XCTAssertEqual(completed.count, 1, "the keyframe arrived whole after 3.5 s")
+    }
+
+    /// The same keyframe stalls with its tail missing for good: it is
+    /// reported as soon as it has stopped arriving and is dropped.
+    func testAKeyframeThatStopsArrivingIsReported() {
+        now = 0
+        assembler = FrameAssembler(nowUs: { [weak self] in self?.now ?? 0 })
+        var reports: [String] = []
+        assembler.onNoFrameYet = { _, missing in reports.append(missing) }
+        for index in UInt16(0)..<250 {
+            now = UInt64(index) * 10_000
+            add(seq: 1, index: index, count: 350, byte: 1, keyframe: true)
+            assembler.tick()
+        }
+        XCTAssertEqual(reports, [], "still arriving at 2.49 s")
+        now = 2_600_000
+        assembler.tick()
+        XCTAssertEqual(reports, ["seq=1 keyframe dropped with 250/350 fragments, missing 250-349; largest fragment 1 bytes"])
+    }
+
     func testMissingFragmentsAreListedAsRanges() {
         XCTAssertEqual(FrameAssembler.ranges([0, 1, 2, 5, 7, 8]), "0-2,5,7-8")
         XCTAssertEqual(FrameAssembler.ranges(stride(from: 0, to: 40, by: 4).map { UInt16($0) }),

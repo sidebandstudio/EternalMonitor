@@ -174,16 +174,35 @@ final class SessionSummaryTests: XCTestCase {
         let link = DeniedLink()
         let manager = ConnectionManager(udpReceiver: { _ in link })
         manager.connect(host: "192.168.1.20", port: 9876)
-        link.onError?(LinkError(.pathUnavailable, "UDP path not ready: The operation couldn’t be completed. (Network.NWError error 50 - Network is down)",
-                                underlying: NWError.posix(.ENETDOWN)))
+        link.onError?(UDPReceiver.waitingError(.posix(.ENETDOWN), status: .unsatisfied, reason: .notAvailable))
         try await until("ended") { manager.state == .disconnected }
-        XCTAssertEqual(manager.problem, .noNetwork)
+        XCTAssertEqual(manager.problem, .wifiOff)
         XCTAssertEqual(manager.problem?.title, "Wi-Fi is off")
         XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
                        ["Disconnect state=connecting reason=noNetwork"])
         let line = logged(manager, "summary").first ?? ""
         XCTAssertTrue(line.contains(" stage=started outcome=error failure=no_network fallback=none end=error "), line)
         Self.assertContract(line)
+    }
+
+    /// No route to the PC or its network while the path is up: the PC is
+    /// asleep or elsewhere, not this iPad's Wi-Fi off. It keeps the card
+    /// and the `other` failure it had before Wi-Fi off got its own.
+    func testUnreachableWhileWaitingIsNotWiFiOff() async throws {
+        for code: POSIXErrorCode in [.EHOSTUNREACH, .ENETUNREACH] {
+            let link = DeniedLink()
+            let manager = ConnectionManager(udpReceiver: { _ in link })
+            manager.connect(host: "192.168.1.20", port: 9876)
+            link.onError?(UDPReceiver.waitingError(.posix(code), status: .satisfied, reason: nil))
+            try await until("ended") { manager.state == .disconnected }
+            XCTAssertNotEqual(manager.problem, .wifiOff, "\(code)")
+            XCTAssertNotEqual(manager.problem?.title, "Wi-Fi is off", "\(code)")
+            XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
+                           ["Disconnect state=connecting reason=linkFailed"], "\(code)")
+            let line = logged(manager, "summary").first ?? ""
+            XCTAssertTrue(line.contains(" failure=other "), line)
+            Self.assertContract(line)
+        }
     }
 
     /// Try again opens a new connection, which asks iPadOS again: once

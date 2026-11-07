@@ -140,9 +140,18 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var hostStreamConfig: StreamConfig?
 
     @Published private(set) var usbStatus = "USB: waiting for a cable"
-    /// The PC of the last session could not reach Apple's USB service; see
-    /// `USBStatusText.describe`.
-    @Published private(set) var pcLacksAppleDevices = false
+    /// A PC left the USB capability out of its HELLO_ACK: when it was
+    /// sampled, that PC couldn't reach Apple's USB service. Kept only for
+    /// the PC at that target, and only for a while; see `USBStatusText`.
+    struct AppleDevicesSighting: Equatable {
+        static let lifetime: TimeInterval = 30 * 60
+        /// "host:port" of the PC over Wi-Fi, or "USB".
+        let target: String
+        let at: Date
+
+        func applies(now: Date) -> Bool { now >= at && now.timeIntervalSince(at) < Self.lifetime }
+    }
+    @Published private(set) var appleDevicesUnreachable: AppleDevicesSighting?
     private var mediaLink: (any MediaLink)?
     private var usbListener: USBListener?
     private var isForeground = true
@@ -374,6 +383,9 @@ final class ConnectionManager: ObservableObject {
         }
         let isUSB = receiver.isUSB
         let pairingAddress = isUSB ? "USB" : PairingStore.address(host: normalizedHost, port: port)
+        let pcTarget = isUSB ? "USB" : "\(normalizedHost):\(port)"
+        // What one PC said about Apple Devices says nothing about another.
+        if appleDevicesUnreachable?.target != pcTarget { appleDevicesUnreachable = nil }
         let pairingToken = explicitPairingToken ?? ((try? pairingStore.token(address: pairingAddress)) ?? Data(repeating: 0, count: 16))
         explicitPairingToken = nil
         let connectionID = UUID()
@@ -608,7 +620,8 @@ final class ConnectionManager: ObservableObject {
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
-                self.pcLacksAppleDevices = info.hostCaps & HelloAck.hostCapUSB == 0
+                self.appleDevicesUnreachable = info.hostCaps & HelloAck.hostCapUSB == 0
+                    ? AppleDevicesSighting(target: pcTarget, at: Date()) : nil
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -792,7 +805,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect(failure == .noNetwork ? .noNetwork : .linkFailed)
+                    self.disconnect(failure == .wifiOff ? .noNetwork : .linkFailed)
                     self.problem = failure
                     return
                 }
