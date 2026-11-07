@@ -256,6 +256,10 @@ struct Hello2: Equatable {
     /// This app understands the stopped, restarting and failed statuses. A PC
     /// sends them only to an iPad that sets it.
     static let featureStandbyStatus: UInt16 = 1 << 3
+    /// A HELLO2 that sets `featureStandbyStatus` is padded with zeros to at
+    /// least this many bytes: the longest HELLO_ACK there is. A PC answers
+    /// while it isn't streaming only with no more bytes than it was sent.
+    static let standbyLength = 164
     /// This app checks for its own updates, so the PC need not tell the user. 0.3.1 and older never set it.
     static let featureChecksUpdates: UInt16 = 1 << 4
     static let maxNameLength = 64
@@ -464,6 +468,10 @@ extension Wire {
                 body.append(h.preferredFPS)
                 body.append(h.authToken)
                 body.appendLE(h.pairingCode)
+            }
+            let padded = Hello2.standbyLength - ControlHeader.size
+            if h.featureCaps & Hello2.featureStandbyStatus != 0, body.count < padded {
+                body.append(Data(count: padded - body.count))
             }
         case .helloAck(let a):
             let name = Data(a.hostName.utf8).prefixOnCharBoundary(a.hostName, max: Hello2.maxNameLength)

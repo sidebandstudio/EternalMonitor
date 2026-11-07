@@ -190,6 +190,19 @@ pub struct HelloAck {
 /// Longest [`HelloAck::reason`] on the wire, in bytes.
 pub const MAX_REASON_LEN: usize = 32;
 
+/// The longest HELLO_ACK datagram: the header, the fixed fields and stream
+/// config, the longest host name, the token and host caps, and the longest
+/// reason.
+pub const MAX_HELLO_ACK_LEN: usize =
+    CONTROL_HEADER_SIZE + 16 + STREAM_CONFIG_SIZE + 1 + MAX_NAME_LEN + 16 + 2 + 1 + MAX_REASON_LEN;
+
+/// A HELLO2 that sets [`FEATURE_STANDBY_STATUS`] is padded with zeros to at
+/// least this size, so any answer to it is no larger than the question. A
+/// PC answers while it isn't streaming only within that bound, and can't be
+/// used to send a forged address more bytes than it was sent. Older parsers
+/// ignore the padding, as any trailing body bytes.
+pub const STANDBY_HELLO2_LEN: usize = MAX_HELLO_ACK_LEN;
+
 /// Why a PC stopped streaming after repeated errors, as [`HelloAck::reason`]
 /// carries it. A token, not text: the iPad says it in its own words, and an
 /// iPad that doesn't know a token shows the general advice.
@@ -451,6 +464,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
                 body.push(h.preferred_fps);
                 body.extend_from_slice(&h.auth_token);
                 body.extend_from_slice(&h.pairing_code.to_le_bytes());
+            }
+            if h.feature_caps & FEATURE_STANDBY_STATUS != 0 {
+                body.resize(body.len().max(STANDBY_HELLO2_LEN - CONTROL_HEADER_SIZE), 0);
             }
         }
         ControlMessage::HelloAck(a) => {
@@ -1280,5 +1296,63 @@ mod tests {
             assert_eq!(FailedReason::from_token(token), Some(reason));
         }
         assert_eq!(FailedReason::from_token("something new"), None);
+    }
+
+    fn standby_hello2(feature_caps: u16, device_name: &str) -> Vec<u8> {
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 7,
+                listen_port: 0,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps,
+                screen_px_w: 1,
+                screen_px_h: 1,
+                screen_pt_w: 1,
+                screen_pt_h: 1,
+                refresh_hz: 60,
+                device_name: device_name.into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            }),
+        )
+    }
+
+    /// Any answer fits in a HELLO2 that asks for standby answers: the
+    /// longest ACK there is, with a 64-byte host name, a token and the
+    /// longest reason, is no larger. The padding parses as the HELLO2 it was.
+    #[test]
+    fn a_hello2_that_asks_for_standby_answers_fits_any_ack() {
+        let mut longest = standby_ack(HelloStatus::Failed, &"r".repeat(MAX_REASON_LEN));
+        longest.host_name = "h".repeat(MAX_NAME_LEN);
+        longest.auth_token = [9; 16];
+        longest.host_caps = 0xFFFF;
+        let ack = encode_control(0, 1, &ControlMessage::HelloAck(longest));
+        assert_eq!(ack.len(), MAX_HELLO_ACK_LEN);
+        for name in ["", "iPad", &"n".repeat(MAX_NAME_LEN)] {
+            let padded = standby_hello2(FEATURE_STANDBY_STATUS, name);
+            assert!(
+                padded.len() >= ack.len(),
+                "{} < {}",
+                padded.len(),
+                ack.len()
+            );
+            let Ok((_, ControlMessage::Hello2(hello))) = parse_control(&padded) else {
+                panic!("a padded HELLO2 must parse");
+            };
+            assert_eq!(hello.device_name, name);
+            assert_eq!((hello.device_id, hello.auth_token), (0, [0; 16]));
+        }
+        assert_eq!(
+            standby_hello2(FEATURE_STANDBY_STATUS, "").len(),
+            STANDBY_HELLO2_LEN
+        );
+        // Without the bit, as from 0.3.4, nothing is added.
+        assert_eq!(standby_hello2(0, "").len(), CONTROL_HEADER_SIZE + 22);
     }
 }

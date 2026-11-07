@@ -14,8 +14,9 @@ final class FakeUDPHost: @unchecked Sendable {
     private var answered = Set<UInt32>()
     /// The nonce of the HELLO2 answered last.
     private(set) var lastNonce: UInt32 = 0
-    /// The HELLO2 answered last.
+    /// The HELLO2 answered last, and its size in bytes.
     private(set) var lastHello: Hello2?
+    private(set) var lastHelloSize = 0
 
     init() {
         var address = sockaddr_in()
@@ -63,6 +64,7 @@ final class FakeUDPHost: @unchecked Sendable {
             client = (from, length)
             lastNonce = hello.clientNonce
             lastHello = hello
+            lastHelloSize = data.count
             send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion, hostCaps: hostCaps,
                           reason: reason))
             return true

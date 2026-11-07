@@ -127,6 +127,8 @@ struct FakeIpad {
     device_id: u64,
     feature_caps: u16,
     auth_token: [u8; 16],
+    /// The bytes of the last HELLO2 sent and of the last ACK received.
+    sizes: std::cell::Cell<(usize, usize)>,
 }
 
 impl FakeIpad {
@@ -142,6 +144,7 @@ impl FakeIpad {
             device_id,
             feature_caps,
             auth_token: [0; 16],
+            sizes: Default::default(),
         }
     }
 
@@ -158,15 +161,20 @@ impl FakeIpad {
             screen_pt_w: 640,
             screen_pt_h: 360,
             refresh_hz: 60,
-            device_name: "standby fake iPad".to_string(),
+            // A long name, so a 0.3.4 iPad's HELLO2 is larger than an
+            // answer carrying any PC name a test machine has.
+            device_name: "standby fake iPad named like a real one".to_string(),
             device_id: self.device_id,
             preferred_fps: 0,
             auth_token: self.auth_token,
             pairing_code: 0,
         });
-        self.socket
-            .send_to(&encode_control(0, nonce, &hello), &self.host)
-            .unwrap();
+        self.send(&encode_control(0, nonce, &hello));
+    }
+
+    fn send(&self, datagram: &[u8]) {
+        self.socket.send_to(datagram, &self.host).unwrap();
+        self.sizes.set((datagram.len(), 0));
     }
 
     /// The next HELLO_ACK for `nonce` within `wait`, skipping video,
@@ -178,6 +186,7 @@ impl FakeIpad {
             if let Ok(len) = self.socket.recv(&mut buffer) {
                 if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buffer[..len]) {
                     if ack.client_nonce == nonce {
+                        self.sizes.set((self.sizes.get().0, len));
                         return Some(ack);
                     }
                 }
@@ -204,6 +213,76 @@ impl FakeIpad {
                 }
             }
         }
+    }
+}
+
+/// The smallest HELLO2 there is: no name, no device id or token, no
+/// feature bits. 38 bytes, as a forged one from an unpaired sender can be.
+fn minimal_hello(nonce: u32) -> Vec<u8> {
+    encode_control(
+        0,
+        nonce,
+        &ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: nonce,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 1,
+            screen_px_h: 1,
+            screen_pt_w: 1,
+            screen_pt_h: 1,
+            refresh_hz: 60,
+            device_name: String::new(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        }),
+    )
+}
+
+/// While no stream runs, the PC never answers with more bytes than it was
+/// sent, so a forged source address can't make it send more than it got.
+/// A small HELLO2 from an unpaired sender hears nothing; an iPad that asks
+/// for standby answers pads its HELLO2 and hears every answer.
+#[test]
+fn a_stopped_pc_never_answers_with_more_than_it_was_sent() {
+    let host = Host::start(GpuInfo::software_fallback(), true);
+    host.send(SupervisorCommand::Stop);
+    host.wait_until_stopped();
+
+    let forged = FakeIpad::new(&host, 1, OLD);
+    let small = minimal_hello(1);
+    assert_eq!(small.len(), 38);
+    forged.send(&small);
+    assert!(
+        forged.ack(1, Duration::from_secs(2)).is_none(),
+        "an answer larger than a 38-byte HELLO2 went out"
+    );
+
+    let unpaired = FakeIpad::new(&host, 2, NEW);
+    let ack = unpaired.ask(2).expect("a padded HELLO2 is answered");
+    assert_eq!(ack.status, HelloStatus::Unauthorized);
+    let (sent, received) = unpaired.sizes.get();
+    assert!(received <= sent, "{received} > {sent}");
+
+    let mut paired = FakeIpad::new(&host, 3, NEW);
+    paired.auth_token = host.shared.pairing.lock().token();
+    let ack = paired.ask(3).expect("a padded HELLO2 is answered");
+    assert_eq!(ack.status, HelloStatus::Stopped);
+    let (sent, received) = paired.sizes.get();
+    assert!(received <= sent, "{received} > {sent}");
+
+    // A paired 0.3.4 iPad: an answer that fits goes out, one that doesn't
+    // is today's silence.
+    let mut old = FakeIpad::new(&host, 4, OLD);
+    old.auth_token = paired.auth_token;
+    if let Some(ack) = old.ask(4) {
+        assert_eq!(ack.status, HelloStatus::Error);
+        let (sent, received) = old.sizes.get();
+        assert!(received <= sent, "{received} > {sent}");
     }
 }
 
@@ -347,6 +426,8 @@ fn the_storm_brake_says_why_and_waits_for_start() {
         .unwrap();
     assert_eq!(failed.reason, "encoder");
     assert_eq!(failed.session_id, 0);
+    let (sent, received) = ipad.sizes.get();
+    assert!(received <= sent, "{received} > {sent}");
     let old = FakeIpad::new(&host, 2, OLD);
     assert_eq!(
         old.ask(1)

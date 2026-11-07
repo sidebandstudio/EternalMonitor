@@ -173,6 +173,19 @@ async fn answer(links: &TransportLinks, shared: &SharedControl, peer: PeerId, da
         crate::diagnostics::log_session_end(end, shared);
     }
     for (destination, reply) in &actions.replies {
+        // Never more than was sent: a forged source address must not get
+        // more bytes than the forger spent. iPads that understand these
+        // answers pad their HELLO2 so every answer fits
+        // (`STANDBY_HELLO2_LEN`); an older one may get today's silence.
+        if reply.len() > datagram.len() {
+            debug!(
+                peer = %destination,
+                reply = reply.len(),
+                request = datagram.len(),
+                "Left a HELLO2 unanswered: the answer is larger than it"
+            );
+            continue;
+        }
         if let Err(error) = links.send_to(reply, *destination).await {
             debug!(peer = %destination, %error, "Could not answer a HELLO2 while the stream is off");
         }

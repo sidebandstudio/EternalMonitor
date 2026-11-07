@@ -405,6 +405,13 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     hello.pairing_code = 123_456;
     vectors.push((
         "hello2_v030",
+        encode_control(0, 4, &ControlMessage::Hello2(hello.clone())),
+    ));
+    // 0.3.5: an iPad that asks for standby answers pads its HELLO2, so an
+    // answer is never larger than the question.
+    hello.feature_caps |= FEATURE_STANDBY_STATUS;
+    vectors.push((
+        "hello2_standby_padded",
         encode_control(0, 4, &ControlMessage::Hello2(hello)),
     ));
     // 0.3.5: answers while the PC isn't streaming, a Failed one with its

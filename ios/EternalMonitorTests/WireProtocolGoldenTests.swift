@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 32,
+            Self.vectors.count, 33,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -69,6 +69,21 @@ final class WireProtocolGoldenTests: XCTestCase {
             XCTAssertEqual(ack.hostCaps, HelloAck.hostCapNack)
             XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
         }
+    }
+
+    /// An iPad that asks for standby answers pads its HELLO2 with zeros, as
+    /// the PC encodes it, so no answer is larger than the question.
+    func testAStandbyHelloIsPaddedToFitAnyAnswer() throws {
+        let data = try vector("hello2_standby_padded")
+        XCTAssertEqual(data.count, Hello2.standbyLength)
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .hello2(let hello) = message else { return XCTFail("wrong type") }
+        XCTAssertNotEqual(hello.featureCaps & Hello2.featureStandbyStatus, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        // Without the bit, nothing is added.
+        var plain = hello
+        plain.featureCaps &= ~Hello2.featureStandbyStatus
+        XCTAssertLessThan(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(plain)).count, data.count)
     }
 
     /// How 0.3.4 and older treat a status they don't know: the whole ACK is

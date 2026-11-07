@@ -27,6 +27,7 @@ final class PCNotStreamingTests: XCTestCase {
         XCTAssertTrue(answered, "the iPad never sent HELLO2")
         let advertised = (host.lastHello?.featureCaps ?? 0) & Hello2.featureStandbyStatus
         XCTAssertNotEqual(advertised, 0, "the PC must know this iPad understands the answer")
+        XCTAssertGreaterThanOrEqual(host.lastHelloSize, Hello2.standbyLength, "padded so any answer fits")
         let firstNonce = host.lastNonce
         try await until("told the PC isn't streaming") { manager.problem == .pcNotStreaming(.stopped) }
         XCTAssertEqual(manager.problem?.title, "Your PC isn't streaming")
