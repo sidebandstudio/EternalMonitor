@@ -216,25 +216,17 @@ fn run_encode_loop(
         if !hevc_wanted {
             hevc_open_failed = false;
         }
-        let preferred: String = if hevc_wanted && !hevc_open_failed {
-            match hevc_encoder_for(&encoder_name) {
-                Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => {
-                    hevc.to_string()
-                }
-                _ => {
-                    if !hevc_unavailable_warned {
-                        hevc_unavailable_warned = true;
-                        warn!(
-                            encoder = %encoder_name,
-                            "HEVC requested but no H.265 encoder is available — staying on H.264"
-                        );
-                    }
-                    encoder_name.clone()
-                }
-            }
-        } else {
-            encoder_name.clone()
-        };
+        let preferred = preferred_encoder(
+            &encoder_name,
+            hevc_wanted,
+            hevc_open_failed,
+            &mut hevc_unavailable_warned,
+        );
+        // An HEVC open going on in the background is of no use once this
+        // frame wants H.264: the stream goes on, and reopens from there.
+        if drop_obsolete_background(&mut background, &preferred) {
+            stall_recovery.trying = false;
+        }
         // No open given up on, or going on in the background, still holds
         // FFmpeg's lock. Until then, an open in that lane would only be
         // refused.
@@ -1391,6 +1383,53 @@ fn open_limits(encoder_name: &str, opening: Opening) -> crate::stall::Limits {
         }
         Opening::Reopen => crate::stall::encoder_reopen_limits(encoder_name),
     }
+}
+
+/// The encoder a frame prefers: the H.265 encoder for `encoder_name` when
+/// HEVC is wanted (the user's preference and the client's decoding) and has
+/// not failed, if FFmpeg has it; else `encoder_name`. `warned` says once
+/// that there is none.
+fn preferred_encoder(
+    encoder_name: &str,
+    hevc_wanted: bool,
+    hevc_open_failed: bool,
+    warned: &mut bool,
+) -> String {
+    if !hevc_wanted || hevc_open_failed {
+        return encoder_name.to_string();
+    }
+    match hevc_encoder_for(encoder_name) {
+        Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => hevc.to_string(),
+        _ => {
+            if !*warned {
+                *warned = true;
+                warn!(
+                    encoder = %encoder_name,
+                    "HEVC requested but no H.265 encoder is available — staying on H.264"
+                );
+            }
+            encoder_name.to_string()
+        }
+    }
+}
+
+/// Drops an HEVC open going on in the background once the frame prefers
+/// H.264 (HEVC turned off, or a client that decodes only H.264): adopted,
+/// it would replace a session the client can decode with one it may not.
+/// The session that streams meanwhile goes on. True when one was dropped;
+/// its result is released when it returns.
+fn drop_obsolete_background(background: &mut Option<Behind>, preferred: &str) -> bool {
+    let obsolete = background
+        .as_ref()
+        .is_some_and(|behind| is_hevc_encoder(behind.open.encoder()) && !is_hevc_encoder(preferred));
+    if let Some(behind) = background.take_if(|_| obsolete) {
+        info!(
+            encoder = behind.open.encoder(),
+            preferred,
+            "The codec changed while an encoder opened in the background; that session will not be used"
+        );
+    }
+    obsolete
 }
 
 /// Whether a reopen from the `current` session to `wanted` opens in the
@@ -5342,6 +5381,69 @@ mod tests {
         let failed = open.poll(&mut input, |_| panic!("a picked BGRA was tried again"));
         assert!(failed.expect("returned").is_err());
         assert_eq!(input, EncoderInput::Bgra);
+    }
+
+    #[test]
+    fn an_hevc_open_in_the_background_is_dropped_once_the_frame_wants_h264() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        // An H.264 encoder whose H.265 sibling this FFmpeg build has.
+        let Some(h264) = ["libx264", "h264_nvenc", "h264_videotoolbox"]
+            .into_iter()
+            .find(|name| ffmpeg_next::encoder::find_by_name(hevc_variant_of(name).unwrap()).is_some())
+        else {
+            eprintln!("no H.265 encoder in this FFmpeg build");
+            return;
+        };
+        // The encode loop's negotiation, from the user's preference and the
+        // client's decoding.
+        let preferred = |hevc_enabled: bool, client_hevc: bool| {
+            preferred_encoder(h264, hevc_enabled && client_hevc, false, &mut true)
+        };
+        let hevc = preferred(true, true);
+        assert!(is_hevc_encoder(&hevc), "{hevc}");
+        for change in ["an H.264-only client connected", "HEVC was turned off"] {
+            let (release, open) = parked_background_open(lanes, &hevc, Pixel::YUV420P, real_yuv_encoder);
+            let mut background = Some(Behind::first(open, 8_000_000));
+            assert!(!drop_obsolete_background(&mut background, &preferred(true, true)));
+            assert!(background.is_some(), "{change}: dropped while wanted");
+            let now = match change {
+                "an H.264-only client connected" => preferred(true, false),
+                _ => preferred(false, true),
+            };
+            assert_eq!(now, h264, "{change}");
+            // The HEVC session opens meanwhile, ready to be taken.
+            release.send(()).unwrap();
+            wait_for_clear_lane(lanes);
+            assert!(
+                drop_obsolete_background(&mut background, &now),
+                "{change}: the HEVC session would replace one the client decodes"
+            );
+            assert!(background.is_none(), "{change}");
+        }
+        // Still wanted, it is taken once it opens.
+        let (release, open) = parked_background_open(lanes, &hevc, Pixel::YUV420P, real_yuv_encoder);
+        let mut background = Some(Behind::first(open, 8_000_000));
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        assert!(!drop_obsolete_background(&mut background, &hevc));
+        let state = background
+            .as_mut()
+            .unwrap()
+            .open
+            .poll(&mut EncoderInput::Yuv420, |_| panic!("tried again"))
+            .expect("returned")
+            .expect("opened");
+        assert_eq!(state.opened_encoder, hevc);
+        // An H.264 open is kept when HEVC is turned on: the client decodes
+        // it, and the stream reopens to HEVC from there.
+        let (release, open) = parked_background_open(lanes, h264, Pixel::YUV420P, real_yuv_encoder);
+        let mut background = Some(Behind::first(open, 8_000_000));
+        assert!(!drop_obsolete_background(&mut background, &hevc));
+        assert!(background.is_some());
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
     }
 
     #[test]
