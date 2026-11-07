@@ -196,13 +196,31 @@ impl Scaler {
         }
         self.check_output(output)?;
         // SAFETY: both frames own their buffers and have the sizes checked.
-        let result = unsafe {
-            ffmpeg_next::ffi::sws_scale_frame(self.context, output.as_mut_ptr(), input.as_ptr())
-        };
+        let result = unsafe { self.scale_frame(output.as_mut_ptr(), input.as_ptr()) };
         if result < 0 {
             return Err(ffmpeg_next::Error::from(result));
         }
         Ok(())
+    }
+
+    /// `sws_scale_frame`, after which swscale holds no reference to either
+    /// frame. It drops them itself once it gets as far as converting. In
+    /// FFmpeg 7.1 `sws_frame_start` can fail after taking the source, which
+    /// would leave it held until the next conversion, so an error ends the
+    /// frame here too.
+    ///
+    /// # Safety
+    /// Both frames must be valid, and `output` reference-counted.
+    unsafe fn scale_frame(
+        &mut self,
+        output: *mut ffmpeg_next::ffi::AVFrame,
+        source: *const ffmpeg_next::ffi::AVFrame,
+    ) -> libc::c_int {
+        let result = unsafe { ffmpeg_next::ffi::sws_scale_frame(self.context, output, source) };
+        if result < 0 {
+            unsafe { ffmpeg_next::ffi::sws_frame_end(self.context) };
+        }
+        result
     }
 
     fn check_output(&self, output: &ffmpeg_next::frame::Video) -> Result<(), ffmpeg_next::Error> {
@@ -240,8 +258,7 @@ pub(super) fn convert_packed_bgra(
     output: &mut ffmpeg_next::frame::Video,
 ) -> Result<(), ffmpeg_next::Error> {
     use ffmpeg_next::ffi::{
-        av_buffer_create, av_frame_alloc, av_frame_free, sws_scale_frame, AVPixelFormat,
-        AV_BUFFER_FLAG_READONLY,
+        av_buffer_create, av_frame_alloc, av_frame_free, AVPixelFormat, AV_BUFFER_FLAG_READONLY,
     };
     let (width, height) = (scaler.width, scaler.height);
     let picture_bytes = width as usize * 4;
@@ -256,9 +273,9 @@ pub(super) fn convert_packed_bgra(
         return scaler.run(&copied, output);
     }
     // sws_scale_frame takes reference-counted frames, so `rows` is wrapped
-    // in a buffer that never frees it. sws_scale_frame drops its references
-    // before it returns, and the frame is freed below, so nothing refers to
-    // `rows` after this call.
+    // in a buffer that never frees it. `scale_frame` leaves swscale holding
+    // no reference, whether it converted or failed, and the frame is freed
+    // below, so nothing refers to `rows` after this call.
     unsafe extern "C" fn borrowed(_: *mut libc::c_void, _: *mut u8) {}
     let mut source = unsafe { av_frame_alloc() };
     if source.is_null() {
@@ -286,7 +303,7 @@ pub(super) fn convert_packed_bgra(
         let result = if (*source).buf[0].is_null() {
             -libc::ENOMEM
         } else {
-            sws_scale_frame(scaler.context, output.as_mut_ptr(), source)
+            scaler.scale_frame(output.as_mut_ptr(), source)
         };
         av_frame_free(&mut source);
         result
@@ -636,6 +653,29 @@ mod tests {
         };
         assert!(result >= 0);
         assert_eq!(set, scaler_threads() as i64);
+    }
+
+    /// A conversion swscale refuses still leaves it holding no reference to
+    /// the source, so a borrowed capture buffer is free when the call ends.
+    /// This error comes after swscale holds both frames. The one that needed
+    /// `scale_frame`'s own `sws_frame_end`, in FFmpeg 7.1's `sws_frame_start`
+    /// after it took the source, only happens when memory runs out.
+    #[test]
+    fn a_failed_conversion_keeps_no_reference_to_the_source() {
+        ffmpeg_next::init().unwrap();
+        let (width, height) = (96, 64);
+        let source = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
+        for threads in [1, 4] {
+            let mut scaler = Scaler::new(Pixel::YUV420P, width, height, threads).unwrap();
+            // An output larger than the scaler's makes swscale fail once it
+            // holds both frames.
+            let mut output = ffmpeg_next::frame::Video::new(Pixel::YUV420P, width, height * 2);
+            let result = unsafe { scaler.scale_frame(output.as_mut_ptr(), source.as_ptr()) };
+            assert!(result < 0, "threads={threads}");
+            let held =
+                unsafe { ffmpeg_next::ffi::av_buffer_get_ref_count((*source.as_ptr()).buf[0]) };
+            assert_eq!(held, 1, "threads={threads}");
+        }
     }
 
     #[test]
