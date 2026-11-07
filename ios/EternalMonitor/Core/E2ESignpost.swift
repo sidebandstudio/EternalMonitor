@@ -34,14 +34,19 @@ enum E2E {
     }
 
     /// `EM_AUTOCONNECT=host:port` makes the app connect immediately on launch,
-    /// bypassing the connect screen — the harness's way in.
-    static var autoconnectTarget: (host: String, port: UInt16)? {
-        guard let spec = ProcessInfo.processInfo.environment["EM_AUTOCONNECT"],
-              let colon = spec.lastIndex(of: ":"),
+    /// bypassing the connect screen — the harness's way in. A pairing link
+    /// (`eternaldisplay://host:port?t=…`, the QR code's text) also brings its
+    /// token. `EM_AUTOCONNECT_FOUND=1` connects as a tap on a PC that Bonjour
+    /// listed would.
+    static var autoconnectTarget: (host: String, port: UInt16, token: Data?, found: Bool)? {
+        guard let spec = ProcessInfo.processInfo.environment["EM_AUTOCONNECT"] else { return nil }
+        let found = ProcessInfo.processInfo.environment["EM_AUTOCONNECT_FOUND"] == "1"
+        if case .success(let link) = PairingCode.parse(spec) { return (link.host, link.port, link.token, found) }
+        guard let colon = spec.lastIndex(of: ":"),
               let port = UInt16(spec[spec.index(after: colon)...])
         else { return nil }
         let host = String(spec[..<colon])
-        return host.isEmpty ? nil : (host, port)
+        return host.isEmpty ? nil : (host, port, nil, found)
     }
 
     /// Simulator builds: `EM_USB_PORT=port` moves the USB listener off 9877
@@ -55,6 +60,17 @@ enum E2E {
         }
         #endif
         return 9877
+    }
+
+    /// Simulator builds: `EM_ROUTE_INTERFACE=en0` stands that interface in
+    /// for the loopback path to a PC on the simulator's own Mac, which no
+    /// iPad has (see `MovedPC.route`).
+    static var loopbackRouteInterface: String? {
+        #if targetEnvironment(simulator)
+        return ProcessInfo.processInfo.environment["EM_ROUTE_INTERFACE"].flatMap { $0.isEmpty ? nil : $0 }
+        #else
+        return nil
+        #endif
     }
 
     static func firstFrame(width: Int, height: Int, link: String = "udp") {

@@ -130,7 +130,7 @@ async fn serve(
             }
             event = links.receive() => match event {
                 Ok(LinkEvent::Datagram(peer, datagram)) => {
-                    answer(links, shared, peer, &datagram).await;
+                    answer(links, shared, bound, peer, &datagram).await;
                 }
                 // A tunnel that closes now is gone for the next generation
                 // too; a session it carried ends on its liveness there.
@@ -180,7 +180,13 @@ async fn open(listen_port: u16, shared: &SharedControl) -> (TransportLinks, Sock
 
 /// Answers a HELLO2. Everything else waits for the next generation: a
 /// session kept across a restart picks up there.
-async fn answer(links: &TransportLinks, shared: &SharedControl, peer: PeerId, datagram: &[u8]) {
+async fn answer(
+    links: &TransportLinks,
+    shared: &SharedControl,
+    bound: SocketAddr,
+    peer: PeerId,
+    datagram: &[u8],
+) {
     match classify(datagram) {
         Classified::Control(_) => {}
         Classified::LegacyHello => {
@@ -196,6 +202,7 @@ async fn answer(links: &TransportLinks, shared: &SharedControl, peer: PeerId, da
         shared,
         stream_epoch: 0,
         pen_available: false,
+        listen: bound,
     };
     let actions = {
         let mut session = shared.session.lock();
