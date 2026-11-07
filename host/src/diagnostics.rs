@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::control::{CaptureTarget, SharedControl};
 use crate::transport::link::LinkId;
 use crate::transport::session::{EndReason, SessionEnd};
+use eternal_wire::v2::control::ByeReason;
 use tracing::info;
 
 static SYSTEM_REPORT: OnceLock<String> = OnceLock::new();
@@ -341,9 +342,25 @@ pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
     );
 }
 
-/// The app is quitting: the summary of the stream it stops.
+/// The app is quitting: the summary of the stream it stops. Its iPad is
+/// told the PC ended the session, or, when a restart or an update hands over
+/// to a new copy, to connect again.
 pub fn log_session_end_at_quit(shared: &SharedControl) {
-    let end = shared.session.lock().shut_down(std::time::Instant::now());
+    let bye = if shared.handoff.holder().is_some() {
+        ByeReason::Error
+    } else {
+        ByeReason::UserDisconnect
+    };
+    stop_session(shared, bye);
+}
+
+/// The stream stops for good: ends the session, which the transport tells
+/// `bye` on its way out, and logs its summary.
+pub fn stop_session(shared: &SharedControl, bye: ByeReason) {
+    let end = shared
+        .session
+        .lock()
+        .shut_down(std::time::Instant::now(), bye);
     if let Some(end) = end {
         log_session_end(&end, shared);
     }

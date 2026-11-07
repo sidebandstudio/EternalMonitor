@@ -1,6 +1,6 @@
-//! When Stop and update ends a stream, the iPad must hear the host's goodbye
-//! however the transport stops, over UDP and over the USB tunnel. Drives the
-//! real transport loop with a fake iPad on loopback.
+//! When Stop and update ends a stream, or the app quits, the iPad must hear
+//! the host's goodbye however the transport stops, over UDP and over the USB
+//! tunnel. Drives the real transport loop with a fake iPad on loopback.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -58,11 +58,8 @@ fn hello() -> ControlMessage {
     })
 }
 
-fn is_goodbye(bytes: &[u8]) -> bool {
-    matches!(
-        parse_control(bytes),
-        Ok((_, ControlMessage::Bye(ByeReason::HostShuttingDown)))
-    )
+fn is_bye(bytes: &[u8], reason: ByeReason) -> bool {
+    matches!(parse_control(bytes), Ok((_, ControlMessage::Bye(said))) if said == reason)
 }
 
 fn free_udp_port() -> u16 {
@@ -72,7 +69,18 @@ fn free_udp_port() -> u16 {
         .unwrap()
 }
 
-/// How the transport stops after Stop and update ended the stream.
+/// How the stream ends.
+#[derive(Clone, Copy)]
+enum End {
+    /// Stop and update.
+    Update,
+    /// The app quits.
+    Quit,
+    /// The app quits for "Restart EternalMonitor".
+    Restart,
+}
+
+/// How the transport stops after the stream ended.
 enum Stop {
     /// The host is closing: `running` goes false.
     Shutdown,
@@ -80,9 +88,10 @@ enum Stop {
     EncoderEof,
 }
 
-/// Runs the transport with a UDP iPad, stops the stream for an update, stops
-/// the transport the given way and counts the goodbyes the iPad received.
-fn udp_goodbyes(stop: Stop) -> usize {
+/// Runs the transport with a UDP iPad, ends the stream the given way, stops
+/// the transport the given way and counts the goodbyes the iPad received
+/// with `reason`.
+fn udp_goodbyes(end: End, stop: Stop, reason: ByeReason) -> usize {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     eternal_host::clock::init();
     // Never reach a real iPad: this unreachable endpoint stands in for USB.
@@ -115,7 +124,17 @@ fn udp_goodbyes(stop: Stop) -> usize {
         });
         // Let the loop take its first ticks.
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(shared.session.lock().begin_update(true));
+        match end {
+            End::Update => assert!(shared.session.lock().begin_update(true)),
+            End::Quit => eternal_host::diagnostics::log_session_end_at_quit(&shared),
+            End::Restart => {
+                shared
+                    .handoff
+                    .claim(eternal_host::handoff::Handoff::Restart)
+                    .unwrap();
+                eternal_host::diagnostics::log_session_end_at_quit(&shared);
+            }
+        }
         match stop {
             Stop::Shutdown => shared.stop(),
             Stop::EncoderEof => drop(nal_tx),
@@ -136,7 +155,7 @@ fn udp_goodbyes(stop: Stop) -> usize {
         while let Ok(Ok((len, _))) =
             tokio::time::timeout(Duration::from_millis(100), ipad.recv_from(&mut bytes)).await
         {
-            goodbyes += usize::from(is_goodbye(&bytes[..len]));
+            goodbyes += usize::from(is_bye(&bytes[..len], reason));
         }
         goodbyes
     })
@@ -145,14 +164,39 @@ fn udp_goodbyes(stop: Stop) -> usize {
 /// One lost datagram must not turn a planned update into a lost connection.
 #[test]
 fn udp_goodbye_is_a_short_burst() {
-    assert_eq!(udp_goodbyes(Stop::Shutdown), 3);
+    assert_eq!(
+        udp_goodbyes(End::Update, Stop::Shutdown, ByeReason::HostShuttingDown),
+        3
+    );
 }
 
 /// The encoder can close its channel before the next liveness tick while the
 /// host shuts down; the goodbye must still go out.
 #[test]
 fn encoder_eof_still_says_goodbye() {
-    assert!(udp_goodbyes(Stop::EncoderEof) >= 1);
+    assert!(udp_goodbyes(End::Update, Stop::EncoderEof, ByeReason::HostShuttingDown) >= 1);
+}
+
+/// Quitting used to end the session without a word: the iPad waited out a
+/// lost signal and then tried to reconnect to a PC that had closed. It now
+/// hears that the PC ended the session, the goodbye that keeps it from
+/// reconnecting by itself.
+#[test]
+fn quitting_tells_the_ipad_the_pc_ended_the_session() {
+    assert_eq!(
+        udp_goodbyes(End::Quit, Stop::Shutdown, ByeReason::UserDisconnect),
+        3
+    );
+}
+
+/// A restart hands over to a new copy that is back in seconds: the iPad is
+/// told to connect again, at once.
+#[test]
+fn a_restart_tells_the_ipad_to_connect_again() {
+    assert_eq!(
+        udp_goodbyes(End::Restart, Stop::Shutdown, ByeReason::Error),
+        3
+    );
 }
 
 /// Over USB the goodbye is queued for a writer task; the transport must wait
@@ -161,6 +205,17 @@ fn encoder_eof_still_says_goodbye() {
 /// one goodbye arrives on a link that stays open.
 #[test]
 fn usb_goodbye_arrives_before_the_link_closes() {
+    usb_goodbye(End::Update, ByeReason::HostShuttingDown);
+}
+
+/// Quitting over the cable: the iPad used to see the tunnel close and showed
+/// an unplugged cable.
+#[test]
+fn quitting_over_usb_says_goodbye_before_the_link_closes() {
+    usb_goodbye(End::Quit, ByeReason::UserDisconnect);
+}
+
+fn usb_goodbye(end: End, reason: ByeReason) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     eternal_host::clock::init();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -204,7 +259,10 @@ fn usb_goodbye_arrives_before_the_link_closes() {
             }
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(shared.session.lock().begin_update(true));
+        match end {
+            End::Update => assert!(shared.session.lock().begin_update(true)),
+            End::Quit | End::Restart => eternal_host::diagnostics::log_session_end_at_quit(&shared),
+        }
         shared.stop();
         let stopping = Instant::now();
         tokio::time::timeout(Duration::from_secs(2), transport)
@@ -217,7 +275,7 @@ fn usb_goodbye_arrives_before_the_link_closes() {
         let mut goodbyes = 0;
         loop {
             match tokio::time::timeout(Duration::from_millis(500), read_datagram(&mut ipad)).await {
-                Ok(Ok(bytes)) => goodbyes += usize::from(is_goodbye(&bytes)),
+                Ok(Ok(bytes)) => goodbyes += usize::from(is_bye(&bytes, reason)),
                 Ok(Err(error)) => panic!("the USB hub closed the tunnel: {error}"),
                 Err(_) => break,
             }

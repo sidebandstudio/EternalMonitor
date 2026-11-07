@@ -327,10 +327,14 @@ pub fn run(
         machine.wait_for_port(Instant::now() + crate::startup::port::RECHECK);
     }
     let mut healthy_since = Instant::now();
+    let mut transport_watch = crate::transport::beat::Watch::default();
 
     loop {
         let message = sup_rx.recv_timeout(Duration::from_millis(250));
         let now = Instant::now();
+        // A stuck transport stays in its generation's thread, which no join
+        // can end: this line says where it is stuck.
+        transport_watch.check_and_log(&shared.transport_beat, crate::clock::host_now_us() / 1000);
 
         // A minute of health clears the storm budget.
         if matches!(machine.state, SupervisorState::Running { .. })
@@ -363,6 +367,9 @@ pub fn run(
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
+                if let Some(bye) = goodbye_when_stopped(&machine.state) {
+                    crate::diagnostics::stop_session(&shared, bye);
+                }
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
             }
@@ -403,6 +410,24 @@ pub fn run(
         }
     }
     info!("Supervisor loop ended");
+}
+
+/// What the iPad of a session is told when the pipeline stops in `state`.
+/// Stopped and Failed wait for a manual Start, so the session ends now: kept,
+/// it went on unanswered while its iPad lost the signal and every HELLO it
+/// sent went unanswered. Stop says the PC ended the session; giving up says
+/// connect again. A backoff or a held port restarts the stream by itself,
+/// and its session goes on.
+fn goodbye_when_stopped(state: &SupervisorState) -> Option<eternal_wire::v2::control::ByeReason> {
+    use eternal_wire::v2::control::ByeReason;
+    match state {
+        SupervisorState::Stopped => Some(ByeReason::UserDisconnect),
+        SupervisorState::Failed { .. } => Some(ByeReason::Error),
+        SupervisorState::Running { .. }
+        | SupervisorState::BackingOff { .. }
+        | SupervisorState::WaitingForPort { .. }
+        | SupervisorState::ShutDown => None,
+    }
 }
 
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
@@ -627,6 +652,40 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Stop and giving up wait for a manual Start: their session ends with
+    /// a goodbye. A stream that restarts by itself keeps its session.
+    #[test]
+    fn only_a_stop_that_waits_for_start_ends_the_session() {
+        use eternal_wire::v2::control::ByeReason;
+        let mut machine = Machine::new(1);
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(
+            goodbye_when_stopped(&machine.state),
+            Some(ByeReason::UserDisconnect)
+        );
+
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        let mut effect = Effect::None;
+        for _ in 0..=STORM_LIMIT {
+            effect = machine.on_stage_exit(1, Stage::Encoder, &failed("x"), t0);
+            if let SupervisorState::BackingOff { .. } = machine.state {
+                assert_eq!(goodbye_when_stopped(&machine.state), None);
+                machine.note_started(1);
+            }
+        }
+        assert_eq!(effect, Effect::StopPipeline);
+        assert!(matches!(machine.state, SupervisorState::Failed { .. }));
+        assert_eq!(goodbye_when_stopped(&machine.state), Some(ByeReason::Error));
+
+        let mut machine = Machine::new(1);
+        machine.wait_for_port(t0);
+        assert_eq!(goodbye_when_stopped(&machine.state), None);
     }
 
     fn failed(reason: &str) -> StageOutcome {
