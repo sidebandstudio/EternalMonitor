@@ -354,12 +354,17 @@ pub fn log_session_end_at_quit(shared: &SharedControl) {
 }
 
 /// The stream stops for good: ends the session, which the transport tells
-/// why on its way out, and logs its summary.
+/// why on its way out, stops the stream, and logs the summary. The goodbye
+/// and `running` change under one session lock, so a transport starting
+/// meanwhile never takes the goodbye for a stale one
+/// (`Session::transport_resumed`).
 pub fn stop_session(shared: &SharedControl, why: StreamStop) {
-    let end = shared
-        .session
-        .lock()
-        .shut_down(std::time::Instant::now(), why);
+    let end = {
+        let mut session = shared.session.lock();
+        let end = session.shut_down(std::time::Instant::now(), why);
+        shared.stop();
+        end
+    };
     if let Some(end) = end {
         log_session_end(&end, shared);
     }
