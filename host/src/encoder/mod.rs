@@ -1728,13 +1728,8 @@ impl OwedKeyframe {
     /// else the last picture again, until the deadline.
     fn next(&mut self, frames: &FrameSlot) -> Next {
         let wait = KEYFRAME_FLUSH_WAIT.min(self.until.saturating_duration_since(Instant::now()));
-        match frames.take_within(wait) {
-            // The newer picture replaces the kept one, which is let go before
-            // the newer one is converted: capture has no buffer to spare.
-            Taken::Frame(frame) => {
-                self.picture = None;
-                Next::Frame(frame)
-            }
+        match frames.take_within(wait, &mut self.picture) {
+            Taken::Frame(frame) => Next::Frame(frame),
             Taken::Closed => Next::Closed,
             Taken::Nothing => match self.picture.take() {
                 Some(picture) if Instant::now() < self.until => {

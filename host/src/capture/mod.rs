@@ -150,6 +150,10 @@ pub struct FrameSlot {
 struct SlotInner {
     state: Mutex<SlotState>,
     condvar: Condvar,
+    /// Runs after [`FrameSlot::take_within`] took a frame and let go of the
+    /// mailbox, where a taker can be descheduled.
+    #[cfg(test)]
+    after_take: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 #[derive(Default)]
@@ -164,6 +168,8 @@ impl FrameSlot {
             inner: Arc::new(SlotInner {
                 state: Mutex::new(SlotState::default()),
                 condvar: Condvar::new(),
+                #[cfg(test)]
+                after_take: Mutex::new(None),
             }),
         }
     }
@@ -200,30 +206,45 @@ impl FrameSlot {
         }
     }
 
-    /// As [`Self::blocking_take`], but gives up after `timeout`.
-    pub fn take_within(&self, timeout: Duration) -> Taken {
+    /// As [`Self::blocking_take`], but gives up after `timeout`. A frame
+    /// taken replaces `kept`, a frame the caller still holds: `kept` is let
+    /// go under the mailbox lock before the frame leaves it, so capture,
+    /// which recycles a few buffers, never finds them all held at once.
+    pub fn take_within(&self, timeout: Duration, kept: &mut Option<RawFrame>) -> Taken {
         let deadline = Instant::now() + timeout;
-        let mut state = self.inner.state.lock();
-        loop {
-            if let Some(frame) = state.frame.take() {
-                return Taken::Frame(frame);
+        let taken = {
+            let mut state = self.inner.state.lock();
+            let mut timed_out = false;
+            loop {
+                if state.frame.is_some() {
+                    *kept = None;
+                    break Taken::Frame(state.frame.take().expect("checked above"));
+                }
+                if state.closed {
+                    break Taken::Closed;
+                }
+                if timed_out {
+                    break Taken::Nothing;
+                }
+                timed_out = self
+                    .inner
+                    .condvar
+                    .wait_until(&mut state, deadline)
+                    .timed_out();
             }
-            if state.closed {
-                return Taken::Closed;
-            }
-            if self
-                .inner
-                .condvar
-                .wait_until(&mut state, deadline)
-                .timed_out()
-            {
-                return match state.frame.take() {
-                    Some(frame) => Taken::Frame(frame),
-                    None if state.closed => Taken::Closed,
-                    None => Taken::Nothing,
-                };
+        };
+        #[cfg(test)]
+        if matches!(taken, Taken::Frame(_)) {
+            if let Some(hook) = self.inner.after_take.lock().as_mut() {
+                hook();
             }
         }
+        taken
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_take(&self, hook: impl FnMut() + Send + 'static) {
+        *self.inner.after_take.lock() = Some(Box::new(hook));
     }
 }
 
@@ -1013,13 +1034,17 @@ mod tests {
             height: 2,
         };
         let short = Duration::from_millis(5);
-        assert!(matches!(consumer.take_within(short), super::Taken::Nothing));
+        assert!(matches!(
+            consumer.take_within(short, &mut None),
+            super::Taken::Nothing
+        ));
         producer.publish(frame(1));
         assert!(matches!(
-            consumer.take_within(short),
+            consumer.take_within(short, &mut None),
             super::Taken::Frame(taken) if taken.frame_number == 1
         ));
-        let waiting = std::thread::spawn(move || consumer.take_within(Duration::from_secs(10)));
+        let waiting =
+            std::thread::spawn(move || consumer.take_within(Duration::from_secs(10), &mut None));
         std::thread::sleep(Duration::from_millis(20));
         producer.publish(frame(2));
         assert!(matches!(
@@ -1028,7 +1053,43 @@ mod tests {
         ));
         let (producer, consumer) = super::frame_slot();
         producer.close();
-        assert!(matches!(consumer.take_within(short), super::Taken::Closed));
+        assert!(matches!(
+            consumer.take_within(short, &mut None),
+            super::Taken::Closed
+        ));
+    }
+
+    /// The synthetic source recycles three buffers. A taker that still held
+    /// a kept picture next to the frame it took, while capture published a
+    /// third, left capture no buffer to render its next frame into.
+    #[test]
+    fn a_frame_taken_in_place_of_a_kept_one_leaves_capture_a_free_buffer() {
+        let (producer, consumer) = super::frame_slot();
+        let pool: Vec<Arc<Vec<u8>>> = (0..3).map(|_| Arc::new(vec![0u8; 16])).collect();
+        let frame = |n: usize| super::RawFrame {
+            frame_number: n as u64,
+            timestamp: Instant::now(),
+            data: Arc::clone(&pool[n]),
+            width: 2,
+            height: 2,
+        };
+        let mut kept = Some(frame(0));
+        producer.publish(frame(1));
+        let third = frame(2);
+        let capture = producer.handle();
+        // The taker is descheduled right after the take: capture publishes
+        // its third buffer and looks for a free one, as the synthetic source
+        // does before it renders.
+        consumer.after_take(move || {
+            capture.publish(third.clone());
+            assert!(
+                pool.iter().any(|buffer| Arc::strong_count(buffer) == 1),
+                "capture has no free buffer for its next frame"
+            );
+        });
+        let taken = consumer.take_within(Duration::from_secs(1), &mut kept);
+        assert!(matches!(taken, super::Taken::Frame(frame) if frame.frame_number == 1));
+        assert!(kept.is_none());
     }
 
     #[test]
