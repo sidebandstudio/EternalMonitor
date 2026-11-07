@@ -40,8 +40,9 @@ final class WireProtocolGoldenTests: XCTestCase {
         )
     }
 
-    /// The identify request and its answer: nonce A0..AF, and the proof of
-    /// pairing token 01..10, which the iPad checks as the PC's own.
+    /// The identify request and its answer: nonce A0..AF, port 9876, two
+    /// addresses, and the proof of pairing token 01..10 over them, which the
+    /// iPad checks as the PC's own.
     func testIdentifyAndIdentityVectors() throws {
         let nonce = Data(0xA0...0xAF)
         let request = try vector("identify")
@@ -55,7 +56,14 @@ final class WireProtocolGoldenTests: XCTestCase {
         let (_, message) = try XCTUnwrap(Wire.parseControl(answer))
         guard case .identity(let identity) = message else { return XCTFail("wrong type") }
         XCTAssertEqual(identity.nonce, nonce)
-        XCTAssertEqual(identity.proof, MovedPC.proof(token: Data(1...16), nonce: nonce))
+        XCTAssertEqual(identity.port, 9876)
+        XCTAssertEqual(identity.addresses, [Data([192, 0, 2, 10]), Data([198, 51, 100, 10])])
+        XCTAssertEqual(identity.proof, MovedPC.proof(token: Data(1...16), nonce: nonce, port: 9876,
+                                                     addresses: identity.addresses))
+        // More addresses than fit are refused, never read past.
+        var five = answer
+        five[16 + 1 + 16 + 2] = 5
+        XCTAssertNil(Wire.parseControl(five))
         XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: message), answer)
     }
 

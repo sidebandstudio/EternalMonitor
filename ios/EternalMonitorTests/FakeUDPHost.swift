@@ -92,7 +92,8 @@ final class FakeUDPHost: @unchecked Sendable {
     }
 
     /// Answers the next identify request as the PC holding `token` would,
-    /// or with `proof` instead. False after thirty quiet seconds.
+    /// receiving at this fake's port on loopback, or with `proof` instead.
+    /// False after thirty quiet seconds.
     func answerIdentify(token: Data, proof: Data? = nil) -> Bool {
         for _ in 0..<100 {
             guard let (data, from, length) = receive() else { continue }
@@ -100,9 +101,40 @@ final class FakeUDPHost: @unchecked Sendable {
             if case .hello2? = message { helloBeforeIdentify = true }
             guard case .identify(let request)? = message else { continue }
             client = (from, length)
+            let addresses = [Data([127, 0, 0, 1])]
             send(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identity(WireIdentity(
-                nonce: request.nonce, proof: proof ?? MovedPC.proof(token: token, nonce: request.nonce)))))
+                nonce: request.nonce, port: port, addresses: addresses,
+                proof: proof ?? MovedPC.proof(token: token, nonce: request.nonce, port: port, addresses: addresses)))))
             return true
+        }
+        return false
+    }
+
+    /// Hands the next identify request to `pc` and gives the iPad whatever
+    /// `pc` answers, from this fake's port. False after thirty quiet seconds.
+    func relayIdentify(to pc: FakeUDPHost) -> Bool {
+        var target = sockaddr_in()
+        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_addr.s_addr = inet_addr("127.0.0.1")
+        target.sin_port = pc.port.bigEndian
+        for _ in 0..<100 {
+            guard let (data, from, length) = receive() else { continue }
+            let message = Wire.parseControl(data)?.message
+            if case .hello2? = message { helloBeforeIdentify = true }
+            if case .identity? = message, client != nil {
+                send(data)
+                return true
+            }
+            guard case .identify? = message else { continue }
+            client = (from, length)
+            _ = data.withUnsafeBytes { bytes in
+                withUnsafePointer(to: &target) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        sendto(fd, bytes.baseAddress, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
         }
         return false
     }

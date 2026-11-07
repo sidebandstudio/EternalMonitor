@@ -368,6 +368,107 @@ impl Drop for Listing {
     }
 }
 
+/// The home network addresses among `adapters`: IPv4 on Wi-Fi and Ethernet
+/// adapters that are up, in a private range or link-local, link-local last.
+/// An iPad checking that it found this PC at an address gets these signed.
+pub fn home_addresses_of(adapters: &[Adapter]) -> Vec<Ipv4Addr> {
+    let mut addresses: Vec<Ipv4Addr> = adapters
+        .iter()
+        .filter(|adapter| adapter.up && matches!(adapter.kind, Kind::Wifi | Kind::Ethernet))
+        .flat_map(|adapter| adapter.ipv4.iter().copied())
+        .filter(|ip| ip.is_private() || ip.is_link_local())
+        .collect();
+    addresses.sort_by_key(|ip| ip.is_link_local());
+    let mut seen = Vec::with_capacity(addresses.len());
+    addresses.retain(|ip| {
+        !seen.contains(ip) && {
+            seen.push(*ip);
+            true
+        }
+    });
+    addresses
+}
+
+/// How long one listing of the home network addresses answers.
+const HOME_TTL: Duration = Duration::from_secs(2);
+
+/// This PC's home network addresses now (see [`home_addresses_of`]), listed
+/// at most every 2 s.
+pub fn home_addresses() -> Vec<Ipv4Addr> {
+    static LISTED: Mutex<Option<(Instant, Vec<Ipv4Addr>)>> = Mutex::new(None);
+    let mut listed_at = LISTED.lock();
+    if let Some((_, addresses)) = listed_at.as_ref().filter(|(at, _)| at.elapsed() < HOME_TTL) {
+        return addresses.clone();
+    }
+    let addresses = listed()
+        .or_else(interfaces)
+        .map(|adapters| home_addresses_of(&adapters))
+        .unwrap_or_default();
+    *listed_at = Some((Instant::now(), addresses.clone()));
+    addresses
+}
+
+/// What kind of interface a Unix name and flags say: network cards are
+/// named en*, eth* or wl*; point-to-point interfaces are tunnels.
+#[cfg(unix)]
+fn interface_kind(name: &str, flags: libc::c_int) -> Kind {
+    if flags & libc::IFF_LOOPBACK != 0 {
+        Kind::Virtual
+    } else if flags & libc::IFF_POINTOPOINT != 0 {
+        Kind::Vpn
+    } else if ["en", "eth", "wl"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        Kind::Ethernet
+    } else {
+        Kind::Other
+    }
+}
+
+/// Unix interfaces with their IPv4 addresses, from `getifaddrs`.
+#[cfg(unix)]
+fn interfaces() -> Option<Vec<Adapter>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut out: Vec<Adapter> = Vec::new();
+    let mut next = list;
+    while !next.is_null() {
+        let entry = unsafe { &*next };
+        next = entry.ifa_next;
+        if entry.ifa_addr.is_null()
+            || i32::from(unsafe { (*entry.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        let sin = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let flags = entry.ifa_flags as libc::c_int;
+        match out.iter_mut().find(|adapter| adapter.name == name) {
+            Some(adapter) => adapter.ipv4.push(ip),
+            None => out.push(Adapter {
+                kind: interface_kind(&name, flags),
+                name,
+                up: flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0,
+                gateway: false,
+                ipv4: vec![ip],
+            }),
+        }
+    }
+    unsafe { libc::freeifaddrs(list) };
+    Some(out)
+}
+
+#[cfg(not(unix))]
+fn interfaces() -> Option<Vec<Adapter>> {
+    None
+}
+
 /// The local address the OS would use toward a public address.
 pub fn default_route() -> Option<IpAddr> {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -939,6 +1040,52 @@ mod tests {
 
     /// Windows says the list grew every time: three bigger buffers, then no
     /// list, so no hint.
+    /// What an identity proof signs: home network addresses on network
+    /// cards that are up, never a VPN's or a virtual switch's, even in a
+    /// private range.
+    #[test]
+    fn home_addresses_are_on_network_cards_that_are_up() {
+        let mut down = adapter(Kind::Ethernet, true, [192, 168, 7, 2]);
+        down.up = false;
+        let adapters = [
+            adapter(Kind::Vpn, false, [10, 8, 0, 2]),
+            adapter(Kind::Virtual, false, [172, 20, 0, 1]),
+            adapter(Kind::Wifi, true, [169, 254, 3, 4]),
+            down,
+            adapter(Kind::Other, true, [192, 168, 9, 9]),
+            Adapter {
+                ipv4: vec![
+                    ip([192, 168, 1, 20]),
+                    ip([203, 0, 113, 5]),
+                    ip([192, 168, 1, 20]),
+                ],
+                ..adapter(Kind::Ethernet, true, [0, 0, 0, 0])
+            },
+            adapter(Kind::Wifi, true, [10, 0, 0, 31]),
+        ];
+        assert_eq!(
+            home_addresses_of(&adapters),
+            [
+                ip([192, 168, 1, 20]),
+                ip([10, 0, 0, 31]),
+                ip([169, 254, 3, 4])
+            ]
+        );
+        assert!(home_addresses_of(&[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_interfaces_are_told_apart_by_flags_then_name() {
+        assert_eq!(interface_kind("en0", libc::IFF_UP), Kind::Ethernet);
+        assert_eq!(interface_kind("wlan0", libc::IFF_UP), Kind::Ethernet);
+        assert_eq!(interface_kind("utun3", libc::IFF_POINTOPOINT), Kind::Vpn);
+        assert_eq!(interface_kind("en5", libc::IFF_POINTOPOINT), Kind::Vpn);
+        assert_eq!(interface_kind("lo0", libc::IFF_LOOPBACK), Kind::Virtual);
+        assert_eq!(interface_kind("bridge100", libc::IFF_UP), Kind::Other);
+        assert_eq!(interface_kind("docker0", libc::IFF_UP), Kind::Other);
+    }
+
     #[test]
     fn listing_gives_up_after_three_bigger_buffers() {
         let warned = AtomicBool::new(false);

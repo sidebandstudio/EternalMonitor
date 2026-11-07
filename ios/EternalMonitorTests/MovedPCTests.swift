@@ -132,12 +132,44 @@ final class MovedPCTests: XCTestCase {
     }
 
     /// The same known answer as the host's pairing tests and the wire's
-    /// golden `identity` vector.
+    /// golden `identity` vector. The proof signs the PC's port and addresses.
     func testTheIdentityProofIsTheSharedKnownAnswer() {
-        let proof = MovedPC.proof(token: Data(1...16), nonce: Data(0xA0...0xAF))
-        XCTAssertEqual(proof.map { String(format: "%02x", $0) }.joined(),
-                       "126dc93467af3b0621c4f9b420e0d323143259d743f85703b9fec83989eba353")
-        XCTAssertNotEqual(MovedPC.proof(token: Data(2...17), nonce: Data(0xA0...0xAF)), proof)
+        let addresses = [Data([192, 0, 2, 10]), Data([198, 51, 100, 10])]
+        let proof = { (token: Data, port: UInt16, addresses: [Data]) in
+            MovedPC.proof(token: token, nonce: Data(0xA0...0xAF), port: port, addresses: addresses)
+        }
+        let known = proof(Data(1...16), 9876, addresses)
+        XCTAssertEqual(known.map { String(format: "%02x", $0) }.joined(),
+                       "18fb81d76bbb96e91101119775ad9766b0c332b2c49441e6f07ec33be1c6d94e")
+        XCTAssertNotEqual(proof(Data(2...17), 9876, addresses), known)
+        XCTAssertNotEqual(proof(Data(1...16), 9877, addresses), known)
+        XCTAssertNotEqual(proof(Data(1...16), 9876, [addresses[0]]), known)
+    }
+
+    /// Only an address this iPad reaches directly, over Wi-Fi or Ethernet
+    /// and in that network's subnet, may be a moved PC. A VPN in a home
+    /// network range is not.
+    func testOnlyAnAddressOnTheLocalNetworkIsLocal() {
+        let wifi = MovedPC.Route(interface: "en0", direct: true, address: "192.168.1.23", netmask: "255.255.255.0")
+        XCTAssertTrue(MovedPC.isLocal("192.168.1.40", over: wifi))
+        XCTAssertFalse(MovedPC.isLocal("192.168.2.40", over: wifi), "another subnet")
+        XCTAssertFalse(MovedPC.isLocal("10.0.0.40", over: wifi))
+        XCTAssertFalse(MovedPC.isLocal("studio-pc.local", over: wifi))
+        let wide = MovedPC.Route(interface: "en0", direct: true, address: "10.20.0.5", netmask: "255.255.0.0")
+        XCTAssertTrue(MovedPC.isLocal("10.20.200.9", over: wide))
+
+        // A VPN in a home network range: the path isn't Wi-Fi or Ethernet,
+        // or the interface is a tunnel, or it is a point-to-point address.
+        let vpn = MovedPC.Route(interface: "utun4", direct: false, address: "10.8.0.6", netmask: "255.255.255.0")
+        XCTAssertFalse(MovedPC.isLocal("10.8.0.1", over: vpn))
+        XCTAssertFalse(MovedPC.isLocal("10.8.0.1", over: MovedPC.Route(interface: "utun4", direct: true, address: "10.8.0.6",
+                                                                       netmask: "255.255.255.0")))
+        XCTAssertFalse(MovedPC.isLocal("192.168.1.40", over: MovedPC.Route(interface: "ipsec0", direct: true,
+                                                                           address: "192.168.1.23", netmask: "255.255.255.0")))
+        XCTAssertFalse(MovedPC.isLocal("192.168.1.23", over: MovedPC.Route(interface: "en0", direct: true,
+                                                                           address: "192.168.1.23", netmask: "255.255.255.255")))
+        XCTAssertFalse(MovedPC.isLocal("192.168.1.40", over: MovedPC.Route(interface: "en0", direct: false,
+                                                                           address: "192.168.1.23", netmask: "255.255.255.0")))
     }
 
     // MARK: - Connecting
@@ -153,6 +185,8 @@ final class MovedPCTests: XCTestCase {
     /// otherwise, paired with `token`; Bonjour has it at `new`. Loopback
     /// counts as a home address here.
     private func setUp(old: FakeUDPHost, new: FakeUDPHost, token: Data?, found: Bool? = true,
+                       route: MovedPC.Route? = MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1",
+                                                             netmask: "255.0.0.0"),
                        connectTimeout: Double) throws -> Setup {
         RecentConnectionStore.shared.connections = [
             RecentConnection(host: "127.0.0.1", port: old.port, lastUsed: .now, isUSB: false, name: "Test PC", found: found),
@@ -163,6 +197,7 @@ final class MovedPCTests: XCTestCase {
         let manager = ConnectionManager(timing: .init(connectTimeoutSeconds: connectTimeout, reconnectGraceSeconds: 0.1,
                                                       reconnectBackoffSeconds: { _ in 0.05 }), pairingStore: pairings)
         manager.homeAddress = { _ in true }
+        manager.localRoute = { _, _ in route }
         var asked: [String] = []
         manager.findPCs = { name in
             asked.append(name)
@@ -237,6 +272,49 @@ final class MovedPCTests: XCTestCase {
             XCTAssertEqual(setup.manager.problem, .noReply(usb: false), answer)
             XCTAssertEqual(try setup.pairings.token(address: address(old)), Self.token, answer)
             XCTAssertNotNil(RecentConnectionStore.shared.entry(host: "127.0.0.1", port: old.port), answer)
+        }
+    }
+
+    /// The answer at the address Bonjour gave comes from the saved PC at
+    /// another address, and says so: it isn't the saved PC at this address.
+    /// No HELLO2, no token.
+    func testAnAnswerFromAnotherAddressIsNotTheSamePC() async throws {
+        let old = FakeUDPHost(), relay = FakeUDPHost(), pc = FakeUDPHost()
+        let setup = try setUp(old: old, new: relay, token: Self.token, connectTimeout: 7)
+        defer { setup.manager.cancel() }
+        setup.manager.connect(host: "127.0.0.1", port: old.port)
+        async let answered = Task.detached { pc.answerIdentify(token: Self.token) }.value
+        let types = await Task.detached { () -> [Wire.PacketType] in
+            guard relay.relayIdentify(to: pc) else { return [] }
+            return relay.received(within: 4)
+        }.value
+        let pcAnswered = await answered
+        XCTAssertTrue(pcAnswered, "the request reached the saved PC")
+        XCTAssertFalse(types.isEmpty, "the iPad asked the relay")
+        XCTAssertFalse(types.contains(.hello2), "\(types)")
+        XCTAssertFalse(relay.helloBeforeIdentify)
+        try await until("timed out", seconds: 15) { setup.manager.state == .disconnected }
+        XCTAssertEqual(setup.manager.problem, .noReply(usb: false))
+        XCTAssertEqual(try setup.pairings.token(address: address(old)), Self.token)
+        XCTAssertNil(RecentConnectionStore.shared.entry(host: "127.0.0.1", port: relay.port))
+    }
+
+    /// Bonjour has the PC at a home network address that this iPad reaches
+    /// over a VPN, or by no ready path: it isn't asked anything.
+    func testAPCReachedOverAVPNIsNeverAsked() async throws {
+        let vpn = MovedPC.Route(interface: "utun4", direct: false, address: "127.0.0.2", netmask: "255.0.0.0")
+        for route: MovedPC.Route? in [vpn, nil] {
+            let old = FakeUDPHost(), new = FakeUDPHost()
+            let setup = try setUp(old: old, new: new, token: Self.token, route: route, connectTimeout: 6)
+            defer { setup.manager.cancel() }
+            setup.manager.connect(host: "127.0.0.1", port: old.port)
+            let types = await Task.detached { new.received(within: 5) }.value
+            XCTAssertEqual(types, [], "\(String(describing: route))")
+            try await until("timed out", seconds: 15) { setup.manager.state == .disconnected }
+            XCTAssertEqual(setup.asked().count, 1)
+            XCTAssertEqual(setup.manager.problem, .noReply(usb: false))
+            XCTAssertTrue(setup.manager.diagnostics.contains { $0.message.contains("not on this iPad's local network") })
+            XCTAssertEqual(try setup.pairings.token(address: address(old)), Self.token)
         }
     }
 

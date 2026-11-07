@@ -224,6 +224,8 @@ final class ConnectionManager: ObservableObject {
     /// Which addresses a saved PC may move from and to. Tests on loopback
     /// widen it.
     var homeAddress: (String) -> Bool = MovedPC.isHomeAddress
+    /// How this iPad reaches an address. Tests replace it.
+    var localRoute: (String, UInt16) async -> MovedPC.Route? = { await MovedPC.route(to: $0, port: $1) }
     /// "host:port" of each address picked from Bonjour's list in this
     /// launch. Saved entries keep the mark once they show a picture.
     private var foundAddresses = Set<String>()
@@ -1056,8 +1058,9 @@ final class ConnectionManager: ObservableObject {
 
     /// The attempt's HELLO2 got no answer at `host:port`. A paired PC that
     /// this iPad found with Bonjour is looked for by name. Where Bonjour has
-    /// it at another home network address, the iPad checks that it is the
-    /// same PC, and only then moves the attempt there with its pairing.
+    /// it at another home network address that this iPad reaches directly,
+    /// the iPad checks that it is the same PC, at that address, and only
+    /// then moves the attempt there with its pairing.
     /// Otherwise the attempt goes on as before.
     private func lookForMovedPC(_ connectionID: UUID, host: String, port: UInt16) {
         let address = PairingStore.address(host: host, port: port)
@@ -1084,8 +1087,15 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, "connection", "The saved PC wasn't found at another address")
                 return
             }
+            let route = await self.localRoute(moved.host, moved.port)
+            guard current() else { return }
+            guard let route, MovedPC.isLocal(moved.host, over: route) else {
+                self.record(.info, "connection", "The saved PC was found, but not on this iPad's local network: staying at the saved address")
+                return
+            }
             self.record(.info, "connection", "Checking that the PC at \(moved.host):\(moved.port) is the saved one")
-            let same = await MovedPC.confirm(host: moved.host, token: token, link: self.makeUDPLink(moved.port))
+            let same = await MovedPC.confirm(host: moved.host, port: moved.port, token: token,
+                                             link: self.makeUDPLink(moved.port))
             guard current() else { return }
             guard same else {
                 self.record(.info, "connection", "The PC there didn't show it is the saved one: staying at the saved address")

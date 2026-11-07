@@ -41,13 +41,9 @@ pub fn parse_token(text: &str) -> Option<[u8; 16]> {
     (token != [0; 16]).then_some(token)
 }
 
-fn identity_proof(token: &[u8; 16], nonce: &[u8; 16]) -> [u8; 32] {
+fn identity_proof(token: &[u8; 16], message: &[u8]) -> [u8; 32] {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token);
-    let mut context = ring::hmac::Context::with_key(&key);
-    context.update(nonce);
-    context.update(eternal_wire::v2::control::IDENTIFY_CONTEXT);
-    context
-        .sign()
+    ring::hmac::sign(&key, message)
         .as_ref()
         .try_into()
         .expect("SHA-256 is 32 bytes")
@@ -153,11 +149,16 @@ impl Pairing {
         Ok(())
     }
 
-    /// The answer to an iPad checking that this is the PC it paired with:
-    /// HMAC-SHA256 keyed with the pairing token over `nonce ‖ context`. Only
-    /// a PC holding the token can make it, and the token never leaves.
-    pub fn identity_proof(&self, nonce: &[u8; 16]) -> [u8; 32] {
-        identity_proof(&self.token, nonce)
+    /// The answer to an iPad checking that this is the PC it paired with, at
+    /// the address it asked: HMAC-SHA256 keyed with the pairing token over
+    /// the nonce, the port and the addresses this PC receives the stream on
+    /// (`identity_message`). Only a PC holding the token can make it, and the
+    /// token never leaves.
+    pub fn identity_proof(&self, nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> [u8; 32] {
+        identity_proof(
+            &self.token,
+            &eternal_wire::v2::control::identity_message(nonce, port, addresses),
+        )
     }
 
     pub fn regenerate_token(&mut self) -> Result<(), getrandom::Error> {
@@ -380,19 +381,29 @@ mod tests {
         let token = std::array::from_fn(|index| index as u8 + 1);
         let nonce = std::array::from_fn(|index| 0xA0 + index as u8);
         let pairing = Pairing::new(true, token).unwrap();
-        let hex: String = pairing
-            .identity_proof(&nonce)
+        let addresses = [[192, 0, 2, 10], [198, 51, 100, 10]];
+        let proof = |nonce: &[u8; 16], port, addresses: &[[u8; 4]]| {
+            pairing.identity_proof(nonce, port, addresses)
+        };
+        let hex: String = proof(&nonce, 9876, &addresses)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             hex,
-            "126dc93467af3b0621c4f9b420e0d323143259d743f85703b9fec83989eba353"
+            "18fb81d76bbb96e91101119775ad9766b0c332b2c49441e6f07ec33be1c6d94e"
         );
-        // Another token, or another nonce, gives another proof.
+        // Another token, nonce, port or address gives another proof.
         let other = Pairing::new(true, [9; 16]).unwrap();
-        assert_ne!(other.identity_proof(&nonce), pairing.identity_proof(&nonce));
-        assert_ne!(pairing.identity_proof(&[0; 16]), pairing.identity_proof(&nonce));
+        let signed = proof(&nonce, 9876, &addresses);
+        assert_ne!(other.identity_proof(&nonce, 9876, &addresses), signed);
+        assert_ne!(proof(&[0; 16], 9876, &addresses), signed);
+        assert_ne!(proof(&nonce, 9877, &addresses), signed);
+        assert_ne!(proof(&nonce, 9876, &addresses[..1]), signed);
+        assert_ne!(
+            proof(&nonce, 9876, &[[192, 0, 2, 10], [198, 51, 100, 11]]),
+            signed
+        );
     }
 
     fn guess(nonce: u32) -> FailedRequest {

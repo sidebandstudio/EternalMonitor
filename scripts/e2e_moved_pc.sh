@@ -10,8 +10,10 @@
 #   EM_PAIRING=off            the PC has pairing off, so nothing proves it
 #   EM_MOVED_HOST_BIN=<path>  the PC comes back as a build before 0.3.5
 #
-# On a shared Mac this is an iOS e2e run: hold the machine's e2e lock, and use
-# your own simulator (EM_SIM_UDID) and a private port (EM_PORT, and the next).
+# On a shared Mac this is an iOS e2e run: hold the machine's e2e lock and use
+# your own simulator (EM_SIM_UDID). The PC's two ports are picked free when the
+# run starts; EM_PORT and EM_NEW_PORT choose them instead, and the run stops
+# before anything starts if either is taken.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,8 +22,6 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig}"
 
 UDID="${EM_SIM_UDID:?set EM_SIM_UDID to your own simulator}"
-PORT="${EM_PORT:-19893}"
-NEW_PORT=$((PORT + 1))
 EXPECT="${EM_EXPECT:-move}"
 PAIRING="${EM_PAIRING:-on}"
 TIMEOUT_SECS="${EM_TIMEOUT:-90}"
@@ -48,6 +48,25 @@ import ipaddress,sys
 a=ipaddress.ip_address(sys.argv[1])
 sys.exit(0 if a.version==4 and a.is_private and not a.is_loopback and a not in ipaddress.ip_network('100.64.0.0/10') else 1)
 PY
+
+# The PC's port before and after the move: each free for UDP and TCP on every
+# address, checked together so the two differ.
+PORTS=$(python3 - "${EM_PORT:-0}" "${EM_NEW_PORT:-0}" <<'PY'
+import socket,sys
+held=[]
+for wanted in map(int, sys.argv[1:3]):
+    try:
+        udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); udp.bind(('0.0.0.0',wanted)); held.append(udp)
+        port=udp.getsockname()[1]
+        tcp=socket.socket(socket.AF_INET,socket.SOCK_STREAM); tcp.bind(('0.0.0.0',port)); held.append(tcp)
+    except OSError:
+        print(f"port {wanted} is in use"); sys.exit(1)
+    print(port)
+PY
+) || { echo "FAIL: $PORTS" >&2; exit 1; }
+PORT=$(echo "$PORTS" | sed -n 1p)
+NEW_PORT=$(echo "$PORTS" | sed -n 2p)
+[ "$PORT" != "$NEW_PORT" ] || { echo "FAIL: EM_PORT and EM_NEW_PORT must differ" >&2; exit 1; }
 
 HOST_PID=""
 SILENT_PID=""

@@ -377,22 +377,39 @@ struct WirePong: Equatable {
 }
 
 /// iPad → PC, session 0: before reconnecting to a PC it found at a new
-/// address, the iPad checks that it is the same PC. The PC answers with a
-/// `WireIdentity`. 32 reserved bytes keep the request as long as the answer.
+/// address, the iPad checks that it is the same PC, at that address. The PC
+/// answers with a `WireIdentity`. Reserved bytes keep the request as long as
+/// the answer.
 struct WireIdentify: Equatable {
     static let version: UInt8 = 1
     /// What the proof signs after the nonce.
     static let context = Data("EternalMonitor identify v1".utf8)
+    /// Addresses an answer carries at most.
+    static let maxAddresses = 4
+    /// Both bodies: version, nonce, port, count, address slots and proof.
+    static let bodySize = 1 + 16 + 2 + 1 + 4 * maxAddresses + 32
     var version = WireIdentify.version
     var nonce: Data
 }
 
-/// PC → iPad, session 0: HMAC-SHA256 keyed with the pairing token over
-/// `nonce ‖ WireIdentify.context`.
+/// PC → iPad, session 0: the port the PC receives the stream on, its home
+/// network IPv4 addresses (4 bytes each), and HMAC-SHA256 keyed with the
+/// pairing token over `message`.
 struct WireIdentity: Equatable {
     var version = WireIdentify.version
     var nonce: Data
+    var port: UInt16
+    var addresses: [Data]
     var proof: Data
+
+    /// What the proof signs: `nonce ‖ context ‖ port (LE) ‖ count ‖ addresses`.
+    static func message(nonce: Data, port: UInt16, addresses: [Data]) -> Data {
+        var message = nonce + WireIdentify.context
+        message.appendLE(port)
+        message.append(UInt8(addresses.count))
+        for address in addresses { message.append(address) }
+        return message
+    }
 }
 
 struct WireInputEvent: Equatable {
@@ -539,11 +556,17 @@ extension Wire {
             precondition(i.nonce.count == 16)
             body.append(i.version)
             body.append(i.nonce)
-            body.append(Data(repeating: 0, count: 32))
+            body.append(Data(repeating: 0, count: WireIdentify.bodySize - 17))
         case .identity(let i):
-            precondition(i.nonce.count == 16 && i.proof.count == 32)
+            precondition(i.nonce.count == 16 && i.proof.count == 32 && i.addresses.count <= WireIdentify.maxAddresses
+                         && i.addresses.allSatisfy { $0.count == 4 })
             body.append(i.version)
             body.append(i.nonce)
+            body.appendLE(i.port)
+            body.append(UInt8(i.addresses.count))
+            for slot in 0..<WireIdentify.maxAddresses {
+                body.append(slot < i.addresses.count ? i.addresses[slot] : Data(count: 4))
+            }
             body.append(i.proof)
         case .inputEvent(let e):
             body.append(e.inputVer)
@@ -645,11 +668,15 @@ extension Wire {
         case .inputEvent:
             message = parseInputEvent(&r)
         case .identify:
-            guard let version = r.readU8(), let nonce = r.take(16), r.take(32) != nil else { return nil }
+            guard let version = r.readU8(), let nonce = r.take(16), r.take(WireIdentify.bodySize - 17) != nil else { return nil }
             message = .identify(WireIdentify(version: version, nonce: Data(nonce)))
         case .identity:
-            guard let version = r.readU8(), let nonce = r.take(16), let proof = r.take(32) else { return nil }
-            message = .identity(WireIdentity(version: version, nonce: Data(nonce), proof: Data(proof)))
+            guard let version = r.readU8(), let nonce = r.take(16), let port = r.readU16(), let count = r.readU8(),
+                  Int(count) <= WireIdentify.maxAddresses, let slots = r.take(4 * WireIdentify.maxAddresses),
+                  let proof = r.take(32) else { return nil }
+            let addresses = (0..<Int(count)).map { Data(slots.dropFirst($0 * 4).prefix(4)) }
+            message = .identity(WireIdentity(version: version, nonce: Data(nonce), port: port, addresses: addresses,
+                                             proof: Data(proof)))
         case .media, .mediaFec, .audio, .error:
             return nil
         }

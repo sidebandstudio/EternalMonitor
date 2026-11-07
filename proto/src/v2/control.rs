@@ -320,27 +320,52 @@ pub const IDENTIFY_VERSION: u8 = 1;
 /// What an [`Identity`] proof signs after the nonce.
 pub const IDENTIFY_CONTEXT: &[u8] = b"EternalMonitor identify v1";
 
+/// At most this many addresses in an [`Identity`].
+pub const IDENTITY_MAX_ADDRESSES: usize = 4;
+
 /// Client → host, session_id 0: before reconnecting to a PC it found at a new
-/// address, the iPad checks that it is the same PC. The host answers with an
-/// [`Identity`] whose proof only the PC holding the pairing token can make.
-/// 32 reserved bytes keep the request as long as the answer. Hosts before
-/// 0.3.5 don't know the type and drop it.
+/// address, the iPad checks that it is the same PC, at that address. The host
+/// answers with an [`Identity`] whose proof only the PC holding the pairing
+/// token can make. Reserved bytes keep the request as long as the answer.
+/// Hosts before 0.3.5 don't know the type and drop it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identify {
     pub version: u8,
     pub nonce: [u8; 16],
 }
 
-/// Host → client, session_id 0: `proof` is HMAC-SHA256 keyed with the
-/// pairing token over `nonce ‖ IDENTIFY_CONTEXT`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Host → client, session_id 0: the port the host receives the stream on and
+/// its home network IPv4 addresses (at most [`IDENTITY_MAX_ADDRESSES`]), and
+/// `proof`, HMAC-SHA256 keyed with the pairing token over
+/// [`identity_message`]. The iPad goes on only when the address it asked at
+/// is one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub version: u8,
     pub nonce: [u8; 16],
+    pub port: u16,
+    pub addresses: Vec<[u8; 4]>,
     pub proof: [u8; 32],
 }
 
-pub const IDENTIFY_BODY_SIZE: usize = 49;
+/// Both bodies: version, nonce, port, address count, the address slots
+/// (unused ones zero) and the proof.
+pub const IDENTIFY_BODY_SIZE: usize = 1 + 16 + 2 + 1 + 4 * IDENTITY_MAX_ADDRESSES + 32;
+
+/// What an [`Identity`] proof signs: `nonce ‖ IDENTIFY_CONTEXT ‖ port (LE) ‖
+/// count ‖ addresses`. Only the first [`IDENTITY_MAX_ADDRESSES`] count.
+pub fn identity_message(nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> Vec<u8> {
+    let addresses = &addresses[..addresses.len().min(IDENTITY_MAX_ADDRESSES)];
+    let mut message = Vec::with_capacity(16 + IDENTIFY_CONTEXT.len() + 3 + 4 * addresses.len());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(IDENTIFY_CONTEXT);
+    message.extend_from_slice(&port.to_le_bytes());
+    message.push(addresses.len() as u8);
+    for address in addresses {
+        message.extend_from_slice(address);
+    }
+    message
+}
 
 pub const INPUT_EVENT_SIZE: usize = 30;
 pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
@@ -491,11 +516,17 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
         ControlMessage::Identify(i) => {
             body.push(i.version);
             body.extend_from_slice(&i.nonce);
-            body.extend_from_slice(&[0; 32]);
+            body.extend_from_slice(&[0; IDENTIFY_BODY_SIZE - 17]);
         }
         ControlMessage::Identity(i) => {
+            let count = i.addresses.len().min(IDENTITY_MAX_ADDRESSES);
             body.push(i.version);
             body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&i.port.to_le_bytes());
+            body.push(count as u8);
+            for slot in 0..IDENTITY_MAX_ADDRESSES {
+                body.extend_from_slice(i.addresses.get(slot).unwrap_or(&[0; 4]));
+            }
             body.extend_from_slice(&i.proof);
         }
         ControlMessage::InputEvent(e) => {
@@ -721,14 +752,27 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
         PacketType::Identify => {
             let version = r.u8()?;
             let nonce = r.take(16)?.try_into().unwrap();
-            r.take(32)?;
+            r.take(IDENTIFY_BODY_SIZE - 17)?;
             ControlMessage::Identify(Identify { version, nonce })
         }
-        PacketType::Identity => ControlMessage::Identity(Identity {
-            version: r.u8()?,
-            nonce: r.take(16)?.try_into().unwrap(),
-            proof: r.take(32)?.try_into().unwrap(),
-        }),
+        PacketType::Identity => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            let port = r.u16()?;
+            let count = usize::from(r.u8()?);
+            if count > IDENTITY_MAX_ADDRESSES {
+                return Err(WireError::InvalidField("identity_addresses"));
+            }
+            let slots = r.take(4 * IDENTITY_MAX_ADDRESSES)?;
+            let addresses = slots.as_chunks::<4>().0[..count].to_vec();
+            ControlMessage::Identity(Identity {
+                version,
+                nonce,
+                port,
+                addresses,
+                proof: r.take(32)?.try_into().unwrap(),
+            })
+        }
         PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
             return Err(WireError::InvalidField("packet_type"));
         }
@@ -996,6 +1040,8 @@ mod tests {
             ControlMessage::Identity(Identity {
                 version: IDENTIFY_VERSION,
                 nonce: [7; 16],
+                port: 9876,
+                addresses: vec![[192, 0, 2, 7], [198, 51, 100, 7]],
                 proof: [9; 32],
             }),
             ControlMessage::InputEvent(InputEvent {

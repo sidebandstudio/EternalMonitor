@@ -83,6 +83,8 @@ struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
     stream_epoch: u32,
     pen_available: bool,
+    /// Where the socket receives the stream.
+    listen: SocketAddr,
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
@@ -113,6 +115,23 @@ impl ConfigSource for SharedConfigSource<'_> {
             },
             bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
         }
+    }
+
+    /// A socket on one address signs that one; one on every address signs
+    /// the PC's home network addresses.
+    fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+        let std::net::IpAddr::V4(ip) = self.listen.ip() else {
+            return None;
+        };
+        let addresses = if ip.is_unspecified() {
+            crate::network::home_addresses()
+        } else {
+            vec![ip]
+        };
+        Some((
+            self.listen.port(),
+            addresses.iter().map(|ip| ip.octets()).collect(),
+        ))
     }
 
     fn host_caps(&self) -> u16 {
@@ -225,6 +244,7 @@ pub async fn start_sender(
         shared: &shared,
         stream_epoch,
         pen_available: input_relay.pen_available(),
+        listen: local_addr,
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -952,6 +972,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let peer = PeerId::udp("127.0.0.1:19893".parse().unwrap());
             let hello = ControlMessage::Hello2(Hello2 {
@@ -1016,6 +1037,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1066,6 +1088,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
             let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1161,6 +1184,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
         let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1267,6 +1291,7 @@ mod tests {
             shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1342,6 +1367,7 @@ mod tests {
                     shared: &shared,
                     stream_epoch: 1,
                     pen_available: false,
+                    listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                 };
                 let links =
                     TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
@@ -1405,6 +1431,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let held = shared
             .session
@@ -1442,6 +1469,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let expired = shared
             .session
