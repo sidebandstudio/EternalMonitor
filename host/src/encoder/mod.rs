@@ -651,16 +651,8 @@ fn run_encode_loop(
                 Err(e) => return Err(e.into()),
             }
         }
-        owed_keyframe = match picture {
-            Some(picture) if !keyframe_out => {
-                let mut owed = owed_keyframe
-                    .take()
-                    .unwrap_or_else(|| OwedKeyframe::until(Instant::now() + KEYFRAME_FLUSH_FOR));
-                owed.picture = Some(picture);
-                Some(owed)
-            }
-            _ => None,
-        };
+        owed_keyframe =
+            OwedKeyframe::after_encode(owed_keyframe.take(), picture, keyframe_out, encode_start);
     }
 
     info!("Capture channel closed, encoder shutting down");
@@ -1722,6 +1714,21 @@ impl OwedKeyframe {
             until,
             given: 0,
         }
+    }
+
+    /// What is owed after a frame was submitted at `submitted`: nothing once
+    /// the keyframe came out or the encoder holds no frame, else `picture`
+    /// to give again, until [`KEYFRAME_FLUSH_FOR`] after the first try.
+    fn after_encode(
+        owed: Option<Self>,
+        picture: Option<RawFrame>,
+        keyframe_out: bool,
+        submitted: Instant,
+    ) -> Option<Self> {
+        let picture = picture.filter(|_| !keyframe_out)?;
+        let mut owed = owed.unwrap_or_else(|| Self::until(submitted + KEYFRAME_FLUSH_FOR));
+        owed.picture = Some(picture);
+        Some(owed)
     }
 
     /// Capture's next picture if one arrives within [`KEYFRAME_FLUSH_WAIT`],
@@ -4757,6 +4764,29 @@ mod tests {
             1,
             "the kept picture still pins a capture buffer while the newer one is encoded"
         );
+    }
+
+    #[test]
+    fn the_deadline_counts_from_the_first_keyframe_submission() {
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let submitted = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .unwrap();
+        // The keyframe went in 200 ms ago; sending and receiving took that long.
+        let owed = OwedKeyframe::after_encode(None, Some(raw(1, &kept)), false, submitted)
+            .expect("the keyframe is owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        // A retry submitted later keeps the first deadline.
+        let owed =
+            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), false, Instant::now())
+                .expect("still owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        assert!(
+            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), true, Instant::now())
+                .is_none(),
+            "the keyframe came out"
+        );
+        assert!(OwedKeyframe::after_encode(None, None, false, submitted).is_none());
     }
 
     #[test]
