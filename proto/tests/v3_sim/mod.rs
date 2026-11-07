@@ -28,6 +28,9 @@ pub const HOST_ID: Id16 = [0xB1; 16];
 pub const TICK: Duration = Duration::from_millis(5);
 pub const REPORT_BODY: usize = 36;
 pub const MEDIA_BODY: usize = 1200;
+pub const HEARTBEAT_BODY: usize = 24;
+/// The iPads' wall clock is `now` plus this, in µs; the host's starts equal.
+pub const CLOCK_OFFSET_US: i64 = 1_762_000_000_000_000;
 
 /// An IPv4-like address: the rate limit counts per `ip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -50,6 +53,14 @@ pub const IPAD: SimAddr = SimAddr {
 
 pub fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
+}
+
+/// SplitMix64's output step: turns related seeds into unrelated ones.
+pub fn splitmix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 /// Deterministic xorshift bytes. Session ids and nonces only; the Noise
@@ -90,6 +101,7 @@ pub enum Kind {
     AckOrRefused,
     Report,
     Media,
+    Heartbeat,
     Bye,
     Other,
 }
@@ -103,6 +115,7 @@ pub fn kind_of(dir: Dir, datagram: &[u8]) -> Kind {
             (_, 1) => Kind::Bye,
             (Dir::ToHost, REPORT_BODY) => Kind::Report,
             (Dir::ToIpad, MEDIA_BODY) => Kind::Media,
+            (Dir::ToIpad, HEARTBEAT_BODY) => Kind::Heartbeat,
             (Dir::ToIpad, _) => Kind::AckOrRefused,
             _ => Kind::Other,
         },
@@ -342,6 +355,7 @@ pub struct Sim {
     sealed: HashMap<(Dir, u32, u64), Vec<u8>>,
     rng: XorShift,
     next_media: Duration,
+    next_heartbeat: Duration,
     next_report: Duration,
 }
 
@@ -361,13 +375,6 @@ impl Sim {
         Self::with_configs(seed, HostConfig::new(HOST_ID), ClientConfig::new(HOST_ID))
     }
 
-    /// [`with_configs`](Self::with_configs), with the host's wall clock set.
-    pub fn with_wall_clock(seed: u64) -> Self {
-        let mut sim = Self::new(seed);
-        sim.sync_host_wall_clock();
-        sim
-    }
-
     pub fn with_configs(seed: u64, host: HostConfig, client: ClientConfig) -> Self {
         let mut rng = XorShift(seed | 1);
         let key = Self::new_key(&mut rng);
@@ -375,7 +382,12 @@ impl Sim {
         keys.insert(key.dev_id, key.k_dev);
         Self {
             now: Duration::from_secs(1000),
-            host: HostSessions::new(host, Box::new(XorShift(rng.next() | 1))),
+            host: HostSessions::new(
+                host,
+                Box::new(XorShift(splitmix(rng.next()) | 1)),
+                Duration::from_secs(1000),
+                CLOCK_OFFSET_US as u64 + 1_000_000_000,
+            ),
             client: Client::new(client, hello(), Box::new(XorShift(rng.next() | 1))),
             key,
             addr: IPAD,
@@ -392,7 +404,7 @@ impl Sim {
             other_host_events: Vec::new(),
             sent: Vec::new(),
             undelivered: 0,
-            clock_offset_us: 1_762_000_000_000_000,
+            clock_offset_us: CLOCK_OFFSET_US,
             in_flight: BTreeMap::new(),
             seq: 0,
             counts: HashMap::new(),
@@ -401,12 +413,22 @@ impl Sim {
             sealed: HashMap::new(),
             rng,
             next_media: Duration::ZERO,
+            next_heartbeat: Duration::ZERO,
             next_report: Duration::ZERO,
         }
     }
 
-    /// Gives the host a wall clock equal to the iPads' clock, so its
-    /// timestamp bound applies.
+    /// The host process restarts: every session is gone, the credential
+    /// store (with its timestamps) stays, and the wall clock is read again.
+    pub fn restart_host(&mut self, config: HostConfig, wall_us: u64) {
+        // A fresh, unrelated seed: a successor state of the same xorshift
+        // sequence would replay the previous instance's session ids.
+        let seed = splitmix(self.rng.next());
+        self.host = HostSessions::new(config, Box::new(XorShift(seed | 1)), self.now, wall_us);
+        self.host_live.clear();
+    }
+
+    /// Steps the host's wall clock to the iPads' clock.
     pub fn sync_host_wall_clock(&mut self) {
         let wall = self.clock_us();
         self.host.set_wall_clock(self.now, wall);
@@ -812,6 +834,22 @@ impl Sim {
                 }
             }
         }
+        if !self.host_live.is_empty() && now >= self.next_heartbeat {
+            // Heartbeats every second while live, as v2 does.
+            self.next_heartbeat = now + ms(1000);
+            let mut devices: Vec<Id16> = self.host_live.keys().copied().collect();
+            devices.sort();
+            for dev_id in devices {
+                if let Some((to, datagram)) = self.host.seal(
+                    now,
+                    &dev_id,
+                    PacketType::Heartbeat as u8,
+                    &[0; HEARTBEAT_BODY],
+                ) {
+                    self.send(Dir::ToIpad, to, to, datagram);
+                }
+            }
+        }
         if let Some(every) = self.policy.report_every {
             if self.client.live_session().is_some() && now >= self.next_report {
                 self.next_report = now + every;
@@ -929,6 +967,26 @@ impl Sim {
                 }
             }
         }
+    }
+
+    /// Commits made at or before `at` whose session never went live on
+    /// device 0. A later commit may still be on its way.
+    pub fn unused_commits_before(&self, at: Duration) -> usize {
+        let live: Vec<u32> = self
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::IpadLive { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .collect();
+        self.events
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::HostCommitted { at: t, session_id, .. }
+                    if *t <= at && !live.contains(session_id))
+            })
+            .count()
     }
 
     /// Commits whose session never went live on that iPad.

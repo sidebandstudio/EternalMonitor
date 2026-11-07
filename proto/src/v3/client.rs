@@ -51,6 +51,9 @@ pub struct ClientConfig {
     pub max_age: Duration,
     /// Reconnect this long before the session's maximum age.
     pub reconnect_margin: Duration,
+    /// No authenticated record on the live session for this long ends it,
+    /// unless the host's Accept gives its own `liveness_timeout_ms`.
+    pub liveness_timeout: Duration,
     /// How long, from message 2, an attempt whose confirm window ran out
     /// keeps its receive key. A `SessionConfirmAck`, a refusal or media under
     /// it in that time is still handled. The host decides within its 5 s
@@ -70,6 +73,7 @@ impl ClientConfig {
             drain_limit: Duration::from_secs(1),
             max_age: SESSION_MAX_AGE,
             reconnect_margin: Duration::from_secs(60),
+            liveness_timeout: Duration::from_secs(3),
             abandoned_keep: Duration::from_secs(11),
         }
     }
@@ -114,6 +118,9 @@ pub enum ClientClose {
     HostBye(u8),
     /// The session reached its maximum age or counter limit.
     Expired,
+    /// Nothing authenticated arrived on it within the host's liveness
+    /// timeout: the host has ended it, or the path is gone.
+    Liveness,
     /// The app ended it.
     Local,
 }
@@ -218,6 +225,8 @@ struct Session {
     sealer: Sealer,
     opener: Opener,
     established: Duration,
+    /// The last authenticated record from the host, once live.
+    last_rx: Duration,
     accept: Accept,
 }
 
@@ -350,15 +359,64 @@ impl Client {
         matches!(self.attempt, Attempt::Confirming { .. })
     }
 
-    /// Starts an attempt with `key`, abandoning any attempt in progress. A
-    /// live session keeps working until the cutover.
-    /// Abandoned attempts under any other key are dropped.
+    /// Starts an attempt with `key`. An attempt in progress ends the way
+    /// every attempt ends ([`abandon_current`](Self::abandon_current)), and
+    /// a live session keeps working until the cutover. Abandoned attempts
+    /// under keys other than `key` and the live session's key are dropped.
     pub fn connect(&mut self, now: Duration, key: ClientKey, clock_us: u64) -> Vec<ClientOutput> {
         let mut out = Vec::new();
-        self.intent = Some(key.dev_id);
-        self.abandoned.retain(|a| a.key.dev_id == key.dev_id);
-        self.start_attempt(now, key, clock_us, false, &mut out);
+        self.begin_attempt(now, key.clone(), clock_us, false, &mut out);
+        let live_key = self.key.as_ref().map(|k| k.dev_id);
+        self.abandoned
+            .retain(|a| a.key.dev_id == key.dev_id || Some(a.key.dev_id) == live_key);
         out
+    }
+
+    /// Ends the current attempt. A confirming attempt becomes abandoned:
+    /// receive-only, because the host may still commit or refuse it. Any
+    /// other attempt simply ends; the host can't commit without a confirm.
+    /// Every path that ends or replaces an attempt goes through here.
+    fn abandon_current(&mut self) {
+        if let Attempt::Confirming {
+            key,
+            session,
+            started,
+            ..
+        } = std::mem::replace(&mut self.attempt, Attempt::Idle)
+        {
+            if self.abandoned.len() >= MAX_ABANDONED {
+                self.abandoned.remove(0);
+            }
+            self.abandoned.push(Abandoned {
+                key,
+                session,
+                until: started + self.config.abandoned_keep,
+            });
+        }
+    }
+
+    /// The one way an attempt starts: the current one ends through
+    /// [`abandon_current`](Self::abandon_current), and `key` becomes the
+    /// intent.
+    fn begin_attempt(
+        &mut self,
+        now: Duration,
+        key: ClientKey,
+        clock_us: u64,
+        stale_retried: bool,
+        out: &mut Vec<ClientOutput>,
+    ) {
+        self.abandon_current();
+        self.intent = Some(key.dev_id);
+        self.start_attempt(now, key, clock_us, stale_retried, out);
+    }
+
+    /// An attempt got no usable answer. The intent falls back to the live
+    /// session's key, so a late answer for it can still be used.
+    fn fail_attempt(&mut self, dev_id: Id16, out: &mut Vec<ClientOutput>) {
+        self.attempt = Attempt::Idle;
+        self.intent = self.key.as_ref().map(|k| k.dev_id);
+        out.push(ClientOutput::AttemptFailed { dev_id });
     }
 
     /// The host refused this key, or said it must be paired again: stop
@@ -370,6 +428,7 @@ impl Client {
             _ => None,
         };
         if attempt_key == Some(*dev_id) {
+            // A refused key's attempt isn't kept: nothing more can come of it.
             self.attempt = Attempt::Idle;
         }
         self.abandoned.retain(|a| a.key.dev_id != *dev_id);
@@ -458,10 +517,9 @@ impl Client {
             ) => {
                 self.set_last_timestamp(stored_timestamp_us);
                 if stale_retried {
-                    self.attempt = Attempt::Idle;
-                    out.push(ClientOutput::AttemptFailed { dev_id: key.dev_id });
+                    self.fail_attempt(key.dev_id, out);
                 } else {
-                    self.start_attempt(now, key, clock_us, true, out);
+                    self.begin_attempt(now, key, clock_us, true, out);
                 }
             }
             (Msg2Payload::TooNew { limit_us }, _) => {
@@ -469,10 +527,9 @@ impl Client {
                 self.clock_limit = Some(limit_us);
                 self.last_timestamp = self.last_timestamp.min(limit_us.saturating_sub(1));
                 if stale_retried {
-                    self.attempt = Attempt::Idle;
-                    out.push(ClientOutput::AttemptFailed { dev_id: key.dev_id });
+                    self.fail_attempt(key.dev_id, out);
                 } else {
-                    self.start_attempt(now, key, clock_us, true, out);
+                    self.begin_attempt(now, key, clock_us, true, out);
                 }
             }
             (Msg2Payload::PairAgain, _) => {
@@ -492,6 +549,7 @@ impl Client {
                         sealer,
                         opener,
                         established: now,
+                        last_rx: now,
                         accept,
                     }),
                     started: now,
@@ -587,10 +645,11 @@ impl Client {
             return;
         }
 
-        if let Some(live) = self.live.as_ref().filter(|s| s.session_id == session_id) {
+        if let Some(live) = self.live.as_mut().filter(|s| s.session_id == session_id) {
             let Ok(opened) = live.opener.open(datagram) else {
                 return;
             };
+            live.last_rx = now;
             match SessionMessage::parse(opened.inner_type, &opened.body) {
                 Ok(None) => out.push(ClientOutput::Deliver {
                     session_id,
@@ -710,6 +769,8 @@ impl Client {
             session_id: session.session_id,
             accept: session.accept.clone(),
         });
+        let mut session = session;
+        session.last_rx = now;
         self.live = Some(session);
         self.key = Some(key);
     }
@@ -746,7 +807,7 @@ impl Client {
     /// of one can't bring the session back.
     pub fn disconnect(&mut self, reason: u8) -> Vec<ClientOutput> {
         let mut out = Vec::new();
-        self.attempt = Attempt::Idle;
+        self.abandon_current();
         self.abandoned.clear();
         self.intent = None;
         if let Some(mut live) = self.live.take() {
@@ -776,8 +837,7 @@ impl Client {
             } => {
                 if now.saturating_sub(*started) >= self.config.msg1_window {
                     let dev_id = key.dev_id;
-                    self.attempt = Attempt::Idle;
-                    out.push(ClientOutput::AttemptFailed { dev_id });
+                    self.fail_attempt(dev_id, &mut out);
                 } else if now.saturating_sub(*last_sent) >= self.config.msg1_retry_interval {
                     *last_sent = now;
                     out.push(ClientOutput::Send(initiator.msg1().to_vec()));
@@ -790,27 +850,10 @@ impl Client {
                 last_sent,
             } => {
                 if now.saturating_sub(*started) >= self.config.confirm_window {
-                    // Stop confirming and start over, but keep the receive
-                    // key: the host may still answer this attempt.
+                    // Stop confirming and start over; the attempt is kept
+                    // receive-only by `abandon_current`.
                     let key = key.clone();
-                    let until = *started + self.config.abandoned_keep;
-                    let Attempt::Confirming {
-                        session,
-                        key: old_key,
-                        ..
-                    } = std::mem::replace(&mut self.attempt, Attempt::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    if self.abandoned.len() >= MAX_ABANDONED {
-                        self.abandoned.remove(0);
-                    }
-                    self.abandoned.push(Abandoned {
-                        key: old_key,
-                        session,
-                        until,
-                    });
-                    self.start_attempt(now, key, clock_us, false, &mut out);
+                    self.begin_attempt(now, key, clock_us, false, &mut out);
                 } else if now.saturating_sub(*last_sent) >= self.config.confirm_retry_interval {
                     *last_sent = now;
                     if let Some(confirm) = seal_confirm(&mut session.sealer) {
@@ -851,6 +894,28 @@ impl Client {
         }
 
         if let Some(live) = &self.live {
+            let timeout = match live.accept.liveness_timeout_ms {
+                0 => self.config.liveness_timeout,
+                ms => Duration::from_millis(u64::from(ms)),
+            };
+            if now.saturating_sub(live.last_rx) >= timeout {
+                // The host has ended the session, or the path is gone: stop
+                // treating it as live, and reconnect if it's still wanted.
+                let session_id = live.session_id;
+                self.live = None;
+                out.push(ClientOutput::Closed {
+                    session_id,
+                    reason: ClientClose::Liveness,
+                });
+                let wanted = self.key.clone().filter(|k| self.intent == Some(k.dev_id));
+                if let (Some(key), Attempt::Idle) = (wanted, &self.attempt) {
+                    self.begin_attempt(now, key, clock_us, false, &mut out);
+                }
+                return out;
+            }
+        }
+
+        if let Some(live) = &self.live {
             let age = now.saturating_sub(live.established);
             // Authenticated progress in each direction: sealed here, opened
             // from the host.
@@ -868,7 +933,7 @@ impl Client {
                     || used + RECONNECT_RECORD_MARGIN >= MAX_RECORDS_PER_DIRECTION)
             {
                 if let Some(key) = self.key.clone() {
-                    self.start_attempt(now, key, clock_us, false, &mut out);
+                    self.begin_attempt(now, key, clock_us, false, &mut out);
                 }
             }
         }

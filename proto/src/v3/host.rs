@@ -75,14 +75,20 @@ pub struct HostConfig {
     /// Diffie-Hellman. The source is [`PeerAddr::rate_bucket`]. Sources that
     /// don't fit the table share one budget of the same size.
     pub msg1_per_second: u32,
-    /// New handshakes (Diffie-Hellman) per second, host-wide. A message 1
-    /// from its `dev_id`'s live session address doesn't count against it.
+    /// Authenticated message 1s answered (each costs a Diffie-Hellman for
+    /// message 2) per second, host-wide. Charged only after message 1
+    /// authenticates, so forged message 1s can't use it up. A message 1 from
+    /// its `dev_id`'s live session address doesn't count against it.
     pub dh_per_second: u32,
-    /// Cached replies (message 2, `Stale`) per second, host-wide, to sources
-    /// other than the one whose message 1 created them.
+    /// Message 1s per second read from a `dev_id`'s live session address,
+    /// before authentication. Its reserved budget of `msg1_per_second` is
+    /// charged only after authentication.
+    pub reserved_precrypto_per_second: u32,
+    /// Cached `Stale`, `TooNew` and `PairAgain` replays per second,
+    /// host-wide, to sources other than the one whose message 1 got them.
     pub unverified_replies_per_second: u32,
-    /// How far ahead of the host's wall clock a message 1 timestamp may be,
-    /// once [`HostSessions::set_wall_clock`] has been called.
+    /// How far ahead of the later of the host's wall clock and the
+    /// committed timestamp a message 1 timestamp may be.
     pub max_timestamp_ahead: Duration,
     /// Pending sessions host-wide.
     pub max_pending: usize,
@@ -106,6 +112,7 @@ impl HostConfig {
             refusal_resend_interval: Duration::from_millis(100),
             msg1_per_second: 20,
             dh_per_second: 200,
+            reserved_precrypto_per_second: 2000,
             unverified_replies_per_second: 50,
             max_timestamp_ahead: Duration::from_secs(24 * 60 * 60),
             max_pending: 16,
@@ -312,12 +319,8 @@ struct PendingSession<A: PeerAddr> {
     opener: Opener,
     msg1_key: Digest,
     msg2: Vec<u8>,
-    /// The source whose message 1 created this pending session, and when
-    /// the cached message 2 last went to it. Its allowance is its own.
-    origin: <A as PeerAddr>::Bucket,
-    origin_sent: Duration,
-    /// When the cached message 2 last went to each other source, oldest
-    /// first.
+    /// When the cached message 2 last went to each source. Each source has
+    /// its own allowance; sources beyond the capacity get nothing.
     msg2_sent: BoundedTimes<<A as PeerAddr>::Bucket>,
     deadline: Duration,
     timestamp_us: u64,
@@ -363,7 +366,9 @@ struct Device<A: PeerAddr> {
     live: Option<LiveSession<A>>,
     pending: Option<PendingSession<A>>,
     /// The message 1 budget for the live session's own address, apart from
-    /// every shared budget.
+    /// every shared budget: a high cap before authentication, and the
+    /// per-source limit charged only after it.
+    reserved_precrypto: RateWindow,
     reserved: RateWindow,
     /// The newest timestamp committed in memory, in case the caller hasn't
     /// persisted it yet.
@@ -375,6 +380,10 @@ impl<A: PeerAddr> Default for Device<A> {
         Self {
             live: None,
             pending: None,
+            reserved_precrypto: RateWindow {
+                start: Duration::ZERO,
+                count: 0,
+            },
             reserved: RateWindow {
                 start: Duration::ZERO,
                 count: 0,
@@ -518,10 +527,10 @@ impl<B: Clone + Eq + Hash> SourceLimiter<B> {
     }
 }
 
-/// Times per key with a fixed capacity, oldest evicted first (O(1)).
+/// Times per key with a fixed capacity. A full table takes no new keys, so
+/// no key's allowance is ever reset by eviction.
 struct BoundedTimes<B> {
     times: HashMap<B, Duration>,
-    order: VecDeque<B>,
     capacity: usize,
 }
 
@@ -529,7 +538,6 @@ impl<B: Clone + Eq + Hash> BoundedTimes<B> {
     fn new(capacity: usize) -> Self {
         Self {
             times: HashMap::new(),
-            order: VecDeque::new(),
             capacity,
         }
     }
@@ -538,15 +546,17 @@ impl<B: Clone + Eq + Hash> BoundedTimes<B> {
         self.times.get(key).copied()
     }
 
-    fn insert(&mut self, key: B, at: Duration) {
-        if self.times.insert(key.clone(), at).is_none() {
-            if self.order.len() >= self.capacity {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.times.remove(&oldest);
-                }
-            }
-            self.order.push_back(key);
+    fn is_full(&self) -> bool {
+        self.times.len() >= self.capacity
+    }
+
+    /// Records `at` for `key`. A new key is refused when full.
+    fn insert(&mut self, key: B, at: Duration) -> bool {
+        if !self.times.contains_key(&key) && self.is_full() {
+            return false;
         }
+        self.times.insert(key, at);
+        true
     }
 }
 
@@ -557,7 +567,10 @@ const MAX_MSG2_SOURCES: usize = 16;
 /// Remembered timed-out message 1s.
 const MAX_EXPIRED_MSG1: usize = 4096;
 /// Remembered message 1s that got an answer without a pending session.
-const MAX_ANSWERED_MSG1: usize = 4096;
+/// Sized for every credential the host can hold (64) at the answer rate
+/// (5/s each) for the 30 s they're remembered: 64 × 5 × 30 = 9,600. When
+/// full, no new answer is given; an unexpired entry is never evicted.
+const MAX_ANSWERED_MSG1: usize = 16_384;
 
 pub struct HostSessions<A: PeerAddr> {
     config: HostConfig,
@@ -577,13 +590,21 @@ pub struct HostSessions<A: PeerAddr> {
     answered_order: VecDeque<(Digest, Duration)>,
     dh_budget: RateWindow,
     unverified_replies: RateWindow,
-    /// The host's wall clock: µs at a given `now`.
-    wall_clock: Option<(Duration, u64)>,
+    /// The host's wall clock: µs since the Unix epoch at a given `now`.
+    wall_clock: (Duration, u64),
+    msg1_reads: u64,
     dh_performed: u64,
 }
 
 impl<A: PeerAddr> HostSessions<A> {
-    pub fn new(config: HostConfig, rng: Box<dyn Random + Send>) -> Self {
+    /// `wall_us` is the host's wall clock, in µs since the Unix epoch, at
+    /// `now`. Message 1 timestamps are bounded against it.
+    pub fn new(
+        config: HostConfig,
+        rng: Box<dyn Random + Send>,
+        now: Duration,
+        wall_us: u64,
+    ) -> Self {
         Self {
             msg1_rate: SourceLimiter::new(config.msg1_per_second),
             stale_replay_rate: SourceLimiter::new(config.stale_replays_per_second),
@@ -605,26 +626,36 @@ impl<A: PeerAddr> HostSessions<A> {
                 start: Duration::ZERO,
                 count: 0,
             },
-            wall_clock: None,
+            wall_clock: (now, wall_us),
+            msg1_reads: 0,
             dh_performed: 0,
         }
     }
 
-    /// Sets the host's wall clock, in µs since the Unix epoch, at `now`.
-    /// From then on a message 1 whose timestamp is more than
-    /// [`HostConfig::max_timestamp_ahead`] ahead of it gets `TooNew`.
+    /// Steps the host's wall clock: `wall_us` at `now`.
     pub fn set_wall_clock(&mut self, now: Duration, wall_us: u64) {
-        self.wall_clock = Some((now, wall_us));
+        self.wall_clock = (now, wall_us);
     }
 
-    fn timestamp_limit(&self, now: Duration) -> Option<u64> {
-        let (at, wall) = self.wall_clock?;
+    /// The latest message 1 timestamp accepted: the later of the host's wall
+    /// clock and the committed timestamp, plus
+    /// [`HostConfig::max_timestamp_ahead`]. Measured from the committed
+    /// value too, so a host clock behind it never locks the device out.
+    fn timestamp_limit(&self, now: Duration, committed: u64) -> u64 {
+        let (at, wall) = self.wall_clock;
         let elapsed = u64::try_from(now.saturating_sub(at).as_micros()).unwrap_or(u64::MAX);
         let ahead = u64::try_from(self.config.max_timestamp_ahead.as_micros()).unwrap_or(u64::MAX);
-        Some(wall.saturating_add(elapsed).saturating_add(ahead))
+        wall.saturating_add(elapsed)
+            .max(committed)
+            .saturating_add(ahead)
     }
 
-    /// Handshakes (Diffie-Hellman on a message 1) performed so far.
+    /// Message 1s read (authenticated or not) so far.
+    pub fn msg1_reads(&self) -> u64 {
+        self.msg1_reads
+    }
+
+    /// Authenticated message 1s answered so far.
     pub fn handshakes_performed(&self) -> u64 {
         self.dh_performed
     }
@@ -712,27 +743,16 @@ impl<A: PeerAddr> HostSessions<A> {
         if let Some(device) = self.devices.get_mut(&dev_id) {
             if let Some(p) = device.pending.as_mut().filter(|p| p.msg1_key == key) {
                 // A retry of the message 1 that made this pending session:
-                // the cached message 2 again. The source that sent it first
-                // has its own allowance; any other source also needs the
-                // host-wide budget for unverified replies.
-                let send = if bucket == p.origin {
-                    let due = now.saturating_sub(p.origin_sent) >= resend_interval;
-                    if due {
-                        p.origin_sent = now;
-                    }
-                    due
-                } else {
-                    let due = p
-                        .msg2_sent
-                        .get(&bucket)
-                        .is_none_or(|t| now.saturating_sub(t) >= resend_interval);
-                    let allowed = due && self.unverified_replies.allow(now, unverified_limit);
-                    if allowed {
-                        p.msg2_sent.insert(bucket, now);
-                    }
-                    allowed
-                };
-                if send {
+                // the cached message 2 again. Each source has its own 100 ms
+                // allowance, whichever sent first; sources beyond
+                // MAX_MSG2_SOURCES get nothing.
+                let due = p
+                    .msg2_sent
+                    .get(&bucket)
+                    .map_or(!p.msg2_sent.is_full(), |t| {
+                        now.saturating_sub(t) >= resend_interval
+                    });
+                if due && p.msg2_sent.insert(bucket, now) {
                     out.push(HostOutput::Send {
                         to: from.clone(),
                         datagram: p.msg2.clone(),
@@ -779,15 +799,14 @@ impl<A: PeerAddr> HostSessions<A> {
                 .as_ref()
                 .is_some_and(|l| l.peer.rate_bucket() == bucket)
         });
+        // Before authentication: cheap per-source limits only.
         if reserved {
-            let limit = self.config.msg1_per_second;
+            let cap = self.config.reserved_precrypto_per_second;
             let device = self.devices.get_mut(&dev_id).expect("has a live session");
-            if !device.reserved.allow(now, limit) {
+            if !device.reserved_precrypto.allow(now, cap) {
                 return;
             }
-        } else if !self.msg1_rate.allow(now, &bucket)
-            || !self.dh_budget.allow(now, self.config.dh_per_second)
-        {
+        } else if !self.msg1_rate.allow(now, &bucket) {
             return;
         }
         let has_pending = self
@@ -797,11 +816,23 @@ impl<A: PeerAddr> HostSessions<A> {
         if !has_pending && self.pending_count() >= self.config.max_pending {
             return;
         }
-        self.dh_performed += 1;
+        self.msg1_reads += 1;
         let Ok(responder) = Responder::read_msg1(&msg1, &k_dev, &self.config.host_id) else {
             return;
         };
         drop(k_dev);
+        // Authenticated: now the budgets that forged message 1s must never
+        // reach. Answering costs a Diffie-Hellman.
+        if reserved {
+            let limit = self.config.msg1_per_second;
+            let device = self.devices.get_mut(&dev_id).expect("has a live session");
+            if !device.reserved.allow(now, limit) {
+                return;
+            }
+        } else if !self.dh_budget.allow(now, self.config.dh_per_second) {
+            return;
+        }
+        self.dh_performed += 1;
         let timestamp_us = responder.payload().timestamp_us;
         if timestamp_us >= MAX_TIMESTAMP_US {
             return;
@@ -815,9 +846,8 @@ impl<A: PeerAddr> HostSessions<A> {
             // A committed value at the ceiling has no valid successor: this
             // key can never connect again. Pairing again issues a new key.
             Some(Msg2Payload::PairAgain)
-        } else if let Some(limit) = self
-            .timestamp_limit(now)
-            .filter(|&limit| timestamp_us > limit)
+        } else if let Some(limit) =
+            Some(self.timestamp_limit(now, committed)).filter(|&limit| timestamp_us > limit)
         {
             Some(Msg2Payload::TooNew { limit_us: limit })
         } else if timestamp_us <= committed {
@@ -855,9 +885,11 @@ impl<A: PeerAddr> HostSessions<A> {
             opener,
             msg1_key: key,
             msg2: msg2.clone(),
-            origin: bucket,
-            origin_sent: now,
-            msg2_sent: BoundedTimes::new(MAX_MSG2_SOURCES),
+            msg2_sent: {
+                let mut sent = BoundedTimes::new(MAX_MSG2_SOURCES);
+                sent.insert(bucket, now);
+                sent
+            },
             deadline: now + self.config.pending_lifetime,
             timestamp_us,
             hello,
@@ -884,6 +916,12 @@ impl<A: PeerAddr> HostSessions<A> {
         reply: &Msg2Payload,
         out: &mut Vec<HostOutput<A>>,
     ) {
+        self.expire_answered(now);
+        if self.answered.len() >= MAX_ANSWERED_MSG1 && !self.answered.contains_key(&key) {
+            // Full of unexpired entries: refuse new work rather than forget
+            // a message 1 that was already answered.
+            return;
+        }
         let limit = self.config.stale_per_second;
         if !self.stale_budget(dev_id, now).window.allow(now, limit) {
             return;
@@ -903,14 +941,10 @@ impl<A: PeerAddr> HostSessions<A> {
             origin,
             until,
         });
-        if self.answered.len() >= MAX_ANSWERED_MSG1 {
-            if let Some((oldest, _)) = self.answered_order.pop_front() {
-                self.answered.remove(&oldest);
-            }
-        }
-        if self.answered.insert(key, until).is_none() {
-            self.answered_order.push_back((key, until));
-        }
+        // Always queued, also when replacing an expired entry for the same
+        // message 1, so every entry expires.
+        self.answered.insert(key, until);
+        self.answered_order.push_back((key, until));
         out.push(HostOutput::Send {
             to: from.clone(),
             datagram: msg2,
@@ -1391,6 +1425,11 @@ impl<A: PeerAddr> HostSessions<A> {
             b.cached.retain(|c| now < c.until);
             !b.cached.is_empty() || now.saturating_sub(b.window.start) < Duration::from_secs(1)
         });
+        self.expire_answered(now);
+        out
+    }
+
+    fn expire_answered(&mut self, now: Duration) {
         while let Some(&(key, until)) = self.answered_order.front() {
             if now < until {
                 break;
@@ -1400,7 +1439,6 @@ impl<A: PeerAddr> HostSessions<A> {
             }
             self.answered_order.pop_front();
         }
-        out
     }
 
     fn allocate_session_id(&mut self) -> u32 {
@@ -1492,7 +1530,12 @@ mod tests {
         let mut creds = Creds::default();
         creds.keys.insert(DEV, K);
         (
-            HostSessions::new(HostConfig::new(HOST), Box::new(SeededRandom::new(1))),
+            HostSessions::new(
+                HostConfig::new(HOST),
+                Box::new(SeededRandom::new(1)),
+                T0,
+                WALL,
+            ),
             creds,
         )
     }
@@ -1514,6 +1557,8 @@ mod tests {
     }
 
     const T0: Duration = Duration::from_secs(100);
+    /// The host's wall clock at T0, in µs. Test timestamps are far below it.
+    const WALL: u64 = 1_762_000_000_000_000;
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
@@ -1785,8 +1830,12 @@ mod tests {
     fn the_rate_limit_counts_per_ip_not_per_port() {
         let mut creds = Creds::default();
         creds.keys.insert(DEV, K);
-        let mut host: HostSessions<SocketAddr> =
-            HostSessions::new(HostConfig::new(HOST), Box::new(SeededRandom::new(2)));
+        let mut host: HostSessions<SocketAddr> = HostSessions::new(
+            HostConfig::new(HOST),
+            Box::new(SeededRandom::new(2)),
+            T0,
+            WALL,
+        );
         let answered = (0..25u16)
             .filter(|&i| {
                 let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10 + u64::from(i))).unwrap();
@@ -1830,8 +1879,12 @@ mod tests {
         // touches another node's budget.
         let mut creds = Creds::default();
         creds.keys.insert(DEV, K);
-        let mut host: HostSessions<SocketAddr> =
-            HostSessions::new(HostConfig::new(HOST), Box::new(SeededRandom::new(4)));
+        let mut host: HostSessions<SocketAddr> = HostSessions::new(
+            HostConfig::new(HOST),
+            Box::new(SeededRandom::new(4)),
+            T0,
+            WALL,
+        );
         let attacker = at([0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x6666, 0x0001]);
         let ipad_addr = at([0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0x1234, 0x0001]);
         for i in 0..30u64 {
@@ -2140,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_message_2_to_other_sources_shares_the_host_wide_budget() {
+    fn cached_message_2_goes_to_a_bounded_number_of_sources() {
         let (mut host, creds) = setup();
         let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
         host.handle_datagram(T0, &1, ipad.msg1(), &creds);
@@ -2149,11 +2202,15 @@ mod tests {
                 sends(&host.handle_datagram(T0 + ms(10), &source, ipad.msg1(), &creds)).len()
             })
             .sum();
-        assert_eq!(replies, 50);
+        assert_eq!(
+            replies,
+            MAX_MSG2_SOURCES - 1,
+            "16 sources per pending session"
+        );
         assert_eq!(
             sends(&host.handle_datagram(T0 + ms(150), &1, ipad.msg1(), &creds)).len(),
             1,
-            "the origin's resend is its own"
+            "a source already seen keeps its allowance"
         );
     }
 
@@ -2179,7 +2236,8 @@ mod tests {
         // Only the per-source table decides here.
         let mut config = HostConfig::new(HOST);
         config.dh_per_second = u32::MAX;
-        let mut host: HostSessions<u32> = HostSessions::new(config, Box::new(SeededRandom::new(5)));
+        let mut host: HostSessions<u32> =
+            HostSessions::new(config, Box::new(SeededRandom::new(5)), T0, WALL);
         let forged = |i: u64| Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(i)).unwrap();
         // Source 1 uses its whole second.
         for i in 0..20 {
@@ -2189,25 +2247,11 @@ mod tests {
         for source in 0..1100u32 {
             host.handle_datagram(T0 + ms(1), &(1000 + source), forged(5).msg1(), &creds);
         }
-        // Source 1 is still at its limit: nothing evicted its window.
-        let before = host.handshakes_performed();
+        // Source 1 is still at its limit: nothing evicted its window, so its
+        // next message 1 isn't even read.
+        let before = host.msg1_reads();
         host.handle_datagram(T0 + ms(2), &1, forged(99).msg1(), &creds);
-        assert_eq!(host.handshakes_performed(), before);
-    }
-
-    #[test]
-    fn handshakes_are_capped_host_wide_before_any_crypto() {
-        let (mut host, creds) = setup();
-        for source in 0..2000u32 {
-            let forged =
-                Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(u64::from(source))).unwrap();
-            host.handle_datagram(T0, &(5000 + source), forged.msg1(), &creds);
-        }
-        assert!(
-            host.handshakes_performed() <= 200,
-            "{}",
-            host.handshakes_performed()
-        );
+        assert_eq!(host.msg1_reads(), before);
     }
 
     #[test]
@@ -2271,5 +2315,172 @@ mod tests {
         }
         assert_eq!(copies, vec![100, 300, 700, 1500, 3100]);
         assert!(opener.open(&first[0]).is_ok());
+    }
+
+    #[test]
+    fn forged_message_1s_never_use_the_host_wide_handshake_budget() {
+        let (mut host, creds) = setup();
+        // Forged message 1s for a known dev_id from 100 sources at their
+        // full per-source rate, for 10 s.
+        let forged: Vec<Vec<u8>> = (0..2000u64)
+            .map(|i| {
+                Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(i))
+                    .unwrap()
+                    .msg1()
+                    .to_vec()
+            })
+            .collect();
+        for second in 0..10u64 {
+            for source in 0..100u32 {
+                for i in 0..20usize {
+                    let msg1 = &forged[source as usize * 20 + i];
+                    host.handle_datagram(
+                        T0 + Duration::from_secs(second),
+                        &(5000 + source),
+                        msg1,
+                        &creds,
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            host.msg1_reads(),
+            20_000,
+            "all read: the per-source limits allow it"
+        );
+        assert_eq!(host.handshakes_performed(), 0, "none authenticated");
+        // A fresh connect in the middle of it is answered.
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        let at = T0 + Duration::from_secs(9);
+        assert_eq!(
+            sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_handshakes_are_capped_host_wide() {
+        let (mut host, mut creds) = setup();
+        let ids: Vec<Id16> = (0..300u16)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..2].copy_from_slice(&i.to_le_bytes());
+                id
+            })
+            .collect();
+        for id in &ids {
+            creds.keys.insert(*id, K);
+        }
+        let mut config = HostConfig::new(HOST);
+        config.max_pending = 1000;
+        let mut host2: HostSessions<u32> =
+            HostSessions::new(config, Box::new(SeededRandom::new(9)), T0, WALL);
+        for (i, id) in ids.iter().enumerate() {
+            let ipad = Initiator::start(&K, id, &HOST, 1, &hello(10)).unwrap();
+            host2.handle_datagram(T0, &(i as u32), ipad.msg1(), &creds);
+        }
+        assert_eq!(host2.handshakes_performed(), 200);
+        let _ = &mut host;
+    }
+
+    #[test]
+    fn spoofing_the_live_address_never_drains_its_reserved_budget() {
+        let (mut host, creds) = setup();
+        live(&mut host, &creds, 10, T0);
+        // Forged message 1s for this dev_id from the live address itself.
+        for i in 0..1500u64 {
+            let forged = Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(100 + i)).unwrap();
+            host.handle_datagram(T0 + ms(5), &ADDR, forged.msg1(), &creds);
+        }
+        let ipad = Initiator::start(&K, &DEV, &HOST, 2, &hello(20)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(6), &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_too_new_limit_counts_from_the_committed_timestamp_too() {
+        let (mut host, creds) = setup();
+        let day = 24 * 60 * 60 * 1_000_000u64;
+        // Committed 3 days ahead of the host's clock (a clock set back, or a
+        // restart with a persisted value).
+        *creds.timestamp.borrow_mut() = WALL + 3 * day;
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(WALL + 3 * day + 5)).unwrap();
+        host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds);
+        assert!(
+            host.pending_session(&DEV).is_some(),
+            "within committed + 24 h"
+        );
+    }
+
+    #[test]
+    fn no_answered_message_1_is_forgotten_within_30_s() {
+        let (mut host, mut creds) = setup();
+        *creds.timestamp.borrow_mut() = 1_000_000;
+        // 28 credentials, each answered Stale 5 times a second for 30 s.
+        let ids: Vec<Id16> = (0..28u8).map(|i| [0x80 | i; 16]).collect();
+        for id in &ids {
+            creds.keys.insert(*id, K);
+        }
+        let mut first = None;
+        for tick in 0..150u64 {
+            let at = T0 + ms(tick * 200);
+            for (n, id) in ids.iter().enumerate() {
+                let ipad = Initiator::start(&K, id, &HOST, 1, &hello(1 + tick)).unwrap();
+                if first.is_none() {
+                    first = Some(ipad.msg1().to_vec());
+                }
+                host.handle_datagram(at, &(100 + n as u32), ipad.msg1(), &creds);
+            }
+            host.poll(at);
+        }
+        // The very first one, replayed just before 30 s, is still recognised.
+        let reads = host.msg1_reads();
+        let out = host.handle_datagram(T0 + ms(29_900), &999, &first.unwrap(), &creds);
+        assert!(out.is_empty());
+        assert_eq!(host.msg1_reads(), reads);
+    }
+
+    #[test]
+    fn a_re_answered_message_1_still_expires() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1000;
+        let old = Initiator::start(&K, &DEV, &HOST, 1, &hello(500)).unwrap();
+        host.handle_datagram(T0, &1, old.msg1(), &creds);
+        // Just after it expires, before any poll prunes it: answered again.
+        let again = T0 + Duration::from_secs(30) + ms(1);
+        assert_eq!(
+            sends(&host.handle_datagram(again, &1, old.msg1(), &creds)).len(),
+            1
+        );
+        host.poll(T0 + Duration::from_secs(61));
+        assert!(host.answered.is_empty(), "the second entry expired too");
+        assert!(host.answered_order.is_empty());
+    }
+
+    #[test]
+    fn every_source_has_its_own_message_2_resend_allowance() {
+        let (mut host, creds) = setup();
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        // A copy raced in from another source creates the pending session;
+        // the iPad's own copy follows.
+        host.handle_datagram(T0, &77, ipad.msg1(), &creds);
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(5), &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+        // Replays from 200 more sources...
+        for source in 100..300u32 {
+            host.handle_datagram(T0 + ms(10), &source, ipad.msg1(), &creds);
+        }
+        // ...never take the iPad's own allowance: its retry gets the resend.
+        assert!(host
+            .handle_datagram(T0 + ms(30), &ADDR, ipad.msg1(), &creds)
+            .is_empty());
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(120), &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
     }
 }

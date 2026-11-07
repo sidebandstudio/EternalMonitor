@@ -1037,15 +1037,17 @@ fn a_new_connect_under_another_key_is_never_cancelled_by_an_older_attempt() {
     sim.store.keys.insert(repaired.dev_id, repaired.k_dev);
     sim.fault = Box::new(|_| Fate::Deliver);
     sim.connect_with(repaired.clone());
-    assert_eq!(
-        sim.client.abandoned_count(),
-        0,
-        "other keys' attempts dropped"
-    );
+    // The abandoned attempt is under the live session's key, so it's kept
+    // (the intent can fall back to that key) but never promoted while the
+    // app is connecting with the re-paired one.
+    assert_eq!(sim.client.abandoned_count(), 1);
     assert!(sim.run_until(Duration::from_secs(5), |s| {
         let host = s.host.live_session(&repaired.dev_id);
         host.is_some() && host == s.client.live_session()
     }));
+    let repaired_live = sim.client.live_session();
+    sim.run_for(Duration::from_secs(3));
+    assert_eq!(sim.client.live_session(), repaired_live);
 }
 
 #[test]
@@ -1116,6 +1118,9 @@ fn the_timestamp_ceiling_means_pair_again() {
     use eternal_wire::v3::MAX_TIMESTAMP_US;
     let mut sim = Sim::new(114);
     sim.clock_offset_us = (MAX_TIMESTAMP_US as i64) + 1_000;
+    // Only a host clock near the ceiling lets a timestamp get there.
+    let now = sim.now;
+    sim.host.set_wall_clock(now, MAX_TIMESTAMP_US - 10);
     sim.client.set_last_timestamp(MAX_TIMESTAMP_US - 3);
     connect_live(&mut sim); // MAX - 2
     let first_msg1 = sim
@@ -1145,7 +1150,7 @@ fn the_timestamp_ceiling_means_pair_again() {
 /// timestamp within the host's bound.
 #[test]
 fn a_clock_far_ahead_of_the_host_still_connects() {
-    let mut sim = Sim::with_wall_clock(115);
+    let mut sim = Sim::new(115);
     sim.clock_offset_us += 3 * 24 * 60 * 60 * 1_000_000;
     connect_live(&mut sim);
     assert_eq!(
@@ -1208,4 +1213,256 @@ fn floods_never_block_a_reconnect_from_the_live_address() {
         }
         assert!(done, "known dev_id: {known}");
     }
+}
+
+/// connect() while an attempt is confirming: the attempt is kept
+/// receive-only, so its late commit is used rather than wasted.
+#[test]
+fn connect_while_confirming_keeps_the_attempt_for_a_late_commit() {
+    for decision in [800u64, 1500, 1900] {
+        let mut sim = Sim::new(120 + decision);
+        sim.latency = ms(100);
+        connect_live(&mut sim);
+        sim.policy.decision_delay = ms(decision);
+        // Later message 1s are lost, so nothing replaces the first attempt.
+        sim.fault = Box::new(|sent| match sent.kind {
+            Kind::Msg1 if sent.nth >= 2 => Fate::Drop,
+            _ => Fate::Deliver,
+        });
+        sim.connect();
+        assert!(sim.run_until(ms(1000), |s| s.client.is_confirming()));
+        sim.connect(); // the app asks again, mid-confirm
+        sim.run_for(Duration::from_secs(8));
+        assert_eq!(sim.unused_commits(), 0, "decision {decision} ms");
+        assert!(sim.both_live_on_same_session(), "decision {decision} ms");
+    }
+}
+
+/// connect() while confirming under a key the host is refusing: the refusal
+/// still reaches the attempt it was sealed for.
+#[test]
+fn connect_while_confirming_still_gets_the_refusal() {
+    let mut sim = Sim::new(125);
+    let live = connect_live(&mut sim);
+    let other = ClientKey {
+        dev_id: [0x7E; 16],
+        k_dev: [0xE7; 32],
+    };
+    sim.store.keys.insert(other.dev_id, other.k_dev);
+    sim.policy.refuse = true;
+    sim.policy.durable_delay = ms(2000);
+    sim.connect_with(other.clone());
+    assert!(sim.run_until(ms(1000), |s| s.client.is_confirming()));
+    sim.run_for(ms(100));
+    sim.connect_with(other); // mid-confirm, before the refusal is sealed
+    assert!(sim.run_until(Duration::from_secs(5), |s| s
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadRefused { .. }))));
+    assert_eq!(sim.client.live_session(), Some(live));
+}
+
+/// A failed connect() under another key, while an attempt under the live
+/// key waits for its late commit: the intent falls back to the live key and
+/// the commit is used.
+#[test]
+fn after_a_failed_connect_a_late_commit_under_the_live_key_is_used() {
+    let mut sim = Sim::new(126);
+    sim.latency = ms(100);
+    connect_live(&mut sim);
+    sim.policy.decision_delay = ms(1950);
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Msg1 if sent.nth >= 2 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    assert!(sim.run_until(ms(3000), |s| s.client.abandoned_count() > 0));
+    // A key the host doesn't know: this attempt fails.
+    sim.connect_with(ClientKey {
+        dev_id: [0x11; 16],
+        k_dev: [0x22; 32],
+    });
+    sim.run_for(Duration::from_secs(8));
+    assert!(sim
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadAttemptFailed { .. })));
+    assert_eq!(sim.unused_commits(), 0);
+    assert!(sim.both_live_on_same_session());
+}
+
+/// The reconnect before the maximum age sets the intent: after a failed
+/// connect() under another key, its late commit is still used.
+#[test]
+fn the_automatic_reconnect_sets_the_intent() {
+    let mut host = HostConfig::new(HOST_ID);
+    host.max_age = Duration::from_secs(20);
+    let mut client = ClientConfig::new(HOST_ID);
+    client.max_age = Duration::from_secs(20);
+    client.reconnect_margin = Duration::from_secs(5);
+    let mut sim = Sim::with_configs(127, host, client);
+    sim.latency = ms(100);
+    connect_live(&mut sim);
+    let start = sim.now;
+    // A failed connect() under an unknown key, early on.
+    sim.connect_with(ClientKey {
+        dev_id: [0x33; 16],
+        k_dev: [0x44; 32],
+    });
+    sim.run_for(Duration::from_secs(4));
+    // The automatic reconnect comes at about 15 s; decide it late, and lose
+    // the message 1s after it.
+    sim.policy.decision_delay = ms(1950);
+    sim.fault = Box::new(move |sent| match sent.kind {
+        Kind::Msg1 if sent.at > start + Duration::from_millis(15_600) => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.run_for(Duration::from_secs(14));
+    assert_eq!(sim.unused_commits(), 0);
+    assert!(sim.both_live_on_same_session());
+    assert!(sim.commits().len() >= 2);
+}
+
+/// The host's clock goes back 2 days after a commit: the next connect still
+/// works, because the TooNew limit counts from the committed value too.
+#[test]
+fn a_host_clock_set_back_after_a_commit_never_locks_the_ipad_out() {
+    let day = 24 * 60 * 60 * 1_000_000u64;
+    let mut sim = Sim::new(129);
+    connect_live(&mut sim);
+    let now = sim.now;
+    let wall = sim.clock_us();
+    sim.host.set_wall_clock(now, wall - 2 * day);
+    let first = sim.host_live();
+    sim.connect();
+    assert!(
+        sim.run_until(Duration::from_secs(3), |s| s.host_live() != first
+            && s.both_live_on_same_session())
+    );
+}
+
+/// A host restart with a persisted committed timestamp 3 days ahead of its
+/// clock (and the iPad's persisted value with it): the iPad still connects.
+#[test]
+fn a_restart_with_persisted_future_timestamps_still_connects() {
+    let day = 24 * 60 * 60 * 1_000_000u64;
+    let mut sim = Sim::new(130);
+    connect_live(&mut sim);
+    let future = sim.clock_us() + 3 * day;
+    sim.store
+        .timestamps
+        .borrow_mut()
+        .insert(sim.key.dev_id, future);
+    sim.client.set_last_timestamp(future);
+    let wall = sim.clock_us();
+    sim.restart_host(HostConfig::new(HOST_ID), wall);
+    sim.connect();
+    assert!(sim.run_until(Duration::from_secs(3), |s| s.both_live_on_same_session()));
+}
+
+/// The host loses every session (a restart). The iPad notices within its
+/// liveness timeout, stops treating the session as live, and reconnects.
+#[test]
+fn the_ipad_notices_a_host_that_ended_the_session() {
+    let mut sim = Sim::new(132);
+    let old = connect_live(&mut sim);
+    let wall = sim.clock_us();
+    sim.restart_host(HostConfig::new(HOST_ID), wall);
+    assert!(
+        sim.run_until(Duration::from_secs(6), |s| s.both_live_on_same_session()
+            && s.host_live() != Some(old))
+    );
+    assert!(sim.events.iter().any(|e| matches!(
+        e,
+        Event::IpadClosed {
+            reason: ClientClose::Liveness,
+            ..
+        }
+    )));
+}
+
+/// Runs device 0's connect with every one of its message 1 copies held back
+/// on the wire and delivered by hand, each right after a burst from
+/// `burst`. Returns whether the iPad went live on a new session.
+fn connect_behind_bursts(sim: &mut Sim, mut burst: impl FnMut(&mut Sim)) -> bool {
+    let before = sim.host_live();
+    sim.fault = Box::new(|sent| match (sent.kind, sent.dir) {
+        (Kind::Msg1, Dir::ToHost) if sent.from == IPAD => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    let mut delivered = 0;
+    for _ in 0..800 {
+        let copies: Vec<Vec<u8>> = sim
+            .sent
+            .iter()
+            .filter(|x| x.kind == Kind::Msg1 && x.from == IPAD)
+            .skip(delivered)
+            .map(|x| x.datagram.clone())
+            .collect();
+        for copy in copies {
+            burst(sim);
+            sim.inject(Dir::ToHost, &copy);
+            delivered += 1;
+        }
+        sim.step();
+        if sim.both_live_on_same_session() && sim.host_live() != before {
+            return true;
+        }
+    }
+    false
+}
+
+fn forged_for(dev_id: &eternal_wire::v3::Id16, count: u64) -> Vec<Vec<u8>> {
+    use eternal_wire::v3::handshake::Initiator;
+    use eternal_wire::v3::wire::HelloPayload;
+    (0..count)
+        .map(|i| {
+            let hello = HelloPayload {
+                timestamp_us: i,
+                ..Default::default()
+            };
+            Initiator::start(&[9; 32], dev_id, &HOST_ID, 1, &hello)
+                .unwrap()
+                .msg1()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Forged message 1s for a known dev_id from 200 sources, right before each
+/// of a fresh iPad's copies, never starve it: the host-wide budget is charged
+/// only after authentication.
+#[test]
+fn forged_message_1s_from_many_sources_never_starve_a_fresh_connect() {
+    let mut sim = Sim::new(128);
+    let forged = forged_for(&sim.key.dev_id, 200);
+    let mut round = 0u16;
+    let ok = connect_behind_bursts(&mut sim, |sim| {
+        for (i, msg1) in forged.iter().enumerate() {
+            let source = SimAddr {
+                ip: 2000 + (i as u16 + round * 200) % 1000,
+                port: 1,
+            };
+            sim.inject_from(source, msg1);
+        }
+        round += 1;
+    });
+    assert!(ok);
+}
+
+/// Forged message 1s spoofing the live session's own address, right before
+/// each of the iPad's copies, never drain its reserved budget: that budget is
+/// charged after authentication.
+#[test]
+fn a_flood_spoofing_the_live_address_never_blocks_its_reconnect() {
+    let mut sim = Sim::new(131);
+    connect_live(&mut sim);
+    let forged = forged_for(&sim.key.dev_id, 25);
+    let ok = connect_behind_bursts(&mut sim, |sim| {
+        for msg1 in &forged {
+            sim.inject_from(IPAD, msg1);
+        }
+    });
+    assert!(ok);
 }
