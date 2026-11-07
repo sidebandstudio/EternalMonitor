@@ -154,6 +154,10 @@ struct Proving {
 /// a secure screen or with the displays off don't count.
 const LOSS_LIMIT: u32 = 8;
 
+/// How often [`State::retry_if_back`] asks Windows whether the desktop is
+/// back.
+const DESKTOP_CHECK: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Default)]
 pub(crate) struct State {
     /// The display attached; the stream has not moved onto it yet.
@@ -180,6 +184,10 @@ pub(crate) struct State {
     /// `blocked_retry_at` when that is set.
     retry_blocked: bool,
     blocked_retry_at: Option<Instant>,
+    /// The last failure came while the user's desktop was away (see
+    /// [`desktop_away`]): once it is back, a connected viewer gets the
+    /// second screen again. When to look at the desktop next.
+    retry_when_back: Option<Instant>,
     /// The graphics cards and the screens' wiring, as last read off the
     /// transport loop: see [`facts`].
     facts: facts::Cache,
@@ -223,6 +231,7 @@ impl State {
         if let Some(reason) = self.fail_unproven(status, now, blocked) {
             return Step::Fallback(reason);
         }
+        self.retry_if_back(status, connected, now);
         match *status {
             VddStatus::WaitingForClient if connected => {
                 let hold = if blocked {
@@ -332,13 +341,39 @@ impl State {
         Some(reason)
     }
 
+    /// After a failure while the desktop was away, try the second screen
+    /// again for a connected viewer once the desktop is back. Without this
+    /// the app run stayed on the mirror after the PC was unlocked or its
+    /// displays woke, until the user clicked Try again. Windows is asked at
+    /// most once a second: this runs on the transport loop.
+    fn retry_if_back(&mut self, status: &mut VddStatus, connected: bool, now: Instant) {
+        let due = self.retry_when_back.is_some_and(|at| now >= at);
+        if !due || !connected || *status != VddStatus::Failed {
+            return;
+        }
+        if self.desktop_away() {
+            self.retry_when_back = Some(now + DESKTOP_CHECK);
+            return;
+        }
+        self.retry_when_back = None;
+        tracing::info!(
+            reason = self.failure.unwrap_or("no_frames"),
+            "The desktop is back after the second screen failed while it was away — trying \
+             the second screen again"
+        );
+        *status = VddStatus::WaitingForClient;
+        self.failure = None;
+    }
+
     /// Save the failure for later connections and app runs, unless
     /// something that passes may explain it: then only this app run keeps
-    /// mirroring, as before. Nor while the mirror is `blocked`, as
+    /// mirroring, as before, or, when the desktop is away now, until it is
+    /// back. Nor while the mirror is `blocked`, as
     /// [`mirror_blocked_now`] read it for this failure: then the next
     /// connection tries the second screen again.
     fn remember(&mut self, reason: &'static str, now: Instant, interrupted: bool, blocked: bool) {
         self.clear_blocked_retry();
+        self.retry_when_back = None;
         if blocked {
             tracing::info!(
                 reason,
@@ -348,13 +383,18 @@ impl State {
             self.retry_blocked = true;
             return;
         }
-        if interrupted || self.desktop_away() {
+        let away = self.desktop_away();
+        if interrupted || away {
             tracing::info!(
                 reason,
+                away,
                 "The second screen failed while Windows withheld the desktop or the display may \
                  have been asleep — not remembering it beyond this app run"
             );
             self.memory.excuse();
+            if away {
+                self.retry_when_back = Some(now);
+            }
             return;
         }
         if let Some(hold) = self.memory.note_failure(reason, now) {
@@ -529,7 +569,15 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
         }
         return;
     }
+    let retrying = *status == VddStatus::Failed && state.retry_when_back.is_some();
     drop((state, status));
+    if retrying {
+        tracing::info!(
+            "Client connected — the second screen failed while the desktop was away, and is \
+             tried again once the desktop is back"
+        );
+        return;
+    }
     if let Some(reason) = remembered_failure(shared) {
         tracing::info!(
             second_screen_fallback = reason,
@@ -2290,6 +2338,65 @@ mod tests {
             reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
             Some(CaptureTarget::PrimaryAuto)
         );
+    }
+
+    /// The PC was locked, or its displays went off, while the second screen
+    /// proved itself. The viewer stayed on the mirror for the rest of the app
+    /// run, even after the user came back.
+    #[test]
+    fn a_second_screen_that_failed_while_the_desktop_was_away_is_tried_again_once_it_is_back() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shared = second_screen_selected();
+        let away = Arc::new(AtomicBool::new(false));
+        shared.second_screen.lock().fake_desktop_away = Some(away.clone());
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        away.store(true, Ordering::Relaxed);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        assert!(!shared.second_screen.lock().memory.saved());
+        // Still away: the mirror stays, and the driver is left alone.
+        let mut elapsed = PROVE_TIMEOUT;
+        while elapsed < secs(60.0) {
+            elapsed += secs(0.25);
+            assert_eq!(next_step(&shared, start + elapsed), Step::Nothing);
+        }
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        away.store(false, Ordering::Relaxed);
+        let back = start + elapsed + DESKTOP_CHECK;
+        assert_eq!(next_step(&shared, back), Step::Attach);
+        assert_eq!(remembered_failure(&shared), None);
+        // Once only: the next failure decides afresh.
+        assert!(shared.second_screen.lock().retry_when_back.is_none());
+    }
+
+    /// A proof that lost the desktop while the user was there is excused
+    /// too, but tried again only at Try again: retrying at once could turn
+    /// a display that keeps dropping out on and off forever.
+    #[test]
+    fn an_interrupted_proof_with_the_desktop_there_is_not_tried_again_by_itself() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        note_interruption_while(&shared, 7, false);
+        assert_eq!(
+            next_step(&shared, start + PROVE_TIMEOUT),
+            Step::Fallback("no_frames")
+        );
+        for second in 1..60 {
+            let now = start + PROVE_TIMEOUT + Duration::from_secs(second);
+            assert_eq!(next_step(&shared, now), Step::Nothing);
+        }
+        assert_eq!(remembered_failure(&shared), Some("no_frames"));
     }
 
     #[test]
