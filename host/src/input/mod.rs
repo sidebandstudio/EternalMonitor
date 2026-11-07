@@ -10,6 +10,9 @@ use eternal_wire::v2::control::InputEvent;
 mod hid;
 pub use hid::hid_to_scancode;
 
+mod injector;
+pub use injector::Injector;
+
 #[cfg(windows)]
 pub mod windows_inject;
 
@@ -367,8 +370,9 @@ pub fn resolve(
 pub mod recorder {
     use super::Injection;
 
-    /// The end-to-end tests record on the transport's thread and read on
-    /// their own. Unit tests run in parallel, so each keeps its own record.
+    /// The end-to-end tests record on the input thread and read on their
+    /// own. Unit tests run in parallel, so each keeps its own record, which
+    /// the input threads it starts write to.
     fn recorded<R>(f: impl FnOnce(&mut Vec<Injection>) -> R) -> R {
         #[cfg(not(test))]
         {
@@ -377,12 +381,37 @@ pub mod recorder {
         }
         #[cfg(test)]
         {
-            thread_local! {
-                static RECORDED: std::cell::RefCell<Vec<Injection>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-            }
-            RECORDED.with_borrow_mut(f)
+            current().with(f)
         }
+    }
+
+    /// A unit test's own record, which the threads it starts share.
+    #[cfg(test)]
+    #[derive(Debug, Clone, Default)]
+    pub struct Record(std::sync::Arc<std::sync::Mutex<Vec<Injection>>>);
+
+    #[cfg(test)]
+    impl Record {
+        fn with<R>(&self, f: impl FnOnce(&mut Vec<Injection>) -> R) -> R {
+            f(&mut self.0.lock().unwrap())
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static RECORD: std::cell::RefCell<Record> = std::cell::RefCell::default();
+    }
+
+    /// This thread's record, for a thread it starts to [`adopt`].
+    #[cfg(test)]
+    pub fn current() -> Record {
+        RECORD.with_borrow(Record::clone)
+    }
+
+    /// Record on this thread into `record`.
+    #[cfg(test)]
+    pub fn adopt(record: Record) {
+        RECORD.set(record);
     }
 
     pub fn record(injections: &[Injection]) {
@@ -406,8 +435,9 @@ pub(crate) mod native_pen {
     use super::pen_contact::{Outcome, PointerKind};
     use super::pen_device::{PenApi, PenDevice};
     use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
+    use parking_lot::Mutex;
     use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Instant;
 
     pub(crate) const SCREEN: VirtualScreen = VirtualScreen {
@@ -418,7 +448,7 @@ pub(crate) mod native_pen {
     };
 
     /// Frames Windows took, with when.
-    pub(crate) type Taken = Rc<RefCell<Vec<(PenSample, Instant)>>>;
+    pub(crate) type Taken = Arc<Mutex<Vec<(PenSample, Instant)>>>;
 
     #[derive(Debug)]
     pub(crate) struct Windows(Taken);
@@ -444,7 +474,7 @@ pub(crate) mod native_pen {
             _: VirtualScreen,
             _: Option<CaptureGeometry>,
         ) -> Outcome {
-            self.0.borrow_mut().push((frame, Instant::now()));
+            self.0.lock().push((frame, Instant::now()));
             Outcome::Injected
         }
         fn send_mouse(&mut self, inputs: &[Injection]) -> usize {
@@ -463,13 +493,50 @@ pub(crate) mod native_pen {
     /// Give this thread's relays a device, and return what Windows takes.
     pub(crate) fn install() -> Taken {
         let taken = Taken::default();
-        DEVICE.set(Some(PenDevice::new(Windows(Rc::clone(&taken)))));
+        DEVICE.set(Some(PenDevice::new(Windows(Arc::clone(&taken)))));
         taken
     }
 
     /// The installed device, if any.
     pub(crate) fn with<R>(f: impl FnOnce(&mut PenDevice<Windows>) -> R) -> Option<R> {
         DEVICE.with_borrow_mut(|device| device.as_mut().map(f))
+    }
+}
+
+/// Lets an end-to-end test hold every injection where Windows' calls would
+/// be, as Windows held them while it reconfigured displays.
+#[cfg(feature = "test-hooks")]
+pub mod hold {
+    use parking_lot::{Condvar, Mutex};
+
+    /// Whether injections wait, and how many are waiting.
+    static HELD: Mutex<(bool, usize)> = Mutex::new((false, 0));
+    static RELEASED: Condvar = Condvar::new();
+
+    pub fn hold() {
+        HELD.lock().0 = true;
+    }
+
+    pub fn release() {
+        HELD.lock().0 = false;
+        RELEASED.notify_all();
+    }
+
+    /// Injections waiting now.
+    pub fn waiting() -> usize {
+        HELD.lock().1
+    }
+
+    pub(super) fn pass() {
+        let mut held = HELD.lock();
+        if !held.0 {
+            return;
+        }
+        held.1 += 1;
+        while held.0 {
+            RELEASED.wait(&mut held);
+        }
+        held.1 -= 1;
     }
 }
 
@@ -732,6 +799,8 @@ impl InputRelay {
     }
 
     fn inject(&mut self, injections: &[Injection]) {
+        #[cfg(feature = "test-hooks")]
+        hold::pass();
         #[cfg(windows)]
         windows_inject::inject(injections, &mut self.pen_device, self.output);
         #[cfg(not(windows))]

@@ -32,7 +32,7 @@ use abr::AbrController;
 use beat::Phase;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::{Deadline, FramePacer, PacingClock};
+use pacer::{FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -222,11 +222,11 @@ pub async fn start_sender(
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
 
-    let input_relay = crate::input::InputRelay::default();
+    let input = crate::input::Injector::start(std::sync::Arc::clone(&shared.capture_geometry));
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
-        pen_available: input_relay.pen_available(),
+        pen_available: input.pen_available(),
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -269,7 +269,7 @@ pub async fn start_sender(
     let mut state = LoopState {
         retransmit_ring: RetransmitRing::default(),
         fault,
-        input_relay,
+        input,
         abr,
     };
     let mut audio_sender = audio::AudioSender::default();
@@ -294,37 +294,14 @@ pub async fn start_sender(
     // starts. It is looked at again while nobody streams.
     let mut network_check = tokio::time::interval(Duration::from_secs(10));
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
-    pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut pen_spacing = Deadline::new("pen-spacing")?;
 
     loop {
-        // A pen backlog sends one bounded chunk at the top of every pass,
-        // whatever the select below keeps ready, so the loop serves one
-        // branch between chunks and the backlog never waits behind them.
-        if state
-            .input_relay
-            .pen_spaced_until()
-            .is_some_and(|at| at <= Instant::now())
-        {
-            beat.mark(Phase::Input);
-            state
-                .input_relay
-                .keep_pen_alive(*shared.capture_geometry.lock());
-        }
-        pen_spacing.arm(state.input_relay.pen_spaced_until());
         beat.mark(Phase::Waiting);
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            // Not while a backlog is held: its chunk went at the top of
-            // this pass, and a second one would leave nothing between them.
-            _ = pen_tick.tick(), if state.input_relay.pen_tick_needed() && state.input_relay.pen_spaced_until().is_none() => {
-                beat.mark(Phase::Input);
-                state.input_relay.keep_pen_alive(*shared.capture_geometry.lock());
-            }
             _ = tokio::time::sleep_until(state.fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if state.fault.enabled() => {
                 beat.mark(Phase::Video);
                 let destination = *shared.target_addr.lock();
@@ -535,10 +512,6 @@ pub async fn start_sender(
                     "Frame sent"
                 );
             }
-            // Only wakes an otherwise idle loop for the next chunk, which
-            // goes at the top of the pass. Last, because any branch ready
-            // before it starts that pass anyway.
-            _ = pen_spacing.wait(), if pen_spacing.armed() => {}
         }
     }
 
@@ -721,7 +694,9 @@ async fn repair_while_pacing(
 struct LoopState {
     retransmit_ring: RetransmitRing,
     fault: FaultInjector,
-    input_relay: crate::input::InputRelay,
+    /// Hands input to Windows on its own thread: Windows' input calls can
+    /// wait seconds while it reconfigures displays.
+    input: crate::input::Injector,
     abr: AbrController,
 }
 
@@ -742,7 +717,7 @@ async fn act(
         state.fault.clear();
     }
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
-        state.input_relay.reset();
+        state.input.reset();
     }
     if let Some(nack) = actions.retransmit.take() {
         send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
@@ -750,11 +725,9 @@ async fn act(
     if let Some((session_id, event)) = actions.input.take() {
         shared.transport_beat.mark(Phase::Input);
         if let Some(geometry) = *shared.capture_geometry.lock() {
-            if actions.input_late {
-                state.input_relay.relay_late(session_id, &event, geometry);
-            } else {
-                state.input_relay.relay(session_id, &event, geometry);
-            }
+            state
+                .input
+                .relay(session_id, event, geometry, actions.input_late);
         }
     }
     if let Some(report) = actions.report.take() {
@@ -1167,7 +1140,7 @@ mod tests {
         LoopState {
             retransmit_ring: RetransmitRing::default(),
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
-            input_relay: crate::input::InputRelay::default(),
+            input: crate::input::Injector::start(Default::default()),
             abr: AbrController::new(15_000_000, true),
         }
     }
@@ -1266,8 +1239,16 @@ mod tests {
             )
             .await;
         }
+        // Windows takes input on the input thread.
+        let injected = |count: usize| {
+            let started = Instant::now();
+            while recorder::peek().len() < count && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            recorder::take()
+        };
         assert!(matches!(
-            recorder::take().as_slice(),
+            injected(3).as_slice(),
             [
                 Injection::KeyDown { .. },
                 Injection::MoveAbs { .. },
@@ -1288,7 +1269,7 @@ mod tests {
         .await;
         assert!(shared.session.lock().session_id().is_none());
         assert!(matches!(
-            recorder::take().as_slice(),
+            injected(2).as_slice(),
             [Injection::KeyUp { .. }, Injection::LeftUp { .. }]
         ));
     }
@@ -1495,104 +1476,6 @@ mod tests {
                 ControlMessage::Bye(eternal_wire::v2::control::ByeReason::Error)
             )]
         );
-    }
-
-    /// `start_sender` itself, with a native pen device that takes every
-    /// frame (Windows' own off Windows). A stall delivers 64 samples at
-    /// once while the encoder always has a frame ready, which the loop takes
-    /// in a branch ahead of the pen's wake-up. The spacing holds back all
-    /// but the first burst, and the loop sends the rest within a few times
-    /// the spacing, one chunk at the top of each pass.
-    #[cfg(not(windows))]
-    #[test]
-    fn the_loop_sends_a_held_pen_backlog_while_video_is_always_ready() {
-        use crate::input::{native_pen, CaptureGeometry, PenPhase, PenSample};
-        const SAMPLES: usize = 64;
-        const VIDEO_QUEUE: usize = 1 << 16;
-        let output = CaptureGeometry {
-            left: 0,
-            top: 0,
-            width: 1920,
-            height: 1080,
-        };
-        let taken = native_pen::install();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (delivered, queued) = runtime.block_on(async {
-            let shared = SharedControl::new(0, 15_000_000);
-            shared.running.store(true, Ordering::SeqCst);
-            *shared.capture_geometry.lock() = Some(output);
-            let (nal_tx, nal_rx) = mpsc::channel(VIDEO_QUEUE);
-            let (_audio_tx, audio_rx) = mpsc::channel(1);
-            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
-            let frame = |sequence| NALUnit {
-                data: vec![0, 0, 0, 1, 0x41],
-                sequence,
-                timestamp: Instant::now(),
-                encode_duration_us: 0,
-                is_keyframe: false,
-            };
-            // A full queue, kept full until the loop stops and drops it.
-            let mut sequence = 0;
-            while nal_tx.try_send(frame(sequence)).is_ok() {
-                sequence += 1;
-            }
-            let video = std::thread::spawn(move || {
-                while nal_tx.blocking_send(frame(sequence)).is_ok() {
-                    sequence += 1;
-                }
-                sequence
-            });
-            let delivered = Instant::now();
-            native_pen::with(|device| {
-                for x in 0..SAMPLES as u16 {
-                    let sample = PenSample {
-                        phase: if x == 0 {
-                            PenPhase::Down
-                        } else {
-                            PenPhase::Move
-                        },
-                        x: i32::from(x),
-                        y: 10,
-                        x_norm: x,
-                        y_norm: 10,
-                        pressure: 512,
-                        tilt_x: 0,
-                        tilt_y: 0,
-                    };
-                    device.deliver(sample, native_pen::SCREEN, Some(output), Instant::now());
-                }
-            });
-            assert!(
-                taken.borrow().len() < SAMPLES / 2,
-                "the spacing must hold the backlog back"
-            );
-            let stop = shared.clone();
-            let watch = async {
-                while taken.borrow().len() < SAMPLES && delivered.elapsed() < Duration::from_secs(2)
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                stop.stop();
-            };
-            let (sent, ()) = tokio::join!(
-                start_sender(nal_rx, audio_rx, 0, shared, supervisor_tx),
-                watch
-            );
-            sent.unwrap();
-            (delivered, video.join().unwrap())
-        });
-        let taken = taken.borrow();
-        let order: Vec<_> = taken.iter().map(|(frame, _)| frame.x_norm).collect();
-        assert_eq!(order, (0..SAMPLES as u16).collect::<Vec<_>>());
-        let drained = taken.last().unwrap().1 - delivered;
-        // 58 held frames 250 µs apart take 15 ms; the 50 ms tick alone
-        // would take 500 ms.
-        assert!(drained < Duration::from_millis(250), "{drained:?}");
-        // The loop kept taking video.
-        assert!(queued > (VIDEO_QUEUE + SAMPLES) as u64, "{queued}");
     }
 
     #[test]
