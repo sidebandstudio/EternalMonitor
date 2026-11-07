@@ -9,14 +9,85 @@ use crate::{
     capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
 };
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
+use web_time::Instant;
 
-/// EternalMonitor patch: how often a lost device's replacement is tried again
-/// while it can't be created or doesn't work, as during a driver reset.
-const REBUILD_RETRY: Duration = Duration::from_millis(500);
+/// EternalMonitor patch: frames the painter skipped because its device was lost or was
+/// being replaced. An app that tells a working window by its frames counts these as
+/// failures.
+pub static SKIPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// EternalMonitor patch: when the painter tries to replace a lost device, and when it
+/// stops trying.
+///
+/// The first try is at once. Each failure, a device that could not be made or a new one
+/// lost before it drew for [`Self::STABLE_AFTER`], waits twice as long as the last, from
+/// 0.5 s up to 30 s. After [`Self::MAX_FAILURES`] the painter gives up and the window
+/// stays blank. A device that drew for [`Self::STABLE_AFTER`] starts the count again.
+#[derive(Debug, Default)]
+pub struct Replacement {
+    failures: u32,
+    next_try: Option<Instant>,
+    drawing_since: Option<Instant>,
+    gave_up: bool,
+}
+
+impl Replacement {
+    pub const MAX_FAILURES: u32 = 10;
+    pub const STABLE_AFTER: Duration = Duration::from_secs(10);
+    const FIRST_WAIT: Duration = Duration::from_millis(500);
+    const LONGEST_WAIT: Duration = Duration::from_secs(30);
+
+    /// The device was lost at `now`. True when the painter just gave up.
+    pub fn lost(&mut self, now: Instant) -> bool {
+        let drew = self
+            .drawing_since
+            .is_some_and(|since| now.duration_since(since) >= Self::STABLE_AFTER);
+        self.drawing_since = None;
+        if drew {
+            self.failures = 0;
+            self.next_try = Some(now);
+            return false;
+        }
+        if self.next_try.is_none() {
+            // The device the window started with: its replacement is the first try.
+            self.next_try = Some(now);
+            return false;
+        }
+        self.failed(now)
+    }
+
+    /// A replacement could not be made at `now`. True when the painter just gave up.
+    pub fn failed(&mut self, now: Instant) -> bool {
+        if self.gave_up {
+            return false;
+        }
+        self.failures += 1;
+        if self.failures >= Self::MAX_FAILURES {
+            self.gave_up = true;
+            return true;
+        }
+        let wait = Self::FIRST_WAIT.saturating_mul(1 << (self.failures - 1).min(16));
+        self.next_try = Some(now + wait.min(Self::LONGEST_WAIT));
+        false
+    }
+
+    /// The device presented a frame at `now`.
+    pub fn drew(&mut self, now: Instant) {
+        self.drawing_since.get_or_insert(now);
+    }
+
+    /// How long until the next try, or `None` once the painter gave up.
+    pub fn wait(&self, now: Instant) -> Option<Duration> {
+        (!self.gave_up).then(|| {
+            self.next_try
+                .map_or(Duration::ZERO, |at| at.saturating_duration_since(now))
+        })
+    }
+}
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
@@ -54,13 +125,13 @@ pub struct Painter {
     /// Set when the current device is lost: by its lost callback, or when a frame's upload
     /// fails. The next paint drops the device and everything made on it.
     device_lost: Arc<AtomicBool>,
-    /// The lost device was dropped; [`Self::set_window`] builds a new one, and failing
-    /// that is retried instead of returned.
+    /// The lost device was dropped; [`Self::set_window`] builds a new one when
+    /// [`Self::replacement`] says, and a failure is retried instead of returned.
     rebuilding: bool,
     /// The new device's first paint uploads the font atlas again.
     restore_fonts: bool,
-    /// When the last device was dropped, so a replacement that fails at once waits.
-    dropped_at: Option<web_time::Instant>,
+    /// When to try replacing a lost device, and when to stop.
+    replacement: Replacement,
 }
 
 impl Painter {
@@ -105,7 +176,7 @@ impl Painter {
             device_lost: Arc::new(AtomicBool::new(false)),
             rebuilding: false,
             restore_fonts: false,
-            dropped_at: None,
+            replacement: Replacement::default(),
         }
     }
 
@@ -120,6 +191,7 @@ impl Painter {
         surface_state: &SurfaceState,
         render_state: &RenderState,
         config: &SurfaceConfig,
+        device_lost: &AtomicBool,
     ) {
         profiling::function_scope!();
 
@@ -140,16 +212,24 @@ impl Painter {
         let width = surface_state.width;
         let height = surface_state.height;
 
+        // EternalMonitor patch: a lost device's adapter may support no surface before its
+        // lost callback runs. Replace the device instead of panicking.
+        let Some(default_config) =
+            surface_state
+                .surface
+                .get_default_config(&render_state.adapter, width, height)
+        else {
+            log::warn!("The surface isn't supported by this adapter; replacing the device");
+            device_lost.store(true, Ordering::SeqCst);
+            return;
+        };
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: render_state.target_format,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
-            ..surface_state
-                .surface
-                .get_default_config(&render_state.adapter, width, height)
-                .expect("The surface isn't supported by this adapter")
+            ..default_config
         };
 
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
@@ -219,6 +299,18 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
+                // EternalMonitor patch: a lost device is replaced when `replacement` says,
+                // not on every repaint, and not at all once it gave up.
+                if self.rebuilding {
+                    match self.replacement.wait(Instant::now()) {
+                        None => return Ok(()),
+                        Some(wait) if !wait.is_zero() => {
+                            self.context.request_repaint_after(wait);
+                            return Ok(());
+                        }
+                        Some(_) => {}
+                    }
+                }
                 let added = match self.instance.create_surface(window) {
                     Ok(surface) => self.add_surface(surface, viewport_id, size).await,
                     Err(err) => Err(err.into()),
@@ -227,8 +319,14 @@ impl Painter {
                     // EternalMonitor patch: while a lost device is replaced, the window
                     // skips frames until a new one can be made.
                     Err(err) if self.rebuilding => {
-                        log::warn!("Could not replace the lost wgpu device yet: {err}");
-                        self.context.request_repaint_after(REBUILD_RETRY);
+                        if self.replacement.failed(Instant::now()) {
+                            Self::log_gave_up(&err);
+                        } else {
+                            log::warn!("Could not replace the lost wgpu device yet: {err}");
+                            if let Some(wait) = self.replacement.wait(Instant::now()) {
+                                self.context.request_repaint_after(wait);
+                            }
+                        }
                     }
                     added => added?,
                 }
@@ -315,7 +413,6 @@ impl Painter {
     /// EternalMonitor patch: forget a lost device and everything made on it. eframe calls
     /// [`Self::set_window`] before each paint, which builds a new device and surfaces.
     fn drop_lost_device(&mut self) {
-        log::warn!("Rebuilding the window renderer after its wgpu device was lost");
         self.render_state = None;
         self.surfaces.clear();
         self.depth_texture_view.clear();
@@ -323,8 +420,23 @@ impl Painter {
         self.screen_capture_state = None;
         self.rebuilding = true;
         self.restore_fonts = false;
-        self.dropped_at = Some(web_time::Instant::now());
-        self.context.request_repaint();
+        let now = Instant::now();
+        if self.replacement.lost(now) {
+            Self::log_gave_up(&"the new device was lost too");
+        } else {
+            log::warn!("Rebuilding the window renderer after its wgpu device was lost");
+            if let Some(wait) = self.replacement.wait(now) {
+                self.context.request_repaint_after(wait);
+            }
+        }
+    }
+
+    /// EternalMonitor patch: said once, when [`Replacement`] gives up.
+    fn log_gave_up(last: &dyn core::fmt::Display) {
+        log::error!(
+            "Gave up replacing the window's lost wgpu device after {} failures ({last}); the window stays blank",
+            Replacement::MAX_FAILURES
+        );
     }
 
     /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
@@ -415,7 +527,12 @@ impl Painter {
         surface_state.width = width;
         surface_state.height = height;
 
-        Self::configure_surface(surface_state, render_state, &self.config.surface);
+        Self::configure_surface(
+            surface_state,
+            render_state,
+            &self.config.surface,
+            &self.device_lost,
+        );
 
         if let Some(depth_format) = self.options.depth_stencil_format {
             self.depth_texture_view.insert(
@@ -515,7 +632,12 @@ impl Painter {
                         .lock()
                         .setPresentsWithTransaction(resizing);
 
-                    Self::configure_surface(state, render_state, &self.config.surface);
+                    Self::configure_surface(
+                        state,
+                        render_state,
+                        &self.config.surface,
+                        &self.device_lost,
+                    );
                 }
             }
         }
@@ -586,17 +708,19 @@ impl Painter {
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
 
-        // EternalMonitor patch: a lost device draws nothing again; replace it, at most
-        // every REBUILD_RETRY.
-        if self.device_lost.load(Ordering::SeqCst) {
-            if self
-                .dropped_at
-                .is_some_and(|dropped| dropped.elapsed() < REBUILD_RETRY)
-            {
-                self.context.request_repaint_after(REBUILD_RETRY);
-            } else {
-                self.drop_lost_device();
+        // EternalMonitor patch: while a lost device is replaced there is nothing to draw
+        // with; set_window makes the next one when `replacement` says. A device lost since
+        // the last frame draws nothing again, so it goes.
+        if self.rebuilding {
+            SKIPPED_FRAMES.fetch_add(1, Ordering::SeqCst);
+            if let Some(wait) = self.replacement.wait(Instant::now()) {
+                self.context.request_repaint_after(wait);
             }
+            return vsync_sec;
+        }
+        if self.device_lost.load(Ordering::SeqCst) {
+            SKIPPED_FRAMES.fetch_add(1, Ordering::SeqCst);
+            self.drop_lost_device();
             return vsync_sec;
         }
 
@@ -689,14 +813,20 @@ impl Painter {
 
         // EternalMonitor patch: skip a frame whose upload failed; the next one replaces the
         // device.
-        if render_state.renderer.read().upload_failed || self.device_lost.load(Ordering::SeqCst) {
+        if render_state.renderer.read().upload_failed() || self.device_lost.load(Ordering::SeqCst) {
+            SKIPPED_FRAMES.fetch_add(1, Ordering::SeqCst);
             self.device_lost.store(true, Ordering::SeqCst);
             self.context.request_repaint_of(viewport_id);
             return vsync_sec;
         }
 
         if surface_state.needs_reconfigure {
-            Self::configure_surface(surface_state, render_state, &self.config.surface);
+            Self::configure_surface(
+                surface_state,
+                render_state,
+                &self.config.surface,
+                &self.device_lost,
+            );
             surface_state.needs_reconfigure = false;
         }
 
@@ -718,7 +848,12 @@ impl Painter {
             other => {
                 match (*self.config.on_surface_status)(&other) {
                     SurfaceErrorAction::Reconfigure => {
-                        Self::configure_surface(surface_state, render_state, &self.config.surface);
+                        Self::configure_surface(
+                            surface_state,
+                            render_state,
+                            &self.config.surface,
+                            &self.device_lost,
+                        );
                         self.context.request_repaint_of(viewport_id);
                     }
                     SurfaceErrorAction::RecreateSurface => {
@@ -876,6 +1011,8 @@ impl Painter {
             render_state.queue.present(output_frame);
             vsync_sec += start.elapsed().as_secs_f32();
         }
+        // EternalMonitor patch: a device that keeps drawing starts the replacement count again.
+        self.replacement.drew(Instant::now());
 
         vsync_sec
     }

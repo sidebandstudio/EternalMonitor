@@ -261,10 +261,16 @@ pub struct Renderer {
 
     /// EternalMonitor patch: the last [`Self::update_buffers`] could not upload its meshes,
     /// as happens once the device is lost, so [`Self::render`] draws nothing.
-    pub(crate) upload_failed: bool,
+    upload_failed: bool,
 }
 
 impl Renderer {
+    /// EternalMonitor patch: the last [`Self::update_buffers`] could not upload its meshes,
+    /// as happens once the device is lost; [`Self::render`] then draws nothing.
+    pub fn upload_failed(&self) -> bool {
+        self.upload_failed
+    }
+
     /// Creates a renderer for a egui UI.
     ///
     /// `output_color_format` should preferably be [`wgpu::TextureFormat::Rgba8Unorm`] or
