@@ -66,18 +66,9 @@ fn crash_dir() -> Option<PathBuf> {
 pub fn install_failure_hooks() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some("main") {
-            in_report_order(
-                || save(&panic_detail(info)),
-                || {
-                    crate::vdd::disable();
-                },
-                show,
-            );
-        } else {
-            tracing::error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
+        on_panic(info, || {
             crate::vdd::disable();
-        }
+        });
         default_hook(info);
     }));
     #[cfg(windows)]
@@ -114,6 +105,25 @@ fn prepare_crash_reporting() {
     }
     let launch_id = crate::telemetry::launch_id().unwrap_or_else(|| "-".to_string());
     reporter::start(&directory, owner, &launch_id);
+}
+
+/// What [`install_failure_hooks`] does for a panic, by its thread, with
+/// `disable_virtual_display` turning the virtual display off. A panic on
+/// egui-wgpu's device replacement thread ends only that try: the window tries
+/// again or gives up, and the stream, maybe on the virtual display, goes on.
+fn on_panic(info: &std::panic::PanicHookInfo<'_>, disable_virtual_display: impl Fn()) {
+    match std::thread::current().name() {
+        Some("main") => {
+            in_report_order(|| save(&panic_detail(info)), &disable_virtual_display, show)
+        }
+        Some(eframe::egui_wgpu::winit::REPLACEMENT_THREAD) => {
+            tracing::warn!(panic = %info, "Making a new device for the window panicked");
+        }
+        _ => {
+            tracing::error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
+            disable_virtual_display();
+        }
+    }
 }
 
 /// Save the report, clean up, then ask for the message: the dialog never
@@ -896,6 +906,59 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("mod.rs:"), "{detail}");
+    }
+
+    #[test]
+    fn a_panic_making_a_window_device_leaves_the_virtual_display_on() {
+        use eframe::egui_wgpu::winit::{
+            Answer, Asked, Replacement, REPLACEMENT_THREAD, REPLACEMENT_TIMEOUT,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        const PIPELINE: &str = "test pipeline thread";
+        static TURNED_OFF: AtomicUsize = AtomicUsize::new(0);
+        // The host's hook, for this test's threads; the hook is process-wide,
+        // so other tests' panics go to the old one.
+        let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+            std::panic::take_hook().into();
+        let fallback = previous.clone();
+        std::panic::set_hook(Box::new(move |info| match std::thread::current().name() {
+            Some(REPLACEMENT_THREAD | PIPELINE) => on_panic(info, || {
+                TURNED_OFF.fetch_add(1, Ordering::SeqCst);
+            }),
+            _ => fallback(info),
+        }));
+
+        // The painter's replacement thread panics, as in a driver.
+        let start = Instant::now();
+        let mut replacing =
+            Answer::<()>::ask(REPLACEMENT_THREAD, start, REPLACEMENT_TIMEOUT, || {
+                panic!("simulated panic making a device")
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(replacing.poll(start), Asked::Ended) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = matches!(replacing.poll(start), Asked::Ended);
+        let after_replacement = TURNED_OFF.load(Ordering::SeqCst);
+        // Any other background thread's panic still turns it off.
+        let _ = std::thread::Builder::new()
+            .name(PIPELINE.into())
+            .spawn(|| panic!("simulated pipeline panic"))
+            .unwrap()
+            .join();
+        let after_pipeline = TURNED_OFF.load(Ordering::SeqCst);
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+        assert!(ended);
+        assert_eq!(after_replacement, 0);
+        assert_eq!(after_pipeline, 1);
+
+        // The painter counts the ended try as failed and tries again later.
+        let mut replacement = Replacement::default();
+        replacement.lost(start);
+        replacement.failed(start);
+        assert_eq!(replacement.wait(start), Some(Duration::from_millis(500)));
     }
 
     #[test]

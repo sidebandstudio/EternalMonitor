@@ -35,7 +35,10 @@ The patch:
   Listing adapters and making the device, where a driver can stall, run on
   their own thread (`winit::Answer`), which the window polls each frame. One
   that hasn't answered in 10 s counts as a failed try, and no other starts
-  while it is out; a late device is still taken. Configuring the new surface,
+  while it is out; a late device is still taken. The thread is named
+  `winit::REPLACEMENT_THREAD`, so the host's panic hook treats a panic there
+  as one failed try: it doesn't turn the virtual display off as it does for
+  other background threads. Configuring the new surface,
   which makes the swapchain, stays on the window's thread, because DXGI sends
   the window messages while it does that.
 - `configure_surface` replaces the device, instead of panicking, when the

@@ -28,6 +28,10 @@ pub static DEVICES_LOST: AtomicU64 = AtomicU64::new(0);
 /// failed. A driver call can stall for much longer, so the window never waits on it.
 pub const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// EternalMonitor patch: the name of the thread that makes a replacement device. A panic
+/// there ends only that try, so an app's panic hook can tell it from others.
+pub const REPLACEMENT_THREAD: &str = "wgpu device replacement";
+
 /// EternalMonitor patch: how often the window looks for a replacement device being made.
 const REPLACEMENT_POLL: Duration = Duration::from_millis(100);
 
@@ -556,20 +560,15 @@ impl Painter {
         };
         let (config, instance, options) =
             (self.config.clone(), self.instance.clone(), self.options);
-        let asked = Answer::ask(
-            "wgpu device replacement",
-            now,
-            REPLACEMENT_TIMEOUT,
-            move || {
-                let made = block_on(RenderState::create(
-                    &config,
-                    &instance,
-                    Some(&surface),
-                    options,
-                ));
-                (surface, made)
-            },
-        );
+        let asked = Answer::ask(REPLACEMENT_THREAD, now, REPLACEMENT_TIMEOUT, move || {
+            let made = block_on(RenderState::create(
+                &config,
+                &instance,
+                Some(&surface),
+                options,
+            ));
+            (surface, made)
+        });
         match asked {
             Ok(replacing) => {
                 self.replacing = Some(replacing);
