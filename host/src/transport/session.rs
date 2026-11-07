@@ -53,6 +53,50 @@ const REFUSED_FOR: Duration = Duration::from_secs(60);
 const REFUSED_SUMMARIES: u32 = 20;
 const REFUSAL_MINUTE: Duration = Duration::from_secs(60);
 
+/// IDENTIFY answers per window: for one asking address, and in all. An
+/// iPad's check sends at most 8 and stops at the first answer.
+const IDENTIFY_WINDOW: Duration = Duration::from_secs(10);
+const IDENTIFY_PER_SOURCE: u32 = 8;
+const IDENTIFY_OVERALL: u32 = 32;
+/// Asking addresses tracked in a window; more get no answer until it ends.
+const IDENTIFY_SOURCES: usize = 16;
+
+/// Bounds what IDENTIFY costs: each answer is an HMAC, an address listing
+/// and a datagram, and anyone on the network may ask.
+#[derive(Debug, Default)]
+struct IdentifyLimiter {
+    overall: Option<(Instant, u32)>,
+    sources: Vec<(std::net::IpAddr, Instant, u32)>,
+}
+
+impl IdentifyLimiter {
+    /// Whether `ip` may be answered now, counting the answer if so.
+    fn allow(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let over = |since: Instant| now.saturating_duration_since(since) >= IDENTIFY_WINDOW;
+        self.overall.take_if(|(since, _)| over(*since));
+        self.sources.retain(|(_, since, _)| !over(*since));
+        let overall = self.overall.get_or_insert((now, 0));
+        if overall.1 >= IDENTIFY_OVERALL {
+            return false;
+        }
+        let index = match self.sources.iter().position(|(source, ..)| *source == ip) {
+            Some(index) => index,
+            None if self.sources.len() < IDENTIFY_SOURCES => {
+                self.sources.push((ip, now, 0));
+                self.sources.len() - 1
+            }
+            None => return false,
+        };
+        let source = &mut self.sources[index];
+        if source.2 >= IDENTIFY_PER_SOURCE {
+            return false;
+        }
+        source.2 += 1;
+        overall.1 += 1;
+        true
+    }
+}
+
 /// The refused attempts of the current minute.
 #[derive(Debug, Clone, Copy)]
 struct RefusalMinute {
@@ -333,6 +377,12 @@ pub trait ConfigSource {
     fn host_caps(&self) -> u16 {
         0
     }
+    /// The port this host receives the stream on and its home network
+    /// addresses, which an identity proof signs. None answers no IDENTIFY.
+    fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+        None
+    }
+
     /// The heartbeat's notice for the iPad (`NOTICE_*` in the wire crate).
     fn notice(&self) -> u8 {
         eternal_wire::v2::control::NOTICE_NONE
@@ -361,6 +411,7 @@ pub struct Session {
     /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
     refused: std::collections::VecDeque<(u32, Instant)>,
     refusal_minute: Option<RefusalMinute>,
+    identify_limiter: IdentifyLimiter,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -379,6 +430,7 @@ impl Session {
             ended_for_liveness: None,
             refused: std::collections::VecDeque::new(),
             refusal_minute: None,
+            identify_limiter: IdentifyLimiter::default(),
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -631,7 +683,10 @@ impl Session {
         // INPUT_EVENT moved the mouse and clicked, a stray RECEIVER_REPORT
         // steered the bitrate, and a late BYE from a superseded session tore
         // down the one that replaced it.
-        if !matches!(message, ControlMessage::Hello2(_)) {
+        if !matches!(
+            message,
+            ControlMessage::Hello2(_) | ControlMessage::Identify(_)
+        ) {
             match self.active.as_ref() {
                 Some(session)
                     if session.session_id == header_session_id && !session.awaiting_takeover => {}
@@ -641,6 +696,7 @@ impl Session {
         }
         match message {
             ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Identify(request) => self.answer_identify(source, request, config, now),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
@@ -946,6 +1002,52 @@ impl Session {
                 actions.report = Some(report);
             }
         }
+        actions
+    }
+
+    /// An iPad checking that this is the PC it paired with, at the address
+    /// it asked, before it reconnects there. It starts no session and works
+    /// while another device streams. Only Wi-Fi asks, within
+    /// [`IdentifyLimiter`]'s bounds.
+    fn answer_identify(
+        &mut self,
+        source: PeerId,
+        request: eternal_wire::v2::control::Identify,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let mut actions = Actions::default();
+        let (LinkId::Udp, Some(asker)) = (source.link, source.addr) else {
+            return actions;
+        };
+        let Some(pairing) = config.pairing() else {
+            return actions;
+        };
+        if request.version != eternal_wire::v2::control::IDENTIFY_VERSION
+            || !self.identify_limiter.allow(asker.ip(), now)
+        {
+            return actions;
+        }
+        let Some((port, addresses)) = config.identity_endpoints() else {
+            return actions;
+        };
+        let addresses: Vec<[u8; 4]> = addresses
+            .into_iter()
+            .take(eternal_wire::v2::control::IDENTITY_MAX_ADDRESSES)
+            .collect();
+        let identity = ControlMessage::Identity(eternal_wire::v2::control::Identity {
+            version: eternal_wire::v2::control::IDENTIFY_VERSION,
+            nonce: request.nonce,
+            port,
+            proof: pairing
+                .lock()
+                .identity_proof(&request.nonce, port, &addresses),
+            addresses,
+        });
+        actions.replies.push((
+            source,
+            eternal_wire::v2::control::encode_control(0, 1, &identity),
+        ));
         actions
     }
 
@@ -2367,6 +2469,298 @@ mod tests {
             Some(&self.0)
         }
     }
+    fn identity_reply(actions: &Actions) -> eternal_wire::v2::control::Identity {
+        assert_eq!(actions.replies.len(), 1);
+        let (header, ControlMessage::Identity(identity)) =
+            eternal_wire::v2::control::parse_control(&actions.replies[0].1).unwrap()
+        else {
+            panic!("expected IDENTITY")
+        };
+        assert_eq!(header.session_id, 0);
+        identity
+    }
+
+    fn identify(version: u8, nonce: [u8; 16]) -> ControlMessage {
+        ControlMessage::Identify(eternal_wire::v2::control::Identify { version, nonce })
+    }
+
+    /// A paired host on port 9876 with the home network addresses given.
+    struct IdentifyConfig(PairConfig, Vec<[u8; 4]>);
+    impl ConfigSource for IdentifyConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            self.0.pairing()
+        }
+        fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+            Some((9876, self.1.clone()))
+        }
+    }
+
+    /// A paired host on every address whose home network addresses come
+    /// from `HomeCache`, listed by `held_home`.
+    struct ListedConfig(PairConfig, crate::network::HomeCache);
+    impl ConfigSource for ListedConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            self.0.pairing()
+        }
+        fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+            super::super::identity_endpoints(SocketAddr::from(([0, 0, 0, 0], 9876)), || {
+                self.1.get()
+            })
+        }
+    }
+
+    /// Held while the test keeps the PC's adapters from being listed.
+    static HOME_HELD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn held_home() -> Option<Vec<crate::network::Adapter>> {
+        let _open = HOME_HELD.lock();
+        Some(vec![crate::network::Adapter {
+            name: String::new(),
+            kind: crate::network::Kind::Wifi,
+            up: true,
+            gateway: true,
+            ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+        }])
+    }
+
+    /// Once the last listing of the PC's addresses has expired, IDENTIFY gets
+    /// no answer until a new listing comes, however long that takes: the PC
+    /// never signs an address it may no longer have.
+    #[test]
+    fn identify_signs_no_expired_listing() {
+        let lifetime = Duration::from_secs(1);
+        let config = ListedConfig(
+            pair_config(true),
+            crate::network::HomeCache::with(held_home, lifetime),
+        );
+        let mut session = Session::new(100);
+        let start = Instant::now();
+        // A new asker and a new limiter window each time, so only the
+        // listing decides.
+        let mut asked = 0u32;
+        let mut ask = |session: &mut Session| {
+            asked += 1;
+            let asker = addr([192, 0, 2, (asked % 250) as u8 + 1], 50100);
+            answered(session, asker, &config, start + IDENTIFY_WINDOW * asked)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "the addresses were never listed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let held = HOME_HELD.lock();
+        std::thread::sleep(lifetime + Duration::from_millis(100));
+        for _ in 0..30 {
+            assert!(!ask(&mut session), "signed an expired listing");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "a fresh listing never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn identify_config(required: bool) -> IdentifyConfig {
+        IdentifyConfig(
+            pair_config(required),
+            vec![[192, 0, 2, 1], [198, 51, 100, 1]],
+        )
+    }
+
+    fn answered(
+        session: &mut Session,
+        asker: PeerId,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> bool {
+        !session
+            .handle_control(asker, 0, identify(1, [3; 16]), config, now)
+            .replies
+            .is_empty()
+    }
+
+    /// The PC proves it holds its pairing token at its own port and
+    /// addresses, with pairing on or off, without starting a session.
+    #[test]
+    fn identify_is_answered_with_the_token_proof_and_starts_nothing() {
+        let config = identify_config(true);
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions = session.handle_control(asker, 0, identify(1, [3; 16]), &config, now);
+        let identity = identity_reply(&actions);
+        assert_eq!(actions.replies[0].0, asker);
+        assert_eq!(identity.nonce, [3; 16]);
+        assert_eq!(identity.port, 9876);
+        assert_eq!(identity.addresses, config.1);
+        let proof =
+            |pairing: &crate::pairing::Pairing| pairing.identity_proof(&[3; 16], 9876, &config.1);
+        assert_eq!(identity.proof, proof(&config.0 .0.lock()));
+        assert_ne!(
+            identity.proof,
+            proof(&crate::pairing::Pairing::new(true, [8; 16]).unwrap())
+        );
+        assert!(session.session_id().is_none());
+        assert!(actions.new_target.is_none());
+
+        // At most four addresses go out, and the proof signs those four.
+        let many = IdentifyConfig(
+            pair_config(false),
+            (1..=6).map(|last| [192, 0, 2, last]).collect(),
+        );
+        let identity =
+            identity_reply(&session.handle_control(asker, 0, identify(1, [3; 16]), &many, now));
+        assert_eq!(identity.addresses, many.1[..4]);
+        assert_eq!(
+            identity.proof,
+            many.0
+                 .0
+                .lock()
+                .identity_proof(&[3; 16], 9876, &many.1[..4])
+        );
+    }
+
+    /// A layout this PC doesn't know gets no answer, as from a PC before
+    /// 0.3.5; so does a host without pairing state or addresses to sign,
+    /// and a request over a cable.
+    #[test]
+    fn identify_of_another_version_is_not_answered() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions =
+            session.handle_control(asker, 0, identify(2, [3; 16]), &identify_config(true), now);
+        assert!(actions.replies.is_empty());
+        assert!(!answered(&mut session, asker, &TestConfig, now));
+        assert!(!answered(&mut session, asker, &pair_config(true), now));
+        assert!(!answered(
+            &mut session,
+            PeerId::usb(1),
+            &identify_config(true),
+            now
+        ));
+        assert!(answered(&mut session, asker, &identify_config(true), now));
+    }
+
+    /// A burst from one address gets 8 answers in 10 s, and the PC 32 in
+    /// all from at most 16 addresses; each count starts over when its
+    /// window ends.
+    #[test]
+    fn identify_answers_are_bounded_per_asker_and_in_all() {
+        let config = identify_config(true);
+        let mut session = Session::new(100);
+        let start = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let burst = (0..20)
+            .filter(|_| answered(&mut session, asker, &config, start))
+            .count();
+        assert_eq!(burst, IDENTIFY_PER_SOURCE as usize);
+        // Another port on the same address shares its count.
+        assert!(!answered(
+            &mut session,
+            addr([192, 0, 2, 9], 50101),
+            &config,
+            start
+        ));
+        // Others still get theirs, up to the PC's 32.
+        let others: usize = (10..13)
+            .map(|last| {
+                (0..20)
+                    .filter(|_| {
+                        answered(&mut session, addr([192, 0, 2, last], 50100), &config, start)
+                    })
+                    .count()
+            })
+            .sum();
+        assert_eq!(others, (IDENTIFY_OVERALL - IDENTIFY_PER_SOURCE) as usize);
+        assert!(!answered(
+            &mut session,
+            addr([192, 0, 2, 40], 50100),
+            &config,
+            start
+        ));
+
+        let later = start + IDENTIFY_WINDOW - Duration::from_millis(1);
+        assert!(!answered(&mut session, asker, &config, later));
+        let next = start + IDENTIFY_WINDOW;
+        assert!(answered(&mut session, asker, &config, next));
+        assert!(answered(
+            &mut session,
+            addr([192, 0, 2, 40], 50100),
+            &config,
+            next
+        ));
+
+        // Past 16 addresses in a window, a new one waits for the next.
+        let mut session = Session::new(100);
+        for last in 0..IDENTIFY_SOURCES as u8 {
+            assert!(answered(
+                &mut session,
+                addr([198, 51, 100, last], 50100),
+                &config,
+                start
+            ));
+        }
+        assert!(!answered(&mut session, asker, &config, start));
+        assert!(answered(&mut session, asker, &config, next));
+    }
+
+    /// While another iPad streams, IDENTIFY is answered within the same
+    /// bounds, and the stream goes on whatever arrives.
+    #[test]
+    fn identify_while_streaming_is_bounded_and_leaves_the_stream() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let streaming = addr([192, 0, 2, 5], 50000);
+        session.handle_control(
+            streaming,
+            0,
+            ControlMessage::Hello2(pair_hello(1)),
+            &pair_config(false),
+            now,
+        );
+        let live = session.session_id();
+        assert!(live.is_some());
+
+        let config = identify_config(false);
+        let asker = addr([192, 0, 2, 9], 50100);
+        let mut answers = 0;
+        for index in 0..40u8 {
+            let actions = session.handle_control(asker, 0, identify(1, [index; 16]), &config, now);
+            assert!(
+                actions.new_target.is_none() && !actions.client_lost && actions.goodbye.is_none()
+            );
+            if !actions.replies.is_empty() {
+                let identity = identity_reply(&actions);
+                assert_eq!(identity.nonce, [index; 16]);
+                assert_eq!(actions.replies[0].0, asker, "never to the streaming iPad");
+                answers += 1;
+            }
+        }
+        assert_eq!(answers, IDENTIFY_PER_SOURCE);
+        // The streaming iPad's own IDENTIFY counts on its own address.
+        assert!(answered(&mut session, streaming, &config, now));
+        assert_eq!(session.session_id(), live, "the stream goes on");
+        let actions = session.tick(&config, true, now + Duration::from_millis(100));
+        assert!(!actions.client_lost);
+        assert_eq!(session.session_id(), live);
+    }
+
     fn pair_config(required: bool) -> PairConfig {
         PairConfig(parking_lot::Mutex::new(
             crate::pairing::Pairing::new(required, [7; 16]).unwrap(),
@@ -3009,6 +3403,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let counts = LeftOut::default();
         let seen = counts.0.clone();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(counts), || {
             session.tick(&config, false, now + Duration::from_secs(30));
             session.tick(&config, false, now + REFUSAL_MINUTE);

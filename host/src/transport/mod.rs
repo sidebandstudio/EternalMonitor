@@ -80,11 +80,36 @@ pub mod probe {
     }
 }
 
+/// What an identity proof signs for a socket on `listen`: that address, or
+/// for one on every address, `home()`. None, and no answer, without an
+/// address to sign.
+fn identity_endpoints(
+    listen: SocketAddr,
+    home: impl FnOnce() -> Vec<std::net::Ipv4Addr>,
+) -> Option<(u16, Vec<[u8; 4]>)> {
+    let std::net::IpAddr::V4(ip) = listen.ip() else {
+        return None;
+    };
+    let addresses = if ip.is_unspecified() {
+        home()
+    } else {
+        vec![ip]
+    };
+    (!addresses.is_empty()).then(|| {
+        (
+            listen.port(),
+            addresses.iter().map(|ip| ip.octets()).collect(),
+        )
+    })
+}
+
 /// Stream parameters advertised in HELLO_ACK and heartbeats.
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
     stream_epoch: u32,
     pen_available: bool,
+    /// Where the socket receives the stream.
+    listen: SocketAddr,
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
@@ -115,6 +140,10 @@ impl ConfigSource for SharedConfigSource<'_> {
             },
             bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
         }
+    }
+
+    fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+        identity_endpoints(self.listen, crate::network::home_addresses)
     }
 
     fn notice(&self) -> u8 {
@@ -216,6 +245,10 @@ pub async fn start_sender(
         .max(1);
 
     let local_addr = socket.local_addr()?;
+    if bind_ip.is_unspecified() {
+        // Lists the home network addresses before anyone asks for them.
+        crate::network::home_addresses();
+    }
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
     // The Address row and QR code follow every bind, so a chosen network
     // that came back shows its address. Resolved before locking: the stats
@@ -231,6 +264,7 @@ pub async fn start_sender(
         shared: &shared,
         stream_epoch,
         pen_available: input_relay.pen_available(),
+        listen: local_addr,
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -981,6 +1015,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        crate::logging::prepare_log_capture();
         let _log = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(crate::diagnostics::FallbackWatch)
@@ -1004,6 +1039,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let peer = PeerId::udp("127.0.0.1:19893".parse().unwrap());
             let hello = ControlMessage::Hello2(Hello2 {
@@ -1056,6 +1092,27 @@ mod tests {
         crate::diagnostics::tests::assert_contract(&summaries[0]);
     }
 
+    /// A socket on one address signs that address; one on every address
+    /// signs the home network addresses. With none to sign, or IPv6, the PC
+    /// answers nothing rather than an empty list.
+    #[test]
+    fn identity_endpoints_need_an_address_to_sign() {
+        let all = SocketAddr::from(([0, 0, 0, 0], 9876));
+        let home = || vec![std::net::Ipv4Addr::new(192, 0, 2, 4)];
+        assert_eq!(
+            identity_endpoints(all, home),
+            Some((9876, vec![[192, 0, 2, 4]]))
+        );
+        assert_eq!(identity_endpoints(all, Vec::new), None);
+        let one = SocketAddr::from(([198, 51, 100, 3], 9876));
+        assert_eq!(
+            identity_endpoints(one, || panic!("lists nothing")),
+            Some((9876, vec![[198, 51, 100, 3]]))
+        );
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9876));
+        assert_eq!(identity_endpoints(v6, home), None);
+    }
+
     #[tokio::test]
     async fn repairs_current_and_previous_frames_before_the_pacing_wait_ends() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1068,6 +1125,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1118,6 +1176,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
             let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1195,11 +1254,16 @@ mod tests {
     /// session, and both go up, as at every other end of a session.
     #[cfg(not(windows))]
     #[tokio::test]
+    // The slot only keeps other tests out; nothing on this test's runtime
+    // takes it.
+    #[allow(clippy::await_holding_lock)]
     async fn a_usb_session_ended_by_its_cable_releases_held_input() {
         use crate::input::{
             recorder, CaptureGeometry, Injection, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
         };
         use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        // The session starts and ends through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
         shared.pairing.lock().required = false;
@@ -1213,6 +1277,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
         let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1319,6 +1384,7 @@ mod tests {
             shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1394,6 +1460,7 @@ mod tests {
                     shared: &shared,
                     stream_epoch: 1,
                     pen_available: false,
+                    listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                 };
                 let links =
                     TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
@@ -1457,6 +1524,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let held = shared
             .session
@@ -1493,6 +1561,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let notices = || {
             let actions = shared.session.lock().tick(&config, true, now);
@@ -1553,6 +1622,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let expired = shared
             .session
@@ -1694,6 +1764,7 @@ mod tests {
             .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
             .finish();
         let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);

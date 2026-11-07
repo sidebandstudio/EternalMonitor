@@ -1321,6 +1321,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(move || Captured(writer.clone())),
         );
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, log);
         let line = String::from_utf8(out.lock().clone()).unwrap();
         line.trim_end().to_owned()

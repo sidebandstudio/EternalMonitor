@@ -56,6 +56,10 @@ pub enum PacketType {
     StreamConfig = 0x18,
     Nack = 0x19,
     InputEvent = 0x20,
+    /// Client → host: prove you are the PC this iPad paired with (0.3.5+).
+    Identify = 0x1A,
+    /// Host → client: the answer to [`PacketType::Identify`].
+    Identity = 0x1B,
     /// Reserved. Not sent in v2.0.
     Error = 0x7F,
 }
@@ -77,6 +81,8 @@ impl PacketType {
             0x18 => Self::StreamConfig,
             0x19 => Self::Nack,
             0x20 => Self::InputEvent,
+            0x1A => Self::Identify,
+            0x1B => Self::Identity,
             0x7F => Self::Error,
             _ => return None,
         })

@@ -1716,6 +1716,7 @@ fn logged(run: impl FnOnce()) -> String {
         .with_ansi(false)
         .with_writer(move || sink.clone())
         .finish();
+    crate::logging::prepare_log_capture();
     tracing::subscriber::with_default(subscriber, run);
     let text = String::from_utf8(out.lock().clone()).unwrap();
     text

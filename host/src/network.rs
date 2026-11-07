@@ -368,6 +368,174 @@ impl Drop for Listing {
     }
 }
 
+/// The home network addresses among `adapters`: IPv4 on Wi-Fi and Ethernet
+/// adapters that are up, in a private range or link-local. Those on an
+/// adapter with a default gateway come first and link-local ones last, so a
+/// cap on how many are signed keeps the home network's.
+/// An iPad checking that it found this PC at an address gets these signed.
+pub fn home_addresses_of(adapters: &[Adapter]) -> Vec<Ipv4Addr> {
+    let mut addresses: Vec<(Ipv4Addr, bool)> = adapters
+        .iter()
+        .filter(|adapter| adapter.up && matches!(adapter.kind, Kind::Wifi | Kind::Ethernet))
+        .flat_map(|adapter| adapter.ipv4.iter().map(|&ip| (ip, adapter.gateway)))
+        .filter(|(ip, _)| ip.is_private() || ip.is_link_local())
+        .collect();
+    addresses.sort_by_key(|&(ip, gateway)| (ip.is_link_local(), !gateway));
+    let mut seen = Vec::with_capacity(addresses.len());
+    for (ip, _) in addresses {
+        if !seen.contains(&ip) {
+            seen.push(ip);
+        }
+    }
+    seen
+}
+
+/// How long one listing of the home network addresses answers.
+const HOME_TTL: Duration = Duration::from_secs(2);
+
+/// The home network addresses from the last listing, listed on a thread of
+/// its own at most every 2 s. Asking never waits: an identity check asks
+/// under the session lock, and no listing runs while it is held. Addresses
+/// older than that are never given out: the PC may have lost them.
+pub struct HomeCache {
+    list: fn() -> Option<Vec<Adapter>>,
+    ttl: Duration,
+    state: Arc<Mutex<HomeState>>,
+}
+
+#[derive(Default)]
+struct HomeState {
+    listed: Option<(Instant, Vec<Ipv4Addr>)>,
+    listing: bool,
+}
+
+impl HomeCache {
+    pub(crate) fn with(list: fn() -> Option<Vec<Adapter>>, ttl: Duration) -> Self {
+        Self {
+            list,
+            ttl,
+            state: Arc::default(),
+        }
+    }
+
+    /// The last listing's addresses while it is fresh: it started less than
+    /// `ttl` ago. A missing or expired one reads as none, so nothing is
+    /// signed, and starts a listing on its own thread. A listing that is
+    /// already expired when it ends is dropped.
+    pub fn get(&self) -> Vec<Ipv4Addr> {
+        let (addresses, start) = {
+            let mut state = self.state.lock();
+            let fresh = state
+                .listed
+                .as_ref()
+                .filter(|(started, _)| started.elapsed() < self.ttl);
+            let addresses = fresh.map(|(_, addresses)| addresses.clone());
+            let start = addresses.is_none() && !state.listing;
+            state.listing |= start;
+            (addresses.unwrap_or_default(), start)
+        };
+        if start {
+            let (list, ttl, listing) = (self.list, self.ttl, HomeListing(self.state.clone()));
+            // A thread that can't start drops the closure, and with it the guard.
+            let _ = std::thread::Builder::new()
+                .name("home-addresses".into())
+                .spawn(move || {
+                    let started = Instant::now();
+                    let addresses = list()
+                        .map(|adapters| home_addresses_of(&adapters))
+                        .unwrap_or_default();
+                    if started.elapsed() < ttl {
+                        listing.0.lock().listed = Some((started, addresses));
+                    }
+                });
+        }
+        addresses
+    }
+}
+
+/// Ends a listing when dropped, so a worker that panics loses only that
+/// refresh.
+struct HomeListing(Arc<Mutex<HomeState>>);
+
+impl Drop for HomeListing {
+    fn drop(&mut self) {
+        self.0.lock().listing = false;
+    }
+}
+
+fn listed_home() -> Option<Vec<Adapter>> {
+    listed().or_else(interfaces)
+}
+
+/// This PC's home network addresses (see [`home_addresses_of`] and
+/// [`HomeCache`]).
+pub fn home_addresses() -> Vec<Ipv4Addr> {
+    static HOME: std::sync::LazyLock<HomeCache> =
+        std::sync::LazyLock::new(|| HomeCache::with(listed_home, HOME_TTL));
+    HOME.get()
+}
+
+/// What kind of interface a Unix name and flags say: network cards are
+/// named en*, eth* or wl*; point-to-point interfaces are tunnels.
+#[cfg(unix)]
+fn interface_kind(name: &str, flags: libc::c_int) -> Kind {
+    if flags & libc::IFF_LOOPBACK != 0 {
+        Kind::Virtual
+    } else if flags & libc::IFF_POINTOPOINT != 0 {
+        Kind::Vpn
+    } else if ["en", "eth", "wl"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        Kind::Ethernet
+    } else {
+        Kind::Other
+    }
+}
+
+/// Unix interfaces with their IPv4 addresses, from `getifaddrs`.
+#[cfg(unix)]
+fn interfaces() -> Option<Vec<Adapter>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut out: Vec<Adapter> = Vec::new();
+    let mut next = list;
+    while !next.is_null() {
+        let entry = unsafe { &*next };
+        next = entry.ifa_next;
+        if entry.ifa_addr.is_null()
+            || i32::from(unsafe { (*entry.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        let sin = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let flags = entry.ifa_flags as libc::c_int;
+        match out.iter_mut().find(|adapter| adapter.name == name) {
+            Some(adapter) => adapter.ipv4.push(ip),
+            None => out.push(Adapter {
+                kind: interface_kind(&name, flags),
+                name,
+                up: flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0,
+                gateway: false,
+                ipv4: vec![ip],
+            }),
+        }
+    }
+    unsafe { libc::freeifaddrs(list) };
+    Some(out)
+}
+
+#[cfg(not(unix))]
+fn interfaces() -> Option<Vec<Adapter>> {
+    None
+}
+
 /// The local address the OS would use toward a public address.
 pub fn default_route() -> Option<IpAddr> {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -939,6 +1107,138 @@ mod tests {
 
     /// Windows says the list grew every time: three bigger buffers, then no
     /// list, so no hint.
+    /// What an identity proof signs: home network addresses on network
+    /// cards that are up, never a VPN's or a virtual switch's, even in a
+    /// private range.
+    #[test]
+    fn home_addresses_are_on_network_cards_that_are_up() {
+        let mut down = adapter(Kind::Ethernet, true, [192, 168, 7, 2]);
+        down.up = false;
+        let adapters = [
+            adapter(Kind::Vpn, false, [10, 8, 0, 2]),
+            adapter(Kind::Virtual, false, [172, 20, 0, 1]),
+            adapter(Kind::Wifi, true, [169, 254, 3, 4]),
+            down,
+            adapter(Kind::Other, true, [192, 168, 9, 9]),
+            Adapter {
+                ipv4: vec![
+                    ip([192, 168, 1, 20]),
+                    ip([203, 0, 113, 5]),
+                    ip([192, 168, 1, 20]),
+                ],
+                ..adapter(Kind::Ethernet, true, [0, 0, 0, 0])
+            },
+            adapter(Kind::Wifi, true, [10, 0, 0, 31]),
+        ];
+        assert_eq!(
+            home_addresses_of(&adapters),
+            [
+                ip([192, 168, 1, 20]),
+                ip([10, 0, 0, 31]),
+                ip([169, 254, 3, 4])
+            ]
+        );
+        assert!(home_addresses_of(&[]).is_empty());
+    }
+
+    /// The home network's address goes first, so the 4 signed include it
+    /// however many other addresses the PC has.
+    #[test]
+    fn home_addresses_with_a_gateway_come_first() {
+        let direct = Adapter {
+            ipv4: (1..=4).map(|last| ip([10, 0, 9, last])).collect(),
+            ..adapter(Kind::Ethernet, false, [0, 0, 0, 0])
+        };
+        let adapters = [
+            adapter(Kind::Wifi, true, [169, 254, 3, 4]),
+            direct,
+            adapter(Kind::Wifi, true, [192, 168, 1, 20]),
+        ];
+        let addresses = home_addresses_of(&adapters);
+        assert_eq!(addresses[0], ip([192, 168, 1, 20]));
+        assert_eq!(
+            addresses[1..5],
+            (1..=4).map(|last| ip([10, 0, 9, last])).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(addresses.last(), Some(&ip([169, 254, 3, 4])));
+    }
+
+    static SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_home() -> Option<Vec<Adapter>> {
+        SLOW_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        tailscale_and_wifi()
+    }
+
+    /// A listing that took longer than its lifetime is already stale when
+    /// it arrives: it is dropped, and the addresses stay unknown.
+    #[test]
+    fn a_listing_older_than_its_lifetime_is_dropped() {
+        let cache = HomeCache::with(slow_home, Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while SLOW_CALLS.load(Ordering::SeqCst) < 3 {
+            assert!(cache.get().is_empty(), "a stale listing was signed");
+            assert!(Instant::now() < deadline, "no listing finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    static HOME_GATE: Mutex<()> = Mutex::new(());
+    static HOME_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static HOME_THREAD: Mutex<Option<String>> = Mutex::new(None);
+
+    fn gated_home() -> Option<Vec<Adapter>> {
+        *HOME_THREAD.lock() = std::thread::current().name().map(str::to_string);
+        HOME_CALLS.fetch_add(1, Ordering::SeqCst);
+        let _open = HOME_GATE.lock();
+        tailscale_and_wifi()
+    }
+
+    /// An identity check asks under the session lock: while the adapters are
+    /// still being listed it gets none at once, from one listing on a thread
+    /// of its own, and the addresses once it is done.
+    #[test]
+    fn home_addresses_never_wait_for_the_listing() {
+        let cache = Arc::new(HomeCache::with(gated_home, HOME_TTL));
+        let closed = HOME_GATE.lock();
+        for _ in 0..50 {
+            let (answer, asked) = std::sync::mpsc::channel();
+            let asking = cache.clone();
+            std::thread::spawn(move || answer.send(asking.get()));
+            let addresses = asked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("asking waited for the listing");
+            assert!(addresses.is_empty());
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while HOME_CALLS.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "no listing started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(HOME_THREAD.lock().as_deref(), Some("home-addresses"));
+        drop(closed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.get().is_empty() {
+            assert!(Instant::now() < deadline, "the addresses never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(cache.get(), [ip([192, 168, 1, 20])]);
+        assert_eq!(HOME_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_interfaces_are_told_apart_by_flags_then_name() {
+        assert_eq!(interface_kind("en0", libc::IFF_UP), Kind::Ethernet);
+        assert_eq!(interface_kind("wlan0", libc::IFF_UP), Kind::Ethernet);
+        assert_eq!(interface_kind("utun3", libc::IFF_POINTOPOINT), Kind::Vpn);
+        assert_eq!(interface_kind("en5", libc::IFF_POINTOPOINT), Kind::Vpn);
+        assert_eq!(interface_kind("lo0", libc::IFF_LOOPBACK), Kind::Virtual);
+        assert_eq!(interface_kind("bridge100", libc::IFF_UP), Kind::Other);
+        assert_eq!(interface_kind("docker0", libc::IFF_UP), Kind::Other);
+    }
+
     #[test]
     fn listing_gives_up_after_three_bigger_buffers() {
         let warned = AtomicBool::new(false);
@@ -988,6 +1288,7 @@ mod tests {
         let warned = AtomicBool::new(false);
         let levels = Levels::default();
         let subscriber = tracing_subscriber::registry().with(levels.clone());
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..3 {
                 assert_eq!(fill(&warned, |_, _| 232), None);
