@@ -42,6 +42,13 @@ impl Host {
 
     /// With the first automatic restart `backoff_ms` after a failure.
     fn start_with_backoff(gpu: GpuInfo, pairing: bool, backoff_ms: u64) -> Self {
+        Self::start_with(gpu, backoff_ms, |shared| {
+            shared.pairing.lock().required = pairing
+        })
+    }
+
+    /// With `configure` applied before the supervisor starts.
+    fn start_with(gpu: GpuInfo, backoff_ms: u64, configure: impl FnOnce(&SharedControl)) -> Self {
         let env = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -66,7 +73,7 @@ impl Host {
             .unwrap()
             .port();
         let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
-        shared.pairing.lock().required = pairing;
+        configure(&shared);
         let (commands, command_rx) = mpsc::channel();
         let supervisor = {
             let (shared, commands) = (shared.clone(), commands.clone());
@@ -104,6 +111,8 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         eternal_host::supervisor::TEST_BACKOFF_BASE_MS.store(500, Ordering::SeqCst);
+        #[cfg(debug_assertions)]
+        eternal_host::network::set_test_adapters(None);
         self.shared.stop();
         let _ = self.commands.send(SupervisorCommand::Shutdown);
         if let Some(supervisor) = self.supervisor.take() {
@@ -133,14 +142,19 @@ struct FakeIpad {
 
 impl FakeIpad {
     fn new(host: &Host, device_id: u64, feature_caps: u16) -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        Self::at(std::net::Ipv4Addr::LOCALHOST, host, device_id, feature_caps)
+    }
+
+    /// An iPad that reaches the PC at `ip`.
+    fn at(ip: std::net::Ipv4Addr, host: &Host, device_id: u64, feature_caps: u16) -> Self {
+        let socket = UdpSocket::bind((ip, 0)).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
         let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024);
         Self {
             socket,
-            host: format!("127.0.0.1:{}", host.port),
+            host: format!("{ip}:{}", host.port),
             device_id,
             feature_caps,
             auth_token: [0; 16],
@@ -199,6 +213,18 @@ impl FakeIpad {
     fn ask(&self, nonce: u32) -> Option<HelloAck> {
         self.hello(nonce);
         self.ack(nonce, Duration::from_secs(2))
+    }
+
+    /// Keeps asking, as a waiting iPad does, until the PC answers at all.
+    fn ask_until_answered(&self, nonce: u32, within: Duration) -> Option<HelloAck> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            self.hello(nonce);
+            if let Some(ack) = self.ack(nonce, Duration::from_millis(500)) {
+                return Some(ack);
+            }
+        }
+        None
     }
 
     /// Keeps asking, as an iPad does, until the PC streams to it.
@@ -439,4 +465,62 @@ fn the_storm_brake_says_why_and_waits_for_start() {
     assert!(!host.streaming());
     let ack = ipad.ask(1000).expect("still answered");
     assert_eq!(ack.status, HelloStatus::Failed);
+}
+
+/// A stopped PC listens where iPads can reach it, as the stream does: on
+/// this PC only while the chosen network is down, on the network's address
+/// once it is back, and on this PC again when it goes. It never starts the
+/// stream to do so.
+#[cfg(debug_assertions)]
+#[test]
+fn a_stopped_pc_follows_the_chosen_network() {
+    use eternal_host::network::{default_route, set_test_adapters, Adapter, Kind, ListenOn};
+    use std::net::{IpAddr, Ipv4Addr};
+    // Binding the network's address needs a real one.
+    let Some(IpAddr::V4(ip)) = default_route().filter(|ip| !ip.is_loopback()) else {
+        eprintln!("SKIP: no IPv4 default route to stand in for the chosen network");
+        return;
+    };
+    let wifi = move |up| {
+        vec![Adapter {
+            name: "Wi-Fi".into(),
+            kind: Kind::Wifi,
+            up,
+            gateway: true,
+            ipv4: vec![ip],
+        }]
+    };
+    let host = Host::start_with(GpuInfo::software_fallback(), 500, |shared| {
+        shared.pairing.lock().required = false;
+        *shared.listen_on.lock() = ListenOn::Adapter("Wi-Fi".into());
+        set_test_adapters(Some(wifi(false)));
+    });
+    host.send(SupervisorCommand::Stop);
+    host.wait_until_stopped();
+    let here = FakeIpad::new(&host, 1, NEW);
+    let lan = FakeIpad::at(ip, &host, 2, NEW);
+    let ack = here
+        .ask(1)
+        .expect("answered on this PC while the network is down");
+    assert_eq!(ack.status, HelloStatus::Stopped);
+
+    set_test_adapters(Some(wifi(true)));
+    let ack = lan
+        .ask_until_answered(2, Duration::from_secs(20))
+        .expect("never answered on the network's address once it came back");
+    assert_eq!(ack.status, HelloStatus::Stopped);
+
+    set_test_adapters(Some(wifi(false)));
+    let ack = here
+        .ask_until_answered(3, Duration::from_secs(20))
+        .expect("never answered on this PC once the network went");
+    assert_eq!(ack.status, HelloStatus::Stopped);
+    assert!(
+        !host.streaming(),
+        "following the network started the stream"
+    );
+    assert_eq!(
+        host.shared.session.lock().not_streaming(),
+        Some(NotStreaming::Stopped)
+    );
 }

@@ -31,6 +31,9 @@ use crate::control::SharedControl;
 const BIND_RETRY: Duration = Duration::from_millis(250);
 /// How often the responder looks for a goodbye left for a stopped session.
 const GOODBYE_CHECK: Duration = Duration::from_millis(250);
+/// How often the responder checks the chosen network's address, so it
+/// follows the network as the stream does, a little sooner.
+const NETWORK_CHECK: Duration = Duration::from_secs(3);
 /// How long [`Standby::stop`] waits for the port to close.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -77,27 +80,57 @@ impl Standby {
 }
 
 async fn run(listen_port: u16, shared: SharedControl, mut stopped: oneshot::Receiver<()>) {
-    let mut links = tokio::select! {
-        links = open(listen_port, &shared) => links,
-        _ = &mut stopped => return,
-    };
-    debug!("Answering iPads while no stream runs");
+    loop {
+        let (mut links, bound) = tokio::select! {
+            opened = open(listen_port, &shared) => opened,
+            _ = &mut stopped => return,
+        };
+        debug!(%bound, "Answering iPads while no stream runs");
+        if !serve(&mut links, bound, &shared, &mut stopped).await {
+            super::park_stream_socket(&shared, links.into_udp_socket());
+            debug!("Stopped answering iPads while no stream runs");
+            return;
+        }
+        // The chosen network went away, came back or changed its address:
+        // listen where iPads can reach the PC now, as the stream would.
+        info!(was = %bound, "The chosen network changed: answering iPads on its new address");
+    }
+}
+
+/// Answers until the supervisor stops the responder (false), or until the
+/// chosen network's address is no longer `bound` (true).
+async fn serve(
+    links: &mut TransportLinks,
+    bound: SocketAddr,
+    shared: &SharedControl,
+    stopped: &mut oneshot::Receiver<()>,
+) -> bool {
     let mut goodbyes = tokio::time::interval(GOODBYE_CHECK);
+    let mut network_check = tokio::time::interval(NETWORK_CHECK);
+    network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
-            _ = &mut stopped => break,
+            _ = &mut *stopped => return false,
+            _ = network_check.tick() => {
+                let listen_on = shared.listen_on.lock().clone();
+                if listen_on != crate::network::ListenOn::All
+                    && crate::network::listen_ip_now(&listen_on) != bound.ip()
+                {
+                    return true;
+                }
+            }
             // A Stop during a restart pause ends a session no transport
             // can tell: say it here.
             _ = goodbyes.tick() => {
                 let goodbye = shared.session.lock().take_goodbye();
                 if let Some(goodbye) = goodbye {
-                    super::say_goodbye(&links, goodbye).await;
+                    super::say_goodbye(links, goodbye).await;
                 }
             }
             event = links.receive() => match event {
                 Ok(LinkEvent::Datagram(peer, datagram)) => {
-                    answer(&links, &shared, peer, &datagram).await;
+                    answer(links, shared, peer, &datagram).await;
                 }
                 // A tunnel that closes now is gone for the next generation
                 // too; a session it carried ends on its liveness there.
@@ -109,17 +142,17 @@ async fn run(listen_port: u16, shared: SharedControl, mut stopped: oneshot::Rece
             },
         }
     }
-    super::park_stream_socket(&shared, links.into_udp_socket());
-    debug!("Stopped answering iPads while no stream runs");
 }
 
 /// Takes the stream port from the generation that just ended, or binds it
 /// as the transport does, retrying while that generation still holds it.
-async fn open(listen_port: u16, shared: &SharedControl) -> TransportLinks {
+/// Returns the links and the address they listen on.
+async fn open(listen_port: u16, shared: &SharedControl) -> (TransportLinks, SocketAddr) {
     let mut logged = false;
     loop {
         let listen_on = shared.listen_on.lock().clone();
-        let bind_addr = SocketAddr::from((crate::network::listen_ip_now(&listen_on), listen_port));
+        let ip = crate::network::listen_ip_now(&listen_on);
+        let bind_addr = SocketAddr::from((ip, listen_port));
         let socket = match super::take_stream_socket(shared, bind_addr) {
             Some(socket) => Ok(socket),
             None => super::bind_stream_socket(bind_addr),
@@ -129,7 +162,11 @@ async fn open(listen_port: u16, shared: &SharedControl) -> TransportLinks {
                 if logged {
                     info!(%bind_addr, "Answering iPads while the stream is off");
                 }
-                return TransportLinks::new(socket, Arc::clone(&shared.force_next_idr));
+                // The Address row and QR code follow, as for the stream.
+                let shown = crate::gui::shown_address(ip, listen_port);
+                crate::stats::PIPELINE_STATS.lock().set_listen_addr(shown);
+                let links = TransportLinks::new(socket, Arc::clone(&shared.force_next_idr));
+                return (links, bind_addr);
             }
             Err(error) if !logged => {
                 logged = true;
