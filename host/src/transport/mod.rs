@@ -292,6 +292,7 @@ pub async fn start_sender(
     let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
     pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pen_spacing = Deadline::new("pen-spacing")?;
+    let mut pointer_budget = Deadline::new("pointer-budget")?;
 
     loop {
         // A pen backlog sends one bounded chunk at the top of every pass,
@@ -307,12 +308,17 @@ pub async fn start_sender(
                 .keep_pen_alive(*shared.capture_geometry.lock());
         }
         pen_spacing.arm(state.input_relay.pen_spaced_until());
-        let pointer_due = {
+        // Tokio's timer can wake 15 ms late on Windows, longer than a frame
+        // budget: the budget's end waits on a high-resolution timer.
+        let pointer_repeat = {
             let (shape, position) = shared.pointer.latest();
             let budget = crate::capture::frame_budget_for(shared.effective_fps());
-            state
-                .pointer
-                .next_poll(budget, position, shape.map(|shape| shape.id))
+            pointer_budget.arm(state.pointer.budget_end(
+                budget,
+                position,
+                shape.map(|shape| shape.id),
+            ));
+            state.pointer.repeat_due(budget)
         };
         tokio::select! {
             // Service timers and queued control before another paced frame.
@@ -400,7 +406,10 @@ pub async fn start_sender(
             _ = shared.pointer.changed() => {
                 send_pointer(&mut state.pointer, &links, &shared).await;
             }
-            _ = tokio::time::sleep_until(pointer_due.unwrap_or_else(Instant::now).into()), if pointer_due.is_some() => {
+            _ = pointer_budget.wait(), if pointer_budget.armed() => {
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
+            _ = tokio::time::sleep_until(pointer_repeat.unwrap_or_else(Instant::now).into()), if pointer_repeat.is_some() => {
                 send_pointer(&mut state.pointer, &links, &shared).await;
             }
             Some(packet) = audio_rx.recv() => {

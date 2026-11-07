@@ -135,16 +135,33 @@ impl PointerSender {
     }
 
     /// When [`Self::poll`] next has something to send without new input:
-    /// the end of the budget a newer position waits for, or a repeat.
+    /// the start of the next budget, for a newer position that waits for
+    /// it, or a repeat.
     pub fn next_poll(
         &self,
         budget: Duration,
         latest: Option<Position>,
         shape_id: Option<u32>,
     ) -> Option<Instant> {
-        self.session_id?;
-        let (sent, at) = self.sent?;
-        let epoch = self.epoch?;
+        [
+            self.budget_end(budget, latest, shape_id),
+            self.repeat_due(budget),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// The start of the next budget, while a newer position waits for it.
+    /// At most one budget away, and later than the one before: the loop
+    /// waits for it on a high-resolution timer.
+    pub fn budget_end(
+        &self,
+        budget: Duration,
+        latest: Option<Position>,
+        shape_id: Option<u32>,
+    ) -> Option<Instant> {
+        let (sent, _) = self.sent?;
         let waiting = latest.is_some_and(|position| {
             (
                 position.visible,
@@ -158,14 +175,21 @@ impl PointerSender {
                 sent.shape_id,
             )
         });
+        waiting.then(|| self.next_slot(budget)).flatten()
+    }
+
+    /// When the last position goes again, no earlier than the next budget.
+    pub fn repeat_due(&self, budget: Duration) -> Option<Instant> {
+        Some(self.repeat_at?.max(self.next_slot(budget)?))
+    }
+
+    fn next_slot(&self, budget: Duration) -> Option<Instant> {
+        self.session_id?;
+        let (_, at) = self.sent?;
+        let epoch = self.epoch?;
         let budget = budget.max(Duration::from_nanos(1));
         let slot = at.saturating_duration_since(epoch).as_nanos() / budget.as_nanos();
-        let next_slot = epoch + budget * (slot as u32 + 1);
-        let budget_end = waiting.then_some(next_slot);
-        [budget_end, self.repeat_at.map(|due| due.max(next_slot))]
-            .into_iter()
-            .flatten()
-            .min()
+        Some(epoch + budget * (slot as u32 + 1))
     }
 }
 
@@ -230,6 +254,7 @@ mod tests {
         // wakeups would.
         let mut sent: Vec<(u64, i32)> = Vec::new();
         let mut latest = None;
+        let mut last_end: Option<Instant> = None;
         let mut next = updates.iter().peekable();
         for ms in 0..=t + 200 {
             while next.peek().is_some_and(|(at_ms, _)| *at_ms == ms) {
@@ -238,6 +263,13 @@ mod tests {
             let now = start + Duration::from_millis(ms);
             for x in states(&sender.poll(now, BUDGET, (Some(shape(1)), latest))) {
                 sent.push((ms, x));
+            }
+            // What the loop's high-resolution timer waits for: within one
+            // budget, and never earlier than the end it waited for before.
+            if let Some(end) = sender.budget_end(BUDGET, latest, Some(1)) {
+                assert!(end > now && end <= now + BUDGET, "{ms} ms");
+                assert!(last_end.is_none_or(|last| end >= last), "{ms} ms");
+                last_end = Some(end);
             }
         }
         let slot = |ms: u64| Duration::from_millis(ms).as_nanos() / BUDGET.as_nanos();
