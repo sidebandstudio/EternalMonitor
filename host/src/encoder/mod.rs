@@ -441,7 +441,20 @@ fn run_encode_loop(
             // once it returned, or a new one.
             let reopened = if let Some(result) = background
                 .as_mut()
-                .and_then(|behind| behind.open.poll())
+                .and_then(|behind| {
+                    behind.open.poll(&mut input_mode, |args| {
+                        EncoderState::new(
+                            &args.encoder_name,
+                            args.size.0,
+                            args.size.1,
+                            args.bitrate_bps,
+                            args.target_fps,
+                            &mut EncoderInput::Yuv420,
+                            Opening::Behind,
+                            &mut || {},
+                        )
+                    })
+                })
             {
                 let behind = background.take().expect("it was just polled");
                 if let Err(error) = &result {
@@ -959,7 +972,7 @@ impl EncoderState {
             formats
         };
         info!(encoder = encoder_name, advertised_formats = ?supported, input = ?input_mode, "Encoder advertised input formats");
-        open_at_input(input_mode, encoder_name, &supported, |pixel_format| {
+        let opened = open_at_input(input_mode, encoder_name, &supported, |pixel_format| {
             Self::open_at(
                 codec,
                 encoder_name,
@@ -970,7 +983,16 @@ impl EncoderState {
                 opening,
                 &mut *progress,
             )
-        })
+        });
+        // One that goes on in the background is tried at YUV420 there.
+        if let Err(error) = &opened {
+            if let Some(still) = error.downcast_ref::<StillOpening>() {
+                if let Some(open) = still.1.lock().as_mut() {
+                    open.yuv_retry = input::retries_as_yuv(*input_mode, open.args.pixel_format);
+                }
+            }
+        }
+        opened
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1025,7 +1047,11 @@ impl EncoderState {
             Opened::Now(result) => Self::opened(result, &args),
             Opened::Behind(pending) => Err(Box::new(StillOpening(
                 encoder_name.to_string(),
-                parking_lot::Mutex::new(Some(BackgroundOpen { pending, args })),
+                parking_lot::Mutex::new(Some(BackgroundOpen {
+                    pending,
+                    args,
+                    yuv_retry: false,
+                })),
             ))),
         }
     }
@@ -1388,6 +1414,9 @@ struct SessionArgs {
 struct BackgroundOpen {
     pending: PendingOpen,
     args: SessionArgs,
+    /// An Automatic BGRA open: if it fails, YUV420 is tried, as
+    /// [`open_at_input`] tries it for an open that fails while waited for.
+    yuv_retry: bool,
 }
 
 impl BackgroundOpen {
@@ -1396,10 +1425,37 @@ impl BackgroundOpen {
     }
 
     /// The session once its open returned, or the open's error; past its
-    /// limit, its stall. None while it opens within its limit.
-    fn poll(&mut self) -> Option<Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>> {
+    /// limit, its stall. None while it opens within its limit. A BGRA open
+    /// that failed is tried again at YUV420 with `retry_yuv`, and `input`
+    /// keeps YUV420 for the pipeline's later opens: the error comes back only
+    /// if that fails too, so an encoder that works at YUV420 is not left for
+    /// the launch.
+    fn poll(
+        &mut self,
+        input: &mut EncoderInput,
+        retry_yuv: impl FnOnce(&SessionArgs) -> Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Option<Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>> {
         let result = self.pending.poll()?;
-        Some(EncoderState::opened(result, &self.args))
+        let opened = EncoderState::opened(result, &self.args);
+        let Err(error) = &opened else {
+            return Some(opened);
+        };
+        if !std::mem::take(&mut self.yuv_retry) || is_open_stall(error.as_ref()) {
+            return Some(opened);
+        }
+        warn!(
+            encoder = %self.args.encoder_name,
+            %error,
+            "Encoder did not open with BGRA input; using YUV420 for this stream"
+        );
+        *input = EncoderInput::Yuv420;
+        match retry_yuv(&self.args) {
+            Err(error) if is_still_opening(error.as_ref()) => {
+                *self = take_still_opening(error.as_ref()).expect("the open going on");
+                None
+            }
+            retried => Some(retried),
+        }
     }
 }
 
@@ -5153,6 +5209,139 @@ mod tests {
         let (retried, _) = open(&failures);
         let retried = retried.expect("opened");
         assert!(!retried.contains("earlier in this launch"), "{retried}");
+    }
+
+    /// A background open in `lanes` of `name` at `pixel_format`, parked
+    /// already, that hangs until the returned sender sends, then gives `open`.
+    fn parked_background_open(
+        lanes: &'static crate::stall::Lanes,
+        name: &str,
+        pixel_format: ffmpeg_next::format::Pixel,
+        open: impl FnOnce() -> Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>
+            + Send
+            + 'static,
+    ) -> (std::sync::mpsc::Sender<()>, BackgroundOpen) {
+        let (release, hang) = stuck_open();
+        let mut pending = crate::stall::start_in(
+            lanes,
+            crate::stall::Call::EncoderOpen,
+            crate::stall::Wait {
+                limits: open_limits(name, Opening::Behind),
+                slice: Duration::from_millis(1),
+                now: Instant::now as fn() -> Instant,
+            },
+            move || {
+                hang();
+                open()
+            },
+            crate::stall::no_hooks(),
+        )
+        .unwrap();
+        assert!(pending.park().is_none());
+        let args = SessionArgs {
+            encoder_name: name.to_string(),
+            size: (64, 64),
+            bitrate_bps: 8_000_000,
+            target_fps: 60,
+            pixel_format,
+            legacy_pts: false,
+        };
+        (
+            release,
+            BackgroundOpen {
+                pending,
+                args,
+                yuv_retry: false,
+            },
+        )
+    }
+
+    /// A real libx264 session at 64x64 YUV420P, opened on the call's thread
+    /// as a hardware encoder would be.
+    fn real_yuv_encoder() -> Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error> {
+        let codec = ffmpeg_next::encoder::find_by_name("libx264").expect("libx264");
+        let mut video = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .encoder()
+            .video()?;
+        video.set_width(64);
+        video.set_height(64);
+        video.set_format(ffmpeg_next::format::Pixel::YUV420P);
+        video.set_time_base(ffmpeg_next::Rational(1, 60));
+        video.open_with(encoder_options("libx264"))
+    }
+
+    #[test]
+    fn a_bgra_open_that_fails_in_the_background_is_tried_again_at_yuv420_there() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let refused = || Err(ffmpeg_next::Error::Other { errno: libc::EINVAL });
+        // NVENC's Automatic BGRA open outlived the first picture's wait, and
+        // fails after it, as an NVENC that takes only YUV420 does.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        open.yuv_retry = true;
+        let mut input = EncoderInput::Automatic;
+        assert!(open
+            .poll(&mut input, |_| panic!("tried again before it failed"))
+            .is_none());
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        // YUV420 is tried at once, in the background too, and the pipeline
+        // keeps it; the BGRA failure is not handed back to be remembered.
+        let mut retried_at = None;
+        let mut yuv_release = None;
+        let polled = open.poll(&mut input, |args| {
+            retried_at = Some((args.encoder_name.clone(), args.size, args.bitrate_bps));
+            let (release, yuv) =
+                parked_background_open(lanes, &args.encoder_name, Pixel::YUV420P, real_yuv_encoder);
+            yuv_release = Some(release);
+            Err(Box::new(StillOpening(
+                args.encoder_name.clone(),
+                parking_lot::Mutex::new(Some(yuv)),
+            )))
+        });
+        assert!(polled.is_none(), "the BGRA failure was handed back");
+        assert_eq!(
+            retried_at,
+            Some(("h264_nvenc".to_string(), (64, 64), 8_000_000))
+        );
+        assert_eq!(input, EncoderInput::Yuv420);
+        assert_eq!(open.args.pixel_format, Pixel::YUV420P);
+        assert!(open
+            .poll(&mut input, |_| panic!("tried again while YUV420 opens"))
+            .is_none());
+        // It opens: the stream takes that session.
+        yuv_release.unwrap().send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let state = open
+            .poll(&mut input, |_| panic!("YUV420 is tried once"))
+            .expect("returned")
+            .expect("the YUV420 open failed");
+        assert_eq!(state.opened_encoder, "h264_nvenc");
+        assert_eq!(state.frame.format(), Pixel::YUV420P);
+
+        // When YUV420 fails too, that failure is handed back, to be
+        // remembered for the launch.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        open.yuv_retry = true;
+        let mut input = EncoderInput::Automatic;
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let failed = open.poll(&mut input, |_| Err("h264_nvenc open failed at YUV420".into()));
+        let error = failed.expect("returned").err().expect("it opened");
+        assert!(error.to_string().contains("at YUV420"), "{error}");
+        assert!(!is_open_stall(error.as_ref()));
+        assert_eq!(input, EncoderInput::Yuv420);
+
+        // A YUV420 open, or a picked BGRA, is not tried again; nor is a
+        // stall, which says nothing about BGRA.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        let mut input = EncoderInput::Bgra;
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let failed = open.poll(&mut input, |_| panic!("a picked BGRA was tried again"));
+        assert!(failed.expect("returned").is_err());
+        assert_eq!(input, EncoderInput::Bgra);
     }
 
     #[test]
