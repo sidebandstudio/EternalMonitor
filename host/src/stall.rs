@@ -940,6 +940,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_timed_out(
                 Call::D3d11CreateDevice,
@@ -954,6 +955,7 @@ mod tests {
         );
         // An encoder's line gives that encoder's own limit.
         out.lock().clear();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(
             tracing_subscriber::fmt()
                 .with_ansi(false)

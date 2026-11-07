@@ -3403,6 +3403,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let counts = LeftOut::default();
         let seen = counts.0.clone();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(counts), || {
             session.tick(&config, false, now + Duration::from_secs(30));
             session.tick(&config, false, now + REFUSAL_MINUTE);

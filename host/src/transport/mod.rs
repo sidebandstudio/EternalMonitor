@@ -1015,6 +1015,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        crate::logging::prepare_log_capture();
         let _log = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(crate::diagnostics::FallbackWatch)
@@ -1253,11 +1254,16 @@ mod tests {
     /// session, and both go up, as at every other end of a session.
     #[cfg(not(windows))]
     #[tokio::test]
+    // The slot only keeps other tests out; nothing on this test's runtime
+    // takes it.
+    #[allow(clippy::await_holding_lock)]
     async fn a_usb_session_ended_by_its_cable_releases_held_input() {
         use crate::input::{
             recorder, CaptureGeometry, Injection, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
         };
         use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        // The session starts and ends through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
         shared.pairing.lock().required = false;
@@ -1758,6 +1764,7 @@ mod tests {
             .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
             .finish();
         let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);

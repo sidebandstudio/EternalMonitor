@@ -3191,6 +3191,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || sink.clone())
             .finish();
+        crate::logging::prepare_log_capture();
         let value = tracing::subscriber::with_default(subscriber, act);
         let log = String::from_utf8(out.lock().clone()).unwrap();
         (log, value)

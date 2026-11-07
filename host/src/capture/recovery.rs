@@ -776,6 +776,7 @@ mod tests {
         let waits = RefCell::new(Vec::new());
         let warnings = Arc::new(AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(Warnings(warnings.clone()));
+        crate::logging::prepare_log_capture();
         let result = tracing::subscriber::with_default(subscriber, || {
             run_until_unblocked(
                 &shared,
