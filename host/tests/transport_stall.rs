@@ -11,8 +11,9 @@ use eternal_host::transport::beat::{Phase, Verdict, Watch};
 use eternal_host::transport::{self};
 use tokio::sync::mpsc;
 
+/// The transport binds every address, so the port must be free on all.
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
+    std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
         .unwrap()
@@ -23,9 +24,17 @@ fn now_ms() -> u64 {
 }
 
 /// Checks the beat as the supervisor does, every 100 ms, until `until`.
-fn watch_until(watch: &mut Watch, shared: &SharedControl, until: Instant) -> Vec<Verdict> {
+/// Fails at once if the transport ended (it could not bind, say), which
+/// would otherwise read as a loop that never marks.
+fn watch_until(
+    watch: &mut Watch,
+    shared: &SharedControl,
+    transport: &std::thread::JoinHandle<()>,
+    until: Instant,
+) -> Vec<Verdict> {
     let mut verdicts = Vec::new();
     while Instant::now() < until {
+        assert!(!transport.is_finished(), "the transport ended early");
         verdicts.extend(watch.check(shared.transport_beat.read(), now_ms()));
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -65,6 +74,7 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
             started.elapsed() < Duration::from_secs(30),
             "the loop starts"
         );
+        assert!(!transport.is_finished(), "the transport ended early");
         std::thread::sleep(Duration::from_millis(10));
     }
     // Running freely, it ticks every 250 ms.
@@ -72,13 +82,19 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
         watch_until(
             &mut watch,
             &shared,
+            &transport,
             Instant::now() + Duration::from_millis(1500)
         ),
         []
     );
 
     let held = shared.session.lock();
-    let stuck = watch_until(&mut watch, &shared, Instant::now() + Duration::from_secs(4));
+    let stuck = watch_until(
+        &mut watch,
+        &shared,
+        &transport,
+        Instant::now() + Duration::from_secs(4),
+    );
     drop(held);
     assert!(
         matches!(
@@ -87,7 +103,12 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
         ),
         "{stuck:?}"
     );
-    let moved = watch_until(&mut watch, &shared, Instant::now() + Duration::from_secs(1));
+    let moved = watch_until(
+        &mut watch,
+        &shared,
+        &transport,
+        Instant::now() + Duration::from_secs(1),
+    );
     assert!(
         matches!(
             moved.as_slice(),
