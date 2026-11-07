@@ -113,10 +113,11 @@ impl Pairing {
         }
     }
 
-    /// Said at startup and whenever pairing is turned off.
-    pub fn warn_if_off(&self) {
+    /// Said at startup and whenever pairing is turned off. The user chose
+    /// it, so it is not a warning.
+    pub fn log_if_off(&self) {
         if !self.required {
-            warn!("Pairing is off: any iPad on the network can connect without a code");
+            info!("Pairing is off: any iPad on the network can connect without a code");
         }
     }
 
@@ -404,6 +405,41 @@ mod tests {
             proof(&nonce, 9876, &[[192, 0, 2, 10], [198, 51, 100, 11]]),
             signed
         );
+    }
+
+    /// Log lines `run` writes on this thread.
+    fn logged(run: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Captured(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8_lossy(&buffer.lock()).into_owned();
+        text
+    }
+
+    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The user turned pairing off: that is a setting, not a warning.
+    #[test]
+    fn pairing_off_is_logged_at_info() {
+        let off = Pairing::new(false, [7; 16]).unwrap();
+        let text = logged(|| off.log_if_off());
+        assert!(text.contains(" INFO "), "{text}");
+        assert!(text.contains("Pairing is off"), "{text}");
+        let on = Pairing::new(true, [7; 16]).unwrap();
+        assert_eq!(logged(|| on.log_if_off()), "");
     }
 
     fn guess(nonce: u32) -> FailedRequest {
