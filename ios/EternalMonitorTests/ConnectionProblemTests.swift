@@ -276,7 +276,10 @@ final class ConnectionProblemTests: XCTestCase {
             XCTAssertEqual(problem.detail, expected[reason]?.1, "\(reason)")
         }
         let error = ConnectionProblem.pcEndedSessionOnError
-        XCTAssertEqual(error.title, ConnectionProblem.pcEndedSession.title, "one title, as SETUP.md lists it")
+        // A PC that restarts by itself also says error: the title must be
+        // true for a restart as well as a fault, and never blame the PC's user.
+        XCTAssertEqual(error.title, "The connection to your PC ended")
+        XCTAssertEqual(ConnectionProblem.pcEndedSession.title, "Your PC ended the session")
         XCTAssertFalse(error.detail.contains("Stop") || error.detail.contains("setting"), error.detail)
         XCTAssertEqual(error.actions, [.retry])
         XCTAssertTrue(error.canReport)

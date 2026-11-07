@@ -102,6 +102,47 @@ pub struct Actions {
     pub ended: Option<SessionEnd>,
 }
 
+/// The stage whose failures made the PC give up, as far as the summary's
+/// `failure=` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageFailure {
+    Capture,
+    Encoder,
+    Other,
+}
+
+/// Why the stream stops for good ([`Session::shut_down`]): what the iPad is
+/// told, and how the session's summary ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStop {
+    /// The app quits. The iPad hears that the PC ended the session.
+    Quit,
+    /// The app quits for a restart or an update that hands over to a new
+    /// copy: the iPad is told to connect again.
+    Handoff,
+    /// Stop on the PC.
+    User,
+    /// The PC gave up after repeated failures; the iPad may try again.
+    GaveUp(StageFailure),
+}
+
+impl StreamStop {
+    fn bye(self) -> ByeReason {
+        match self {
+            Self::Quit | Self::User => ByeReason::UserDisconnect,
+            Self::Handoff | Self::GaveUp(_) => ByeReason::Error,
+        }
+    }
+
+    fn reason(self) -> EndReason {
+        match self {
+            Self::Quit | Self::Handoff => EndReason::Shutdown,
+            Self::User => EndReason::Stopped,
+            Self::GaveUp(stage) => EndReason::Failed(stage),
+        }
+    }
+}
+
 /// How far a session got and how it ended, for its support summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
@@ -130,6 +171,10 @@ pub enum EndReason {
     Superseded,
     /// An update stopped the stream, or the app quit.
     Shutdown,
+    /// Stop on the PC.
+    Stopped,
+    /// The PC gave up restarting a stage that kept failing.
+    Failed(StageFailure),
     /// The session's link (the USB tunnel) closed.
     LinkLost,
     /// The pairing credentials changed.
@@ -291,6 +336,15 @@ pub enum NotStreaming {
     Failed(FailedReason),
 }
 
+/// Why a HELLO2 can't start a session ([`Session::closed_to_clients`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Turned away with Busy, logged with this line.
+    Busy(&'static str),
+    /// Told why, once it passes the pairing check.
+    NotStreaming(NotStreaming),
+}
+
 /// Provides the current stream parameters for HELLO_ACK/heartbeats.
 pub trait ConfigSource {
     fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
@@ -312,6 +366,10 @@ pub struct Session {
     /// either closes the host or gives up. Changed only under the session lock,
     /// together with the check that nobody is streaming.
     updating: bool,
+    /// The stream stopped for good ([`Self::shut_down`]) and no transport
+    /// has resumed since: new clients are turned away, as nothing would
+    /// serve them.
+    stream_stopped: bool,
     /// No stream runs: HELLO2s are told why instead of starting a session.
     not_streaming: Option<NotStreaming>,
     /// The goodbye for a stream an update or a stop ended, sent by the next
@@ -336,6 +394,7 @@ impl Session {
             active: None,
             last_end: None,
             updating: false,
+            stream_stopped: false,
             not_streaming: None,
             goodbye: None,
             stopped: None,
@@ -383,15 +442,24 @@ impl Session {
                 return false;
             }
             info!(peer = %session.peer, "Stopping the stream for an update");
-            self.stopped = self.end_saying(ByeReason::HostShuttingDown, Instant::now());
+            self.stopped = self.end_saying(
+                ByeReason::HostShuttingDown,
+                EndReason::Shutdown,
+                Instant::now(),
+            );
         }
         self.updating = true;
         true
     }
 
-    /// Ends the active session for [`EndReason::Shutdown`] and leaves `bye`
-    /// for the transport to send before its links close.
-    fn end_saying(&mut self, bye: ByeReason, now: Instant) -> Option<SessionEnd> {
+    /// Ends the active session for `reason` and leaves `bye` for the
+    /// transport to send before its links close.
+    fn end_saying(
+        &mut self,
+        bye: ByeReason,
+        reason: EndReason,
+        now: Instant,
+    ) -> Option<SessionEnd> {
         let session = self.active.as_ref()?;
         let (peer, session_id) = (session.peer, session.session_id);
         let msg_seq = self.next_msg_seq();
@@ -403,7 +471,7 @@ impl Session {
                 &ControlMessage::Bye(bye),
             ),
         ));
-        self.end(EndReason::Shutdown, now)
+        self.end(reason, now)
     }
 
     /// The goodbye left for a stopped stream ([`Self::begin_update`],
@@ -428,14 +496,32 @@ impl Session {
         self.updating = false;
     }
 
-    /// The stream stops for good (the app quits, or Stop): the end of the
-    /// session it stops, or of one an update stopped that no tick reported
-    /// yet. A session it stops is told `bye` by the transport on its way
-    /// out; the iPad used to hear nothing, and showed a lost signal or an
-    /// unplugged cable.
-    pub fn shut_down(&mut self, now: Instant, bye: ByeReason) -> Option<SessionEnd> {
-        let active = self.end_saying(bye, now);
+    /// The stream stops for good, for `why`: the end of the session it
+    /// stops, or of one an update stopped that no tick reported yet. A
+    /// session it stops is told why by the transport on its way out; the
+    /// iPad used to hear nothing, and showed a lost signal or an unplugged
+    /// cable. Until a transport resumes, new clients are turned away.
+    pub fn shut_down(&mut self, now: Instant, why: StreamStop) -> Option<SessionEnd> {
+        self.stream_stopped = true;
+        let active = self.end_saying(why.bye(), why.reason(), now);
         self.stopped.take().or(active)
+    }
+
+    /// Why a HELLO2 can't start a session now, if it can't: an update is
+    /// about to close the host, no stream runs (the supervisor says why), or
+    /// the stream stopped and its transport is on its way out (the app
+    /// quits). The first and last are turned away with Busy before anything
+    /// else is looked at; a retry once the stream runs again works.
+    fn closed_to_clients(&self) -> Option<Closed> {
+        if self.updating {
+            Some(Closed::Busy("Client turned away while an update starts"))
+        } else if let Some(state) = self.not_streaming {
+            Some(Closed::NotStreaming(state))
+        } else if self.stream_stopped {
+            Some(Closed::Busy("Client turned away while the stream stops"))
+        } else {
+            None
+        }
     }
 
     /// The first video went to `session_id`. Later calls change nothing.
@@ -674,10 +760,10 @@ impl Session {
             return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
         }
 
-        // An update is about to close the host: don't start a stream it would cut.
-        // The iPad shows Busy ("already streaming"); a retry after the restart works.
-        if self.updating {
-            info!(peer = %source, "Client turned away while an update starts");
+        // Don't start a stream nothing will serve.
+        let closed = self.closed_to_clients();
+        if let Some(Closed::Busy(why)) = closed {
+            info!(peer = %source, "{why}");
             return self.refuse(source, HelloStatus::Busy, &hello, config, now);
         }
 
@@ -692,7 +778,7 @@ impl Session {
             {
                 // Exact replay of an accepted handshake. In particular, losing the
                 // first code-based ACK must not require the now-rotated code.
-                if let Some(state) = self.not_streaming {
+                if let Some(Closed::NotStreaming(state)) = closed {
                     drop(pairing);
                     return self.answer_not_streaming(source, state, &hello, config, now);
                 }
@@ -716,7 +802,7 @@ impl Session {
         };
         // Only an iPad that may connect learns why the PC isn't streaming.
         // A right pairing code isn't spent: it still works after Start.
-        if let Some(state) = self.not_streaming {
+        if let Some(Closed::NotStreaming(state)) = closed {
             drop(pairing);
             return self.answer_not_streaming(source, state, &hello, config, now);
         }
@@ -940,6 +1026,7 @@ impl Session {
     /// count against it: 0.3.1 expired live iPads the moment a slow restart
     /// finished and made them reconnect.
     pub fn transport_resumed(&mut self, now: Instant) {
+        self.stream_stopped = false;
         if let Some(session) = self.active.as_mut() {
             session.liveness_deadline = session.liveness_deadline.max(now + LIVENESS_TIMEOUT);
         }
@@ -2750,20 +2837,42 @@ mod tests {
             (4, EndReason::Shutdown)
         );
         assert_eq!(
-            session.shut_down(now, ByeReason::UserDisconnect),
+            session.shut_down(now, StreamStop::Quit),
             None,
             "reported once"
         );
         assert_eq!(session.take_goodbye(), None, "nobody left to tell");
 
         session.end_update();
+        // The stream runs again: clients are let in.
+        session.transport_resumed(now);
         session.handle_control(usb, 0, identified_hello(5, 77), &TestConfig, now);
         let quit = session
-            .shut_down(now + Duration::from_secs(3), ByeReason::UserDisconnect)
+            .shut_down(now + Duration::from_secs(3), StreamStop::Quit)
             .unwrap();
         assert_eq!((quit.client_nonce, quit.reason), (5, EndReason::Shutdown));
         assert_eq!(quit.duration, Duration::from_secs(3));
         assert!(!session.is_active());
+    }
+
+    /// A HELLO2 that arrives after the stream stopped, before its transport
+    /// noticed (up to a liveness tick), used to open a session nothing would
+    /// serve: no heartbeats, and the PC counted it as connected. It is turned
+    /// away until a transport resumes.
+    #[test]
+    fn a_hello_after_the_stream_stopped_is_turned_away_until_it_runs_again() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        assert_eq!(session.shut_down(now, StreamStop::User), None);
+        let refused = session.handle_control(peer, 0, identified_hello(7, 77), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        assert!(!session.is_active());
+
+        session.transport_resumed(now);
+        let admitted = session.handle_control(peer, 0, identified_hello(8, 77), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+        assert!(session.is_active());
     }
 
     /// Quitting or Stop ends the stream for good: the iPad hears why, from
@@ -2772,15 +2881,39 @@ mod tests {
     #[test]
     fn a_stopped_stream_tells_its_ipad() {
         let now = Instant::now();
-        for (peer, bye) in [
-            (PeerId::usb(17), ByeReason::UserDisconnect),
-            (addr([10, 0, 0, 5], 50000), ByeReason::Error),
+        let usb = PeerId::usb(17);
+        let wifi = addr([10, 0, 0, 5], 50000);
+        for (peer, why, bye, reason) in [
+            (
+                usb,
+                StreamStop::Quit,
+                ByeReason::UserDisconnect,
+                EndReason::Shutdown,
+            ),
+            (
+                wifi,
+                StreamStop::Handoff,
+                ByeReason::Error,
+                EndReason::Shutdown,
+            ),
+            (
+                wifi,
+                StreamStop::User,
+                ByeReason::UserDisconnect,
+                EndReason::Stopped,
+            ),
+            (
+                usb,
+                StreamStop::GaveUp(StageFailure::Encoder),
+                ByeReason::Error,
+                EndReason::Failed(StageFailure::Encoder),
+            ),
         ] {
             let mut session = Session::new(500);
             session.handle_control(peer, 0, identified_hello(6, 77), &TestConfig, now);
             let id = session.session_id().unwrap();
-            let end = session.shut_down(now, bye).unwrap();
-            assert_eq!(end.reason, EndReason::Shutdown);
+            let end = session.shut_down(now, why).unwrap();
+            assert_eq!(end.reason, reason);
             let (to, bytes) = session.take_goodbye().expect("a goodbye");
             let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();
             assert_eq!(
@@ -3594,6 +3727,33 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+    }
+
+    /// Stop ends the session and closes the PC to clients; the supervisor
+    /// then says why, and a HELLO2 hears it instead of Busy. A quit, which
+    /// no supervisor state follows, still turns it away with Busy.
+    #[test]
+    fn a_stop_is_answered_with_why_not_busy() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        session.shut_down(now, StreamStop::Quit);
+        let busy = pair_send(
+            &mut session,
+            &config,
+            addr([192, 0, 2, 1], 50000),
+            paired_hello(1, FEATURE_STANDBY_STATUS),
+            now,
+        );
+        assert_eq!(pair_ack(&busy).status, HelloStatus::Busy);
+        session.shut_down(now, StreamStop::User);
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Stopped,
+            paired_hello(2, FEATURE_STANDBY_STATUS),
+        ));
+        assert_eq!(ack.status, HelloStatus::Stopped);
     }
 
     #[test]
