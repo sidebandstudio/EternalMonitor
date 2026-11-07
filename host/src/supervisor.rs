@@ -78,6 +78,11 @@ const STORM_LIMIT: usize = 6;
 /// nothing about whether a stage is wedged.
 const WATCH_GAP_MS: u64 = 2_000;
 
+/// After such a gap the stages get this long before the watchdog judges
+/// them. Waking displays and drivers can hold capture for seconds while
+/// nothing is wrong; a stage still silent after it is restarted then.
+const WAKE_GRACE_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
     Running {
@@ -124,6 +129,8 @@ pub struct Machine {
     attempt: u32,
     /// When the watchdog last looked at the live generation's heartbeats.
     watched_ms: Option<u64>,
+    /// When the watchdog last found such a gap, during [`WAKE_GRACE_MS`].
+    woke_ms: Option<u64>,
 }
 
 impl Machine {
@@ -135,6 +142,7 @@ impl Machine {
             restarts: Vec::new(),
             attempt: 0,
             watched_ms: None,
+            woke_ms: None,
         }
     }
 
@@ -278,6 +286,7 @@ impl Machine {
         self.state = SupervisorState::Running { generation };
         // Joining the old generation can take seconds; that is no sleep.
         self.watched_ms = None;
+        self.woke_ms = None;
     }
 
     /// A successful stretch of running clears the failure budget.
@@ -471,13 +480,14 @@ pub(crate) fn wedge_reason_at(
 ) -> Option<String> {
     if !matches!(machine.state, SupervisorState::Running { .. }) {
         machine.watched_ms = None;
+        machine.woke_ms = None;
         return None;
     }
     // After a sleep the first look can come before any stage has run again,
     // and every heartbeat looks as old as the sleep: 7 of 10 "capture loop
     // silent" restarts in the field were PCs waking after 3 min to 3.5 h.
-    // Give the stages a fresh window instead; a real wedge still shows 3 s
-    // later.
+    // Give the stages a fresh window instead, with a grace while the
+    // displays wake; a real wedge still shows when the grace ends.
     let last_look = machine.watched_ms.replace(now_ms);
     if let Some(gap_ms) = last_look
         .map(|last| now_ms.saturating_sub(last))
@@ -496,7 +506,14 @@ pub(crate) fn wedge_reason_at(
                 beat.store(now_ms, Ordering::Relaxed);
             }
         }
+        machine.woke_ms = Some(now_ms);
         return None;
+    }
+    if let Some(woke_ms) = machine.woke_ms {
+        if now_ms.saturating_sub(woke_ms) < WAKE_GRACE_MS {
+            return None;
+        }
+        machine.woke_ms = None;
     }
     let loop_ms = shared.hb_capture_loop_ms.load(Ordering::Relaxed);
     let frame_ms = shared.hb_capture_frame_ms.load(Ordering::Relaxed);
@@ -917,12 +934,21 @@ mod tests {
         // Asleep: no thread runs, the clock moves on two hours.
         now_ms += 2 * 3600 * 1000;
         assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
-        now_ms += 250;
-        beat(now_ms);
-        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        // The displays wake slowly: capture is stuck in a driver call for
+        // 6 s, then runs again. No restart.
+        let woke = now_ms;
+        while now_ms < woke + 6_000 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        while now_ms < woke + 12_000 {
+            now_ms += 250;
+            beat(now_ms);
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
 
-        // A real wedge after waking is still caught when it was before: the
-        // capture loop stops 3 s later.
+        // A real wedge once awake is caught as before: 3 s after the capture
+        // loop stops.
         let stuck = now_ms;
         while now_ms < stuck + 3_000 {
             now_ms += 250;
@@ -934,7 +960,8 @@ mod tests {
             Some("capture loop silent for 3250ms".into())
         );
 
-        // A wedge that began just before the sleep shows 3 s after waking.
+        // A capture loop that never runs again after waking is restarted
+        // when the grace ends.
         let mut machine = Machine::new(2);
         beat(now_ms);
         assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
@@ -943,12 +970,15 @@ mod tests {
         now_ms += 3600 * 1000;
         assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
         let woke = now_ms;
-        while now_ms < woke + 3_000 {
+        while now_ms < woke + WAKE_GRACE_MS - 250 {
             now_ms += 250;
             assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
         }
         now_ms += 250;
-        assert!(wedge_reason_at(&shared, &mut machine, now_ms).is_some());
+        assert_eq!(
+            wedge_reason_at(&shared, &mut machine, now_ms),
+            Some("capture loop silent for 10000ms".into())
+        );
     }
 
     /// A restart joins the old generation for up to 5 s between two looks;
