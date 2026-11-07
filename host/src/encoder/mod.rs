@@ -174,20 +174,17 @@ fn run_encode_loop(
                 Some(frame) => frame,
                 None => break,
             },
-            Some(owed) => match frames.take_within(KEYFRAME_FLUSH_WAIT) {
-                Taken::Frame(frame) => frame,
-                Taken::Closed => break,
-                Taken::Nothing => match owed.again() {
-                    Some(frame) => frame,
-                    None => {
-                        info!(
-                            given = owed.given,
-                            "The encoder still holds the session's first keyframe; waiting for the next capture"
-                        );
-                        owed_keyframe = None;
-                        continue;
-                    }
-                },
+            Some(owed) => match owed.next(&frames) {
+                Next::Frame(frame) => frame,
+                Next::Closed => break,
+                Next::GaveUp => {
+                    info!(
+                        given = owed.given,
+                        "The encoder still holds the session's first keyframe; waiting for the next capture"
+                    );
+                    owed_keyframe = None;
+                    continue;
+                }
             },
         };
         if !shared.running.load(Ordering::SeqCst)
@@ -655,10 +652,13 @@ fn run_encode_loop(
             }
         }
         owed_keyframe = match picture {
-            Some(picture) if !keyframe_out => Some(OwedKeyframe {
-                picture,
-                given: owed_keyframe.map_or(0, |owed| owed.given),
-            }),
+            Some(picture) if !keyframe_out => {
+                let mut owed = owed_keyframe
+                    .take()
+                    .unwrap_or_else(|| OwedKeyframe::until(Instant::now() + KEYFRAME_FLUSH_FOR));
+                owed.picture = Some(picture);
+                Some(owed)
+            }
             _ => None,
         };
     }
@@ -1689,31 +1689,64 @@ pub fn holds_last_frame(encoder_name: &str) -> bool {
 /// again, to bring out a session's first keyframe. It is about one frame at
 /// 60 fps, and longer than AMF takes to encode one.
 const KEYFRAME_FLUSH_WAIT: Duration = Duration::from_millis(20);
-/// How many times the last picture is given again before the keyframe is
-/// left to capture's next picture: 500 ms, as an AMD driver can take a few
-/// hundred to encode a fresh session's first frame, and capture's keepalive
-/// follows at 750 ms.
-const KEYFRAME_FLUSHES: u32 = 25;
+/// How long after the keyframe went in the last picture is given again,
+/// before the keyframe is left to capture's next picture: an AMD driver can
+/// take a few hundred ms to encode a fresh session's first frame, and
+/// capture's keepalive follows at 750 ms.
+const KEYFRAME_FLUSH_FOR: Duration = Duration::from_millis(500);
 
 /// A session's first keyframe still inside an encoder that holds its last
 /// frame, and the picture to give it again.
 struct OwedKeyframe {
-    picture: RawFrame,
+    /// The last picture encoded. It pins one of capture's few buffers.
+    picture: Option<RawFrame>,
+    /// When the picture stops being given again.
+    until: Instant,
     given: u32,
 }
 
+/// What the encode loop encodes next while a keyframe is owed.
+enum Next {
+    Frame(RawFrame),
+    Closed,
+    /// The deadline passed: capture's next picture brings the keyframe out.
+    GaveUp,
+}
+
 impl OwedKeyframe {
-    fn again(&mut self) -> Option<RawFrame> {
-        if self.given >= KEYFRAME_FLUSHES {
-            return None;
+    fn until(until: Instant) -> Self {
+        Self {
+            picture: None,
+            until,
+            given: 0,
         }
-        self.given += 1;
-        debug!(
-            frame = self.picture.frame_number,
-            given = self.given,
-            "Giving the encoder its last picture again to bring out the keyframe"
-        );
-        Some(self.picture.clone())
+    }
+
+    /// Capture's next picture if one arrives within [`KEYFRAME_FLUSH_WAIT`],
+    /// else the last picture again, until the deadline.
+    fn next(&mut self, frames: &FrameSlot) -> Next {
+        let wait = KEYFRAME_FLUSH_WAIT.min(self.until.saturating_duration_since(Instant::now()));
+        match frames.take_within(wait) {
+            // The newer picture replaces the kept one, which is let go before
+            // the newer one is converted: capture has no buffer to spare.
+            Taken::Frame(frame) => {
+                self.picture = None;
+                Next::Frame(frame)
+            }
+            Taken::Closed => Next::Closed,
+            Taken::Nothing => match self.picture.take() {
+                Some(picture) if Instant::now() < self.until => {
+                    self.given += 1;
+                    debug!(
+                        frame = picture.frame_number,
+                        given = self.given,
+                        "Giving the encoder its last picture again to bring out the keyframe"
+                    );
+                    Next::Frame(picture)
+                }
+                _ => Next::GaveUp,
+            },
+        }
     }
 }
 
@@ -4666,6 +4699,57 @@ mod tests {
         let mut pending = true;
         assert!(take_keyframe_request(&mut pending, "libx264", 10));
         assert!(!pending);
+    }
+
+    fn raw(frame_number: u64, data: &std::sync::Arc<Vec<u8>>) -> RawFrame {
+        RawFrame {
+            frame_number,
+            timestamp: Instant::now(),
+            data: std::sync::Arc::clone(data),
+            width: 2,
+            height: 2,
+        }
+    }
+
+    /// Capture recycles three buffers, and the mailbox may hold one while the
+    /// encoder works on another. A kept picture that outlived a newer capture
+    /// took the third: the synthetic source found no free buffer and panicked.
+    #[test]
+    fn a_newer_capture_releases_the_kept_picture_before_it_is_encoded() {
+        let (producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let newer = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(5));
+        owed.picture = Some(raw(1, &kept));
+        producer.publish(raw(2, &newer));
+        let Next::Frame(frame) = owed.next(&consumer) else {
+            panic!("no frame");
+        };
+        assert_eq!(frame.frame_number, 2);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the kept picture still pins a capture buffer while the newer one is encoded"
+        );
+    }
+
+    #[test]
+    fn the_kept_picture_is_given_again_only_until_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_millis(60));
+        owed.picture = Some(raw(1, &kept));
+        let started = Instant::now();
+        let Next::Frame(frame) = owed.next(&consumer) else {
+            panic!("the picture was not given again");
+        };
+        assert_eq!(frame.frame_number, 1);
+        assert!(started.elapsed() >= KEYFRAME_FLUSH_WAIT);
+        // The loop keeps the picture again after encoding it.
+        owed.picture = Some(frame);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(matches!(owed.next(&consumer), Next::GaveUp));
+        assert_eq!(owed.given, 1);
     }
 
     #[test]
