@@ -1527,3 +1527,126 @@ fn pair_again_never_strands_the_session_that_reached_the_ceiling() {
     assert_eq!(sim.commits().len(), 1);
     assert!(sim.both_live_on_same_session());
 }
+
+/// A previously live client, now disconnected, connects with another key.
+/// Its first attempt is confirming when it connects again, and the newer
+/// attempt fails. The intent must stay on the new key (not the key still
+/// remembered from the ended session), so the host's late commit of the
+/// first attempt is used.
+#[test]
+fn a_disconnected_client_switching_keys_keeps_the_intent_on_failure() {
+    let mut sim = Sim::new(140);
+    connect_live(&mut sim);
+    sim.disconnect();
+    sim.run_for(ms(500));
+    sim.latency = ms(300);
+    let other = ClientKey {
+        dev_id: [0x9B; 16],
+        k_dev: [0xB9; 32],
+    };
+    sim.store.keys.insert(other.dev_id, other.k_dev);
+    sim.policy.decision_delay = ms(1900);
+    sim.connect_with(other.clone());
+    assert!(sim.run_until(ms(2000), |s| s.client.is_confirming()));
+    // Every later message 1 is lost, so the newer attempt fails.
+    let since = sim.now;
+    sim.fault = Box::new(move |sent| match sent.kind {
+        Kind::Msg1 if sent.at > since => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.run_for(ms(50));
+    sim.connect_with(other.clone());
+    sim.run_for(Duration::from_secs(10));
+    assert!(sim
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadAttemptFailed { .. })));
+    let host = sim.host.live_session(&other.dev_id);
+    assert!(host.is_some(), "the late commit happened");
+    assert_eq!(sim.client.live_session(), host, "and the iPad uses it");
+}
+
+/// Genuine old message 1s, replayed hundreds of times from spoofed sources
+/// right before each of a fresh connect's copies, never starve it: replays
+/// that only earn a Stale answer never reach the handshake budget. There are
+/// more of them than the device's Stale budget answers in a second, so most
+/// get no answer; those are remembered, and their replays cost no crypto.
+#[test]
+fn genuine_replayed_message_1s_never_starve_a_fresh_connect() {
+    let mut sim = Sim::new(141);
+    for _ in 0..31 {
+        connect_live(&mut sim);
+    }
+    // The message 1s of the superseded sessions: genuine, and stale.
+    let old: Vec<Vec<u8>> = sim
+        .sent_of(Dir::ToHost, Kind::Msg1)
+        .iter()
+        .map(|s| s.datagram.clone())
+        .collect::<Vec<_>>();
+    let mut distinct: Vec<Vec<u8>> = Vec::new();
+    for m in old {
+        if !distinct.contains(&m) {
+            distinct.push(m);
+        }
+    }
+    let replays: Vec<Vec<u8>> = distinct.into_iter().take(30).collect();
+    assert_eq!(replays.len(), 30);
+    // A fresh connect: no live session, so no reserved budget either.
+    sim.disconnect();
+    sim.run_for(ms(200));
+    let mut round = 0u16;
+    let ok = connect_behind_bursts(&mut sim, |sim| {
+        for msg1 in &replays {
+            for i in 0..210u16 {
+                let source = SimAddr {
+                    ip: 3000 + (round * 7 + i) % 1000,
+                    port: 1,
+                };
+                sim.inject_from(source, msg1);
+            }
+        }
+        round += 1;
+    });
+    assert!(ok);
+}
+
+/// Forged message 1s from the live address above its 2,000/s pre-crypto
+/// cap: the iPad's own copy past the cap falls back to the per-source path
+/// instead of being dropped.
+#[test]
+fn past_the_live_address_cap_the_reconnect_falls_back_to_the_per_source_path() {
+    let mut sim = Sim::new(142);
+    connect_live(&mut sim);
+    let forged = forged_for(&sim.key.dev_id, 100);
+    let ok = connect_behind_bursts(&mut sim, |sim| {
+        for i in 0..2010 {
+            sim.inject_from(IPAD, &forged[i % forged.len()]);
+        }
+    });
+    assert!(ok);
+}
+
+/// The iPad's first message 1 is lost on its way, and an attacker who saw
+/// it replays it from 20 spoofed sources first, taking every per-source
+/// message 2 slot. The iPad's own retries still get message 2 through the
+/// shared overflow allowance.
+#[test]
+fn spoofed_copies_taking_every_message_2_slot_never_lock_the_ipad_out() {
+    let mut sim = Sim::new(143);
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Msg1 if sent.nth == 0 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    let first = sim.sent_of(Dir::ToHost, Kind::Msg1)[0].datagram.clone();
+    for i in 0..20u16 {
+        sim.inject_from(
+            SimAddr {
+                ip: 4000 + i,
+                port: 1,
+            },
+            &first,
+        );
+    }
+    assert!(sim.run_until(Duration::from_secs(3), |s| s.both_live_on_same_session()));
+}

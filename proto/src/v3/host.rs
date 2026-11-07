@@ -320,8 +320,11 @@ struct PendingSession<A: PeerAddr> {
     msg1_key: Digest,
     msg2: Vec<u8>,
     /// When the cached message 2 last went to each source. Each source has
-    /// its own allowance; sources beyond the capacity get nothing.
+    /// its own allowance; sources beyond the capacity share one.
     msg2_sent: BoundedTimes<<A as PeerAddr>::Bucket>,
+    /// When the shared allowance for sources beyond the capacity was last
+    /// used.
+    msg2_overflow_sent: Option<Duration>,
     deadline: Duration,
     timestamp_us: u64,
     hello: HelloPayload,
@@ -655,7 +658,9 @@ impl<A: PeerAddr> HostSessions<A> {
         self.msg1_reads
     }
 
-    /// Authenticated message 1s answered so far.
+    /// Diffie-Hellman operations performed so far: one per message 2
+    /// written, whether it accepts or answers `Stale`, `TooNew` or
+    /// `PairAgain`.
     pub fn handshakes_performed(&self) -> u64 {
         self.dh_performed
     }
@@ -745,14 +750,29 @@ impl<A: PeerAddr> HostSessions<A> {
                 // A retry of the message 1 that made this pending session:
                 // the cached message 2 again. Each source has its own 100 ms
                 // allowance, whichever sent first; sources beyond
-                // MAX_MSG2_SOURCES get nothing.
-                let due = p
-                    .msg2_sent
-                    .get(&bucket)
-                    .map_or(!p.msg2_sent.is_full(), |t| {
-                        now.saturating_sub(t) >= resend_interval
-                    });
-                if due && p.msg2_sent.insert(bucket, now) {
+                // MAX_MSG2_SOURCES share one more.
+                let send = match p.msg2_sent.get(&bucket) {
+                    Some(t) => {
+                        let due = now.saturating_sub(t) >= resend_interval;
+                        if due {
+                            p.msg2_sent.insert(bucket.clone(), now);
+                        }
+                        due
+                    }
+                    None if !p.msg2_sent.is_full() => p.msg2_sent.insert(bucket.clone(), now),
+                    None => {
+                        // The table is full: new sources share one allowance,
+                        // so 16 spoofed copies can't lock the iPad out.
+                        let due = p
+                            .msg2_overflow_sent
+                            .is_none_or(|t| now.saturating_sub(t) >= resend_interval);
+                        if due {
+                            p.msg2_overflow_sent = Some(now);
+                        }
+                        due
+                    }
+                };
+                if send {
                     out.push(HostOutput::Send {
                         to: from.clone(),
                         datagram: p.msg2.clone(),
@@ -799,14 +819,18 @@ impl<A: PeerAddr> HostSessions<A> {
                 .as_ref()
                 .is_some_and(|l| l.peer.rate_bucket() == bucket)
         });
-        // Before authentication: cheap per-source limits only.
+        // Before authentication: cheap per-source limits only. Past the
+        // live address's own cap, it falls back to the shared per-source
+        // path rather than being dropped.
+        let mut reserved = reserved;
         if reserved {
             let cap = self.config.reserved_precrypto_per_second;
             let device = self.devices.get_mut(&dev_id).expect("has a live session");
             if !device.reserved_precrypto.allow(now, cap) {
-                return;
+                reserved = false;
             }
-        } else if !self.msg1_rate.allow(now, &bucket) {
+        }
+        if !reserved && !self.msg1_rate.allow(now, &bucket) {
             return;
         }
         let has_pending = self
@@ -821,20 +845,11 @@ impl<A: PeerAddr> HostSessions<A> {
             return;
         };
         drop(k_dev);
-        // Authenticated: now the budgets that forged message 1s must never
-        // reach. Answering costs a Diffie-Hellman.
-        if reserved {
-            let limit = self.config.msg1_per_second;
-            let device = self.devices.get_mut(&dev_id).expect("has a live session");
-            if !device.reserved.allow(now, limit) {
-                return;
-            }
-        } else if !self.dh_budget.allow(now, self.config.dh_per_second) {
-            return;
-        }
-        self.dh_performed += 1;
+        // Authenticated. The answer is decided first; each kind of answer
+        // has its own budget, charged only on its own path.
         let timestamp_us = responder.payload().timestamp_us;
         if timestamp_us >= MAX_TIMESTAMP_US {
+            self.remember_answered(now, key);
             return;
         }
         let committed = creds.last_committed_timestamp(&dev_id).max(
@@ -863,14 +878,30 @@ impl<A: PeerAddr> HostSessions<A> {
         }
         if let Some(p) = self.devices.get(&dev_id).and_then(|d| d.pending.as_ref()) {
             if timestamp_us <= p.timestamp_us {
-                // A late copy from an older attempt.
+                // A late copy from an older attempt: no answer, and its
+                // replays cost no crypto from now on.
+                self.remember_answered(now, key);
                 return;
             }
+        }
+        // A new pending session: only now the budgets that genuine replays
+        // and forged message 1s must never reach. Answering costs a
+        // Diffie-Hellman. A refusal here isn't remembered, so the iPad's
+        // identical retry gets through once the budget allows.
+        if reserved {
+            let limit = self.config.msg1_per_second;
+            let device = self.devices.get_mut(&dev_id).expect("has a live session");
+            if !device.reserved.allow(now, limit) {
+                return;
+            }
+        } else if !self.dh_budget.allow(now, self.config.dh_per_second) {
+            return;
         }
         let hello = responder.payload().clone();
         let session_id = self.allocate_session_id();
         let mut accept = creds.accept_template(&dev_id);
         accept.session_id = session_id;
+        self.dh_performed += 1;
         let Ok((msg2, Some(keys))) = responder.write_msg2(&Msg2Payload::Accept(accept)) else {
             return;
         };
@@ -890,6 +921,7 @@ impl<A: PeerAddr> HostSessions<A> {
                 sent.insert(bucket, now);
                 sent
             },
+            msg2_overflow_sent: None,
             deadline: now + self.config.pending_lifetime,
             timestamp_us,
             hello,
@@ -924,8 +956,12 @@ impl<A: PeerAddr> HostSessions<A> {
         }
         let limit = self.config.stale_per_second;
         if !self.stale_budget(dev_id, now).window.allow(now, limit) {
+            // Over the dev_id's budget: no answer, but remembered, so its
+            // replays cost no crypto.
+            self.remember_answered(now, key);
             return;
         }
+        self.dh_performed += 1;
         let Ok((msg2, _)) = responder.write_msg2(reply) else {
             return;
         };
@@ -941,14 +977,25 @@ impl<A: PeerAddr> HostSessions<A> {
             origin,
             until,
         });
-        // Always queued, also when replacing an expired entry for the same
-        // message 1, so every entry expires.
-        self.answered.insert(key, until);
-        self.answered_order.push_back((key, until));
+        self.remember_answered(now, key);
         out.push(HostOutput::Send {
             to: from.clone(),
             datagram: msg2,
         });
+    }
+
+    /// Remembers an authenticated message 1 for 30 s, so its replays are
+    /// dropped before any crypto. Always queued, also when replacing an
+    /// expired entry for the same message 1, so every entry expires. When
+    /// the table is full of unexpired entries, nothing is evicted.
+    fn remember_answered(&mut self, now: Duration, key: Digest) {
+        self.expire_answered(now);
+        if self.answered.len() >= MAX_ANSWERED_MSG1 && !self.answered.contains_key(&key) {
+            return;
+        }
+        let until = now + self.config.expired_msg1_lifetime;
+        self.answered.insert(key, until);
+        self.answered_order.push_back((key, until));
     }
 
     fn handle_record(
@@ -2203,9 +2250,8 @@ mod tests {
             })
             .sum();
         assert_eq!(
-            replies,
-            MAX_MSG2_SOURCES - 1,
-            "16 sources per pending session"
+            replies, MAX_MSG2_SOURCES,
+            "the 15 other slots of 16, plus one shared overflow reply per 100 ms"
         );
         assert_eq!(
             sends(&host.handle_datagram(T0 + ms(150), &1, ipad.msg1(), &creds)).len(),
@@ -2384,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn spoofing_the_live_address_never_drains_its_reserved_budget() {
+    fn spoofing_the_live_address_below_its_cap_never_drains_its_reserved_budget() {
         let (mut host, creds) = setup();
         live(&mut host, &creds, 10, T0);
         // Forged message 1s for this dev_id from the live address itself.
