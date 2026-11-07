@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
+use crate::transport::session::{StageFailure, StreamStop};
 
 /// The current pipeline generation. Stage health reports carry the generation
 /// they belong to; anything from an older generation is ignored (a "poisoned"
@@ -88,6 +89,8 @@ pub enum SupervisorState {
     /// Too many automatic restarts in the window; a manual Start is required.
     Failed {
         reason: String,
+        /// The stage that kept failing (a wedge counts as capture).
+        stage: Stage,
     },
     Stopped,
     ShutDown,
@@ -222,7 +225,10 @@ impl Machine {
                 STORM_WINDOW.as_secs()
             );
             error!("{message} — giving up until a manual Start");
-            self.state = SupervisorState::Failed { reason: message };
+            self.state = SupervisorState::Failed {
+                reason: message,
+                stage,
+            };
             return Effect::StopPipeline;
         }
         self.restarts.push(now);
@@ -327,10 +333,14 @@ pub fn run(
         machine.wait_for_port(Instant::now() + crate::startup::port::RECHECK);
     }
     let mut healthy_since = Instant::now();
+    let mut transport_watch = crate::transport::beat::Watch::default();
 
     loop {
         let message = sup_rx.recv_timeout(Duration::from_millis(250));
         let now = Instant::now();
+        // A stuck transport stays in its generation's thread, which no join
+        // can end: this line says where it is stuck.
+        transport_watch.check_and_log(&shared.transport_beat, crate::clock::host_now_us() / 1000);
 
         // A minute of health clears the storm budget.
         if matches!(machine.state, SupervisorState::Running { .. })
@@ -363,7 +373,7 @@ pub fn run(
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
-                shared.stop();
+                stop_pipeline(&shared, &machine.state);
                 bounded_join(&mut pipeline, generation);
             }
             Effect::Restart | Effect::Start => {
@@ -427,6 +437,37 @@ fn take_late_detection(gpu: &mut GpuInfo, late: impl FnOnce() -> Option<GpuInfo>
     );
     *gpu = found;
     true
+}
+
+/// Stops the pipeline that the machine stopped in `state`, first ending the
+/// session as [`stop_when_stopped`] says: its goodbye goes out with the
+/// transport, which runs until it sees `running` false.
+fn stop_pipeline(shared: &SharedControl, state: &SupervisorState) {
+    if let Some(why) = stop_when_stopped(state) {
+        crate::diagnostics::stop_session(shared, why);
+    }
+    shared.stop();
+}
+
+/// How a session ends when the pipeline stops in `state`. Stopped and
+/// Failed wait for a manual Start, so the session ends now: kept, it went on
+/// unanswered while its iPad lost the signal and every HELLO it sent went
+/// unanswered. Stop says the PC ended the session; giving up says connect
+/// again, and names the stage in the summary. A backoff or a held port
+/// restarts the stream by itself, and its session goes on.
+fn stop_when_stopped(state: &SupervisorState) -> Option<StreamStop> {
+    match state {
+        SupervisorState::Stopped => Some(StreamStop::User),
+        SupervisorState::Failed { stage, .. } => Some(StreamStop::GaveUp(match stage {
+            Stage::Capture => StageFailure::Capture,
+            Stage::Encoder => StageFailure::Encoder,
+            Stage::Transport | Stage::Audio => StageFailure::Other,
+        })),
+        SupervisorState::Running { .. }
+        | SupervisorState::BackingOff { .. }
+        | SupervisorState::WaitingForPort { .. }
+        | SupervisorState::ShutDown => None,
+    }
 }
 
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
@@ -686,6 +727,111 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Stop and giving up wait for a manual Start: their session ends with
+    /// a goodbye. A stream that restarts by itself keeps its session.
+    #[test]
+    fn only_a_stop_that_waits_for_start_ends_the_session() {
+        use crate::transport::link::PeerId;
+        use crate::transport::session::ConfigSource;
+        use eternal_wire::v2::control::{
+            parse_control, ByeReason, ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264,
+        };
+        struct Config;
+        impl ConfigSource for Config {
+            fn stream_config(&self) -> StreamConfig {
+                StreamConfig {
+                    stream_epoch: 1,
+                    width: 1280,
+                    height: 720,
+                    fps: 60,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 10_000_000,
+                }
+            }
+            fn host_name(&self) -> String {
+                "TEST-HOST".into()
+            }
+        }
+        // Stops the pipeline as the run loop does, with an iPad streaming,
+        // and returns the goodbye left for the transport to send.
+        let stop = |state: &SupervisorState| {
+            let shared = SharedControl::new(19899, 10_000_000);
+            shared.pairing.lock().required = false;
+            shared.running.store(true, Ordering::SeqCst);
+            let peer = PeerId::udp("127.0.0.1:19898".parse().unwrap());
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 1,
+                listen_port: 19898,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps: 0,
+                screen_px_w: 1280,
+                screen_px_h: 720,
+                screen_pt_w: 1280,
+                screen_pt_h: 720,
+                refresh_hz: 60,
+                device_name: "stop test".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            shared
+                .session
+                .lock()
+                .handle_control(peer, 0, hello, &Config, Instant::now());
+            stop_pipeline(&shared, state);
+            assert!(!shared.running.load(Ordering::SeqCst));
+            let goodbye = shared.session.lock().take_goodbye();
+            let ended = !shared.client_connected();
+            goodbye.map(|(to, bytes)| {
+                assert_eq!(to, peer);
+                assert!(ended, "a goodbye ends the session");
+                match parse_control(&bytes) {
+                    Ok((_, ControlMessage::Bye(reason))) => reason,
+                    other => panic!("not a goodbye: {other:?}"),
+                }
+            })
+        };
+
+        let mut machine = Machine::new(1);
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(stop(&machine.state), Some(ByeReason::UserDisconnect));
+
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        let mut effect = Effect::None;
+        for _ in 0..=STORM_LIMIT {
+            effect = machine.on_stage_exit(1, Stage::Encoder, &failed("x"), t0);
+            if let SupervisorState::BackingOff { .. } = machine.state {
+                assert_eq!(stop(&machine.state), None, "a backoff keeps the session");
+                machine.note_started(1);
+            }
+        }
+        assert_eq!(effect, Effect::StopPipeline);
+        assert!(matches!(
+            machine.state,
+            SupervisorState::Failed {
+                stage: Stage::Encoder,
+                ..
+            }
+        ));
+        assert_eq!(
+            stop_when_stopped(&machine.state),
+            Some(StreamStop::GaveUp(StageFailure::Encoder))
+        );
+        assert_eq!(stop(&machine.state), Some(ByeReason::Error));
+
+        let mut machine = Machine::new(1);
+        machine.wait_for_port(t0);
+        assert_eq!(stop(&machine.state), None, "a held port keeps the session");
     }
 
     fn failed(reason: &str) -> StageOutcome {

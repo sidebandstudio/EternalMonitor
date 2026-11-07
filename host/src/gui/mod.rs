@@ -795,7 +795,7 @@ impl AnalyzerApp {
         {
             let mut pairing = self.control.shared.pairing.lock();
             pairing.required = required;
-            pairing.warn_if_off();
+            pairing.log_if_off();
         }
         self.persist_settings();
     }

@@ -4,7 +4,7 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|error-local-network|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked|setup|setup-blocked`.
+/// `EM_UI_PREVIEW=display|quality|restoring|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|error-local-network|error-wifi-off|mismatch|pairing|settings|settings-about|feedback|recent|searchFailed|searchBlocked|setup|setup-blocked`.
 /// `setup` opens first-run setup whatever the saved state (launch with
 /// `-didSeeOnboarding NO`); `setup-blocked` also fails its search as if
 /// Local Network were off.
@@ -12,7 +12,7 @@ import SwiftUI
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
-    static var showsBackdrop: Bool { mode == "display" || mode == "quality" || mode == "restoring" }
+    static var showsBackdrop: Bool { mode == "display" || mode == "quality" || mode == "restoring" || mode == "locked" }
     static var opensQuality: Bool { mode == "quality" }
     static var opensSettings: Bool { mode == "settings" || mode == "settings-about" }
     /// Scrolls Settings to Support and About.
@@ -46,6 +46,10 @@ enum UIPreview {
             manager.transportMode = "WiFi"
             manager.state = .connected
             manager.pictureRestoring = true
+        case "locked":
+            manager.transportMode = "WiFi"
+            manager.state = .connected
+            manager.pcLocked = true
         case "connecting":
             manager.state = .connecting
         case "error":
@@ -60,6 +64,8 @@ enum UIPreview {
             manager.problem = .pcUpdating(.reconnecting)
         case "error-local-network":
             manager.problem = .localNetworkBlocked
+        case "error-wifi-off":
+            manager.problem = .wifiOff
         case "mismatch":
             manager.versionMismatch = .iPadOlder
             manager.connectionError = VersionMismatch.iPadOlder.message

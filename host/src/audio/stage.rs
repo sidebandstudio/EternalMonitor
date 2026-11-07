@@ -708,6 +708,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Captured(writer.clone()))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, run);
         let text = String::from_utf8_lossy(&buffer.lock()).into_owned();
         text

@@ -40,6 +40,11 @@ use tracing::warn;
 
 use crate::control::{CaptureTarget, SharedControl, VddStatus};
 use crate::gpu_preference::AdapterId;
+pub(crate) use memory::PANEL_LOST;
+
+/// The Stream page's reason for a lost panel from before the last restart:
+/// the panel is back, and Second screen only waits to be chosen again.
+pub(crate) const PANEL_LOST_BEFORE: &str = "panel_lost_before";
 use memory::{Hold, Memory};
 
 #[cfg(any(windows, test, debug_assertions))]
@@ -171,6 +176,8 @@ pub(crate) struct State {
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
     memory: Memory,
+    /// This app run's Enable took the built-in panel away.
+    panel_lost_this_run: bool,
     /// Windows refused the mirror's screen from the card EternalMonitor
     /// captures on, which the display configuration then wired to another
     /// card: see [`note_mirror_refused`].
@@ -225,8 +232,12 @@ impl State {
         }
         match *status {
             VddStatus::WaitingForClient if connected => {
-                let hold = if blocked {
-                    if let Some(hold) = self.memory.hold(now) {
+                let held = self.memory.hold(now);
+                // A blocked mirror is no reason to take the panel again.
+                let hold = if held.is_some_and(|hold| hold.until_chosen) {
+                    held
+                } else if blocked {
+                    if let Some(hold) = held {
                         tracing::info!(
                             reason = hold.reason,
                             failures = hold.failures,
@@ -236,9 +247,7 @@ impl State {
                     }
                     None
                 } else {
-                    self.memory
-                        .hold(now)
-                        .or_else(|| self.memory.hold_for_rule(now))
+                    held.or_else(|| self.memory.hold_for_rule(now))
                 };
                 if let Some(hold) = hold {
                     *status = VddStatus::Failed;
@@ -368,6 +377,21 @@ impl State {
         }
     }
 
+    /// The display took the built-in panel away: save that until Second
+    /// screen is chosen again. Neither a blocked mirror nor a withheld
+    /// desktop excuses it, since trying again takes the panel again.
+    fn remember_panel_lost(&mut self, now: Instant) {
+        self.clear_blocked_retry();
+        if let Some(hold) = self.memory.note_failure(PANEL_LOST, now) {
+            tracing::info!(
+                reason = PANEL_LOST,
+                failures = hold.failures,
+                "Remembering that the second screen took the built-in screen away on this PC — \
+                 Second screen sessions mirror until Second screen is chosen again"
+            );
+        }
+    }
+
     /// [`desktop_away`], or what the fake display an end-to-end test
     /// installed says.
     fn desktop_away(&self) -> bool {
@@ -443,6 +467,16 @@ pub(crate) fn proving(shared: &SharedControl) -> bool {
 /// The one log line for a connection that mirrors because the second screen
 /// failed on this PC before. Diagnostics count `second_screen_fallback=remembered`.
 fn log_hold(hold: Hold) {
+    if hold.until_chosen {
+        tracing::info!(
+            second_screen_fallback = "remembered",
+            reason = hold.reason,
+            failures = hold.failures,
+            "The second screen took the built-in screen away on this PC before — mirroring the \
+             primary display until Second screen is chosen again, or the user clicks Try again"
+        );
+        return;
+    }
     tracing::info!(
         second_screen_fallback = "remembered",
         reason = hold.reason,
@@ -473,6 +507,8 @@ pub fn load_memory(shared: &SharedControl) {
         Instant::now(),
     );
     memory.set_rule(rule, dir.join(memory::RULE_FILE_NAME));
+    let uptime = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } / 1000;
+    memory.set_boot(wall.saturating_sub(uptime));
     shared.second_screen.lock().memory = memory;
     #[cfg(not(test))]
     display_power::watch();
@@ -489,7 +525,8 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
     // The mirror would show nothing: the second screen is the only picture.
-    if *status == VddStatus::Failed && blocked {
+    // Not after a lost panel: the next try takes it again.
+    if *status == VddStatus::Failed && blocked && state.failure != Some(PANEL_LOST) {
         let reason = state.failure.unwrap_or("attach_timeout");
         if let Some(at) = state.blocked_retry_at.filter(|at| now < *at) {
             tracing::info!(
@@ -543,7 +580,9 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
 pub(crate) fn retries_later(shared: &SharedControl) -> bool {
     let status = *shared.vdd_status.lock();
     let state = shared.second_screen.lock();
-    status == VddStatus::Failed && (state.memory.saved() || state.retry_blocked)
+    status == VddStatus::Failed
+        && state.failure != Some(PANEL_LOST)
+        && (state.memory.saved() || state.retry_blocked)
 }
 
 /// Windows refused to duplicate the mirror's `screen` from `card`, the card
@@ -668,6 +707,18 @@ pub(crate) fn remembered_failure(shared: &SharedControl) -> Option<&'static str>
         VddStatus::TaskFailed => Some(failure.unwrap_or("enable_failed")),
         _ => None,
     }
+}
+
+/// [`remembered_failure`] for the Stream page's notice, where a lost panel
+/// from before the last restart is [`PANEL_LOST_BEFORE`]: only one that is
+/// still off asks for a restart.
+pub(crate) fn notice_failure(shared: &SharedControl) -> Option<&'static str> {
+    let failure = remembered_failure(shared);
+    let state = shared.second_screen.lock();
+    if failure == Some(PANEL_LOST) && !state.panel_lost_this_run && !state.memory.panel_lost_now() {
+        return Some(PANEL_LOST_BEFORE);
+    }
+    failure
 }
 
 /// The user asked to try again: a failed start, or one whose thread is gone,
@@ -1296,11 +1347,32 @@ pub(crate) trait Driver {
     fn settle(&self, chosen: OutputInfo) -> OutputInfo {
         chosen
     }
+    /// After an Enable that worked: whether Windows put the desktop on the
+    /// display alone, so it will not attach beside the PC's screens. The
+    /// display guard has already tried to bring them back, unless the
+    /// display took the built-in panel away.
+    fn turned_on(&self) -> TurnedOn {
+        TurnedOn::Beside
+    }
     /// Say why the display did not appear or showed no picture, while it is
     /// still on.
     fn report(&self, _failure: Failure) {}
     fn now(&self) -> Instant;
     fn sleep(&self, duration: Duration);
+}
+
+/// How an Enable that worked left the PC's screens, for [`Driver::turned_on`].
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnedOn {
+    /// As usual: the display can attach beside them.
+    Beside,
+    /// Windows put the desktop on the display alone.
+    Alone,
+    /// On a hybrid laptop, the display took the built-in panel away until
+    /// the PC restarts (`crate::display_guard`). The desktop is on the
+    /// display, and turning it off would leave the PC with no screen.
+    PanelLost,
 }
 
 /// Why a second screen failed, for [`Driver::report`].
@@ -1407,13 +1479,19 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         return;
     }
     let waiting_since = driver.now();
-    let result = wait_for_virtual_output(
-        &before,
-        timeout,
-        || selected().then(|| driver.outputs()),
-        || driver.now(),
-        |duration| driver.sleep(duration),
-    );
+    // No wait for a display that can't attach.
+    let turned_on = driver.turned_on();
+    let result = if turned_on != TurnedOn::Beside {
+        AttachResult::TimedOut
+    } else {
+        wait_for_virtual_output(
+            &before,
+            timeout,
+            || selected().then(|| driver.outputs()),
+            || driver.now(),
+            |duration| driver.sleep(duration),
+        )
+    };
     #[cfg(windows)]
     let result = match result {
         AttachResult::Attached(_) if super::simulated_attach_timeout() => AttachResult::TimedOut,
@@ -1453,12 +1531,36 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 disable(shared, driver);
             }
         }
-        AttachResult::TimedOut => {
+        AttachResult::TimedOut if turned_on == TurnedOn::PanelLost => {
             warn!(
-                second_screen_fallback = "attach_timeout",
-                timeout_ms = timeout.as_millis() as u64,
-                "Virtual display did not attach in time — capturing the primary display instead"
+                second_screen_fallback = "panel_lost",
+                "The laptop's built-in screen went dark when the virtual display turned on — \
+                 leaving the display on and mirroring it, so the iPad shows the desktop"
             );
+            driver.report(Failure::AttachTimeout);
+            // No turn off: it would leave Windows with no screen at all.
+            let now = driver.now();
+            let mut status = shared.vdd_status.lock();
+            *status = VddStatus::Failed;
+            let mut state = shared.second_screen.lock();
+            state.failure = Some(PANEL_LOST);
+            state.panel_lost_this_run = true;
+            state.remember_panel_lost(now);
+        }
+        AttachResult::TimedOut => {
+            if turned_on == TurnedOn::Alone {
+                warn!(
+                    second_screen_fallback = "vdd_only",
+                    "Windows put the desktop on the virtual display alone — capturing the \
+                     primary display instead"
+                );
+            } else {
+                warn!(
+                    second_screen_fallback = "attach_timeout",
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Virtual display did not attach in time — capturing the primary display instead"
+                );
+            }
             driver.report(Failure::AttachTimeout);
             // Enable succeeded but nothing attached: turn it back off so no
             // half-enabled device lingers as a phantom monitor.
@@ -1469,6 +1571,8 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
             let mut state = shared.second_screen.lock();
+            // Alone too: the same notice and wait, in a record every
+            // version reads.
             state.failure = Some("attach_timeout");
             state.remember("attach_timeout", now, false, blocked);
             if blocked && copied {
@@ -1595,6 +1699,16 @@ impl Driver for WindowsDriver<'_> {
         chosen
     }
 
+    fn turned_on(&self) -> TurnedOn {
+        if crate::display_guard::last_turn_on_lost_panel() {
+            TurnedOn::PanelLost
+        } else if crate::display_guard::last_turn_on_alone() {
+            TurnedOn::Alone
+        } else {
+            TurnedOn::Beside
+        }
+    }
+
     fn report(&self, failure: Failure) {
         let request = self.request.borrow();
         let device = match failure {
@@ -1719,7 +1833,8 @@ mod tests {
     /// display attaches `attach_after` later, or never. `on_sleep` sees the
     /// clock each time the host waits, as the transport's ticks would.
     /// With `enable_fails`, the Enable task reports that instead. Setting
-    /// the mode after the attach takes `settle_takes`.
+    /// the mode after the attach takes `settle_takes`. `turned_on` says how the
+    /// Enable left the PC's screens.
     struct FakeDriver<'a> {
         start: Instant,
         elapsed: Cell<Duration>,
@@ -1730,6 +1845,7 @@ mod tests {
         toggles: RefCell<Vec<(Duration, bool)>>,
         on_sleep: &'a dyn Fn(Duration),
         enable_fails: Option<EnableReport>,
+        turned_on: TurnedOn,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -1749,6 +1865,7 @@ mod tests {
                 toggles: RefCell::new(Vec::new()),
                 on_sleep,
                 enable_fails: None,
+                turned_on: TurnedOn::Beside,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -1794,6 +1911,10 @@ mod tests {
             self.sleep(self.settle_takes);
             self.calls.borrow_mut().push(Call::Settle);
             chosen
+        }
+
+        fn turned_on(&self) -> TurnedOn {
+            self.turned_on
         }
 
         fn report(&self, failure: Failure) {
@@ -2948,6 +3069,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(move || Sink(Arc::clone(&writer)))
                 .finish();
+            crate::logging::prepare_log_capture();
             tracing::subscriber::with_default(subscriber, || {
                 attach(&shared, &driver, ATTACH_TIMEOUT)
             });
@@ -2976,6 +3098,67 @@ mod tests {
             assert_eq!(*shared.vdd_status.lock(), VddStatus::TaskFailed);
             assert_eq!(remembered_failure(&shared), Some("enable_failed"));
         }
+    }
+
+    /// The hybrid laptop: the Enable left the virtual display as the only
+    /// screen, and the display guard gave the panel back without it. The
+    /// start falls back to the mirror at once, with its own reason, instead
+    /// of waiting 30 s for a display that cannot attach; the failure is
+    /// remembered as a timeout's, with the same notice and wait.
+    #[test]
+    fn a_display_windows_left_alone_falls_back_at_once() {
+        use std::sync::Arc;
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        let on_sleep = |_| {};
+        // It would attach later, if it were waited for.
+        let driver = FakeDriver {
+            turned_on: TurnedOn::Alone,
+            ..FakeDriver::new(secs(7.0), Some(secs(1.0)), &on_sleep)
+        };
+        let out = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&out);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || attach(&shared, &driver, ATTACH_TIMEOUT));
+        let lines = String::from_utf8(out.lock().clone()).unwrap();
+        assert!(
+            lines.contains(
+                "Windows put the desktop on the virtual display alone — capturing the primary \
+                 display instead second_screen_fallback=\"vdd_only\""
+            ),
+            "{lines}"
+        );
+        assert!(!lines.contains("did not attach in time"), "{lines}");
+        assert_eq!(
+            driver.calls(),
+            [
+                Call::Prepare,
+                Call::Enable,
+                Call::Report(Failure::AttachTimeout),
+                Call::Disable
+            ]
+        );
+        // Turned off after the gap, not after the attach wait.
+        let toggles = driver.toggles.borrow().clone();
+        assert_eq!(toggles[1].0 - toggles[0].0, MIN_TOGGLE_GAP, "{toggles:?}");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(shared.vdd_output.lock().as_deref(), None);
+        assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
+        assert_eq!(next_step(&shared, driver.now()), Step::Nothing);
     }
 
     /// "Windows added the second screen but kept your desktop off it": the

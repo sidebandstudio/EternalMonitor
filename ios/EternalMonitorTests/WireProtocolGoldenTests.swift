@@ -35,9 +35,36 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 29,
+            Self.vectors.count, 32,
             "golden vector count drifted — update both test suites together"
         )
+    }
+
+    /// The identify request and its answer: nonce A0..AF, port 9876, two
+    /// addresses, and the proof of pairing token 01..10 over them, which the
+    /// iPad checks as the PC's own.
+    func testIdentifyAndIdentityVectors() throws {
+        let nonce = Data(0xA0...0xAF)
+        let request = try vector("identify")
+        let (requestHeader, asked) = try XCTUnwrap(Wire.parseControl(request))
+        XCTAssertEqual(asked, .identify(WireIdentify(version: 1, nonce: nonce)))
+        XCTAssertEqual(requestHeader.sessionId, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: asked), request)
+
+        let answer = try vector("identity")
+        XCTAssertEqual(answer.count, request.count, "never longer than the request")
+        let (_, message) = try XCTUnwrap(Wire.parseControl(answer))
+        guard case .identity(let identity) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(identity.nonce, nonce)
+        XCTAssertEqual(identity.port, 9876)
+        XCTAssertEqual(identity.addresses, [Data([192, 0, 2, 10]), Data([198, 51, 100, 10])])
+        XCTAssertEqual(identity.proof, MovedPC.proof(token: Data(1...16), nonce: nonce, port: 9876,
+                                                     addresses: identity.addresses))
+        // More addresses than fit are refused, never read past.
+        var five = answer
+        five[16 + 1 + 16 + 2] = 5
+        XCTAssertNil(Wire.parseControl(five))
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: message), answer)
     }
 
     func testPairingRejectionVectors() throws {
@@ -300,6 +327,23 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertEqual(hb.hostTimeUs, 987_654_321)
         XCTAssertEqual(hb.streamConfig, Self.sampleConfig)
         XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: 42, message: message), data)
+    }
+
+    /// The PC says it is locked in one byte after the stream config. An
+    /// iPad older than the field reads the same heartbeat without it.
+    func testPCLockedHeartbeatVector() throws {
+        let data = try vector("heartbeat_pc_locked")
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .heartbeat(let hb) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(hb.hostTimeUs, 987_654_321)
+        XCTAssertEqual(hb.streamConfig, Self.sampleConfig)
+        XCTAssertEqual(hb.notice, Heartbeat.noticePCLocked)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: 42, message: message), data)
+        let plain = try vector("heartbeat")
+        XCTAssertEqual(data.count, plain.count + 1)
+        XCTAssertEqual(data.dropFirst(8).dropLast(), plain.dropFirst(8))
+        guard case .heartbeat(let old) = try XCTUnwrap(Wire.parseControl(plain)).message else { return XCTFail("wrong type") }
+        XCTAssertEqual(old.notice, Heartbeat.noticeNone)
     }
 
     func testByeVector() throws {

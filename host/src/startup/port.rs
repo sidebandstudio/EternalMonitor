@@ -604,6 +604,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, run);
         let bytes = lines.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
