@@ -491,18 +491,23 @@ fn amf_hevc_honours_keyframe_requests() {
     assert_keyframe_on_request(&run, Id::HEVC);
 }
 
-/// How long the desktop stays still after a keyframe request. Capture resends
-/// the last picture once for the request, and then nothing until the 750 ms
-/// keepalive, so an encoder that holds a frame until the next one arrives
-/// kept a new viewer waiting that long. Nothing is published in this window:
-/// a keyframe that leaves at all left without a next frame. How fast it
-/// leaves is printed, not checked, because an AMD driver's own reopen took
+/// How long a keyframe requested on a still desktop may take to come out.
+/// Capture resends the last picture once for the request, and then nothing
+/// until the 750 ms keepalive, so an encoder that holds a frame until the
+/// next one arrives kept a new viewer waiting that long. Nothing is published
+/// meanwhile: a keyframe that comes out at all came out without a next frame.
+/// How fast is printed, not checked, because an AMD driver's own reopen took
 /// from 50 to over 400 ms in a fresh test process.
 const STILL_WINDOW: Duration = Duration::from_millis(1500);
+/// How long the encoder may take to open and encode the warm-up frames.
+const WARM_UP_LIMIT: Duration = Duration::from_secs(10);
+/// The warm-up is over once no packet has come for this long.
+const WARM_UP_QUIET: Duration = Duration::from_millis(300);
 
-/// Streams a few frames, goes still, then requests a keyframe with one
-/// resent picture and nothing after it. Returns how long that picture's
-/// keyframe took to leave the stage, or `None` if it never did.
+/// Streams a few frames and waits for the encoder to encode them, goes still,
+/// then requests a keyframe with one resent picture and nothing after it, as
+/// for a reconnecting viewer. Returns how long that picture's keyframe took
+/// to leave the stage, or `None` if it did not within [`STILL_WINDOW`].
 fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
     ffmpeg_next::init().unwrap();
     let (producer, consumer) = frame_slot();
@@ -519,12 +524,13 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
     let stage = std::thread::spawn(move || {
         run_encode_stage(consumer, tx, stage_shared, gpu, generation).map_err(|e| e.to_string())
     });
+    let (packets_tx, packets) = std::sync::mpsc::channel();
     let collector = std::thread::spawn(move || {
-        let mut packets = Vec::new();
         while let Some(nal) = rx.blocking_recv() {
-            packets.push((Instant::now(), nal));
+            if packets_tx.send((Instant::now(), nal)).is_err() {
+                break;
+            }
         }
-        packets
     });
     let publish = |number: u64| {
         let (width, height) = LARGE;
@@ -543,13 +549,45 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
         publish(number);
         std::thread::sleep(FRAME_INTERVAL);
     }
-    // The desktop goes still, and a viewer connects.
-    std::thread::sleep(Duration::from_millis(500));
+    // The request must find a session that has encoded frames, so that it
+    // takes the reopen a reconnect takes, whatever the encoder's open cost.
+    let warm_up_until = Instant::now() + WARM_UP_LIMIT;
+    let mut seen = Vec::new();
+    loop {
+        match packets.recv_timeout(WARM_UP_QUIET) {
+            Ok(packet) => seen.push(packet),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !seen.is_empty() => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                Instant::now() < warm_up_until,
+                "{encoder} encoded nothing within {WARM_UP_LIMIT:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "{encoder} stage ended during the warm-up: {:?}",
+                    stage.join()
+                )
+            }
+        }
+    }
+
+    // A viewer connects to the still desktop.
     const RESENT: u64 = 100;
     let requested = Instant::now();
     shared.force_next_idr.store(true, Ordering::SeqCst);
     publish(RESENT);
-    std::thread::sleep(STILL_WINDOW);
+    let mut keyframe = None;
+    while keyframe.is_none() {
+        let left = STILL_WINDOW.saturating_sub(requested.elapsed());
+        match packets.recv_timeout(left) {
+            Ok((at, nal)) => {
+                if nal.is_keyframe && nal.sequence == RESENT {
+                    keyframe = Some(at.duration_since(requested));
+                }
+                seen.push((at, nal));
+            }
+            Err(_) => break,
+        }
+    }
     producer.close();
 
     match stage.join() {
@@ -557,20 +595,16 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
         Ok(Err(error)) => panic!("{encoder} encode stage failed: {error}"),
         Err(_) => panic!("{encoder} encode stage panicked"),
     }
+    collector.join().unwrap();
     let software_fallback = PIPELINE_STATS.lock().using_software_fallback;
-    let packets = collector.join().unwrap();
-    let keyframe = packets
-        .iter()
-        .find(|(_, nal)| nal.is_keyframe && nal.sequence == RESENT)
-        .map(|(at, _)| at.duration_since(requested));
     eprintln!(
         "{encoder}: still-desktop keyframe after {keyframe:?}; packets {:?}",
-        packets
-            .iter()
+        seen.iter()
             .map(|(at, nal)| (
                 nal.sequence,
                 nal.is_keyframe,
-                at.saturating_duration_since(requested).as_millis()
+                at.saturating_duration_since(requested).as_millis() as i64
+                    - requested.saturating_duration_since(*at).as_millis() as i64
             ))
             .collect::<Vec<_>>()
     );
