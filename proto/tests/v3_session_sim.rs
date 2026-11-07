@@ -1466,3 +1466,32 @@ fn a_flood_spoofing_the_live_address_never_blocks_its_reconnect() {
     });
     assert!(ok);
 }
+
+/// No live session yet. The first attempt is confirming when the app
+/// connects again, and that new attempt fails. The host then commits the
+/// first one late: the iPad must still use it, because the failure leaves
+/// the intent on the key the app is connecting with.
+#[test]
+fn a_failed_attempt_without_a_live_session_keeps_the_intent() {
+    let mut sim = Sim::new(133);
+    sim.latency = ms(300);
+    sim.policy.decision_delay = ms(1900);
+    sim.connect();
+    assert!(sim.run_until(ms(2000), |s| s.client.is_confirming()));
+    // Every later message 1 (the first attempt sent 3) is lost, so the new
+    // attempt fails.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Msg1 if sent.nth >= 3 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.run_for(ms(50));
+    sim.connect();
+    sim.run_for(Duration::from_secs(10));
+    assert!(sim
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadAttemptFailed { .. })));
+    assert_eq!(sim.stranded_commits_before(sim.now), 0);
+    assert_eq!(sim.unused_commits(), 0);
+    assert!(sim.both_live_on_same_session());
+}

@@ -412,10 +412,14 @@ impl Client {
     }
 
     /// An attempt got no usable answer. The intent falls back to the live
-    /// session's key, so a late answer for it can still be used.
+    /// session's key, so a late answer for it can still be used. Without a
+    /// live session the intent stays: the app still wants that key, and an
+    /// earlier attempt under it may yet be committed.
     fn fail_attempt(&mut self, dev_id: Id16, out: &mut Vec<ClientOutput>) {
         self.attempt = Attempt::Idle;
-        self.intent = self.key.as_ref().map(|k| k.dev_id);
+        if let Some(live_key) = &self.key {
+            self.intent = Some(live_key.dev_id);
+        }
         out.push(ClientOutput::AttemptFailed { dev_id });
     }
 
