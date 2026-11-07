@@ -218,6 +218,23 @@ final class ConnectionManager: ObservableObject {
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
     /// to fail a lookup without asking DNS.
     var makeUDPLink: (UInt16) -> any MediaLink
+    /// Looks for PCs with Bonjour, given the service name wanted. Tests
+    /// replace it.
+    var findPCs: (String) async -> [DiscoveredHost] = { await MovedPC.find($0) }
+    /// "host:port" of each address the user typed in this launch. Saved
+    /// entries keep the mark once they show a picture.
+    private var typedAddresses = Set<String>()
+    /// A saved PC that didn't answer at its address and was found at another.
+    private struct Move {
+        let from: (host: String, port: UInt16)
+        let name: String
+        /// Its pairing token, or zeros: the PC at the new address must give
+        /// the same one back.
+        let token: Data
+    }
+    /// The move the next attempt makes, and the one the current attempt made.
+    private var pendingMove: Move?
+    private var attemptMove: Move?
 
     init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }) {
         self.timing = timing
@@ -301,9 +318,11 @@ final class ConnectionManager: ObservableObject {
 
     // MARK: - Connect / Disconnect
 
-    func connect(host: String, port: UInt16, token: Data? = nil) {
+    /// `typed`: the user typed this address, so it is never looked up by name.
+    func connect(host: String, port: UInt16, token: Data? = nil, typed: Bool = false) {
         guard state == .disconnected else { return }
         explicitPairingToken = token
+        if typed { typedAddresses.insert(PairingStore.address(host: host, port: port)) }
         if let token {
             do { try pairingStore.save(token: token, hostName: "", address: PairingStore.address(host: host, port: port)) }
             catch { record(.warning, "pairing", "Could not save the scanned pairing on this iPad.") }
@@ -373,6 +392,8 @@ final class ConnectionManager: ObservableObject {
         let pairingAddress = isUSB ? "USB" : PairingStore.address(host: normalizedHost, port: port)
         let pairingToken = explicitPairingToken ?? ((try? pairingStore.token(address: pairingAddress)) ?? Data(repeating: 0, count: 16))
         explicitPairingToken = nil
+        attemptMove = isUSB ? nil : pendingMove
+        pendingMove = nil
         let connectionID = UUID()
         currentAttempt.withLock { $0 = connectionID }
         transportMode = isUSB ? "USB" : "WiFi"
@@ -403,6 +424,7 @@ final class ConnectionManager: ObservableObject {
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
         record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
+        if attemptMove != nil { record(.info, "connection", "Trying the saved PC at the new address Bonjour gave") }
 
         let decoder = VideoDecoder()
         let metrics = ReceiverMetrics()
@@ -464,8 +486,19 @@ final class ConnectionManager: ObservableObject {
                     UIApplication.shared.isIdleTimerDisabled =
                         UserDefaults.standard.flag(forKey: "keepScreenAwake")
                     E2E.firstFrame(width: frameWidth, height: frameHeight, link: isUSB ? "usb" : "udp")
-                    RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
-                        port: port, isUSB: isUSB)
+                    if let move = self.attemptMove {
+                        // The same PC by its name and pairing: its new address
+                        // replaces the old one, and so does its pairing.
+                        RecentConnectionStore.shared.moved(from: move.from, to: (normalizedHost, port),
+                                                           name: self.hostInfo?.hostName ?? move.name)
+                        if MovedPC.replacesSavedEntry(move.from.host) {
+                            try? self.pairingStore.remove(address: PairingStore.address(host: move.from.host, port: move.from.port))
+                        }
+                    } else {
+                        RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
+                            port: port, isUSB: isUSB, name: self.hostInfo?.hostName,
+                            typed: self.typedAddresses.contains(pairingAddress))
+                    }
                     if !isUSB {
                         UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
                         UserDefaults.standard.set(Int(port), forKey: "lastPort")
@@ -589,6 +622,12 @@ final class ConnectionManager: ObservableObject {
             let acceptedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                if let move = self.attemptMove, !Self.isSamePC(move, info) {
+                    self.record(.warning, "connection", "The PC at the new address isn't the saved one")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
                 self.sessionAcceptedAt = acceptedAt
                 self.acceptedAddresses.insert("\(normalizedHost):\(port)")
                 self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
@@ -617,6 +656,14 @@ final class ConnectionManager: ObservableObject {
             let mismatch = channel?.lastMismatch
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // A PC that wants a code didn't take the saved PC's pairing:
+                // it is another PC, and the saved pairing stays.
+                if self.attemptMove != nil, status == .unauthorized || status == .rateLimited {
+                    self.record(.warning, "connection", "The PC at the new address isn't the saved one: it asked for pairing")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
                 // Busy passes: the PC is streaming elsewhere, often to this
                 // iPad's own cable session that hasn't closed yet. An
                 // automatic cycle keeps retrying and shows it if it runs out.
@@ -664,6 +711,7 @@ final class ConnectionManager: ObservableObject {
                     self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
+                    if !isUSB { self.lookForMovedPC(connectionID, host: normalizedHost, port: port, token: pairingToken) }
                 }
             }
         }
@@ -1000,6 +1048,41 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// The attempt's HELLO2 got no answer at `host:port`. A saved PC whose
+    /// address may have changed is looked for by name; where Bonjour has it
+    /// at another address, the attempt moves there with the PC's pairing.
+    private func lookForMovedPC(_ connectionID: UUID, host: String, port: UInt16, token: Data) {
+        let address = PairingStore.address(host: host, port: port)
+        let saved = RecentConnectionStore.shared.entry(host: host, port: port)
+        let name = saved?.name ?? pairingStore.pcName(address: address)
+        guard attemptMove == nil, let name,
+              MovedPC.canLookUp(host: host, pcName: name, typed: typedAddresses.contains(address) || saved?.typed == true)
+        else { return }
+        record(.info, "connection", "Looking for the saved PC by name: no answer at its address")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let found = await self.findPCs(MovedPC.serviceName(pcName: name))
+            // The PC may have answered meanwhile, or the attempt ended.
+            guard self.currentAttempt.withLock({ $0 == connectionID }), self.state == .connecting,
+                  self.hostInfo == nil, !self.awaitingPairing else { return }
+            guard let moved = MovedPC.newAddress(pcName: name, host: host, port: port, found: found) else {
+                self.record(.info, "connection", "The saved PC wasn't found at another address")
+                return
+            }
+            self.record(.info, "connection", "Found the saved PC at \(moved.host):\(moved.port)")
+            self.disconnect(.pcMoved)
+            self.pendingMove = Move(from: (host, port), name: name, token: token)
+            self.explicitPairingToken = PairingStore.valid(token) ? token : nil
+            self.startAttempt(.udp(host: moved.host, port: moved.port))
+        }
+    }
+
+    /// The PC that accepted a moved attempt is the saved one: it has the
+    /// saved name, and gave back the saved pairing token if there was one.
+    private static func isSamePC(_ move: Move, _ info: ControlChannel.SessionInfo) -> Bool {
+        info.hostName == move.name && (!PairingStore.valid(move.token) || info.authToken == move.token)
+    }
+
     /// Retires the automatic reconnect cycle, if one is running: its task
     /// stops at its next check and can no longer write state.
     private func endReconnectCycle() {
@@ -1036,10 +1119,12 @@ final class ConnectionManager: ObservableObject {
                 self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
-                self.problem = self.noPictureStreak.shown(.timeout(
+                let problem = self.noPictureStreak.shown(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
+                self.problem = problem == .noReply(usb: false) && self.attemptMove != nil
+                    ? .noReplyAtNewAddress(debug.host) : problem
                 // The app gave up, not the user: the PC's log tells them apart.
                 self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
@@ -1545,6 +1630,10 @@ struct RecentConnection: Codable, Identifiable {
     let port: UInt16
     let lastUsed: Date
     let isUSB: Bool
+    /// The name the PC gave. Entries saved before 0.3.5 have none.
+    var name: String? = nil
+    /// The user typed this address. It is never looked up by name again.
+    var typed: Bool? = nil
 }
 
 extension RecentConnection {
@@ -1568,14 +1657,33 @@ final class RecentConnectionStore: ObservableObject {
         load()
     }
 
-    func add(host: String, port: UInt16, isUSB: Bool) {
+    /// Saves a connection that showed a picture. A Wi-Fi entry keeps its
+    /// name and typed mark when this connection gives none.
+    func add(host: String, port: UInt16, isUSB: Bool, name: String? = nil, typed: Bool = false) {
+        let previous = isUSB ? nil : entry(host: host, port: port)
         connections.removeAll { $0.host == host && $0.port == port && $0.isUSB == isUSB }
         connections.insert(
-            RecentConnection(host: host, port: port, lastUsed: Date(), isUSB: isUSB),
+            RecentConnection(host: host, port: port, lastUsed: Date(), isUSB: isUSB,
+                             name: isUSB ? nil : name.flatMap { $0.isEmpty ? nil : $0 } ?? previous?.name,
+                             typed: isUSB ? nil : (typed || previous?.typed == true)),
             at: 0
         )
         if connections.count > 10 { connections = Array(connections.prefix(10)) }
         save()
+    }
+
+    /// The saved Wi-Fi entry for `host:port`.
+    func entry(host: String, port: UInt16) -> RecentConnection? {
+        connections.first { !$0.isUSB && $0.host == host && $0.port == port }
+    }
+
+    /// The PC moved from `old` to `new`: the old entry gives way where
+    /// `MovedPC.replacesSavedEntry` says so.
+    func moved(from old: (host: String, port: UInt16), to new: (host: String, port: UInt16), name: String) {
+        if MovedPC.replacesSavedEntry(old.host) {
+            connections.removeAll { !$0.isUSB && $0.host == old.host && $0.port == old.port }
+        }
+        add(host: new.host, port: new.port, isUSB: false, name: name)
     }
 
     private func load() {

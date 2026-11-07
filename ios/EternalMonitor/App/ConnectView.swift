@@ -20,6 +20,9 @@ struct ConnectView: View {
     // track whether we've already pre-filled from lastHost so we
     // don't clobber user edits on every re-render.
     @State private var didPrefillFromLastHost = false
+    /// The address the app last put in the field: the last PC, or one
+    /// found, scanned or picked from Recent.
+    @State private var filledAddress: String?
     @State private var showQRScanner = false
     @State private var showDetails = false
     @State private var feedbackRequest: FeedbackRequest?
@@ -60,6 +63,12 @@ struct ConnectView: View {
     private var showsFeedbackAsk: Bool {
         connectionManager.problem == nil && connectionManager.connectionError == nil && !isConnecting
             && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected)
+    }
+
+    /// The address field holds something the app didn't put there: the
+    /// user typed it.
+    private var typedAddress: Bool {
+        normalizedHostIP != filledAddress
     }
 
     private var canConnect: Bool {
@@ -207,7 +216,7 @@ struct ConnectView: View {
                 if UIPreview.opensSetup && !didSeeOnboarding { showSetup = true; return }
                 #endif
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
-                    hostIP = settings.lastHost
+                    fill(settings.lastHost)
                     if settings.lastPort != 0 {
                         port = String(settings.lastPort)
                     }
@@ -273,7 +282,7 @@ struct ConnectView: View {
         setupOutcome = .finished
         switch outcome {
         case .connect(let host, let port):
-            hostIP = host
+            fill(host)
             self.port = String(port)
             connectionManager.connect(host: host, port: port)
             return
@@ -447,7 +456,7 @@ struct ConnectView: View {
 
             if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
                 Button {
-                    hostIP = settings.lastHost
+                    fill(settings.lastHost)
                     if settings.lastPort != 0 { port = String(settings.lastPort) }
                 } label: {
                     Label(L("Use last PC: \(settings.lastHost)"), systemImage: "clock.arrow.circlepath")
@@ -467,7 +476,7 @@ struct ConnectView: View {
                 focusedField = nil
                 guard let p = parsedPort else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    connectionManager.connect(host: normalizedHostIP, port: p)
+                    connectionManager.connect(host: normalizedHostIP, port: p, typed: typedAddress)
                 }
             } label: {
                 Text(L("Connect"))
@@ -540,13 +549,18 @@ struct ConnectView: View {
                         focusedField = .port
                     } else if canConnect, let p = parsedPort {
                         focusedField = nil
-                        connectionManager.connect(host: normalizedHostIP, port: p)
+                        connectionManager.connect(host: normalizedHostIP, port: p, typed: typedAddress)
                     }
                 }
                 .focused($focusedField, equals: field)
                 .accessibilityLabel(label)
                 .accessibilityIdentifier(field == .host ? "connect.host" : "connect.port")
         }
+    }
+
+    private func fill(_ address: String) {
+        hostIP = address
+        filledAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Connecting
@@ -620,7 +634,7 @@ struct ConnectView: View {
     private func handleScannedQR(_ value: String) {
         switch PairingCode.parse(value) {
         case .success(let target):
-            hostIP = target.host
+            fill(target.host)
             port = String(target.port)
             connectionManager.connect(host: target.host, port: target.port, token: target.token)
         case .failure(.wrongScheme):
@@ -697,7 +711,7 @@ struct ConnectView: View {
                     Button {
                         // Only an IPv4 address reaches the PC; see DiscoveredHost.
                         guard let address = host.address else { return }
-                        hostIP = address
+                        fill(address)
                         port = "\(host.port)"
                         connectionManager.connect(host: address, port: host.port)
                     } label: {
@@ -743,7 +757,7 @@ struct ConnectView: View {
                         if conn.isUSB {
                             connectionManager.resumeUSBConnections()
                         } else {
-                            hostIP = conn.host
+                            fill(conn.host)
                             port = "\(conn.port)"
                             connectionManager.connect(host: conn.host, port: conn.port)
                         }

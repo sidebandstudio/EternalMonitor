@@ -205,8 +205,8 @@ final class ConnectionProblemTests: XCTestCase {
 
     func testEveryProblemSaysWhatToDoWithoutTransportJargon() {
         let all: [ConnectionProblem] = [
-            .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
-            .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
+            .noReply(usb: false), .noReply(usb: true), .noReplyAtNewAddress("192.168.1.31"), .noPicture, .receiverNotReady,
+            .badAddress("pc"), .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
             .pcEndedSessionOnError, .pcBusy, .pairingCodeAsAddress, .routerAddress,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),

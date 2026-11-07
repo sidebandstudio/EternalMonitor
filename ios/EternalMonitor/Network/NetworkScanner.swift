@@ -86,6 +86,9 @@ final class NetworkScanner: NSObject, ObservableObject {
     private var scanTask: Task<Void, Never>?
     // track auto-retry state so we don't bounce forever when discovery is broken.
     private var didAutoRetry = false
+    /// Search once more when a search finds nothing. Off for a one-off
+    /// lookup that stops the search itself.
+    var retriesWhenEmpty = true
 
     override init() {
         super.init()
@@ -139,7 +142,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         }
 
         if hosts.isEmpty {
-            if !didAutoRetry {
+            if !didAutoRetry && retriesWhenEmpty {
                 // auto-retry once after 2s. Bonjour browse occasionally
                 // misses the first multicast burst.
                 didAutoRetry = true

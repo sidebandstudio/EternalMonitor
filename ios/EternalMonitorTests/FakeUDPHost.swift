@@ -14,6 +14,8 @@ final class FakeUDPHost: @unchecked Sendable {
     private var answered = Set<UInt32>()
     /// The nonce of the HELLO2 answered last.
     private(set) var lastNonce: UInt32 = 0
+    /// The pairing token the HELLO2 answered last carried.
+    private(set) var lastAuthToken = Data()
 
     init() {
         var address = sockaddr_in()
@@ -50,14 +52,17 @@ final class FakeUDPHost: @unchecked Sendable {
     /// Answers the next HELLO2 attempt, with session 41 unless `status`
     /// refuses it. False after thirty quiet seconds, a backstop that a
     /// loaded machine's slow start does not reach.
-    func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2, hostCaps: UInt16 = 0) -> Bool {
+    func acceptSession(status: HelloStatus = .ok, acceptedVersion: UInt8 = 2, hostCaps: UInt16 = 0,
+                       hostName: String = "Test PC", authToken: Data = Data(17...32)) -> Bool {
         for _ in 0..<100 {
             guard let (data, from, length) = receive() else { continue }
             guard case .hello2(let hello) = Wire.parseControl(data)?.message,
                   answered.insert(hello.clientNonce).inserted else { continue }
             client = (from, length)
             lastNonce = hello.clientNonce
-            send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion, hostCaps: hostCaps))
+            lastAuthToken = hello.authToken
+            send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion,
+                          hostName: hostName, authToken: authToken, hostCaps: hostCaps))
             return true
         }
         return false
