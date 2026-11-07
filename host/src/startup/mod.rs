@@ -34,8 +34,10 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 /// thread holds the heap lock) or `fail-fast` (past the exception filter) to
 /// fail while the window renderer starts; `early-error` to fail right after the failure reporter
 /// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
-/// the window works; or `surface-error` to report a surface error on every
-/// frame of the first two seconds. A `-quiet` suffix skips the message box.
+/// the window works; `device-lost-later` to lose the window's graphics
+/// device 15 s after the window works; or `surface-error` to report a surface
+/// error on every frame of the first two seconds. A `-quiet` suffix skips the
+/// message box.
 /// Only debug builds and builds with the `fault-injection` feature read it;
 /// a release build ignores it.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
@@ -581,6 +583,17 @@ pub(crate) fn simulate_window_failure() {
         "fail-fast-later" if later => std::process::abort(),
         _ => {}
     }
+}
+
+/// True once, 15 s after the window works, when [`SIMULATE_ENV`] asks for
+/// `device-lost-later`: the window's graphics device is to be lost then.
+pub(crate) fn simulate_device_loss_now() -> bool {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    simulated() == "device-lost-later"
+        && SHOWN_AT
+            .get()
+            .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15))
+        && !DONE.swap(true, Ordering::SeqCst)
 }
 
 /// Count surface errors for the first two seconds of frames, when

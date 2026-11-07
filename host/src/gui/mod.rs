@@ -1074,8 +1074,9 @@ impl eframe::App for AnalyzerApp {
         CANVAS.to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         renderer::frame_started(ui.ctx());
+        renderer::simulate_device_loss(frame);
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(language) = self.pending_language.take() {

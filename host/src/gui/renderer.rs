@@ -453,6 +453,47 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     }
 }
 
+/// Lose the window's graphics device on purpose when
+/// [`crate::startup::SIMULATE_ENV`] asks: DX12 removes the device, as a
+/// driver reset does; other backends destroy it.
+pub(super) fn simulate_device_loss(frame: &eframe::Frame) {
+    if !crate::startup::simulate_device_loss_now() {
+        return;
+    }
+    let Some(render_state) = frame.wgpu_render_state() else {
+        return;
+    };
+    warn!("Simulated loss of the window's graphics device");
+    #[cfg(windows)]
+    if remove_dx12_device(&render_state.device) {
+        return;
+    }
+    render_state.device.destroy();
+}
+
+/// `ID3D12Device5::RemoveDevice` on a DX12 device; false on other backends.
+#[cfg(windows)]
+fn remove_dx12_device(device: &wgpu::Device) -> bool {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Device5};
+    let Some(hal) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
+        return false;
+    };
+    // wgpu-hal uses a newer windows crate, so the device crosses as its COM
+    // pointer, which is all either version's interface type holds.
+    let raw: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(hal.raw_device()) };
+    let Some(device) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else {
+        return false;
+    };
+    match device.cast::<ID3D12Device5>() {
+        Ok(device) => {
+            unsafe { device.RemoveDevice() };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// The window closed normally. A launch that quits before its window is
 /// confirmed did not fail, so its marker goes without counting either way.
 pub(super) fn window_closed() {
