@@ -389,8 +389,8 @@ pub struct Session {
     /// The host-wide media sent to clients before they answered, as of when
     /// it was last counted (see [`UNANSWERED_MEDIA_BUDGET`]).
     unanswered_media: (usize, Instant),
-    /// Counts the sessions; each id is this count hashed with
-    /// [`Self::session_id_keys`], so one id says nothing about the next.
+    /// Counts the sessions. Session ids come from a per-launch keyed hash
+    /// of this count ([`Self::session_id_keys`]).
     next_session_id: u32,
     session_id_keys: std::collections::hash_map::RandomState,
     legacy_client_warned: bool,
@@ -4138,9 +4138,10 @@ mod tests {
         assert!(session.may_send_media(ack.session_id, 10 * UNANSWERED_MEDIA_BUDGET, now));
     }
 
-    /// Each session's id is unrelated to the one before.
+    /// Session ids come from a keyed hash, so two instances with the same
+    /// seed hand out different ids.
     #[test]
-    fn session_ids_do_not_follow_each_other() {
+    fn session_ids_differ_between_instances() {
         let ipad = addr([10, 0, 0, 5], 50000);
         let ids = |session: &mut Session| -> Vec<u32> {
             (1..=4)
