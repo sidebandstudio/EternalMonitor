@@ -985,6 +985,60 @@ mod tests {
         assert_eq!(harness.calls.lock().len(), 2);
     }
 
+    /// The hop the thread adds: from the transport queueing an event to the
+    /// call that hands it to Windows, at a steady 1 kHz. Prints p50, p99 and
+    /// the worst; the bound only catches a thread that waits for a timer.
+    #[test]
+    fn the_hop_to_the_input_thread_is_short() {
+        struct Timed(Arc<Mutex<Vec<(u32, Instant)>>>);
+        impl Sink for Timed {
+            fn relay(&mut self, _: u32, event: &InputEvent, _: CaptureGeometry, _: bool) {
+                self.0.lock().push((event.event_id, Instant::now()));
+            }
+            fn reset(&mut self) {}
+            fn keep_alive(&mut self, _: Option<CaptureGeometry>) {}
+            fn pen_available(&self) -> bool {
+                false
+            }
+            fn spaced_until(&self) -> Option<Instant> {
+                None
+            }
+            fn tick_needed(&self) -> bool {
+                false
+            }
+        }
+        const EVENTS: u32 = 2000;
+        let taken = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&taken);
+        let thread = InputThread::with_sink(Limits::default(), move || Timed(recorded));
+        let injector = thread.begin(geometry());
+        let mut queued = Vec::new();
+        let mut next = Instant::now();
+        for id in 0..EVENTS {
+            next += Duration::from_millis(1);
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            queued.push(Instant::now());
+            injector.relay(1, event(KIND_HOVER, PHASE_MOVED, id), OUTPUT, false);
+        }
+        assert!(thread.finish(Duration::from_secs(5)));
+        let mut hops: Vec<_> = taken
+            .lock()
+            .iter()
+            .map(|(id, at)| *at - queued[*id as usize])
+            .collect();
+        assert_eq!(hops.len(), EVENTS as usize);
+        hops.sort();
+        let at = |q: f64| hops[((hops.len() - 1) as f64 * q) as usize];
+        let (p50, p99, worst) = (at(0.5), at(0.99), *hops.last().unwrap());
+        eprintln!(
+            "input hop to the input thread: p50 {} us, p99 {} us, max {} us",
+            p50.as_micros(),
+            p99.as_micros(),
+            worst.as_micros()
+        );
+        assert!(p99 < Duration::from_millis(50), "{p99:?}");
+    }
+
     /// The real relay, with a native pen device that takes every frame
     /// (Windows' own off Windows). A stall delivers 64 samples at once; the
     /// spacing holds back all but the first burst, and the thread sends the
