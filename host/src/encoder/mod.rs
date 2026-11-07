@@ -636,7 +636,7 @@ struct EncoderState {
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     /// BGRA to the encoder's YUV input, reading capture's buffer directly.
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<input::Scaler>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -815,8 +815,12 @@ impl EncoderState {
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
         let scaler = input::conversion_context(pixel_format, width, height)?;
-        if scaler.is_some() {
-            info!(output = ?pixel_format, "swscale BGRA conversion context created");
+        if let Some(scaler) = &scaler {
+            info!(
+                output = ?pixel_format,
+                threads = scaler.threads(),
+                "swscale BGRA conversion context created"
+            );
         }
 
         Ok(Self {

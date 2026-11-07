@@ -100,20 +100,126 @@ pub(super) fn conversion_context(
     format: Pixel,
     width: u32,
     height: u32,
-) -> Result<Option<ffmpeg_next::software::scaling::Context>, ffmpeg_next::Error> {
+) -> Result<Option<Scaler>, ffmpeg_next::Error> {
     if !matches!(format, Pixel::YUV420P | Pixel::NV12) {
         return Ok(None);
     }
-    ffmpeg_next::software::scaling::Context::get(
-        Pixel::BGRA,
-        width,
-        height,
-        format,
-        width,
-        height,
-        ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
-    )
-    .map(Some)
+    Scaler::new(format, width, height, scaler_threads()).map(Some)
+}
+
+/// Threads one conversion is split across: half the logical processors, at
+/// most four. A 2732x2048 frame takes about 14 ms on one thread of a desktop
+/// CPU, most of a 60 fps frame's 16.7 ms.
+fn scaler_threads() -> usize {
+    threads_for(std::thread::available_parallelism().map_or(1, |count| count.get()))
+}
+
+fn threads_for(processors: usize) -> usize {
+    (processors / 2).clamp(1, 4)
+}
+
+/// swscale converting BGRA to `output` at one size, FAST_BILINEAR, on
+/// `threads` threads. FFmpeg 7.1 splits a conversion across threads only in
+/// `sws_scale_frame`; `sws_scale`, which ffmpeg-next's `Context::run` calls,
+/// always runs on one.
+pub(super) struct Scaler {
+    context: *mut ffmpeg_next::ffi::SwsContext,
+    width: u32,
+    height: u32,
+    output: Pixel,
+    threads: usize,
+}
+
+impl Scaler {
+    fn new(
+        output: Pixel,
+        width: u32,
+        height: u32,
+        threads: usize,
+    ) -> Result<Self, ffmpeg_next::Error> {
+        use ffmpeg_next::ffi::{
+            av_opt_set_int, sws_alloc_context, sws_init_context, AVPixelFormat, SWS_FAST_BILINEAR,
+        };
+        let context = unsafe { sws_alloc_context() };
+        if context.is_null() {
+            return Err(ffmpeg_next::Error::Other {
+                errno: libc::ENOMEM,
+            });
+        }
+        // Freed by Drop from here on, including on the errors below.
+        let scaler = Self {
+            context,
+            width,
+            height,
+            output,
+            threads,
+        };
+        let options = [
+            (c"srcw", i64::from(width)),
+            (c"srch", i64::from(height)),
+            (c"src_format", AVPixelFormat::from(Pixel::BGRA) as i64),
+            (c"dstw", i64::from(width)),
+            (c"dsth", i64::from(height)),
+            (c"dst_format", AVPixelFormat::from(output) as i64),
+            (c"sws_flags", i64::from(SWS_FAST_BILINEAR)),
+            (c"threads", threads as i64),
+        ];
+        for (name, value) in options {
+            let result = unsafe { av_opt_set_int(context.cast(), name.as_ptr(), value, 0) };
+            if result < 0 {
+                return Err(ffmpeg_next::Error::from(result));
+            }
+        }
+        let result =
+            unsafe { sws_init_context(context, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if result < 0 {
+            return Err(ffmpeg_next::Error::from(result));
+        }
+        Ok(scaler)
+    }
+
+    pub(super) fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Converts `input`, a BGRA frame of the scaler's size, into `output`.
+    pub(super) fn run(
+        &mut self,
+        input: &ffmpeg_next::frame::Video,
+        output: &mut ffmpeg_next::frame::Video,
+    ) -> Result<(), ffmpeg_next::Error> {
+        if input.format() != Pixel::BGRA
+            || input.width() != self.width
+            || input.height() != self.height
+        {
+            return Err(ffmpeg_next::Error::InputChanged);
+        }
+        self.check_output(output)?;
+        // SAFETY: both frames own their buffers and have the sizes checked.
+        let result = unsafe {
+            ffmpeg_next::ffi::sws_scale_frame(self.context, output.as_mut_ptr(), input.as_ptr())
+        };
+        if result < 0 {
+            return Err(ffmpeg_next::Error::from(result));
+        }
+        Ok(())
+    }
+
+    fn check_output(&self, output: &ffmpeg_next::frame::Video) -> Result<(), ffmpeg_next::Error> {
+        if output.format() != self.output
+            || output.width() != self.width
+            || output.height() != self.height
+        {
+            return Err(ffmpeg_next::Error::OutputChanged);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Scaler {
+    fn drop(&mut self) {
+        unsafe { ffmpeg_next::ffi::sws_freeContext(self.context) }
+    }
 }
 
 /// Converts capture's BGRA rows, `row_bytes` apart, into `output` where they
@@ -128,49 +234,62 @@ pub(super) fn conversion_context(
 /// [`frame_buffer`](crate::capture::frame_buffer) has, are copied into a
 /// frame FFmpeg allocated first.
 pub(super) fn convert_packed_bgra(
-    scaler: &mut ffmpeg_next::software::scaling::Context,
+    scaler: &mut Scaler,
     rows: &[u8],
     row_bytes: usize,
     output: &mut ffmpeg_next::frame::Video,
 ) -> Result<(), ffmpeg_next::Error> {
-    let input = *scaler.input();
-    let picture_bytes = input.width as usize * 4;
+    use ffmpeg_next::ffi::{
+        av_buffer_create, av_frame_alloc, av_frame_free, sws_scale_frame, AVPixelFormat,
+        AV_BUFFER_FLAG_READONLY,
+    };
+    let (width, height) = (scaler.width, scaler.height);
+    let picture_bytes = width as usize * 4;
     // The last row ends after its picture's pixels.
-    let frame_bytes = row_bytes * (input.height as usize).saturating_sub(1) + picture_bytes;
-    if input.format != Pixel::BGRA || row_bytes < picture_bytes || rows.len() < frame_bytes {
+    let frame_bytes = row_bytes * (height as usize).saturating_sub(1) + picture_bytes;
+    if row_bytes < picture_bytes || rows.len() < frame_bytes {
         return Err(ffmpeg_next::Error::InputChanged);
     }
-    let wanted = scaler.output();
-    if output.format() != wanted.format
-        || output.width() != wanted.width
-        || output.height() != wanted.height
-    {
-        return Err(ffmpeg_next::Error::OutputChanged);
-    }
+    scaler.check_output(output)?;
     if rows.len() < frame_bytes + FRAME_PADDING {
-        let copied = copied_frame(&rows[..frame_bytes], row_bytes, input.width, input.height);
+        let copied = copied_frame(&rows[..frame_bytes], row_bytes, width, height);
         return scaler.run(&copied, output);
     }
-    let planes = [
-        rows.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        std::ptr::null(),
-    ];
-    let strides = [row_bytes as libc::c_int, 0, 0, 0];
-    // swscale reads `input.height` rows of `picture_bytes`, `row_bytes`
+    // sws_scale_frame takes reference-counted frames, so `rows` is wrapped
+    // in a buffer that never frees it. sws_scale_frame drops its references
+    // before it returns, and the frame is freed below, so nothing refers to
+    // `rows` after this call.
+    unsafe extern "C" fn borrowed(_: *mut libc::c_void, _: *mut u8) {}
+    let mut source = unsafe { av_frame_alloc() };
+    if source.is_null() {
+        return Err(ffmpeg_next::Error::Other {
+            errno: libc::ENOMEM,
+        });
+    }
+    // SAFETY: swscale reads `height` rows of `picture_bytes`, `row_bytes`
     // apart, from `rows`, and at most FRAME_PADDING more, checked above, and
     // writes the planes `output` allocated at the output size.
     let result = unsafe {
-        ffmpeg_next::ffi::sws_scale(
-            scaler.as_mut_ptr(),
-            planes.as_ptr(),
-            strides.as_ptr(),
-            0,
-            input.height as libc::c_int,
-            (*output.as_mut_ptr()).data.as_ptr(),
-            (*output.as_mut_ptr()).linesize.as_ptr(),
-        )
+        let data = rows.as_ptr().cast_mut();
+        (*source).format = AVPixelFormat::from(Pixel::BGRA) as libc::c_int;
+        (*source).width = width as libc::c_int;
+        (*source).height = height as libc::c_int;
+        (*source).data[0] = data;
+        (*source).linesize[0] = row_bytes as libc::c_int;
+        (*source).buf[0] = av_buffer_create(
+            data,
+            rows.len(),
+            Some(borrowed),
+            std::ptr::null_mut(),
+            AV_BUFFER_FLAG_READONLY,
+        );
+        let result = if (*source).buf[0].is_null() {
+            -libc::ENOMEM
+        } else {
+            sws_scale_frame(scaler.context, output.as_mut_ptr(), source)
+        };
+        av_frame_free(&mut source);
+        result
     };
     if result < 0 {
         return Err(ffmpeg_next::Error::from(result));
@@ -395,9 +514,9 @@ mod tests {
         }
     }
 
-    /// What the copy into an aligned BGRA frame gives.
+    /// What the copy into an aligned BGRA frame gives, converted by
+    /// ffmpeg-next's single-threaded `sws_scale`.
     fn converted_from_copy(
-        scaler: &mut ffmpeg_next::software::scaling::Context,
         format: Pixel,
         rows: &[u8],
         width: u32,
@@ -406,7 +525,18 @@ mod tests {
         let frame_bytes = width as usize * 4 * height as usize;
         let copied = copied_frame(&rows[..frame_bytes], width as usize * 4, width, height);
         let mut converted = ffmpeg_next::frame::Video::new(format, width, height);
-        scaler.run(&copied, &mut converted).unwrap();
+        ffmpeg_next::software::scaling::Context::get(
+            Pixel::BGRA,
+            width,
+            height,
+            format,
+            width,
+            height,
+            ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
+        )
+        .unwrap()
+        .run(&copied, &mut converted)
+        .unwrap();
         converted
     }
 
@@ -432,23 +562,36 @@ mod tests {
         }
     }
 
-    /// swscale reading a padded capture buffer gives the same picture as the
-    /// copy into an aligned BGRA frame it replaced, at widths whose rows are
-    /// and aren't 64-byte multiples.
+    /// swscale reading a padded capture buffer, on one thread or several,
+    /// gives the same picture as single-threaded swscale reading the copy into
+    /// an aligned BGRA frame it replaced, at widths whose rows are (1680) and
+    /// aren't (2732, 1366) 64-byte multiples, and whole iPad screens.
     #[test]
     fn converting_capture_rows_in_place_matches_the_copied_frame() {
         ffmpeg_next::init().unwrap();
-        for (width, height) in [(2732u32, 64u32), (96, 64), (1366, 32), (102, 18)] {
+        for (width, height) in [
+            (2732u32, 2048u32),
+            (2732, 64),
+            (1680, 1050),
+            (96, 64),
+            (1366, 32),
+            (102, 18),
+        ] {
             let row_bytes = width as usize * 4;
             let frame_bytes = row_bytes * height as usize;
             let mut rows = crate::capture::frame_buffer(frame_bytes);
             fill_pattern(&mut rows[..frame_bytes], row_bytes);
             for format in [Pixel::YUV420P, Pixel::NV12] {
+                let before = converted_from_copy(format, &rows, width, height);
+                for threads in [1, 4] {
+                    let mut scaler = Scaler::new(format, width, height, threads).unwrap();
+                    let mut after = ffmpeg_next::frame::Video::new(format, width, height);
+                    convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut after).unwrap();
+                    let label = format!("{width}x{height} {format:?} threads={threads}");
+                    assert_same_picture(&before, &after, &label);
+                }
                 let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
-                let before = converted_from_copy(&mut scaler, format, &rows, width, height);
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
-                convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut after).unwrap();
-                assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
                 // A short buffer or another size is refused, never read past.
                 assert_eq!(
                     convert_packed_bgra(
@@ -473,6 +616,29 @@ mod tests {
     }
 
     #[test]
+    fn conversions_use_half_the_processors_up_to_four_threads() {
+        ffmpeg_next::init().unwrap();
+        for (processors, threads) in [(1, 1), (2, 1), (4, 2), (6, 3), (8, 4), (16, 4), (64, 4)] {
+            assert_eq!(threads_for(processors), threads, "{processors} processors");
+        }
+        let scaler = conversion_context(Pixel::YUV420P, 2732, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scaler.threads(), scaler_threads());
+        let mut set = 0;
+        let result = unsafe {
+            ffmpeg_next::ffi::av_opt_get_int(
+                scaler.context.cast(),
+                c"threads".as_ptr(),
+                0,
+                &mut set,
+            )
+        };
+        assert!(result >= 0);
+        assert_eq!(set, scaler_threads() as i64);
+    }
+
+    #[test]
     fn capture_padding_is_ffmpegs() {
         assert_eq!(
             FRAME_PADDING,
@@ -480,21 +646,22 @@ mod tests {
         );
     }
 
-    /// Rows with no readable bytes after them, ending where an unreadable
-    /// page starts, convert to the same picture without a crash: swscale
-    /// can read past the last row, so they take the copy.
+    /// `len` bytes that end where a page that faults on any access starts.
     #[cfg(unix)]
-    #[test]
-    fn rows_without_padding_are_never_read_past() {
-        ffmpeg_next::init().unwrap();
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        for (width, height) in [(2733u32, 2048u32), (1365, 32), (17, 3)] {
-            let row_bytes = width as usize * 4;
-            let frame_bytes = row_bytes * height as usize;
-            let readable = frame_bytes.div_ceil(page) * page;
+    struct Guarded {
+        base: *mut libc::c_void,
+        mapped: usize,
+        len: usize,
+    }
+
+    #[cfg(unix)]
+    impl Guarded {
+        fn new(len: usize) -> Self {
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let readable = len.div_ceil(page) * page;
             // SAFETY: a fresh private mapping, `readable` bytes then one
-            // page that faults on any access; unmapped below.
-            let rows = unsafe {
+            // page that faults on any access; unmapped on drop.
+            unsafe {
                 let base = libc::mmap(
                     std::ptr::null_mut(),
                     readable + page,
@@ -506,8 +673,45 @@ mod tests {
                 assert_ne!(base, libc::MAP_FAILED);
                 let guard = base.cast::<u8>().add(readable);
                 assert_eq!(libc::mprotect(guard.cast(), page, libc::PROT_NONE), 0);
-                std::slice::from_raw_parts_mut(guard.sub(frame_bytes), frame_bytes)
-            };
+                Self {
+                    base,
+                    mapped: readable + page,
+                    len,
+                }
+            }
+        }
+
+        fn bytes(&mut self) -> &mut [u8] {
+            let start = self.mapped - unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            // SAFETY: the last `len` readable bytes of the mapping.
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.base.cast::<u8>().add(start - self.len),
+                    self.len,
+                )
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Guarded {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.base, self.mapped) }, 0);
+        }
+    }
+
+    /// Rows with no readable bytes after them, ending where an unreadable
+    /// page starts, convert to the same picture without a crash: swscale
+    /// can read past the last row, so they take the copy.
+    #[cfg(unix)]
+    #[test]
+    fn rows_without_padding_are_never_read_past() {
+        ffmpeg_next::init().unwrap();
+        for (width, height) in [(2733u32, 2048u32), (1365, 32), (17, 3)] {
+            let row_bytes = width as usize * 4;
+            let frame_bytes = row_bytes * height as usize;
+            let mut mapping = Guarded::new(frame_bytes);
+            let rows = mapping.bytes();
             fill_pattern(rows, row_bytes);
             // The pixel swscale reads after each odd-width row is set.
             let copied = copied_frame(rows, row_bytes, width, height);
@@ -517,15 +721,43 @@ mod tests {
                 assert_eq!(line[row_bytes..], line[row_bytes - 4..row_bytes]);
             }
             for format in [Pixel::YUV420P, Pixel::NV12] {
-                let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
-                let mut after = ffmpeg_next::frame::Video::new(format, width, height);
-                convert_packed_bgra(&mut scaler, rows, row_bytes, &mut after).unwrap();
-                let before = converted_from_copy(&mut scaler, format, rows, width, height);
-                assert_same_picture(&before, &after, &format!("{width}x{height} {format:?}"));
+                let before = converted_from_copy(format, rows, width, height);
+                for threads in [1, 4] {
+                    let mut scaler = Scaler::new(format, width, height, threads).unwrap();
+                    let mut after = ffmpeg_next::frame::Video::new(format, width, height);
+                    convert_packed_bgra(&mut scaler, rows, row_bytes, &mut after).unwrap();
+                    let label = format!("{width}x{height} {format:?} threads={threads}");
+                    assert_same_picture(&before, &after, &label);
+                }
             }
-            unsafe {
-                let base = rows.as_mut_ptr().add(frame_bytes).sub(readable);
-                assert_eq!(libc::munmap(base.cast(), readable + page), 0);
+        }
+    }
+
+    /// Capture's padded rows are converted where they lie, on one thread or
+    /// several, without reading past the padding: an unreadable page starts
+    /// right after it. Even widths give the copy's picture; at odd widths the
+    /// last chroma column takes the next row's first pixel instead.
+    #[cfg(unix)]
+    #[test]
+    fn padded_rows_are_read_in_place_no_further_than_the_padding() {
+        ffmpeg_next::init().unwrap();
+        for (width, height) in [(2732u32, 2048u32), (2733, 2048), (1680, 1050), (17, 3)] {
+            let row_bytes = width as usize * 4;
+            let frame_bytes = row_bytes * height as usize;
+            let mut mapping = Guarded::new(frame_bytes + FRAME_PADDING);
+            let rows = mapping.bytes();
+            fill_pattern(&mut rows[..frame_bytes], row_bytes);
+            for format in [Pixel::YUV420P, Pixel::NV12] {
+                let before = converted_from_copy(format, rows, width, height);
+                for threads in [1, 4] {
+                    let mut scaler = Scaler::new(format, width, height, threads).unwrap();
+                    let mut after = ffmpeg_next::frame::Video::new(format, width, height);
+                    convert_packed_bgra(&mut scaler, rows, row_bytes, &mut after).unwrap();
+                    if width % 2 == 0 {
+                        let label = format!("{width}x{height} {format:?} threads={threads}");
+                        assert_same_picture(&before, &after, &label);
+                    }
+                }
             }
         }
     }
