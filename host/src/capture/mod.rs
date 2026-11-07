@@ -108,6 +108,34 @@ pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool 
     last_present_time != 0 || seen_image
 }
 
+/// What the capture loop does with an acquired frame.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Acquired {
+    /// Read the image back for the encoder.
+    ReadBack,
+    /// Release it: there is no image yet ([`frame_has_image`]).
+    Skip,
+    /// Release it: only the pointer moved, and the iPad draws the pointer.
+    /// The last picture still goes out as on a still desktop
+    /// ([`keepalive_due`]): a moving pointer keeps the duplication from ever
+    /// timing out, and without it the watchdog took the silence for a stuck
+    /// capture and restarted the stream, and keyframe requests went
+    /// unanswered.
+    PointerOnly,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn acquired(last_present_time: i64, seen_image: bool, draws_pointer: bool) -> Acquired {
+    if !frame_has_image(last_present_time, seen_image) {
+        Acquired::Skip
+    } else if draws_pointer && last_present_time == 0 {
+        Acquired::PointerOnly
+    } else {
+        Acquired::ReadBack
+    }
+}
+
 pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
     let fps = target_fps.max(1) as u64;
     Duration::from_micros(1_000_000 / fps)
@@ -976,6 +1004,48 @@ mod tests {
         assert!(frame_has_image(756_304_210_358, false));
         // Once an image exists the surface holds it; pointer moves still render.
         assert!(frame_has_image(0, true));
+    }
+
+    /// While only the pointer moves and the iPad draws it, the duplication
+    /// returns pointer updates (here 600 a second) and never times out. The
+    /// last picture must still go out every keepalive, and a keyframe request
+    /// be answered within its resend time, as on a still desktop.
+    #[test]
+    fn pointer_only_updates_keep_the_picture_alive_for_an_ipad_that_draws_it() {
+        assert_eq!(acquired(0, false, true), Acquired::Skip, "no image yet");
+        assert_eq!(acquired(0, true, false), Acquired::ReadBack, "older iPad");
+        assert_eq!(
+            acquired(42, true, true),
+            Acquired::ReadBack,
+            "the desktop changed"
+        );
+        let mut since_send = Duration::ZERO;
+        let mut resends = Vec::new();
+        let step = Duration::from_micros(1_600);
+        let mut now = Duration::ZERO;
+        let (mut asked, mut pending) = (false, false);
+        while now < Duration::from_secs(3) {
+            now += step;
+            since_send += step;
+            if !asked && now >= Duration::from_millis(2_000) {
+                (asked, pending) = (true, true);
+            }
+            assert_eq!(acquired(0, true, true), Acquired::PointerOnly);
+            if keepalive_due(since_send, pending, true) {
+                resends.push(now);
+                since_send = Duration::ZERO;
+                pending = false;
+            }
+        }
+        assert!(resends.len() >= 4, "{resends:?}");
+        for pair in resends.windows(2) {
+            assert!(pair[1] - pair[0] <= IDLE_KEEPALIVE + step, "{resends:?}");
+        }
+        assert!(
+            resends.iter().any(|at| *at >= Duration::from_millis(2_000)
+                && *at <= Duration::from_millis(2_000) + KEYFRAME_RESEND + step),
+            "the keyframe request waited: {resends:?}"
+        );
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {

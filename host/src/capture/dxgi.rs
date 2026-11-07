@@ -16,10 +16,10 @@ use super::recovery::{
     LossStep, OpenStep, LOSS_GIVE_UP,
 };
 use super::{
-    client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
+    acquired, client_connected, frame_budget_for, frame_buffer, heartbeat, idle_heartbeat,
     keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
-    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
-    FPS_WINDOW, FRAME_PADDING,
+    resolve_target, Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -498,15 +498,34 @@ pub fn run_capture_loop(
 
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
-                // A pointer-only update needs no frame when the iPad draws
-                // the pointer: the transport sends the position.
-                if !frame_has_image(frame_info.LastPresentTime, seen_image)
-                    || (draws_pointer && frame_info.LastPresentTime == 0)
-                {
-                    unsafe {
-                        dupl.ReleaseFrame()?;
+                // A pointer-only update needs no new frame when the iPad
+                // draws the pointer: the transport sends the position.
+                match acquired(frame_info.LastPresentTime, seen_image, draws_pointer) {
+                    Acquired::ReadBack => {}
+                    skip => {
+                        unsafe {
+                            dupl.ReleaseFrame()?;
+                        }
+                        if skip == Acquired::PointerOnly
+                            && client_connected(&shared)
+                            && keepalive_due(
+                                last_send.elapsed(),
+                                shared.force_next_idr.load(Ordering::SeqCst),
+                                seen_image,
+                            )
+                            && keepalive_allowed(seen_image, second_screen)
+                        {
+                            resend_last_frame(
+                                slot,
+                                &shared,
+                                frame_number,
+                                &mut last_send,
+                                &last_frame,
+                                (tex_width, tex_height),
+                            );
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let frame_data = read_back_image(&shared, generation, &mut seen_image, || {
                     windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
