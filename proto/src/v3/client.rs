@@ -52,9 +52,10 @@ pub struct ClientConfig {
     /// Reconnect this long before the session's maximum age.
     pub reconnect_margin: Duration,
     /// How long, from message 2, an attempt whose confirm window ran out
-    /// keeps its receive key: the host's pending lifetime plus time for its
-    /// answer to arrive. A `SessionConfirmAck`, a refusal or media under it
-    /// in that time is still handled.
+    /// keeps its receive key. A `SessionConfirmAck`, a refusal or media under
+    /// it in that time is still handled. The host decides within its 5 s
+    /// pending lifetime, may take up to 5 s more to seal a refusal after
+    /// retiring the record, and the answer needs time in flight: 5 + 5 + 1.
     pub abandoned_keep: Duration,
 }
 
@@ -69,7 +70,7 @@ impl ClientConfig {
             drain_limit: Duration::from_secs(1),
             max_age: SESSION_MAX_AGE,
             reconnect_margin: Duration::from_secs(60),
-            abandoned_keep: Duration::from_secs(6),
+            abandoned_keep: Duration::from_secs(11),
         }
     }
 }
@@ -140,6 +141,11 @@ pub enum ClientOutput {
         dev_id: Id16,
         status: SlotStatus,
     },
+    /// This key can never connect again: pair again, which issues a new
+    /// key. Nothing more is attempted under it.
+    PairAgain {
+        dev_id: Id16,
+    },
     /// No usable answer within the attempt's window. Try the next key.
     AttemptFailed {
         dev_id: Id16,
@@ -177,6 +183,9 @@ impl std::fmt::Debug for ClientOutput {
                 .field("dev_id", dev_id)
                 .field("status", status)
                 .finish(),
+            Self::PairAgain { dev_id } => {
+                f.debug_struct("PairAgain").field("dev_id", dev_id).finish()
+            }
             Self::AttemptFailed { dev_id } => f
                 .debug_struct("AttemptFailed")
                 .field("dev_id", dev_id)
@@ -252,6 +261,12 @@ pub struct Client {
     /// Attempts whose confirm window ran out, oldest first, kept
     /// receive-only: the host may still have committed or refused them.
     abandoned: Vec<Abandoned>,
+    /// The `dev_id` the app wants a session under: set by `connect`,
+    /// cleared by `disconnect` and by a refusal of that key. An abandoned
+    /// attempt is only ever promoted for it.
+    intent: Option<Id16>,
+    /// From a `TooNew` answer: the clock is used only up to this value.
+    clock_limit: Option<u64>,
 }
 
 /// A confirming attempt the iPad stopped retrying. Nothing is sealed under
@@ -262,8 +277,9 @@ struct Abandoned {
     until: Duration,
 }
 
-/// Abandoned attempts kept at once.
-const MAX_ABANDONED: usize = 3;
+/// Abandoned attempts kept at once: a new attempt starts at most every 2 s,
+/// so 11 s of retention holds at most 6.
+const MAX_ABANDONED: usize = 6;
 
 impl Client {
     /// `hello` holds the session fields; its timestamp is set per attempt.
@@ -278,6 +294,8 @@ impl Client {
             live: None,
             drain: None,
             abandoned: Vec::new(),
+            intent: None,
+            clock_limit: None,
         }
     }
 
@@ -295,21 +313,25 @@ impl Client {
     }
 
     /// The next message 1 timestamp: `max(clock, last + 1)`, using only
-    /// values below [`MAX_TIMESTAMP_US`]. An out-of-range clock is ignored.
-    /// If `last + 1` would reach the bound, the sequence restarts from the
-    /// clock, or from 1; the host restarts its filter at the same point.
+    /// values below [`MAX_TIMESTAMP_US`]. An out-of-range clock, or one past
+    /// a host's `TooNew` limit, is ignored. The sequence never restarts:
+    /// once `last + 1` would reach the bound it stays at the last valid
+    /// value, and the host answers `PairAgain`.
     fn next_timestamp(&self, clock_us: u64) -> u64 {
-        let clock = Some(clock_us).filter(|&c| c < MAX_TIMESTAMP_US);
+        let clock = Some(clock_us)
+            .filter(|&c| c < MAX_TIMESTAMP_US)
+            .filter(|&c| self.clock_limit.is_none_or(|limit| c <= limit));
         let after_last = self
             .last_timestamp
             .checked_add(1)
-            .filter(|&t| t < MAX_TIMESTAMP_US);
-        match (clock, after_last) {
-            (Some(c), Some(n)) => c.max(n),
-            (None, Some(n)) => n,
-            (Some(c), None) => c,
-            (None, None) => 1,
-        }
+            .filter(|&t| t < MAX_TIMESTAMP_US)
+            .unwrap_or(MAX_TIMESTAMP_US - 1);
+        clock.map_or(after_last, |c| c.max(after_last))
+    }
+
+    /// Abandoned attempts currently kept.
+    pub fn abandoned_count(&self) -> usize {
+        self.abandoned.len()
     }
 
     pub fn live_session(&self) -> Option<u32> {
@@ -330,10 +352,33 @@ impl Client {
 
     /// Starts an attempt with `key`, abandoning any attempt in progress. A
     /// live session keeps working until the cutover.
+    /// Abandoned attempts under any other key are dropped.
     pub fn connect(&mut self, now: Duration, key: ClientKey, clock_us: u64) -> Vec<ClientOutput> {
         let mut out = Vec::new();
+        self.intent = Some(key.dev_id);
+        self.abandoned.retain(|a| a.key.dev_id == key.dev_id);
         self.start_attempt(now, key, clock_us, false, &mut out);
         out
+    }
+
+    /// The host refused this key, or said it must be paired again: stop
+    /// using it. Ends an attempt under it, drops every abandoned attempt
+    /// under it, and forgets it as the reconnect key.
+    fn retire_key(&mut self, dev_id: &Id16) {
+        let attempt_key = match &self.attempt {
+            Attempt::Connecting { key, .. } | Attempt::Confirming { key, .. } => Some(key.dev_id),
+            _ => None,
+        };
+        if attempt_key == Some(*dev_id) {
+            self.attempt = Attempt::Idle;
+        }
+        self.abandoned.retain(|a| a.key.dev_id != *dev_id);
+        if self.key.as_ref().is_some_and(|k| k.dev_id == *dev_id) {
+            self.key = None;
+        }
+        if self.intent == Some(*dev_id) {
+            self.intent = self.key.as_ref().map(|k| k.dev_id);
+        }
     }
 
     fn start_attempt(
@@ -419,6 +464,21 @@ impl Client {
                     self.start_attempt(now, key, clock_us, true, out);
                 }
             }
+            (Msg2Payload::TooNew { limit_us }, _) => {
+                // Use timestamps at or below the host's limit from now on.
+                self.clock_limit = Some(limit_us);
+                self.last_timestamp = self.last_timestamp.min(limit_us.saturating_sub(1));
+                if stale_retried {
+                    self.attempt = Attempt::Idle;
+                    out.push(ClientOutput::AttemptFailed { dev_id: key.dev_id });
+                } else {
+                    self.start_attempt(now, key, clock_us, true, out);
+                }
+            }
+            (Msg2Payload::PairAgain, _) => {
+                self.retire_key(&key.dev_id);
+                out.push(ClientOutput::PairAgain { dev_id: key.dev_id });
+            }
             (Msg2Payload::Accept(accept), Some(keys)) => {
                 out.push(ClientOutput::ReleaseAllInput);
                 let (mut sealer, opener) = keys.initiator(accept.session_id);
@@ -461,7 +521,7 @@ impl Client {
                         out.push(ClientOutput::Status { dev_id, status });
                     }
                     Ok(Some(SessionMessage::Refused(status))) => {
-                        self.attempt = Attempt::Idle;
+                        self.retire_key(&dev_id);
                         out.push(ClientOutput::Refused { dev_id, status });
                     }
                     Ok(None) => {
@@ -502,15 +562,18 @@ impl Client {
             let dev_id = self.abandoned[index].key.dev_id;
             match SessionMessage::parse(opened.inner_type, &opened.body) {
                 Ok(Some(SessionMessage::ConfirmAck(status))) => {
-                    self.promote_abandoned(now, index, out);
-                    out.push(ClientOutput::Status { dev_id, status });
+                    if self.promote_abandoned(now, index, out) {
+                        out.push(ClientOutput::Status { dev_id, status });
+                    }
                 }
                 Ok(Some(SessionMessage::Refused(status))) => {
-                    self.abandoned.remove(index);
+                    self.retire_key(&dev_id);
                     out.push(ClientOutput::Refused { dev_id, status });
                 }
                 Ok(None) => {
-                    self.promote_abandoned(now, index, out);
+                    if !self.promote_abandoned(now, index, out) {
+                        return;
+                    }
                     out.push(ClientOutput::Deliver {
                         session_id,
                         counter: opened.counter,
@@ -602,13 +665,27 @@ impl Client {
     /// The host answered an abandoned attempt: it committed it after all.
     /// Older abandoned attempts are dropped; a message 1 still unanswered is
     /// no longer needed.
-    fn promote_abandoned(&mut self, now: Duration, index: usize, out: &mut Vec<ClientOutput>) {
+    ///
+    /// Only for the key the app currently wants a session under. Being a
+    /// new cutover, it releases held input first, like message 2 does.
+    /// Returns whether it promoted.
+    fn promote_abandoned(
+        &mut self,
+        now: Duration,
+        index: usize,
+        out: &mut Vec<ClientOutput>,
+    ) -> bool {
+        if self.intent != Some(self.abandoned[index].key.dev_id) {
+            return false;
+        }
         let promoted = self.abandoned.remove(index);
         self.abandoned.drain(..index);
         if self.is_connecting() {
             self.attempt = Attempt::Idle;
         }
+        out.push(ClientOutput::ReleaseAllInput);
         self.go_live(now, *promoted.session, promoted.key.clone(), out);
+        true
     }
 
     /// Makes `session` live and moves the old one to the drain. A drain
@@ -665,9 +742,13 @@ impl Client {
     }
 
     /// Ends the live session with a sealed BYE.
+    /// Abandoned attempts go too, and their keys are wiped, so a late commit
+    /// of one can't bring the session back.
     pub fn disconnect(&mut self, reason: u8) -> Vec<ClientOutput> {
         let mut out = Vec::new();
         self.attempt = Attempt::Idle;
+        self.abandoned.clear();
+        self.intent = None;
         if let Some(mut live) = self.live.take() {
             let bye = SessionMessage::Bye(reason);
             if let Ok(record) = live.sealer.seal(bye.inner_type(), &bye.encode_body()) {
@@ -867,15 +948,52 @@ mod tests {
         // An out-of-range clock: last + 1 instead.
         ipad.set_last_timestamp(500);
         assert_eq!(ipad.next_timestamp(u64::MAX), 501);
-        // At the ceiling: restart from the clock, or from 1.
+        // At the ceiling the sequence stays at the last valid value; it
+        // never restarts.
         ipad.set_last_timestamp(MAX_TIMESTAMP_US - 1);
-        assert_eq!(ipad.next_timestamp(1_000), 1_000);
-        assert_eq!(ipad.next_timestamp(u64::MAX), 1);
-        // Never a value at or above the bound.
+        assert_eq!(ipad.next_timestamp(1_000), MAX_TIMESTAMP_US - 1);
+        assert_eq!(ipad.next_timestamp(u64::MAX), MAX_TIMESTAMP_US - 1);
         let msg1 = sent(&ipad.connect(T0, key(), u64::MAX)).remove(0);
         let parsed = wire::parse_msg1(&msg1).unwrap();
         let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
         assert!(host.payload().timestamp_us < MAX_TIMESTAMP_US);
+    }
+
+    #[test]
+    fn too_new_caps_the_clock_and_retries_once() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 9_000_000)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let (msg2, _) = host
+            .write_msg2(&Msg2Payload::TooNew {
+                limit_us: 5_000_000,
+            })
+            .unwrap();
+        let out = ipad.handle_datagram(T0, &msg2, 9_000_000);
+        let retry = sent(&out).remove(0);
+        let parsed = wire::parse_msg1(&retry).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        assert!(host.payload().timestamp_us <= 5_000_000);
+        assert!(ipad.next_timestamp(9_000_000) <= 5_000_000 + 1);
+    }
+
+    #[test]
+    fn pair_again_retires_the_key() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let (msg2, _) = host.write_msg2(&Msg2Payload::PairAgain).unwrap();
+        let out = ipad.handle_datagram(T0, &msg2, 1_000);
+        assert!(out.contains(&ClientOutput::PairAgain {
+            dev_id: key().dev_id
+        }));
+        assert!(!ipad.is_connecting());
+        assert!(
+            ipad.poll(T0 + Duration::from_secs(3), 1_000).is_empty(),
+            "no AttemptFailed, no retry"
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl Initiator {
     /// Reads a message 2 datagram. On failure nothing changes, so a forged or
     /// stale message 2 doesn't spoil the real one arriving later. On success
     /// the attempt is over: the keys are returned for an `Accept`, and
-    /// dropped for a `Stale`.
+    /// dropped for any other answer.
     pub fn read_msg2(
         &mut self,
         datagram: &[u8],
@@ -134,7 +134,7 @@ impl Initiator {
         let keys = split(&mut self.state);
         Ok(match reply {
             Msg2Payload::Accept(_) => (reply, Some(keys)),
-            Msg2Payload::Stale { .. } => (reply, None),
+            _ => (reply, None),
         })
     }
 }
@@ -211,7 +211,7 @@ impl Responder {
         let keys = split(&mut self.state);
         Ok(match reply {
             Msg2Payload::Accept(_) => (datagram, Some(keys)),
-            Msg2Payload::Stale { .. } => (datagram, None),
+            _ => (datagram, None),
         })
     }
 }

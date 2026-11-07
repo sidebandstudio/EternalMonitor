@@ -258,6 +258,9 @@ pub enum Event {
     IpadAttemptFailed {
         at: Duration,
     },
+    IpadPairAgain {
+        at: Duration,
+    },
     IpadDelivered {
         at: Duration,
         session_id: u32,
@@ -283,6 +286,7 @@ impl Event {
             | Event::IpadStatus { at, .. }
             | Event::IpadRefused { at, .. }
             | Event::IpadAttemptFailed { at }
+            | Event::IpadPairAgain { at }
             | Event::IpadDelivered { at, .. }
             | Event::IpadClosed { at, .. } => *at,
         }
@@ -357,6 +361,13 @@ impl Sim {
         Self::with_configs(seed, HostConfig::new(HOST_ID), ClientConfig::new(HOST_ID))
     }
 
+    /// [`with_configs`](Self::with_configs), with the host's wall clock set.
+    pub fn with_wall_clock(seed: u64) -> Self {
+        let mut sim = Self::new(seed);
+        sim.sync_host_wall_clock();
+        sim
+    }
+
     pub fn with_configs(seed: u64, host: HostConfig, client: ClientConfig) -> Self {
         let mut rng = XorShift(seed | 1);
         let key = Self::new_key(&mut rng);
@@ -392,6 +403,13 @@ impl Sim {
             next_media: Duration::ZERO,
             next_report: Duration::ZERO,
         }
+    }
+
+    /// Gives the host a wall clock equal to the iPads' clock, so its
+    /// timestamp bound applies.
+    pub fn sync_host_wall_clock(&mut self) {
+        let wall = self.clock_us();
+        self.host.set_wall_clock(self.now, wall);
     }
 
     fn new_key(rng: &mut XorShift) -> ClientKey {
@@ -520,6 +538,12 @@ impl Sim {
             to: from,
             datagram: datagram.to_vec(),
         });
+    }
+
+    /// Device 0's app ends its session.
+    pub fn disconnect(&mut self) {
+        let out = self.client.disconnect(0);
+        self.client_outputs(None, out);
     }
 
     /// The host user removes device 0's record.
@@ -714,6 +738,7 @@ impl Sim {
                 ClientOutput::Status { status, .. } => Event::IpadStatus { at: now, status },
                 ClientOutput::Refused { status, .. } => Event::IpadRefused { at: now, status },
                 ClientOutput::AttemptFailed { .. } => Event::IpadAttemptFailed { at: now },
+                ClientOutput::PairAgain { .. } => Event::IpadPairAgain { at: now },
                 ClientOutput::Deliver {
                     session_id,
                     draining,

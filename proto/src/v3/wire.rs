@@ -291,10 +291,20 @@ pub enum Msg2Payload {
     Stale {
         stored_timestamp_us: u64,
     },
+    /// This key's committed timestamp has no valid successor. The key can't
+    /// connect again: pair again, which issues a new key.
+    PairAgain,
+    /// The timestamp was further ahead of the host's clock than it accepts.
+    /// The iPad uses timestamps no later than `limit_us` from now on.
+    TooNew {
+        limit_us: u64,
+    },
 }
 
 const MSG2_ACCEPT: u8 = 0;
 const MSG2_STALE: u8 = 1;
+const MSG2_PAIR_AGAIN: u8 = 2;
+const MSG2_TOO_NEW: u8 = 3;
 
 /// The v3 HelloAck: the v2 fields minus status, version and credential, plus
 /// the slot status.
@@ -333,6 +343,11 @@ impl Msg2Payload {
                 out.push(MSG2_STALE);
                 out.extend_from_slice(&stored_timestamp_us.to_le_bytes());
             }
+            Self::PairAgain => out.push(MSG2_PAIR_AGAIN),
+            Self::TooNew { limit_us } => {
+                out.push(MSG2_TOO_NEW);
+                out.extend_from_slice(&limit_us.to_le_bytes());
+            }
         }
         out
     }
@@ -359,6 +374,8 @@ impl Msg2Payload {
             MSG2_STALE => Ok(Self::Stale {
                 stored_timestamp_us: r.u64()?,
             }),
+            MSG2_PAIR_AGAIN => Ok(Self::PairAgain),
+            MSG2_TOO_NEW => Ok(Self::TooNew { limit_us: r.u64()? }),
             _ => Err(WireError::InvalidField("msg2_kind")),
         }
     }

@@ -1,8 +1,9 @@
 //! Host and iPad state machines together on the simulated network, with
 //! fuzzer-chosen loss, duplication, delay, latency, host answers, reconnects,
-//! replays and forged datagrams. After every step the host table's
-//! invariants hold, and every iPad only ever goes live on a session the
-//! host committed for it, also after the network settles.
+//! disconnects, lost acks and refusals, replays and forged datagrams. After
+//! every step the host table's invariants hold, and every iPad only ever goes
+//! live on a session the host committed for it, also after the network
+//! settles.
 #![no_main]
 
 #[path = "../../tests/v3_sim/mod.rs"]
@@ -51,7 +52,14 @@ fuzz_target!(|data: &[u8]| {
     sim.policy.decision_delay = ms(u64::from(cursor.borrow_mut().byte()) * 12);
     let second = sim.add_ipad(SimAddr { ip: 20, port: 1 });
     let net = cursor.clone();
-    sim.fault = Box::new(move |_| {
+    // Acks and refusals to lose next, set by an op.
+    let lose_answers = Rc::new(std::cell::Cell::new(0u8));
+    let lose = lose_answers.clone();
+    sim.fault = Box::new(move |sent| {
+        if sent.kind == Kind::AckOrRefused && lose.get() > 0 {
+            lose.set(lose.get() - 1);
+            return Fate::Drop;
+        }
         let b = net.borrow_mut().byte();
         match b % 16 {
             0 | 1 => Fate::Drop,
@@ -92,6 +100,11 @@ fuzz_target!(|data: &[u8]| {
             3 => sim.revoke(),
             4 => sim.policy.refuse = !sim.policy.refuse,
             6 => sim.connect_other(second),
+            9 => sim.disconnect(),
+            10 => {
+                let count = cursor.borrow_mut().byte() % 4 + 1;
+                lose_answers.set(count);
+            }
             7 => {
                 // Device 0 roams to a fuzzer-chosen address.
                 let ip = u16::from(cursor.borrow_mut().byte() % 4);

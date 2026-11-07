@@ -42,35 +42,28 @@ jobs:
         run: cargo "+$FUZZ_TOOLCHAIN" fuzz build
       - name: Run each target for 30 s
         working-directory: proto/fuzz
+        # The repository is public: libFuzzer's output names and encodes the
+        # crashing input, so it goes to a file that is never printed or
+        # uploaded. A crash is reported by target name only.
         run: |
-          set -euo pipefail
+          set -uo pipefail
           targets="v3_handshake v3_parsers v3_record_open v3_replay_window v3_session_sim"
           listed=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list | sort | tr '\n' ' ' | sed 's/ $//')
           if [ "$listed" != "$targets" ]; then
             echo "::error::fuzz targets are '$listed', expected '$targets'"
             exit 1
           fi
+          failed=0
           for target in $targets; do
             sanitizer=address
             # Safe Rust only; it runs far faster without the sanitizer.
             if [ "$target" = v3_session_sim ]; then sanitizer=none; fi
-            echo "::group::$target"
-            cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30
-            echo "::endgroup::"
+            log="$RUNNER_TEMP/fuzz-$target.log"
+            if cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30 > "$log" 2>&1; then
+              echo "$target: $(grep -E '^Done [0-9]+ runs' "$log" || echo 'finished')"
+            else
+              echo "::error::crash in $target, reproduce locally with cargo fuzz run $target"
+              failed=1
+            fi
           done
-      - name: Check the crash artifacts for secret values
-        id: artifact-scan
-        if: failure()
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/artifact_secrets.py scan
-          --secrets GITHUB_TOKEN
-          proto/fuzz/artifacts
-      - name: Upload crash artifacts
-        if: failure() && steps.artifact-scan.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: proto-fuzz-artifacts
-          path: proto/fuzz/artifacts
-          if-no-files-found: ignore
+          exit "$failed"
