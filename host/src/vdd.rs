@@ -819,6 +819,7 @@ mod tests {
                 .with_max_level(tracing::Level::DEBUG)
                 .with_writer(std::io::sink)
                 .finish();
+            crate::logging::prepare_log_capture();
             let ran = tracing::subscriber::with_default(subscriber, || {
                 tasks.set_enabled(
                     true,

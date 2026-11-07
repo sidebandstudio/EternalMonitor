@@ -543,11 +543,50 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Call before a test sets the subscriber that captures its log lines.
+///
+/// `tracing` decides once, for the whole process, whether a log line is
+/// wanted: the first time any thread runs it. While only one subscriber is
+/// registered, it asks only the thread running the line, so a test thread
+/// with no subscriber caches the line as unwanted and the test capturing it
+/// on another thread never sees it. A second registered subscriber, nobody's
+/// default, makes `tracing` ask every live subscriber instead.
+#[cfg(test)]
+pub(crate) fn prepare_log_capture() {
+    static ANOTHER: Lazy<tracing::Dispatch> =
+        Lazy::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    Lazy::force(&ANOTHER);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// A line another thread runs first, with no subscriber, still reaches
+    /// the capturing test.
+    #[test]
+    fn a_capture_sees_a_line_another_thread_ran_first() {
+        use tracing_subscriber::prelude::*;
+        fn line() {
+            tracing::info!("first run elsewhere");
+        }
+        struct Count(Arc<Mutex<usize>>);
+        impl<S: Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+                *self.0.lock() += 1;
+            }
+        }
+        prepare_log_capture();
+        let count = Arc::new(Mutex::new(0));
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Count(Arc::clone(&count))),
+        );
+        std::thread::spawn(line).join().unwrap();
+        line();
+        assert_eq!(*count.lock(), 1);
+    }
 
     #[test]
     fn mdns_success_announcements_do_not_hide_real_errors() {
@@ -565,6 +604,7 @@ mod tests {
                 .with_writer(move || writer.clone())
                 .with_filter(MdnsDedupFilter::new()),
         );
+        prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             // The log-to-tracing bridge stores the original module in log.target.
             tracing::error!(target: "log", { log.target = "mdns_sd::service_daemon" },
@@ -815,6 +855,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(move || writer.clone()),
         );
+        prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             crate::diagnostics::install_ffmpeg_logging();
             let format =
