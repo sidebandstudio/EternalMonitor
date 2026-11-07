@@ -367,6 +367,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
 
+    // The last stream's releases of held keys and buttons reach Windows,
+    // unless Windows is stuck.
+    gui_control
+        .shared
+        .input
+        .finish(std::time::Duration::from_millis(500));
+
     // The window is gone and the display is off, so a slow disk keeps no one
     // waiting on screen: give the second screen record up to 30 s to land.
     eternal_host::capture::second_screen::finish_saving(&gui_control.shared);

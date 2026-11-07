@@ -226,7 +226,9 @@ pub async fn start_sender(
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
 
-    let input = crate::input::Injector::start(std::sync::Arc::clone(&shared.capture_geometry));
+    let input = shared
+        .input
+        .begin(std::sync::Arc::clone(&shared.capture_geometry));
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
@@ -1159,7 +1161,7 @@ mod tests {
         LoopState {
             retransmit_ring: RetransmitRing::default(),
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
-            input: crate::input::Injector::start(Default::default()),
+            input: crate::input::InputThread::default().begin(Default::default()),
             abr: AbrController::new(15_000_000, true),
         }
     }

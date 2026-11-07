@@ -84,6 +84,9 @@ pub struct SharedControl {
     /// normalized touch coordinates onto this rect. `None` until the first
     /// capture stage comes up.
     pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
+    /// The one thread that hands iPad input to Windows, for every stream
+    /// generation of this app.
+    pub input: Arc<crate::input::InputThread>,
     /// The user's "prefer HEVC" setting. The encoder switches to an H.265
     /// session only when this is on AND the connected client advertised HEVC
     /// decode in its HELLO2.
@@ -196,6 +199,7 @@ impl SharedControl {
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
             transport_beat: Default::default(),
             capture_geometry: Arc::new(Mutex::new(None)),
+            input: Arc::default(),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
             audio_enabled: Arc::new(AtomicBool::new(true)),
             active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),

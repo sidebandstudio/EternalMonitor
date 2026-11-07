@@ -4,8 +4,14 @@
 //! `GetSystemMetrics`, creating the pen device) can wait while Windows
 //! reconfigures its displays. They ran on the transport loop, which then
 //! answered nobody: no heartbeats, no HELLO answers, and a stopped stream
-//! kept its port. Now the transport only queues input, and this thread
-//! hands it to Windows in order.
+//! kept its port. Now the transport only queues input, and one thread for
+//! the whole app hands it to Windows in order.
+//!
+//! Each stream generation queues on the same thread, behind the one before
+//! it. A generation's end releases what its input still holds before the
+//! next one's input lands, however long Windows kept the thread waiting,
+//! and a restart never starts a second thread that could inject alongside
+//! a stuck one.
 //!
 //! The queue is bounded. While Windows takes nothing, a pointer or Pencil
 //! move replaces the move queued just before it, so a backlog never replays
@@ -15,7 +21,8 @@
 //! key releases and session resets are never dropped or merged.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::InputEvent;
@@ -47,8 +54,8 @@ const SLOW_CALL: Duration = Duration::from_millis(250);
 /// milliseconds or worse on Windows.
 const PRECISE_WAIT: Duration = Duration::from_millis(2);
 
-/// How long the transport waits at its start for the thread to say whether
-/// Windows gave it a pen device.
+/// How long the first stream waits for the thread to say whether Windows
+/// gave it a pen device. Later streams know at once.
 const START_WAIT: Duration = Duration::from_secs(1);
 
 /// What the injection thread drives: the input relay, or a test's fake.
@@ -86,8 +93,14 @@ impl Sink for InputRelay {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+type Geometry = Arc<Mutex<Option<CaptureGeometry>>>;
+
+#[derive(Debug, Clone)]
 enum Command {
+    /// A stream generation starts: what the one before it holds is
+    /// released first. `geometry` is the capture rect a still Pencil
+    /// follows.
+    Begin { geometry: Geometry },
     Relay {
         session_id: u32,
         event: InputEvent,
@@ -96,6 +109,8 @@ enum Command {
     },
     /// Release what the PC holds: the session ended, expired or is on hold.
     Reset,
+    /// The generation's stream stopped: release what it holds.
+    End,
 }
 
 impl Command {
@@ -134,10 +149,11 @@ impl Command {
             && event.buttons == earlier_event.buttons
     }
 
-    /// An end or reset: what keeps the PC from holding a key or button.
+    /// An end, reset or generation change: what keeps the PC from holding
+    /// a key or button.
     fn must_land(&self) -> bool {
         match self {
-            Command::Reset => true,
+            Command::Begin { .. } | Command::Reset | Command::End => true,
             Command::Relay { event, .. } => event.phase > PHASE_MOVED,
         }
     }
@@ -145,6 +161,7 @@ impl Command {
 
 #[derive(Debug)]
 struct Queued {
+    generation: u64,
     command: Command,
     at: Instant,
 }
@@ -152,27 +169,33 @@ struct Queued {
 #[derive(Debug, Default)]
 struct State {
     commands: VecDeque<Queued>,
-    closed: bool,
+    /// The thread is handing a command to Windows.
+    busy: bool,
     merged: u64,
     dropped: u64,
 }
 
+/// What the transport's handles and the thread share.
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    capacity: usize,
-    merge_from: usize,
-    stale_after: Duration,
+    /// The queue is empty and the thread waits: for `InputThread::finish`.
+    idle: Condvar,
+    limits: Limits,
+    next_generation: AtomicU64,
+    /// Whether the relay has a native pen device: 0 not known yet, 1 no,
+    /// 2 yes.
+    pen: AtomicU8,
 }
 
 impl Shared {
-    fn push(&self, command: Command, now: Instant) {
+    fn push(&self, generation: u64, command: Command, now: Instant) {
         let mut state = self.state.lock();
         let waiting = state.commands.len();
-        if waiting >= self.merge_from {
+        if waiting >= self.limits.merge_from {
             if let Some(last) = state.commands.back_mut() {
-                if command.merges_with(&last.command) {
+                if last.generation == generation && command.merges_with(&last.command) {
                     // The newer sample, in the older one's place: it has
                     // waited as long.
                     last.command = command;
@@ -182,75 +205,141 @@ impl Shared {
             }
         }
         // Ends and resets may pass the bound, by as many as were pressed.
-        if waiting >= self.capacity && !(command.must_land() && waiting < 2 * self.capacity) {
+        let capacity = self.limits.capacity;
+        if waiting >= capacity && !(command.must_land() && waiting < 2 * capacity) {
             state.dropped += 1;
             return;
         }
-        state.commands.push_back(Queued { command, at: now });
+        state.commands.push_back(Queued {
+            generation,
+            command,
+            at: now,
+        });
         drop(state);
         self.wake.notify_one();
     }
 }
 
-/// The transport's handle on the injection thread. Dropping it lets the
-/// thread hand over what is queued and release what the PC holds, without
-/// waiting for Windows.
+/// The app's one input thread, started with the first stream that takes
+/// input. `SharedControl` keeps it across stream generations.
+#[derive(Default)]
+pub struct InputThread {
+    shared: OnceLock<Arc<Shared>>,
+}
+
+impl std::fmt::Debug for InputThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputThread")
+            .field("started", &self.shared.get().is_some())
+            .finish()
+    }
+}
+
+impl InputThread {
+    /// A new stream generation's handle; starts the thread with the relay
+    /// the first time.
+    pub fn begin(&self, geometry: Geometry) -> Injector {
+        let shared = self.shared.get_or_init(|| {
+            #[cfg(all(test, not(windows)))]
+            let recorder = super::recorder::current();
+            spawn(Limits::default(), move || {
+                #[cfg(all(test, not(windows)))]
+                super::recorder::adopt(recorder);
+                InputRelay::default()
+            })
+        });
+        Injector::begin(Arc::clone(shared), geometry)
+    }
+
+    /// A thread driving a test's fake instead of Windows.
+    #[cfg(test)]
+    fn with_sink<S: Sink>(limits: Limits, sink: impl FnOnce() -> S + Send + 'static) -> Self {
+        let thread = Self::default();
+        let _ = thread.shared.set(spawn(limits, sink));
+        thread
+    }
+
+    /// At quit: wait up to `limit` for what is queued, the last stream's
+    /// releases among it, to reach Windows. Whether it did.
+    pub fn finish(&self, limit: Duration) -> bool {
+        let Some(shared) = self.shared.get() else {
+            return true;
+        };
+        let deadline = Instant::now() + limit;
+        let mut state = shared.state.lock();
+        while state.busy || !state.commands.is_empty() {
+            if shared.idle.wait_until(&mut state, deadline).timed_out() {
+                warn!(
+                    waiting = state.commands.len(),
+                    "Quitting before Windows took the last input"
+                );
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn spawn<S: Sink>(limits: Limits, sink: impl FnOnce() -> S + Send + 'static) -> Arc<Shared> {
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State::default()),
+        wake: Condvar::new(),
+        idle: Condvar::new(),
+        limits,
+        next_generation: AtomicU64::new(1),
+        pen: AtomicU8::new(0),
+    });
+    let worker = Arc::clone(&shared);
+    let spawned = std::thread::Builder::new()
+        .name("input-inject".into())
+        .spawn(move || {
+            let mut sink = sink();
+            note_pen(&worker, &sink);
+            run(&worker, &mut sink);
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "Could not start the input thread; input is ignored");
+        shared.pen.store(1, Ordering::SeqCst);
+    }
+    shared
+}
+
+fn note_pen(shared: &Shared, sink: &impl Sink) {
+    let pen = if sink.pen_available() { 2 } else { 1 };
+    shared.pen.store(pen, Ordering::SeqCst);
+}
+
+/// One stream generation's handle on the input thread. Dropping it
+/// releases what the generation's input holds, in turn, without waiting
+/// for Windows.
 #[derive(Debug)]
 pub struct Injector {
     shared: Arc<Shared>,
+    generation: u64,
     pen_available: bool,
 }
 
 impl Injector {
-    /// Starts the thread with a new relay. `geometry` is the capture rect a
-    /// still Pencil follows.
-    pub fn start(geometry: Arc<Mutex<Option<CaptureGeometry>>>) -> Self {
-        #[cfg(all(test, not(windows)))]
-        let recorder = super::recorder::current();
-        Self::spawn(geometry, Limits::default(), move || {
-            #[cfg(all(test, not(windows)))]
-            super::recorder::adopt(recorder);
-            InputRelay::default()
-        })
-    }
-
-    fn spawn<S: Sink>(
-        geometry: Arc<Mutex<Option<CaptureGeometry>>>,
-        limits: Limits,
-        sink: impl FnOnce() -> S + Send + 'static,
-    ) -> Self {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
-            wake: Condvar::new(),
-            capacity: limits.capacity,
-            merge_from: limits.merge_from,
-            stale_after: limits.stale_after,
-        });
-        let (ready_tx, ready) = std::sync::mpsc::channel();
-        let worker = Arc::clone(&shared);
-        let spawned = std::thread::Builder::new()
-            .name("input-inject".into())
-            .spawn(move || {
-                let mut sink = sink();
-                let _ = ready_tx.send(sink.pen_available());
-                run(&worker, &mut sink, &geometry);
-            });
-        let pen_available = match spawned {
-            Ok(_) => ready.recv_timeout(START_WAIT).unwrap_or_else(|_| {
-                warn!(
-                    wait_ms = START_WAIT.as_millis() as u64,
-                    "Windows did not set up input in time; the Pencil uses the mouse this stream"
-                );
-                false
-            }),
-            Err(error) => {
-                warn!(%error, "Could not start the input thread; input is ignored this stream");
-                shared.state.lock().closed = true;
-                false
+    fn begin(shared: Arc<Shared>, geometry: Geometry) -> Self {
+        let generation = shared.next_generation.fetch_add(1, Ordering::SeqCst);
+        shared.push(generation, Command::Begin { geometry }, Instant::now());
+        let started = Instant::now();
+        let pen_available = loop {
+            match shared.pen.load(Ordering::SeqCst) {
+                0 if started.elapsed() < START_WAIT => std::thread::sleep(Duration::from_millis(1)),
+                0 => {
+                    warn!(
+                        wait_ms = START_WAIT.as_millis() as u64,
+                        "Windows did not set up input in time; the Pencil uses the mouse this stream"
+                    );
+                    break false;
+                }
+                pen => break pen == 2,
             }
         };
         Self {
             shared,
+            generation,
             pen_available,
         }
     }
@@ -262,27 +351,27 @@ impl Injector {
 
     /// Queue one session-validated event. Never waits for Windows.
     pub fn relay(&self, session_id: u32, event: InputEvent, output: CaptureGeometry, late: bool) {
-        self.shared.push(
-            Command::Relay {
-                session_id,
-                event,
-                output,
-                late,
-            },
-            Instant::now(),
-        );
+        self.push(Command::Relay {
+            session_id,
+            event,
+            output,
+            late,
+        });
     }
 
     /// Queue a release of every key, button and pen contact the PC holds.
     pub fn reset(&self) {
-        self.shared.push(Command::Reset, Instant::now());
+        self.push(Command::Reset);
+    }
+
+    fn push(&self, command: Command) {
+        self.shared.push(self.generation, command, Instant::now());
     }
 }
 
 impl Drop for Injector {
     fn drop(&mut self) {
-        self.shared.state.lock().closed = true;
-        self.shared.wake.notify_one();
+        self.push(Command::End);
     }
 }
 
@@ -307,7 +396,6 @@ enum Next {
     Command(Queued),
     /// A pen frame's spacing or the refresh tick is due.
     Due,
-    Closed,
 }
 
 /// Input that waited for Windows, counted until the queue empties.
@@ -317,20 +405,29 @@ struct Backlog {
     longest: Duration,
 }
 
-fn run<S: Sink>(shared: &Shared, sink: &mut S, geometry: &Mutex<Option<CaptureGeometry>>) {
+/// The generation whose input the thread takes now.
+struct Current {
+    generation: u64,
+    geometry: Geometry,
+    /// Its input reached the relay, so its end has something to release.
+    relayed: bool,
+}
+
+fn run<S: Sink>(shared: &Shared, sink: &mut S) {
     let mut timer = crate::capture::timing::FrameTimer::new();
     let mut next_tick = Instant::now() + PEN_TICK;
     let mut backlog = Backlog::default();
+    let mut current: Option<Current> = None;
     loop {
         let next = {
             let mut state = shared.state.lock();
+            state.busy = false;
             loop {
                 if let Some(queued) = state.commands.pop_front() {
+                    state.busy = true;
                     break Next::Command(queued);
                 }
-                if state.closed {
-                    break Next::Closed;
-                }
+                shared.idle.notify_all();
                 let (merged, dropped) = (
                     std::mem::take(&mut state.merged),
                     std::mem::take(&mut state.dropped),
@@ -346,8 +443,9 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S, geometry: &Mutex<Option<CaptureGe
                     backlog = Backlog::default();
                 }
                 let now = Instant::now();
-                let spaced = sink.spaced_until();
-                let due = spaced.or_else(|| sink.tick_needed().then_some(next_tick));
+                let spaced = current.as_ref().and(sink.spaced_until());
+                let ticks = current.is_some() && sink.tick_needed();
+                let due = spaced.or_else(|| ticks.then_some(next_tick));
                 match due {
                     Some(at) if at <= now => break Next::Due,
                     Some(at) if spaced.is_some() && at - now <= PRECISE_WAIT => {
@@ -367,32 +465,61 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S, geometry: &Mutex<Option<CaptureGe
                 }
             }
         };
-        match next {
-            Next::Command(Queued { command, at }) => {
-                let started = Instant::now();
-                let waited = started.saturating_duration_since(at);
-                backlog.longest = backlog.longest.max(waited);
-                match command {
-                    Command::Relay {
-                        session_id,
-                        event,
-                        output,
-                        late,
-                    } => {
-                        let stale = waited > shared.stale_after;
-                        backlog.stale += u64::from(stale && !late);
-                        sink.relay(session_id, &event, output, late || stale);
+        if let Next::Command(Queued {
+            generation,
+            command,
+            at,
+        }) = next
+        {
+            let started = Instant::now();
+            let waited = started.saturating_duration_since(at);
+            backlog.longest = backlog.longest.max(waited);
+            let ours = current
+                .as_ref()
+                .is_some_and(|current| current.generation == generation);
+            match command {
+                Command::Begin { geometry } => {
+                    // A generation that never said it ended releases what
+                    // it holds before the new one's input.
+                    if current.take().is_some_and(|current| current.relayed) {
+                        sink.reset();
                     }
-                    Command::Reset => sink.reset(),
+                    current = Some(Current {
+                        generation,
+                        geometry,
+                        relayed: false,
+                    });
                 }
-                note_slow(started, "input");
+                Command::End if ours => {
+                    if current.take().is_some_and(|current| current.relayed) {
+                        sink.reset();
+                    }
+                }
+                Command::Reset if ours => sink.reset(),
+                Command::Relay {
+                    session_id,
+                    event,
+                    output,
+                    late,
+                } if ours => {
+                    let stale = waited > shared.limits.stale_after;
+                    backlog.stale += u64::from(stale && !late);
+                    sink.relay(session_id, &event, output, late || stale);
+                    if let Some(current) = current.as_mut() {
+                        current.relayed = true;
+                    }
+                }
+                // An ended generation's: its end released what it held.
+                Command::End | Command::Reset | Command::Relay { .. } => {}
             }
-            // The relay goes with the thread, releasing what the PC holds.
-            Next::Closed => return,
-            Next::Due => {}
+            note_slow(started, "input");
+            note_pen(shared, sink);
         }
         // Pen frames held back for their spacing, and the refresh a still
         // contact needs, go between commands.
+        let Some(current) = current.as_ref() else {
+            continue;
+        };
         let now = Instant::now();
         let spaced_due = sink.spaced_until().is_some_and(|at| at <= now);
         let tick_due = sink.spaced_until().is_none() && sink.tick_needed() && next_tick <= now;
@@ -401,7 +528,7 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S, geometry: &Mutex<Option<CaptureGe
                 next_tick = now + PEN_TICK;
             }
             let started = Instant::now();
-            sink.keep_alive(*geometry.lock());
+            sink.keep_alive(*current.geometry.lock());
             note_slow(started, "pen_refresh");
         }
     }
@@ -484,6 +611,7 @@ mod tests {
     }
 
     struct Harness {
+        thread: InputThread,
         injector: Option<Injector>,
         calls: Arc<Mutex<Vec<Call>>>,
         go: mpsc::Sender<()>,
@@ -495,17 +623,23 @@ mod tests {
         let (go, hold) = mpsc::channel();
         let (entered_tx, entered) = mpsc::channel();
         let recorded = Arc::clone(&calls);
-        let injector = Injector::spawn(Arc::new(Mutex::new(Some(OUTPUT))), limits, move || Fake {
+        let thread = InputThread::with_sink(limits, move || Fake {
             calls: recorded,
             hold: Some(hold),
             entered: Some(entered_tx),
         });
+        let injector = thread.begin(geometry());
         Harness {
+            thread,
             injector: Some(injector),
             calls,
             go,
             entered,
         }
+    }
+
+    fn geometry() -> Geometry {
+        Arc::new(Mutex::new(Some(OUTPUT)))
     }
 
     impl Harness {
@@ -535,6 +669,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             self.calls.lock().clone()
+        }
+
+        /// Nothing more reaches Windows.
+        fn settled(&self, count: usize) {
+            assert!(self.thread.finish(Duration::from_secs(5)));
+            assert_eq!(self.calls.lock().len(), count, "{:?}", self.calls.lock());
         }
     }
 
@@ -645,8 +785,7 @@ mod tests {
             Call::Reset,
         ];
         assert_eq!(harness.wait_for(expected.len()), expected);
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(harness.calls.lock().len(), expected.len());
+        harness.settled(expected.len());
     }
 
     #[test]
@@ -710,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_handle_returns_at_once_and_its_input_still_lands() {
+    fn a_dropped_handle_returns_at_once_and_its_input_still_lands_then_is_released() {
         let mut harness = harness(Limits::default());
         harness.stuck();
         harness.send(KIND_KEY, PHASE_ENDED, 1);
@@ -718,13 +857,55 @@ mod tests {
         drop(harness.injector.take());
         assert!(started.elapsed() < Duration::from_millis(100));
         harness.go.send(()).unwrap();
-        assert_eq!(
-            harness.wait_for(2),
-            [
-                relayed(KIND_KEY, PHASE_BEGAN, 0),
-                relayed(KIND_KEY, PHASE_ENDED, 1),
-            ]
-        );
+        let expected = [
+            relayed(KIND_KEY, PHASE_BEGAN, 0),
+            relayed(KIND_KEY, PHASE_ENDED, 1),
+            Call::Reset,
+        ];
+        assert_eq!(harness.wait_for(3), expected);
+        harness.settled(expected.len());
+    }
+
+    /// A stream restarts while Windows holds the old one's input. The new
+    /// generation's handle is ready at once, on the same thread, and its
+    /// input lands only after the old one's release: a key it presses
+    /// stays down. Restarts over and over start no thread of their own.
+    #[test]
+    fn a_restart_while_windows_is_stuck_releases_the_old_input_before_the_new() {
+        let mut harness = harness(Limits::default());
+        harness.stuck();
+        drop(harness.injector.take());
+        let started = Instant::now();
+        let mut generations: Vec<_> = (0..20).map(|_| harness.thread.begin(geometry())).collect();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let newest = generations.pop().unwrap();
+        generations.clear();
+        newest.relay(1, event(KIND_KEY, PHASE_BEGAN, 1), OUTPUT, false);
+        harness.go.send(()).unwrap();
+        let expected = [
+            relayed(KIND_KEY, PHASE_BEGAN, 0),
+            Call::Reset,
+            relayed(KIND_KEY, PHASE_BEGAN, 1),
+        ];
+        assert_eq!(harness.wait_for(3), expected);
+        // The old generations' ends, queued behind the new one's start,
+        // released nothing of it.
+        harness.settled(expected.len());
+        drop(newest);
+        assert_eq!(harness.wait_for(4)[3], Call::Reset);
+    }
+
+    #[test]
+    fn quitting_waits_for_queued_releases_but_not_past_its_limit() {
+        let harness = harness(Limits::default());
+        harness.stuck();
+        harness.send(KIND_KEY, PHASE_ENDED, 1);
+        let started = Instant::now();
+        assert!(!harness.thread.finish(Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        harness.go.send(()).unwrap();
+        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert_eq!(harness.calls.lock().len(), 2);
     }
 
     /// The real relay, with a native pen device that takes every frame
@@ -739,39 +920,36 @@ mod tests {
         let (taken_tx, taken_rx) = mpsc::channel();
         let delivered = Arc::new(Mutex::new(None));
         let at = Arc::clone(&delivered);
-        let injector = Injector::spawn(
-            Arc::new(Mutex::new(Some(OUTPUT))),
-            Limits::default(),
-            move || {
-                let taken = native_pen::install();
-                *at.lock() = Some(Instant::now());
-                native_pen::with(|device| {
-                    for x in 0..SAMPLES as u16 {
-                        let sample = PenSample {
-                            phase: if x == 0 {
-                                PenPhase::Down
-                            } else {
-                                PenPhase::Move
-                            },
-                            x: i32::from(x),
-                            y: 10,
-                            x_norm: x,
-                            y_norm: 10,
-                            pressure: 512,
-                            tilt_x: 0,
-                            tilt_y: 0,
-                        };
-                        device.deliver(sample, native_pen::SCREEN, Some(OUTPUT), Instant::now());
-                    }
-                });
-                assert!(
-                    taken.lock().len() < SAMPLES / 2,
-                    "the spacing must hold the backlog back"
-                );
-                taken_tx.send(taken).unwrap();
-                InputRelay::default()
-            },
-        );
+        let thread = InputThread::with_sink(Limits::default(), move || {
+            let taken = native_pen::install();
+            *at.lock() = Some(Instant::now());
+            native_pen::with(|device| {
+                for x in 0..SAMPLES as u16 {
+                    let sample = PenSample {
+                        phase: if x == 0 {
+                            PenPhase::Down
+                        } else {
+                            PenPhase::Move
+                        },
+                        x: i32::from(x),
+                        y: 10,
+                        x_norm: x,
+                        y_norm: 10,
+                        pressure: 512,
+                        tilt_x: 0,
+                        tilt_y: 0,
+                    };
+                    device.deliver(sample, native_pen::SCREEN, Some(OUTPUT), Instant::now());
+                }
+            });
+            assert!(
+                taken.lock().len() < SAMPLES / 2,
+                "the spacing must hold the backlog back"
+            );
+            taken_tx.send(taken).unwrap();
+            InputRelay::default()
+        });
+        let injector = thread.begin(geometry());
         let taken = taken_rx.recv().unwrap();
         let started = Instant::now();
         while taken.lock().len() < SAMPLES && started.elapsed() < Duration::from_secs(2) {

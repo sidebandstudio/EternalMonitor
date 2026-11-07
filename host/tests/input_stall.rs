@@ -121,6 +121,10 @@ fn input_windows_holds_never_stops_the_transport_loop() {
     eternal_host::clock::init();
     // Never reach a real iPad over USB.
     std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
+    // Bound first, so their ports are never the one the PC takes.
+    let unbound = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut ipad = Ipad::new(unbound, 1);
+    let mut other = Ipad::new(unbound, 2);
     let port = UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
@@ -153,7 +157,8 @@ fn input_windows_holds_never_stops_the_transport_loop() {
             .unwrap();
     });
     let host = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut ipad = Ipad::new(host, 1);
+    ipad.host = host;
+    other.host = host;
     let session_id = ipad.accepted();
 
     // Windows stops taking input, and the iPad presses a key.
@@ -191,7 +196,6 @@ fn input_windows_holds_never_stops_the_transport_loop() {
     // iPad's HELLO is answered, and the watch sees the loop moving.
     let mut watch = Watch::default();
     let mut verdicts = Vec::new();
-    let mut other = Ipad::new(host, 2);
     other.hello();
     let mut heartbeats = 0;
     let mut answered = false;

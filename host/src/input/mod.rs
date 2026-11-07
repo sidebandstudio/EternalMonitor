@@ -11,7 +11,7 @@ mod hid;
 pub use hid::hid_to_scancode;
 
 mod injector;
-pub use injector::Injector;
+pub use injector::{Injector, InputThread};
 
 #[cfg(windows)]
 pub mod windows_inject;
@@ -509,34 +509,59 @@ pub(crate) mod native_pen {
 pub mod hold {
     use parking_lot::{Condvar, Mutex};
 
-    /// Whether injections wait, and how many are waiting.
-    static HELD: Mutex<(bool, usize)> = Mutex::new((false, 0));
+    #[derive(Default)]
+    struct Held {
+        on: bool,
+        /// Only the first injection waits; later ones pass, as on a thread
+        /// Windows is not holding.
+        first_only: bool,
+        waiting: usize,
+    }
+
+    static HELD: Mutex<Held> = Mutex::new(Held {
+        on: false,
+        first_only: false,
+        waiting: 0,
+    });
     static RELEASED: Condvar = Condvar::new();
 
+    /// Every injection waits until [`release`].
     pub fn hold() {
-        HELD.lock().0 = true;
+        *HELD.lock() = Held {
+            on: true,
+            ..Held::default()
+        };
+    }
+
+    /// The next injection waits until [`release`]; the rest pass.
+    pub fn hold_next() {
+        *HELD.lock() = Held {
+            on: true,
+            first_only: true,
+            waiting: 0,
+        };
     }
 
     pub fn release() {
-        HELD.lock().0 = false;
+        HELD.lock().on = false;
         RELEASED.notify_all();
     }
 
     /// Injections waiting now.
     pub fn waiting() -> usize {
-        HELD.lock().1
+        HELD.lock().waiting
     }
 
     pub(super) fn pass() {
         let mut held = HELD.lock();
-        if !held.0 {
+        if !held.on || (held.first_only && held.waiting > 0) {
             return;
         }
-        held.1 += 1;
-        while held.0 {
+        held.waiting += 1;
+        while held.on {
             RELEASED.wait(&mut held);
         }
-        held.1 -= 1;
+        held.waiting -= 1;
     }
 }
 
