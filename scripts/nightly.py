@@ -22,7 +22,8 @@ Users see these builds as the Beta channel. Each is a semver pre-release,
 <next>-beta.<YYYYMMDD>.<run>, which semver orders below <next> and above a
 hand-made <next>-beta.1. A stable install is never offered one. A Beta
 install reads the beta release's body (beta_body()) and is offered the newer
-of that Beta and the next stable release (host/src/updates.rs).
+of that Beta and the next stable release (host/src/updates.rs), once
+scripts/sign_beta_manifest.py has signed the build; this script never signs.
 """
 import argparse
 import datetime

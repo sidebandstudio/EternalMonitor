@@ -9,7 +9,10 @@
 //!
 //! A Beta build (`x.y.z-beta.…`) also reads the nightly's fixed `beta`
 //! GitHub release (scripts/nightly.py) and is offered the newer of that Beta
-//! and the stable release. Stable builds never see a Beta.
+//! and the stable release. Stable builds never see a Beta. A Beta needs a
+//! manifest signed with a pinned Ed25519 key that GitHub does not hold
+//! (scripts/sign_beta_manifest.py): the release body and the installer's
+//! digest are both written by whoever can publish releases.
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -29,6 +32,16 @@ const INSTALLER_NAME: &str = "EternalMonitor-Setup.exe";
 /// The nightly's fixed release and its installer (scripts/nightly.py).
 const BETA_TAG: &str = "beta";
 const BETA_INSTALLER_NAME: &str = "EternalMonitor-Setup-beta.exe";
+/// The Beta's signed manifest and its raw Ed25519 signature, assets of the
+/// same release.
+const BETA_MANIFEST_NAME: &str = "beta-manifest.txt";
+const BETA_SIGNATURE_NAME: &str = "beta-manifest.sig";
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024;
+/// The Ed25519 public key Beta manifests are signed with, raw.
+const BETA_PUBLIC_KEY: [u8; 32] = [
+    0x82, 0xc2, 0xaf, 0x21, 0xc6, 0x85, 0xd2, 0xc0, 0x42, 0xc5, 0x1f, 0x72, 0xa3, 0x4c, 0x78, 0xbd,
+    0xb5, 0xd0, 0x04, 0xba, 0xd8, 0x9e, 0x75, 0xa8, 0x30, 0x6a, 0x43, 0x22, 0x4d, 0x16, 0xec, 0x5a,
+];
 /// What the popup says under a Beta's title.
 const BETA_NOTE: &str = "A Beta build with the newest fixes, for testing.";
 /// A new Beta comes out most nights. Its notification and popup come at
@@ -68,6 +81,8 @@ pub struct Endpoints {
     /// Hosts the download may start at or be redirected to.
     pub download_hosts: Vec<String>,
     pub https_only: bool,
+    /// The Ed25519 public key a Beta manifest must be signed with.
+    pub beta_key: [u8; 32],
 }
 
 impl Endpoints {
@@ -84,6 +99,7 @@ impl Endpoints {
                 "release-assets.githubusercontent.com".into(),
             ],
             https_only: true,
+            beta_key: BETA_PUBLIC_KEY,
         }
     }
 
@@ -109,6 +125,7 @@ impl Endpoints {
             installer_prefix: format!("{base}/releases/download/"),
             download_hosts: vec![host],
             https_only: false,
+            beta_key: BETA_PUBLIC_KEY,
         })
     }
 }
@@ -315,13 +332,22 @@ fn published_sha256(body: &str) -> Option<String> {
     Some(pattern.captures(body)?[1].to_ascii_lowercase())
 }
 
-/// The Beta channel's fixed `beta` release as the GitHub API returns it, and
-/// its installer's size. scripts/nightly.py writes the body: a line
-/// `Version <version>, from the Beta channel…` and the installer's SHA-256
-/// in a code block. No website manifest names a Beta, so GitHub's own digest
-/// of the installer must match the body instead, which also fails closed
-/// while the nightly swaps the installer before it rewrites the body.
-pub fn parse_beta(data: &[u8], endpoints: &Endpoints) -> Result<(Release, u64), UpdateError> {
+/// The `beta` release as GitHub lists it, checked: the Beta its body names,
+/// the installer's size, and where its signed manifest and signature are.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BetaListing {
+    pub release: Release,
+    pub size: u64,
+    manifest: String,
+    signature: String,
+}
+
+/// The Beta channel's fixed `beta` release as the GitHub API returns it.
+/// scripts/nightly.py writes the body: a line `Version <version>, from the
+/// Beta channel…` and the installer's SHA-256 in a code block. GitHub's own
+/// digest of the installer must match it, and the signed manifest's assets
+/// must be there; [`check_beta_manifest`] checks those against the listing.
+pub fn parse_beta(data: &[u8], endpoints: &Endpoints) -> Result<BetaListing, UpdateError> {
     let bad = |why: &str| UpdateError::BadManifest(why.into());
     let unsafe_download = |why: &str| UpdateError::UnsafeDownload(why.into());
     let github: GithubRelease =
@@ -340,33 +366,36 @@ pub fn parse_beta(data: &[u8], endpoints: &Endpoints) -> Result<(Release, u64), 
     )
     .ok_or_else(|| bad("Beta has no SHA-256"))?
     .to_ascii_lowercase();
-    let installer = format!(
-        "{}{BETA_TAG}/{BETA_INSTALLER_NAME}",
-        endpoints.installer_prefix
-    );
-    let asset = github
-        .assets
-        .iter()
-        .find(|asset| asset.name == BETA_INSTALLER_NAME)
-        .ok_or_else(|| unsafe_download("release has no installer"))?;
-    if asset.browser_download_url != installer {
-        return Err(unsafe_download("unexpected installer URL"));
-    }
-    if asset.digest.as_deref().map(str::to_ascii_lowercase) != Some(format!("sha256:{sha256}")) {
+    // Each asset must be the release's own file of that name.
+    let asset = |name: &str| {
+        let url = format!("{}{BETA_TAG}/{name}", endpoints.installer_prefix);
+        match github.assets.iter().find(|asset| asset.name == name) {
+            Some(asset) if asset.browser_download_url == url => Ok(asset),
+            Some(_) => Err(unsafe_download("unexpected Beta asset URL")),
+            None => Err(bad("Beta asset missing")),
+        }
+    };
+    let installer = asset(BETA_INSTALLER_NAME)?;
+    if installer.digest.as_deref().map(str::to_ascii_lowercase) != Some(format!("sha256:{sha256}"))
+    {
         return Err(unsafe_download("GitHub digest is missing or differs"));
     }
-    if asset.size == 0 || asset.size > MAX_INSTALLER_BYTES {
+    if installer.size == 0 || installer.size > MAX_INSTALLER_BYTES {
         return Err(unsafe_download("installer size out of range"));
     }
-    let release = Release {
-        version: version.to_string(),
-        installer,
-        sha256,
-        recommended: false,
-        note: Some(BETA_NOTE.into()),
-        rollout: None,
-    };
-    Ok((release, asset.size))
+    Ok(BetaListing {
+        release: Release {
+            version: version.to_string(),
+            installer: installer.browser_download_url.clone(),
+            sha256,
+            recommended: false,
+            note: Some(BETA_NOTE.into()),
+            rollout: None,
+        },
+        size: installer.size,
+        manifest: asset(BETA_MANIFEST_NAME)?.browser_download_url.clone(),
+        signature: asset(BETA_SIGNATURE_NAME)?.browser_download_url.clone(),
+    })
 }
 
 /// The first group of `pattern`'s one match in `text`. None, or two, is
@@ -378,15 +407,84 @@ fn only_match(pattern: &str, text: &str) -> Option<String> {
     matches.next().is_none().then_some(first)
 }
 
-/// Checks the Beta release against the one chosen and returns the
-/// installer's size. A Beta published since then is refused: its hash is not
-/// the one the helper will check.
+/// What `beta-manifest.txt` says, signed outside GitHub.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BetaManifest {
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl BetaManifest {
+    /// The canonical text, version 1: UTF-8, every line ending in LF.
+    pub fn text(&self) -> String {
+        format!(
+            "eternalmonitor-beta-manifest 1\nversion={}\nsha256={}\nsize={}\nasset={BETA_INSTALLER_NAME}\n",
+            self.version, self.sha256, self.size
+        )
+    }
+
+    /// Only the canonical text parses: its fields must render back to the
+    /// same bytes, so no spacing, case or line ending varies.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(data).ok()?;
+        // The header and asset lines are checked by rendering back.
+        let mut lines = text.strip_suffix('\n')?.split('\n').skip(1);
+        let mut field = |key: &str| {
+            let line = lines.next()?;
+            line.strip_prefix(key)?
+                .strip_prefix('=')
+                .map(str::to_string)
+        };
+        let manifest = Self {
+            version: field("version")?,
+            sha256: field("sha256")?,
+            size: field("size")?.parse().ok()?,
+        };
+        let valid = semver::Version::parse(&manifest.version).is_ok_and(|version| {
+            version.to_string() == manifest.version && version.build.is_empty()
+        }) && is_beta(&manifest.version)
+            && is_sha256(&manifest.sha256)
+            && manifest.sha256 == manifest.sha256.to_ascii_lowercase();
+        (valid && manifest.text().as_bytes() == data).then_some(manifest)
+    }
+}
+
+/// The manifest must carry a valid signature by `key` and name the Beta,
+/// hash and size the listing does. Anything else means no offer.
+pub fn check_beta_manifest(
+    listing: &BetaListing,
+    manifest: &[u8],
+    signature: &[u8],
+    key: &[u8; 32],
+) -> Result<(), UpdateError> {
+    use ring::signature::{UnparsedPublicKey, ED25519};
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(manifest, signature)
+        .map_err(|_| UpdateError::UnsafeDownload("Beta signature is not valid".into()))?;
+    let manifest = BetaManifest::parse(manifest)
+        .ok_or_else(|| UpdateError::BadManifest("malformed Beta manifest".into()))?;
+    let release = &listing.release;
+    if (&manifest.version, &manifest.sha256, manifest.size)
+        != (&release.version, &release.sha256, listing.size)
+    {
+        return Err(UpdateError::UnsafeDownload(
+            "Beta manifest differs from the release".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the Beta release against the one chosen, whose manifest was
+/// verified, and returns the installer's size. A Beta published since then
+/// is refused: its hash is not the one the helper will check.
 fn check_beta_release(
     data: &[u8],
     release: &Release,
     endpoints: &Endpoints,
 ) -> Result<u64, UpdateError> {
-    let (published, size) = parse_beta(data, endpoints)?;
+    let listing = parse_beta(data, endpoints)?;
+    let published = &listing.release;
     if (&published.version, &published.installer, &published.sha256)
         != (&release.version, &release.installer, &release.sha256)
     {
@@ -394,7 +492,7 @@ fn check_beta_release(
             "the Beta release changed".into(),
         ));
     }
-    Ok(size)
+    Ok(listing.size)
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -502,9 +600,52 @@ pub fn fetch_manifest(endpoints: &Endpoints) -> Result<Release, UpdateError> {
 
 const GITHUB_JSON: &str = "application/vnd.github+json";
 
+/// The newest Beta, offered only with a valid signed manifest.
 pub fn fetch_beta(endpoints: &Endpoints) -> Result<Release, UpdateError> {
     let data = get_json(&format!("{}{BETA_TAG}", endpoints.release_api), GITHUB_JSON)?;
-    parse_beta(&data, endpoints).map(|(release, _)| release)
+    let listing = parse_beta(&data, endpoints)?;
+    let manifest = get_asset(&listing.manifest, endpoints)?;
+    let signature = get_asset(&listing.signature, endpoints)?;
+    check_beta_manifest(&listing, &manifest, &signature, &endpoints.beta_key)?;
+    Ok(listing.release)
+}
+
+/// A small release file, following redirects only to allowed hosts.
+fn get_asset(url: &str, endpoints: &Endpoints) -> Result<Vec<u8>, UpdateError> {
+    let network = |error: &dyn std::fmt::Display| UpdateError::Network(error.to_string());
+    let unsafe_download = |why: String| UpdateError::UnsafeDownload(why);
+    let agent = agent(Duration::from_secs(10));
+    let mut url = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        if !allowed_url(&url, endpoints) {
+            return Err(unsafe_download(format!("host not allowed: {url}")));
+        }
+        let mut response = agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| network(&e))?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| unsafe_download("redirect without a location".into()))?;
+            url = resolve_redirect(&url, location)
+                .ok_or_else(|| unsafe_download(format!("bad redirect: {location}")))?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(UpdateError::Network(format!("HTTP {}", response.status())));
+        }
+        return response
+            .body_mut()
+            .with_config()
+            .limit(MAX_MANIFEST_BYTES)
+            .read_to_vec()
+            .map_err(|e| network(&e));
+    }
+    Err(unsafe_download("too many redirects".into()))
 }
 
 // ── The failure message ─────────────────────────────────────────────────────

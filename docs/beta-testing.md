@@ -34,10 +34,16 @@ back to Stable by running the Stable installer over it.
   Stable users are never offered a Beta build.
 - **Updates on Beta:** a Beta build also reads the `beta` release below and
   offers the newer of that Beta and the next Stable release, with the same
-  banner, popup and helper as a Stable update. The version and SHA-256 come
-  from the release body `nightly.py` writes, and GitHub's digest of the
-  installer must match it. A new Beta is announced at most once a day, never
-  during a stream. Settings, General, **Get Beta updates** (shown only on a
+  banner, popup and helper as a Stable update. Beta updates are signed and
+  verified against a public key pinned in the app: the release must carry
+  `beta-manifest.txt` and its Ed25519 signature `beta-manifest.sig`, and the
+  manifest's version, SHA-256 and size must match the release body
+  `nightly.py` writes, GitHub's digest of the installer and the downloaded
+  file. The nightly does not sign; until a build is signed, Beta installs are
+  offered no Beta. After a nightly publishes, pipe the signing key into
+  `scripts/sign_beta_manifest.py`, which checks the release, signs, uploads
+  both files and verifies them; `--verify-only` checks what is published.
+  A new Beta is announced at most once a day, never during a stream. Settings, General, **Get Beta updates** (shown only on a
   Beta build) turns this off. Taking a Stable release leaves the Beta channel.
   Betas built before this arrived can't update themselves, so their testers
   install one newer Beta by hand.

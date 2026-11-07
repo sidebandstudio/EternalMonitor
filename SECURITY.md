@@ -34,9 +34,13 @@ Knowing these limits helps you judge whether a finding is new.
 - In-app updates (Windows) trust the network for nothing: the host fetches over
   HTTPS from an allowlist of GitHub hosts, and the installer must match the
   SHA-256 in both eternalmonitor.dev/latest.json and the GitHub release. A Beta
-  build may also update to the newer Beta from the fixed `beta` GitHub release;
-  that installer must match both the SHA-256 in the release body and GitHub's own
-  digest of the file. Stable builds never take a Beta. Against
+  build may also update to the newer Beta from the fixed `beta` GitHub release.
+  Beta updates are signed: the release must carry a manifest with a valid
+  Ed25519 signature by a public key pinned in the app, made with a key the
+  release workflows don't have, and the manifest's version, SHA-256 and size
+  must match the release body, GitHub's digest of the installer and the
+  downloaded file. Without a valid signature no Beta is offered. Stable builds
+  never take a Beta. Against
   other software already running as your Windows user, the updater adds defense
   in depth rather than a guarantee. Its helper loads DLLs only from System32 and
   imports only Windows system libraries. It inherits only its output pipe from
