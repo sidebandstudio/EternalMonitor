@@ -251,10 +251,16 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    shared.session.lock().transport_resumed(now());
-    // A goodbye left while no transport ran (a Stop while the port was held)
-    // is for a session that is over; its iPad may be in a new one by now.
-    if shared.session.lock().take_goodbye().is_some() {
+    // One lock, with `running` read under it: a stop
+    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
+    // under the same lock, so this either sees that stop and keeps its
+    // goodbye, or comes first and the stop's goodbye is kept anyway.
+    let retired = {
+        let mut session = shared.session.lock();
+        let stopping = !shared.running.load(Ordering::SeqCst);
+        session.transport_resumed(now(), stopping)
+    };
+    if retired {
         debug!("Dropped a goodbye left while the stream was stopped");
     }
     let beat = std::sync::Arc::clone(&shared.transport_beat);

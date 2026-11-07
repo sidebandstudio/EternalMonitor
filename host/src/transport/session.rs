@@ -1025,11 +1025,25 @@ impl Session {
     /// and reports during the restart gap went unheard, so the gap must not
     /// count against it: 0.3.1 expired live iPads the moment a slow restart
     /// finished and made them reconnect.
-    pub fn transport_resumed(&mut self, now: Instant) {
-        self.stream_stopped = false;
+    ///
+    /// `stopping`: the stream was stopped for good (`running` false, read
+    /// under the session lock, which [`Self::shut_down`]'s caller holds while
+    /// it clears it) before this transport got going. Its goodbye is
+    /// current, and this transport sends it on its way out; clients stay
+    /// turned away. Otherwise the stream runs again: clients are let in, and
+    /// a goodbye a stop left while no transport ran is retired, as its
+    /// session is long over. Both happen in this one call, so a stop that
+    /// comes after it keeps its goodbye. Returns whether one was retired.
+    pub fn transport_resumed(&mut self, now: Instant, stopping: bool) -> bool {
         if let Some(session) = self.active.as_mut() {
             session.liveness_deadline = session.liveness_deadline.max(now + LIVENESS_TIMEOUT);
         }
+        if stopping {
+            return false;
+        }
+        let stale = self.stream_stopped && self.goodbye.take().is_some();
+        self.stream_stopped = false;
+        stale
     }
 
     /// Periodic tick: expire the session when the client has been silent past
@@ -2041,7 +2055,7 @@ mod tests {
         session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         // The transport was down for 11 s (a capture restart with backoff).
         let resumed = now + Duration::from_secs(11);
-        session.transport_resumed(resumed);
+        session.transport_resumed(resumed, false);
         assert!(!session.tick(&TestConfig, false, resumed).client_lost);
         assert!(session.is_active());
         // A client that stays silent after the restart still expires.
@@ -2845,7 +2859,7 @@ mod tests {
 
         session.end_update();
         // The stream runs again: clients are let in.
-        session.transport_resumed(now);
+        session.transport_resumed(now, false);
         session.handle_control(usb, 0, identified_hello(5, 77), &TestConfig, now);
         let quit = session
             .shut_down(now + Duration::from_secs(3), StreamStop::Quit)
@@ -2869,10 +2883,52 @@ mod tests {
         assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
         assert!(!session.is_active());
 
-        session.transport_resumed(now);
+        session.transport_resumed(now, false);
         let admitted = session.handle_control(peer, 0, identified_hello(8, 77), &TestConfig, now);
         assert_eq!(admitted.new_target, Some(peer));
         assert!(session.is_active());
+    }
+
+    /// A transport starting after a stop retires the stop's goodbye only if
+    /// the stream runs again; one starting while the stream is stopping keeps
+    /// it, and keeps clients out. A stop after the start keeps its goodbye.
+    #[test]
+    fn a_starting_transport_retires_only_a_goodbye_from_before_the_stream_ran_again() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let admit = |session: &mut Session, nonce| {
+            session.handle_control(peer, 0, identified_hello(nonce, 77), &TestConfig, now)
+        };
+
+        // Stopped while no transport ran; Start brought the stream back.
+        let mut session = Session::new(500);
+        admit(&mut session, 1);
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(
+            session.transport_resumed(now, false),
+            "a stale goodbye is retired"
+        );
+        assert_eq!(session.take_goodbye(), None);
+        assert_eq!(admit(&mut session, 2).new_target, Some(peer));
+
+        // Stopped while this transport was starting: the goodbye is current.
+        let mut session = Session::new(500);
+        admit(&mut session, 3);
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(!session.transport_resumed(now, true));
+        assert!(
+            session.take_goodbye().is_some(),
+            "the current goodbye is kept"
+        );
+        let refused = admit(&mut session, 4);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+
+        // Stopped once the transport ran: kept, for the transport to send.
+        let mut session = Session::new(500);
+        admit(&mut session, 5);
+        assert!(!session.transport_resumed(now, false), "nothing to retire");
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(session.take_goodbye().is_some());
     }
 
     /// Quitting or Stop ends the stream for good: the iPad hears why, from
