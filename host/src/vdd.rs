@@ -214,15 +214,29 @@ impl DriverTasks {
         self.gate.lock().health
     }
 
-    /// Before any request, with the device as Configuration Manager reports
-    /// it: one Windows reports disabled (problem 22) is off already, so no
-    /// Disable needs to run. True when so.
-    fn found_off(&self, device: crate::vdd_device::DeviceState) -> bool {
-        let off = device == crate::vdd_device::DeviceState::Problem(22);
-        if off {
-            self.gate.lock().known_enabled = Some(false);
-        }
-        off
+    /// The startup cleanup: a Disable on its own turn, unless `already_off`
+    /// says, on that turn, that the display is off with no task left to
+    /// change it. Then it counts as a Disable that completed, so later
+    /// requests know the display is off.
+    fn disable_at_startup(
+        &self,
+        on_turn: impl FnOnce(),
+        already_off: impl FnOnce() -> bool,
+        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
+    ) -> bool {
+        self.set_enabled_on_turn(
+            false,
+            Purpose::Cleanup,
+            || {},
+            on_turn,
+            |enabled, progress| {
+                if already_off() {
+                    TaskOutcome::Done
+                } else {
+                    run(enabled, progress)
+                }
+            },
+        )
     }
 
     #[cfg(test)]
@@ -472,20 +486,7 @@ fn request_on_turn(
     #[cfg(windows)]
     {
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
-            let mut outcome = TaskOutcome::Failed(None);
-            // Read here, after the gate decided and before the task runs.
-            let display_off = TASKS.gate.lock().known_enabled == Some(false);
-            crate::startup::display::change(enabled, progress, |progress| {
-                outcome = crate::display_guard::around(
-                    enabled,
-                    crate::startup::ProcessId::current(),
-                    log_screens,
-                    display_off,
-                    || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
-                    |outcome| *outcome == TaskOutcome::Done,
-                );
-                outcome == TaskOutcome::Done
-            });
+            let outcome = run_on_turn(enabled, progress);
             *ran = Some(outcome);
             outcome
         })
@@ -496,6 +497,26 @@ fn request_on_turn(
         on_turn();
         false
     }
+}
+
+/// Run the driver task for `enabled`, once the gate let a request run.
+#[cfg(windows)]
+fn run_on_turn(enabled: bool, progress: &mut dyn FnMut()) -> TaskOutcome {
+    let mut outcome = TaskOutcome::Failed(None);
+    // Read here, after the gate decided and before the task runs.
+    let display_off = TASKS.gate.lock().known_enabled == Some(false);
+    crate::startup::display::change(enabled, progress, |progress| {
+        outcome = crate::display_guard::around(
+            enabled,
+            crate::startup::ProcessId::current(),
+            log_screens,
+            display_off,
+            || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
+            |outcome| *outcome == TaskOutcome::Done,
+        );
+        outcome == TaskOutcome::Done
+    });
+    outcome
 }
 
 /// Disable the virtual display device (best effort — failures are non-fatal).
@@ -512,14 +533,11 @@ pub fn disable() -> bool {
 /// A hung task no longer keeps a Mirror stream black for up to 30 s.
 ///
 /// A display Windows already reports disabled, as at almost every start,
-/// runs no task. That Disable was the task that hung most often in the
-/// field, and every later request waited behind it and failed.
+/// runs no task, unless an Enable or Disable task is still queued or running
+/// from before: an Enable the previous host gave up on can still turn the
+/// display on. That Disable was the task that hung most often in the field,
+/// and every later request waited behind it and failed.
 pub fn disable_in_background() {
-    #[cfg(windows)]
-    if TASKS.found_off(crate::vdd_device::query()) {
-        info!("Virtual display already off — not running the Disable task");
-        return;
-    }
     let (held, turn) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("vdd-startup-off".into())
@@ -527,7 +545,20 @@ pub fn disable_in_background() {
             let on_turn = move || {
                 let _ = held.send(());
             };
-            request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None)
+            #[cfg(windows)]
+            TASKS.disable_at_startup(
+                on_turn,
+                || {
+                    let off = off_with_nothing_pending(task_pending(), crate::vdd_device::query);
+                    if off {
+                        info!("Virtual display already off — not running the Disable task");
+                    }
+                    off
+                },
+                run_on_turn,
+            );
+            #[cfg(not(windows))]
+            request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None);
         });
     match spawned {
         Ok(_) => {
@@ -537,6 +568,65 @@ pub fn disable_in_background() {
             disable();
         }
     }
+}
+
+/// Whether the display is off and stays off: Task Scheduler reports no
+/// driver task queued or running (`pending`, `None` when it could not say),
+/// and only then does the device read disabled (problem 22). In that order,
+/// so an Enable that ends meanwhile shows in the device.
+#[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
+fn off_with_nothing_pending(
+    pending: Option<bool>,
+    device: impl FnOnce() -> crate::vdd_device::DeviceState,
+) -> bool {
+    pending == Some(false) && device() == crate::vdd_device::DeviceState::Problem(22)
+}
+
+/// Whether either driver task has an instance queued or running, as Task
+/// Scheduler reports it; a missing task has none. `None` when it can't say.
+#[cfg(windows)]
+fn task_pending() -> Option<bool> {
+    tasks_pending(&[TASK_ENABLE, TASK_DISABLE])
+}
+
+#[cfg(windows)]
+fn tasks_pending(names: &[&str]) -> Option<bool> {
+    use windows::core::{BSTR, HRESULT, VARIANT};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        ITaskService, TaskScheduler, TASK_STATE_QUEUED, TASK_STATE_RUNNING,
+    };
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .ok()?;
+    let _apartment = Apartment;
+    let service: ITaskService =
+        unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let local = VARIANT::default();
+    unsafe { service.Connect(&local, &local, &local, &local) }.ok()?;
+    let folder = unsafe { service.GetFolder(&BSTR::from("\\")) }.ok()?;
+    let mut pending = false;
+    for &name in names {
+        match unsafe { folder.GetTask(&BSTR::from(name)) } {
+            Ok(task) => {
+                let state = unsafe { task.State() }.ok()?;
+                pending |= state == TASK_STATE_QUEUED || state == TASK_STATE_RUNNING;
+            }
+            // 0x80070002: the task does not exist.
+            Err(error) if error.code() == HRESULT(0x8007_0002_u32 as i32) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(pending)
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
@@ -597,8 +687,13 @@ mod tests {
         use crate::vdd_device::DeviceState;
         use std::cell::Cell;
         let tasks = DriverTasks::new();
-        assert!(tasks.found_off(DeviceState::Problem(22)));
-        // Neither the startup cleanup nor a quit before any stream runs one.
+        let off = || off_with_nothing_pending(Some(false), || DeviceState::Problem(22));
+        assert!(tasks.disable_at_startup(
+            || {},
+            off,
+            |_, _| { panic!("ran the Disable task for a display that is off") }
+        ));
+        // Nor does a quit before any stream.
         assert!(tasks.set_enabled(
             false,
             Purpose::Cleanup,
@@ -628,18 +723,108 @@ mod tests {
             DeviceState::Missing,
         ] {
             let tasks = DriverTasks::new();
-            assert!(!tasks.found_off(device), "{device:?}");
             let ran = Cell::new(false);
-            tasks.set_enabled(
-                false,
-                Purpose::Cleanup,
+            tasks.disable_at_startup(
                 || {},
+                || off_with_nothing_pending(Some(false), || device),
                 |_, _| {
                     ran.set(true);
                     TaskOutcome::Done
                 },
             );
             assert!(ran.get(), "no Disable for {device:?}");
+        }
+    }
+
+    /// Review r1: an Enable task the previous host gave up on can still be
+    /// queued or running while the device reads disabled. Recording "off"
+    /// then let it add the monitor, and every later Disable, the quit's
+    /// too, found the display "already off": a phantom monitor stayed.
+    #[test]
+    fn an_enable_left_running_by_the_previous_host_is_turned_off_at_startup() {
+        use crate::vdd_device::DeviceState;
+        use std::cell::Cell;
+        let tasks = DriverTasks::new();
+        // Task Scheduler still runs the Enable, and Windows has not added the
+        // display yet.
+        let enable_running = Cell::new(true);
+        let display_on = Cell::new(false);
+        let device = || {
+            if display_on.get() {
+                DeviceState::Ready
+            } else {
+                DeviceState::Problem(22)
+            }
+        };
+        let enable_ends = || {
+            if enable_running.replace(false) {
+                display_on.set(true);
+            }
+        };
+        let queried_device = Cell::new(false);
+        let disabled = tasks.disable_at_startup(
+            || {},
+            || {
+                off_with_nothing_pending(Some(enable_running.get()), || {
+                    queried_device.set(true);
+                    device()
+                })
+            },
+            // The startup Disable runs vdd_task.ps1 with -After Enable, which
+            // waits for the Enable to end before it disables.
+            |enabled, _| {
+                assert!(!enabled);
+                enable_ends();
+                display_on.set(false);
+                TaskOutcome::Done
+            },
+        );
+        assert!(disabled);
+        // A surviving Enable ends whenever it ends; then the host quits.
+        enable_ends();
+        tasks.set_enabled(
+            false,
+            Purpose::Cleanup,
+            || {},
+            |_, _| {
+                display_on.set(false);
+                TaskOutcome::Done
+            },
+        );
+        assert!(!display_on.get(), "a phantom monitor stayed after quit");
+        assert!(
+            !queried_device.get(),
+            "decided on the device while a task was pending"
+        );
+
+        // When Task Scheduler can't say, the Disable runs too.
+        let tasks = DriverTasks::new();
+        let ran = Cell::new(false);
+        tasks.disable_at_startup(
+            || {},
+            || off_with_nothing_pending(None, || DeviceState::Problem(22)),
+            |_, _| {
+                ran.set(true);
+                TaskOutcome::Done
+            },
+        );
+        assert!(ran.get(), "no Disable when the task state was unknown");
+    }
+
+    /// Native only (`--ignored` on Windows): Task Scheduler answers for the
+    /// driver tasks, a missing task has nothing pending, and a task started
+    /// beforehand and named in `EM_TEST_PENDING_TASK` reads as pending.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn task_scheduler_reports_pending_driver_tasks() {
+        assert_eq!(
+            tasks_pending(&["EternalMonitor test task that does not exist"]),
+            Some(false)
+        );
+        assert!(task_pending().is_some(), "Task Scheduler did not answer");
+        if let Ok(running) = std::env::var("EM_TEST_PENDING_TASK") {
+            assert_eq!(tasks_pending(&[running.as_str()]), Some(true), "{running}");
         }
     }
 
